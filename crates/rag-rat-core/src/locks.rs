@@ -120,14 +120,35 @@ pub fn socket_lock_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
 /// exceed the `sun_path` budget. Hook clients compute the same path independently, so this must
 /// stay deterministic for a given (base_dir, worktree_root) and environment.
 pub fn hook_socket_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
+    let runtime_base =
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    socket_path_with_runtime_base(base_dir, worktree_root, &runtime_base)
+}
+
+/// Inner implementation: builds the candidate path cascade with an explicit `runtime_base` so the
+/// fallback logic can be unit-tested without touching the process environment.
+///
+/// Priority:
+/// 1. `<base_dir>/sockets/<hash>.sock` — within budget?  Use it.
+/// 2. `<runtime_base>/rag-rat/<hash>.sock` — within budget?  Use it.
+/// 3. `<temp_dir>/rag-rat/<hash>.sock` — best effort; callers fail open if still over budget.
+fn socket_path_with_runtime_base(
+    base_dir: &Path,
+    worktree_root: &Path,
+    runtime_base: &Path,
+) -> PathBuf {
     let name = format!("{}.sock", worktree_hash(worktree_root));
     let preferred = base_dir.join("sockets").join(&name);
     if preferred.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
         return preferred;
     }
-    let runtime_base =
-        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    runtime_base.join("rag-rat").join(name)
+    let xdg_candidate = runtime_base.join("rag-rat").join(&name);
+    if xdg_candidate.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
+        return xdg_candidate;
+    }
+    // Both preferred and XDG are over budget — fall through to the OS temp dir.
+    // If even this is over budget there is nothing better; callers fail open.
+    std::env::temp_dir().join("rag-rat").join(name)
 }
 
 #[cfg(test)]
@@ -199,18 +220,49 @@ mod tests {
         assert!(socket.extension().is_some_and(|ext| ext == "sock"));
     }
 
+    /// Build a base dir long enough that `<base>/sockets/<hash>.sock` exceeds `MAX_SOCKET_PATH_LEN`.
+    fn long_base_dir() -> PathBuf {
+        let mut base = temp_dir();
+        // Each push appends ~28 bytes; 12 × 28 = 336, well over the 100-byte budget.
+        for _ in 0..12 {
+            base.push("very-long-directory-segment");
+        }
+        base
+    }
+
     #[test]
     fn hook_socket_path_falls_back_when_base_path_is_too_long() {
-        // sun_path is ~108 bytes; a deeply nested base dir must divert to a short runtime dir.
-        let mut long_base = temp_dir();
-        for _ in 0..12 {
-            long_base.push("very-long-directory-segment");
-        }
+        // When the preferred path is over budget and XDG_RUNTIME_DIR is a short /tmp path, the
+        // XDG candidate fits within budget and is returned.
+        let long_base = long_base_dir();
         let root = temp_dir();
-        let socket = hook_socket_path(&long_base, &root);
+        // Use a known-short runtime_base so the test is independent of the runner environment.
+        let short_runtime_base = std::env::temp_dir(); // e.g. /tmp — always short
+        let socket = socket_path_with_runtime_base(&long_base, &root, &short_runtime_base);
         assert!(
             socket.as_os_str().len() <= MAX_SOCKET_PATH_LEN,
-            "fallback path still too long: {}",
+            "XDG fallback path still too long: {}",
+            socket.display()
+        );
+        // Should NOT live under the long base dir.
+        assert!(!socket.starts_with(&long_base), "expected fallback, got preferred path");
+    }
+
+    #[test]
+    fn hook_socket_path_falls_back_to_temp_when_xdg_also_too_long() {
+        // When both the preferred path and the XDG candidate are over budget, the function falls
+        // through to the OS temp dir (best-effort; callers fail open).
+        let long_base = long_base_dir();
+        let long_runtime_base = long_base_dir();
+        let root = temp_dir();
+        let socket = socket_path_with_runtime_base(&long_base, &root, &long_runtime_base);
+        // Must not be under either long base.
+        assert!(!socket.starts_with(&long_base));
+        assert!(!socket.starts_with(&long_runtime_base));
+        // Should be rooted at the OS temp dir.
+        assert!(
+            socket.starts_with(std::env::temp_dir()),
+            "expected temp-dir fallback, got: {}",
             socket.display()
         );
     }
