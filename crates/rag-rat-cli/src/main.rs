@@ -24,6 +24,9 @@ fn main() -> anyhow::Result<()> {
     if command == "init" {
         return init::run(&args);
     }
+    if command == "claude-hook" {
+        return claude_hook::run();
+    }
     let config_path = option_value(&args, "--config").unwrap_or_else(|| "rag-rat.toml".to_string());
     let config = Config::load(&config_path)?;
     apply_embedding_runtime_env(&config.local_ai.embedding.runtime);
@@ -890,7 +893,7 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <init|index|doctor|migrate|query|brief|clusters|mcp|github|hooks|maintenance|models|reconcile|gc|eval|dump-config> [--config <path>] [query]\n\
+        "usage: rag-rat <init|index|doctor|migrate|query|brief|clusters|mcp|github|hooks|claude-hook|maintenance|models|reconcile|gc|eval|dump-config> [--config <path>] [query]\n\
          default config: rag-rat.toml\n\
          examples:\n\
          rag-rat init\n\

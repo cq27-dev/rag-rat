@@ -5,7 +5,16 @@
 //! augments greps and must never block one. Spec:
 //! `docs/specs/2026-06-09-grep-augment-pretooluse-hook.md`.
 
+use std::{
+    io::Read as _,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use rag_rat_core::{config::Config, locks, query::grep_augment, storage::IndexConnection};
 use serde::Deserialize;
+
+const SOCKET_BUDGET: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
@@ -44,9 +53,30 @@ const SEARCH_COMMANDS: &[&str] = &["grep", "rg", "ag"];
 /// Flags whose *next* token is a value, not the pattern. Conservative superset across the
 /// three tools — a missed flag only costs a wrong-pattern no-op downstream, never a block.
 const ARG_FLAGS: &[&str] = &[
-    "-A", "-B", "-C", "-m", "-g", "-t", "-T", "-f", "-M", "--glob", "--type", "--type-not",
-    "--include", "--exclude", "--exclude-dir", "--max-count", "--max-depth", "--context",
-    "--after-context", "--before-context", "--file", "--ignore-file", "--threads", "--colors",
+    "-A",
+    "-B",
+    "-C",
+    "-m",
+    "-g",
+    "-t",
+    "-T",
+    "-f",
+    "-M",
+    "--glob",
+    "--type",
+    "--type-not",
+    "--include",
+    "--exclude",
+    "--exclude-dir",
+    "--max-count",
+    "--max-depth",
+    "--context",
+    "--after-context",
+    "--before-context",
+    "--file",
+    "--ignore-file",
+    "--threads",
+    "--colors",
 ];
 
 /// Extract (pattern, path) from a shell command that runs grep/rg/ag, or `None` when the
@@ -175,6 +205,109 @@ fn shell_tokens(segment: &str) -> Option<Vec<String>> {
     Some(tokens)
 }
 
+/// Entry point for `rag-rat claude-hook`. Every failure path prints nothing and returns
+/// Ok(()) — the hook must never block a grep (spec: error posture).
+pub fn run() -> anyhow::Result<()> {
+    let _ = run_inner(); // swallow: silence is the contract
+    Ok(())
+}
+
+fn run_inner() -> anyhow::Result<()> {
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw)?;
+    let input: HookInput = serde_json::from_str(&raw)?;
+    let Some(search) = extract_search(&input) else { return Ok(()) };
+    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
+
+    let context = ask_listener(&config, &input.session_id, &search)
+        .unwrap_or_else(|| fallback_compose(&config, &search));
+    if let Some(context) = context {
+        // PreToolUse contract: allow + additionalContext; plain stdout is debug-only.
+        println!(
+            "{}",
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "additionalContext": context,
+                }
+            })
+        );
+    }
+    Ok(())
+}
+
+/// Walk up from the hook's cwd to the nearest rag-rat.toml. `None` ⇒ not a rag-rat repo ⇒
+/// silent no-op (what makes `--global` install safe).
+fn find_config(start: &Path) -> Option<Config> {
+    let mut dir = Some(start);
+    while let Some(current) = dir {
+        let candidate = current.join("rag-rat.toml");
+        if candidate.is_file() {
+            return Config::load(&candidate).ok();
+        }
+        dir = current.parent();
+    }
+    None
+}
+
+/// Outer Option: did the listener answer at all (None ⇒ fall back). Inner Option: did it
+/// have anything new to say.
+fn ask_listener(config: &Config, session_id: &str, search: &Search) -> Option<Option<String>> {
+    #[cfg(unix)]
+    {
+        use std::{
+            io::{BufRead, BufReader, Write as _},
+            os::unix::net::UnixStream,
+        };
+        let socket = socket_path(config);
+        let stream = UnixStream::connect(&socket).ok()?;
+        stream.set_read_timeout(Some(SOCKET_BUDGET)).ok()?;
+        stream.set_write_timeout(Some(SOCKET_BUDGET)).ok()?;
+        let request = serde_json::json!({
+            "v": 1, "kind": "grep_augment", "session_id": session_id,
+            "pattern": search.pattern, "search_path": search.search_path,
+            "source": search.source,
+        });
+        let mut writer = stream.try_clone().ok()?;
+        writeln!(writer, "{request}").ok()?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).ok()?;
+        let reply: serde_json::Value = serde_json::from_str(&line).ok()?;
+        if reply.get("v")?.as_u64()? != 1 {
+            return None;
+        }
+        Some(reply.get("context")?.as_str().map(str::to_string))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (config, session_id, search);
+        None
+    }
+}
+
+/// Mirrors `rag_rat_mcp::claude_hook::socket_path_for` without depending on the MCP crate:
+/// both derive the path from the same `locks::hook_socket_path` inputs.
+fn socket_path(config: &Config) -> PathBuf {
+    let base_dir =
+        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
+    locks::hook_socket_path(&base_dir, &config.root)
+}
+
+/// Stateless direct read (no dedupe — spec: fallback path). Any error ⇒ silence.
+fn fallback_compose(config: &Config, search: &Search) -> Option<String> {
+    let conn = IndexConnection::open_read_only(&config.database).ok()?;
+    grep_augment::compose(
+        conn.connection(),
+        &search.pattern,
+        search.search_path.as_deref(),
+        &grep_augment::DedupeFilter::default(),
+    )
+    .ok()
+    .flatten()
+    .map(|out| out.context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,11 +346,11 @@ mod tests {
         let negatives = [
             "ls -la",
             "cargo test",
-            "rg",                       // no pattern
+            "rg",                                        // no pattern
             "find . -name '*.rs' -exec grep foo {} \\;", // -exec: ambiguous
-            "echo `rg foo`",            // backticks: ambiguous
-            "xargs grep foo",           // xargs: ambiguous
-            "groups",                   // not grep
+            "echo `rg foo`",                             // backticks: ambiguous
+            "xargs grep foo",                            // xargs: ambiguous
+            "groups",                                    // not grep
         ];
         for cmd in negatives {
             assert!(parse_bash_search(cmd).is_none(), "false positive for {cmd}");
