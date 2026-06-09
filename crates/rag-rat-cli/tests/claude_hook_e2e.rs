@@ -238,6 +238,16 @@ impl McpServer {
     }
 }
 
+// Reap the spawned `mcp` process even if a test panics between spawn and the explicit
+// `kill_and_wait` — otherwise a mid-test assert failure orphans the process (and its bound
+// socket/lock) until the OS reaps it. Idempotent with `kill_and_wait`.
+#[cfg(unix)]
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
 /// Decode the client's `hookSpecificOutput` JSON and pull out `additionalContext` (None when the
 /// client printed nothing, i.e. a deduped/empty response).
 #[cfg(unix)]
