@@ -10,7 +10,7 @@
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -46,6 +46,14 @@ fn sigusr1_hot_upgrade_resumes_session_in_place() {
     let after = session.call_semantic_search();
     assert!(after["chunk_id"].as_i64().is_some(), "session resumed transparently after exec");
 
+    // The grep-augment hook socket must answer *after* the in-place `exec`: the old process's lock
+    // fd and bound socket died with the exec'd image, so the resumed process has to re-run the
+    // socket election and re-bind the listener (the `AbortOnDrop` guard + the election retry loop).
+    // Probing it proves `spawn_listener` runs on the handoff-resume path, not just cold start.
+    let socket = env.hook_socket_path();
+    let reply = hook_roundtrip(&socket, "sqlite", Duration::from_secs(15));
+    assert_eq!(reply["v"], 1, "hook socket re-binds and speaks the protocol after hot-upgrade");
+
     session.stop();
     env.cleanup();
 }
@@ -71,6 +79,7 @@ fn sigusr1_exec_failure_exits_nonzero() {
 struct TestEnv {
     root: PathBuf,
     config_path: PathBuf,
+    config: Config,
 }
 
 impl TestEnv {
@@ -87,7 +96,14 @@ impl TestEnv {
         .unwrap();
         let config = Config::load(&config_path).unwrap();
         rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
-        Self { root, config_path }
+        Self { root, config_path, config }
+    }
+
+    /// The deterministic hook-socket path for this config — the same derivation the elected
+    /// listener and the CLI client use (`hook_socket_path_for` handles the XDG/temp budget
+    /// cascade), so the probe can't drift from where the server actually binds.
+    fn hook_socket_path(&self) -> PathBuf {
+        rag_rat_core::locks::hook_socket_path_for(&self.config)
     }
 
     /// A `/bin/sh` wrapper that touches `sentinel` then `exec`s the real binary with our argv —
@@ -214,6 +230,34 @@ impl Session {
     fn stop(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Connect to the hook socket and exchange one `grep_augment` request/reply, polling until a bound
+/// listener answers (the post-`exec` process must win the socket election before it re-binds, which
+/// the 5s election retry can stretch out). Returns the decoded reply envelope; the caller asserts on
+/// `v`. We deliberately do not couple to the `context` payload — the point is "the socket is alive
+/// and speaks the protocol after exec", not what it found for `pattern`.
+fn hook_roundtrip(socket: &Path, pattern: &str, timeout: Duration) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(stream) = UnixStream::connect(socket) {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let request = json!({
+                "v": 1, "kind": "grep_augment", "session_id": "upgrade-probe",
+                "pattern": pattern, "search_path": null, "source": "grep_tool",
+            });
+            if writeln!(writer, "{request}").is_ok() {
+                let mut line = String::new();
+                if BufReader::new(stream).read_line(&mut line).is_ok() && !line.is_empty() {
+                    return serde_json::from_str(&line).unwrap();
+                }
+            }
+        }
+        assert!(Instant::now() < deadline, "hook socket never answered after upgrade: {socket:?}");
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
