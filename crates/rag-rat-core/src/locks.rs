@@ -81,6 +81,22 @@ pub fn write_lock_path(database: &Path) -> PathBuf {
     database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-write.lock")
 }
 
+/// `sun_path` budget for Unix domain sockets (108 bytes on Linux, 104 on macOS) with headroom.
+pub const MAX_SOCKET_PATH_LEN: usize = 100;
+
+/// Stable per-worktree key: sha256 of the canonicalized root (see `election_lock_path` doc
+/// comment for why canonicalize-but-not-case-fold).
+fn worktree_hash(worktree_root: &Path) -> String {
+    let canonical = worktree_root.canonicalize().unwrap_or_else(|_| worktree_root.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let mut hash = String::with_capacity(32);
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(hash, "{byte:02x}");
+    }
+    hash
+}
+
 /// Per-worktree election lock path, keyed by a hash of the **canonicalized** worktree root —
 /// `canonicalize` resolves symlink aliases (the common way one checkout is reached via two paths) to
 /// one key. We deliberately do **not** case-fold: folding would, on a case-sensitive volume,
@@ -90,14 +106,28 @@ pub fn write_lock_path(database: &Path) -> PathBuf {
 /// watchers, which the write lock makes harmless. `base_dir` is the index DB's directory (the
 /// shared location across a repo's worktrees), so all election locks sit under `<base_dir>/locks/`.
 pub fn election_lock_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
-    let canonical = worktree_root.canonicalize().unwrap_or_else(|_| worktree_root.to_path_buf());
-    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    let mut hash = String::with_capacity(32);
-    for byte in &digest[..16] {
-        use std::fmt::Write as _;
-        let _ = write!(hash, "{byte:02x}");
+    base_dir.join("locks").join(format!("{}.lock", worktree_hash(worktree_root)))
+}
+
+/// Election lock for the grep-augment hook socket: one listener per worktree, separate from the
+/// watcher election so core never calls back into the MCP crate and either process may win each.
+pub fn socket_lock_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
+    base_dir.join("locks").join(format!("{}.socket.lock", worktree_hash(worktree_root)))
+}
+
+/// Where the elected listener binds. Prefers a `sockets/` sibling of `locks/` under the shared
+/// DB dir; diverts to `$XDG_RUNTIME_DIR/rag-rat/` then the OS temp dir when the result would
+/// exceed the `sun_path` budget. Hook clients compute the same path independently, so this must
+/// stay deterministic for a given (base_dir, worktree_root) and environment.
+pub fn hook_socket_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
+    let name = format!("{}.sock", worktree_hash(worktree_root));
+    let preferred = base_dir.join("sockets").join(&name);
+    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
+        return preferred;
     }
-    base_dir.join("locks").join(format!("{hash}.lock"))
+    let runtime_base =
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    runtime_base.join("rag-rat").join(name)
 }
 
 #[cfg(test)]
@@ -146,5 +176,42 @@ mod tests {
         assert_eq!(a1, a2, "same worktree root → same lock");
         assert_ne!(a1, b, "different worktree roots → different locks");
         assert!(a1.starts_with(base.join("locks")));
+    }
+
+    #[test]
+    fn socket_lock_path_is_distinct_from_election_lock_path() {
+        let base = temp_dir();
+        let root = temp_dir();
+        let election = election_lock_path(&base, &root);
+        let socket_lock = socket_lock_path(&base, &root);
+        assert_ne!(election, socket_lock);
+        assert!(socket_lock.to_string_lossy().ends_with(".socket.lock"));
+        // Same worktree key: both live under <base>/locks/ with the same hash stem.
+        assert_eq!(election.parent(), socket_lock.parent());
+    }
+
+    #[test]
+    fn hook_socket_path_lives_under_base_sockets_dir() {
+        let base = temp_dir();
+        let root = temp_dir();
+        let socket = hook_socket_path(&base, &root);
+        assert_eq!(socket.parent().unwrap().file_name().unwrap(), "sockets");
+        assert!(socket.extension().is_some_and(|ext| ext == "sock"));
+    }
+
+    #[test]
+    fn hook_socket_path_falls_back_when_base_path_is_too_long() {
+        // sun_path is ~108 bytes; a deeply nested base dir must divert to a short runtime dir.
+        let mut long_base = temp_dir();
+        for _ in 0..12 {
+            long_base.push("very-long-directory-segment");
+        }
+        let root = temp_dir();
+        let socket = hook_socket_path(&long_base, &root);
+        assert!(
+            socket.as_os_str().len() <= MAX_SOCKET_PATH_LEN,
+            "fallback path still too long: {}",
+            socket.display()
+        );
     }
 }
