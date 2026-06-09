@@ -25,24 +25,34 @@ fn is_ours(entry: &Value) -> bool {
         .is_some_and(|hooks| hooks.iter().any(|h| h["command"] == HOOK_COMMAND))
 }
 
+/// The `hooks.PreToolUse` array, the single place both install and uninstall navigate to.
+/// With `create`, missing `hooks`/`PreToolUse` containers are inserted (install path); without
+/// it, a missing or malformed path yields `None` (uninstall/read path). Returns `None` rather
+/// than panicking whenever `hooks` or `PreToolUse` exists but is the wrong JSON type — a user's
+/// hand-edited settings.json must never crash `rag-rat hooks`.
+fn pretooluse_array_mut(settings: &mut Value, create: bool) -> Option<&mut Vec<Value>> {
+    if create {
+        if !settings.is_object() {
+            *settings = json!({});
+        }
+        let hooks = settings
+            .as_object_mut()
+            .unwrap() // safe: just ensured object above
+            .entry("hooks")
+            .or_insert_with(|| json!({}));
+        if hooks.is_object() {
+            hooks.as_object_mut().unwrap().entry("PreToolUse").or_insert_with(|| json!([]));
+        }
+    }
+    settings.get_mut("hooks").and_then(|h| h.get_mut("PreToolUse")).and_then(Value::as_array_mut)
+}
+
 /// Add missing Grep/Bash entries. Returns true when the document changed.
 ///
 /// Gracefully handles malformed pre-existing settings: if `hooks` is not an object or
 /// `hooks.PreToolUse` is not an array, leaves the document untouched and returns false.
 pub fn merge_hook_entries(settings: &mut Value) -> bool {
-    if !settings.is_object() {
-        *settings = json!({});
-    }
-    // If `hooks` already exists but is not an object, leave it untouched rather than panic.
-    let entries = settings
-        .as_object_mut()
-        .unwrap() // safe: we just ensured it's an object above
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .map(|hooks| hooks.entry("PreToolUse").or_insert_with(|| json!([])));
-    // If `hooks` was not an object or `PreToolUse` is not an array (malformed), bail safely.
-    let Some(Value::Array(entries)) = entries else { return false };
+    let Some(entries) = pretooluse_array_mut(settings, true) else { return false };
     let mut changed = false;
     for matcher in MATCHERS {
         let present = entries.iter().any(|e| e["matcher"] == *matcher && is_ours(e));
@@ -56,11 +66,7 @@ pub fn merge_hook_entries(settings: &mut Value) -> bool {
 
 /// Remove our entries; prune `PreToolUse`/`hooks` containers that end up empty.
 pub fn remove_hook_entries(settings: &mut Value) -> bool {
-    let Some(entries) = settings
-        .get_mut("hooks")
-        .and_then(|h| h.get_mut("PreToolUse"))
-        .and_then(Value::as_array_mut)
-    else {
+    let Some(entries) = pretooluse_array_mut(settings, false) else {
         return false;
     };
     let before = entries.len();
