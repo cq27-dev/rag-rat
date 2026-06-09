@@ -104,6 +104,26 @@ pub fn search_explain(
     )
 }
 
+/// BM25/FTS-only search for latency-critical callers (the grep-augment hook): bypasses
+/// `ai::embed_query`, so it can never trigger an embedding-model load. Also skips git and
+/// papertrail boosts — pure lexical + structural rank.
+pub fn search_lexical_only(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    include_generated: bool,
+) -> anyhow::Result<Vec<SearchHit>> {
+    search_with_query_embedding(
+        conn,
+        query,
+        limit,
+        include_generated,
+        None,
+        false,
+        SearchOptions { include_git: false, include_papertrail: false },
+    )
+}
+
 pub fn search_with_options(
     conn: &Connection,
     query: &str,
@@ -545,4 +565,53 @@ fn collect_rows<T>(
         out.push(row?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::index::schema;
+
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES ('src/watch.rs', 'rust', 'source', 'abc', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let chunk_id: i64 = conn
+            .query_row(
+                "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
+                                    start_line, end_line, text, text_hash)
+                 VALUES (1, 'symbol', 'watcher_main', 0, 10, 1, 20,
+                         'fn watcher_main() { /* election retry loop */ }', 'h1')
+                 RETURNING id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Populate the FTS index directly — content tables in FTS5 need an explicit INSERT
+        // on the FTS virtual table to build shadow-table entries; rebuild_fts's DELETE approach
+        // is unreliable on fresh in-memory connections.
+        conn.execute(
+            "INSERT INTO chunk_fts(rowid, text)
+             VALUES (?1, 'fn watcher_main() { /* election retry loop */ }')",
+            [chunk_id],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn search_lexical_only_returns_bm25_hits_without_embeddings() {
+        let conn = seeded_conn();
+        let hits = search_lexical_only(&conn, "election retry", 5, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/watch.rs");
+        // No model is configured in this DB; reaching here without error proves no embed path ran.
+    }
 }
