@@ -56,6 +56,8 @@ mod listener {
     const ELECTION_RETRY: Duration = Duration::from_secs(5);
     const SESSION_CAP: usize = 64;
     const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+    /// > client's 250 ms timeout; a stalled peer cannot wedge the serialized accept loop.
+    const READ_BUDGET: Duration = Duration::from_millis(500);
 
     /// The shared base dir the socket and its election lock key off: the index DB's directory
     /// (shared across a repo's worktrees), falling back to the worktree root.
@@ -105,7 +107,10 @@ mod listener {
             let Ok(listener) = UnixListener::bind(&socket) else { return };
             let mut sessions: HashMap<String, SessionState> = HashMap::new();
             loop {
-                let Ok((stream, _addr)) = listener.accept().await else { continue };
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
                 prune_sessions(&mut sessions);
                 if let Err(err) = serve_one(stream, &config, &mut sessions).await
                     && std::env::var_os("RAG_RAT_HOOK_DEBUG").is_some()
@@ -136,7 +141,12 @@ mod listener {
     ) -> anyhow::Result<()> {
         let (read, mut write) = stream.into_split();
         let mut line = String::new();
-        BufReader::new(read).read_line(&mut line).await?;
+        match tokio::time::timeout(READ_BUDGET, BufReader::new(read).read_line(&mut line)).await {
+            Err(_elapsed) => return Ok(()), // stalled peer — drop, keep loop live
+            Ok(io) => {
+                io?;
+            }, // propagate real I/O errors as before
+        }
         let reply = match serde_json::from_str::<HookRequest>(&line) {
             Ok(req) if req.v == PROTOCOL_VERSION && req.kind == "grep_augment" => {
                 let filter = {
