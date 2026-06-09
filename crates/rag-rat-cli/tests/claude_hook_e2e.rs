@@ -15,7 +15,7 @@ fn run_hook(stdin_body: &str, cwd: &std::path::Path) -> (String, std::process::E
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    child.stdin.as_mut().unwrap().write_all(stdin_body.as_bytes()).unwrap();
+    let _ = child.stdin.as_mut().unwrap().write_all(stdin_body.as_bytes());
     let out = child.wait_with_output().unwrap();
     (String::from_utf8_lossy(&out.stdout).into_owned(), out.status)
 }

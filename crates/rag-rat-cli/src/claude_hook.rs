@@ -261,6 +261,9 @@ fn ask_listener(config: &Config, session_id: &str, search: &Search) -> Option<Op
             os::unix::net::UnixStream,
         };
         let socket = socket_path(config);
+        // SOCKET_BUDGET covers both read and write. Unix-domain connect() completes into
+        // the listener's backlog immediately (no network round-trip), so no separate connect
+        // timeout is needed.
         let stream = UnixStream::connect(&socket).ok()?;
         stream.set_read_timeout(Some(SOCKET_BUDGET)).ok()?;
         stream.set_write_timeout(Some(SOCKET_BUDGET)).ok()?;
@@ -286,12 +289,10 @@ fn ask_listener(config: &Config, session_id: &str, search: &Search) -> Option<Op
     }
 }
 
-/// Mirrors `rag_rat_mcp::claude_hook::socket_path_for` without depending on the MCP crate:
-/// both derive the path from the same `locks::hook_socket_path` inputs.
+/// Single source of truth via `locks::hook_socket_path_for`; same computation as the MCP
+/// listener's `socket_path_for`, guaranteed not to diverge.
 fn socket_path(config: &Config) -> PathBuf {
-    let base_dir =
-        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
-    locks::hook_socket_path(&base_dir, &config.root)
+    locks::hook_socket_path_for(config)
 }
 
 /// Stateless direct read (no dedupe — spec: fallback path). Any error ⇒ silence.

@@ -19,6 +19,8 @@ use std::{
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 
+use crate::config::Config;
+
 /// A held exclusive file lock. Released on drop.
 #[derive(Debug)]
 pub struct FileLock {
@@ -123,6 +125,22 @@ pub fn hook_socket_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
     let runtime_base =
         std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     socket_path_with_runtime_base(base_dir, worktree_root, &runtime_base)
+}
+
+/// Single source of truth for the hook socket path given a `Config`. Shared by the MCP listener
+/// and the CLI client so the two cannot diverge.
+pub fn hook_socket_path_for(config: &Config) -> PathBuf {
+    let base =
+        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
+    hook_socket_path(&base, &config.root)
+}
+
+/// Single source of truth for the hook socket election-lock path given a `Config`. Shared by the
+/// MCP listener and the CLI client so the two cannot diverge.
+pub fn hook_socket_lock_path_for(config: &Config) -> PathBuf {
+    let base =
+        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
+    socket_lock_path(&base, &config.root)
 }
 
 /// Inner implementation: builds the candidate path cascade with an explicit `runtime_base` so the

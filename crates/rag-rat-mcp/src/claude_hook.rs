@@ -59,22 +59,12 @@ mod listener {
     /// > client's 250 ms timeout; a stalled peer cannot wedge the serialized accept loop.
     const READ_BUDGET: Duration = Duration::from_millis(500);
 
-    /// The shared base dir the socket and its election lock key off: the index DB's directory
-    /// (shared across a repo's worktrees), falling back to the worktree root.
-    fn socket_base_dir(config: &Config) -> PathBuf {
-        config
-            .database
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| config.root.clone())
-    }
-
     pub fn socket_path_for(config: &Config) -> PathBuf {
-        locks::hook_socket_path(&socket_base_dir(config), &config.root)
+        locks::hook_socket_path_for(config)
     }
 
     fn socket_lock_path_for(config: &Config) -> PathBuf {
-        locks::socket_lock_path(&socket_base_dir(config), &config.root)
+        locks::hook_socket_lock_path_for(config)
     }
 
     /// Per-session record of what was already injected. Pruned by LRU cap + TTL.
