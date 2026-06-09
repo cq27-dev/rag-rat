@@ -244,10 +244,11 @@ struct Section {
 /// `MAX_MEMORY_BODY_CHARS`, appending `…` when truncated.
 fn clamp_body(body: &str) -> String {
     let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.len() <= MAX_MEMORY_BODY_CHARS {
+    // Compare char count (not byte length) so multibyte bodies don't get `…` with nothing removed.
+    if collapsed.chars().count() <= MAX_MEMORY_BODY_CHARS {
         collapsed
     } else {
-        // Truncate at a char boundary ≤ MAX_MEMORY_BODY_CHARS.
+        // Truncate at exactly MAX_MEMORY_BODY_CHARS chars.
         let truncated: String = collapsed.chars().take(MAX_MEMORY_BODY_CHARS).collect();
         format!("{truncated}…")
     }
@@ -579,42 +580,97 @@ mod tests {
 
     #[test]
     fn render_truncation_respects_cap_no_dangling_headers_ids_match() {
+        // ── Setup ──────────────────────────────────────────────────────────────────────
+        // seeded_conn() already contains one memory ("One watcher per worktree") bound to
+        // symbol_id=1.  We add FOUR more memories, each with a body long enough to survive
+        // the 240-char clamp as a full 241-char string (body trimmed = 300 ASCII words ≈
+        // 1499 chars, collapses to 1499 chars, clamped to exactly 240 chars + `…`).
+        //
+        // Each rendered memory line is:
+        //   "- [Invariant | active] <title≈80chars> — <241-char-body>\n"
+        //   ≈ 24 + 80 + 4 + 241 + 1 = ~350 chars
+        //
+        // With four such lines:
+        //   preamble(41) + header(39) + 4×350(1400) = 1480 chars for memories alone.
+        //
+        // The symbol section header+line needs ~151 chars more → 1480+151 = 1631 > 1500.
+        // Therefore the render loop MUST drop the symbol section entirely, giving us a
+        // genuine truncation scenario.  We assert below that the candidate total exceeds
+        // the cap so the test is self-verifying.
         let conn = seeded_conn();
 
-        // Seed a memory with a ~3000-char body (under the 4000-char validation cap).
-        let long_body = "word ".repeat(600); // 3000 chars
-        assert!(long_body.len() < 4000, "precondition: under validation cap");
-        memory::create_memory(
-            &conn,
-            RepoMemoryCreate {
-                kind: "Decision".to_string(),
-                title: "Long body memory".to_string(),
-                body: long_body,
-                confidence: "medium".to_string(),
-                created_by: Some("test".to_string()),
-                source: None,
-                tags: vec![],
-                bind: RepoMemoryBindTarget {
-                    symbol_id: Some(1),
-                    logical_symbol_id: None,
-                    chunk_id: None,
-                    edge_id: None,
-                    path: None,
-                    start_line: None,
-                    end_line: None,
-                    commit_hash: None,
-                    github_owner: None,
-                    github_repo: None,
-                    github_number: None,
-                    start_logical_symbol_id: None,
-                    end_logical_symbol_id: None,
-                    edge_sequence_hash: None,
-                    path_summary: None,
-                },
-            },
-        )
-        .unwrap();
+        // Body: 300 distinct English words × ~5 chars = ~1499 chars → collapses to 1499
+        // chars → clamped to 240 chars + `…`.  All ASCII so char count == byte count.
+        let long_body: String =
+            (0u32..300).map(|i| format!("word{i:04}")).collect::<Vec<_>>().join(" ");
+        assert!(long_body.len() > MAX_MEMORY_BODY_CHARS, "body must survive clamp");
+        assert!(long_body.len() < 4000, "must not exceed validation cap");
 
+        // Titles are ~80 chars — recognizable and unique, long enough to push each rendered
+        // line to ~350 chars.
+        let titles = [
+            "Truncation memory one — extra padding words fill the title field here ok",
+            "Truncation memory two — extra padding words fill the title field here ok",
+            "Truncation memory three — extra padding words fill the title field here",
+            "Truncation memory four — extra padding words fill the title field here ok",
+        ];
+
+        let mut created_ids: Vec<String> = Vec::new();
+        for title in &titles {
+            let result = memory::create_memory(
+                &conn,
+                RepoMemoryCreate {
+                    kind: "Invariant".to_string(),
+                    title: title.to_string(),
+                    body: long_body.clone(),
+                    confidence: "high".to_string(),
+                    created_by: Some("test".to_string()),
+                    source: None,
+                    tags: vec![],
+                    bind: RepoMemoryBindTarget {
+                        symbol_id: Some(1),
+                        logical_symbol_id: None,
+                        chunk_id: None,
+                        edge_id: None,
+                        path: None,
+                        start_line: None,
+                        end_line: None,
+                        commit_hash: None,
+                        github_owner: None,
+                        github_repo: None,
+                        github_number: None,
+                        start_logical_symbol_id: None,
+                        end_logical_symbol_id: None,
+                        edge_sequence_hash: None,
+                        path_summary: None,
+                    },
+                },
+            )
+            .unwrap();
+            created_ids.push(result.memory.memory_id);
+        }
+        assert_eq!(created_ids.len(), 4, "all four memories must be created");
+
+        // ── Sanity-check: verify the cap path triggers ─────────────────────────────────
+        // A single memory render line ≈ 350 chars (conservative lower bound: 24+70+4+241+1).
+        // Four lines + preamble + mem-header = min ~1480 chars; symbol section adds ~151.
+        // Assert total candidate content exceeds MAX_CONTEXT_CHARS so truncation is forced.
+        let per_mem_line_min: usize = "- [Invariant | active] ".len()  // 24
+            + titles[0].len()                                            // ≥70
+            + " — ".len()                                                // 4
+            + MAX_MEMORY_BODY_CHARS + 1; // 241 (clamped+…)
+        let preamble_len = "rag-rat index context for this search:\n".len();
+        let mem_header_len = "**Repo memories bound to this code:**\n".len();
+        let symbol_section_min: usize = "**Known symbols matching this pattern:**\n".len() + 80; // header + short line
+        let candidate_total =
+            preamble_len + mem_header_len + 4 * per_mem_line_min + symbol_section_min;
+        assert!(
+            candidate_total > MAX_CONTEXT_CHARS,
+            "candidate_total={candidate_total} must exceed MAX_CONTEXT_CHARS={MAX_CONTEXT_CHARS} \
+             for truncation to trigger",
+        );
+
+        // ── Run compose ────────────────────────────────────────────────────────────────
         let out = compose(&conn, "watcher_main", None, &DedupeFilter::default())
             .unwrap()
             .expect("payload expected");
@@ -627,7 +683,8 @@ mod tests {
             MAX_CONTEXT_CHARS,
         );
 
-        // (b) No section header is the last line / every header is followed by at least one item.
+        // (b) No section header is the last line / every committed header is followed by
+        //     at least one item line.
         let section_headers = [
             "**Repo memories bound to this code:**",
             "**Known symbols matching this pattern:**",
@@ -644,22 +701,35 @@ mod tests {
             }
         }
 
-        // (c) Returned IDs correspond exactly to items whose titles/names appear in `context`.
-        // Check the two seeded memory titles: exactly those whose titles appear in context
-        // should have their IDs returned.
-        let watcher_in_context = out.context.contains("One watcher per worktree");
-        let long_in_context = out.context.contains("Long body memory");
-        // If a title appears in context, the count of returned IDs must be ≥ 1.
-        if watcher_in_context || long_in_context {
-            assert!(!out.memory_ids.is_empty(), "IDs must be returned for rendered memories");
+        // (c) Exact two-way correspondence for every seeded memory:
+        //     context.contains(title)  ⟺  memory_ids.contains(that_id)
+        for (title, id) in titles.iter().zip(created_ids.iter()) {
+            let in_context = out.context.contains(*title);
+            let id_present = out.memory_ids.contains(id);
+            assert_eq!(
+                in_context, id_present,
+                "mismatch for '{title}': in_context={in_context}, id_present={id_present}",
+            );
         }
-        // The long body must have been clamped — the 241st char onward must not appear.
-        // After whitespace-collapsing, "word ".repeat(600) → "word word word..." (5 chars/word
-        // including space). 240 chars fits ~48 words. Check that 60 consecutive words don't
-        // all appear (which would require an unclamped body).
+
+        // (d) Two-way correspondence for the symbol: symbol_keys non-empty ⟺
+        //     "watch::watcher_main" appears in context.
+        let sym_in_context = out.context.contains("watch::watcher_main");
+        let sym_keys_non_empty = !out.symbol_keys.is_empty();
+        assert_eq!(
+            sym_in_context, sym_keys_non_empty,
+            "symbol context/key mismatch: sym_in_context={sym_in_context}, \
+             sym_keys_non_empty={sym_keys_non_empty}",
+        );
+
+        // (e) Truncation actually occurred: at least one seeded memory title OR the symbol
+        //     must be absent from context (we have more content than the cap allows).
+        let all_titles_present = titles.iter().all(|t| out.context.contains(*t));
+        let symbol_present = out.context.contains("watch::watcher_main");
         assert!(
-            !out.context.contains(&"word ".repeat(60)),
-            "raw long body must not appear unclamped in context",
+            !all_titles_present || !symbol_present,
+            "no truncation detected: all memory titles and the symbol section all fit within \
+             MAX_CONTEXT_CHARS — increase body/title size so the cap is actually exercised",
         );
     }
 
