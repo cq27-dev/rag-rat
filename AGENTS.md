@@ -41,6 +41,10 @@ server is read-only on source — it never edits files; it writes only its own S
 If the MCP returns empty results, the self-index may be stale or pointed at the wrong root —
 `rag-rat index --discover` then `rag-rat reconcile` refreshes it.
 
+The grep-augmentation PreToolUse hook augments Claude Code's `Grep` and Bash grep/rg/ag calls with
+symbol and repo-memory context automatically; install it with `rag-rat hooks install --claude` (or
+`--global`).
+
 ## Repo orientation
 
 - Rust workspace, three crates: `rag-rat-core` (engine: indexing, tree-sitter graph, embeddings,
