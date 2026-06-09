@@ -12,6 +12,7 @@ use rag_rat_core::{
     search::lexical::SearchHit,
 };
 
+mod claude_hook;
 mod init;
 
 fn main() -> anyhow::Result<()> {
