@@ -1,6 +1,7 @@
 pub mod clusters;
 pub mod graph;
 pub mod graph_meta;
+pub mod grep_augment;
 pub mod impact;
 pub mod memory;
 pub mod repo_brief;
