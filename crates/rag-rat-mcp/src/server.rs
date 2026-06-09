@@ -465,6 +465,19 @@ pub async fn run_stdio(config: Config) -> anyhow::Result<()> {
     }
 }
 
+/// Aborts a spawned task when dropped. Used to tear down the hook listener on normal EOF
+/// shutdown so its socket + election lock release promptly (a hot-`exec` replaces the process
+/// image instead, so the task vanishes and the successor re-elects).
+#[cfg(unix)]
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+#[cfg(unix)]
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Unix `run_stdio`: serves over a [`crate::upgrade::GatedStdin`] so a `SIGUSR1` can hot-`exec`
 /// the newly installed binary in place, and resumes (skipping `initialize`) when handed off to.
 #[cfg(unix)]
@@ -505,6 +518,12 @@ async fn run_stdio_unix(config: Config) -> anyhow::Result<()> {
     let install_path = upgrade::install_path();
     let _watcher =
         rag_rat_core::watch::Watcher::spawn_with_fleet(config.clone(), install_path.clone());
+
+    // Grep-augment hook listener: one elected listener per worktree. Spawned after the `running`
+    // match so it covers both cold start and hot-upgrade resume. On normal EOF shutdown the guard
+    // aborts the task so the socket + election lock release promptly; on a hot-`exec` the process
+    // image is replaced (task vanishes) and the new process re-elects.
+    let _hook_listener = AbortOnDrop(crate::claude_hook::spawn_listener(config.clone()));
 
     // Arm the SIGUSR1 hot-upgrade handler only when an install target is configured.
     if let Some(install_path) = install_path {
