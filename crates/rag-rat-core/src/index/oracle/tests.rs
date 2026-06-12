@@ -44,7 +44,11 @@ impl Drop for TempRoot {
 
 const TOOL: OracleTool = OracleTool::RustAnalyzer;
 const VERSION: &str = "test";
-const COMMIT: &str = "";
+// Model a REAL clean git checkout: a non-empty `commit_sha`, empty `worktree_id` (the
+// `FileScope::commit` case — the dominant production shape). The earlier `"" / ""` pair only
+// occurs in a non-git temp dir, where the active-checkout predicate degenerates and silently
+// masked the #82 P0 (the AND-of-both-non-empty predicate matched zero rows on every real repo).
+const COMMIT: &str = "deadbeefcafef00d";
 const WORKTREE: &str = "";
 
 /// A test corpus written to a temp checkout + an index DB seeded to match.
@@ -602,8 +606,10 @@ fn edge_join_candidates_filters_null_range_and_scopes_by_worktree() {
     assert_eq!(candidates[0].edge_kind, "calls_name");
     assert_eq!(candidates[0].source_path, "caller.rs");
 
-    // A candidate in a different worktree is out of scope.
-    assert!(store::edge_join_candidates(&h.conn, COMMIT, "other-worktree").unwrap().is_empty());
+    // A candidate scoped to a DIFFERENT commit is out of scope. (Under clean-checkout semantics a
+    // commit-scoped file is visible from any worktree-overlay query as long as the commit matches,
+    // so the isolation that actually matters is the commit, not the overlay id.)
+    assert!(store::edge_join_candidates(&h.conn, "other-commit-sha", WORKTREE).unwrap().is_empty());
 }
 
 /// `symbol_spans_for_path` returns the file's symbols ordered by start byte, scoped to the path +
@@ -1452,7 +1458,13 @@ fn parse_utf16_astral_character_shifts_offset_by_surrogate_width() {
 // leak into (or be erased by) the active run.
 // ---------------------------------------------------------------------------
 
-const OTHER_WORKTREE: &str = "other-wt";
+// A sibling checkout sharing the same DB: a DIFFERENT commit, clean (empty worktree). Modelling the
+// sibling as a distinct commit (rather than the same commit + a second worktree id) matches the
+// real shape — two checkouts at the same HEAD is unusual, and under the active-checkout predicate a
+// same-commit worktree overlay would (correctly) *shadow* the clean row by path, which is not the
+// cross-checkout-isolation property these tests mean to assert. Commit isolation is.
+const OTHER_COMMIT: &str = "5ad1f1ce5ad1f1ce";
+const OTHER_WORKTREE: &str = "";
 
 /// Finding 1: `clear_edge_oracle_for_tool` must delete ONLY the active checkout's verdicts. With
 /// two worktrees' verdicts for the same `(tool, tool_version)` in one DB, clearing one leaves the
@@ -1464,7 +1476,7 @@ fn clear_edge_oracle_is_scoped_to_active_checkout() {
     let active_file = h.add_file("a.rs", "fn caller() { target(); }\n");
     let active_edge = h.add_edge(active_file, "target", 14, 20, "NameOnly", None);
     // Another worktree's edge (same DB) + a verdict for the SAME tool/version.
-    let other_file = h.add_file_in_scope("a.rs", COMMIT, OTHER_WORKTREE);
+    let other_file = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
     let other_edge = h.add_edge(other_file, "target", 14, 20, "NameOnly", None);
 
     let mk = |edge| EdgeOracleRow {
@@ -1521,7 +1533,7 @@ fn upgradeable_fraction_denominator_is_scoped_to_active_checkout() {
 
     // Another worktree: an unresolved NameOnly candidate carrying a callee range, NO verdict. If
     // the denominator weren't scoped, it would count → fraction 1/2.
-    let other = h.add_file_in_scope("a.rs", COMMIT, OTHER_WORKTREE);
+    let other = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
     let _ = h.add_edge(other, "v", 0, 1, "NameOnly", None);
 
     let m = super::oracle_eval_metrics(
@@ -1687,7 +1699,7 @@ fn verdict_counts_and_metrics_ignore_sibling_checkout_rows() {
 
     // Sibling checkout B (same DB, same tool/version): TWO confirms + an upgrade. If A's counts
     // leaked B's rows, A's precision would jump to 3/4 and its recall would change.
-    let b_file = h.add_file_in_scope("a.rs", COMMIT, OTHER_WORKTREE);
+    let b_file = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
     let b_conf1 = h.add_edge(b_file, "e", 0, 1, "Exact", None);
     let b_conf2 = h.add_edge(b_file, "f", 1, 2, "Exact", None);
     let b_up = h.add_edge(b_file, "g", 2, 3, "NameOnly", None);
@@ -1724,7 +1736,8 @@ fn verdict_counts_and_metrics_ignore_sibling_checkout_rows() {
     assert_eq!(status.upgraded, 0);
 
     // Sanity: checkout B's own scoped status sees its three rows, proving the rows really exist.
-    let status_b = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, OTHER_WORKTREE).unwrap();
+    let status_b =
+        super::oracle_status(&h.conn, TOOL, VERSION, OTHER_COMMIT, OTHER_WORKTREE).unwrap();
     assert_eq!(status_b.total_verdicts, 3);
     assert_eq!(status_b.confirmed, 2);
     assert_eq!(status_b.upgraded, 1);
@@ -2063,8 +2076,11 @@ fn drifted_file_sha_is_skipped_not_verdicted() {
 #[test]
 fn last_run_meta_is_scoped_to_active_worktree() {
     let h = Harness::new();
-    // A run in a SIBLING worktree (same tool/version/commit). It must not be THIS checkout's last.
-    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, OTHER_WORKTREE, "Completed", "{}")
+    // A run in a SIBLING worktree (same tool/version/commit, distinct worktree id). It must not be
+    // THIS checkout's last. `oracle_runs.worktree_id` scoping is orthogonal to the file-predicate
+    // fix, so this uses a non-empty sibling worktree id directly rather than the file-level
+    // `OTHER_*` constants.
+    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, "sibling-wt", "Completed", "{}")
         .unwrap();
 
     // This checkout has no run yet → no last run, despite the sibling's row existing.
@@ -2312,25 +2328,95 @@ fn resolved_def_drift_verdict_is_not_surfaced() {
     assert!(after.is_empty(), "a verdict whose resolved definition drifted must not surface");
 }
 
-/// Dirty/overlay (uncommitted) edges never surface `Compiler`: an edge whose file lives in a
-/// different `(commit_sha, worktree_id)` scope than the active checkout is out of the scope join,
-/// so its verdict is never returned for the active checkout. (Models the overlay edge — the
-/// compiler hasn't seen the uncommitted edit; the oracle row binds to commit-scoped rows only.)
+/// Overlay def-drift (#82 P2): when the *def* file goes dirty, the indexer inserts a
+/// worktree-scoped overlay row and leaves the old commit-scoped symbols shadowed-but-PRESENT (not
+/// deleted). A raw `EXISTS (symbols.id = resolved_symbol_id)` would still find the stale id and
+/// keep surfacing a `Compiler` verdict pointing at the pre-edit target (the CALLSITE file is
+/// untouched, so its sha still matches). The scope-aware def-drift EXISTS — which joins `symbols ->
+/// files` and applies the active-checkout predicate — must treat the shadowed commit-scoped def as
+/// out of scope, reverting the verdict to heuristic. Callsite and def are in SEPARATE files so only
+/// the def's scope changes.
+#[test]
+fn overlay_shadowed_def_verdict_is_not_surfaced() {
+    let h = Harness::new();
+    // Callsite in `caller.rs` (stays committed); def in `defs.rs` (will get an overlay).
+    // The active context for a dirty checkout carries a real worktree id (the root path) alongside
+    // the HEAD commit — `resolve_git_context` always returns the root as `worktree_id`. Both the
+    // committed (clean) caller row and the dirty overlay use that id.
+    let active_wt = "/some/checkout/root";
+    let caller = h.add_file_in_scope("caller.rs", COMMIT, "");
+    h.conn
+        .execute("UPDATE files SET sha256 = 'caller-sha' WHERE id = ?1", params![caller])
+        .unwrap();
+    let defs = h.add_file_in_scope("defs.rs", COMMIT, "");
+    let resolved = h.add_symbol(defs, "target", 3, 9);
+    let edge = h.add_edge(caller, "target", 14, 20, "NameOnly", None);
+    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
+        edge_id: edge,
+        file_sha: "caller-sha",
+        resolved_symbol_id: Some(resolved),
+        scip_symbol: "scip x `target`().",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+
+    // Sanity: with no overlay, the committed def is in scope → the verdict surfaces.
+    let before =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, active_wt, &[
+            edge,
+        ])
+        .unwrap();
+    assert!(before.contains_key(&edge), "verdict surfaces before the def file goes dirty");
+
+    // The def file goes dirty: a worktree-scoped overlay row for `defs.rs` is inserted; the
+    // committed `defs.rs` row (and its `target` symbol) stay shadowed-but-present. The active
+    // worktree id matches the overlay, so the committed def is now shadowed out of scope.
+    h.add_file_in_scope("defs.rs", "", active_wt);
+
+    let after =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, active_wt, &[
+            edge,
+        ])
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "a verdict whose resolved def is shadowed by a dirty overlay must not keep surfacing"
+    );
+}
+
+/// A verdict whose edge lives in a different checkout never surfaces for the active one: querying
+/// the seeded (clean-checkout) edge under a DIFFERENT commit is out of the active-checkout scope
+/// join, so the verdict is excluded. (Commit, not worktree id, is the isolation boundary for a
+/// commit-scoped row — a clean file is visible from any worktree-overlay query at the same commit,
+/// so a sibling-worktree query at the SAME commit would correctly still see it; the genuine
+/// out-of-scope case is a different commit.)
 #[test]
 fn out_of_scope_verdict_is_not_surfaced() {
     let (h, edge, sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", true);
-    // Query the SAME edge under a sibling worktree scope: the scope join excludes it.
+    // Query the SAME edge under a different commit's scope: the scope join excludes it.
     let verdicts = store::current_oracle_verdicts_for_edges(
         &h.conn,
         TOOL,
         VERSION,
-        COMMIT,
-        "other-worktree",
+        "a-different-commit-sha",
+        WORKTREE,
         &[edge],
     )
     .unwrap();
     assert!(verdicts.is_empty(), "a verdict outside the active checkout must not surface");
     let _ = sha;
+}
+
+/// #82 P3: the `--scip` run-id fingerprint is a stable 12-hex-char content hash, distinct for
+/// distinct bytes — so two indexes sharing a basename don't collide onto one `tool_version`.
+#[test]
+fn scip_content_fingerprint_is_stable_and_content_distinct() {
+    let a = super::scip_content_fingerprint(b"index-A-bytes");
+    let b = super::scip_content_fingerprint(b"index-B-bytes");
+    assert_eq!(a.len(), 12, "12 hex chars");
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(a, super::scip_content_fingerprint(b"index-A-bytes"), "stable for identical bytes");
+    assert_ne!(a, b, "distinct bytes → distinct fingerprint (no basename collision)");
 }
 
 /// A `resolved-external` verdict surfaces a `resolved-external(<package>)` label derived from the

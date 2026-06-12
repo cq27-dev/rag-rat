@@ -4365,7 +4365,7 @@ fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
         &symbol_b,
         10,
         &crate::query::impact::ImpactSurfaceOptions::default(),
-        |_hops| Ok(()),
+        |_hops| Ok(false),
     )
     .unwrap();
 

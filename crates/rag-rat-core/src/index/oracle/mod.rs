@@ -103,24 +103,35 @@ pub enum OracleRunOutcome {
     Blocked { tool: String, program: String, hint: String },
 }
 
-/// Invoke an oracle tool to produce a `.scip` for `checkout_root`, then run the phase-1 join over
-/// it — OR, when the tool is absent, return [`OracleRunOutcome::Blocked`] with the install hint
-/// (never an error exit). The produced index is written to `scip_output` (a caller-owned temp path)
-/// and consumed in place. `tool_version` is the probed version string (content-addressed staleness
-/// key), so a tool upgrade invalidates prior verdicts.
-pub fn run_oracle_with_tool(
-    conn: &Connection,
+/// The result of the LOCK-FREE half of a tool-driven oracle run: either the tool produced a `.scip`
+/// (carrying its probed version + the serialized bytes), or it was [`OracleRunOutcome::Blocked`].
+/// Splitting this from the join lets the CLI run the slow `rust-analyzer scip` subprocess WITHOUT
+/// the index write lock held — only the subsequent probe-recheck + join/write need to serialize
+/// against the watcher/indexer (#82 P3). The content-integrity gate in [`run_oracle`] already
+/// tolerates disk drift between this production and the join.
+pub enum ScipProduction {
+    /// The tool ran and wrote a readable `.scip`; `bytes` is its content, `version` the probed
+    /// tool version (content-addressed staleness key).
+    Produced { version: String, bytes: Vec<u8> },
+    /// The tool isn't runnable / can't produce SCIP — the `oracle run` Blocked UX.
+    Blocked { tool: String, program: String, hint: String },
+}
+
+/// Probe the tool and, if runnable, invoke `<tool> scip` to produce a `.scip` at `scip_output`,
+/// returning its bytes — the LOCK-FREE half of a tool-driven run. Takes NO DB connection, so the
+/// caller can run this before acquiring the index write lock (the rust-analyzer subprocess is the
+/// slow part and must not starve the watcher). A missing/unrunnable tool yields
+/// [`ScipProduction::Blocked`] — never an error.
+pub fn produce_scip_with_tool(
     tool: OracleTool,
     checkout_root: &Path,
     scip_output: &Path,
-    commit_sha: &str,
-    worktree_id: &str,
-) -> anyhow::Result<OracleRunOutcome> {
+) -> anyhow::Result<ScipProduction> {
     let manifest = ToolManifest::for_tool(tool);
     let version = match manifest.probe() {
         ToolAvailability::Available { version, .. } => version,
         ToolAvailability::Blocked { tool, program, hint } =>
-            return Ok(OracleRunOutcome::Blocked { tool, program, hint }),
+            return Ok(ScipProduction::Blocked { tool, program, hint }),
     };
     let mut command = manifest.scip_command(checkout_root, scip_output);
     let status = command
@@ -129,26 +140,69 @@ pub fn run_oracle_with_tool(
     if !status.success() {
         anyhow::bail!("{} scip exited with status {status}", manifest.program);
     }
-    let scip_bytes = std::fs::read(scip_output).map_err(|err| {
+    let bytes = std::fs::read(scip_output).map_err(|err| {
         anyhow::anyhow!(
             "{} produced no readable index at {}: {err}",
             manifest.program,
             scip_output.display()
         )
     })?;
-    let report =
-        run_oracle(conn, tool, &version, commit_sha, worktree_id, &scip_bytes, checkout_root)?;
-    Ok(OracleRunOutcome::Completed {
-        tool: tool.as_db_str().to_string(),
-        tool_version: version,
-        report,
-    })
+    Ok(ScipProduction::Produced { version, bytes })
+}
+
+/// Invoke an oracle tool to produce a `.scip` for `checkout_root`, then run the phase-1 join over
+/// it — OR, when the tool is absent, return [`OracleRunOutcome::Blocked`] with the install hint
+/// (never an error exit). The produced index is written to `scip_output` (a caller-owned temp path)
+/// and consumed in place. `tool_version` is the probed version string (content-addressed staleness
+/// key), so a tool upgrade invalidates prior verdicts.
+///
+/// This couples production + join under one connection (used by the public DB API + tests). The CLI
+/// `oracle run` path deliberately does NOT use this: it calls [`produce_scip_with_tool`] BEFORE the
+/// write lock, then [`run_oracle`] under the lock, so the subprocess doesn't hold the lock (#82
+/// P3).
+pub fn run_oracle_with_tool(
+    conn: &Connection,
+    tool: OracleTool,
+    checkout_root: &Path,
+    scip_output: &Path,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<OracleRunOutcome> {
+    match produce_scip_with_tool(tool, checkout_root, scip_output)? {
+        ScipProduction::Blocked { tool, program, hint } =>
+            Ok(OracleRunOutcome::Blocked { tool, program, hint }),
+        ScipProduction::Produced { version, bytes } => {
+            let report =
+                run_oracle(conn, tool, &version, commit_sha, worktree_id, &bytes, checkout_root)?;
+            Ok(OracleRunOutcome::Completed {
+                tool: tool.as_db_str().to_string(),
+                tool_version: version,
+                report,
+            })
+        },
+    }
 }
 
 /// Probe a tool's availability without running it — backs `oracle status`'s "is the tool
 /// installed?" line. A `Blocked` probe is informational, not an error.
 pub fn probe_oracle_tool(tool: OracleTool) -> ToolAvailability {
     ToolManifest::for_tool(tool).probe()
+}
+
+/// A short content fingerprint (first 12 hex chars of the SHA-256) of a pre-built `.scip`'s bytes.
+/// The `--scip` run-id keys on `scip-file:{basename}@{fingerprint}` so two DIFFERENT indexes that
+/// happen to share a basename (`index.scip` from two trees) don't collide onto one
+/// content-addressed `tool_version` — which would let a stale run's verdicts masquerade as the new
+/// fixture's (#82 P3). 12 hex chars (48 bits) is ample for a human-run fixture namespace.
+pub fn scip_content_fingerprint(scip_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(scip_bytes);
+    let mut out = String::with_capacity(12);
+    for byte in digest.iter().take(6) {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Fetch the CURRENT, in-scope oracle verdicts for a set of edge ids — the read-side join that

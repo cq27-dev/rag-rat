@@ -950,12 +950,20 @@ impl IndexDatabase {
     /// Dirty/overlay (uncommitted) edges never carry oracle verdicts (oracle rows bind to
     /// commit-scoped index rows only), so they always show heuristic — this falls out of the
     /// `(commit_sha, worktree_id)` scope with no special-casing.
+    /// Returns whether any hop was PROMOTED to the `compiler` tier — i.e. whether enrichment
+    /// changed a hop's `effective_confidence_rank`. Only an `Upgrade`/`Confirm` that became
+    /// `compiler` changes ranking; a `ResolvedExternal` sets a label but leaves the confidence
+    /// heuristic, so it does NOT count. The caller uses this to decide whether the
+    /// overfetch+re-sort is needed: with no promotion the heuristic order + the caller's
+    /// original `limit` are already correct and must be left untouched (#82 P2 — the
+    /// unconditional re-sort changed truncation membership on EVERY query, including repos with
+    /// no oracle run).
     fn enrich_hops_with_oracle(
         &self,
         hops: &mut [crate::query::graph::GraphHop],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if hops.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let tool = oracle::OracleTool::RustAnalyzer;
         let Some(tool_version) = oracle::latest_run_tool_version(
@@ -966,7 +974,7 @@ impl IndexDatabase {
         )?
         else {
             // No oracle run for this checkout — nothing to surface, all hops stay heuristic.
-            return Ok(());
+            return Ok(false);
         };
         let edge_ids = hops.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
         let verdicts = oracle::current_oracle_verdicts_for_edges(
@@ -978,8 +986,9 @@ impl IndexDatabase {
             &edge_ids,
         )?;
         if verdicts.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
+        let mut promoted_any = false;
         for hop in hops.iter_mut() {
             let Some(verdict) = verdicts.get(&hop.edge_id) else {
                 continue;
@@ -1002,6 +1011,7 @@ impl IndexDatabase {
                     hop.verified_target_symbol = true;
                     hop.confidence = "compiler".to_string();
                     hop.resolution_reason = Some(verdict.resolution_reason());
+                    promoted_any = true;
                 },
                 oracle::OracleResolutionKind::ResolvedExternal => {
                     hop.resolved_external = verdict.resolved_external_label();
@@ -1011,7 +1021,7 @@ impl IndexDatabase {
                 oracle::OracleResolutionKind::Contradict => {},
             }
         }
-        Ok(())
+        Ok(promoted_any)
     }
 
     /// Traverse, surface the `Compiler` tier, then rank-and-truncate so a compiler-upgraded edge is
@@ -1042,11 +1052,19 @@ impl IndexDatabase {
             overfetch,
             options,
         )?;
-        self.enrich_hops_with_oracle(&mut hops)?;
-        // Stable sort by effective (post-enrichment) confidence so a `compiler` upgrade rises above
-        // the heuristic `exact`/`syntactic` edges that out-ranked it in the SQL ORDER BY. Stable
-        // keeps the heuristic order within a tier.
-        hops.sort_by_key(|hop| crate::query::graph::effective_confidence_rank(&hop.confidence));
+        let promoted = self.enrich_hops_with_oracle(&mut hops)?;
+        // Only re-rank when a hop was actually PROMOTED to `compiler` (#82 P2). With no promotion
+        // the heuristic SQL order already ranks the candidates correctly, so re-sorting would only
+        // perturb truncation membership for free (it demotes `match_tier` to a within-confidence
+        // tiebreak) — including on every query in a repo with no oracle run. When nothing was
+        // promoted, keep the heuristic order and the caller's original `limit`: the overfetched set
+        // is in heuristic order, so its first `limit` rows ARE the original top-`limit`.
+        if promoted {
+            // Stable sort by effective (post-enrichment) confidence so a `compiler` upgrade rises
+            // above the heuristic `exact`/`syntactic` edges that out-ranked it in the SQL ORDER BY.
+            // Stable keeps the heuristic order (the `match_tier` primary key) within a tier.
+            hops.sort_by_key(|hop| crate::query::graph::effective_confidence_rank(&hop.confidence));
+        }
         hops.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         Ok(hops)
     }
@@ -1346,6 +1364,19 @@ impl IndexDatabase {
             &self.active_worktree_id,
         )?;
         summary.verdicts_examined = u64::try_from(comparisons.len()).unwrap_or(u64::MAX);
+        // A run exists for this checkout but produced ZERO in-scope verdicts to compare. This is
+        // NOT "the compiler agrees with the graph" — it is "the run found nothing in this
+        // checkout's scope," which is exactly the silent-no-op symptom the #82 P0 scope bug
+        // produced (the active-checkout predicate matched no file rows). Surface it so a
+        // run-but-empty result is distinguishable from a genuine all-agree.
+        if summary.verdicts_examined == 0 {
+            summary.warnings.push(
+                "oracle run exists for this checkout but examined 0 in-scope verdicts — nothing \
+                 to compare (this is run-but-empty, not compiler-agrees); re-run `rag-rat oracle \
+                 run` if you expected verdicts"
+                    .to_string(),
+            );
+        }
         for comparison in comparisons {
             if comparison.kind != oracle::OracleResolutionKind::Contradict {
                 continue;
@@ -1709,13 +1740,18 @@ fn resolved_external_label(scip_symbol: &str) -> Option<String> {
     oracle::package_of(scip_symbol).map(|package| format!("resolved-external({package})"))
 }
 
-/// Append a quantitative clause to `summary.completeness_risk` describing how much of the
-/// unresolved gap the oracle placed in an external dependency, e.g. " (2 of 7 unresolved are
+/// Append a quantitative clause to `summary.completeness_risk` describing how many of the SHOWN
+/// neighbors the oracle placed in an external dependency, e.g. " (2 shown neighbors are
 /// resolved-external: libc, tokio)". Quantitative completeness is the #69 ask: turn the qualitative
 /// risk into a count when the oracle has data. No-op when no hop carries a `resolved-external`
-/// verdict (then the risk string stays purely qualitative). The denominator is `summary.unresolved
-/// + summary.name_only + summary.ambiguous` — every low-confidence/unresolved neighbor the
-/// heuristic couldn't pin down, the population a `resolved-external` placement informs.
+/// verdict (then the risk string stays purely qualitative).
+///
+/// COUNTING SCOPE (#82 P3): `external_count` is counted over the TRUNCATED `hops` window (the
+/// neighbors actually returned), so the clause speaks of "shown neighbors" — it does NOT divide by
+/// the population-wide `summary.unresolved + name_only + ambiguous`. Mixing a shown-window
+/// numerator with a population-wide denominator produced a misleading ratio (`5 of 7` where 5
+/// counts only the displayed window and 7 the whole graph). The honest statement is the count over
+/// what was shown.
 fn annotate_completeness_with_externals(
     summary: &mut crate::query::graph::GraphTraversalSummary,
     hops: &[crate::query::graph::GraphHop],
@@ -1736,16 +1772,12 @@ fn annotate_completeness_with_externals(
     if external_count == 0 {
         return;
     }
-    let gap =
-        summary.unresolved.saturating_add(summary.name_only).saturating_add(summary.ambiguous);
-    let denominator = gap.max(external_count);
+    let neighbor_word = if external_count == 1 { "neighbor is" } else { "neighbors are" };
     let package_list = packages.into_iter().collect::<Vec<_>>().join(", ");
     let clause = if package_list.is_empty() {
-        format!(" ({external_count} of {denominator} unresolved are resolved-external)")
+        format!(" ({external_count} shown {neighbor_word} resolved-external)")
     } else {
-        format!(
-            " ({external_count} of {denominator} unresolved are resolved-external: {package_list})"
-        )
+        format!(" ({external_count} shown {neighbor_word} resolved-external: {package_list})")
     };
     summary.completeness_risk.push_str(&clause);
 }
@@ -2032,6 +2064,40 @@ mod oracle_surfacing_tests {
         assert_eq!(c.heuristic_confidence, "exact");
         assert_eq!(c.resolved_external.as_deref(), Some("resolved-external(other)"));
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #82 P0: when a run EXISTS but examined 0 in-scope verdicts, `compare_graph_to_scip` must WARN
+    /// — that is "run-but-empty" (the silent symptom of the scope bug), not "compiler agrees". Here
+    /// a run writes a verdict, then the callsite file drifts so the current-content gate
+    /// filters every verdict out → `verdicts_examined == 0` despite the run row existing.
+    #[test]
+    fn compare_warns_when_run_exists_but_no_verdicts_in_scope() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let (_edge_id, cs, ce, path) = call_edge(&db);
+        let symbol = "scip-rust crate held-mini `target`().";
+        let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((29, 35)));
+        db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+
+        // Drift the callsite file so every verdict's `file_sha` gate fails → 0 in-scope verdicts,
+        // even though the `oracle_runs` row still exists.
+        db.storage
+            .connection()
+            .execute("UPDATE main.files SET sha256 = 'drifted' WHERE path = ?1", params![path])
+            .unwrap();
+
+        let compare = db.compare_graph_to_scip().unwrap();
+        assert!(!compare.summary.no_oracle_data, "a run DOES exist for this checkout");
+        assert_eq!(compare.summary.verdicts_examined, 0, "all verdicts filtered by the drift gate");
+        assert!(
+            compare.summary.warnings.iter().any(|w| w.contains("0 in-scope verdicts")),
+            "run-but-empty must warn, not silently read as compiler-agrees: {:?}",
+            compare.summary.warnings
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2354,9 +2420,11 @@ mod oracle_surfacing_tests {
             hop(None),
         ];
         annotate_completeness_with_externals(&mut summary, &hops);
+        // The count is over the SHOWN window (2 of the passed hops), not divided by the
+        // population-wide unresolved gap (#82 P3) — the clause speaks of "shown neighbors".
         assert_eq!(
             summary.completeness_risk,
-            "medium (2 of 5 unresolved are resolved-external: libc, tokio)"
+            "medium (2 shown neighbors are resolved-external: libc, tokio)"
         );
 
         // No externals → the qualitative string is left untouched.
@@ -2388,6 +2456,138 @@ mod oracle_surfacing_tests {
         let outcome =
             db.run_oracle_with_tool(OracleTool::RustAnalyzer, &root.join("o.scip")).unwrap();
         assert!(matches!(outcome, crate::index::oracle::OracleRunOutcome::Blocked { .. }));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Run a git command in `root`, panicking on failure — used to make a real committed checkout
+    /// so `resolve_git_context` returns a non-empty `commit_sha` AND `worktree_id` (the active
+    /// context every other e2e test misses by running in a non-git temp dir).
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// #82 P2 regression: `find_callers` with NO oracle data must return the IDENTICAL membership
+    /// and order as the plain heuristic traversal. The unconditional re-sort in
+    /// `traverse_with_oracle` demoted `match_tier` to a within-confidence tiebreak and changed
+    /// truncation membership on EVERY query — including repos with no oracle run, where
+    /// enrichment is a no-op. The fix only re-sorts when a hop was actually promoted, so with
+    /// no oracle data the overfetched heuristic order + the caller's `limit` are returned
+    /// untouched.
+    #[test]
+    fn find_callers_without_oracle_matches_heuristic_order() {
+        let root = temp_root();
+        // Several callers of `target` with differing heuristic confidence, more than `limit` so
+        // truncation membership is observable.
+        let mut src = String::new();
+        for i in 0..8 {
+            src.push_str(&format!("fn caller{i}() {{ target(); }} "));
+        }
+        src.push_str("fn target() {}\n");
+        fs::write(root.join("src/lib.rs"), src).unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // No oracle run at all: enrichment early-returns false, so no re-sort fires.
+        let opts = crate::query::graph::GraphTraversalOptions {
+            include_unresolved: true,
+            ..Default::default()
+        };
+        let limit = 3;
+        let via_oracle_path = db.find_callers_with_options("target", limit, &opts).unwrap();
+
+        // The pre-oracle path: plain heuristic traversal at the SAME limit (what the oracle-aware
+        // entry point must collapse to when there's nothing to enrich).
+        let grouped = db.graph_options_with_logical_group(&opts).unwrap();
+        let heuristic = crate::query::graph::traverse_with_options(
+            db.storage.connection(),
+            "target",
+            true,
+            limit,
+            &grouped,
+        )
+        .unwrap();
+
+        let ids = |hops: &[crate::query::graph::GraphHop]| {
+            hops.iter().map(|h| h.edge_id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&via_oracle_path),
+            ids(&heuristic),
+            "with no oracle data, find_callers must match the plain heuristic membership + order"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #82 P0 regression: on a REAL committed git checkout the active context is
+    /// `(commit_sha = HEAD, worktree_id = root)` — BOTH non-empty — and the indexed files are
+    /// `FileScope::commit` rows `(HEAD, '')`. The old oracle scope predicate
+    /// `files.commit_sha = ?sha AND files.worktree_id = ?wt` matched ZERO such rows, so `oracle
+    /// run` silently wrote 0 verdicts and the `Compiler` tier never surfaced. This test commits
+    /// the checkout, runs the oracle, and asserts verdicts are written AND `trace_callees`
+    /// surfaces `compiler` — the exact case the unit harness (`commit=''`) and the non-git e2e
+    /// tests both degenerate past.
+    #[test]
+    fn oracle_surfaces_compiler_tier_on_a_real_git_checkout() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return; // no git on PATH — skip rather than fail.
+        }
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        // A real committed checkout: clean tree → files index as `FileScope::commit` (HEAD, '').
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // Sanity: the active context carries BOTH a real commit_sha and a worktree_id, and the file
+        // rows are committed-scoped (commit set, worktree empty) — the shape that broke the AND.
+        let (active_commit, active_worktree) = crate::index::resolve_git_context(&root);
+        assert!(!active_commit.is_empty(), "real checkout has a HEAD commit");
+        assert!(!active_worktree.is_empty(), "worktree id is the root path");
+        let (file_commit, file_worktree): (String, String) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT commit_sha, worktree_id FROM files WHERE path = 'src/lib.rs'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(!file_commit.is_empty() && file_worktree.is_empty(), "committed-scoped file row");
+
+        let (edge_id, callee_start, callee_end, path) = call_edge(&db);
+        let symbol = "scip-rust crate held-mini `target`().";
+        let scip = scip_with(&path, callee_start, callee_end, symbol, Some(&path), Some((29, 35)));
+
+        let report = db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+        assert!(
+            report.rows_written >= 1,
+            "verdicts must be written on a real git checkout (the #82 P0 wrote 0); got {report:?}"
+        );
+
+        let callees = db
+            .trace_callees_with_options("caller", 50, &crate::query::graph::GraphTraversalOptions {
+                include_unresolved: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let hop = callees.iter().find(|h| h.edge_id == edge_id).expect("call edge present");
+        assert_eq!(hop.confidence, "compiler", "Compiler tier must surface on a real git checkout");
+        assert_eq!(hop.resolution_reason.as_deref(), Some("scip:rust-analyzer@v-test"));
+
         let _ = fs::remove_dir_all(&root);
     }
 }

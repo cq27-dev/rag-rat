@@ -60,22 +60,40 @@ impl ToolManifest {
         }
     }
 
-    /// Probe whether the tool can run by detecting its version. Never errors: an absent or
-    /// unrunnable program yields [`ToolAvailability::Blocked`] with the install hint, so the
-    /// `oracle run` / `oracle status` UX can degrade gracefully (exit 0) instead of failing.
+    /// Probe whether the tool can run by detecting its version AND confirming it can actually
+    /// produce SCIP (it exposes the `scip` subcommand). Never errors: an absent program, an
+    /// unrunnable one, OR a binary on `PATH` that lacks the `scip` subcommand all yield
+    /// [`ToolAvailability::Blocked`] with the install hint, so the `oracle run` / `oracle status`
+    /// UX degrades gracefully (exit 0) instead of failing — or worse, invoking a `scip`-less
+    /// binary and reporting a confusing subprocess error.
+    ///
+    /// Checking only `--version` (#82 P3) would mark a stripped/wrong `rust-analyzer` build with no
+    /// `scip` subcommand as `Available`, then fail the actual run. `Blocked` must mean "can't
+    /// produce SCIP," so we exercise `<program> scip --help` too.
     pub fn probe(&self) -> ToolAvailability {
         match detect_version(self.program) {
-            Some(version) => ToolAvailability::Available {
+            Some(version) if self.supports_scip_subcommand() => ToolAvailability::Available {
                 tool: self.tool.as_db_str().to_string(),
                 program: self.program.to_string(),
                 version,
             },
-            None => ToolAvailability::Blocked {
+            _ => ToolAvailability::Blocked {
                 tool: self.tool.as_db_str().to_string(),
                 program: self.program.to_string(),
                 hint: self.install_hint.to_string(),
             },
         }
+    }
+
+    /// Whether `<program> scip --help` runs successfully — the cheap capability check that the
+    /// binary can actually emit a SCIP index (not just report a version). A non-zero exit or a
+    /// spawn failure means no `scip` subcommand, so the tool is `Blocked` for oracle purposes.
+    fn supports_scip_subcommand(&self) -> bool {
+        Command::new(self.program)
+            .arg("scip")
+            .arg("--help")
+            .output()
+            .is_ok_and(|output| output.status.success())
     }
 
     /// Build the command that produces a `.scip` index at `output` for the checkout rooted at
@@ -152,6 +170,26 @@ mod tests {
         // Proves the version-detection path returns a non-empty line for a real program.
         let version = detect_version("cargo");
         assert!(version.is_some_and(|v| v.starts_with("cargo")));
+    }
+
+    #[test]
+    fn probe_requires_the_scip_subcommand_not_just_a_version() {
+        // `cargo` is on PATH and reports a `--version`, but has no `scip` subcommand — so the
+        // capability check fails and the tool is Blocked, not Available (#82 P3: `Blocked` must
+        // mean "can't produce SCIP," not merely "absent"). We borrow `cargo` as a stand-in
+        // for a binary that exists + versions but can't emit SCIP.
+        let manifest = ToolManifest {
+            tool: OracleTool::RustAnalyzer,
+            program: "cargo",
+            languages: &["rust"],
+            install_hint: "hint",
+        };
+        assert!(detect_version("cargo").is_some(), "cargo reports a version");
+        assert!(!manifest.supports_scip_subcommand(), "cargo has no `scip` subcommand");
+        assert!(
+            !manifest.probe().is_available(),
+            "a versioned binary lacking `scip` must probe Blocked, not Available"
+        );
     }
 
     #[test]

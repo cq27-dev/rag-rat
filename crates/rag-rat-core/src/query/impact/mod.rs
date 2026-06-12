@@ -105,23 +105,31 @@ pub fn impact_surface(
     impact_surface_with_options(conn, query, limit, GraphResolutionMode::Syntactic)
 }
 
-/// Traverse one direction, oracle-enrich, re-rank by effective confidence, and truncate to `limit`
-/// — the impact-side mirror of `IndexDatabase::traverse_with_oracle` so a compiler-upgraded
-/// neighbor survives the limit here too (#82 finding 4). Overfetches via
-/// `graph::oracle_overfetch_limit`, runs `enrich` over the larger candidate set, stable-sorts by
-/// `graph::effective_confidence_rank` (so `compiler` outranks `exact`), then truncates.
+/// Traverse one direction, oracle-enrich, re-rank by effective confidence ONLY when a hop was
+/// promoted, and truncate to `limit` — the impact-side mirror of
+/// `IndexDatabase::traverse_with_oracle` so a compiler-upgraded neighbor survives the limit here
+/// too (#82 finding 4). Overfetches via `graph::oracle_overfetch_limit`, runs `enrich` over the
+/// larger candidate set, and — when `enrich` reports a promotion — stable-sorts by
+/// `graph::effective_confidence_rank` (so `compiler` outranks `exact`) before truncating.
+///
+/// `enrich` returns whether any hop was PROMOTED to `compiler`. With no promotion (no oracle run,
+/// or no in-scope verdict on these hops) the heuristic order + the caller's `limit` are already
+/// correct — re-sorting would change truncation membership on EVERY query, including repos with no
+/// oracle run (#82 P2). The overfetched set is in heuristic order, so its first `limit` rows are
+/// the original top-`limit`, identical to pre-oracle behavior.
 fn oracle_ranked_neighbors(
     conn: &Connection,
     symbol: &str,
     reverse: bool,
     limit: u32,
     graph_options: &GraphTraversalOptions,
-    enrich: &impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<()>,
+    enrich: &impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<bool>,
 ) -> anyhow::Result<Vec<GraphHop>> {
     let overfetch = graph::oracle_overfetch_limit(limit);
     let mut hops = graph::traverse_with_options(conn, symbol, reverse, overfetch, graph_options)?;
-    enrich(&mut hops)?;
-    hops.sort_by_key(|hop| graph::effective_confidence_rank(&hop.confidence));
+    if enrich(&mut hops)? {
+        hops.sort_by_key(|hop| graph::effective_confidence_rank(&hop.confidence));
+    }
     hops.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(hops)
 }
@@ -131,7 +139,7 @@ pub fn impact_surface_report_for_symbol(
     symbol: &SymbolHit,
     limit: u32,
     options: &ImpactSurfaceOptions,
-    enrich: impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<()>,
+    enrich: impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<bool>,
 ) -> anyhow::Result<ImpactSurfaceReport> {
     let graph_options = GraphTraversalOptions {
         resolution_mode: options.resolution_mode,

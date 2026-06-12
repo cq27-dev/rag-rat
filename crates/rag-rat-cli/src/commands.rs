@@ -134,19 +134,7 @@ pub(crate) fn default_eval_path(config: &Config, file_name: &str) -> PathBuf {
 
 pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
     match &args.command {
-        OracleCommand::Run(run_args) => {
-            // `oracle run` WRITES `edge_oracle` / `oracle_runs`, so it must serialize with the
-            // background watcher / `index` exactly like `maintenance` does. A concurrent indexer
-            // can delete+reinsert `edges` (cascading `edge_oracle`) between the pass loading edge
-            // ids and writing verdicts — FK failures / verdicts against a moving graph. Hold the
-            // write lock for the whole run, acquired BEFORE opening the DB so the indexer can't
-            // slip in between open and the pass. `status` is read-only — no lock.
-            let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
-                &rag_rat_core::locks::write_lock_path(&config.database),
-            )?;
-            let db = open_index(config)?;
-            oracle_run(config, &db, run_args)
-        },
+        OracleCommand::Run(run_args) => oracle_run(config, run_args),
         OracleCommand::Status(status_args) => {
             let db = open_index(config)?;
             oracle_status(&db, status_args)
@@ -154,23 +142,49 @@ pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Acquire the index write lock, open the DB, and run a CLOSURE under it. `oracle run` WRITES
+/// `edge_oracle` / `oracle_runs`, so the join/write must serialize with the background watcher /
+/// `index` — a concurrent indexer can delete+reinsert `edges` (cascading `edge_oracle`) between the
+/// pass loading edge ids and writing verdicts. The lock is acquired BEFORE opening the DB so the
+/// indexer can't slip in between open and the pass.
+///
+/// Scoped to JUST the join/write: the slow `rust-analyzer scip` subprocess runs OUTSIDE this (#82
+/// P3), so the watcher isn't starved through the whole subprocess. The content-integrity gate in
+/// the join already tolerates disk drift between `.scip` production and the join.
+fn with_oracle_write_lock<T>(
+    config: &Config,
+    body: impl FnOnce(&IndexDatabase) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
+        &rag_rat_core::locks::write_lock_path(&config.database),
+    )?;
+    let db = open_index(config)?;
+    body(&db)
+}
+
 /// `rag-rat oracle run` — either consume a pre-built `--scip` (deterministic; no tool needed) or
 /// invoke the indexer to produce a `.scip` into a temp file and run the join over it. A missing /
 /// unrunnable tool prints the install hint and exits 0 (the missing-embedding-model UX) — never an
 /// error. Prints the `OracleReport` (or the `Blocked` outcome) as JSON.
-fn oracle_run(config: &Config, db: &IndexDatabase, args: &OracleRunArgs) -> anyhow::Result<()> {
+fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
     let tool = args.tool.core();
     if let Some(scip_path) = &args.scip {
+        // Pre-built index: reading a file is fast, so this whole path runs under the lock.
         let scip_bytes = fs::read(scip_path).map_err(|err| {
             anyhow::anyhow!("failed to read SCIP index {}: {err}", scip_path.display())
         })?;
         // A pre-built index carries no detectable tool version; label the run by the source path's
-        // file name so re-running the same fixture is content-addressed stably.
+        // file name AND a content fingerprint so re-running the same fixture is content-addressed
+        // stably, while two DIFFERENT indexes that share a basename (`index.scip` from two trees)
+        // get distinct run-ids instead of colliding onto one `tool_version` (#82 P3).
         let tool_version = format!(
-            "scip-file:{}",
-            scip_path.file_name().and_then(|n| n.to_str()).unwrap_or("index.scip")
+            "scip-file:{}@{}",
+            scip_path.file_name().and_then(|n| n.to_str()).unwrap_or("index.scip"),
+            rag_rat_core::index::oracle::scip_content_fingerprint(&scip_bytes),
         );
-        let report = db.run_oracle_from_scip(tool, &tool_version, &scip_bytes)?;
+        let report = with_oracle_write_lock(config, |db| {
+            db.run_oracle_from_scip(tool, &tool_version, &scip_bytes)
+        })?;
         return print_json(&serde_json::json!({
             "outcome": "completed",
             "tool": tool.as_db_str(),
@@ -178,20 +192,41 @@ fn oracle_run(config: &Config, db: &IndexDatabase, args: &OracleRunArgs) -> anyh
             "report": report,
         }));
     }
-    // No pre-built index: invoke the tool, writing the `.scip` to a temp file the join consumes.
+
+    // No pre-built index: produce the `.scip` with the tool BEFORE acquiring the write lock, so the
+    // slow rust-analyzer subprocess doesn't hold the lock and starve the watcher (#82 P3). Only the
+    // probe-recheck + join/write below run under the lock.
     let scip_output = config
         .database
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir)
         .join(format!("rag-rat-oracle-{}.scip", std::process::id()));
-    let outcome = db.run_oracle_with_tool(tool, &scip_output);
+    let production =
+        rag_rat_core::index::oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
     let _ = fs::remove_file(&scip_output);
-    let outcome = outcome?;
-    if let rag_rat_core::index::oracle::OracleRunOutcome::Blocked { hint, .. } = &outcome {
-        eprintln!("oracle: {hint}");
+    match production? {
+        rag_rat_core::index::oracle::ScipProduction::Blocked { tool, program, hint } => {
+            eprintln!("oracle: {hint}");
+            print_json(&rag_rat_core::index::oracle::OracleRunOutcome::Blocked {
+                tool,
+                program,
+                hint,
+            })
+        },
+        rag_rat_core::index::oracle::ScipProduction::Produced { version, bytes } => {
+            // Re-probe under the lock is implicit: the content-integrity gate revalidates against
+            // current disk bytes during the join. Run only the join/write under the lock.
+            let report =
+                with_oracle_write_lock(config, |db| db.run_oracle(tool, &version, &bytes))?;
+            print_json(&serde_json::json!({
+                "outcome": "completed",
+                "tool": tool.as_db_str(),
+                "tool_version": version,
+                "report": report,
+            }))
+        },
     }
-    print_json(&outcome)
 }
 
 /// `rag-rat oracle status` — verdict counts for the latest run in this checkout, plus whether the
