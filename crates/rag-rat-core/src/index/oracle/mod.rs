@@ -27,6 +27,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::path::Path;
 
 pub(crate) use join::package_of;
@@ -43,6 +44,13 @@ pub(crate) use store::{EdgeOracleComparison, EdgeOracleVerdict};
 ///
 /// `checkout_root` is the source root whose bytes are read for per-document position-encoding
 /// conversion (the `.scip` document paths are relative to it).
+///
+/// `production_sha` is the per-document disk-hash snapshot captured when a TOOL produced this
+/// `.scip` (`None` for a pre-built `--scip`). When present it arms the scip-vs-disk content gate
+/// (#82 TOCTOU); see [`run::OracleRunInput::production_sha`].
+// The args mirror `OracleRunInput`'s fields one-to-one (this is the public thin adapter to it), so
+// a params struct would only re-wrap what callers already pass positionally.
+#[allow(clippy::too_many_arguments)]
 pub fn run_oracle(
     conn: &Connection,
     tool: OracleTool,
@@ -51,6 +59,7 @@ pub fn run_oracle(
     worktree_id: &str,
     scip_bytes: &[u8],
     checkout_root: &Path,
+    production_sha: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<OracleReport> {
     run::run(conn, &OracleRunInput {
         tool,
@@ -59,6 +68,7 @@ pub fn run_oracle(
         worktree_id,
         scip_bytes,
         checkout_root,
+        production_sha,
     })
 }
 
@@ -107,12 +117,21 @@ pub enum OracleRunOutcome {
 /// (carrying its probed version + the serialized bytes), or it was [`OracleRunOutcome::Blocked`].
 /// Splitting this from the join lets the CLI run the slow `rust-analyzer scip` subprocess WITHOUT
 /// the index write lock held — only the subsequent probe-recheck + join/write need to serialize
-/// against the watcher/indexer (#82 P3). The content-integrity gate in [`run_oracle`] already
-/// tolerates disk drift between this production and the join.
+/// against the watcher/indexer (#82 P3). The `production_sha` snapshot carried on `Produced` lets
+/// the join narrow the resulting lock-free window: a document the watcher reindexes between this
+/// production and the join is skipped (scip-vs-disk gate, #82 TOCTOU), never mis-joined. The
+/// snapshot is best-effort (taken at subprocess exit, not at rust-analyzer's own reads), so a
+/// mid-subprocess edit remains uncovered — see the `production_sha` field on `Produced` below.
 pub enum ScipProduction {
     /// The tool ran and wrote a readable `.scip`; `bytes` is its content, `version` the probed
-    /// tool version (content-addressed staleness key).
-    Produced { version: String, bytes: Vec<u8> },
+    /// tool version (content-addressed staleness key). `production_sha` is `relative_path -> hex
+    /// sha256` of each document's disk bytes read the instant the subprocess finished — the
+    /// scip-vs-disk content pin the join uses to reject a document the watcher reindexed in the
+    /// lock-free window before the join (#82 TOCTOU). It is a best-effort snapshot taken as close
+    /// to production as the API allows; a file unreadable at snapshot time is simply absent
+    /// (its candidate then fails the `Some(_) == disk` gate and is skipped, the safe
+    /// direction).
+    Produced { version: String, bytes: Vec<u8>, production_sha: HashMap<String, String> },
     /// The tool isn't runnable / can't produce SCIP — the `oracle run` Blocked UX.
     Blocked { tool: String, program: String, hint: String },
 }
@@ -147,7 +166,36 @@ pub fn produce_scip_with_tool(
             scip_output.display()
         )
     })?;
-    Ok(ScipProduction::Produced { version, bytes })
+    // Snapshot each document's disk hash NOW, the instant the subprocess finished — this is the
+    // content the `.scip` describes. The join later pins its occurrence offsets to these hashes so
+    // a file the watcher reindexes in the lock-free window before the join is skipped instead
+    // of mis-joined (#82 TOCTOU). Reading the doc list from the `.scip` (not the whole tree)
+    // keeps the snapshot to exactly the files the oracle can speak to. An unreadable file is
+    // omitted (its candidate then fails the gate and is skipped — the safe direction).
+    let production_sha = snapshot_document_disk_hashes(&bytes, checkout_root);
+    Ok(ScipProduction::Produced { version, bytes, production_sha })
+}
+
+/// Hash each `.scip` document's CURRENT disk bytes under `checkout_root`, returning `relative_path
+/// -> hex sha256`. Backs the scip-vs-disk content gate (#82 TOCTOU): the caller captures this right
+/// after the tool exits so the join can verify a document hasn't drifted since production. Hashes
+/// in the same space as `files.sha256` / the join's `disk_sha` (via [`run::hex_sha256`]) so the
+/// three compare directly. Unreadable documents (and an unparseable `.scip`, which can't have
+/// produced usable verdicts anyway) are simply absent from the map.
+fn snapshot_document_disk_hashes(
+    scip_bytes: &[u8],
+    checkout_root: &Path,
+) -> HashMap<String, String> {
+    let Ok(paths) = scip::ScipIndex::document_relative_paths(scip_bytes) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::with_capacity(paths.len());
+    for path in paths {
+        if let Ok(bytes) = std::fs::read(checkout_root.join(&path)) {
+            out.insert(path, run::hex_sha256(&bytes));
+        }
+    }
+    out
 }
 
 /// Invoke an oracle tool to produce a `.scip` for `checkout_root`, then run the phase-1 join over
@@ -171,9 +219,17 @@ pub fn run_oracle_with_tool(
     match produce_scip_with_tool(tool, checkout_root, scip_output)? {
         ScipProduction::Blocked { tool, program, hint } =>
             Ok(OracleRunOutcome::Blocked { tool, program, hint }),
-        ScipProduction::Produced { version, bytes } => {
-            let report =
-                run_oracle(conn, tool, &version, commit_sha, worktree_id, &bytes, checkout_root)?;
+        ScipProduction::Produced { version, bytes, production_sha } => {
+            let report = run_oracle(
+                conn,
+                tool,
+                &version,
+                commit_sha,
+                worktree_id,
+                &bytes,
+                checkout_root,
+                Some(&production_sha),
+            )?;
             Ok(OracleRunOutcome::Completed {
                 tool: tool.as_db_str().to_string(),
                 tool_version: version,

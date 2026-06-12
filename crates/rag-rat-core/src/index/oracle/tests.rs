@@ -275,7 +275,7 @@ fn def_inside_corpus_upgrades_unresolved_edge() {
     });
     let bytes = full.write_to_bytes().unwrap();
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, _scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::Upgrade.as_db_str());
@@ -297,7 +297,7 @@ fn def_outside_corpus_resolves_external() {
         occurrence(0, 14, 19, external, SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
@@ -371,7 +371,7 @@ fn non_ascii_identifier_resolves_under_both_encodings() {
         });
         let bytes = index.write_to_bytes().unwrap();
 
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
         let (kind, resolved, _) =
             h.verdict(edge).unwrap_or_else(|| panic!("verdict written for encoding {encoding:?}"));
@@ -396,7 +396,7 @@ fn local_symbols_are_skipped() {
         occurrence(0, 14, 20, "local 0", SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     assert!(h.verdict(edge).is_none(), "local symbol must not produce a verdict");
 }
@@ -441,7 +441,7 @@ fn exact_edge_contradiction_recorded_not_applied() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::Contradict.as_db_str());
@@ -485,7 +485,8 @@ fn exact_edge_agreement_recorded_as_confirm() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::Confirm.as_db_str());
@@ -848,7 +849,8 @@ fn run_with_empty_scip_completes_with_no_verdicts() {
     let edge = h.add_edge(caller, "target", 14, 20, "NameOnly", None);
 
     let empty = Index::default().write_to_bytes().unwrap();
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty, h.root(), None).unwrap();
 
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.no_occurrence, 1, "no document → no occurrence bucket");
@@ -880,7 +882,8 @@ fn candidate_outside_any_occurrence_counts_no_occurrence() {
         ),
     ]);
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.no_occurrence, 1);
     assert_eq!(report.rows_written, 0);
@@ -922,7 +925,8 @@ fn run_aggregates_counts_and_recall_gap() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.upgraded, 1);
     assert_eq!(report.rows_written, 1);
@@ -963,7 +967,7 @@ fn rerun_clears_stale_verdict_for_dropped_edge() {
         ..Default::default()
     });
     let bytes = index.write_to_bytes().unwrap();
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     assert_eq!(
         h.verdict(edge).map(|(k, _, _)| k).as_deref(),
         Some("upgrade"),
@@ -982,7 +986,7 @@ fn rerun_clears_stale_verdict_for_dropped_edge() {
                 SymbolRole::UnspecifiedSymbolRole as i32,
             ),
         ]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty_doc, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty_doc, h.root(), None).unwrap();
 
     assert!(h.verdict(edge).is_none(), "the dropped edge's stale verdict was cleared on rerun");
     let total: i64 =
@@ -1030,7 +1034,8 @@ fn recall_gap_counts_only_call_like_occurrences() {
         ..Default::default()
     };
     let bytes = index.write_to_bytes().unwrap();
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     // Only the one uncovered callable reference is the recall gap; the import + type ref are not.
     assert_eq!(report.oracle_only_calls, 1, "only the call-like uncovered reference counts");
@@ -1598,7 +1603,7 @@ fn recall_gap_excludes_definitions_in_unindexed_files() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root())
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None)
             .unwrap()
             .oracle_only_calls
     };
@@ -1657,7 +1662,7 @@ fn recall_gap_excludes_occurrences_in_unindexed_source_files() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root())
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None)
             .unwrap()
             .oracle_only_calls
     };
@@ -1763,7 +1768,8 @@ fn exact_in_corpus_edge_contradicted_by_external_scip_resolution() {
         occurrence(0, 14, 19, external, SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(
@@ -1811,7 +1817,8 @@ fn name_only_edge_with_external_scip_stays_resolved_external() {
         occurrence(0, 14, 19, external, SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, _, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
@@ -1859,7 +1866,8 @@ fn scip_definition_outside_indexed_corpus_resolves_external() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
     assert_eq!(resolved, None, "def maps to no indexed symbol → external");
@@ -1882,7 +1890,8 @@ fn reference_without_definition_or_package_yields_no_verdict() {
         occurrence(0, 14, 21, bare, SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     assert!(h.verdict(edge).is_none(), "no definition + no package → no verdict");
     assert_eq!(report.rows_written, 0);
     assert_eq!(report.no_occurrence, 1, "dropped into the no-actionable bucket");
@@ -1925,7 +1934,7 @@ fn recall_gap_excludes_field_const_term_reads() {
             ..Default::default()
         };
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root())
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None)
             .unwrap()
             .oracle_only_calls
     };
@@ -1979,7 +1988,8 @@ fn covered_side_ignores_references_type_confirmation() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     // BOTH edges got verdicts (both carry callee ranges and join)…
     assert!(h.verdict(call_edge).is_some(), "call edge verdicted");
     assert!(h.verdict(type_edge).is_some(), "type-ref edge verdicted");
@@ -2054,7 +2064,7 @@ fn drifted_file_sha_is_skipped_not_verdicted() {
         let _ = target_sym;
         let bytes = index.write_to_bytes().unwrap();
         let report =
-            run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+            run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
         (h.verdict(edge), report.skipped_drifted, report.rows_written)
     };
 
@@ -2067,6 +2077,132 @@ fn drifted_file_sha_is_skipped_not_verdicted() {
     assert!(verdict.is_some(), "the same candidate with a matching file_sha IS verdicted");
     assert_eq!(skipped, 0, "no drift when the sha matches");
     assert_eq!(written, 1);
+}
+
+/// #82 TOCTOU: the scip-vs-disk gate. A tool-driven run carries a per-document `production_sha`
+/// snapshot — the disk hashes captured the instant the subprocess finished. The join verdicts a
+/// candidate only when that snapshot STILL equals the disk bytes it reads; if the snapshot no
+/// longer matches (the watcher reindexed the call-site file in the lock-free window after the
+/// `.scip` was built, so index-vs-disk agrees on the NEW content while the `.scip` describes the
+/// OLD), the candidate is skipped as drifted instead of writing a spurious Compiler verdict. A
+/// document absent from the snapshot (unreadable at production) also fails the gate. The pre-built
+/// `--scip` path (`None`) keeps only the index-vs-disk gate — proven by
+/// `drifted_file_sha_is_skipped_not_verdicted`.
+#[test]
+fn stale_production_snapshot_is_skipped_not_verdicted() {
+    // What the production snapshot says about the documents a verdict depends on: the call-site
+    // file `caller.rs` and the definition file `defs.rs`.
+    enum Snapshot {
+        MatchesDisk,
+        StaleCaller,
+        MissingCaller,
+        StaleDefs,
+    }
+    // (verdict row; skipped_drifted; rows_written)
+    type Probe = (Option<(String, Option<i64>, String)>, u64, u64);
+    let build = |snapshot: Snapshot| -> Probe {
+        let h = Harness::new();
+        let caller = h.add_file("caller.rs", "fn caller() { target(); }\n");
+        let defs = h.add_file("defs.rs", "fn target() {}\n");
+        let _target_sym = h.add_symbol(defs, "target", 3, 9);
+        let edge = h.add_edge(caller, "target", 14, 20, "NameOnly", None);
+
+        let sym = "scip-rust crate v1 `target`().";
+        let mut index = Index {
+            documents: vec![Document {
+                relative_path: "caller.rs".to_string(),
+                occurrences: vec![occurrence(
+                    0,
+                    14,
+                    20,
+                    sym,
+                    SymbolRole::UnspecifiedSymbolRole as i32,
+                )],
+                position_encoding: EnumOrUnknown::new(
+                    PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        index.documents.push(Document {
+            relative_path: "defs.rs".to_string(),
+            occurrences: vec![occurrence(0, 3, 9, sym, SymbolRole::Definition as i32)],
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        });
+        let bytes = index.write_to_bytes().unwrap();
+
+        // Hash the disk bytes the way the join does, so MatchesDisk pins the actual current
+        // content.
+        let disk_hash =
+            |rel: &str| super::run::hex_sha256(&std::fs::read(h.root().join(rel)).unwrap());
+        let stale = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let mut production: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // Default: both documents match disk. Each arm then drifts exactly one (or omits it).
+        production.insert("caller.rs".to_string(), disk_hash("caller.rs"));
+        production.insert("defs.rs".to_string(), disk_hash("defs.rs"));
+        match snapshot {
+            Snapshot::MatchesDisk => {},
+            // The subprocess saw older CALL-SITE content than what's on disk at join time.
+            Snapshot::StaleCaller => {
+                production.insert("caller.rs".to_string(), stale);
+            },
+            Snapshot::MissingCaller => {
+                production.remove("caller.rs"); // unreadable at production → absent from the snapshot
+            },
+            // The call site is pristine, but the watcher reindexed the DEFINITION file in the
+            // window: the resolved-symbol byte range is converted against drifted bytes, so the
+            // verdict must be skipped even though `caller.rs` passes the call-site gate.
+            Snapshot::StaleDefs => {
+                production.insert("defs.rs".to_string(), stale);
+            },
+        }
+
+        let report = run_oracle(
+            &h.conn,
+            TOOL,
+            VERSION,
+            COMMIT,
+            WORKTREE,
+            &bytes,
+            h.root(),
+            Some(&production),
+        )
+        .unwrap();
+        (h.verdict(edge), report.skipped_drifted, report.rows_written)
+    };
+
+    let (verdict, skipped, written) = build(Snapshot::MatchesDisk);
+    assert!(verdict.is_some(), "a snapshot matching disk IS verdicted");
+    assert_eq!(skipped, 0);
+    assert_eq!(written, 1);
+
+    let (verdict, skipped, written) = build(Snapshot::StaleCaller);
+    assert!(verdict.is_none(), "a stale production snapshot must NOT be verdicted (TOCTOU)");
+    assert_eq!(skipped, 1, "the stale-snapshot candidate is tallied in skipped_drifted");
+    assert_eq!(written, 0, "nothing written from a `.scip` describing superseded content");
+
+    let (verdict, skipped, written) = build(Snapshot::MissingCaller);
+    assert!(
+        verdict.is_none(),
+        "a candidate absent from the production snapshot must NOT be verdicted"
+    );
+    assert_eq!(skipped, 1);
+    assert_eq!(written, 0);
+
+    // The def-document leg of the gate: call site pristine, definition file drifted from the
+    // snapshot → the resolved-target conversion is untrustworthy, so the verdict is skipped too.
+    let (verdict, skipped, written) = build(Snapshot::StaleDefs);
+    assert!(
+        verdict.is_none(),
+        "a verdict whose DEFINITION document drifted must NOT be verdicted (def-doc TOCTOU)"
+    );
+    assert_eq!(skipped, 1, "the stale-def candidate is tallied in skipped_drifted");
+    assert_eq!(written, 0);
 }
 
 /// Finding 3: a run recorded for ANOTHER worktree (same tool/version/commit) does NOT surface as
@@ -2141,7 +2277,7 @@ fn deleted_file_occurrences_do_not_inflate_gap() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root())
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None)
             .unwrap()
             .oracle_only_calls
     };
@@ -2151,7 +2287,7 @@ fn deleted_file_occurrences_do_not_inflate_gap() {
 }
 
 /// Finding 6a: the oracle's checkout scope is leak-proof BY CONSTRUCTION — every raw `edge_oracle`
-/// query lives in `store.rs` (which owns the scoped helpers + the `EDGE_ORACLE_SCOPE_JOIN`
+/// query lives in `store.rs` (which owns the scoped helpers + the `edge_oracle_scope_join`
 /// predicate). This source-scan test fails CI if a future unscoped `FROM edge_oracle` query is
 /// added to any other oracle module (run.rs / status.rs / join.rs / scip.rs), forcing it back
 /// through the scoped helper.
@@ -2172,7 +2308,7 @@ fn raw_edge_oracle_queries_live_only_in_store() {
         assert!(
             !text.contains("FROM edge_oracle"),
             "{name} contains a raw `FROM edge_oracle` query — route it through \
-             store::count_edge_oracle_scoped / EDGE_ORACLE_SCOPE_JOIN so it can't drop the \
+             store::count_edge_oracle_scoped / edge_oracle_scope_join so it can't drop the \
              checkout scope",
         );
     }
@@ -2264,7 +2400,7 @@ fn seed_verdict_full(
         .query_row("SELECT sha256 FROM files WHERE id = ?1", params![f], |r| r.get(0))
         .unwrap();
     // An in-corpus resolution must point at a symbol that EXISTS — the def-drift gate in
-    // `EDGE_ORACLE_CURRENT_PREDICATE` filters a dangling `resolved_symbol_id`.
+    // `edge_oracle_current_predicate` filters a dangling `resolved_symbol_id`.
     let resolved_symbol_id = in_corpus.then(|| h.add_symbol(f, "target", 3, 9));
     let edge = h.add_edge(f, "target", 14, 20, "NameOnly", None);
     store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {

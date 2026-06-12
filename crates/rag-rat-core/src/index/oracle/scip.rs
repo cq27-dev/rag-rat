@@ -74,6 +74,18 @@ impl ScipIndex {
         Self::from_index(&index, &mut read_document_source)
     }
 
+    /// The relative paths of every document in a serialized `.scip`, WITHOUT reading any source or
+    /// converting offsets. Used by `produce_scip_with_tool` to snapshot the disk content the tool
+    /// just built against (the scip-vs-disk content gate, #82 TOCTOU) — that snapshot only needs
+    /// the document list, so it skips the full [`ScipIndex::parse`]. Returns paths in document
+    /// order; a duplicate document path (SCIP shouldn't emit one) is harmless to the caller's
+    /// set/hash use.
+    pub(crate) fn document_relative_paths(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+        let index = Index::parse_from_bytes(bytes)
+            .map_err(|err| anyhow::anyhow!("failed to parse SCIP index: {err}"))?;
+        Ok(index.documents.iter().map(|document| document.relative_path.clone()).collect())
+    }
+
     /// Build the maps from an already-deserialized [`Index`] — the entry point tests use after
     /// constructing an `Index` programmatically.
     pub(crate) fn from_index(

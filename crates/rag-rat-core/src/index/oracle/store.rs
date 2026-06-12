@@ -348,7 +348,7 @@ pub(crate) fn edge_oracle_scope_join() -> String {
 
 /// Count `edge_oracle` rows for `(tool, tool_version)` **within the active checkout**, optionally
 /// filtered to a single `kind`. The one scoped count helper behind both the total and the per-kind
-/// status/metric reads — every caller routes through [`EDGE_ORACLE_SCOPE_JOIN`], so the scope can
+/// status/metric reads — every caller routes through [`edge_oracle_scope_join`], so the scope can
 /// never be re-spelled (and thus can't be forgotten) per query.
 pub(crate) fn count_edge_oracle_scoped(
     conn: &Connection,
@@ -374,7 +374,7 @@ pub(crate) fn count_edge_oracle_scoped(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
-/// The CURRENT-content predicate appended to [`EDGE_ORACLE_SCOPE_JOIN`] for any READ that surfaces
+/// The CURRENT-content predicate appended to [`edge_oracle_scope_join`] for any READ that surfaces
 /// a verdict in query output (the `Compiler` tier). A verdict is valid for display ONLY when BOTH:
 ///
 /// 1. **The callsite file is unchanged** — `edge_oracle.file_sha == files.sha256` for the edge's
@@ -429,7 +429,7 @@ pub(crate) struct EdgeOracleVerdict {
     /// heuristic edge's stale/heuristic target — and an `Upgrade` whose resolved symbol can't
     /// be surfaced (`None`) is NOT promoted to `compiler`: we won't attach the tier to a
     /// target we can't name (#82 finding 2). The def-drift gate in
-    /// `EDGE_ORACLE_CURRENT_PREDICATE` already filters a deleted/reinserted resolved symbol,
+    /// [`edge_oracle_current_predicate`] already filters a deleted/reinserted resolved symbol,
     /// so in practice this is `None` only for externals.
     pub(crate) resolved_qualified_name: Option<String>,
     pub(crate) scip_symbol: String,
@@ -459,8 +459,8 @@ impl EdgeOracleVerdict {
 
 /// Fetch the CURRENT, in-scope oracle verdicts for a set of edge ids (the read-side join that
 /// surfaces the `Compiler` tier in `trace_callees` / `find_callers` / `impact_surface`). Scoped to
-/// the active `(commit_sha, worktree_id)` via [`EDGE_ORACLE_SCOPE_JOIN`] AND gated to current
-/// content via [`EDGE_ORACLE_CURRENT_PREDICATE`], so a drifted file's verdict is never returned
+/// the active `(commit_sha, worktree_id)` via [`edge_oracle_scope_join`] AND gated to current
+/// content via [`edge_oracle_current_predicate`], so a drifted file's verdict is never returned
 /// (its edge reverts to heuristic display). Returns at most one row per edge id (PK
 /// `(edge_id, tool, tool_version)` and the single-tool scope).
 ///
@@ -486,8 +486,9 @@ pub(crate) fn current_oracle_verdicts_for_edges(
         let placeholders =
             (0..chunk.len()).map(|i| format!("?{}", i + 5)).collect::<Vec<_>>().join(", ");
         // The resolved symbol's qualified name is pulled via a correlated subquery (not a trailing
-        // JOIN) so the shared `EDGE_ORACLE_SCOPE_JOIN`/`..._CURRENT_PREDICATE` strings — which end
-        // in a WHERE — stay the single source of the scope+current predicate. A deleted/reinserted
+        // JOIN) so the shared `edge_oracle_scope_join()`/`edge_oracle_current_predicate()` strings
+        // — which end in a WHERE — stay the single source of the scope+current predicate. A
+        // deleted/reinserted
         // resolved symbol yields NULL here, so the `Upgrade` target can't be surfaced and the hop
         // is left heuristic (#82 finding 2).
         let sql = format!(
@@ -562,8 +563,8 @@ pub(crate) struct EdgeOracleComparison {
 
 /// Load every CURRENT, in-scope `edge_oracle` verdict joined to its edge's heuristic resolution —
 /// the data `compare_graph_to_scip` diffs (it keeps the `Contradict` rows). Scoped to the active
-/// `(commit_sha, worktree_id)` via [`EDGE_ORACLE_SCOPE_JOIN`] AND gated to current content via
-/// [`EDGE_ORACLE_CURRENT_PREDICATE`], so a drifted/dirty file's verdict is never reported as a
+/// `(commit_sha, worktree_id)` via [`edge_oracle_scope_join`] AND gated to current content via
+/// [`edge_oracle_current_predicate`], so a drifted/dirty file's verdict is never reported as a
 /// disagreement (it reverted to heuristic display). The heuristic target's qualified name comes
 /// from the `to_symbols` join (the `edges.to_symbol_id` the heuristic picked).
 pub(crate) fn current_oracle_comparisons(
@@ -574,7 +575,7 @@ pub(crate) fn current_oracle_comparisons(
     worktree_id: &str,
 ) -> anyhow::Result<Vec<EdgeOracleComparison>> {
     // The heuristic target's qualified name is fetched via a correlated subquery rather than a
-    // trailing LEFT JOIN, so the shared `EDGE_ORACLE_SCOPE_JOIN` string (which already ends in a
+    // trailing LEFT JOIN, so the shared `edge_oracle_scope_join` string (which already ends in a
     // WHERE) stays the single source of the scope predicate — a JOIN can't legally follow a WHERE.
     let sql = format!(
         "SELECT edge_oracle.edge_id, edge_oracle.kind, edges.edge_kind, edges.confidence, (SELECT \

@@ -149,8 +149,13 @@ pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
 /// indexer can't slip in between open and the pass.
 ///
 /// Scoped to JUST the join/write: the slow `rust-analyzer scip` subprocess runs OUTSIDE this (#82
-/// P3), so the watcher isn't starved through the whole subprocess. The content-integrity gate in
-/// the join already tolerates disk drift between `.scip` production and the join.
+/// P3), so the watcher isn't starved through the whole subprocess. The lock-free window that opens
+/// between `.scip` production and the join is narrowed by the scip-vs-disk content gate: production
+/// snapshots each document's disk hash at subprocess exit, and the join skips (never mis-joins) any
+/// candidate whose call-site OR definition document drifted from that snapshot (#82 TOCTOU). The
+/// snapshot is taken at exit, not when rust-analyzer read each file, so a mid-subprocess edit + a
+/// pre-join reindex remains best-effort — pinning the pre-spawn `files.sha256` would close that
+/// residual tail (follow-up).
 fn with_oracle_write_lock<T>(
     config: &Config,
     body: impl FnOnce(&IndexDatabase) -> anyhow::Result<T>,
@@ -214,11 +219,19 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
                 hint,
             })
         },
-        rag_rat_core::index::oracle::ScipProduction::Produced { version, bytes } => {
-            // Re-probe under the lock is implicit: the content-integrity gate revalidates against
-            // current disk bytes during the join. Run only the join/write under the lock.
-            let report =
-                with_oracle_write_lock(config, |db| db.run_oracle(tool, &version, &bytes))?;
+        rag_rat_core::index::oracle::ScipProduction::Produced {
+            version,
+            bytes,
+            production_sha,
+        } => {
+            // The join's content gate revalidates against current disk bytes under the lock, and
+            // `production_sha` (the per-document disk hashes captured the instant the subprocess
+            // finished) pins the `.scip` to the content it was built against — so a file the
+            // watcher reindexes in this lock-free window is skipped, not mis-joined
+            // (#82 TOCTOU). Run only the join/write under the lock.
+            let report = with_oracle_write_lock(config, |db| {
+                db.run_oracle(tool, &version, &bytes, Some(&production_sha))
+            })?;
             print_json(&serde_json::json!({
                 "outcome": "completed",
                 "tool": tool.as_db_str(),

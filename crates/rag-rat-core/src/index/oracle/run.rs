@@ -30,6 +30,17 @@ pub(crate) struct OracleRunInput<'a> {
     /// Checkout root: document paths in the `.scip` are joined against this to read current bytes
     /// for position-encoding conversion.
     pub(crate) checkout_root: &'a Path,
+    /// `relative_path -> hex sha256` of the disk bytes captured the instant the tool finished
+    /// producing the `.scip`, for a tool-driven run; `None` for a pre-built `--scip` (no
+    /// production moment we control). When present it adds the scip-vs-disk leg of the content
+    /// gate (#82 TOCTOU): the `.scip`'s occurrence offsets describe the bytes the subprocess saw,
+    /// so the join only trusts them for a document whose disk content is STILL that snapshot. Both
+    /// documents a verdict depends on are pinned against it — the call-site document
+    /// (pre-classify) AND the resolved symbol's definition document (post-classify) — since
+    /// the watcher reindexing EITHER in the lock-free window corrupts the join while `disk_sha
+    /// == file_sha` (both the new content) still passes the index-vs-disk gate. See
+    /// [`super::ScipProduction::Produced`].
+    pub(crate) production_sha: Option<&'a HashMap<String, String>>,
 }
 
 /// Run the oracle join over all current edge candidates and persist verdicts + a run row.
@@ -129,7 +140,23 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         // silently-wrong verdict. Skip the candidate and tally it as drifted so `eval` can
         // warn. A file with no computed hash (unreadable) already produced no occurrences,
         // so it never reaches here.
-        if disk_sha.get(&candidate.source_path).map(String::as_str) != Some(&candidate.file_sha) {
+        let disk = disk_sha.get(&candidate.source_path).map(String::as_str);
+        if disk != Some(&candidate.file_sha) {
+            report.skipped_drifted += 1;
+            continue;
+        }
+
+        // scip-vs-disk gate (#82 TOCTOU): the index-vs-disk check above only proves the EDGE and
+        // the disk agree — both could be the NEW content the watcher reindexed in the
+        // lock-free window after the tool built the `.scip` against the OLD content. For a
+        // tool-driven run we also hold the disk hash captured at production time; require
+        // it to still match disk, so the `.scip`'s occurrence offsets describe the very
+        // bytes the join reads. A drifted document is skipped (tallied as drifted), exactly
+        // like index-vs-disk drift. A pre-built `--scip` (`production_sha == None`) has no
+        // production moment to pin, so it keeps the index-vs-disk gate only.
+        if let Some(production_sha) = input.production_sha
+            && production_sha.get(&candidate.source_path).map(String::as_str) != disk
+        {
             report.skipped_drifted += 1;
             continue;
         }
@@ -148,6 +175,25 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
             report.no_occurrence += 1;
             continue;
         };
+
+        // scip-vs-disk gate, DEFINITION side (#82 TOCTOU, def-document variant). The call-site gate
+        // above only pins the document the occurrence lives in. But an in-corpus verdict also
+        // depends on the DEFINITION document: the resolved symbol comes from converting the `.scip`
+        // def occurrence's offsets against the def file's join-time disk bytes, then mapping that
+        // byte range to a current indexed symbol. If the watcher reindexed the DEF file in the
+        // lock-free window, that conversion lands on the wrong bytes and resolves the wrong symbol
+        // (a mis-targeted `Upgrade`/`Contradict`, or a false external when it maps to
+        // nothing). Pin the def document the same way — its hash is already in the
+        // production snapshot. An external symbol with no in-corpus definition entry has no
+        // def document to pin, so it's unaffected.
+        if let Some(production_sha) = input.production_sha
+            && let Some(def) = index.definitions.get(&verdict.scip_symbol)
+            && production_sha.get(&def.path).map(String::as_str)
+                != disk_sha.get(&def.path).map(String::as_str)
+        {
+            report.skipped_drifted += 1;
+            continue;
+        }
 
         // Mark EXACTLY the occurrence the verdict matched as covered (finding 4): use the range the
         // join selected (reference-preferred, full containment), not a re-derived start-only match
@@ -201,8 +247,10 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
 }
 
 /// Hex SHA-256 of a byte slice — matches `files.sha256` (computed as `hex_sha256(fs::read(file))`),
-/// so the content-integrity check compares the same hash space the indexer wrote.
-fn hex_sha256(bytes: &[u8]) -> String {
+/// so the content-integrity check compares the same hash space the indexer wrote. `pub(crate)` so
+/// the production-time snapshot in `produce_scip_with_tool` hashes disk bytes in the SAME space the
+/// join's `disk_sha` / the candidate's `file_sha` live in (the scip-vs-disk gate, #82 TOCTOU).
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {

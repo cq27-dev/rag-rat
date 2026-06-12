@@ -251,7 +251,10 @@ fn run_oracle_eval(
     let scip_bytes = fs::read(scip_path).map_err(|err| {
         anyhow::anyhow!("failed to read SCIP fixture {}: {err}", scip_path.display())
     })?;
-    let report = db.run_oracle(OracleTool::RustAnalyzer, EVAL_ORACLE_TOOL_VERSION, &scip_bytes)?;
+    // Eval consumes a pre-built fixture `.scip` (no tool subprocess), so there is no production
+    // snapshot — `None` leaves only the index-vs-disk content gate, as on the `--scip` CLI path.
+    let report =
+        db.run_oracle(OracleTool::RustAnalyzer, EVAL_ORACLE_TOOL_VERSION, &scip_bytes, None)?;
     // Both recall sides come from the run, occurrence-counted over the call population.
     let recall_calls =
         RecallCalls { covered: report.covered_calls, oracle_only: report.oracle_only_calls };

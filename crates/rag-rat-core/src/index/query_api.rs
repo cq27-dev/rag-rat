@@ -8,11 +8,15 @@ impl IndexDatabase {
     /// edge candidates, writing `edge_oracle` verdicts. The heuristic resolution on the `edges`
     /// row is never touched. Phase 1 (#68): eval-only, no CLI/MCP surface. Requires a `source_root`
     /// (the checkout whose bytes back the SCIP document position-encoding conversion).
+    /// `production_sha` is the per-document disk-hash snapshot a tool-driven run captured the
+    /// instant its `.scip` was produced (`Some`), arming the scip-vs-disk content gate (#82
+    /// TOCTOU); a pre-built `--scip` has no production moment and passes `None`.
     pub fn run_oracle(
         &self,
         tool: OracleTool,
         tool_version: &str,
         scip_bytes: &[u8],
+        production_sha: Option<&std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<OracleReport> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!(
@@ -28,6 +32,7 @@ impl IndexDatabase {
             &self.active_worktree_id,
             scip_bytes,
             &root,
+            production_sha,
         )
     }
 
@@ -102,7 +107,9 @@ impl IndexDatabase {
         tool_version: &str,
         scip_bytes: &[u8],
     ) -> anyhow::Result<oracle::OracleReport> {
-        self.run_oracle(tool, tool_version, scip_bytes)
+        // A pre-built `--scip` carries no production moment we control, so there is no per-document
+        // snapshot to pin — the scip-vs-disk gate is off and only the index-vs-disk gate applies.
+        self.run_oracle(tool, tool_version, scip_bytes, None)
     }
 
     /// Probe whether an oracle tool is installed, for `oracle status`. A `Blocked` probe is
@@ -947,9 +954,13 @@ impl IndexDatabase {
     ///   target, so promoting it would assert a resolution we don't stand behind — it stays
     ///   heuristic (`compare_graph_to_scip` is where contradictions surface).
     ///
-    /// Dirty/overlay (uncommitted) edges never carry oracle verdicts (oracle rows bind to
-    /// commit-scoped index rows only), so they always show heuristic — this falls out of the
-    /// `(commit_sha, worktree_id)` scope with no special-casing.
+    /// Verdicts bind to whichever files are the ACTIVE version of the checkout, not to
+    /// commit-scoped rows specifically: on a clean tree that's the committed `(sha,'')` rows;
+    /// on a dirty tree the worktree-dirty `('',wt)` overlay rows shadow them. The shared
+    /// active-checkout predicate (the #82 P0 fix) selects exactly one version per file, so a
+    /// verdict surfaces only for the version in play — a verdict written against a file that
+    /// has since been overlaid (or that belongs to a non-active checkout) drops out of scope
+    /// and the hop reverts to heuristic, with no special-casing.
     /// Returns whether any hop was PROMOTED to the `compiler` tier — i.e. whether enrichment
     /// changed a hop's `effective_confidence_rank`. Only an `Upgrade`/`Confirm` that became
     /// `compiler` changes ranking; a `ResolvedExternal` sets a label but leaves the confidence
@@ -1001,7 +1012,7 @@ impl IndexDatabase {
                     // moving the target would attach the compiler tier to a heuristic/absent
                     // target (#82 finding 2). If the resolved symbol can't be surfaced (it was
                     // deleted/reinserted, so its qualified name is gone — though the def-drift gate
-                    // in `EDGE_ORACLE_CURRENT_PREDICATE` already filters that case), do NOT
+                    // in `edge_oracle_current_predicate` already filters that case), do NOT
                     // promote.
                     let Some(resolved_name) = verdict.resolved_qualified_name.clone() else {
                         continue;
@@ -2338,6 +2349,7 @@ mod oracle_surfacing_tests {
             &db.active_worktree_id,
             &Index::default().write_to_bytes().unwrap(),
             &root,
+            None,
         )
         .unwrap();
         db.storage
