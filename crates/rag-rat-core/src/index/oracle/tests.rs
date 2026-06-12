@@ -107,6 +107,85 @@ impl Harness {
         self.conn.last_insert_rowid()
     }
 
+    /// Insert a symbol with an explicit qualified name + kind (the production shape is
+    /// path-qualified), returning its id. The moniker tests need the qualified name to CHANGE on a
+    /// file move so the qualified-name relocation arm can't fire.
+    fn add_symbol_qualified(
+        &self,
+        file_id: i64,
+        name: &str,
+        qualified_name: &str,
+        kind: &str,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> i64 {
+        self.conn
+            .execute(
+                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, \
+                 end_byte, start_line, end_line) VALUES (?1, 'rust', ?2, ?3, ?4, ?5, ?6, 1, 1)",
+                params![file_id, name, qualified_name, kind, start_byte as i64, end_byte as i64],
+            )
+            .unwrap();
+        self.conn.last_insert_rowid()
+    }
+
+    /// Insert a logical symbol group (explicit content-derived-style id) with one member.
+    fn add_logical_symbol(
+        &self,
+        logical_symbol_id: i64,
+        path: &str,
+        name: &str,
+        qualified_name: &str,
+        symbol_id: i64,
+    ) {
+        self.conn
+            .execute(
+                "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name, \
+                 kind, variant_count, group_reason) VALUES (?1, 'rust', ?2, ?3, ?4, 'function', \
+                 1, 'single')",
+                params![logical_symbol_id, path, name, qualified_name],
+            )
+            .unwrap();
+        self.conn
+            .execute(
+                "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, cfg_expr, \
+                 signature_hash, start_line, end_line) VALUES (?1, ?2, NULL, NULL, 1, 1)",
+                params![logical_symbol_id, symbol_id],
+            )
+            .unwrap();
+    }
+
+    /// Insert a chunk for a symbol (the memory bind/validate path reads the symbol's chunk for its
+    /// content hash and line span; a symbol row without one is not a shape the indexer produces).
+    fn add_chunk(&self, file_id: i64, symbol_path: &str, text: &str) {
+        self.conn
+            .execute(
+                "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, \
+                 start_line, end_line, text, text_hash) VALUES (?1, 'symbol', ?2, 0, ?3, 1, 1, \
+                 ?4, ?5)",
+                params![file_id, symbol_path, text.len() as i64, text, sha256_hex(text.as_bytes())],
+            )
+            .unwrap();
+    }
+
+    /// The persisted moniker row for a logical symbol, if any.
+    fn moniker(&self, logical_symbol_id: i64) -> Option<(String, String, String)> {
+        self.conn
+            .query_row(
+                "SELECT moniker, tool, tool_version FROM logical_symbol_monikers WHERE \
+                 logical_symbol_id = ?1",
+                params![logical_symbol_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .ok()
+    }
+
     /// Insert a `calls_name` edge carrying a callee identifier byte range, returning its id.
     #[allow(clippy::too_many_arguments)]
     fn add_edge(
@@ -531,7 +610,47 @@ fn migration_creates_oracle_side_tables() {
         assert!(columns.contains(&expected.to_string()), "edge_oracle missing {expected}");
     }
 
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 18);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 19);
+}
+
+/// The V019 moniker migration: the `logical_symbol_monikers` table (STRICT, NO foreign key — see
+/// the migration's invariant comment: an FK would cascade-wipe monikers on every
+/// `rebuild_logical_symbols` DELETE-all pass) plus the moniker provenance + relocation-reason
+/// columns on `repo_memory_bindings`.
+#[test]
+fn migration_creates_moniker_table_and_binding_columns() {
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'logical_symbol_monikers'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("STRICT"), "logical_symbol_monikers must be STRICT");
+    assert!(
+        !sql.to_uppercase().contains("FOREIGN KEY"),
+        "logical_symbol_monikers must NOT carry an FK to logical_symbols — the DELETE-all \
+         logical-symbol rebuild would cascade-wipe monikers on every index pass"
+    );
+
+    let columns = table_columns(&conn, "logical_symbol_monikers");
+    for expected in ["logical_symbol_id", "tool", "tool_version", "moniker", "computed_at"] {
+        assert!(
+            columns.contains(&expected.to_string()),
+            "logical_symbol_monikers missing {expected}"
+        );
+    }
+
+    let binding_columns = table_columns(&conn, "repo_memory_bindings");
+    for expected in ["moniker_tool", "moniker_tool_version", "relocation_reason"] {
+        assert!(
+            binding_columns.contains(&expected.to_string()),
+            "repo_memory_bindings missing {expected}"
+        );
+    }
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
@@ -2657,4 +2776,291 @@ fn prune_oracle_runs_drops_dead_contexts_only() {
     let remaining: i64 =
         h.conn.query_row("SELECT COUNT(*) FROM oracle_runs", [], |r| r.get(0)).unwrap();
     assert_eq!(remaining, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Moniker anchors (#70, phase 3): oracle-run moniker pass + memory relocation.
+// ---------------------------------------------------------------------------
+
+use crate::query::memory::{
+    RepoMemoryBindTarget, RepoMemoryCreate, create_memory, memory_by_id, split_active_stale,
+    validate_memories,
+};
+
+/// Build a multi-document SCIP index, serialized.
+fn scip_bytes_docs(docs: Vec<(&str, Vec<Occurrence>)>) -> Vec<u8> {
+    let documents = docs
+        .into_iter()
+        .map(|(path, occurrences)| Document {
+            relative_path: path.to_string(),
+            occurrences,
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        })
+        .collect();
+    let index = Index { documents, ..Default::default() };
+    index.write_to_bytes().unwrap()
+}
+
+const TARGET_MONIKER: &str = "rust-analyzer cargo test_crate 0.1.0 target().";
+
+/// A definition that maps to an in-corpus symbol writes that logical symbol's moniker; a
+/// definition in a document rag-rat never indexed writes nothing.
+#[test]
+fn oracle_run_writes_monikers_for_in_corpus_defs() {
+    let h = Harness::new();
+    let defs = h.add_file("defs.rs", "fn target() {}\n");
+    let sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+    h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", sym);
+    // A dependency source the `.scip` covers but rag-rat never indexed (on disk, no `files` row).
+    std::fs::write(h.root().join("dep.rs"), "fn external_fn() {}\n").unwrap();
+
+    let bytes = scip_bytes_docs(vec![
+        // `target` identifier at line 0, chars 3..9.
+        ("defs.rs", vec![occurrence(0, 3, 9, TARGET_MONIKER, SymbolRole::Definition as i32)]),
+        ("dep.rs", vec![occurrence(
+            0,
+            3,
+            14,
+            "rust-analyzer cargo dep 1.0.0 external_fn().",
+            SymbolRole::Definition as i32,
+        )]),
+    ]);
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+
+    assert_eq!(report.monikers_written, 1, "only the in-corpus def writes a moniker");
+    let (moniker, tool, tool_version) = h.moniker(1001).expect("moniker row written");
+    assert_eq!(moniker, TARGET_MONIKER);
+    assert_eq!(tool, TOOL.as_db_str());
+    assert_eq!(tool_version, VERSION);
+    let total: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM logical_symbol_monikers", [], |r| r.get(0)).unwrap();
+    assert_eq!(total, 1, "the unindexed dep def must not write a row");
+}
+
+/// A re-run is authoritative for the tool: monikers the current `.scip` no longer defines are
+/// cleared, not left stale.
+#[test]
+fn oracle_rerun_clears_prior_monikers_for_tool() {
+    let h = Harness::new();
+    let defs = h.add_file("defs.rs", "fn target() {}\n");
+    let sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+    h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", sym);
+
+    let bytes = scip_bytes_docs(vec![("defs.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        TARGET_MONIKER,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+    assert!(h.moniker(1001).is_some());
+
+    // Second run: a `.scip` with no definitions at all.
+    let empty = scip_bytes_docs(vec![("defs.rs", vec![])]);
+    run_oracle(&h.conn, TOOL, "v2", COMMIT, WORKTREE, &empty, h.root(), None).unwrap();
+    assert!(h.moniker(1001).is_none(), "authoritative clear removed the stale moniker");
+}
+
+/// Create a memory bound to the harness symbol, asserting the automatic `scip_moniker` binding.
+fn create_target_memory(h: &Harness, symbol_id: i64) -> String {
+    let created = create_memory(&h.conn, RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "target invariant".to_string(),
+        body: "target must stay reentrant".to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget { symbol_id: Some(symbol_id), ..Default::default() },
+    })
+    .unwrap();
+    assert!(!created.duplicate);
+    let moniker_binding =
+        created.memory.bindings.iter().find(|b| b.binding_kind == "scip_moniker").expect(
+            "memory on a symbol with a known moniker gets the moniker binding automatically",
+        );
+    assert_eq!(moniker_binding.binding_id, TARGET_MONIKER);
+    assert_eq!(moniker_binding.moniker_tool.as_deref(), Some(TOOL.as_db_str()));
+    assert_eq!(moniker_binding.moniker_tool_version.as_deref(), Some(VERSION));
+    created.memory.memory_id
+}
+
+/// Simulate a file move WITH a content edit: the old file/symbol/logical rows die, the new home
+/// has a different path, qualified name, AND content — so neither the qualified-name arm nor the
+/// name+content-hash arm can relocate, only the moniker can. Returns the new symbol id.
+fn move_target_with_edit(h: &Harness, old_file: i64, new_kind: &str) -> i64 {
+    h.conn.execute("DELETE FROM logical_symbol_members", []).unwrap();
+    h.conn.execute("DELETE FROM logical_symbols", []).unwrap();
+    h.conn.execute("DELETE FROM symbols", []).unwrap();
+    h.conn.execute("DELETE FROM files WHERE id = ?1", params![old_file]).unwrap();
+    std::fs::remove_file(h.root().join("defs.rs")).unwrap();
+
+    let moved = h.add_file("moved.rs", "fn target(changed: u32) {}\n");
+    let sym = h.add_symbol_qualified(moved, "target", "moved.rs::target", new_kind, 0, 26);
+    h.add_chunk(moved, "moved.rs::target", "fn target(changed: u32) {}\n");
+    h.add_logical_symbol(2002, "moved.rs", "target", "moved.rs::target", sym);
+    sym
+}
+
+/// The #70 acceptance test: a memory bound to a symbol survives a file move (with a content edit
+/// the hash fallback can't survive) via moniker relocation — `relocated`, reason `moniker-match`.
+#[test]
+fn memory_survives_file_move_via_moniker_relocation() {
+    let h = Harness::new();
+    let defs = h.add_file("defs.rs", "fn target() {}\n");
+    let sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+    h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", sym);
+    let bytes = scip_bytes_docs(vec![("defs.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        TARGET_MONIKER,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+
+    let memory_id = create_target_memory(&h, sym);
+
+    move_target_with_edit(&h, defs, "function");
+    // The next oracle run sees the same moniker defined at its new home.
+    let bytes = scip_bytes_docs(vec![("moved.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        TARGET_MONIKER,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+
+    let report = validate_memories(&h.conn).unwrap();
+    assert!(report.relocated >= 1, "expected a relocation, got {report:?}");
+
+    let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
+    let symbol_binding =
+        memory.bindings.iter().find(|b| b.binding_kind == "symbol").expect("symbol binding");
+    assert_eq!(symbol_binding.anchor_status, "relocated");
+    assert_eq!(symbol_binding.binding_id, "moved.rs::target");
+    assert_eq!(symbol_binding.path.as_deref(), Some("moved.rs"));
+    assert_eq!(symbol_binding.relocation_reason.as_deref(), Some("moniker-match"));
+    let moniker_binding =
+        memory.bindings.iter().find(|b| b.binding_kind == "scip_moniker").expect("moniker binding");
+    assert_eq!(moniker_binding.anchor_status, "relocated");
+    assert_eq!(moniker_binding.logical_symbol_id, Some(2002));
+}
+
+/// A moniker match under a DIFFERENT current tool_version is lower confidence: it relocates only
+/// when the stored `symbol_kind` corroborates the candidate.
+#[test]
+fn cross_version_moniker_match_requires_kind_corroboration() {
+    for (new_kind, expect_status) in [("function", "relocated"), ("struct", "gone")] {
+        let h = Harness::new();
+        let defs = h.add_file("defs.rs", "fn target() {}\n");
+        let sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+        h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+        h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", sym);
+        let bytes = scip_bytes_docs(vec![("defs.rs", vec![occurrence(
+            0,
+            3,
+            9,
+            TARGET_MONIKER,
+            SymbolRole::Definition as i32,
+        )])]);
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+        let memory_id = create_target_memory(&h, sym);
+
+        move_target_with_edit(&h, defs, new_kind);
+        // The re-run comes from an UPGRADED tool: same moniker, different tool_version.
+        let bytes = scip_bytes_docs(vec![("moved.rs", vec![occurrence(
+            0,
+            3,
+            9,
+            TARGET_MONIKER,
+            SymbolRole::Definition as i32,
+        )])]);
+        run_oracle(&h.conn, TOOL, "v-newer", COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+
+        validate_memories(&h.conn).unwrap();
+        let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
+        let symbol_binding =
+            memory.bindings.iter().find(|b| b.binding_kind == "symbol").expect("symbol binding");
+        assert_eq!(
+            symbol_binding.anchor_status, expect_status,
+            "cross-version match with new_kind={new_kind}"
+        );
+    }
+}
+
+/// `scip_moniker` binding statuses: `unverified` when the tool has no data at all, `gone` when
+/// current data lacks the moniker, `stale` when the moniker's row dangles (its content-derived
+/// logical id died after the symbol changed).
+#[test]
+fn moniker_binding_validation_statuses() {
+    let h = Harness::new();
+    let defs = h.add_file("defs.rs", "fn target() {}\n");
+    let sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+    h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", sym);
+    let bytes = scip_bytes_docs(vec![("defs.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        TARGET_MONIKER,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+    let memory_id = create_target_memory(&h, sym);
+
+    let moniker_status = |h: &Harness| -> String {
+        validate_memories(&h.conn).unwrap();
+        let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
+        memory
+            .bindings
+            .iter()
+            .find(|b| b.binding_kind == "scip_moniker")
+            .expect("moniker binding")
+            .anchor_status
+            .clone()
+    };
+
+    assert_eq!(moniker_status(&h), "current");
+
+    // Dangling: the symbol changed — its content-derived logical id died, the row points nowhere.
+    h.conn.execute("DELETE FROM logical_symbols WHERE id = 1001", []).unwrap();
+    assert_eq!(moniker_status(&h), "stale");
+
+    // A lagging moniker anchor must NOT demote the memory's evidence — the symbol binding is
+    // intact, and the moniker self-heals on the next oracle run.
+    let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
+    let symbol_status = memory
+        .bindings
+        .iter()
+        .find(|b| b.binding_kind == "symbol")
+        .map(|b| b.anchor_status.clone())
+        .unwrap();
+    assert_eq!(symbol_status, "current");
+    let (direct, stale) = split_active_stale(vec![memory]);
+    assert_eq!(direct.len(), 1, "stale moniker anchor must not demote the memory");
+    assert!(stale.is_empty());
+
+    // Gone: the tool has current data, but not this moniker.
+    h.conn
+        .execute(
+            "UPDATE logical_symbol_monikers SET moniker = 'rust-analyzer cargo test_crate 0.1.0 \
+             other().' WHERE logical_symbol_id = 1001",
+            [],
+        )
+        .unwrap();
+    assert_eq!(moniker_status(&h), "gone");
+
+    // Unverified: no oracle data for the tool at all.
+    h.conn.execute("DELETE FROM logical_symbol_monikers", []).unwrap();
+    assert_eq!(moniker_status(&h), "unverified");
 }

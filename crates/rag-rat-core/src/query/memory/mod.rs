@@ -1,10 +1,12 @@
 mod api;
+mod moniker;
 mod resolve;
 mod validate;
 use std::collections::BTreeSet;
 
 pub use api::memory_evidence_for_symbol;
 pub(crate) use api::*;
+pub(crate) use moniker::*;
 pub(crate) use resolve::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -67,6 +69,17 @@ pub struct RepoMemoryBinding {
     pub symbol_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature_hash: Option<String>,
+    /// SCIP moniker provenance, set on `scip_moniker`-kind bindings: the oracle tool + version
+    /// whose data supplied `binding_id` (the moniker) at bind time. A relocation match against a
+    /// different current `tool_version` is lower confidence (#70).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moniker_tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moniker_tool_version: Option<String>,
+    /// How the last validation relocated this binding (e.g. `moniker-match`), `None` when the
+    /// anchor never relocated or relocated via the default qualified-name/content paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relocation_reason: Option<String>,
     pub anchor_status: String,
     pub created_at_ms: i64,
 }

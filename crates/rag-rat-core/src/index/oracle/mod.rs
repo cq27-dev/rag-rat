@@ -149,8 +149,9 @@ pub fn produce_scip_with_tool(
     let manifest = ToolManifest::for_tool(tool);
     let version = match manifest.probe() {
         ToolAvailability::Available { version, .. } => version,
-        ToolAvailability::Blocked { tool, program, hint } =>
-            return Ok(ScipProduction::Blocked { tool, program, hint }),
+        ToolAvailability::Blocked { tool, program, hint } => {
+            return Ok(ScipProduction::Blocked { tool, program, hint });
+        },
     };
     let mut command = manifest.scip_command(checkout_root, scip_output);
     let status = command
@@ -420,6 +421,9 @@ pub struct OracleReport {
     pub no_occurrence: u64,
     /// `edge_oracle` rows written this pass.
     pub rows_written: u64,
+    /// `logical_symbol_monikers` rows written this pass — in-corpus SCIP definitions mapped to a
+    /// logical symbol (#70).
+    pub monikers_written: u64,
     pub status: String,
 }
 

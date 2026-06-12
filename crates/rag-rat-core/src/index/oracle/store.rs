@@ -176,6 +176,87 @@ pub(crate) fn indexed_paths_in_scope(
     Ok(out)
 }
 
+/// The `files.sha256` of every file indexed in the active `(commit_sha, worktree_id)` checkout,
+/// keyed by path. The moniker pass uses it as its index-vs-disk drift gate: a SCIP definition in a
+/// document whose disk bytes no longer match the indexed content was byte-converted against a
+/// coordinate space the symbol spans don't share, so its moniker must not be written. Tombstones
+/// are excluded for the same reason as [`indexed_paths_in_scope`].
+pub(crate) fn indexed_file_shas_in_scope(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT path, sha256 FROM files WHERE {scope} AND kind != 'deleted'",
+        scope = active_checkout_file_predicate("?1", "?2"),
+    ))?;
+    let rows = stmt.query_map(params![commit_sha, worktree_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (path, sha) = row?;
+        out.insert(path, sha);
+    }
+    Ok(out)
+}
+
+/// The logical symbol a member symbol belongs to, if grouped. Local copy of the
+/// `logical_symbol_members` read so the oracle layer doesn't reach into `query::memory`.
+pub(crate) fn logical_symbol_id_for_member(
+    conn: &Connection,
+    symbol_id: i64,
+) -> anyhow::Result<Option<i64>> {
+    use rusqlite::OptionalExtension as _;
+    conn.query_row(
+        "SELECT logical_symbol_id FROM logical_symbol_members WHERE symbol_id = ?1 LIMIT 1",
+        [symbol_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Delete every `logical_symbol_monikers` row for `tool`. Called at the start of a run, inside the
+/// run's transaction, so the moniker set is **authoritative** for the latest run: a symbol the
+/// current `.scip` no longer defines must not keep a stale moniker, and dangling rows (whose
+/// content-derived logical id died in a rebuild) are swept on every run. The clear is global for
+/// the tool — `logical_symbols` itself is rebuilt unscoped from all symbols, so monikers follow
+/// the same (single-checkout-in-practice) lifecycle rather than inventing a per-checkout scope the
+/// parent table doesn't have.
+pub(crate) fn clear_logical_symbol_monikers_for_tool(
+    conn: &Connection,
+    tool: OracleTool,
+) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM logical_symbol_monikers WHERE tool = ?1", [tool.as_db_str()])?;
+    Ok(())
+}
+
+/// Upsert one moniker row: this logical symbol's SCIP symbol string per `tool`, with the version
+/// that produced it. PK `(logical_symbol_id, tool)` — one moniker per logical symbol per tool;
+/// cfg-gated variants share the logical symbol, hence the moniker, by construction (#70).
+pub(crate) fn write_logical_symbol_moniker(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    logical_symbol_id: i64,
+    moniker: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "
+        INSERT INTO logical_symbol_monikers(logical_symbol_id, tool, tool_version, moniker, \
+         computed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(logical_symbol_id, tool) DO UPDATE SET
+            tool_version = excluded.tool_version,
+            moniker = excluded.moniker,
+            computed_at = excluded.computed_at
+        ",
+        params![logical_symbol_id, tool.as_db_str(), tool_version, moniker, now_ms()],
+    )?;
+    Ok(())
+}
+
 /// Delete the `edge_oracle` verdicts for a `(tool, tool_version)` scope **within the active
 /// checkout**. Called at the start of a run so the pass is **authoritative** for its tool version:
 /// an edge the prior `.scip` covered but the current one no longer yields a verdict for must NOT

@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 18;
+pub const LATEST_SCHEMA_VERSION: u32 = 19;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -80,6 +80,10 @@ const MIGRATION_018_ID: &str = "018_scip_oracle_tables";
 const MIGRATION_018_CHECKSUM: &str = "sha256:rag-rat-scip-oracle-tables-v18";
 const MIGRATION_018_DESCRIPTION: &str =
     "Add oracle_runs + edge_oracle side tables for SCIP compiler-grade edge resolution (#68)";
+const MIGRATION_019_ID: &str = "019_scip_moniker_anchors";
+const MIGRATION_019_CHECKSUM: &str = "sha256:rag-rat-scip-moniker-anchors-v19";
+const MIGRATION_019_DESCRIPTION: &str = "Add logical_symbol_monikers + moniker provenance and \
+                                         relocation reason on repo memory bindings (#70)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +172,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_017_ID, MIGRATION_017_CHECKSUM, MIGRATION_017_DESCRIPTION)?;
     apply_oracle_tables(conn)?;
     record_migration(conn, MIGRATION_018_ID, MIGRATION_018_CHECKSUM, MIGRATION_018_DESCRIPTION)?;
+    apply_scip_moniker_anchors(conn)?;
+    record_migration(conn, MIGRATION_019_ID, MIGRATION_019_CHECKSUM, MIGRATION_019_DESCRIPTION)?;
     Ok(())
 }
 

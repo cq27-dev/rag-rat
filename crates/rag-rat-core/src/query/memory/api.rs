@@ -42,6 +42,9 @@ pub(crate) fn create_memory(
         ],
     )?;
     insert_binding(conn, &id, &binding, now)?;
+    // A symbol-bound memory whose logical symbol has a known SCIP moniker gets the moniker anchor
+    // automatically (#70) — the relocation fallback the hash anchors can't provide.
+    insert_auto_moniker_binding(conn, &id, &binding, now)?;
     replace_tags(conn, &id, &request.tags)?;
     upsert_memory_fts(conn, &id)?;
     let memory = memory_by_id(conn, &id)?
@@ -453,6 +456,7 @@ pub(crate) fn rebind_memory(
     conn.execute("DELETE FROM repo_memory_call_paths WHERE memory_id = ?1", [memory_id])?;
     let now = now_ms();
     insert_binding(conn, memory_id, &binding, now)?;
+    insert_auto_moniker_binding(conn, memory_id, &binding, now)?;
     conn.execute(
         "UPDATE repo_memories SET source_text_hash = ?2, updated_at_ms = ?3 WHERE id = ?1",
         params![memory_id, binding.source_text_hash, now],
@@ -569,6 +573,10 @@ pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDocto
         JOIN repo_memories AS m ON m.id = b.memory_id
         WHERE m.status = 'active'
           AND b.anchor_status IN ('gone', 'stale')
+          -- `scip_moniker` bindings are excluded: a lagging moniker self-heals on the next
+          -- `oracle run` and is never rebind-actionable; a genuinely dead symbol surfaces via
+          -- its symbol/logical_symbol binding anyway (#70).
+          AND b.binding_kind != 'scip_moniker'
         ORDER BY b.memory_id, b.binding_kind, b.binding_id
         ",
     )?;
@@ -719,8 +727,8 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line,
                logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, github_owner,
-               github_repo, github_number, symbol_kind, signature_hash, anchor_status, \
-         created_at_ms
+               github_repo, github_number, symbol_kind, signature_hash, moniker_tool,
+               moniker_tool_version, relocation_reason, anchor_status, created_at_ms
         FROM repo_memory_bindings
         ",
     )?;
@@ -744,7 +752,8 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
             UPDATE OR IGNORE repo_memory_bindings
             SET anchor_status = ?3, logical_symbol_id = ?4, symbol_id = ?5, chunk_id = ?6,
                 edge_id = ?7, path = ?8, start_line = ?9, end_line = ?10,
-                binding_id = ?11, symbol_kind = ?12, signature_hash = ?13
+                binding_id = ?11, symbol_kind = ?12, signature_hash = ?13,
+                moniker_tool_version = ?15, relocation_reason = ?16
             WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?14
             ",
             params![
@@ -761,7 +770,9 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
                 binding.binding_id,
                 binding.symbol_kind,
                 binding.signature_hash,
-                original_binding_id
+                original_binding_id,
+                binding.moniker_tool_version,
+                binding.relocation_reason
             ],
         )?;
         // UPDATE OR IGNORE: if a sibling binding already holds the new (memory_id, kind,

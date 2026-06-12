@@ -10,6 +10,7 @@ pub(crate) fn validate_binding(
         "chunk" => validate_chunk_binding(conn, binding),
         "edge" => validate_edge_binding(conn, binding),
         "call_path" => validate_call_path_binding(conn, binding),
+        "scip_moniker" => validate_moniker_binding(conn, binding),
         "path" => validate_path_binding(conn, binding),
         "dir" => validate_dir_binding(conn, binding),
         "commit" | "github" => Ok("unverified".to_string()),
@@ -78,7 +79,7 @@ pub(crate) fn validate_logical_symbol_binding(
             return Ok("relocated".to_string());
         }
     }
-    Ok("gone".to_string())
+    relocate_via_moniker_or_gone(conn, binding)
 }
 pub(crate) fn validate_symbol_binding(
     conn: &Connection,
@@ -131,6 +132,31 @@ pub(crate) fn validate_symbol_binding(
             binding.signature_hash = m.signature_hash;
             return Ok("relocated".to_string());
         }
+    }
+    relocate_via_moniker_or_gone(conn, binding)
+}
+
+/// Last-resort relocation for a symbol/logical_symbol binding whose qualified-name and
+/// name+content-hash anchors are exhausted: re-resolve the memory's recorded SCIP moniker against
+/// current oracle data (#70). A unique live match — semantic identity, robust to content edits the
+/// hash fallback can't survive — relocates with `relocation_reason = "moniker-match"`; otherwise
+/// the binding is gone.
+fn relocate_via_moniker_or_gone(
+    conn: &Connection,
+    binding: &mut RepoMemoryBinding,
+) -> anyhow::Result<String> {
+    if let Some(m) = relocate_binding_by_moniker(conn, binding)? {
+        binding.binding_id = m.binding_id;
+        binding.symbol_id = Some(m.symbol_id);
+        binding.logical_symbol_id = m.logical_symbol_id;
+        binding.path = Some(m.path);
+        binding.chunk_id = m.chunk_id;
+        binding.start_line = m.start_line;
+        binding.end_line = m.end_line;
+        binding.symbol_kind = m.symbol_kind;
+        binding.signature_hash = m.signature_hash;
+        binding.relocation_reason = Some(MONIKER_MATCH_REASON.to_string());
+        return Ok("relocated".to_string());
     }
     Ok("gone".to_string())
 }

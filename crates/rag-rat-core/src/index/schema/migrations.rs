@@ -520,6 +520,51 @@ pub(crate) fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+pub(crate) fn apply_scip_moniker_anchors(conn: &Connection) -> rusqlite::Result<()> {
+    // SCIP moniker anchors (#70, phase 3). Greenfield table STRICT per repo convention.
+    //
+    // `logical_symbol_monikers`: the SCIP symbol string ("moniker") for a logical symbol, written
+    // by `oracle run` from the `.scip` definition map. Keyed by `logical_symbols.id`, which is a
+    // CONTENT-DERIVED stable id (language/path/name/qualified_name/kind/signature — see
+    // `LogicalSymbolKey::stable_id`), NOT a rowid.
+    //
+    // INVARIANT (load-bearing): NO foreign key to `logical_symbols`, on purpose.
+    // `rebuild_logical_symbols` runs on EVERY index pass and rebuilds the table wholesale
+    // (DELETE-all + reinsert) — an FK cascade would wipe every moniker on every reindex, defeating
+    // the relocation fallback. Because the id is content-derived, an unchanged symbol's reinserted
+    // row keeps its id and its moniker row stays valid across rebuilds with no re-run. A CHANGED
+    // symbol mints a new id and its old moniker row dangles; every read joins live
+    // `logical_symbols`, so a dangling row never resolves, and the next `oracle run`'s
+    // authoritative per-tool clear removes it.
+    //
+    // PK `(logical_symbol_id, tool)`: one moniker per logical symbol per tool — cfg-gated Rust
+    // variants share the logical symbol, hence share the moniker by construction. `tool_version`
+    // rides along so a relocation match against a binding recorded under a different version can
+    // be treated as lower confidence (#70).
+    //
+    // `repo_memory_bindings` gains the moniker provenance pair (set on `scip_moniker`-kind binding
+    // rows) and `relocation_reason` (e.g. `moniker-match`), all nullable/additive.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS logical_symbol_monikers(
+            logical_symbol_id INTEGER NOT NULL,
+            tool TEXT NOT NULL,
+            tool_version TEXT NOT NULL,
+            moniker TEXT NOT NULL,
+            computed_at INTEGER NOT NULL,
+            PRIMARY KEY(logical_symbol_id, tool)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_logical_symbol_monikers_moniker
+            ON logical_symbol_monikers(moniker, tool);
+        ",
+    )?;
+    add_column_if_missing(conn, "repo_memory_bindings", "moniker_tool", "TEXT")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "moniker_tool_version", "TEXT")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "relocation_reason", "TEXT")?;
+    Ok(())
+}
+
 pub(crate) fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
     let mut stmt = conn.prepare(
         "
@@ -565,6 +610,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_016_ID => Some(16),
             MIGRATION_017_ID => Some(17),
             MIGRATION_018_ID => Some(18),
+            MIGRATION_019_ID => Some(19),
             _ => None,
         })
         .max()
@@ -592,6 +638,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_016_ID
             | MIGRATION_017_ID
             | MIGRATION_018_ID
+            | MIGRATION_019_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -616,6 +663,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_016_ID => migration.checksum != MIGRATION_016_CHECKSUM,
         MIGRATION_017_ID => migration.checksum != MIGRATION_017_CHECKSUM,
         MIGRATION_018_ID => migration.checksum != MIGRATION_018_CHECKSUM,
+        MIGRATION_019_ID => migration.checksum != MIGRATION_019_CHECKSUM,
         _ => false,
     }
 }

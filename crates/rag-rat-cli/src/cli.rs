@@ -468,8 +468,9 @@ mod tests {
         ])
         .expect("parse");
         match cli.command {
-            Command::Memory(MemoryArgs { command: MemoryCommand::Rebind { symbol_path, .. } }) =>
-                assert_eq!(symbol_path.as_deref(), Some("src/a.rs::foo")),
+            Command::Memory(MemoryArgs { command: MemoryCommand::Rebind { symbol_path, .. } }) => {
+                assert_eq!(symbol_path.as_deref(), Some("src/a.rs::foo"))
+            },
             other => panic!("expected memory rebind, got {other:?}"),
         }
     }

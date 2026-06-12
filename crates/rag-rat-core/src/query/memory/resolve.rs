@@ -1028,6 +1028,9 @@ pub(crate) fn binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemor
         github_number: row.get("github_number")?,
         symbol_kind: row.get("symbol_kind")?,
         signature_hash: row.get("signature_hash")?,
+        moniker_tool: row.get("moniker_tool")?,
+        moniker_tool_version: row.get("moniker_tool_version")?,
+        relocation_reason: row.get("relocation_reason")?,
         anchor_status: row.get("anchor_status")?,
         created_at_ms: row.get("created_at_ms")?,
     })
@@ -1040,7 +1043,8 @@ pub(crate) fn attach_memory_children(
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line, logical_symbol_id,
                symbol_id, chunk_id, edge_id, commit_hash, github_owner, github_repo,
-               github_number, symbol_kind, signature_hash, anchor_status, created_at_ms
+               github_number, symbol_kind, signature_hash, moniker_tool, moniker_tool_version,
+               relocation_reason, anchor_status, created_at_ms
         FROM repo_memory_bindings
         WHERE memory_id = ?1
         ORDER BY binding_kind, binding_id
@@ -1095,9 +1099,14 @@ pub(crate) fn split_active_stale(memories: Vec<RepoMemory>) -> (Vec<RepoMemory>,
     let mut direct = Vec::new();
     let mut stale = Vec::new();
     for memory in memories {
+        // The auxiliary `scip_moniker` binding never demotes a memory: it is an identity anchor
+        // for relocation (#70), not a content anchor, and it naturally lags between (opt-in)
+        // oracle runs. A real problem with the anchored code shows on the primary
+        // symbol/logical_symbol binding, which still demotes.
         if memory.status == "stale"
             || memory.bindings.iter().any(|binding| {
-                matches!(binding.anchor_status.as_str(), "stale" | "gone" | "unverified")
+                binding.binding_kind != SCIP_MONIKER_BINDING_KIND
+                    && matches!(binding.anchor_status.as_str(), "stale" | "gone" | "unverified")
             })
         {
             stale.push(memory);

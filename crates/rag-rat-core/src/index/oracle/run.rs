@@ -68,6 +68,9 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         input.commit_sha,
         input.worktree_id,
     )?;
+    // Monikers are authoritative per tool the same way verdicts are per (tool, tool_version):
+    // clear, then write the current `.scip`'s definitions, all in this transaction (#70).
+    store::clear_logical_symbol_monikers_for_tool(conn, input.tool)?;
 
     // Parse the `.scip`, reading each document's current checkout bytes for encoding conversion.
     // The bytes we read here are the SAME bytes whose hash we compare against each candidate's
@@ -219,6 +222,41 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         report.rows_written += 1;
     }
     report.covered_calls = covered_call_occurrences.len() as u64;
+
+    // Moniker pass (#70 phase 3): for every SCIP definition that maps to an in-corpus symbol,
+    // record the SCIP symbol string as that logical symbol's moniker. Same drift discipline as the
+    // edge join, applied to the DEFINITION document: the def occurrence's byte range was converted
+    // against live disk bytes, so the indexed content (the symbol spans we map against) and — for
+    // a tool-driven run — the production snapshot must both still match those bytes, or the
+    // mapping landed in the wrong coordinate space and would anchor the moniker to the wrong
+    // symbol. `local N` symbols never reach here (dropped at parse).
+    let indexed_shas =
+        store::indexed_file_shas_in_scope(conn, input.commit_sha, input.worktree_id)?;
+    for (scip_symbol, def) in &index.definitions {
+        let disk = disk_sha.get(&def.path).map(String::as_str);
+        if disk.is_none() || indexed_shas.get(&def.path).map(String::as_str) != disk {
+            continue;
+        }
+        if let Some(production_sha) = input.production_sha
+            && production_sha.get(&def.path).map(String::as_str) != disk
+        {
+            continue;
+        }
+        let Some(symbol_id) = resolve_symbol(&def.path, def.start_byte, def.end_byte) else {
+            continue;
+        };
+        let Some(logical_symbol_id) = store::logical_symbol_id_for_member(conn, symbol_id)? else {
+            continue;
+        };
+        store::write_logical_symbol_moniker(
+            conn,
+            input.tool,
+            input.tool_version,
+            logical_symbol_id,
+            scip_symbol,
+        )?;
+        report.monikers_written += 1;
+    }
 
     // Recall gap: in-corpus *reference* occurrences whose symbol resolves inside the corpus but
     // that no edge candidate covered — calls the heuristic never emitted. Two scope filters, both
