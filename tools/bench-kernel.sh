@@ -120,6 +120,9 @@ db, seconds = sys.argv[1], float(sys.argv[2])
 maxrss_kb, sampled_peak_kb = int(sys.argv[3]), int(sys.argv[4])
 out, tag, taxonomy_csv = sys.argv[5], sys.argv[6], sys.argv[7]
 conn = sqlite3.connect(db)
+# Checkpoint the WAL into the main file first so db_size measures the real durable footprint.
+conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+db_size = os.path.getsize(db)
 count = lambda table: conn.execute(f"select count(*) from {table}").fetchone()[0]
 files, symbols, edges, chunks = count("files"), count("symbols"), count("edges"), count("chunks")
 resolved = conn.execute("select count(*) from edges where to_symbol_id is not null").fetchone()[0]
@@ -153,6 +156,9 @@ bmf = {
         "edges": {"value": edges},
         "resolved_edges": {"value": resolved},
         "chunks": {"value": chunks},
+        # On-disk index size, bytes (post-checkpoint) — the #79 interning headline at kernel
+        # scale; tracked so size regressions surface alongside latency/memory.
+        "db_size": {"value": db_size},
     }
 }
 with open(out, "w") as f:
@@ -162,7 +168,7 @@ taxonomy = " ".join(f"{kind}={n}" for kind, n in unresolved_by_kind)
 print(
     f"bench-kernel: indexed {files} files of Linux {tag} in {seconds:.1f}s "
     f"({files/seconds:.1f} files/s, wave={wave}) — peak {maxrss_kb/1024:.0f} MiB maxrss "
-    f"(sampled {sampled_peak_kb/1024:.0f} MiB) — "
+    f"(sampled {sampled_peak_kb/1024:.0f} MiB) — db {db_size/1024/1024:.0f} MiB — "
     f"{symbols} symbols, {edges} edges ({resolved} resolved, {resolved_pct:.1f}%), {chunks} chunks → {out}",
     file=sys.stderr,
 )
