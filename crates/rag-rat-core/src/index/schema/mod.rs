@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 19;
+pub const LATEST_SCHEMA_VERSION: u32 = 20;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -84,6 +84,10 @@ const MIGRATION_019_ID: &str = "019_scip_moniker_anchors";
 const MIGRATION_019_CHECKSUM: &str = "sha256:rag-rat-scip-moniker-anchors-v19";
 const MIGRATION_019_DESCRIPTION: &str = "Add logical_symbol_monikers + moniker provenance and \
                                          relocation reason on repo memory bindings (#70)";
+const MIGRATION_020_ID: &str = "020_edge_string_interning";
+const MIGRATION_020_CHECKSUM: &str = "sha256:rag-rat-edge-string-interning-v20";
+const MIGRATION_020_DESCRIPTION: &str = "Normalize repeated edge strings into the edge_strings \
+                                         dictionary behind the edges compatibility view (#79)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -174,6 +178,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_018_ID, MIGRATION_018_CHECKSUM, MIGRATION_018_DESCRIPTION)?;
     apply_scip_moniker_anchors(conn)?;
     record_migration(conn, MIGRATION_019_ID, MIGRATION_019_CHECKSUM, MIGRATION_019_DESCRIPTION)?;
+    apply_edge_string_interning(conn)?;
+    record_migration(conn, MIGRATION_020_ID, MIGRATION_020_CHECKSUM, MIGRATION_020_DESCRIPTION)?;
     Ok(())
 }
 

@@ -92,33 +92,49 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS edges(
+        -- Interned strings for the graph (#79): edge rows repeat the same names/paths/snippets
+        -- relentlessly (the kernel graph is 11.2M edges), so the high-repeat TEXT columns live
+        -- here once and `edges_data` stores integer ids. Deliberately NO foreign keys from
+        -- `edges_data` into this table — gc prunes orphaned values, and an FK would force
+        -- dictionary-before-edges delete ordering for no integrity gain.
+        CREATE TABLE IF NOT EXISTS edge_strings(
+            id INTEGER PRIMARY KEY,
+            value TEXT NOT NULL UNIQUE
+        ) STRICT;
+
+        -- The REAL edge rows (#79). Readers go through the compatibility VIEW `edges` (created by
+        -- `ensure_edges_view` — it reconstructs the historical TEXT columns), so the query surface
+        -- is unchanged; the hot write paths target this table directly with interned ids.
+        -- Callee byte range: the SCIP occurrence key (#67); NULL for non-call / file-level edges
+        -- (source_*_byte covers the whole call_expression, callee_* the identifier token).
+        CREATE TABLE IF NOT EXISTS edges_data(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_file_id INTEGER,
             from_symbol_id INTEGER,
             to_symbol_id INTEGER,
-            from_name TEXT,
-            to_name TEXT NOT NULL,
+            from_name_id INTEGER,
+            to_name_id INTEGER NOT NULL,
             source_start_line INTEGER NOT NULL DEFAULT 0,
             source_end_line INTEGER NOT NULL DEFAULT 0,
             source_start_byte INTEGER NOT NULL DEFAULT 0,
             source_end_byte INTEGER NOT NULL DEFAULT 0,
             target_start_line INTEGER,
             target_end_line INTEGER,
-            target_qualified_name TEXT,
+            target_qualified_name_id INTEGER,
+            -- `evidence` stays INLINE: ~40% of its values are distinct, so interning costs more
+            -- (dictionary row + UNIQUE-index entry per value) than the dedup saves. It is also
+            -- the lazy-materialization candidate (#79 step 3), which wants the raw text local.
             evidence TEXT,
-            receiver_hint TEXT,
-            resolution TEXT NOT NULL DEFAULT 'unresolved',
-            -- Callee identifier byte range (the SCIP occurrence key, #67); NULL for non-call /
-            -- file-level edges. source_*_byte covers the whole call_expression, these the token.
+            receiver_hint_id INTEGER,
+            resolution_id INTEGER NOT NULL,
             callee_start_byte INTEGER,
             callee_end_byte INTEGER,
-            edge_kind TEXT NOT NULL,
-            confidence TEXT NOT NULL,
+            edge_kind_id INTEGER NOT NULL,
+            confidence_id INTEGER NOT NULL,
             FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE,
             FOREIGN KEY(from_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL,
             FOREIGN KEY(to_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
-        );
+        ) STRICT;
 
         CREATE TABLE IF NOT EXISTS docs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -449,8 +465,6 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             ON logical_symbols(qualified_name);
         CREATE INDEX IF NOT EXISTS idx_logical_symbol_members_symbol
             ON logical_symbol_members(symbol_id);
-        CREATE INDEX IF NOT EXISTS idx_edges_from_symbol ON edges(from_symbol_id);
-        CREATE INDEX IF NOT EXISTS idx_edges_to_symbol ON edges(to_symbol_id);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_path ON git_file_changes(path);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_commit ON git_file_changes(commit_hash);
         CREATE INDEX IF NOT EXISTS idx_github_refs_path ON github_refs(source_path);
@@ -475,15 +489,15 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             ON repo_memory_call_paths(end_logical_symbol_id);
         ",
     )?;
+    // The view + its INSTEAD OF triggers exist only when no legacy `edges` TABLE is present
+    // (fresh DB, or post-V020): `migrate_edges` below touches `edges`, which on a fresh DB must
+    // already resolve to the view. On a pre-V020 DB the legacy table is still in place here and
+    // `apply_edge_string_interning` converts it later in the ladder.
+    ensure_edges_data_indexes(conn)?;
+    ensure_edges_view(conn)?;
     migrate_files(conn)?;
     migrate_chunks(conn)?;
     migrate_edges(conn)?;
-    conn.execute_batch(
-        "
-        CREATE INDEX IF NOT EXISTS idx_edges_from_name ON edges(from_name);
-        CREATE INDEX IF NOT EXISTS idx_edges_to_name ON edges(to_name);
-        ",
-    )?;
     apply_embedding_vector_metadata(conn)?;
     apply_derived_artifact_reconcile_metadata(conn)?;
     apply_edge_source_target_spans(conn)?;

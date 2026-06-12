@@ -865,6 +865,28 @@ impl IndexDatabase {
         // rows would survive the file pruning. Prune them with the SAME live sets, so a run and the
         // edges it produced are dropped together.
         oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
+        // Dictionary hygiene (#79): drop `edge_strings` values no edge references any more. The
+        // dictionary has NO FKs by design (see the schema comment), so orphans accumulate as
+        // edges are pruned; the vocabulary is small, but gc is the natural rate-limited home for
+        // the sweep. Every referencing column must appear here — a missed column would null its
+        // strings out from under live edges.
+        conn.execute(
+            "
+            DELETE FROM main.edge_strings
+            WHERE id NOT IN (
+                SELECT from_name_id FROM main.edges_data WHERE from_name_id IS NOT NULL
+                UNION SELECT to_name_id FROM main.edges_data
+                UNION SELECT target_qualified_name_id FROM main.edges_data
+                    WHERE target_qualified_name_id IS NOT NULL
+                UNION SELECT receiver_hint_id FROM main.edges_data
+                    WHERE receiver_hint_id IS NOT NULL
+                UNION SELECT resolution_id FROM main.edges_data
+                UNION SELECT edge_kind_id FROM main.edges_data
+                UNION SELECT confidence_id FROM main.edges_data
+            )
+            ",
+            [],
+        )?;
         let files_remaining = table_row_count(conn, "files")?;
         let chunks_remaining = table_row_count(conn, "chunks")?;
         Ok(GcReport {

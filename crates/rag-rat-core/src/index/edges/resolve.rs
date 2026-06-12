@@ -20,10 +20,18 @@ use super::*;
 pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let symbols = all_symbols(conn)?;
     let index = SymbolIndex::build(&symbols);
+    // Read/write `edges_data` directly (#79): this loop is per-edge hot on every incremental
+    // pass, so the strings it needs come from explicit dictionary joins and the verdict UPDATEs
+    // write pre-interned ids instead of paying the view triggers' per-row probes. The `files`
+    // join is the active-checkout scope (#89) and is unaffected by the interning.
+    let mut interner = EdgeStringInterner::default();
     let mut stmt = conn.prepare(
-        "SELECT edges.id, edges.source_file_id, edges.to_name, edges.target_qualified_name, \
-         edges.edge_kind, edges.confidence, edges.evidence, edges.receiver_hint FROM edges JOIN \
-         files ON files.id = edges.source_file_id ORDER BY edges.id",
+        "SELECT d.id, d.source_file_id, tn.value, tqn.value, ek.value, conf.value, d.evidence, \
+         rh.value FROM edges_data d JOIN files ON files.id = d.source_file_id LEFT JOIN \
+         edge_strings tn ON tn.id = d.to_name_id LEFT JOIN edge_strings tqn ON tqn.id = \
+         d.target_qualified_name_id LEFT JOIN edge_strings ek ON ek.id = d.edge_kind_id LEFT JOIN \
+         edge_strings conf ON conf.id = d.confidence_id LEFT JOIN edge_strings rh ON rh.id = \
+         d.receiver_hint_id ORDER BY d.id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -69,34 +77,38 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
             };
             // prepare_cached: one UPDATE per edge; cache the statement so the SQL compiles once per
             // connection instead of on every call.
+            let confidence_id = interner.get(conn, confidence.as_str())?;
+            let resolution_id = interner.get(conn, "unresolved")?;
             conn.prepare_cached(
-                "UPDATE edges
+                "UPDATE edges_data
                  SET to_symbol_id = NULL,
                      target_start_line = NULL,
                      target_end_line = NULL,
-                     confidence = ?2,
-                     resolution = 'unresolved'
+                     confidence_id = ?2,
+                     resolution_id = ?3
                  WHERE id = ?1",
             )?
-            .execute(params![edge_id, confidence.as_str()])?;
+            .execute(params![edge_id, confidence_id, resolution_id])?;
             continue;
         };
+        let confidence_id = interner.get(conn, confidence.as_str())?;
+        let resolution_id = interner.get(conn, reason)?;
         conn.prepare_cached(
-            "UPDATE edges
+            "UPDATE edges_data
              SET to_symbol_id = ?2,
-                 confidence = ?3,
+                 confidence_id = ?3,
                  target_start_line = ?4,
                  target_end_line = ?5,
-                 resolution = ?6
+                 resolution_id = ?6
              WHERE id = ?1",
         )?
         .execute(params![
             edge_id,
             to_symbol_id.id,
-            confidence.as_str(),
+            confidence_id,
             to_symbol_id.start_line,
             to_symbol_id.end_line,
-            reason,
+            resolution_id,
         ])?;
     }
     Ok(())
@@ -128,8 +140,8 @@ pub(crate) fn resolve_and_insert_edges(
     // Safe because a full rebuild owns the edges table inside the rebuild transaction (WAL).
     let edge_indexes = conn
         .prepare(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'edges' AND \
-             sql IS NOT NULL",
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'edges_data' \
+             AND sql IS NOT NULL",
         )?
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -146,6 +158,7 @@ pub(crate) fn resolve_and_insert_edges(
     // would; `file_id` therefore drops out of the key (constant within each reset window).
     let mut seen = BTreeSet::new();
     let mut seen_file_id: Option<i64> = None;
+    let mut interner = EdgeStringInterner::default();
     for (file_id, candidate) in &edges {
         if seen_file_id != Some(*file_id) {
             seen.clear();
@@ -207,15 +220,24 @@ pub(crate) fn resolve_and_insert_edges(
         // NULL when the sentinel marks an absent callee range; see
         // `CompactEdge::callee_byte_columns`.
         let (callee_start_byte, callee_end_byte) = candidate.callee_byte_columns();
+        // Interned ids straight into edges_data (#79); the memo keeps repeated names to one map
+        // probe, so the bulk path writes pure integers.
+        let from_name_id = interner.get_opt(conn, from_name)?;
+        let to_name_id = interner.get(conn, to_name)?;
+        let target_qualified_name_id = interner.get_opt(conn, target_qualified_name)?;
+        let receiver_hint_id = interner.get_opt(conn, receiver_hint)?;
+        let edge_kind_id = interner.get(conn, candidate.edge_kind.as_str())?;
+        let confidence_id = interner.get(conn, confidence.as_str())?;
+        let resolution_id = interner.get(conn, reason)?;
         conn.prepare_cached(
             "
-            INSERT INTO edges(
-                source_file_id, from_symbol_id, from_name, to_name,
-                target_qualified_name, evidence, receiver_hint,
+            INSERT INTO edges_data(
+                source_file_id, from_symbol_id, from_name_id, to_name_id,
+                target_qualified_name_id, evidence, receiver_hint_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 callee_start_byte, callee_end_byte,
-                edge_kind, confidence,
-                to_symbol_id, target_start_line, target_end_line, resolution
+                edge_kind_id, confidence_id,
+                to_symbol_id, target_start_line, target_end_line, resolution_id
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
              ?18, ?19)
@@ -224,23 +246,23 @@ pub(crate) fn resolve_and_insert_edges(
         .execute(params![
             file_id,
             candidate.from_symbol_id,
-            from_name,
-            to_name,
-            target_qualified_name,
+            from_name_id,
+            to_name_id,
+            target_qualified_name_id,
             evidence,
-            receiver_hint,
+            receiver_hint_id,
             i64::from(candidate.source_span.start_line),
             i64::from(candidate.source_span.end_line),
             i64::from(candidate.source_span.start_byte),
             i64::from(candidate.source_span.end_byte),
             callee_start_byte,
             callee_end_byte,
-            candidate.edge_kind.as_str(),
-            confidence.as_str(),
+            edge_kind_id,
+            confidence_id,
             to_symbol_id,
             target_start_line,
             target_end_line,
-            reason,
+            resolution_id,
         ])?;
     }
     crate::index::mem_trace("edges: inserted, before index rebuild");
@@ -500,7 +522,8 @@ mod tests {
             params![source_file_id, to_name, target_qualified_name],
         )
         .unwrap();
-        conn.last_insert_rowid()
+        // `edges` is a view; `last_insert_rowid` does not survive its INSTEAD OF trigger (#79).
+        conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
     }
 
     fn edge_state(conn: &Connection, edge_id: i64) -> (Option<i64>, String, String) {

@@ -237,6 +237,51 @@ pub(crate) fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSym
         end_line: row.get(9)?,
     })
 }
+/// Intern one string into `edge_strings`, returning its id (#79). `INSERT OR IGNORE` + lookup —
+/// two cached statements; callers on bulk paths wrap this in [`EdgeStringInterner`] so repeats
+/// hit a process-side map instead of the b-tree.
+pub(crate) fn intern_edge_string(conn: &Connection, value: &str) -> anyhow::Result<i64> {
+    conn.prepare_cached("INSERT OR IGNORE INTO edge_strings(value) VALUES (?1)")?
+        .execute([value])?;
+    conn.prepare_cached("SELECT id FROM edge_strings WHERE value = ?1")?
+        .query_row([value], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+pub(crate) fn intern_edge_string_opt(
+    conn: &Connection,
+    value: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    value.map(|value| intern_edge_string(conn, value)).transpose()
+}
+
+/// A process-side memo over [`intern_edge_string`] for bulk paths: the graph vocabulary is small
+/// (tens of thousands of distinct strings against millions of edges), so the map stays tiny while
+/// saving two b-tree probes per repeated string.
+#[derive(Default)]
+pub(crate) struct EdgeStringInterner {
+    cache: std::collections::HashMap<String, i64>,
+}
+
+impl EdgeStringInterner {
+    pub(crate) fn get(&mut self, conn: &Connection, value: &str) -> anyhow::Result<i64> {
+        if let Some(id) = self.cache.get(value) {
+            return Ok(*id);
+        }
+        let id = intern_edge_string(conn, value)?;
+        self.cache.insert(value.to_string(), id);
+        Ok(id)
+    }
+
+    pub(crate) fn get_opt(
+        &mut self,
+        conn: &Connection,
+        value: Option<&str>,
+    ) -> anyhow::Result<Option<i64>> {
+        value.map(|value| self.get(conn, value)).transpose()
+    }
+}
+
 pub(crate) fn insert_candidates(
     conn: &Connection,
     file_id: i64,
@@ -273,34 +318,46 @@ pub(crate) fn insert_candidates(
             ),
             None => (None, None),
         };
+        // Direct interned write to edges_data (#79): the view's INSTEAD OF insert would work but
+        // costs 8 dictionary probes per row in SQL, and `last_insert_rowid` does not survive an
+        // INSTEAD OF trigger.
+        let from_name_id = intern_edge_string_opt(conn, candidate.from_name.as_deref())?;
+        let to_name_id = intern_edge_string(conn, to_name)?;
+        let target_qualified_name_id =
+            intern_edge_string_opt(conn, candidate.target_qualified_name.as_deref())?;
+        let receiver_hint_id = intern_edge_string_opt(conn, candidate.receiver_hint.as_deref())?;
+        let edge_kind_id = intern_edge_string(conn, candidate.edge_kind.as_str())?;
+        let confidence_id = intern_edge_string(conn, candidate.confidence.as_str())?;
+        let resolution_id = intern_edge_string(conn, "unresolved")?;
         conn.prepare_cached(
             "
-            INSERT INTO edges(
-                source_file_id, from_symbol_id, from_name, to_name,
-                target_qualified_name, evidence, receiver_hint,
+            INSERT INTO edges_data(
+                source_file_id, from_symbol_id, from_name_id, to_name_id,
+                target_qualified_name_id, evidence, receiver_hint_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 callee_start_byte, callee_end_byte,
-                edge_kind, confidence
+                edge_kind_id, confidence_id, resolution_id
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             ",
         )?
         .execute(params![
             file_id,
             candidate.from_symbol_id,
-            candidate.from_name,
-            to_name,
-            candidate.target_qualified_name,
+            from_name_id,
+            to_name_id,
+            target_qualified_name_id,
             candidate.evidence,
-            candidate.receiver_hint,
+            receiver_hint_id,
             candidate.source_span.start_line,
             candidate.source_span.end_line,
             candidate.source_span.start_byte,
             candidate.source_span.end_byte,
             callee_start_byte,
             callee_end_byte,
-            candidate.edge_kind.as_str(),
-            candidate.confidence.as_str(),
+            edge_kind_id,
+            confidence_id,
+            resolution_id,
         ])?;
     }
     Ok(())

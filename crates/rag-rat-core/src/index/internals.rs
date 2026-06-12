@@ -659,7 +659,7 @@ impl IndexDatabase {
         };
         self.storage.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| -> anyhow::Result<()> {
-            self.storage.connection().execute("DELETE FROM edges", [])?;
+            self.storage.connection().execute("DELETE FROM edges_data", [])?;
             let files = self.graph_reindex_files()?;
             for file in files {
                 if file.kind == TargetKind::Generated || file.language == Language::Markdown {
@@ -864,10 +864,14 @@ impl IndexDatabase {
         worktree_id: &str,
     ) -> anyhow::Result<()> {
         let path = path_string(path);
+        // Direct edges_data writes (#79): these statements touch up to every in-edge of a file's
+        // symbols, so they must not pay the view triggers' per-row dictionary probes.
+        // 'NameOnly' is the EdgeConfidence demotion the resolver applies to a target-less edge.
+        let name_only_id = edges::intern_edge_string(self.storage.connection(), "NameOnly")?;
         self.storage.connection().execute(
-            "UPDATE edges
+            "UPDATE edges_data
              SET to_symbol_id = NULL,
-                 confidence = 'NameOnly'
+                 confidence_id = ?4
              WHERE to_symbol_id IN (
                  SELECT symbols.id FROM symbols
                  JOIN main.files ON main.files.id = symbols.file_id
@@ -875,10 +879,10 @@ impl IndexDatabase {
                    AND main.files.commit_sha = ?2
                    AND main.files.worktree_id = ?3
              )",
-            params![path, commit_sha, worktree_id],
+            params![path, commit_sha, worktree_id, name_only_id],
         )?;
         self.storage.connection().execute(
-            "DELETE FROM edges
+            "DELETE FROM edges_data
              WHERE source_file_id IN (
                     SELECT id FROM main.files
                     WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3

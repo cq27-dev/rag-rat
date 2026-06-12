@@ -240,7 +240,8 @@ impl Harness {
                 ],
             )
             .unwrap();
-        self.conn.last_insert_rowid()
+        // `edges` is a view; `last_insert_rowid` does not survive its INSTEAD OF trigger (#79).
+        self.conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
     }
 
     fn root(&self) -> &Path {
@@ -610,7 +611,7 @@ fn migration_creates_oracle_side_tables() {
         assert!(columns.contains(&expected.to_string()), "edge_oracle missing {expected}");
     }
 
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 19);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 20);
 }
 
 /// The V019 moniker migration: the `logical_symbol_monikers` table (STRICT, NO foreign key — see
@@ -3362,4 +3363,180 @@ fn pre_spawn_gate_skips_definition_reindexed_mid_subprocess() {
     // The call site is clean but its DEF document drifted: the occurrence resolving into it must
     // not count as a recall gap either (#88 review).
     assert_eq!(report.oracle_only_calls, 0, "drifted def doc is excluded from recall");
+}
+
+// ---------------------------------------------------------------------------
+// Edge string interning (#79): compat view shape, round-trip writes, dedup, V020 conversion.
+// ---------------------------------------------------------------------------
+
+/// The V020 shape: `edges` is a VIEW over `edges_data` + the `edge_strings` dictionary, with
+/// INSTEAD OF triggers; both backing tables are STRICT; the int indexes replaced the TEXT ones.
+#[test]
+fn edges_is_a_compat_view_over_interned_tables() {
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    let object_type = |name: &str| -> String {
+        conn.query_row("SELECT type FROM sqlite_master WHERE name = ?1", [name], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(object_type("edges"), "view");
+    assert_eq!(object_type("edges_data"), "table");
+    assert_eq!(object_type("edge_strings"), "table");
+    for trigger in ["edges_view_insert", "edges_view_update", "edges_view_delete"] {
+        assert_eq!(object_type(trigger), "trigger", "{trigger} must exist");
+    }
+    let index_table: String = conn
+        .query_row("SELECT tbl_name FROM sqlite_master WHERE name = 'idx_edges_to_name'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(index_table, "edges_data", "TEXT indexes were replaced by int indexes");
+}
+
+/// Writes through the view round-trip with the legacy semantics: defaults for omitted columns,
+/// UPDATE rewrites, DELETE, and shared strings deduplicate in the dictionary.
+#[test]
+fn view_writes_round_trip_and_dedup() {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { target(); helper(); }\n");
+    // Two edges sharing from_name/edge_kind/confidence; insert via the view, omitting the
+    // defaulted columns (source_* spans, resolution) like legacy SQL could.
+    h.conn
+        .execute(
+            "INSERT INTO edges(source_file_id, from_name, to_name, edge_kind, confidence) VALUES \
+             (?1, 'a.rs::caller', 'target', 'calls_name', 'NameOnly')",
+            params![f],
+        )
+        .unwrap();
+    h.conn
+        .execute(
+            "INSERT INTO edges(source_file_id, from_name, to_name, edge_kind, confidence) VALUES \
+             (?1, 'a.rs::caller', 'helper', 'calls_name', 'NameOnly')",
+            params![f],
+        )
+        .unwrap();
+
+    let (resolution, start_line): (String, i64) = h
+        .conn
+        .query_row(
+            "SELECT resolution, source_start_line FROM edges WHERE to_name = 'target'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(resolution, "unresolved", "legacy DEFAULT applies through the trigger");
+    assert_eq!(start_line, 0, "legacy DEFAULT applies through the trigger");
+
+    // Shared strings appear once: from_name, edge_kind, confidence, resolution are common.
+    let shared: i64 = h
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM edge_strings WHERE value IN ('a.rs::caller', 'calls_name', \
+             'NameOnly', 'unresolved')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared, 4, "each shared string interned exactly once across both edges");
+
+    // UPDATE through the view rewrites the row (the maintenance/migration path).
+    h.conn
+        .execute("UPDATE edges SET confidence = 'Syntactic' WHERE to_name = 'target'", [])
+        .unwrap();
+    let confidence: String = h
+        .conn
+        .query_row("SELECT confidence FROM edges WHERE to_name = 'target'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(confidence, "Syntactic");
+
+    // DELETE through the view removes the backing row.
+    h.conn.execute("DELETE FROM edges WHERE to_name = 'helper'", []).unwrap();
+    let remaining: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM edges_data", [], |r| r.get(0)).unwrap();
+    assert_eq!(remaining, 1);
+}
+
+/// V020 conversion: a legacy `edges` TABLE (pre-interning shape, with rows) converts into the
+/// dictionary + `edges_data` behind the view, byte-equal through the view, ids preserved, and the
+/// `edge_oracle` FK re-pointed so verdict cascade still fires.
+#[test]
+fn v020_converts_a_legacy_edges_table() {
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // Recreate the LEGACY world: drop the view shape and install a real old-format table with a
+    // row, plus an edge_oracle row referencing it.
+    conn.execute_batch(
+        "
+        DROP TRIGGER edges_view_insert;
+        DROP TRIGGER edges_view_update;
+        DROP TRIGGER edges_view_delete;
+        DROP VIEW edges;
+        DELETE FROM edges_data;
+        DELETE FROM edge_strings;
+        CREATE TABLE edges(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_file_id INTEGER,
+            from_symbol_id INTEGER,
+            to_symbol_id INTEGER,
+            from_name TEXT,
+            to_name TEXT NOT NULL,
+            source_start_line INTEGER NOT NULL DEFAULT 0,
+            source_end_line INTEGER NOT NULL DEFAULT 0,
+            source_start_byte INTEGER NOT NULL DEFAULT 0,
+            source_end_byte INTEGER NOT NULL DEFAULT 0,
+            target_start_line INTEGER,
+            target_end_line INTEGER,
+            target_qualified_name TEXT,
+            evidence TEXT,
+            receiver_hint TEXT,
+            resolution TEXT NOT NULL DEFAULT 'unresolved',
+            callee_start_byte INTEGER,
+            callee_end_byte INTEGER,
+            edge_kind TEXT NOT NULL,
+            confidence TEXT NOT NULL
+        );
+        DROP TABLE edge_oracle;
+        CREATE TABLE edge_oracle(
+            edge_id INTEGER NOT NULL,
+            file_sha TEXT NOT NULL,
+            tool TEXT NOT NULL,
+            tool_version TEXT NOT NULL,
+            resolved_symbol_id INTEGER,
+            scip_symbol TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            computed_at INTEGER NOT NULL,
+            PRIMARY KEY(edge_id, tool, tool_version),
+            FOREIGN KEY(edge_id) REFERENCES edges(id) ON DELETE CASCADE
+        ) STRICT;
+        INSERT INTO edges(id, to_name, from_name, edge_kind, confidence, resolution, evidence)
+        VALUES (7, 'target', 'caller', 'calls_name', 'Syntactic', 'qualified_suffix', 'target()');
+        INSERT INTO edge_oracle(edge_id, file_sha, tool, tool_version, resolved_symbol_id, \
+         scip_symbol, kind, computed_at)
+        VALUES (7, 'sha', 'rust-analyzer', 'v1', NULL, 'sym', 'upgrade', 0);
+        ",
+    )
+    .unwrap();
+
+    schema::apply_edge_string_interning(&conn).unwrap();
+
+    let (to_name, evidence, resolution): (String, String, String) = conn
+        .query_row("SELECT to_name, evidence, resolution FROM edges WHERE id = 7", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(
+        (to_name.as_str(), evidence.as_str(), resolution.as_str()),
+        ("target", "target()", "qualified_suffix")
+    );
+    let object_type: String = conn
+        .query_row("SELECT type FROM sqlite_master WHERE name = 'edges'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(object_type, "view", "legacy table converted to the view shape");
+
+    // The re-pointed FK still cascades verdicts away with their edge.
+    conn.execute("DELETE FROM edges_data WHERE id = 7", []).unwrap();
+    let verdicts: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(verdicts, 0, "edge_oracle FK was re-pointed at edges_data");
 }

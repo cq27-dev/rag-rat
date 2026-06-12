@@ -389,7 +389,7 @@ pub(crate) fn apply_graph_file_lookup_indexes(conn: &Connection) -> rusqlite::Re
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
-        CREATE INDEX IF NOT EXISTS idx_edges_source_file ON edges(source_file_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_source_file ON edges_data(source_file_id);
         ",
     )?;
     Ok(())
@@ -508,7 +508,7 @@ pub(crate) fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
          oracle,
             -- so cascading old verdicts away (rather than orphaning them, where status/eval would
             -- keep counting them) is correct. `PRAGMA foreign_keys=ON` is set, so this fires.
-            FOREIGN KEY(edge_id) REFERENCES edges(id) ON DELETE CASCADE
+            FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE
         ) STRICT;
 
         CREATE INDEX IF NOT EXISTS idx_edge_oracle_staleness
@@ -565,6 +565,256 @@ pub(crate) fn apply_scip_moniker_anchors(conn: &Connection) -> rusqlite::Result<
     Ok(())
 }
 
+/// The integer indexes on `edges_data` (#79) — the successors of the old TEXT indexes on `edges`.
+/// Called from baseline (fresh DBs) AND after the V020 conversion (upgrading DBs, where the
+/// same-named legacy indexes blocked `IF NOT EXISTS` until `DROP TABLE edges` removed them).
+pub(crate) fn ensure_edges_data_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_edges_from_symbol ON edges_data(from_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_to_symbol ON edges_data(to_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_source_file ON edges_data(source_file_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_from_name ON edges_data(from_name_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_to_name ON edges_data(to_name_id);
+        ",
+    )
+}
+
+/// Create the `edges` compatibility VIEW + its INSTEAD OF triggers (#79) — but ONLY when no
+/// legacy `edges` TABLE is present (an INSTEAD OF trigger on a table is a hard error, and the
+/// legacy table must keep working until `apply_edge_string_interning` converts it).
+///
+/// The view reconstructs the historical column shape, so the entire read surface — graph
+/// traversal, impact, memory fingerprints, oracle compare, dev-inspect SQL — keeps working
+/// unchanged. All dictionary joins are LEFT JOINs against the `edge_strings` PRIMARY KEY, so the
+/// planner drops the joins a query doesn't reference.
+///
+/// The triggers make ad-hoc writes through the view work (tests, migrations, maintenance UPDATEs)
+/// with the legacy semantics, including the old columns' DEFAULTs. CAVEAT (load-bearing):
+/// `last_insert_rowid()` REVERTS after an INSTEAD OF trigger ends — an insert through the view
+/// cannot read back the new edge id that way. The production insert paths write `edges_data`
+/// directly with interned ids for this reason (and for bulk speed).
+pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
+    let legacy_table: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = 'edges' AND type = 'table'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if legacy_table.is_some() {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        CREATE VIEW IF NOT EXISTS edges AS
+        SELECT d.id,
+               d.source_file_id,
+               d.from_symbol_id,
+               d.to_symbol_id,
+               fn.value AS from_name,
+               tn.value AS to_name,
+               d.source_start_line,
+               d.source_end_line,
+               d.source_start_byte,
+               d.source_end_byte,
+               d.target_start_line,
+               d.target_end_line,
+               tqn.value AS target_qualified_name,
+               d.evidence,
+               rh.value AS receiver_hint,
+               res.value AS resolution,
+               d.callee_start_byte,
+               d.callee_end_byte,
+               ek.value AS edge_kind,
+               conf.value AS confidence
+        FROM edges_data d
+        LEFT JOIN edge_strings fn ON fn.id = d.from_name_id
+        LEFT JOIN edge_strings tn ON tn.id = d.to_name_id
+        LEFT JOIN edge_strings tqn ON tqn.id = d.target_qualified_name_id
+        LEFT JOIN edge_strings rh ON rh.id = d.receiver_hint_id
+        LEFT JOIN edge_strings res ON res.id = d.resolution_id
+        LEFT JOIN edge_strings ek ON ek.id = d.edge_kind_id
+        LEFT JOIN edge_strings conf ON conf.id = d.confidence_id;
+
+        -- Interning per column: `INSERT OR IGNORE` + `value NOT NULL` means a NULL string is
+        -- silently skipped and its id subselect yields NULL — exactly the legacy nullability.
+        -- COALESCE mirrors the legacy table's column DEFAULTs for inserts that omit them.
+        CREATE TRIGGER IF NOT EXISTS edges_view_insert INSTEAD OF INSERT ON edges BEGIN
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.from_name);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.to_name);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.target_qualified_name);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.receiver_hint);
+            INSERT OR IGNORE INTO edge_strings(value)
+                VALUES (COALESCE(NEW.resolution, 'unresolved'));
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.edge_kind);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.confidence);
+            INSERT INTO edges_data(
+                id, source_file_id, from_symbol_id, to_symbol_id, from_name_id, to_name_id,
+                source_start_line, source_end_line, source_start_byte, source_end_byte,
+                target_start_line, target_end_line, target_qualified_name_id, evidence,
+                receiver_hint_id, resolution_id, callee_start_byte, callee_end_byte,
+                edge_kind_id, confidence_id
+            )
+            VALUES (
+                NEW.id, NEW.source_file_id, NEW.from_symbol_id, NEW.to_symbol_id,
+                (SELECT id FROM edge_strings WHERE value = NEW.from_name),
+                (SELECT id FROM edge_strings WHERE value = NEW.to_name),
+                COALESCE(NEW.source_start_line, 0), COALESCE(NEW.source_end_line, 0),
+                COALESCE(NEW.source_start_byte, 0), COALESCE(NEW.source_end_byte, 0),
+                NEW.target_start_line, NEW.target_end_line,
+                (SELECT id FROM edge_strings WHERE value = NEW.target_qualified_name),
+                NEW.evidence,
+                (SELECT id FROM edge_strings WHERE value = NEW.receiver_hint),
+                (SELECT id FROM edge_strings
+                 WHERE value = COALESCE(NEW.resolution, 'unresolved')),
+                NEW.callee_start_byte, NEW.callee_end_byte,
+                (SELECT id FROM edge_strings WHERE value = NEW.edge_kind),
+                (SELECT id FROM edge_strings WHERE value = NEW.confidence)
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS edges_view_update INSTEAD OF UPDATE ON edges BEGIN
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.from_name);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.to_name);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.target_qualified_name);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.receiver_hint);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.resolution);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.edge_kind);
+            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.confidence);
+            UPDATE edges_data SET
+                source_file_id = NEW.source_file_id,
+                from_symbol_id = NEW.from_symbol_id,
+                to_symbol_id = NEW.to_symbol_id,
+                from_name_id = (SELECT id FROM edge_strings WHERE value = NEW.from_name),
+                to_name_id = (SELECT id FROM edge_strings WHERE value = NEW.to_name),
+                source_start_line = NEW.source_start_line,
+                source_end_line = NEW.source_end_line,
+                source_start_byte = NEW.source_start_byte,
+                source_end_byte = NEW.source_end_byte,
+                target_start_line = NEW.target_start_line,
+                target_end_line = NEW.target_end_line,
+                target_qualified_name_id =
+                    (SELECT id FROM edge_strings WHERE value = NEW.target_qualified_name),
+                evidence = NEW.evidence,
+                receiver_hint_id = (SELECT id FROM edge_strings WHERE value = NEW.receiver_hint),
+                resolution_id = (SELECT id FROM edge_strings WHERE value = NEW.resolution),
+                callee_start_byte = NEW.callee_start_byte,
+                callee_end_byte = NEW.callee_end_byte,
+                edge_kind_id = (SELECT id FROM edge_strings WHERE value = NEW.edge_kind),
+                confidence_id = (SELECT id FROM edge_strings WHERE value = NEW.confidence)
+            WHERE id = OLD.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS edges_view_delete INSTEAD OF DELETE ON edges BEGIN
+            DELETE FROM edges_data WHERE id = OLD.id;
+        END;
+        ",
+    )?;
+    Ok(())
+}
+
+/// V020 (#79): convert a legacy `edges` TABLE into `edge_strings` + `edges_data` and re-point
+/// `edge_oracle`'s FK at `edges_data`. Idempotent: a DB already on the view shape skips the
+/// conversion entirely. The copy runs in ONE transaction (legacy table intact on a crash);
+/// `PRAGMA foreign_keys` toggles outside it (it is a no-op inside one).
+pub(crate) fn apply_edge_string_interning(conn: &Connection) -> rusqlite::Result<()> {
+    let legacy = conn
+        .query_row("SELECT type FROM sqlite_master WHERE name = 'edges'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .as_deref()
+        == Some("table");
+    if legacy {
+        conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch(
+                "
+                INSERT OR IGNORE INTO edge_strings(value)
+                    SELECT DISTINCT from_name FROM main.edges WHERE from_name IS NOT NULL;
+                INSERT OR IGNORE INTO edge_strings(value) SELECT DISTINCT to_name FROM main.edges;
+                INSERT OR IGNORE INTO edge_strings(value)
+                    SELECT DISTINCT target_qualified_name FROM main.edges
+                    WHERE target_qualified_name IS NOT NULL;
+                INSERT OR IGNORE INTO edge_strings(value)
+                    SELECT DISTINCT receiver_hint FROM main.edges WHERE receiver_hint IS NOT NULL;
+                INSERT OR IGNORE INTO edge_strings(value)
+                    SELECT DISTINCT resolution FROM main.edges;
+                INSERT OR IGNORE INTO edge_strings(value)
+                    SELECT DISTINCT edge_kind FROM main.edges;
+                INSERT OR IGNORE INTO edge_strings(value)
+                    SELECT DISTINCT confidence FROM main.edges;
+                INSERT INTO main.edges_data(
+                    id, source_file_id, from_symbol_id, to_symbol_id, from_name_id, to_name_id,
+                    source_start_line, source_end_line, source_start_byte, source_end_byte,
+                    target_start_line, target_end_line, target_qualified_name_id, evidence,
+                    receiver_hint_id, resolution_id, callee_start_byte, callee_end_byte,
+                    edge_kind_id, confidence_id
+                )
+                SELECT e.id, e.source_file_id, e.from_symbol_id, e.to_symbol_id,
+                       (SELECT id FROM edge_strings WHERE value = e.from_name),
+                       (SELECT id FROM edge_strings WHERE value = e.to_name),
+                       e.source_start_line, e.source_end_line,
+                       e.source_start_byte, e.source_end_byte,
+                       e.target_start_line, e.target_end_line,
+                       (SELECT id FROM edge_strings WHERE value = e.target_qualified_name),
+                       e.evidence,
+                       (SELECT id FROM edge_strings WHERE value = e.receiver_hint),
+                       (SELECT id FROM edge_strings WHERE value = e.resolution),
+                       e.callee_start_byte, e.callee_end_byte,
+                       (SELECT id FROM edge_strings WHERE value = e.edge_kind),
+                       (SELECT id FROM edge_strings WHERE value = e.confidence)
+                FROM main.edges e;
+                DROP TABLE main.edges;
+                ",
+            )?;
+            // Re-point edge_oracle's FK from the (now dropped) legacy table at edges_data. The
+            // rebuilt table keeps the V018 shape; verdict rows survive byte-for-byte.
+            let has_oracle: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
+                 'edge_oracle')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_oracle {
+                conn.execute_batch(
+                    "
+                    ALTER TABLE main.edge_oracle RENAME TO edge_oracle_legacy;
+                    CREATE TABLE main.edge_oracle(
+                        edge_id INTEGER NOT NULL,
+                        file_sha TEXT NOT NULL,
+                        tool TEXT NOT NULL,
+                        tool_version TEXT NOT NULL,
+                        resolved_symbol_id INTEGER,
+                        scip_symbol TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        computed_at INTEGER NOT NULL,
+                        PRIMARY KEY(edge_id, tool, tool_version),
+                        FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE
+                    ) STRICT;
+                    INSERT INTO main.edge_oracle SELECT * FROM main.edge_oracle_legacy;
+                    DROP TABLE main.edge_oracle_legacy;
+                    CREATE INDEX IF NOT EXISTS idx_edge_oracle_staleness
+                        ON edge_oracle(file_sha, tool, tool_version);
+                    CREATE INDEX IF NOT EXISTS idx_edge_oracle_symbol
+                        ON edge_oracle(resolved_symbol_id);
+                    ",
+                )?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+            return result;
+        }
+        conn.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?;
+    }
+    ensure_edges_data_indexes(conn)?;
+    ensure_edges_view(conn)?;
+    Ok(())
+}
+
 pub(crate) fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
     let mut stmt = conn.prepare(
         "
@@ -611,6 +861,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_017_ID => Some(17),
             MIGRATION_018_ID => Some(18),
             MIGRATION_019_ID => Some(19),
+            MIGRATION_020_ID => Some(20),
             _ => None,
         })
         .max()
@@ -639,6 +890,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_017_ID
             | MIGRATION_018_ID
             | MIGRATION_019_ID
+            | MIGRATION_020_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -664,6 +916,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_017_ID => migration.checksum != MIGRATION_017_CHECKSUM,
         MIGRATION_018_ID => migration.checksum != MIGRATION_018_CHECKSUM,
         MIGRATION_019_ID => migration.checksum != MIGRATION_019_CHECKSUM,
+        MIGRATION_020_ID => migration.checksum != MIGRATION_020_CHECKSUM,
         _ => false,
     }
 }
