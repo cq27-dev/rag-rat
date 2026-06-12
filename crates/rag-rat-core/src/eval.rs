@@ -6,9 +6,15 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::index::ai;
+use crate::index::oracle::{OracleEvalMetrics, OracleTool, RecallCalls};
 use crate::{Config, IndexDatabase};
 
 const TOP_K: usize = 10;
+
+/// Tool version recorded for the eval oracle pass. Eval consumes pre-built `.scip` fixtures, so the
+/// real indexer version isn't known here; a stable label keeps the `(file_sha, tool, tool_version)`
+/// staleness key deterministic across eval runs.
+const EVAL_ORACLE_TOOL_VERSION: &str = "eval-fixture";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvalSuite {
@@ -74,6 +80,10 @@ pub struct EvalOptions {
     pub queries_path: PathBuf,
     pub expected_path: PathBuf,
     pub update_baseline: bool,
+    /// Optional pre-built `.scip` to drive the SCIP-oracle precision/recall metrics against the
+    /// eval corpus. `None` (or a missing path) skips the oracle pass — `EvalReport.oracle` is then
+    /// `None` and oracle metrics aren't gated.
+    pub scip_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,7 +92,21 @@ pub struct EvalReport {
     pub queries: usize,
     pub metrics: EvalMetrics,
     pub hash_vector_baseline: EvalBaselineReport,
+    /// SCIP-oracle precision/recall metrics (#68), present only when a `.scip` fixture was
+    /// supplied and the oracle pass ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle: Option<OracleEvalMetrics>,
+    /// Edge candidates the oracle pass skipped because their source file drifted between the index
+    /// build and the `.scip` (`file_sha` mismatch — content-integrity, #81 finding 2). Non-zero
+    /// means some documents were out of sync and their verdicts were correctly withheld; `eval`
+    /// surfaces it so the recall/precision numbers aren't silently computed over drifted content.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub oracle_skipped_drifted: u64,
     pub results: Vec<EvalQueryReport>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -192,14 +216,48 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
 
     let metrics = aggregate(&results);
     let baseline = hash_vector_baseline(config, &db, &suite.query, &expected, &metrics)?;
+    let oracle_eval = run_oracle_eval(&db, options)?;
+    let (oracle, oracle_skipped_drifted) = match oracle_eval {
+        Some((metrics, skipped_drifted)) => (Some(metrics), skipped_drifted),
+        None => (None, 0),
+    };
     let pass = metrics.stale_current_source_violations == 0 && results.iter().all(|r| r.passed);
     Ok(EvalReport {
         pass,
         queries: results.len(),
         metrics,
         hash_vector_baseline: baseline,
+        oracle,
+        oracle_skipped_drifted,
         results,
     })
+}
+
+/// Run the SCIP-oracle pass against the eval corpus from the supplied `.scip` fixture, returning
+/// its heuristic-vs-oracle metrics plus the count of candidates skipped for content drift. `None`
+/// when no fixture path is configured or the file is absent — the oracle is opt-in and never an
+/// error when unavailable (mirrors the missing-embedding degradation). The pass writes
+/// `edge_oracle` side rows; the heuristic `edges` rows are untouched.
+fn run_oracle_eval(
+    db: &IndexDatabase,
+    options: &EvalOptions,
+) -> anyhow::Result<Option<(OracleEvalMetrics, u64)>> {
+    let Some(scip_path) = options.scip_path.as_ref() else {
+        return Ok(None);
+    };
+    if !scip_path.exists() {
+        return Ok(None);
+    }
+    let scip_bytes = fs::read(scip_path).map_err(|err| {
+        anyhow::anyhow!("failed to read SCIP fixture {}: {err}", scip_path.display())
+    })?;
+    let report = db.run_oracle(OracleTool::RustAnalyzer, EVAL_ORACLE_TOOL_VERSION, &scip_bytes)?;
+    // Both recall sides come from the run, occurrence-counted over the call population.
+    let recall_calls =
+        RecallCalls { covered: report.covered_calls, oracle_only: report.oracle_only_calls };
+    let metrics =
+        db.oracle_eval_metrics(OracleTool::RustAnalyzer, EVAL_ORACLE_TOOL_VERSION, recall_calls)?;
+    Ok(Some((metrics, report.skipped_drifted)))
 }
 
 fn load_queries(path: &Path) -> anyhow::Result<EvalSuite> {
@@ -784,6 +842,7 @@ mod tests {
             queries_path: workspace_root().join("evals/queries.toml"),
             expected_path: workspace_root().join("evals/expected_hits.toml"),
             update_baseline: false,
+            scip_path: None,
         })
         .unwrap();
         assert_eq!(report.metrics.stale_current_source_violations, 0);
@@ -791,6 +850,91 @@ mod tests {
         assert!(report.metrics.recall_at_10 > 0.0);
 
         // Best-effort cleanup; do not fail the test on cleanup error.
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    /// When a `.scip` fixture is supplied, the eval suite runs the SCIP-oracle pass end-to-end
+    /// through the public `IndexDatabase` API (`run_oracle` + `oracle_eval_metrics`, both scoped to
+    /// the rebuilt fixture's active checkout) and attaches `OracleEvalMetrics` to the report. This
+    /// exercises `run_oracle_eval` and the `query_api` oracle wrappers — the integration seam the
+    /// unit tests can't reach (they call the `oracle::` functions directly on a synthetic conn).
+    #[test]
+    fn eval_suite_runs_oracle_when_scip_fixture_present() {
+        use ::protobuf::Message;
+        use ::scip::types::{
+            Document, Index as ScipIndexProto, Occurrence, PositionEncoding, SymbolRole,
+        };
+        use protobuf::EnumOrUnknown;
+
+        let root = fixture_root();
+        let mut config = Config::load(root.join("rag-rat.toml")).unwrap();
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut db_dir = std::env::temp_dir();
+        db_dir.push(format!(
+            "rag-rat-eval-oracle-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        config.database = db_dir.join("index.sqlite");
+
+        IndexDatabase::rebuild(&config).unwrap();
+
+        // A minimal but well-formed `.scip` over the fixture's `src/lib.rs`: a single reference to
+        // `open_database` plus its definition. The pass reads `src/lib.rs`'s real bytes for the
+        // position-encoding conversion, so the document path must match an indexed file.
+        let symbol = "scip-rust crate held-mini `open_database`().";
+        let index = ScipIndexProto {
+            documents: vec![Document {
+                relative_path: "src/lib.rs".to_string(),
+                occurrences: vec![
+                    // `open_database` is at line 2 (`pub fn open_database() {}`); its identifier
+                    // sits after "pub fn " (7 bytes) → chars 7..20 on line 2.
+                    Occurrence {
+                        range: vec![2, 7, 20],
+                        symbol: symbol.to_string(),
+                        symbol_roles: SymbolRole::Definition as i32,
+                        ..Default::default()
+                    },
+                ],
+                position_encoding: EnumOrUnknown::new(
+                    PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let scip_path = db_dir.join("oracle.scip");
+        std::fs::write(&scip_path, index.write_to_bytes().unwrap()).unwrap();
+
+        let report = run(&config, &EvalOptions {
+            queries_path: workspace_root().join("evals/queries.toml"),
+            expected_path: workspace_root().join("evals/expected_hits.toml"),
+            update_baseline: false,
+            scip_path: Some(scip_path),
+        })
+        .unwrap();
+
+        // The oracle ran and produced metrics (rates are all in [0, 1]); the exact values depend on
+        // the fixture's edges, so we assert presence + bounds, not specific numbers.
+        let oracle = report.oracle.expect("oracle metrics attached when a .scip is supplied");
+        for rate in [
+            oracle.precision,
+            oracle.recall,
+            oracle.name_only_recovery_rate,
+            oracle.oracle_upgradeable_fraction,
+        ] {
+            assert!((0.0..=1.0).contains(&rate), "rate {rate} out of [0,1]");
+        }
+
+        // The run persisted an `oracle_runs` row + any verdicts; the status read (the other
+        // `query_api` oracle wrapper) reflects them for the same tool/version.
+        let db = IndexDatabase::open_config(&config).unwrap();
+        let status = db.oracle_status(OracleTool::RustAnalyzer, EVAL_ORACLE_TOOL_VERSION).unwrap();
+        assert_eq!(status.tool, "rust-analyzer");
+        assert_eq!(status.tool_version, EVAL_ORACLE_TOOL_VERSION);
+        assert_eq!(status.last_run_status.as_deref(), Some("Completed"));
+
         let _ = std::fs::remove_dir_all(&db_dir);
     }
 

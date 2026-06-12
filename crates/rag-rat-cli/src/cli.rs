@@ -220,6 +220,10 @@ pub(crate) struct EvalArgs {
     /// Rewrite the baseline from this run's results.
     #[arg(long)]
     pub update_baseline: bool,
+    /// Optional pre-built `.scip` index to drive SCIP-oracle precision/recall metrics (#68).
+    /// Defaults to <root>/evals/oracle.scip when present; absent → oracle metrics skipped.
+    #[arg(long)]
+    pub scip: Option<PathBuf>,
     /// Emit JSON instead of the summary.
     #[arg(long)]
     pub json: bool,

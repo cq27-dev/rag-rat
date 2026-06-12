@@ -5,6 +5,7 @@ pub mod edges;
 pub mod git_history;
 pub mod github;
 pub mod ignore_rules;
+pub mod oracle;
 pub mod parser;
 pub mod schema;
 pub mod symbols;

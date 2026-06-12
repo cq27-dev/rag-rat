@@ -108,6 +108,10 @@ pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(|| default_eval_path(config, "expected_hits.toml")),
         update_baseline: args.update_baseline,
+        scip_path: args.scip.clone().or_else(|| {
+            let default = default_eval_path(config, "oracle.scip");
+            default.exists().then_some(default)
+        }),
     };
     let report = rag_rat_core::eval::run(config, &options)?;
     if args.json || options.update_baseline {

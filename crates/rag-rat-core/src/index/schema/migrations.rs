@@ -454,6 +454,72 @@ pub(crate) fn apply_edge_callee_byte_range(conn: &Connection) -> rusqlite::Resul
     Ok(())
 }
 
+pub(crate) fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
+    // SCIP-oracle side tables (#68). Greenfield, STRICT per repo convention.
+    //
+    // `oracle_runs`: one row per oracle pass (a `.scip` consumed against a checkout). `stats_json`
+    // is an opaque per-run `OracleReport` snapshot, suffixed `_json` per the naming convention.
+    //
+    // `edge_oracle`: the compiler-grade resolution for an edge, kept **beside** the heuristic
+    // resolution that lives on the `edges` row — the heuristic row is NEVER overwritten, so eval
+    // can diff the two and `compare_graph_to_scip` (#69) has both. INVARIANT: writing an
+    // `edge_oracle` row must not UPDATE `edges.resolution` / `edges.to_symbol_id`.
+    //
+    // Staleness key is `(file_sha, tool, tool_version)` (content addressing, exactly like the
+    // embedding `input_hash`): a row is valid iff the file bytes it was computed against are
+    // unchanged. `file_sha` is the `files.sha256` of the edge's source file at compute time, so a
+    // changed file's oracle rows are detectably stale without an indexer re-run on unchanged files.
+    //
+    // `kind` is the oracle resolution outcome (upgrade / resolved-external / confirm / contradict);
+    // `resolved_symbol_id` is our `symbols.id` when the SCIP definition mapped inside the corpus,
+    // NULL for `resolved-external`. `scip_symbol` is the raw SCIP symbol string for provenance.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS oracle_runs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool TEXT NOT NULL,
+            tool_version TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            -- The checkout the run was scoped to. A multi-worktree DB holds runs from sibling
+            -- checkouts under the same `(tool, tool_version, commit_sha)`; without this the status
+            -- read's `last_run_meta` could surface a SIBLING worktree's run as THIS checkout's \
+         last
+            -- run (the verdict counts are already worktree-scoped, so the two would disagree). \
+         Added
+            -- in V018 directly (this is the unshipped oracle migration) — no separate migration.
+            worktree_id TEXT NOT NULL DEFAULT '',
+            started_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            stats_json TEXT NOT NULL DEFAULT '{}'
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS edge_oracle(
+            edge_id INTEGER NOT NULL,
+            file_sha TEXT NOT NULL,
+            tool TEXT NOT NULL,
+            tool_version TEXT NOT NULL,
+            resolved_symbol_id INTEGER,
+            scip_symbol TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            computed_at INTEGER NOT NULL,
+            PRIMARY KEY(edge_id, tool, tool_version),
+            -- A verdict is meaningless once its edge is gone. The full rebuild and
+            -- `remove_file_in_scope` delete + reinsert edges with new ids and recompute the \
+         oracle,
+            -- so cascading old verdicts away (rather than orphaning them, where status/eval would
+            -- keep counting them) is correct. `PRAGMA foreign_keys=ON` is set, so this fires.
+            FOREIGN KEY(edge_id) REFERENCES edges(id) ON DELETE CASCADE
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_edge_oracle_staleness
+            ON edge_oracle(file_sha, tool, tool_version);
+        CREATE INDEX IF NOT EXISTS idx_edge_oracle_symbol
+            ON edge_oracle(resolved_symbol_id);
+        ",
+    )?;
+    Ok(())
+}
+
 pub(crate) fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
     let mut stmt = conn.prepare(
         "
@@ -498,6 +564,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_015_ID => Some(15),
             MIGRATION_016_ID => Some(16),
             MIGRATION_017_ID => Some(17),
+            MIGRATION_018_ID => Some(18),
             _ => None,
         })
         .max()
@@ -524,6 +591,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_015_ID
             | MIGRATION_016_ID
             | MIGRATION_017_ID
+            | MIGRATION_018_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -547,6 +615,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_015_ID => migration.checksum != MIGRATION_015_CHECKSUM,
         MIGRATION_016_ID => migration.checksum != MIGRATION_016_CHECKSUM,
         MIGRATION_017_ID => migration.checksum != MIGRATION_017_CHECKSUM,
+        MIGRATION_018_ID => migration.checksum != MIGRATION_018_CHECKSUM,
         _ => false,
     }
 }

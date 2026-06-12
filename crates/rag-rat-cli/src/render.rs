@@ -31,6 +31,16 @@ pub(crate) fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
     if let Some(precision) = report.metrics.papertrail_precision_sample {
         println!("eval: papertrail_precision_sample={precision:.3}");
     }
+    if let Some(oracle) = &report.oracle {
+        println!("{}", format_oracle_line(oracle));
+    }
+    if report.oracle_skipped_drifted > 0 {
+        println!(
+            "eval: WARNING oracle skipped {} candidate(s) on drifted source (file_sha mismatch); \
+             rebuild the index against the .scip checkout for complete oracle metrics",
+            report.oracle_skipped_drifted,
+        );
+    }
     println!(
         "eval: hash_vector_baseline model={} available={} current_artifacts={} mrr@10={:.3} \
          recall@10={:.3} delta_mrr@10={:+.3} delta_recall@10={:+.3}",
@@ -259,5 +269,61 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
         IndexProgress::Finished { files } => {
             eprintln!("index: complete ({files} files)");
         },
+    }
+}
+
+/// Format the one-line SCIP-oracle eval summary. Split out from `print_eval_summary` so the
+/// formatting is unit-testable without capturing stdout — the rates and raw counts must stay in the
+/// line so `eval` output is greppable.
+fn format_oracle_line(oracle: &rag_rat_core::index::oracle::OracleEvalMetrics) -> String {
+    format!(
+        "eval: oracle precision={:.3} recall={:.3} name_only_recovery={:.3} \
+         upgradeable_fraction={:.3} (confirm={} contradict={} upgrade={} external={} \
+         covered_calls={} oracle_only={})",
+        oracle.precision,
+        oracle.recall,
+        oracle.name_only_recovery_rate,
+        oracle.oracle_upgradeable_fraction,
+        oracle.confirmed,
+        oracle.contradicted,
+        oracle.upgraded,
+        oracle.resolved_external,
+        oracle.covered_calls,
+        oracle.oracle_only_calls,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use rag_rat_core::index::oracle::OracleEvalMetrics;
+
+    use super::format_oracle_line;
+
+    #[test]
+    fn oracle_line_carries_rates_and_raw_counts() {
+        let oracle = OracleEvalMetrics {
+            precision: 0.5,
+            recall: 0.75,
+            name_only_recovery_rate: 1.0,
+            oracle_upgradeable_fraction: 0.25,
+            confirmed: 3,
+            contradicted: 3,
+            upgraded: 2,
+            resolved_external: 1,
+            covered_calls: 12,
+            oracle_only_calls: 4,
+        };
+        let line = format_oracle_line(&oracle);
+        assert!(line.starts_with("eval: oracle "));
+        assert!(line.contains("precision=0.500"));
+        assert!(line.contains("recall=0.750"));
+        assert!(line.contains("upgradeable_fraction=0.250"));
+        // Raw counts present and greppable.
+        assert!(line.contains("confirm=3"));
+        assert!(line.contains("contradict=3"));
+        assert!(line.contains("upgrade=2"));
+        assert!(line.contains("external=1"));
+        assert!(line.contains("covered_calls=12"));
+        assert!(line.contains("oracle_only=4"));
     }
 }

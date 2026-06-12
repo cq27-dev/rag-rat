@@ -1,6 +1,72 @@
 use super::*;
+use crate::index::oracle::{
+    self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls,
+};
 
 impl IndexDatabase {
+    /// Run a SCIP-oracle pass from a pre-built `.scip` over the current (active commit/worktree)
+    /// edge candidates, writing `edge_oracle` verdicts. The heuristic resolution on the `edges`
+    /// row is never touched. Phase 1 (#68): eval-only, no CLI/MCP surface. Requires a `source_root`
+    /// (the checkout whose bytes back the SCIP document position-encoding conversion).
+    pub fn run_oracle(
+        &self,
+        tool: OracleTool,
+        tool_version: &str,
+        scip_bytes: &[u8],
+    ) -> anyhow::Result<OracleReport> {
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!(
+                "index has no source_root metadata; rebuild required for the oracle pass"
+            );
+        };
+        let root = root.to_path_buf();
+        oracle::run_oracle(
+            self.storage.connection(),
+            tool,
+            tool_version,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+            scip_bytes,
+            &root,
+        )
+    }
+
+    /// Heuristic-vs-oracle eval metrics (precision/recall/recovery) for a tool/version, diffing the
+    /// persisted `edge_oracle` rows against the `edges` heuristic. [`RecallCalls`] is the
+    /// `(covered_calls, oracle_only_calls)` pair reported by the most recent [`run_oracle`] — both
+    /// occurrence-counted over the call population, so recall compares like with like.
+    pub fn oracle_eval_metrics(
+        &self,
+        tool: OracleTool,
+        tool_version: &str,
+        recall_calls: RecallCalls,
+    ) -> anyhow::Result<OracleEvalMetrics> {
+        oracle::oracle_eval_metrics(
+            self.storage.connection(),
+            tool,
+            tool_version,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+            recall_calls,
+        )
+    }
+
+    /// Persisted oracle status (verdict counts + last run) for a tool/version, scoped to this
+    /// database's active `(commit_sha, worktree_id)` checkout.
+    pub fn oracle_status(
+        &self,
+        tool: OracleTool,
+        tool_version: &str,
+    ) -> anyhow::Result<OracleStatus> {
+        oracle::oracle_status(
+            self.storage.connection(),
+            tool,
+            tool_version,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )
+    }
+
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
         let mut counts = BTreeMap::new();
         let mut stmt = self

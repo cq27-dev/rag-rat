@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 17;
+pub const LATEST_SCHEMA_VERSION: u32 = 18;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -76,6 +76,10 @@ const MIGRATION_017_ID: &str = "017_edge_callee_byte_range";
 const MIGRATION_017_CHECKSUM: &str = "sha256:rag-rat-edge-callee-byte-range-v17";
 const MIGRATION_017_DESCRIPTION: &str =
     "Add callee identifier byte range to edges for the SCIP occurrence join (#61 prerequisite)";
+const MIGRATION_018_ID: &str = "018_scip_oracle_tables";
+const MIGRATION_018_CHECKSUM: &str = "sha256:rag-rat-scip-oracle-tables-v18";
+const MIGRATION_018_DESCRIPTION: &str =
+    "Add oracle_runs + edge_oracle side tables for SCIP compiler-grade edge resolution (#68)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -162,6 +166,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_016_ID, MIGRATION_016_CHECKSUM, MIGRATION_016_DESCRIPTION)?;
     apply_edge_callee_byte_range(conn)?;
     record_migration(conn, MIGRATION_017_ID, MIGRATION_017_CHECKSUM, MIGRATION_017_DESCRIPTION)?;
+    apply_oracle_tables(conn)?;
+    record_migration(conn, MIGRATION_018_ID, MIGRATION_018_CHECKSUM, MIGRATION_018_DESCRIPTION)?;
     Ok(())
 }
 
