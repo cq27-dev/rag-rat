@@ -1514,6 +1514,56 @@ fn git_history_reload_is_not_skipped_on_a_shallow_clone() {
     fs::remove_dir_all(shallow).unwrap();
 }
 
+fn read_meta(db: &IndexDatabase, key: &str) -> Option<String> {
+    db.storage
+        .connection()
+        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
+        .optional()
+        .unwrap()
+}
+
+#[test]
+fn idle_discover_sweep_does_not_rewrite_indexed_at_ms() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let config = git_history_test_config(&root);
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // Stamp a non-numeric sentinel so any spurious timestamp write is unmistakable.
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO index_meta(key, value) VALUES('indexed_at_ms', 'SENTINEL')
+             ON CONFLICT(key) DO UPDATE SET value = 'SENTINEL'",
+            [],
+        )
+        .unwrap();
+    drop(db);
+
+    // A discover sweep over an unchanged tree must not mutate the DB — the sentinel survives
+    // (no timestamp-only write + COMMIT). See issue #63.
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    assert_eq!(
+        read_meta(&db, "indexed_at_ms").as_deref(),
+        Some("SENTINEL"),
+        "an unchanged discover sweep must not rewrite indexed_at_ms"
+    );
+    drop(db);
+
+    // A real change must persist — the sweep writes a fresh timestamp, clearing the sentinel.
+    fs::write(root.join("docs/added.md"), "# Added\nfresh content\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "Add a doc"]);
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    assert_ne!(
+        read_meta(&db, "indexed_at_ms").as_deref(),
+        Some("SENTINEL"),
+        "a sweep that indexes a new file must update indexed_at_ms"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn indexes_rust_graph_edges_from_tree_sitter() {
     let root = unique_temp_root();

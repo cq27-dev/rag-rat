@@ -325,11 +325,25 @@ impl IndexDatabase {
         Ok(symbol_ids)
     }
 
-    pub(super) fn write_git_meta(&self, root: &Path) -> anyhow::Result<()> {
-        self.set_meta("git_commit", &git_output(root, &["rev-parse", "HEAD"]).unwrap_or_default())?;
+    /// Write a meta key only if the stored value differs. Returns whether a write happened — so a
+    /// no-change incremental/sweep pass can avoid dirtying a WAL page (see issue #63).
+    pub(super) fn set_meta_if_changed(&self, key: &str, value: &str) -> anyhow::Result<bool> {
+        if self.meta(key)?.as_deref() == Some(value) {
+            return Ok(false);
+        }
+        self.set_meta(key, value)?;
+        Ok(true)
+    }
+
+    /// Refresh `git_commit` / `git_dirty` meta, writing only the keys that actually changed.
+    /// Returns whether either was written (so the caller can tell a no-op pass from a real one).
+    pub(super) fn write_git_meta(&self, root: &Path) -> anyhow::Result<bool> {
+        let commit = git_output(root, &["rev-parse", "HEAD"]).unwrap_or_default();
         let dirty = !git_output(root, &["status", "--porcelain"]).unwrap_or_default().is_empty();
-        self.set_meta("git_dirty", if dirty { "true" } else { "false" })?;
-        Ok(())
+        let commit_changed = self.set_meta_if_changed("git_commit", &commit)?;
+        let dirty_changed =
+            self.set_meta_if_changed("git_dirty", if dirty { "true" } else { "false" })?;
+        Ok(commit_changed || dirty_changed)
     }
 
     /// O(1) check of whether the indexed git history is still current for `root`'s HEAD, so the
