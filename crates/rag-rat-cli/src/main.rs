@@ -48,7 +48,16 @@ fn main() -> anyhow::Result<()> {
         Cmd::Brief(args) => brief(&config, &args)?,
         Cmd::Clusters(args) => clusters(&config, &args)?,
         Cmd::Mcp => {
-            tokio::runtime::Runtime::new()?.block_on(rag_rat_mcp::server::run_stdio(config))?;
+            // The MCP server is an stdio JSON-RPC loop (one client, mostly serial) plus a SIGUSR1
+            // task; the file watcher runs on its own OS thread and CPU-heavy indexing is rayon, not
+            // tokio. The default runtime's ~num_cpus workers are therefore idle overhead, so cap it
+            // small (issue #63, facet 3). Stay multi_thread (not current_thread) so a blocking tool
+            // handler can't stall the serve loop or the upgrade-signal task.
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?
+                .block_on(rag_rat_mcp::server::run_stdio(config))?;
         },
         Cmd::Memory(args) => memory(&config, &args)?,
         Cmd::Github(args) => github(&config, &args)?,
