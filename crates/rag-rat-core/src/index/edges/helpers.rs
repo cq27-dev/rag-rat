@@ -203,6 +203,10 @@ pub(crate) fn symbols_for_file(
     let rows = stmt.query_map([file_id], symbol_row)?;
     collect_rows(rows)
 }
+/// Every symbol in the ACTIVE CHECKOUT, ordered by qualified name. The `files` join goes through
+/// the per-connection scoped TEMP VIEW (overlay wins, dead scopes excluded) — resolving against
+/// raw `symbols` duplicated every symbol whenever multiple scopes coexist and collapsed edge
+/// resolution (#89).
 pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol>> {
     let mut stmt = conn.prepare(
         "
@@ -210,6 +214,7 @@ pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol
          symbols.qualified_name, symbols.kind,
                symbols.start_byte, symbols.end_byte, symbols.start_line, symbols.end_line
         FROM symbols
+        JOIN files ON files.id = symbols.file_id
         ORDER BY symbols.qualified_name
         ",
     )?;

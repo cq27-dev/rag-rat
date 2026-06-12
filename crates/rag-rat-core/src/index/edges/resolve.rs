@@ -1,11 +1,29 @@
 use super::*;
 
+/// Re-resolve the ACTIVE CHECKOUT's edges against the ACTIVE CHECKOUT's symbols.
+///
+/// SCOPE (load-bearing, #89): both SELECTs join `files` — the per-connection scoped TEMP VIEW
+/// (`install_scope_view`: overlay rows win, shadowed committed rows and other commits/worktrees
+/// are excluded). The DB legitimately holds MULTIPLE scopes at once (a dead commit's rows linger
+/// until gc after every HEAD move; a sibling worktree's scope is live permanently; dirty files
+/// add overlay rows), and resolving against raw `symbols` made every symbol a duplicate: unique
+/// qualified-suffix/name matches demoted to `logical_variant` picking `matches[0]` — an ARBITRARY
+/// scope's symbol id, which the active-checkout reads (and the oracle's def-drift gate) then
+/// rightly refuse — and cross-scope mixtures went ambiguous → mass-NULLed targets. On a
+/// connection without the view (a raw test connection), `files` falls back to `main.files` and
+/// resolution is unscoped — production connections always have the view (`set_context` installs
+/// it at open/rebuild/incremental).
+///
+/// Dead scopes' edges are likewise NOT re-resolved (their source file is outside the view): each
+/// scope's edges stay self-consistent until gc prunes them or their own worktree's pass rewrites
+/// them.
 pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let symbols = all_symbols(conn)?;
     let index = SymbolIndex::build(&symbols);
     let mut stmt = conn.prepare(
-        "SELECT id, source_file_id, to_name, target_qualified_name, edge_kind, confidence, \
-         evidence, receiver_hint FROM edges ORDER BY id",
+        "SELECT edges.id, edges.source_file_id, edges.to_name, edges.target_qualified_name, \
+         edges.edge_kind, edges.confidence, edges.evidence, edges.receiver_hint FROM edges JOIN \
+         files ON files.id = edges.source_file_id ORDER BY edges.id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -432,4 +450,143 @@ pub(crate) fn preferred_matches<'a>(
         .copied()
         .filter(|symbol| preferred_kinds.contains(&symbol.kind.as_str()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::{Connection, params};
+
+    use super::*;
+    use crate::index::schema;
+
+    const NEW: &str = "newcommitsha";
+    const OLD: &str = "oldcommitsha";
+
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn
+    }
+
+    fn add_file(conn: &Connection, path: &str, commit: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id) VALUES (?1, 'rust', 'source', ?2, 0, 0, ?3, '')",
+            params![path, format!("sha-{commit}-{path}"), commit],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn add_symbol(conn: &Connection, file_id: i64, name: &str, qualified: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, \
+             end_byte, start_line, end_line) VALUES (?1, 'rust', ?2, ?3, 'function', 0, 10, 1, 1)",
+            params![file_id, name, qualified],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn add_edge(
+        conn: &Connection,
+        source_file_id: i64,
+        to_name: &str,
+        target_qualified_name: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, \
+             confidence, resolution) VALUES (?1, ?2, ?3, 'calls_name', 'NameOnly', 'unresolved')",
+            params![source_file_id, to_name, target_qualified_name],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn edge_state(conn: &Connection, edge_id: i64) -> (Option<i64>, String, String) {
+        conn.query_row(
+            "SELECT to_symbol_id, confidence, resolution FROM edges WHERE id = ?1",
+            params![edge_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// The #89 regression: with a DEAD scope's rows still in the DB (post-HEAD-move before gc, or
+    /// a sibling worktree's live scope), resolution must behave exactly as in a single-scope DB —
+    /// unique qualified-suffix matches stay `qualified_suffix` (not demoted to `logical_variant`
+    /// picking an arbitrary scope's copy), and the target id belongs to the ACTIVE scope.
+    #[test]
+    fn resolution_is_scoped_to_the_active_checkout() {
+        let conn = seeded_conn();
+        // Active scope NEW + dead scope OLD, same corpus shape in both.
+        let caller_new = add_file(&conn, "a.rs", NEW);
+        let defs_new = add_file(&conn, "b.rs", NEW);
+        let caller_old = add_file(&conn, "a.rs", OLD);
+        let defs_old = add_file(&conn, "b.rs", OLD);
+        let target_new = add_symbol(&conn, defs_new, "target", "crate::b::target");
+        let target_old = add_symbol(&conn, defs_old, "target", "crate::b::target");
+        add_symbol(&conn, caller_new, "caller", "crate::a::caller");
+        add_symbol(&conn, caller_old, "caller", "crate::a::caller");
+
+        // The suffix-shaped qualified target exercises the by_qn_tail arm (the one duplicates
+        // demote): `b::target` matches `crate::b::target` by suffix.
+        let edge_new = add_edge(&conn, caller_new, "b::target", "b::target");
+        // The dead scope's own edge: pre-resolved to its own scope's symbol; must stay untouched.
+        let edge_old = add_edge(&conn, caller_old, "b::target", "b::target");
+        conn.execute(
+            "UPDATE edges SET to_symbol_id = ?2, confidence = 'Syntactic', resolution = \
+             'qualified_suffix' WHERE id = ?1",
+            params![edge_old, target_old],
+        )
+        .unwrap();
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, confidence, resolution) = edge_state(&conn, edge_new);
+        assert_eq!(
+            to,
+            Some(target_new),
+            "the active edge must resolve to the ACTIVE scope's symbol, not an arbitrary copy"
+        );
+        assert_eq!(confidence, "Syntactic");
+        assert_eq!(
+            resolution, "qualified_suffix",
+            "a unique in-scope suffix match must not demote to logical_variant"
+        );
+
+        let (to, _, resolution) = edge_state(&conn, edge_old);
+        assert_eq!(to, Some(target_old), "the dead scope's edge is left untouched");
+        assert_eq!(resolution, "qualified_suffix");
+    }
+
+    /// A dirty-worktree overlay shadows the committed row: resolution must target the OVERLAY's
+    /// symbols (the active content), not the shadowed committed copy.
+    #[test]
+    fn resolution_prefers_overlay_over_shadowed_committed_rows() {
+        let conn = seeded_conn();
+        let caller = add_file(&conn, "a.rs", NEW);
+        let defs_committed = add_file(&conn, "b.rs", NEW);
+        // Overlay row for b.rs (dirty file): commit_sha empty, worktree id set.
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id) VALUES ('b.rs', 'rust', 'source', 'sha-overlay', 0, 0, '', \
+             '/wt')",
+            [],
+        )
+        .unwrap();
+        let defs_overlay = conn.last_insert_rowid();
+        add_symbol(&conn, defs_committed, "target", "crate::b::target");
+        let target_overlay = add_symbol(&conn, defs_overlay, "target", "crate::b::target");
+        add_symbol(&conn, caller, "caller", "crate::a::caller");
+        let edge = add_edge(&conn, caller, "b::target", "b::target");
+
+        crate::index::install_scope_view(&conn, NEW, "/wt").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, resolution) = edge_state(&conn, edge);
+        assert_eq!(to, Some(target_overlay), "overlay symbols win over shadowed committed rows");
+        assert_eq!(resolution, "qualified_suffix");
+    }
 }
