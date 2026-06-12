@@ -3050,6 +3050,11 @@ fn moniker_binding_validation_statuses() {
     assert_eq!(direct.len(), 1, "stale moniker anchor must not demote the memory");
     assert!(stale.is_empty());
 
+    // ...and must not count toward the anchor-health totals that drive the "run memory doctor"
+    // warnings — doctor hides moniker rows, so counting them would warn about nothing visible.
+    let health = crate::query::memory::anchor_health_counts(&h.conn).unwrap();
+    assert_eq!(health.stale, 0, "auxiliary moniker anchors are excluded from health counts");
+
     // Gone: the tool has current data, but not this moniker.
     h.conn
         .execute(
@@ -3090,4 +3095,110 @@ fn moniker_for_symbol_with_member_defs_is_the_symbols_own() {
     assert_eq!(report.monikers_written, 1, "one row per logical symbol, not per def");
     let (moniker, ..) = h.moniker(3003).expect("moniker row written");
     assert_eq!(moniker, struct_moniker, "the symbol's own (shortest) moniker wins");
+}
+
+/// Moniker-STRING drift (Codex P2): rust-analyzer monikers embed the Cargo package version, so a
+/// routine version bump rewrites every string while no symbol changes. The binding's stored
+/// content-derived logical id is still live, so validation re-anchors the binding to the new
+/// string (`relocated`, reason `moniker-refresh`) instead of marking it gone forever — and a
+/// LATER file move can still relocate via the refreshed moniker.
+#[test]
+fn moniker_string_drift_rebinds_via_live_logical_symbol_then_survives_move() {
+    let h = Harness::new();
+    let defs = h.add_file("defs.rs", "fn target() {}\n");
+    let sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+    h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", sym);
+    let bytes = scip_bytes_docs(vec![("defs.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        TARGET_MONIKER,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+    let memory_id = create_target_memory(&h, sym);
+
+    // Crate version bump: same symbol, same location, NEW moniker string + tool version.
+    let bumped_moniker = "rust-analyzer cargo test_crate 0.2.0 target().";
+    let bytes = scip_bytes_docs(vec![("defs.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        bumped_moniker,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, "v-bumped", COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+
+    validate_memories(&h.conn).unwrap();
+    let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
+    let moniker_binding =
+        memory.bindings.iter().find(|b| b.binding_kind == "scip_moniker").expect("moniker binding");
+    assert_eq!(moniker_binding.anchor_status, "relocated");
+    assert_eq!(moniker_binding.binding_id, bumped_moniker, "rebound to the current string");
+    assert_eq!(moniker_binding.moniker_tool_version.as_deref(), Some("v-bumped"));
+    assert_eq!(moniker_binding.relocation_reason.as_deref(), Some("moniker-refresh"));
+
+    // The refreshed anchor still does its job: a later move + content edit relocates via it.
+    move_target_with_edit(&h, defs, "function");
+    let bytes = scip_bytes_docs(vec![("moved.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        bumped_moniker,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, "v-bumped", COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+    validate_memories(&h.conn).unwrap();
+    let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
+    let symbol_binding =
+        memory.bindings.iter().find(|b| b.binding_kind == "symbol").expect("symbol binding");
+    assert_eq!(symbol_binding.anchor_status, "relocated");
+    assert_eq!(symbol_binding.path.as_deref(), Some("moved.rs"));
+    assert_eq!(symbol_binding.relocation_reason.as_deref(), Some("moniker-match"));
+}
+
+/// The string-resolution path must NOT refresh the bind-time `moniker_tool_version` (Codex P1):
+/// the cross-version corroboration gate compares the CURRENT data's version against bind-time
+/// provenance, and a "last verified" refresh would silently downgrade a real cross-version match
+/// to same-version.
+#[test]
+fn string_resolution_preserves_bind_time_tool_version() {
+    let h = Harness::new();
+    let defs = h.add_file("defs.rs", "fn target() {}\n");
+    let sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+    h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", sym);
+    let bytes = scip_bytes_docs(vec![("defs.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        TARGET_MONIKER,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+    let memory_id = create_target_memory(&h, sym);
+
+    // Move with the SAME moniker string but a NEWER tool version: the stored logical id is dead,
+    // so validation takes the string-resolution path.
+    move_target_with_edit(&h, defs, "function");
+    let bytes = scip_bytes_docs(vec![("moved.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        TARGET_MONIKER,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, "v-newer", COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+    validate_memories(&h.conn).unwrap();
+
+    let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
+    let moniker_binding =
+        memory.bindings.iter().find(|b| b.binding_kind == "scip_moniker").expect("moniker binding");
+    assert_eq!(moniker_binding.anchor_status, "relocated");
+    assert_eq!(
+        moniker_binding.moniker_tool_version.as_deref(),
+        Some(VERSION),
+        "bind-time provenance must survive a string-resolution relocate"
+    );
 }

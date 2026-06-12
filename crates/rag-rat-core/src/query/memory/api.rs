@@ -704,6 +704,10 @@ pub(crate) fn anchor_health_counts(
         FROM repo_memory_bindings AS b
         JOIN repo_memories AS m ON m.id = b.memory_id
         WHERE m.status = 'active'
+          -- Auxiliary `scip_moniker` anchors are excluded exactly as in `doctor_report`: these
+          -- counts drive the 'run memory doctor' warnings, so counting rows doctor then hides
+          -- would yield an unresolvable warning (#70 review).
+          AND b.binding_kind != 'scip_moniker'
         GROUP BY b.anchor_status
         ",
     )?;

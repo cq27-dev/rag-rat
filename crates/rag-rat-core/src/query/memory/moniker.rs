@@ -22,6 +22,12 @@ use super::*;
 /// qualified-name/content paths.
 pub(crate) const MONIKER_MATCH_REASON: &str = "moniker-match";
 
+/// Why a `scip_moniker` binding's own anchor string was rewritten: its live logical symbol got a
+/// NEW moniker from the latest run (rust-analyzer monikers embed the Cargo package version, so a
+/// routine version bump changes every string without changing any symbol identity). The rebind is
+/// keyed off our own content-derived logical id, not fuzzy matching.
+pub(crate) const MONIKER_REFRESH_REASON: &str = "moniker-refresh";
+
 /// The binding kind for a moniker anchor row.
 pub(crate) const SCIP_MONIKER_BINDING_KIND: &str = "scip_moniker";
 
@@ -49,6 +55,27 @@ pub(crate) fn moniker_for_logical_symbol(
         LIMIT 1
         ",
         [logical_symbol_id],
+        |row| Ok(MonikerRow { moniker: row.get(0)?, tool: row.get(1)?, tool_version: row.get(2)? }),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The current moniker row for a logical symbol under a SPECIFIC tool — the read the validation
+/// re-derivation path uses (the binding records which tool supplied its anchor, so the refresh
+/// must not cross tools).
+pub(crate) fn moniker_for_logical_symbol_tool(
+    conn: &Connection,
+    logical_symbol_id: i64,
+    tool: &str,
+) -> anyhow::Result<Option<MonikerRow>> {
+    conn.query_row(
+        "
+        SELECT moniker, tool, tool_version
+        FROM logical_symbol_monikers
+        WHERE logical_symbol_id = ?1 AND tool = ?2
+        ",
+        params![logical_symbol_id, tool],
         |row| Ok(MonikerRow { moniker: row.get(0)?, tool: row.get(1)?, tool_version: row.get(2)? }),
     )
     .optional()
@@ -298,11 +325,25 @@ pub(crate) fn insert_auto_moniker_binding(
 ///
 /// - `unverified` — no oracle data for the tool at all (nothing can be said), or a malformed row
 ///   missing its tool provenance.
-/// - `gone` — the tool has current data and the moniker is not in it.
+/// - `gone` — the tool has current data and the moniker is not in it (and the stored logical symbol
+///   is dead too).
 /// - `stale` — the data is outdated (the moniker's row dangles after the symbol changed) or
 ///   ambiguous (two live logical symbols share it); awaiting the next `oracle run`.
-/// - `current` / `relocated` — unique live match; `relocated` when the resolved logical symbol
-///   differs from the stored one (the binding's fields are rewritten to the new home).
+/// - `current` / `relocated` — anchored to a live logical symbol; `relocated` when the resolved
+///   logical symbol — or the moniker string itself — changed (the binding is rewritten).
+///
+/// Resolution order is deliberate. (1) The binding's stored `logical_symbol_id` is a
+/// CONTENT-DERIVED stable id — when it is still live and carries a current moniker row, that is
+/// the strongest evidence and also heals MONIKER-STRING DRIFT: rust-analyzer monikers embed the
+/// Cargo package version, so a routine version bump rewrites every string while no symbol
+/// changes; matching by string alone would mark every anchor `gone` forever. The rebind takes the
+/// row's fresh `tool_version` as new provenance (it is a re-bind under current data, not a
+/// cross-version string trust). (2) Only when the stored id is dead (the file-move case) does the
+/// recorded STRING resolve against current rows — and there the bind-time
+/// `moniker_tool_version` is deliberately NOT refreshed, so the cross-version corroboration gate
+/// in [`relocate_binding_by_moniker`] always compares against bind-time provenance (Codex P1: a
+/// refreshed "last verified" version would silently downgrade a real cross-version match to
+/// same-version).
 pub(crate) fn validate_moniker_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
@@ -310,25 +351,35 @@ pub(crate) fn validate_moniker_binding(
     let Some(tool) = binding.moniker_tool.clone() else {
         return Ok("unverified".to_string());
     };
+    // (1) The stored stable logical id is live and has a current moniker row → anchor there.
+    if let Some(stored_id) = binding.logical_symbol_id
+        && crate::query::symbol::lookup_logical_by_id(conn, stored_id)?.is_some()
+        && let Some(row) = moniker_for_logical_symbol_tool(conn, stored_id, &tool)?
+    {
+        let Some(matched) = relocate_match_for_logical_symbol(conn, stored_id)? else {
+            return Ok("stale".to_string());
+        };
+        let drifted = binding.binding_id != row.moniker;
+        apply_relocate_match(binding, &matched);
+        if drifted {
+            binding.binding_id = row.moniker;
+            binding.moniker_tool_version = Some(row.tool_version);
+            binding.relocation_reason = Some(MONIKER_REFRESH_REASON.to_string());
+            return Ok("relocated".to_string());
+        }
+        return Ok("current".to_string());
+    }
+    // (2) The stored id is dead (file move) or has no current row: resolve the recorded string.
     match resolve_moniker(conn, &binding.binding_id, &tool)? {
         MonikerResolution::NoData => Ok("unverified".to_string()),
         MonikerResolution::Gone => Ok("gone".to_string()),
         MonikerResolution::Dangling | MonikerResolution::Ambiguous => Ok("stale".to_string()),
-        MonikerResolution::Unique { logical_symbol_id, tool_version } => {
+        MonikerResolution::Unique { logical_symbol_id, tool_version: _ } => {
             let moved = binding.logical_symbol_id != Some(logical_symbol_id);
             let Some(matched) = relocate_match_for_logical_symbol(conn, logical_symbol_id)? else {
                 return Ok("stale".to_string());
             };
-            binding.logical_symbol_id = matched.logical_symbol_id;
-            binding.symbol_id = Some(matched.symbol_id);
-            binding.path = Some(matched.path);
-            binding.chunk_id = matched.chunk_id;
-            binding.start_line = matched.start_line;
-            binding.end_line = matched.end_line;
-            binding.symbol_kind = matched.symbol_kind;
-            binding.signature_hash = matched.signature_hash;
-            // The binding is now verified against this version's data.
-            binding.moniker_tool_version = Some(tool_version);
+            apply_relocate_match(binding, &matched);
             if moved {
                 binding.relocation_reason = Some(MONIKER_MATCH_REASON.to_string());
                 Ok("relocated".to_string())
@@ -337,4 +388,17 @@ pub(crate) fn validate_moniker_binding(
             }
         },
     }
+}
+
+/// Rewrite a binding's location fields from a relocate match (shared by the moniker validate arms;
+/// the symbol/logical fallback in validate.rs additionally rewrites `binding_id`).
+fn apply_relocate_match(binding: &mut RepoMemoryBinding, matched: &RelocateMatch) {
+    binding.logical_symbol_id = matched.logical_symbol_id;
+    binding.symbol_id = Some(matched.symbol_id);
+    binding.path = Some(matched.path.clone());
+    binding.chunk_id = matched.chunk_id;
+    binding.start_line = matched.start_line;
+    binding.end_line = matched.end_line;
+    binding.symbol_kind = matched.symbol_kind.clone();
+    binding.signature_hash = matched.signature_hash.clone();
 }
