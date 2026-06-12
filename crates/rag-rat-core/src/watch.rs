@@ -135,12 +135,21 @@ fn kind_is_mutation(kind: &EventKind) -> bool {
     }
 }
 
-/// A relevant event is a rescan/overflow notice, or a *content-mutating* event whose path matches a
-/// configured target and is **not** ignored by the repo's compiled `.gitignore` rules + floor
-/// (issue #62). Classification only decides *whether to fire a pass*, not what to index (the
-/// discover sweep does that). The walker and watcher share one [`IgnoreMatcher`] so a path the
-/// walker won't index also won't fire a re-index here — no drift. Read-only events never fire
-/// regardless of path (see [`kind_is_mutation`]).
+/// Whether `path`'s file name is `.gitignore`. A mutation to any `**/.gitignore` changes the
+/// repo's ignore rules, so it is a relevant event (issue #62 / PR #66 finding 4) even though
+/// `.gitignore` is not a configured target language — the pass it fires recompiles the matcher and
+/// re-discovers (dropping newly-ignored files, adding newly-unignored ones).
+fn is_gitignore_path(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == ".gitignore")
+}
+
+/// A relevant event is a rescan/overflow notice, a *content-mutating* `.gitignore` edit (the rules
+/// themselves changed — finding 4), or a *content-mutating* event whose path matches a configured
+/// target and is **not** ignored by the repo's compiled `.gitignore` rules + floor (issue #62).
+/// Classification only decides *whether to fire a pass*, not what to index (the discover sweep does
+/// that). The walker and watcher share one [`IgnoreMatcher`] so a path the walker won't index also
+/// won't fire a re-index here — no drift. Read-only events never fire regardless of path (see
+/// [`kind_is_mutation`]).
 ///
 /// The event path may be a just-deleted file, so dir-ness can't be stat'd; we pass `is_dir = false`
 /// to the gitignore match. That is sound for the floor (component-name check is dir-ness-agnostic)
@@ -154,6 +163,11 @@ fn event_is_relevant(config: &Config, ignore: &IgnoreMatcher, event: &Event) -> 
         return false;
     }
     event.paths.iter().any(|path| {
+        // A `.gitignore` edit changes the rules; it must fire a pass even though it is not a
+        // target file and may itself sit in a directory the *current* rules ignore.
+        if is_gitignore_path(path) {
+            return true;
+        }
         if ignore.is_ignored(path, false) {
             return false;
         }
@@ -258,11 +272,12 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
             let _ = notify_watcher.watch(&config.root.join(dir), RecursiveMode::Recursive);
         }
     }
-    // Compile the repo's `.gitignore` rules once for event classification — the same matcher the
-    // discover walk uses (issue #62), so an ignored path never fires a pass. Recompiled only at
-    // watcher start; a `.gitignore` edit is itself a mutation event that fires a pass, and each
-    // pass's discover walk recompiles, so the index stays correct even if this classifier lags.
-    let ignore = IgnoreMatcher::compile(&config.root);
+    // Compile the repo's `.gitignore` rules for event classification — the same matcher the
+    // discover walk uses (issue #62), so an ignored path never fires a pass. Recompiled whenever a
+    // `.gitignore` mutation is observed (finding 3) so the running classifier never applies stale
+    // rules; each pass's discover walk also compiles its own fresh matcher, so the index itself is
+    // always current regardless.
+    let mut ignore = IgnoreMatcher::compile(&config.root);
     // Fleet hot-upgrade: also watch the installed binary's directory so a new `cargo install`
     // rename triggers a fleet-wide upgrade. Watch the directory (not the file) so the atomic
     // rename — which replaces the inode — is still observed.
@@ -297,6 +312,15 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
                 let now = Instant::now();
                 if event_is_relevant(&config, &ignore, &event) {
                     debounce.on_event(now);
+                    // A `.gitignore` mutation changed the rules — recompile so subsequent events
+                    // are classified against current rules, not the matcher
+                    // this watcher booted with (finding 3). Cheap relative to a
+                    // pass and only runs on actual gitignore edits.
+                    if kind_is_mutation(&event.kind)
+                        && event.paths.iter().any(|path| is_gitignore_path(path))
+                    {
+                        ignore = IgnoreMatcher::compile(&config.root);
+                    }
                 }
                 if event_targets_binary(fleet_bin.as_deref(), &event) {
                     fleet_debounce.on_event(now);
@@ -406,6 +430,65 @@ mod tests {
         let created =
             Event::new(EventKind::Create(CreateKind::File)).add_path(root.join("crates/new.rs"));
         assert!(event_is_relevant(&config, &ignore, &created), "new source file fires");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn gitignore_edit_is_relevant_and_recompile_reflects_new_rules() {
+        // FINDINGS 3 + 4: a `.gitignore` mutation must (4) fire a pass even though `.gitignore` is
+        // not a target language, and (3) recompiling the matcher must make subsequent
+        // classification honor the new rules — so a now-ignored file stops firing and a
+        // now-unignored file resumes.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ragrat-watchgi-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(root.join("crates")).unwrap();
+        // Initially nothing is gitignored.
+        std::fs::write(root.join(".gitignore"), "").unwrap();
+
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("crates")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            watch: WatchConfig::default(),
+        };
+
+        let ignore = IgnoreMatcher::compile(&root);
+        let secret = root.join("crates/secret.rs");
+        // Before the rule edit: a normal source edit fires.
+        assert!(event_is_relevant(&config, &ignore, &mutation_event(secret.clone())), "fires pre");
+
+        // A `.gitignore` mutation is itself relevant (finding 4) — even a root `.gitignore`, and
+        // even a nested one that has no target language.
+        let gi_edit = mutation_event(root.join(".gitignore"));
+        assert!(event_is_relevant(&config, &ignore, &gi_edit), "gitignore edit fires a pass");
+        let nested_gi = mutation_event(root.join("crates/.gitignore"));
+        assert!(event_is_relevant(&config, &ignore, &nested_gi), "nested gitignore edit fires");
+
+        // Now the user adds `secret.rs` to `.gitignore`; recompiling (finding 3) must make the
+        // classifier drop it.
+        std::fs::write(root.join(".gitignore"), "secret.rs\n").unwrap();
+        let ignore = IgnoreMatcher::compile(&root);
+        assert!(
+            !event_is_relevant(&config, &ignore, &mutation_event(secret)),
+            "recompiled matcher honors the new ignore rule (now-ignored file stops firing)",
+        );
+        // A different, still-unignored source file keeps firing.
+        let other = root.join("crates/keep.rs");
+        assert!(
+            event_is_relevant(&config, &ignore, &mutation_event(other)),
+            "unignored still fires"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
