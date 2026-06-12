@@ -52,6 +52,7 @@ pub(crate) fn call_tool_with_db(
             let resolution_mode = resolution_mode(args.resolution);
             compare_graph_to_text_tool(db, args, resolution_mode)?
         },
+        "compare_graph_to_scip" => json!(db.compare_graph_to_scip()?),
         "impact_surface" => {
             let args: ImpactArgs = serde_json::from_value(arguments)?;
             let resolution_mode = resolution_mode(args.resolution);

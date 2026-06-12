@@ -129,6 +129,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "find_callers",
     "trace_callees",
     "compare_graph_to_text",
+    "compare_graph_to_scip",
     "impact_surface",
     "repo_brief",
     "repo_clusters",
@@ -667,6 +668,11 @@ pub fn description(name: &str) -> &'static str {
             "Cross-check a symbol's graph caller edges against a regex text search of indexed \
              source — surfaces call sites the tree-sitter graph missed and flags likely false \
              edges. Use when you suspect graph coverage gaps.",
+        "compare_graph_to_scip" =>
+            "Cross-check the tree-sitter graph against the SCIP compiler oracle — report the edges \
+             where they DISAGREE on a callee's resolution (the compiler contradicts tree-sitter). \
+             A resolver-debugging diagnostic; requires `rag-rat oracle run` first to populate \
+             compiler verdicts. Reports nothing when no oracle data exists for this checkout.",
         "impact_surface" =>
             "Pre-edit blast radius for a symbol or path: graph callers/callees, tests, docs, git \
              history, GitHub papertrail, and the repo memories crossing it, with a completeness / \
@@ -767,6 +773,7 @@ pub fn schema(name: &str) -> Value {
             schema_for::<SymbolArgs>(),
         "find_callers" | "trace_callees" | "docs_for_symbol" => schema_for::<SymbolGraphArgs>(),
         "compare_graph_to_text" => schema_for::<CompareGraphTextArgs>(),
+        "compare_graph_to_scip" => schema_for::<EmptyArgs>(),
         "impact_surface" => schema_for::<ImpactArgs>(),
         "repo_brief" => schema_for::<RepoBriefArgs>(),
         "repo_clusters" => schema_for::<RepoClustersArgs>(),

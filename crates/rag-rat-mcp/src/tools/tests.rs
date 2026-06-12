@@ -51,6 +51,7 @@ fn list_tools_exposes_complete_typed_schemas() {
         "find_callers",
         "trace_callees",
         "compare_graph_to_text",
+        "compare_graph_to_scip",
         "impact_surface",
         "repo_brief",
         "repo_clusters",

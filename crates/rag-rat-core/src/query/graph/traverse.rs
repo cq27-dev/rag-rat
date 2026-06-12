@@ -138,6 +138,10 @@ pub(crate) fn traverse_with_options(
             evidence: row.get("evidence")?,
             receiver_hint: row.get("receiver_hint")?,
             resolution,
+            // Heuristic traversal sets no oracle fields; the `IndexDatabase` enrichment pass
+            // (`enrich_hops_with_oracle`) fills these from a current, in-scope `edge_oracle` join.
+            resolution_reason: None,
+            resolved_external: None,
             verified_target_symbol,
             shown_by_default: CALL_EDGE_KINDS.contains(&edge_kind.as_str()),
             callsite: Some(Callsite {

@@ -70,6 +70,7 @@ fn main() -> anyhow::Result<()> {
             print_json(&db.gc()?)?;
         },
         Cmd::Eval(args) => eval(&config, &args)?,
+        Cmd::Oracle(args) => oracle(&config, &args)?,
         Cmd::DumpConfig => dump_config(&config)?,
     }
 

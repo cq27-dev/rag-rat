@@ -238,7 +238,13 @@ pub struct GraphHop {
     pub from_symbol: Option<String>,
     pub to_symbol: Option<String>,
     pub edge_kind: String,
+    /// The DISPLAYED confidence tier. Normally the heuristic tier (`exact`/`syntactic`/…);
+    /// upgraded to `compiler` when a current, in-scope `edge_oracle` verdict covers this edge
+    /// (the new tier ABOVE `exact`). `edge_confidence` always keeps the underlying heuristic
+    /// tier so the upgrade is legible.
     pub confidence: String,
+    /// The heuristic edge confidence as stored on the `edges` row, regardless of any oracle
+    /// upgrade — so a `compiler`-tier hop still shows what tree-sitter alone concluded.
     pub edge_confidence: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
@@ -249,6 +255,15 @@ pub struct GraphHop {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_hint: Option<String>,
     pub resolution: String,
+    /// `scip:<tool>@<version>` when this hop carries a current oracle verdict — the provenance of
+    /// the `compiler` tier (and the `resolved-external` placement). `None` for heuristic-only
+    /// hops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_reason: Option<String>,
+    /// `resolved-external(<package>)` when the oracle resolved this callee to a dependency outside
+    /// the corpus. Present only on `resolved-external` verdicts; `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_external: Option<String>,
     pub verified_target_symbol: bool,
     pub shown_by_default: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,4 +275,60 @@ pub struct Callsite {
     pub path: String,
     pub line: i64,
     pub span: [i64; 2],
+}
+
+/// Report for `compare_graph_to_scip`: where tree-sitter and the compiler (SCIP) DISAGREE on an
+/// edge's resolution. Sibling of [`CompareGraphTextReport`]; a user diagnostic + a resolver-
+/// debugging instrument. Built from the `Contradict` verdicts in `edge_oracle` (the heuristic
+/// resolved an edge to an in-corpus target the compiler says is wrong), scoped to the active
+/// checkout and gated to current content — never from drifted/dirty rows.
+#[derive(Debug, Serialize)]
+pub struct CompareGraphScipReport {
+    pub query: CompareGraphScipQuery,
+    pub summary: CompareGraphScipSummary,
+    /// Edges the compiler contradicts: tree-sitter resolved them one way, SCIP another.
+    pub contradictions: Vec<GraphScipContradiction>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompareGraphScipQuery {
+    pub tool: String,
+    pub tool_version: Option<String>,
+    pub commit_sha: String,
+    pub worktree_id: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct CompareGraphScipSummary {
+    /// `edge_oracle` rows examined in scope (current content only).
+    pub verdicts_examined: u64,
+    /// How many were `Contradict` (the heuristic and compiler disagree).
+    pub contradictions: u64,
+    /// True when no oracle run has populated this checkout — `contradictions` is then trivially 0
+    /// because there's nothing to compare, not because the graph agrees with the compiler.
+    pub no_oracle_data: bool,
+    pub warnings: Vec<String>,
+}
+
+/// One edge where the heuristic and the compiler disagree on the callee's resolution.
+#[derive(Debug, Serialize)]
+pub struct GraphScipContradiction {
+    pub edge_id: i64,
+    pub edge_kind: String,
+    /// The heuristic's confidence (`exact`/`syntactic`/…) — what tree-sitter concluded.
+    pub heuristic_confidence: String,
+    /// The heuristic's resolved target symbol (qualified name), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heuristic_target: Option<String>,
+    /// The callee name the edge points at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee_name: Option<String>,
+    /// The raw SCIP symbol the compiler resolved the callee to — the disagreement's other side.
+    pub scip_symbol: String,
+    /// `resolved-external(<package>)` when the compiler placed the callee in a dependency; `None`
+    /// when it resolved to a different in-corpus symbol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_external: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callsite: Option<Callsite>,
 }

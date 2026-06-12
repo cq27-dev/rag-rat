@@ -67,6 +67,61 @@ impl IndexDatabase {
         )
     }
 
+    /// `rag-rat oracle run [--tool <id>]` without a pre-built `--scip`: invoke the indexer to
+    /// produce a `.scip` (to a caller-owned temp path), then run the phase-1 join over it. A
+    /// missing or unrunnable tool returns [`oracle::OracleRunOutcome::Blocked`] with an install
+    /// hint (the CLI prints it and exits 0) — never an error. Records an `oracle_runs` row on
+    /// success.
+    pub fn run_oracle_with_tool(
+        &self,
+        tool: OracleTool,
+        scip_output: &Path,
+    ) -> anyhow::Result<oracle::OracleRunOutcome> {
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!(
+                "index has no source_root metadata; rebuild required for the oracle pass"
+            );
+        };
+        let root = root.to_path_buf();
+        oracle::run_oracle_with_tool(
+            self.storage.connection(),
+            tool,
+            &root,
+            scip_output,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )
+    }
+
+    /// Run the oracle pass over a PRE-BUILT `.scip` for a tool, recording an `oracle_runs` row. The
+    /// `--scip <path>` consumption path of `oracle run`; deterministic (no subprocess), so it's the
+    /// tested end-to-end seam. `tool_version` labels the run (content-addressed staleness key).
+    pub fn run_oracle_from_scip(
+        &self,
+        tool: OracleTool,
+        tool_version: &str,
+        scip_bytes: &[u8],
+    ) -> anyhow::Result<oracle::OracleReport> {
+        self.run_oracle(tool, tool_version, scip_bytes)
+    }
+
+    /// Probe whether an oracle tool is installed, for `oracle status`. A `Blocked` probe is
+    /// informational (the tool isn't installed), never an error.
+    pub fn probe_oracle_tool(&self, tool: OracleTool) -> oracle::ToolAvailability {
+        oracle::probe_oracle_tool(tool)
+    }
+
+    /// The `tool_version` of the most recent oracle run for `tool` in this checkout, or `None` when
+    /// no run exists. The version `oracle status` reports verdict counts against.
+    pub fn latest_oracle_run_version(&self, tool: OracleTool) -> anyhow::Result<Option<String>> {
+        oracle::latest_run_tool_version(
+            self.storage.connection(),
+            tool,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )
+    }
+
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
         let mut counts = BTreeMap::new();
         let mut stmt = self
@@ -778,6 +833,12 @@ impl IndexDatabase {
         )?;
         self.delete_staged_files_cascade()?;
         conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
+        // `edge_oracle` verdicts cascade away with their edges via the FK ON DELETE CASCADE (fired
+        // by the cascade above, with `PRAGMA foreign_keys=ON`). `oracle_runs`, however, is keyed by
+        // `(commit_sha, worktree_id)` directly — nothing cascades it — so a dead checkout's run
+        // rows would survive the file pruning. Prune them with the SAME live sets, so a run and the
+        // edges it produced are dropped together.
+        oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
         let files_remaining = table_row_count(conn, "files")?;
         let chunks_remaining = table_row_count(conn, "chunks")?;
         Ok(GcReport {
@@ -867,13 +928,84 @@ impl IndexDatabase {
         options: &crate::query::graph::GraphTraversalOptions,
     ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
         let options = self.graph_options_with_logical_group(options)?;
-        crate::query::graph::traverse_with_options(
+        let mut hops = crate::query::graph::traverse_with_options(
             self.storage.connection(),
             symbol,
             true,
             limit,
             &options,
-        )
+        )?;
+        self.enrich_hops_with_oracle(&mut hops)?;
+        Ok(hops)
+    }
+
+    /// Upgrade graph hops to the `Compiler` confidence tier where a CURRENT, in-scope `edge_oracle`
+    /// verdict covers the edge — the read-side surfacing for `trace_callees` / `find_callers` /
+    /// `impact_surface`. The heuristic `edges` row is NEVER mutated (side-table invariant); this
+    /// JOINs `edge_oracle` (scoped to the active checkout AND filtered to current content via
+    /// `file_sha == files.sha256`) at read time and rewrites only the in-memory hop's display
+    /// fields:
+    /// - `Upgrade`/`Confirm` (in-corpus compiler resolution) → `confidence = "compiler"` with
+    ///   `resolution_reason = "scip:<tool>@<version>"`. A drifted file's verdict is excluded by the
+    ///   current-content filter, so the hop reverts to heuristic display (never `compiler`).
+    /// - `ResolvedExternal` → `resolved_external = "resolved-external(<package>)"` + the reason;
+    ///   the confidence stays heuristic (the callee is outside the corpus, not an in-corpus
+    ///   upgrade).
+    /// - `Contradict` is NOT surfaced as `compiler`: the oracle disagrees with the heuristic
+    ///   target, so promoting it would assert a resolution we don't stand behind — it stays
+    ///   heuristic (`compare_graph_to_scip` is where contradictions surface).
+    ///
+    /// Dirty/overlay (uncommitted) edges never carry oracle verdicts (oracle rows bind to
+    /// commit-scoped index rows only), so they always show heuristic — this falls out of the
+    /// `(commit_sha, worktree_id)` scope with no special-casing.
+    fn enrich_hops_with_oracle(
+        &self,
+        hops: &mut [crate::query::graph::GraphHop],
+    ) -> anyhow::Result<()> {
+        if hops.is_empty() {
+            return Ok(());
+        }
+        let tool = oracle::OracleTool::RustAnalyzer;
+        let Some(tool_version) = oracle::latest_run_tool_version(
+            self.storage.connection(),
+            tool,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )?
+        else {
+            // No oracle run for this checkout — nothing to surface, all hops stay heuristic.
+            return Ok(());
+        };
+        let edge_ids = hops.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
+        let verdicts = oracle::current_oracle_verdicts_for_edges(
+            self.storage.connection(),
+            tool,
+            &tool_version,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+            &edge_ids,
+        )?;
+        if verdicts.is_empty() {
+            return Ok(());
+        }
+        for hop in hops.iter_mut() {
+            let Some(verdict) = verdicts.get(&hop.edge_id) else {
+                continue;
+            };
+            match verdict.kind {
+                oracle::OracleResolutionKind::Upgrade | oracle::OracleResolutionKind::Confirm => {
+                    hop.confidence = "compiler".to_string();
+                    hop.resolution_reason = Some(verdict.resolution_reason());
+                },
+                oracle::OracleResolutionKind::ResolvedExternal => {
+                    hop.resolved_external = verdict.resolved_external_label();
+                    hop.resolution_reason = Some(verdict.resolution_reason());
+                },
+                // The oracle disagrees with the heuristic target — do not promote to `compiler`.
+                oracle::OracleResolutionKind::Contradict => {},
+            }
+        }
+        Ok(())
     }
 
     pub fn trace_callees(
@@ -891,13 +1023,15 @@ impl IndexDatabase {
         options: &crate::query::graph::GraphTraversalOptions,
     ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
         let options = self.graph_options_with_logical_group(options)?;
-        crate::query::graph::traverse_with_options(
+        let mut hops = crate::query::graph::traverse_with_options(
             self.storage.connection(),
             symbol,
             false,
             limit,
             &options,
-        )
+        )?;
+        self.enrich_hops_with_oracle(&mut hops)?;
+        Ok(hops)
     }
 
     pub fn graph_traversal_report(
@@ -909,14 +1043,15 @@ impl IndexDatabase {
         options: &crate::query::graph::GraphTraversalOptions,
     ) -> anyhow::Result<crate::query::graph::GraphTraversalReport> {
         let options = self.graph_options_with_logical_group(options)?;
-        let results = crate::query::graph::traverse_with_options(
+        let mut results = crate::query::graph::traverse_with_options(
             self.storage.connection(),
             &symbol.qualified_name,
             reverse,
             limit,
             &options,
         )?;
-        let summary = crate::query::graph::traversal_summary(
+        self.enrich_hops_with_oracle(&mut results)?;
+        let mut summary = crate::query::graph::traversal_summary(
             self.storage.connection(),
             &symbol.qualified_name,
             reverse,
@@ -924,6 +1059,12 @@ impl IndexDatabase {
             &options,
             results.len(),
         )?;
+        // Make `completeness_risk` quantitative where the oracle covers the unresolved neighbors:
+        // append a clause like "2 of 7 unresolved are resolved-external: libc, tokio". This is a
+        // read-time annotation derived from the surfaced `resolved-external` verdicts — the risk
+        // *level* string is unchanged; the clause just tells the caller how much of the gap is a
+        // known external dependency rather than a resolver miss.
+        annotate_completeness_with_externals(&mut summary, &results);
         let (logical_symbol, variants) = self.graph_logical_symbol(options.logical_symbol_id)?;
         let mut paths = BTreeSet::new();
         paths.insert(symbol.path.clone());
@@ -1122,6 +1263,91 @@ impl IndexDatabase {
         })
     }
 
+    /// `compare_graph_to_scip` — report where tree-sitter and the compiler (SCIP) DISAGREE on edge
+    /// resolution: the `Contradict` verdicts in `edge_oracle` (the heuristic resolved an edge to an
+    /// in-corpus target the compiler says is wrong, OR resolved in-corpus while the compiler placed
+    /// the callee in a dependency). A user diagnostic + our own resolver-debugging instrument,
+    /// sibling of `compare_graph_to_text`.
+    ///
+    /// Scoped + current ONLY: reads through the store's scope+current join, so a sibling worktree's
+    /// or a drifted/dirty file's verdict is never reported. When no oracle run has populated this
+    /// checkout, `no_oracle_data` is set and the contradiction list is empty (the graph isn't
+    /// "verified to agree" — there's just nothing to compare). The heuristic `edges` row is never
+    /// mutated; this is pure read-time diffing.
+    pub fn compare_graph_to_scip(
+        &self,
+    ) -> anyhow::Result<crate::query::graph::CompareGraphScipReport> {
+        let tool = oracle::OracleTool::RustAnalyzer;
+        let conn = self.storage.connection();
+        let tool_version = oracle::latest_run_tool_version(
+            conn,
+            tool,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )?;
+        let mut summary = crate::query::graph::CompareGraphScipSummary::default();
+        let mut contradictions = Vec::new();
+        let Some(version) = tool_version.clone() else {
+            summary.no_oracle_data = true;
+            summary.warnings.push(
+                "no oracle run for this checkout; run `rag-rat oracle run` to populate compiler \
+                 verdicts before comparing"
+                    .to_string(),
+            );
+            return Ok(crate::query::graph::CompareGraphScipReport {
+                query: crate::query::graph::CompareGraphScipQuery {
+                    tool: tool.as_db_str().to_string(),
+                    tool_version: None,
+                    commit_sha: self.active_commit_sha.clone(),
+                    worktree_id: self.active_worktree_id.clone(),
+                },
+                summary,
+                contradictions,
+            });
+        };
+        let comparisons = oracle::current_oracle_comparisons(
+            conn,
+            tool,
+            &version,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )?;
+        summary.verdicts_examined = u64::try_from(comparisons.len()).unwrap_or(u64::MAX);
+        for comparison in comparisons {
+            if comparison.kind != oracle::OracleResolutionKind::Contradict {
+                continue;
+            }
+            contradictions.push(crate::query::graph::GraphScipContradiction {
+                edge_id: comparison.edge_id,
+                edge_kind: comparison.edge_kind,
+                heuristic_confidence: crate::query::graph::normalize_confidence(
+                    &comparison.heuristic_confidence,
+                )
+                .to_string(),
+                heuristic_target: comparison.heuristic_target,
+                callee_name: comparison.callee_name,
+                resolved_external: resolved_external_label(&comparison.scip_symbol),
+                scip_symbol: comparison.scip_symbol,
+                callsite: Some(crate::query::graph::Callsite {
+                    path: comparison.callsite_path,
+                    line: comparison.callsite_line,
+                    span: [comparison.callsite_line, comparison.callsite_line],
+                }),
+            });
+        }
+        summary.contradictions = u64::try_from(contradictions.len()).unwrap_or(u64::MAX);
+        Ok(crate::query::graph::CompareGraphScipReport {
+            query: crate::query::graph::CompareGraphScipQuery {
+                tool: tool.as_db_str().to_string(),
+                tool_version,
+                commit_sha: self.active_commit_sha.clone(),
+                worktree_id: self.active_worktree_id.clone(),
+            },
+            summary,
+            contradictions,
+        })
+    }
+
     fn graph_logical_symbol(
         &self,
         logical_symbol_id: Option<i64>,
@@ -1285,12 +1511,17 @@ impl IndexDatabase {
         limit: u32,
         options: &crate::query::impact::ImpactSurfaceOptions,
     ) -> anyhow::Result<crate::query::impact::ImpactSurfaceReport> {
-        crate::query::impact::impact_surface_report_for_symbol(
+        let mut report = crate::query::impact::impact_surface_report_for_symbol(
             self.storage.connection(),
             symbol,
             limit,
             options,
-        )
+        )?;
+        // Surface the `Compiler` tier on impact's direct graph neighbors too (same read-side JOIN
+        // as trace_callees/find_callers), so the coding preflight shows compiler-grade resolutions.
+        self.enrich_hops_with_oracle(&mut report.direct_semantic_callers)?;
+        self.enrich_hops_with_oracle(&mut report.direct_semantic_callees)?;
+        Ok(report)
     }
 
     pub fn repo_brief(
@@ -1421,5 +1652,476 @@ impl IndexDatabase {
         memory_id: &str,
     ) -> anyhow::Result<Option<crate::query::memory::RepoMemory>> {
         crate::query::memory::memory_by_id(self.storage.connection(), memory_id)
+    }
+}
+
+/// `resolved-external(<package>)` for a SCIP symbol that names a dependency outside the corpus, or
+/// `None` when it has no package component. Shared by `compare_graph_to_scip` to label a
+/// contradiction whose compiler resolution is external.
+fn resolved_external_label(scip_symbol: &str) -> Option<String> {
+    oracle::package_of(scip_symbol).map(|package| format!("resolved-external({package})"))
+}
+
+/// Append a quantitative clause to `summary.completeness_risk` describing how much of the
+/// unresolved gap the oracle placed in an external dependency, e.g. " (2 of 7 unresolved are
+/// resolved-external: libc, tokio)". Quantitative completeness is the #69 ask: turn the qualitative
+/// risk into a count when the oracle has data. No-op when no hop carries a `resolved-external`
+/// verdict (then the risk string stays purely qualitative). The denominator is `summary.unresolved
+/// + summary.name_only + summary.ambiguous` — every low-confidence/unresolved neighbor the
+/// heuristic couldn't pin down, the population a `resolved-external` placement informs.
+fn annotate_completeness_with_externals(
+    summary: &mut crate::query::graph::GraphTraversalSummary,
+    hops: &[crate::query::graph::GraphHop],
+) {
+    let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut external_count = 0u64;
+    for hop in hops {
+        if let Some(label) = &hop.resolved_external {
+            external_count += 1;
+            // `resolved-external(<package>)` → `<package>` for the readable list.
+            if let Some(package) =
+                label.strip_prefix("resolved-external(").and_then(|rest| rest.strip_suffix(')'))
+            {
+                packages.insert(package.to_string());
+            }
+        }
+    }
+    if external_count == 0 {
+        return;
+    }
+    let gap =
+        summary.unresolved.saturating_add(summary.name_only).saturating_add(summary.ambiguous);
+    let denominator = gap.max(external_count);
+    let package_list = packages.into_iter().collect::<Vec<_>>().join(", ");
+    let clause = if package_list.is_empty() {
+        format!(" ({external_count} of {denominator} unresolved are resolved-external)")
+    } else {
+        format!(
+            " ({external_count} of {denominator} unresolved are resolved-external: {package_list})"
+        )
+    };
+    summary.completeness_risk.push_str(&clause);
+}
+
+#[cfg(test)]
+mod oracle_surfacing_tests {
+    //! End-to-end integration tests for the phase-2 (#69) read-side surfacing through the public
+    //! `IndexDatabase` API: build a real temp Rust checkout with an intra-file call, rebuild, run
+    //! the oracle over a programmatically-built `.scip` (the deterministic `--scip` consumption
+    //! path — no rust-analyzer), and assert the `Compiler` tier / `resolved-external` /
+    //! `compare_graph_to_scip` / gc behaviours. Models `eval::tests::eval_suite_runs_oracle_*`.
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use ::protobuf::{EnumOrUnknown, Message};
+    use ::scip::types::{Document, Index, Occurrence, PositionEncoding, SymbolRole};
+
+    use super::*;
+    use crate::config::ResolvedTarget;
+    use crate::index::oracle::OracleTool;
+
+    static N: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-q-oracle-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        root
+    }
+
+    fn rust_config(root: PathBuf) -> Config {
+        Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+        }
+    }
+
+    /// The callee identifier byte range of the (single) `calls_name` edge, read back from the DB so
+    /// the `.scip` occurrence aligns exactly with what the indexer recorded.
+    fn call_edge(db: &IndexDatabase) -> (i64, i64, i64, String) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT edges.id, edges.callee_start_byte, edges.callee_end_byte, files.path
+                 FROM edges JOIN files ON files.id = edges.source_file_id
+                 WHERE edges.edge_kind = 'calls_name' AND edges.callee_start_byte IS NOT NULL
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    /// Build a `.scip` over a single-line source file: a reference occurrence at the callee byte
+    /// range (single-line → char == byte for ASCII) plus a definition occurrence for the same
+    /// symbol at `def_range`. `def_path` is where the definition lives (in-corpus → Upgrade;
+    /// elsewhere/external symbol → resolved-external).
+    fn scip_with(
+        path: &str,
+        callee_start: i64,
+        callee_end: i64,
+        symbol: &str,
+        def_path: Option<&str>,
+        def_range: Option<(i64, i64)>,
+    ) -> Vec<u8> {
+        let occ = |start: i64, end: i64, role: SymbolRole| Occurrence {
+            range: vec![0, start as i32, end as i32],
+            symbol: symbol.to_string(),
+            symbol_roles: role as i32,
+            ..Default::default()
+        };
+        let mut documents = vec![Document {
+            relative_path: path.to_string(),
+            occurrences: vec![occ(callee_start, callee_end, SymbolRole::UnspecifiedSymbolRole)],
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        }];
+        if let (Some(def_path), Some((ds, de))) = (def_path, def_range) {
+            // A def in the SAME file must be appended to that document's occurrence list, not
+            // pushed as a SECOND document with the same `relative_path` —
+            // `ScipIndex::from_index` keys `occurrences_by_path` by path, so a
+            // duplicate-path document overwrites the ref.
+            if def_path == path {
+                documents[0].occurrences.push(occ(ds, de, SymbolRole::Definition));
+            } else {
+                documents.push(Document {
+                    relative_path: def_path.to_string(),
+                    occurrences: vec![occ(ds, de, SymbolRole::Definition)],
+                    position_encoding: EnumOrUnknown::new(
+                        PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+                    ),
+                    ..Default::default()
+                });
+            }
+        }
+        Index { documents, ..Default::default() }.write_to_bytes().unwrap()
+    }
+
+    /// The full path: rebuild a checkout where `caller` calls `target`, run the oracle from a
+    /// pre-built `.scip` that resolves the call in-corpus, and assert `find_callers` /
+    /// `trace_callees` surface the `compiler` tier with the `scip:<tool>@<version>` reason — while
+    /// the heuristic `edges` row is untouched. Also asserts `compare_graph_to_scip` reports no
+    /// contradiction (an Upgrade is agreement-shaped, not a disagreement).
+    #[test]
+    fn oracle_run_from_scip_surfaces_compiler_tier() {
+        let root = temp_root();
+        // Single line so byte offsets == char offsets (ASCII): `target` is the callee.
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let (edge_id, callee_start, callee_end, path) = call_edge(&db);
+        // `target` definition: `fn target() {}` → identifier `target` at bytes 29..35.
+        let symbol = "scip-rust crate held-mini `target`().";
+        let scip = scip_with(&path, callee_start, callee_end, symbol, Some(&path), Some((29, 35)));
+
+        let report = db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+        // `target` is defined in-corpus, so the heuristic resolves it; the oracle CONFIRMS it. Both
+        // Confirm and Upgrade surface the `compiler` tier.
+        assert!(
+            report.confirmed >= 1 || report.upgraded >= 1,
+            "expected in-corpus confirm/upgrade, got {report:?}"
+        );
+
+        // find_callers (reverse) surfaces the compiler tier on the matching edge.
+        let callers = db
+            .find_callers_with_options("target", 50, &crate::query::graph::GraphTraversalOptions {
+                include_unresolved: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let hop = callers.iter().find(|h| h.edge_id == edge_id).expect("call edge present");
+        assert_eq!(hop.confidence, "compiler", "expected Compiler tier surfaced");
+        assert_eq!(hop.resolution_reason.as_deref(), Some("scip:rust-analyzer@v-test"));
+        // The heuristic edge confidence is preserved (not overwritten).
+        assert_ne!(hop.edge_confidence, "compiler");
+
+        // The heuristic `edges` row was never mutated by the oracle pass.
+        let edge_confidence: String = db
+            .storage
+            .connection()
+            .query_row("SELECT confidence FROM edges WHERE id = ?1", params![edge_id], |r| r.get(0))
+            .unwrap();
+        assert_ne!(edge_confidence, "compiler");
+
+        // An Upgrade is agreement-shaped → compare_graph_to_scip reports no contradiction.
+        let compare = db.compare_graph_to_scip().unwrap();
+        assert!(!compare.summary.no_oracle_data);
+        assert_eq!(compare.summary.contradictions, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Staleness revert: after a current run surfaces `compiler`, drifting the source file (so its
+    /// `files.sha256` no longer matches the verdict's `file_sha`) reverts the edge to heuristic
+    /// display — never `compiler`.
+    #[test]
+    fn drifted_file_reverts_to_heuristic_display() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let (edge_id, cs, ce, path) = call_edge(&db);
+        let symbol = "scip-rust crate held-mini `target`().";
+        let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((29, 35)));
+        db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+
+        // Drift the recorded sha so the verdict's file_sha no longer matches (file changed). The
+        // active connection exposes `files` as a scoped TEMP VIEW (read-only), so the UPDATE must
+        // target the underlying `main.files` table.
+        db.storage
+            .connection()
+            .execute("UPDATE main.files SET sha256 = 'drifted' WHERE path = ?1", params![path])
+            .unwrap();
+
+        let callers = db
+            .find_callers_with_options("target", 50, &crate::query::graph::GraphTraversalOptions {
+                include_unresolved: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let hop = callers.iter().find(|h| h.edge_id == edge_id).expect("call edge present");
+        assert_ne!(hop.confidence, "compiler", "drifted file must revert to heuristic display");
+        assert!(hop.resolution_reason.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `resolved-external`: a `.scip` resolving the callee to a packaged dependency symbol with no
+    /// in-corpus definition surfaces `resolved_external = resolved-external(<package>)` on the hop,
+    /// and feeds the quantitative completeness clause in the graph report.
+    #[test]
+    fn external_resolution_surfaces_resolved_external_label() {
+        let root = temp_root();
+        // `external_fn` is NOT defined in-corpus → the heuristic can't resolve it (NameOnly /
+        // unresolved), so SCIP's external resolution is a clean `resolved-external`, not a
+        // contradiction of an in-corpus claim.
+        fs::write(root.join("src/lib.rs"), "fn caller() { external_fn(); }\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let (edge_id, cs, ce, path) = call_edge(&db);
+        // A packaged SCIP symbol with NO in-corpus definition occurrence →
+        // resolved-external(tokio).
+        let symbol = "scip-rust cargo tokio 1.0 `external_fn`().";
+        let scip = scip_with(&path, cs, ce, symbol, None, None);
+        let report = db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+        assert!(report.resolved_external >= 1, "expected resolved-external, got {report:?}");
+
+        let callees = db
+            .trace_callees_with_options("caller", 50, &crate::query::graph::GraphTraversalOptions {
+                include_unresolved: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let hop = callees.iter().find(|h| h.edge_id == edge_id).expect("call edge present");
+        assert_eq!(hop.resolved_external.as_deref(), Some("resolved-external(tokio)"));
+        // External placement is not an in-corpus upgrade → confidence stays heuristic.
+        assert_ne!(hop.confidence, "compiler");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `compare_graph_to_scip` reports a contradiction when the heuristic resolved an edge
+    /// in-corpus but the compiler resolves the callee to a DIFFERENT (external) target.
+    #[test]
+    fn compare_graph_to_scip_reports_contradiction() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let (edge_id, cs, ce, path) = call_edge(&db);
+        // Force the heuristic edge to look in-corpus-resolved (Exact + to_symbol_id), so the
+        // compiler's external resolution is a contradiction, not a plain resolved-external.
+        let target_sym: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE edges SET confidence = 'Exact', resolution = 'exact', to_symbol_id = ?2 \
+                 WHERE id = ?1",
+                params![edge_id, target_sym],
+            )
+            .unwrap();
+
+        // The compiler says the callee is actually `other::target` in a dependency → contradiction.
+        let symbol = "scip-rust cargo other 1.0 `target`().";
+        let scip = scip_with(&path, cs, ce, symbol, None, None);
+        db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+
+        let compare = db.compare_graph_to_scip().unwrap();
+        assert_eq!(compare.summary.contradictions, 1, "{compare:?}");
+        let c = &compare.contradictions[0];
+        assert_eq!(c.edge_id, edge_id);
+        assert_eq!(c.heuristic_confidence, "exact");
+        assert_eq!(c.resolved_external.as_deref(), Some("resolved-external(other)"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// gc prunes `oracle_runs` for dead checkout contexts: an oracle run recorded under a sibling
+    /// `(commit, worktree)` is dropped by `prune_to_live` when that context is not live.
+    #[test]
+    fn gc_prunes_oracle_runs_for_dead_contexts() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // Record a run for THIS (active) checkout + a run for a dead sibling context.
+        crate::index::oracle::run_oracle(
+            db.storage.connection(),
+            OracleTool::RustAnalyzer,
+            "v-test",
+            &db.active_commit_sha,
+            &db.active_worktree_id,
+            &Index::default().write_to_bytes().unwrap(),
+            &root,
+        )
+        .unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "INSERT INTO oracle_runs(tool, tool_version, commit_sha, worktree_id, started_at, \
+                 status, stats_json) VALUES ('rust-analyzer', 'v-test', 'dead-commit', \
+                 'dead-worktree', 0, 'Completed', '{}')",
+                [],
+            )
+            .unwrap();
+        let before: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM oracle_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 2);
+
+        // gc keeps the active context and prunes the dead one.
+        db.prune_to_live(
+            std::slice::from_ref(&db.active_commit_sha),
+            std::slice::from_ref(&db.active_worktree_id),
+        )
+        .unwrap();
+
+        let remaining: Vec<String> = {
+            let conn = db.storage.connection();
+            let mut stmt = conn.prepare("SELECT commit_sha FROM oracle_runs").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            !remaining.iter().any(|c| c == "dead-commit"),
+            "dead-context oracle_runs row must be pruned: {remaining:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolved_external_label_extracts_package() {
+        assert_eq!(
+            resolved_external_label("scip-rust cargo tokio 1.0 `spawn`()."),
+            Some("resolved-external(tokio)".to_string())
+        );
+        // A symbol with no package component yields no label.
+        assert_eq!(resolved_external_label("local 0"), None);
+    }
+
+    #[test]
+    fn completeness_annotation_counts_externals_and_lists_packages() {
+        let mut summary = crate::query::graph::GraphTraversalSummary {
+            unresolved: 5,
+            completeness_risk: "medium".to_string(),
+            ..Default::default()
+        };
+        let hop = |external: Option<&str>| crate::query::graph::GraphHop {
+            edge_id: 0,
+            from_symbol: None,
+            to_symbol: None,
+            edge_kind: "calls_name".to_string(),
+            confidence: "name_only".to_string(),
+            edge_confidence: "name_only".to_string(),
+            target: None,
+            target_qualified_name: None,
+            evidence: None,
+            receiver_hint: None,
+            resolution: "unresolved".to_string(),
+            resolution_reason: None,
+            resolved_external: external.map(str::to_string),
+            verified_target_symbol: false,
+            shown_by_default: true,
+            callsite: None,
+        };
+        let hops = vec![
+            hop(Some("resolved-external(tokio)")),
+            hop(Some("resolved-external(libc)")),
+            hop(None),
+        ];
+        annotate_completeness_with_externals(&mut summary, &hops);
+        assert_eq!(
+            summary.completeness_risk,
+            "medium (2 of 5 unresolved are resolved-external: libc, tokio)"
+        );
+
+        // No externals → the qualitative string is left untouched.
+        let mut bare = crate::query::graph::GraphTraversalSummary {
+            unresolved: 3,
+            completeness_risk: "high".to_string(),
+            ..Default::default()
+        };
+        annotate_completeness_with_externals(&mut bare, &[hop(None)]);
+        assert_eq!(bare.completeness_risk, "high");
+    }
+
+    /// `run_oracle_with_tool` degrades to `Blocked` (never an error) when the indexer isn't
+    /// installed — the missing-embedding-model UX. Skipped when rust-analyzer happens to be on PATH
+    /// (then the subprocess path runs, which this test doesn't assert).
+    #[test]
+    fn oracle_run_without_tool_is_blocked_not_error() {
+        if std::process::Command::new("rust-analyzer")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return; // rust-analyzer present; the Blocked path isn't exercised here.
+        }
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let outcome =
+            db.run_oracle_with_tool(OracleTool::RustAnalyzer, &root.join("o.scip")).unwrap();
+        assert!(matches!(outcome, crate::index::oracle::OracleRunOutcome::Blocked { .. }));
+        let _ = fs::remove_dir_all(&root);
     }
 }

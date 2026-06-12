@@ -266,6 +266,31 @@ pub(crate) fn record_oracle_run(
     Ok(conn.last_insert_rowid())
 }
 
+/// The `tool_version` of the most recent run for `tool` **in the active checkout**, if any. This is
+/// the version the surfacing reads (the `Compiler` tier) key on: query output should show the
+/// verdicts the last `oracle run` for this checkout produced. Scoped to `(commit_sha, worktree_id)`
+/// so a sibling worktree's run can't dictate this checkout's displayed tool version.
+pub(crate) fn latest_run_tool_version(
+    conn: &Connection,
+    tool: OracleTool,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let version = conn
+        .query_row(
+            "
+            SELECT tool_version FROM oracle_runs
+            WHERE tool = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+            ",
+            params![tool.as_db_str(), commit_sha, worktree_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    Ok(version)
+}
+
 /// The single canonical scope predicate every `edge_oracle` metric read joins through: restrict the
 /// counted verdicts to those whose edge belongs to the active `(commit_sha, worktree_id)` checkout,
 /// via `edge_oracle -> edges -> files`. This is the SAME join `edge_join_candidates` /
@@ -309,4 +334,247 @@ pub(crate) fn count_edge_oracle_scoped(
         )?,
     };
     Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// The CURRENT-content predicate appended to [`EDGE_ORACLE_SCOPE_JOIN`] for any READ that surfaces
+/// a verdict in query output (the `Compiler` tier). A verdict is valid for display ONLY when the
+/// file it was computed against is unchanged — `edge_oracle.file_sha == files.sha256` for the
+/// edge's current source file. A drifted/changed file's `file_sha` differs, so the verdict is
+/// filtered out here and the edge reverts to heuristic display (`oracle-stale`), never `Compiler`.
+/// This is the read-side mirror of the run-time content-integrity gate (run.rs) and the staleness
+/// key `(file_sha, tool, tool_version)`.
+///
+/// (The eval/status COUNTS in [`count_edge_oracle_scoped`] deliberately do NOT apply this — they
+/// describe the persisted verdict population for precision/recall, which is content-addressed by
+/// the run, not the live display. Only the surfacing reads gate on currency.)
+pub(crate) const EDGE_ORACLE_CURRENT_PREDICATE: &str = " AND edge_oracle.file_sha = files.sha256";
+
+/// One current, in-scope oracle verdict for an edge, surfaced in graph/impact query output as the
+/// `Compiler` tier. `package` is the external dependency name for `resolved-external` verdicts
+/// (`scip_symbol`'s package component), `None` for in-corpus resolutions.
+#[derive(Debug, Clone)]
+pub(crate) struct EdgeOracleVerdict {
+    pub(crate) kind: OracleResolutionKind,
+    pub(crate) scip_symbol: String,
+    pub(crate) tool: OracleTool,
+    pub(crate) tool_version: String,
+}
+
+impl EdgeOracleVerdict {
+    /// The provenance string surfaced as `resolution_reason` when this verdict upgrades an edge to
+    /// the `Compiler` tier: `scip:<tool>@<version>` (the #61 design's reason format).
+    pub(crate) fn resolution_reason(&self) -> String {
+        format!("scip:{}@{}", self.tool.as_db_str(), self.tool_version)
+    }
+
+    /// `resolved-external(<package>)` when the oracle placed this callee in a dependency outside
+    /// the corpus, deriving `<package>` from the SCIP symbol's package component; `None` for
+    /// in-corpus verdicts. The display string surfaced in query output for
+    /// unresolved-but-externally-resolved edges.
+    pub(crate) fn resolved_external_label(&self) -> Option<String> {
+        if self.kind != OracleResolutionKind::ResolvedExternal {
+            return None;
+        }
+        let package = super::join::package_of(&self.scip_symbol)?;
+        Some(format!("resolved-external({package})"))
+    }
+}
+
+/// Fetch the CURRENT, in-scope oracle verdicts for a set of edge ids (the read-side join that
+/// surfaces the `Compiler` tier in `trace_callees` / `find_callers` / `impact_surface`). Scoped to
+/// the active `(commit_sha, worktree_id)` via [`EDGE_ORACLE_SCOPE_JOIN`] AND gated to current
+/// content via [`EDGE_ORACLE_CURRENT_PREDICATE`], so a drifted file's verdict is never returned
+/// (its edge reverts to heuristic display). Returns at most one row per edge id (PK
+/// `(edge_id, tool, tool_version)` and the single-tool scope).
+///
+/// SCOPE (load-bearing): this is the ONLY place a surfacing read of `edge_oracle` lives — it routes
+/// through the shared scope predicate so the checkout scope can't be dropped, exactly like the
+/// metric reads. Callers pass `edge_ids` already produced by the heuristic traversal (themselves
+/// scoped), so the returned verdicts are a subset, never an expansion.
+pub(crate) fn current_oracle_verdicts_for_edges(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+    edge_ids: &[i64],
+) -> anyhow::Result<std::collections::HashMap<i64, EdgeOracleVerdict>> {
+    let mut out = std::collections::HashMap::new();
+    if edge_ids.is_empty() {
+        return Ok(out);
+    }
+    // Bind the variable-length id list after the fixed ?1..?4 scope slots. Chunk to stay under
+    // SQLite's bound-variable limit on large traversals.
+    for chunk in edge_ids.chunks(900) {
+        let placeholders =
+            (0..chunk.len()).map(|i| format!("?{}", i + 5)).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT edge_oracle.edge_id, edge_oracle.kind, edge_oracle.resolved_symbol_id, \
+             edge_oracle.scip_symbol{EDGE_ORACLE_SCOPE_JOIN}{EDGE_ORACLE_CURRENT_PREDICATE} AND \
+             edge_oracle.edge_id IN ({placeholders})"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tool.as_db_str().to_string()),
+            Box::new(tool_version.to_string()),
+            Box::new(commit_sha.to_string()),
+            Box::new(worktree_id.to_string()),
+        ];
+        for id in chunk {
+            params.push(Box::new(*id));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let edge_id: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let resolved_symbol_id: Option<i64> = row.get(2)?;
+            let scip_symbol: String = row.get(3)?;
+            Ok((edge_id, kind, resolved_symbol_id, scip_symbol))
+        })?;
+        for row in rows {
+            let (edge_id, kind, _resolved_symbol_id, scip_symbol) = row?;
+            let Some(kind) = OracleResolutionKind::from_db_str(&kind) else {
+                continue;
+            };
+            out.insert(edge_id, EdgeOracleVerdict {
+                kind,
+                scip_symbol,
+                tool,
+                tool_version: tool_version.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// One row of the `compare_graph_to_scip` diagnostic: an edge and the SCIP verdict that
+/// contradicts / agrees with its heuristic resolution, with enough edge context to render the
+/// disagreement. The compare tool filters to `Contradict` kinds; the total it scans is every
+/// current verdict in scope.
+#[derive(Debug, Clone)]
+pub(crate) struct EdgeOracleComparison {
+    pub(crate) edge_id: i64,
+    pub(crate) kind: OracleResolutionKind,
+    pub(crate) edge_kind: String,
+    pub(crate) heuristic_confidence: String,
+    pub(crate) heuristic_target: Option<String>,
+    pub(crate) callee_name: Option<String>,
+    pub(crate) scip_symbol: String,
+    pub(crate) callsite_path: String,
+    pub(crate) callsite_line: i64,
+}
+
+/// Load every CURRENT, in-scope `edge_oracle` verdict joined to its edge's heuristic resolution —
+/// the data `compare_graph_to_scip` diffs (it keeps the `Contradict` rows). Scoped to the active
+/// `(commit_sha, worktree_id)` via [`EDGE_ORACLE_SCOPE_JOIN`] AND gated to current content via
+/// [`EDGE_ORACLE_CURRENT_PREDICATE`], so a drifted/dirty file's verdict is never reported as a
+/// disagreement (it reverted to heuristic display). The heuristic target's qualified name comes
+/// from the `to_symbols` join (the `edges.to_symbol_id` the heuristic picked).
+pub(crate) fn current_oracle_comparisons(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<Vec<EdgeOracleComparison>> {
+    // The heuristic target's qualified name is fetched via a correlated subquery rather than a
+    // trailing LEFT JOIN, so the shared `EDGE_ORACLE_SCOPE_JOIN` string (which already ends in a
+    // WHERE) stays the single source of the scope predicate — a JOIN can't legally follow a WHERE.
+    let sql = format!(
+        "SELECT edge_oracle.edge_id, edge_oracle.kind, edges.edge_kind, edges.confidence, (SELECT \
+         qualified_name FROM symbols WHERE symbols.id = edges.to_symbol_id), edges.to_name, \
+         edge_oracle.scip_symbol, files.path, COALESCE(NULLIF(edges.source_start_line, 0), 1) \
+         {EDGE_ORACLE_SCOPE_JOIN}{EDGE_ORACLE_CURRENT_PREDICATE} ORDER BY files.path, \
+         edges.source_start_line"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows =
+        stmt.query_map(params![tool.as_db_str(), tool_version, commit_sha, worktree_id], |row| {
+            let kind: String = row.get(1)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                kind,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (
+            edge_id,
+            kind,
+            edge_kind,
+            heuristic_confidence,
+            heuristic_target,
+            callee_name,
+            scip_symbol,
+            callsite_path,
+            callsite_line,
+        ) = row?;
+        let Some(kind) = OracleResolutionKind::from_db_str(&kind) else {
+            continue;
+        };
+        out.push(EdgeOracleComparison {
+            edge_id,
+            kind,
+            edge_kind,
+            heuristic_confidence,
+            heuristic_target,
+            callee_name,
+            scip_symbol,
+            callsite_path,
+            callsite_line,
+        });
+    }
+    Ok(out)
+}
+
+/// Prune `oracle_runs` rows whose `(commit_sha, worktree_id)` is NOT live — the gc companion to the
+/// `edge_oracle` FK cascade (which already drops verdict rows when their edges are deleted). Unlike
+/// `edge_oracle`, `oracle_runs` is keyed by `(commit_sha, worktree_id)` directly, not by an edge,
+/// so nothing cascades it; a dead checkout's run rows would otherwise linger after gc drops its
+/// edges/files. Refuses to prune when both live sets are empty (mirrors `prune_to_live`), so a
+/// missing live set never wipes all run history. Returns the number of rows deleted.
+///
+/// A run survives iff its commit is live OR its worktree overlay is live — the SAME survival rule
+/// `prune_to_live` applies to `files`, so a run and the edges it produced are pruned together.
+pub(crate) fn prune_oracle_runs_outside_scope(
+    conn: &Connection,
+    live_commits: &[String],
+    live_worktrees: &[String],
+) -> anyhow::Result<u64> {
+    if live_commits.is_empty() && live_worktrees.is_empty() {
+        return Ok(0);
+    }
+    let commit_list = sql_quoted_list(live_commits);
+    let worktree_list = sql_quoted_list(live_worktrees);
+    let deleted = conn.execute(
+        &format!(
+            "DELETE FROM oracle_runs
+             WHERE commit_sha NOT IN ({commit_list})
+               AND worktree_id NOT IN ({worktree_list})"
+        ),
+        [],
+    )?;
+    Ok(u64::try_from(deleted).unwrap_or(0))
+}
+
+/// Render a slice of strings as a SQL `IN (...)` value list with single-quote escaping. Inputs are
+/// commit shas / worktree ids (hex / path-derived), never user free-text, but we escape `'` anyway
+/// so the list can't break the statement. An empty slice yields `''` (a value nothing matches),
+/// which is correct: `prune_oracle_runs_outside_scope` only reaches here when at least one of the
+/// two lists is non-empty, and a row survives if EITHER its commit or its worktree is live.
+fn sql_quoted_list(values: &[String]) -> String {
+    if values.is_empty() {
+        return "''".to_string();
+    }
+    values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

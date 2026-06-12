@@ -1,8 +1,8 @@
 use super::*;
 use crate::cli::{
     BriefArgs, ClustersArgs, EvalArgs, GithubArgs, GithubCommand, HookAction, HooksArgs, IndexArgs,
-    MaintenanceArgs, MemoryArgs, MemoryCommand, MigrateArgs, ModelsArgs, ModelsCommand, QueryArgs,
-    ReconcileArgs,
+    MaintenanceArgs, MemoryArgs, MemoryCommand, MigrateArgs, ModelsArgs, ModelsCommand, OracleArgs,
+    OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs, ReconcileArgs,
 };
 
 pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
@@ -130,6 +130,72 @@ pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
 }
 pub(crate) fn default_eval_path(config: &Config, file_name: &str) -> PathBuf {
     config.root.join("evals").join(file_name)
+}
+
+pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
+    let db = open_index(config)?;
+    match &args.command {
+        OracleCommand::Run(run_args) => oracle_run(config, &db, run_args),
+        OracleCommand::Status(status_args) => oracle_status(&db, status_args),
+    }
+}
+
+/// `rag-rat oracle run` — either consume a pre-built `--scip` (deterministic; no tool needed) or
+/// invoke the indexer to produce a `.scip` into a temp file and run the join over it. A missing /
+/// unrunnable tool prints the install hint and exits 0 (the missing-embedding-model UX) — never an
+/// error. Prints the `OracleReport` (or the `Blocked` outcome) as JSON.
+fn oracle_run(config: &Config, db: &IndexDatabase, args: &OracleRunArgs) -> anyhow::Result<()> {
+    let tool = args.tool.core();
+    if let Some(scip_path) = &args.scip {
+        let scip_bytes = fs::read(scip_path).map_err(|err| {
+            anyhow::anyhow!("failed to read SCIP index {}: {err}", scip_path.display())
+        })?;
+        // A pre-built index carries no detectable tool version; label the run by the source path's
+        // file name so re-running the same fixture is content-addressed stably.
+        let tool_version = format!(
+            "scip-file:{}",
+            scip_path.file_name().and_then(|n| n.to_str()).unwrap_or("index.scip")
+        );
+        let report = db.run_oracle_from_scip(tool, &tool_version, &scip_bytes)?;
+        return print_json(&serde_json::json!({
+            "outcome": "completed",
+            "tool": tool.as_db_str(),
+            "tool_version": tool_version,
+            "report": report,
+        }));
+    }
+    // No pre-built index: invoke the tool, writing the `.scip` to a temp file the join consumes.
+    let scip_output = config
+        .database
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("rag-rat-oracle-{}.scip", std::process::id()));
+    let outcome = db.run_oracle_with_tool(tool, &scip_output);
+    let _ = fs::remove_file(&scip_output);
+    let outcome = outcome?;
+    if let rag_rat_core::index::oracle::OracleRunOutcome::Blocked { hint, .. } = &outcome {
+        eprintln!("oracle: {hint}");
+    }
+    print_json(&outcome)
+}
+
+/// `rag-rat oracle status` — verdict counts for the latest run in this checkout, plus whether the
+/// indexer tool is installed (its probe, a `Blocked` line when absent, never an error).
+fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<()> {
+    let tool = args.tool.core();
+    let availability = db.probe_oracle_tool(tool);
+    // Use the most recent run's version for the verdict counts; no run → no counts (status is a
+    // read-only sibling — nothing to report against).
+    let status = match db.latest_oracle_run_version(tool)? {
+        Some(version) => Some(db.oracle_status(tool, &version)?),
+        None => None,
+    };
+    print_json(&serde_json::json!({
+        "tool": tool.as_db_str(),
+        "tool_available": availability,
+        "verdicts": status,
+    }))
 }
 pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;

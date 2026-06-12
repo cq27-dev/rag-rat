@@ -114,6 +114,18 @@ impl RagRatService {
     }
 
     #[tool(
+        name = "compare_graph_to_scip",
+        description = "Report edges where the tree-sitter graph and the SCIP compiler oracle \
+                       disagree on resolution (contradictions). Requires `rag-rat oracle run`."
+    )]
+    fn compare_graph_to_scip(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("compare_graph_to_scip", json!({}))
+    }
+
+    #[tool(
         name = "impact_surface",
         description = "Graph-backed coding preflight with structural, textual fallback, and \
                        papertrail evidence."

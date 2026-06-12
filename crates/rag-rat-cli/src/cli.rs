@@ -77,6 +77,9 @@ pub(crate) enum Command {
     /// Run the search-quality eval suite.
     Eval(EvalArgs),
 
+    /// SCIP-oracle pass: compiler-grade edge resolution from a language indexer.
+    Oracle(OracleArgs),
+
     /// Print the resolved configuration as JSON.
     DumpConfig,
 }
@@ -227,6 +230,52 @@ pub(crate) struct EvalArgs {
     /// Emit JSON instead of the summary.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct OracleArgs {
+    #[command(subcommand)]
+    pub command: OracleCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum OracleCommand {
+    /// Run an oracle pass: invoke the indexer (or consume a pre-built `.scip`) and write verdicts.
+    Run(OracleRunArgs),
+    /// Report oracle verdict counts + whether the indexer tool is installed.
+    Status(OracleStatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct OracleRunArgs {
+    /// The oracle tool to use (default: rust-analyzer).
+    #[arg(long, value_enum, default_value_t = OracleToolArg::RustAnalyzer)]
+    pub tool: OracleToolArg,
+    /// Consume a pre-built `.scip` index instead of invoking the tool. Deterministic; the tool
+    /// need not be installed.
+    #[arg(long)]
+    pub scip: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct OracleStatusArgs {
+    /// The oracle tool to report on (default: rust-analyzer).
+    #[arg(long, value_enum, default_value_t = OracleToolArg::RustAnalyzer)]
+    pub tool: OracleToolArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum OracleToolArg {
+    #[value(name = "rust-analyzer")]
+    RustAnalyzer,
+}
+
+impl OracleToolArg {
+    pub(crate) fn core(self) -> rag_rat_core::index::oracle::OracleTool {
+        match self {
+            OracleToolArg::RustAnalyzer => rag_rat_core::index::oracle::OracleTool::RustAnalyzer,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -436,5 +485,38 @@ mod tests {
             },
             other => panic!("expected hooks, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oracle_run_defaults_to_rust_analyzer() {
+        let cli = Cli::try_parse_from(["rag-rat", "oracle", "run"]).expect("parse");
+        match cli.command {
+            Command::Oracle(OracleArgs { command: OracleCommand::Run(args) }) => {
+                assert_eq!(args.tool, OracleToolArg::RustAnalyzer);
+                assert!(args.scip.is_none());
+            },
+            other => panic!("expected oracle run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oracle_run_accepts_scip_path() {
+        let cli = Cli::try_parse_from(["rag-rat", "oracle", "run", "--scip", "/tmp/x.scip"])
+            .expect("parse");
+        match cli.command {
+            Command::Oracle(OracleArgs { command: OracleCommand::Run(args) }) => {
+                assert_eq!(args.scip.as_deref(), Some(std::path::Path::new("/tmp/x.scip")));
+            },
+            other => panic!("expected oracle run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oracle_status_parses() {
+        let cli = Cli::try_parse_from(["rag-rat", "oracle", "status"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Oracle(OracleArgs { command: OracleCommand::Status(_) })
+        ));
     }
 }

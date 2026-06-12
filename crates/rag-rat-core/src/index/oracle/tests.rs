@@ -2210,3 +2210,190 @@ fn name_only_recovery_rate_excludes_exact_upgrades() {
     );
     assert!((m.name_only_recovery_rate - 1.0).abs() < 1e-9);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 (#69): read-side surfacing helpers — `Compiler` tier, staleness/dirty
+// revert, `resolved-external`, `compare_graph_to_scip` data, and gc pruning of
+// `oracle_runs`. All deterministic against the synthetic harness conn (no
+// rust-analyzer, no `.scip` subprocess).
+// ---------------------------------------------------------------------------
+
+/// Seed one edge with a written verdict and return `(harness, edge_id, file_sha)`. The verdict's
+/// `file_sha` matches the file's recorded sha (current), so it surfaces; tests that want staleness
+/// drift the edge's file sha afterward.
+fn seed_verdict(
+    kind: OracleResolutionKind,
+    scip_symbol: &str,
+    resolved_symbol_id: Option<i64>,
+) -> (Harness, i64, String) {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { target(); }\n");
+    let file_sha: String = h
+        .conn
+        .query_row("SELECT sha256 FROM files WHERE id = ?1", params![f], |r| r.get(0))
+        .unwrap();
+    let edge = h.add_edge(f, "target", 14, 20, "NameOnly", None);
+    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
+        edge_id: edge,
+        file_sha: &file_sha,
+        resolved_symbol_id,
+        scip_symbol,
+        kind,
+    })
+    .unwrap();
+    (h, edge, file_sha)
+}
+
+/// A CURRENT verdict (its `file_sha` matches `files.sha256`) is returned by the surfacing read —
+/// the `Compiler` tier data.
+#[test]
+fn current_verdict_is_surfaced_for_edge() {
+    let (h, edge, _sha) =
+        seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", Some(1));
+    let verdicts =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    let verdict = verdicts.get(&edge).expect("current verdict surfaced");
+    assert_eq!(verdict.kind, OracleResolutionKind::Upgrade);
+    assert_eq!(verdict.resolution_reason(), format!("scip:{}@{VERSION}", TOOL.as_db_str()));
+}
+
+/// Staleness revert: drift the edge's file sha so it no longer matches the verdict's `file_sha`.
+/// The surfacing read excludes it — the edge reverts to heuristic display, never `Compiler`.
+#[test]
+fn drifted_file_verdict_is_not_surfaced() {
+    let (h, edge, _sha) =
+        seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", Some(1));
+    // The file's content changed since the verdict was computed: its sha now differs from
+    // `edge_oracle.file_sha`, so the current-content predicate filters the verdict out.
+    h.conn.execute("UPDATE files SET sha256 = 'drifted-sha' WHERE path = 'a.rs'", []).unwrap();
+    let verdicts =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    assert!(verdicts.is_empty(), "a drifted file's verdict must not surface as Compiler");
+}
+
+/// Dirty/overlay (uncommitted) edges never surface `Compiler`: an edge whose file lives in a
+/// different `(commit_sha, worktree_id)` scope than the active checkout is out of the scope join,
+/// so its verdict is never returned for the active checkout. (Models the overlay edge — the
+/// compiler hasn't seen the uncommitted edit; the oracle row binds to commit-scoped rows only.)
+#[test]
+fn out_of_scope_verdict_is_not_surfaced() {
+    let (h, edge, sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", Some(1));
+    // Query the SAME edge under a sibling worktree scope: the scope join excludes it.
+    let verdicts = store::current_oracle_verdicts_for_edges(
+        &h.conn,
+        TOOL,
+        VERSION,
+        COMMIT,
+        "other-worktree",
+        &[edge],
+    )
+    .unwrap();
+    assert!(verdicts.is_empty(), "a verdict outside the active checkout must not surface");
+    let _ = sha;
+}
+
+/// A `resolved-external` verdict surfaces a `resolved-external(<package>)` label derived from the
+/// SCIP symbol's package component.
+#[test]
+fn resolved_external_label_surfaces_package() {
+    let (h, edge, _sha) = seed_verdict(
+        OracleResolutionKind::ResolvedExternal,
+        "scip-rust cargo tokio 1.0 `spawn`().",
+        None,
+    );
+    let verdicts =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    let verdict = verdicts.get(&edge).expect("verdict surfaced");
+    assert_eq!(verdict.resolved_external_label().as_deref(), Some("resolved-external(tokio)"));
+}
+
+/// `current_oracle_comparisons` returns CURRENT, in-scope verdicts joined to the heuristic edge —
+/// the `compare_graph_to_scip` data. A `Contradict` verdict appears with its scip symbol; a drifted
+/// row does not.
+#[test]
+fn comparisons_return_current_contradictions_only() {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { target(); }\n");
+    let sha: String = h
+        .conn
+        .query_row("SELECT sha256 FROM files WHERE id = ?1", params![f], |r| r.get(0))
+        .unwrap();
+    let target = h.add_symbol(f, "target", 3, 9);
+    // An Exact edge the heuristic resolved to `target`; the oracle CONTRADICTS it (points
+    // elsewhere).
+    let edge = h.add_edge(f, "target", 14, 20, "Exact", Some(target));
+    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
+        edge_id: edge,
+        file_sha: &sha,
+        resolved_symbol_id: None,
+        scip_symbol: "scip-rust cargo other 1.0 `target`().",
+        kind: OracleResolutionKind::Contradict,
+    })
+    .unwrap();
+
+    let comparisons =
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(comparisons.len(), 1);
+    let c = &comparisons[0];
+    assert_eq!(c.kind, OracleResolutionKind::Contradict);
+    assert_eq!(c.edge_id, edge);
+    assert_eq!(c.heuristic_confidence, "Exact");
+    assert_eq!(c.scip_symbol, "scip-rust cargo other 1.0 `target`().");
+
+    // Drift the file → the comparison drops out (no stale contradiction surfaced).
+    h.conn.execute("UPDATE files SET sha256 = 'drift' WHERE id = ?1", params![f]).unwrap();
+    let after =
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert!(after.is_empty(), "a drifted file's contradiction must not surface");
+}
+
+/// `latest_run_tool_version` returns the most recent run's version for the active checkout, and
+/// `None` when there is no run.
+#[test]
+fn latest_run_tool_version_tracks_active_checkout() {
+    let h = Harness::new();
+    assert_eq!(store::latest_run_tool_version(&h.conn, TOOL, COMMIT, WORKTREE).unwrap(), None);
+    store::record_oracle_run(&h.conn, TOOL, "v1", COMMIT, WORKTREE, "Completed", "{}").unwrap();
+    store::record_oracle_run(&h.conn, TOOL, "v2", COMMIT, WORKTREE, "Completed", "{}").unwrap();
+    assert_eq!(
+        store::latest_run_tool_version(&h.conn, TOOL, COMMIT, WORKTREE).unwrap().as_deref(),
+        Some("v2")
+    );
+    // A sibling worktree's run does not leak in.
+    store::record_oracle_run(&h.conn, TOOL, "v3", COMMIT, "other", "Completed", "{}").unwrap();
+    assert_eq!(
+        store::latest_run_tool_version(&h.conn, TOOL, COMMIT, WORKTREE).unwrap().as_deref(),
+        Some("v2")
+    );
+}
+
+/// gc: `prune_oracle_runs_outside_scope` drops runs whose `(commit, worktree)` is dead, keeps live
+/// ones, and refuses to prune when both live sets are empty (so a missing live set never wipes all
+/// run history).
+#[test]
+fn prune_oracle_runs_drops_dead_contexts_only() {
+    let h = Harness::new();
+    store::record_oracle_run(&h.conn, TOOL, "v1", "live-commit", "live-wt", "Completed", "{}")
+        .unwrap();
+    store::record_oracle_run(&h.conn, TOOL, "v1", "dead-commit", "dead-wt", "Completed", "{}")
+        .unwrap();
+    // A run whose commit is dead but whose worktree overlay is live survives (OR rule).
+    store::record_oracle_run(&h.conn, TOOL, "v1", "dead-commit", "live-wt", "Completed", "{}")
+        .unwrap();
+
+    let live_commits = vec!["live-commit".to_string()];
+    let live_worktrees = vec!["live-wt".to_string()];
+
+    // Empty live sets are a no-op (never wipe everything).
+    assert_eq!(store::prune_oracle_runs_outside_scope(&h.conn, &[], &[]).unwrap(), 0);
+
+    let deleted =
+        store::prune_oracle_runs_outside_scope(&h.conn, &live_commits, &live_worktrees).unwrap();
+    assert_eq!(deleted, 1, "only the (dead-commit, dead-wt) run is pruned");
+    let remaining: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM oracle_runs", [], |r| r.get(0)).unwrap();
+    assert_eq!(remaining, 2);
+}
