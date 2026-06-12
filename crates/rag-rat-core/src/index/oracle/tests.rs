@@ -3202,3 +3202,55 @@ fn string_resolution_preserves_bind_time_tool_version() {
         "bind-time provenance must survive a string-resolution relocate"
     );
 }
+
+/// Bare `path` bindings are AREA anchors (like `dir` bindings): a file edit must not stale them —
+/// before this, every commit permanently staled every area-level note bound to a touched file,
+/// burying real staleness signals. A SPANNED `path:start-end` binding claims specific content and
+/// keeps the content-hash staleness.
+#[test]
+fn bare_path_binding_survives_file_edit_spanned_goes_stale() {
+    let h = Harness::new();
+    let file = h.add_file("notes.rs", "fn a() {}\nfn b() {}\n");
+
+    let bind_path = |start: Option<i64>, end: Option<i64>, title: &str| {
+        create_memory(&h.conn, RepoMemoryCreate {
+            kind: "Decision".to_string(),
+            title: title.to_string(),
+            body: "area note".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            bind: RepoMemoryBindTarget {
+                path: Some("notes.rs".to_string()),
+                start_line: start,
+                end_line: end,
+                ..Default::default()
+            },
+        })
+        .unwrap()
+        .memory
+        .memory_id
+    };
+    let bare = bind_path(None, None, "bare path note");
+    let spanned = bind_path(Some(1), Some(1), "spanned path note");
+
+    // Edit the file: new content, new sha on the files row.
+    h.set_file_sha(file, "edited-sha");
+    validate_memories(&h.conn).unwrap();
+
+    let status =
+        |id: &str| memory_by_id(&h.conn, id).unwrap().unwrap().bindings[0].anchor_status.clone();
+    assert_eq!(
+        status(&bare),
+        "current",
+        "bare path binding is an area anchor — never content-stale"
+    );
+    assert_eq!(status(&spanned), "stale", "spanned path binding still claims content");
+
+    // Deleting the file row sends both to gone.
+    h.conn.execute("DELETE FROM files WHERE id = ?1", [file]).unwrap();
+    validate_memories(&h.conn).unwrap();
+    assert_eq!(status(&bare), "gone");
+    assert_eq!(status(&spanned), "gone");
+}

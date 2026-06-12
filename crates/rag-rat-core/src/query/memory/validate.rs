@@ -345,6 +345,15 @@ pub(crate) fn validate_path_binding(
     let Some(current_hash) = current_hash else {
         return Ok("gone".to_string());
     };
+    // A BARE path binding (no line span) is an AREA anchor, like a `dir` binding: the claim is
+    // "this note is about this file", not "this file's bytes are X" — so it is current while the
+    // file is indexed, never content-stale. Hashing the whole file made every commit stale every
+    // area-level note bound to a touched file, permanently (nothing refreshes the hash), which
+    // buried the real staleness signals under noise. Only a SPANNED `path:start-end` binding
+    // claims specific content and keeps the content-hash check.
+    if binding.start_line.is_none() && binding.end_line.is_none() {
+        return Ok("current".to_string());
+    }
     match source_hash_for_memory(conn, &binding.memory_id)? {
         Some(expected) if expected != current_hash => Ok("stale".to_string()),
         _ => Ok("current".to_string()),
