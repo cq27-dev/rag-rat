@@ -128,6 +128,11 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
     // A non-call edge kind (`references_type` / `uses_macro` / …) marks `matched_occurrences` but
     // NOT this set, so its confirmation can't inflate recall.
     let mut covered_call_occurrences: HashSet<(String, usize, usize)> = HashSet::new();
+    // Documents a drift gate fired for (call-site OR definition side). The recall pass must
+    // exclude occurrences in (or resolving into) these: a skipped-as-drifted candidate's
+    // occurrence is not a heuristic miss — the oracle deliberately declined to judge it — so
+    // counting it as `oracle_only_calls` would falsely lower recall (#88 review).
+    let mut drifted_paths: HashSet<String> = HashSet::new();
 
     // Resolve a SCIP definition `(path, byte-range)` back to one of OUR symbols, scoped to the
     // active `(commit_sha, worktree_id)` checkout (via `symbol_spans_for_path`). Used both by the
@@ -164,6 +169,7 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         let disk = disk_sha.get(&candidate.source_path).map(String::as_str);
         if disk != Some(&candidate.file_sha) {
             report.skipped_drifted += 1;
+            drifted_paths.insert(candidate.source_path.clone());
             continue;
         }
 
@@ -179,6 +185,7 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
             && production_sha.get(&candidate.source_path).map(String::as_str) != disk
         {
             report.skipped_drifted += 1;
+            drifted_paths.insert(candidate.source_path.clone());
             continue;
         }
 
@@ -193,6 +200,7 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
                 != Some(candidate.file_sha.as_str())
         {
             report.skipped_drifted += 1;
+            drifted_paths.insert(candidate.source_path.clone());
             continue;
         }
 
@@ -227,6 +235,7 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
                 != disk_sha.get(&def.path).map(String::as_str)
         {
             report.skipped_drifted += 1;
+            drifted_paths.insert(def.path.clone());
             continue;
         }
 
@@ -241,6 +250,7 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
                 != indexed_shas.get(&def.path).map(String::as_str)
         {
             report.skipped_drifted += 1;
+            drifted_paths.insert(def.path.clone());
             continue;
         }
 
@@ -339,8 +349,13 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
     // can cover a call from an unindexed source file, so those occurrences are out of scope,
     // not misses.
     let indexed_paths = store::indexed_paths_in_scope(conn, commit_sha, worktree_id)?;
-    report.oracle_only_calls =
-        count_uncovered_calls(&index, &matched_occurrences, &indexed_paths, &resolve_symbol);
+    report.oracle_only_calls = count_uncovered_calls(
+        &index,
+        &matched_occurrences,
+        &indexed_paths,
+        &drifted_paths,
+        &resolve_symbol,
+    );
 
     report.status = "Completed".to_string();
     store::record_oracle_run(
@@ -402,13 +417,17 @@ fn count_uncovered_calls(
     index: &ScipIndex,
     matched: &HashSet<(String, usize, usize)>,
     indexed_paths: &HashSet<String>,
+    drifted_paths: &HashSet<String>,
     resolve_definition: &dyn Fn(&str, usize, usize) -> Option<i64>,
 ) -> u64 {
     let mut count = 0u64;
     for (path, occurrences) in &index.occurrences_by_path {
         // The call site must live in a file rag-rat indexed in this checkout; a call from an
         // unindexed source is unreachable by any edge candidate, so it is not a recall gap.
-        if !indexed_paths.contains(path) {
+        // A DRIFTED call-site document is excluded too (#88 review): its candidates were
+        // deliberately skipped as untrusted, so its uncovered occurrences are abstentions, not
+        // heuristic misses.
+        if !indexed_paths.contains(path) || drifted_paths.contains(path) {
             continue;
         }
         for occ in occurrences {
@@ -422,6 +441,12 @@ fn count_uncovered_calls(
             let Some(def) = index.definitions.get(&occ.symbol) else {
                 continue;
             };
+            // A def in a DRIFTED document is excluded for the same reason as a drifted call
+            // site: the byte-converted def range can't be trusted, and the candidates that
+            // depended on it were skipped, not missed.
+            if drifted_paths.contains(&def.path) {
+                continue;
+            }
             if resolve_definition(&def.path, def.start_byte, def.end_byte).is_none() {
                 continue;
             }

@@ -1985,6 +1985,47 @@ mod oracle_surfacing_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// `oracle_pre_spawn_snapshot` returns the active checkout's indexed `(path -> sha256)` map;
+    /// a run pinned to a MATCHING snapshot verdicts normally, while a snapshot disagreeing with
+    /// the join-time indexed sha (the mid-subprocess reindex, #83) skips the candidate.
+    #[test]
+    fn pre_spawn_snapshot_round_trips_through_run_oracle() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let (_edge_id, cs, ce, path) = call_edge(&db);
+        let snapshot = db.oracle_pre_spawn_snapshot().unwrap();
+        let indexed_sha: String = db
+            .storage
+            .connection()
+            .query_row("SELECT sha256 FROM files WHERE path = ?1", params![path], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            snapshot.get(&path).map(String::as_str),
+            Some(indexed_sha.as_str()),
+            "snapshot must carry the indexed sha for every active-checkout file"
+        );
+
+        let symbol = "scip-rust crate held-mini `target`().";
+        let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((29, 35)));
+        let report = db
+            .run_oracle(OracleTool::RustAnalyzer, "v-test", &scip, None, Some(&snapshot))
+            .unwrap();
+        assert!(report.confirmed >= 1 || report.upgraded >= 1, "matching pin verdicts normally");
+        assert_eq!(report.skipped_drifted, 0);
+
+        let mut stale = snapshot.clone();
+        stale.insert(path.clone(), "pre-spawn-old".to_string());
+        let report =
+            db.run_oracle(OracleTool::RustAnalyzer, "v-test2", &scip, None, Some(&stale)).unwrap();
+        assert_eq!(report.rows_written, 0, "a mid-subprocess reindex must skip the candidate");
+        assert!(report.skipped_drifted >= 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Staleness revert: after a current run surfaces `compiler`, drifting the source file (so its
     /// `files.sha256` no longer matches the verdict's `file_sha`) reverts the edge to heuristic
     /// display — never `compiler`.

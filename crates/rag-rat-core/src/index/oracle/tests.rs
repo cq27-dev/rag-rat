@@ -3321,6 +3321,7 @@ fn pre_spawn_gate_passes_when_nothing_reindexed() {
     });
     assert!(verdict.is_some(), "matching pre-spawn snapshot must not block the verdict");
     assert_eq!(report.skipped_drifted, 0);
+    assert_eq!(report.oracle_only_calls, 0, "the covered call is no recall gap");
 }
 
 /// CALL-SITE document edited during the subprocess: index/disk/production all carry the NEW
@@ -3338,6 +3339,9 @@ fn pre_spawn_gate_skips_call_site_reindexed_mid_subprocess() {
     assert!(verdict.is_none(), "mid-subprocess call-site reindex must skip the verdict");
     assert_eq!(report.skipped_drifted, 1);
     assert_eq!(report.rows_written, 0);
+    // A skipped-as-drifted candidate is an ABSTENTION, not a heuristic miss: its occurrence must
+    // not count as a recall gap (#88 review).
+    assert_eq!(report.oracle_only_calls, 0, "drifted call-site doc is excluded from recall");
 }
 
 /// DEFINITION document edited during the subprocess: the call-site gate passes, but the resolved
@@ -3355,4 +3359,7 @@ fn pre_spawn_gate_skips_definition_reindexed_mid_subprocess() {
     assert!(verdict.is_none(), "mid-subprocess def reindex must skip the verdict");
     assert_eq!(report.skipped_drifted, 1);
     assert_eq!(report.rows_written, 0);
+    // The call site is clean but its DEF document drifted: the occurrence resolving into it must
+    // not count as a recall gap either (#88 review).
+    assert_eq!(report.oracle_only_calls, 0, "drifted def doc is excluded from recall");
 }
