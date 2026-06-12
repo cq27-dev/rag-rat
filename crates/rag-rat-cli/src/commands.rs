@@ -201,6 +201,12 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
     // No pre-built index: produce the `.scip` with the tool BEFORE acquiring the write lock, so the
     // slow rust-analyzer subprocess doesn't hold the lock and starve the watcher (#82 P3). Only the
     // probe-recheck + join/write below run under the lock.
+    //
+    // Snapshot the indexed shas BEFORE spawning (#83): a cheap read-only query, taken without the
+    // write lock. The join requires every verdict's documents to still carry these shas, so a file
+    // the watcher reindexes ANYWHERE in the spawn → join window — including DURING the subprocess,
+    // which the post-exit `production_sha` snapshot cannot see — is skipped, never mis-joined.
+    let pre_spawn_sha = open_index(config)?.oracle_pre_spawn_snapshot()?;
     let scip_output = config
         .database
         .parent()
@@ -224,13 +230,15 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
             bytes,
             production_sha,
         } => {
-            // The join's content gate revalidates against current disk bytes under the lock, and
-            // `production_sha` (the per-document disk hashes captured the instant the subprocess
-            // finished) pins the `.scip` to the content it was built against — so a file the
-            // watcher reindexes in this lock-free window is skipped, not mis-joined
-            // (#82 TOCTOU). Run only the join/write under the lock.
+            // The join's content gate revalidates against current disk bytes under the lock;
+            // `production_sha` (per-document disk hashes captured the instant the subprocess
+            // finished) pins the `.scip` to the content it was built against (#82 TOCTOU); and
+            // `pre_spawn_sha` (indexed shas captured before the spawn) extends that pin across
+            // the subprocess interior (#83) — together they cover the whole lock-free window, so
+            // a file the watcher reindexes anywhere in it is skipped, not mis-joined. Run only
+            // the join/write under the lock.
             let report = with_oracle_write_lock(config, |db| {
-                db.run_oracle(tool, &version, &bytes, Some(&production_sha))
+                db.run_oracle(tool, &version, &bytes, Some(&production_sha), Some(&pre_spawn_sha))
             })?;
             print_json(&serde_json::json!({
                 "outcome": "completed",

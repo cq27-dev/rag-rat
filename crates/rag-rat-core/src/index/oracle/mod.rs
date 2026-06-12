@@ -48,6 +48,11 @@ pub(crate) use store::{EdgeOracleComparison, EdgeOracleVerdict};
 /// `production_sha` is the per-document disk-hash snapshot captured when a TOOL produced this
 /// `.scip` (`None` for a pre-built `--scip`). When present it arms the scip-vs-disk content gate
 /// (#82 TOCTOU); see [`run::OracleRunInput::production_sha`].
+///
+/// `pre_spawn_sha` is the indexed `(path -> files.sha256)` snapshot taken BEFORE the tool
+/// subprocess was spawned (`None` for a pre-built `--scip`). It arms the pre-spawn gate (#83),
+/// which covers the subprocess INTERIOR the post-exit `production_sha` cannot; see
+/// [`run::OracleRunInput::pre_spawn_sha`].
 // The args mirror `OracleRunInput`'s fields one-to-one (this is the public thin adapter to it), so
 // a params struct would only re-wrap what callers already pass positionally.
 #[allow(clippy::too_many_arguments)]
@@ -60,6 +65,7 @@ pub fn run_oracle(
     scip_bytes: &[u8],
     checkout_root: &Path,
     production_sha: Option<&HashMap<String, String>>,
+    pre_spawn_sha: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<OracleReport> {
     run::run(conn, &OracleRunInput {
         tool,
@@ -69,7 +75,19 @@ pub fn run_oracle(
         scip_bytes,
         checkout_root,
         production_sha,
+        pre_spawn_sha,
     })
+}
+
+/// The indexed `(path -> files.sha256)` map for the active checkout — the pre-spawn snapshot
+/// callers take BEFORE spawning the oracle tool (#83). Cheap (reads indexed shas; hashes
+/// nothing), and read-only, so the CLI takes it before acquiring the index write lock.
+pub fn pre_spawn_snapshot(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<HashMap<String, String>> {
+    store::indexed_file_shas_in_scope(conn, commit_sha, worktree_id)
 }
 
 /// Heuristic-vs-oracle eval metrics for a tool/version, diffing `edge_oracle` against `edges`,
@@ -127,10 +145,12 @@ pub enum ScipProduction {
     /// tool version (content-addressed staleness key). `production_sha` is `relative_path -> hex
     /// sha256` of each document's disk bytes read the instant the subprocess finished — the
     /// scip-vs-disk content pin the join uses to reject a document the watcher reindexed in the
-    /// lock-free window before the join (#82 TOCTOU). It is a best-effort snapshot taken as close
-    /// to production as the API allows; a file unreadable at snapshot time is simply absent
-    /// (its candidate then fails the `Some(_) == disk` gate and is skipped, the safe
-    /// direction).
+    /// lock-free window AFTER production (#82 TOCTOU). A file unreadable at snapshot time is
+    /// simply absent (its candidate then fails the `Some(_) == disk` gate and is skipped, the
+    /// safe direction). The window INSIDE the subprocess — an edit between the tool reading a
+    /// source and this post-exit snapshot — is covered by the separate pre-spawn indexed-sha
+    /// snapshot the caller takes before spawning (#83); the two gates compose to span the whole
+    /// spawn → join window.
     Produced { version: String, bytes: Vec<u8>, production_sha: HashMap<String, String> },
     /// The tool isn't runnable / can't produce SCIP — the `oracle run` Blocked UX.
     Blocked { tool: String, program: String, hint: String },
@@ -217,6 +237,10 @@ pub fn run_oracle_with_tool(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<OracleRunOutcome> {
+    // Snapshot the indexed shas BEFORE spawning the tool — the pre-spawn gate (#83) needs the
+    // state from before the subprocess could observe any source, so a mid-subprocess reindex is
+    // detectable at the join.
+    let pre_spawn_sha = pre_spawn_snapshot(conn, commit_sha, worktree_id)?;
     match produce_scip_with_tool(tool, checkout_root, scip_output)? {
         ScipProduction::Blocked { tool, program, hint } =>
             Ok(OracleRunOutcome::Blocked { tool, program, hint }),
@@ -230,6 +254,7 @@ pub fn run_oracle_with_tool(
                 &bytes,
                 checkout_root,
                 Some(&production_sha),
+                Some(&pre_spawn_sha),
             )?;
             Ok(OracleRunOutcome::Completed {
                 tool: tool.as_db_str().to_string(),
