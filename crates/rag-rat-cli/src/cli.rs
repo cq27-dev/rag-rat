@@ -315,6 +315,10 @@ pub(crate) enum MemoryCommand {
         path: Option<String>,
         #[arg(long)]
         chunk: Option<i64>,
+        /// Directory anchor relative to the repo root (`""` for the repo root) — the area-level
+        /// binding `dir`-bound memories use.
+        #[arg(long)]
+        dir: Option<String>,
     },
 }
 

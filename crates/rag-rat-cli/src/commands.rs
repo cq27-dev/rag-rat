@@ -400,6 +400,10 @@ fn path_bind_target(path: String) -> rag_rat_core::query::memory::RepoMemoryBind
     rag_rat_core::query::memory::RepoMemoryBindTarget { path: Some(path), ..Default::default() }
 }
 
+fn dir_bind_target(dir: String) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
+    rag_rat_core::query::memory::RepoMemoryBindTarget { dir: Some(dir), ..Default::default() }
+}
+
 fn chunk_bind_target(chunk_id: i64) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
     rag_rat_core::query::memory::RepoMemoryBindTarget {
         chunk_id: Some(chunk_id),
@@ -455,7 +459,7 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
             }
             Ok(())
         },
-        MemoryCommand::Rebind { memory_id, symbol, symbol_path, symbol_id, path, chunk } => {
+        MemoryCommand::Rebind { memory_id, symbol, symbol_path, symbol_id, path, chunk, dir } => {
             let db = open_index(config)?;
             let bind = if symbol.is_some() || symbol_path.is_some() || symbol_id.is_some() {
                 let selector = rag_rat_core::query::symbol::SymbolSelector {
@@ -492,10 +496,12 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                 path_bind_target(path.clone())
             } else if let Some(chunk_id) = chunk {
                 chunk_bind_target(*chunk_id)
+            } else if let Some(dir) = dir {
+                dir_bind_target(dir.clone())
             } else {
                 anyhow::bail!(
                     "memory rebind needs one of --symbol <name>, --symbol-path <path::name>, \
-                     --symbol-id <id>, --path <path>, or --chunk <id>"
+                     --symbol-id <id>, --path <path>, --chunk <id>, or --dir <dir>"
                 );
             };
             print_json(&db.memory_rebind(memory_id, bind)?)
