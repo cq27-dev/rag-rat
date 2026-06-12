@@ -623,9 +623,11 @@ fn collect_index_files(config: &Config) -> anyhow::Result<Vec<IndexFile>> {
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
 
-    // Compile the repo's `.gitignore` rules (root + nested) once, shared across targets, so the
-    // walker skips the same paths the watcher's `event_is_relevant` will (issue #62).
-    let ignore = ignore_rules::IgnoreMatcher::compile(&config.root);
+    // Compile the repo's `.gitignore` rules (ancestor chain + nested-along-target-trees) once,
+    // shared across targets, so the walker skips the same paths the watcher's `event_is_relevant`
+    // will (issue #62). Nested-gitignore discovery is scoped to the configured target directories
+    // so a large unindexed sibling is never walked (round-3 finding).
+    let ignore = ignore_rules::IgnoreMatcher::compile(&config.root, &config.target_directories());
     for target in targets {
         for file in walker::walk_target(&config.root, target, &ignore)? {
             let relative_path = file.strip_prefix(&config.root)?.to_path_buf();

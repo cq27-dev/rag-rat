@@ -5,32 +5,50 @@
 //! repo-specific `.gitignore` entries — generated dirs, build outputs, vendored code in
 //! non-standard locations — so they could get indexed and (recursively) watched.
 //!
-//! [`IgnoreMatcher`] compiles the repo's real `.gitignore` rules (root **and** nested gitignores,
-//! via ripgrep's [`ignore`] crate) once, and both the walker and the watcher consult it so a path
-//! one ignores the other also ignores — no drift. The hardcoded names are kept as a **floor**
-//! ([`FLOOR_DIRS`]): they apply even in a non-git tree with no `.gitignore`, and they cover
-//! rag-rat's own index dir (`.rag-rat/`), which must never be indexed regardless of gitignore
-//! contents.
+//! [`IgnoreMatcher`] compiles the repo's real `.gitignore` rules and both the walker and the
+//! watcher consult it, so a path one ignores the other also ignores — no drift. The hardcoded names
+//! are kept as a **floor** ([`FLOOR_DIRS`]): they apply even in a non-git tree with no
+//! `.gitignore`, and they cover rag-rat's own index dir (`.rag-rat/`), which must never be indexed
+//! regardless of gitignore contents.
 //!
-//! **Two git semantics this matcher must get right** (both were P2 review findings — see issue #62
-//! / PR #66):
+//! **Git semantics, correct by construction (issue #62 / PR #66, three rounds of P2 findings).**
+//! We build the matcher on the [`ignore`] crate's native [`Gitignore`] machinery — each
+//! `.gitignore` is compiled by [`GitignoreBuilder`] *anchored at its own directory*, so a
+//! non-anchored pattern (`skip.rs`) scopes to that subtree exactly as Git does. We do **not**
+//! flatten everything into one builder (that would `**/`-prefix nested patterns and leak them
+//! repo-wide). The matcher is a small ancestor-anchored *stack* of these per-directory
+//! `Gitignore`s; precedence and parent-exclusion then fall out of walking a path's ancestors
+//! top-down (see [`IgnoreMatcher::is_ignored`]).
 //!
-//! 1. **All checks run on the path *relative to the repo root*, never on its absolute ancestors.**
-//!    The walker and the watcher feed absolute paths. A repo can live *under* a directory named
-//!    like a floor entry (`/tmp/build/repo`, a checkout below `…/node_modules/…`), so testing floor
-//!    components on the absolute path would mark the whole repo ignored → empty discovery. We strip
-//!    the root first and test only the in-repo remainder.
-//! 2. **Parent exclusion is honored: a file under an ignored directory is *not* re-included** by a
-//!    deeper negation unless the *parent directory itself* is re-included. Git evaluates ancestors
-//!    top-down and stops descending once a directory is excluded; a nested `gen/.gitignore`
-//!    `!keep.rs` under a root-ignored `gen/` does **not** resurrect `gen/keep.rs`. [`is_ignored`]
-//!    walks the relative path root→leaf and short-circuits at the first ignored ancestor, exactly
-//!    as `ignore`'s own `WalkBuilder` does.
+//! The three properties that earned their own findings:
+//!
+//! 1. **Repo-relative checks, never absolute-ancestor.** The walker and watcher feed absolute
+//!    paths. A repo can live *under* a directory named like a floor entry (`/tmp/build/repo`), so
+//!    the floor check runs on the path relative to `config.root`, not on its absolute ancestors.
+//! 2. **Parent exclusion.** A file under an ignored directory is *not* re-included by a deeper
+//!    negation unless the *parent directory itself* is re-included. Git stops descending once a
+//!    directory is excluded; a nested `gen/.gitignore !keep.rs` under a root-ignored `gen/` does
+//!    not resurrect `gen/keep.rs`. [`is_ignored`] walks ancestors root→leaf and short-circuits at
+//!    the first ignored directory, and discovery prunes excluded subtrees so their nested
+//!    `.gitignore` is never even read.
+//! 3. **Ancestor `.gitignore` files above a subdirectory `config.root`.** When `config.root` is a
+//!    subdirectory of a larger Git worktree, the worktree-root `.gitignore` (and every `.gitignore`
+//!    on the chain down to `config.root`) still governs paths under `config.root` — Git applies
+//!    them. The matcher resolves the worktree root (via
+//!    [`crate::index::git_history::worktree_root`], the one place we shell `git rev-parse
+//!    --show-toplevel`) and seeds the stack with that ancestor chain before the in-tree gitignores.
+//!    In a non-git tree the base is just `config.root`.
+//!
+//! **Discovery is scoped to the target trees** (finding from round 3): nested `.gitignore` files
+//! are collected only along the configured `target.directories`, never by recursing the whole
+//! `config.root` into large unindexed sibling directories.
 
 use std::path::{Component, Path, PathBuf};
 
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+use crate::index::git_history;
 
 /// Directory names always skipped, gitignore or not — the floor under the compiled `.gitignore`
 /// rules. `.rag-rat` is rag-rat's own index dir (indexing it would be a feedback loop); `.git` is
@@ -45,57 +63,85 @@ fn is_floor_dir(name: &str) -> bool {
     FLOOR_DIRS.contains(&name)
 }
 
-/// One `.gitignore`, compiled with its own directory as the matching root so its patterns are
-/// scoped to that subtree (gitignore semantics: a non-anchored pattern like `skip.rs` matches only
-/// at or below the file's directory, not the whole repo). `rel_dir` is that directory **relative to
-/// the repo root** — matching strips it off the candidate's repo-relative path before applying the
-/// compiled matcher, keeping every decision in repo-relative space (see [`IgnoreMatcher`] finding
-/// 1).
+/// One `.gitignore`, compiled by [`GitignoreBuilder`] with its own directory as the matching root
+/// so its patterns are scoped to that subtree (gitignore semantics: a non-anchored pattern like
+/// `skip.rs` matches only at or below the file's directory, not the whole repo). `rel_dir` is that
+/// directory **relative to the matcher base** (the worktree root, or `config.root` outside git);
+/// matching strips it off the candidate's base-relative path before applying the compiled matcher.
 #[derive(Debug)]
 struct ScopedGitignore {
-    /// The `.gitignore`'s directory relative to the repo root (empty for the root `.gitignore`);
-    /// the matcher applies only to repo-relative paths under it.
+    /// The `.gitignore`'s directory relative to the matcher base (empty for the base
+    /// `.gitignore`); the matcher applies only to base-relative paths under it.
     rel_dir: PathBuf,
     gitignore: Gitignore,
 }
 
-/// Compiled ignore rules for one repo root: the floor names plus a per-directory stack of compiled
-/// `.gitignore` files (root and nested), each scoped to its own subtree. Built once per walk/watch
-/// and shared so the walker and watcher classify paths identically (issue #62).
+/// Compiled ignore rules for one indexed root: the floor names plus an ancestor-anchored stack of
+/// per-directory [`Gitignore`]s. Built once per walk/watch and shared so the walker and watcher
+/// classify paths identically (issue #62).
 ///
-/// **Why a per-directory stack and not one flat `GitignoreBuilder`:** `GitignoreBuilder::add`
-/// flattens every file's globs into a single matcher rooted at the *builder* root and gives each
-/// non-anchored pattern a `**/` prefix — so a nested `.gitignore` rule `skip.rs` would wrongly
-/// match `skip.rs` anywhere in the repo. Compiling each `.gitignore` against *its own* directory
-/// and only applying it to descendants of that directory is what makes nesting correct.
+/// **Two anchors.** `base` is the matcher's gitignore frame — the Git worktree root when
+/// `config.root` is inside one (so ancestor `.gitignore` rules apply to a subdirectory root,
+/// finding 3), else `config.root`. `root` is `config.root` itself; the floor check and the
+/// "governed at all?" guard run relative to `root`, so a `config.root` living under a floor-named
+/// worktree path (`/tmp/build/repo`) still indexes its own files (finding 1).
 ///
-/// **All matching is repo-relative** (`root` is stripped first), and ancestor directories are
-/// evaluated top-down with parent-exclusion short-circuit — see the module docs and [`is_ignored`].
+/// **Why a per-directory stack and not one flat builder:** `GitignoreBuilder::add` flattens every
+/// file's globs into a single matcher rooted at the *builder* root and `**/`-prefixes non-anchored
+/// patterns — so a nested `.gitignore` rule `skip.rs` would wrongly match `skip.rs` anywhere.
+/// Compiling each `.gitignore` against *its own* directory and only applying it to descendants is
+/// what makes nesting correct.
 #[derive(Debug)]
 pub struct IgnoreMatcher {
-    /// The repo root. Absolute candidate paths are stripped to this before any floor / gitignore
-    /// check so we never test ancestors *above* the repo (finding 1).
+    /// `config.root` — the indexed root. Floor checks and the governed-path guard are relative to
+    /// this (finding 1), independently of the wider `base`.
     root: PathBuf,
-    /// Stack of compiled gitignores, **outermost first** (root before nested). Matching applies
-    /// the ones whose `rel_dir` is an ancestor of the candidate, outermost→innermost, deepest
-    /// decision winning, so a nested whitelist can override an outer ignore — standard git
-    /// precedence.
+    /// The gitignore frame: the Git worktree root if `root` is inside one, else `root`. Every
+    /// `ScopedGitignore.rel_dir` and all gitignore matching is relative to `base` (finding 3).
+    base: PathBuf,
+    /// Stack of compiled gitignores, **outermost first** (worktree-root/ancestor before nested).
+    /// Matching applies the ones whose `rel_dir` is an ancestor of the candidate,
+    /// outermost→innermost, deepest decision winning, so a nested whitelist can override an outer
+    /// ignore — standard git precedence.
     stack: Vec<ScopedGitignore>,
 }
 
 impl IgnoreMatcher {
-    /// Compile the matcher for `root`. Collects every `.gitignore` at or below `root` (skipping the
-    /// floor dirs themselves, and **not descending into a directory an outer rule already
-    /// ignores**, so a nested gitignore can't un-ignore files under an excluded parent —
-    /// finding 2) and compiles each against its own directory. Never fails — a malformed
-    /// gitignore is dropped and matching proceeds with what compiled.
-    pub fn compile(root: &Path) -> Self {
-        let mut matcher = Self { root: root.to_path_buf(), stack: Vec::new() };
-        // Discover and compile gitignores top-down so an outer rule is in `stack` before we decide
-        // whether to descend into a child directory (parent-exclusion pruning, finding 2).
-        matcher.collect_gitignores(root);
-        // Outermost first: shortest rel_dir sorts before its descendants. (collect_gitignores
-        // already pushes top-down, but make the invariant explicit and order-independent.)
+    /// Compile the matcher for `root`, scoping nested-`.gitignore` discovery to `target_dirs`
+    /// (relative to `root`). Resolves the enclosing Git worktree root and seeds the stack with the
+    /// ancestor `.gitignore` chain from there down to `root` (finding 3), then discovers nested
+    /// gitignores only along the target trees (round-3 scoping fix) — never recursing the whole
+    /// `root` into unindexed siblings. Never fails — a malformed gitignore is dropped and matching
+    /// proceeds with what compiled.
+    pub fn compile(root: &Path, target_dirs: &[PathBuf]) -> Self {
+        // The gitignore frame: the worktree root if `root` is inside a Git worktree, else `root`.
+        // Only accept it when `root` is actually a descendant (or equal) — a `--show-toplevel`
+        // result we can't relate to `root` is unusable as a prefix-stripping base.
+        let base = git_history::worktree_root(root)
+            .filter(|wt| root.starts_with(wt))
+            .unwrap_or_else(|| root.to_path_buf());
+
+        let mut matcher = Self { root: root.to_path_buf(), base, stack: Vec::new() };
+
+        // (1) Ancestor chain: every `.gitignore` from the worktree base down to (and including)
+        // `root`, so worktree-root rules govern a subdirectory `config.root` (finding 3).
+        matcher.collect_ancestor_gitignores();
+
+        // (2) Nested gitignores, but ONLY along the configured target directories (round-3 scoping
+        // fix) — not a recursive sweep of the whole `root`. Each target dir is walked top-down with
+        // parent-exclusion pruning (finding 2). Dedup so a `.gitignore` under overlapping target
+        // dirs is compiled once.
+        let scan_roots = if target_dirs.is_empty() {
+            vec![root.to_path_buf()]
+        } else {
+            target_dirs.iter().map(|dir| root.join(dir)).collect()
+        };
+        for scan_root in scan_roots {
+            matcher.collect_nested_gitignores(&scan_root);
+        }
+
+        // Outermost first: shortest rel_dir sorts before its descendants, making the precedence
+        // walk in `decision_for` order-independent.
         matcher.stack.sort_by_key(|scoped| scoped.rel_dir.as_os_str().len());
         matcher
     }
@@ -103,20 +149,27 @@ impl IgnoreMatcher {
     /// Whether `path` is ignored. `is_dir` must say whether the path is a directory — gitignore
     /// distinguishes `foo/` (dir-only) from `foo`.
     ///
-    /// The candidate is first made **repo-relative** by stripping `root`; a path outside the repo
-    /// is not governed by these rules (returns `false`). A floor-dir name among the *relative*
-    /// components ignores it unconditionally (the floor can't be whitelisted away). Otherwise each
-    /// ancestor directory is evaluated root→leaf against the scoped `.gitignore` stack: the first
-    /// ancestor that resolves to *ignored* makes the whole path ignored (git parent exclusion — a
-    /// deeper `!negation` cannot resurrect a file under an excluded directory). A whitelisted
-    /// ancestor clears the ignored state for that level so its subtree is re-evaluated.
+    /// A path outside `config.root` is not governed (returns `false`). A floor-dir name among the
+    /// components relative to `config.root` ignores it unconditionally (the floor can't be
+    /// whitelisted away — finding 1). Otherwise each ancestor directory, walked **relative to the
+    /// matcher base** (which may sit above `config.root`), is evaluated root→leaf against the
+    /// scoped `.gitignore` stack: the first ancestor that resolves to *ignored* makes the whole
+    /// path ignored (git parent exclusion — a deeper `!negation` cannot resurrect a file under
+    /// an excluded directory). A whitelisted ancestor clears the ignored state for that level.
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        let Ok(rel) = path.strip_prefix(&self.root) else {
-            return false; // outside the repo root — not governed by our rules.
+        // Governed only inside config.root; the floor is checked on the config.root-relative path
+        // so a root under a floor-named ancestor still indexes (finding 1).
+        let Ok(rel_to_root) = path.strip_prefix(&self.root) else {
+            return false; // outside the indexed root — not governed by our rules.
         };
-        if rel_contains_floor_dir(rel) {
+        if rel_contains_floor_dir(rel_to_root) {
             return true;
         }
+        // Gitignore matching is base-relative so ancestor `.gitignore`s above config.root apply
+        // (finding 3). `root` is always under `base`, so this strip succeeds.
+        let Ok(rel) = path.strip_prefix(&self.base) else {
+            return false;
+        };
         // Walk ancestor prefixes root→leaf. `ignored` carries the inherited decision from shallower
         // levels; once a directory level lands on `Ignore`, every deeper level inherits it unless a
         // level is explicitly whitelisted (which clears it for that and deeper levels).
@@ -125,7 +178,7 @@ impl IgnoreMatcher {
         let mut components = rel.components().peekable();
         while let Some(component) = components.next() {
             let Component::Normal(name) = component else {
-                continue; // skip `.`/`..`/prefix/root — repo-relative paths shouldn't have them.
+                continue; // skip `.`/`..`/prefix/root — base-relative paths shouldn't have them.
             };
             prefix.push(name);
             // The leaf uses the caller's `is_dir`; every intermediate prefix is a directory.
@@ -145,10 +198,11 @@ impl IgnoreMatcher {
         ignored
     }
 
-    /// The combined gitignore decision for one repo-relative path at one level, applying every
+    /// The combined gitignore decision for one base-relative path at one level, applying every
     /// scoped gitignore whose `rel_dir` is an ancestor, outermost→innermost (deepest wins). Uses
-    /// `matched` (not `matched_path_or_any_parents`): the caller ([`is_ignored`]) already walks
-    /// ancestors top-down, so per-level leaf matching is correct and avoids double parent-walking.
+    /// `Gitignore::matched` (leaf-only, not `matched_path_or_any_parents`): the caller
+    /// ([`is_ignored`]) already walks ancestors top-down, so per-level leaf matching is correct and
+    /// avoids double parent-walking.
     fn decision_for(&self, rel: &Path, is_dir: bool) -> Match<()> {
         let mut decision = Match::None;
         for scoped in &self.stack {
@@ -167,22 +221,38 @@ impl IgnoreMatcher {
         decision
     }
 
-    /// Recursively collect + compile `.gitignore` files at or below `dir`, pruning floor dirs and —
-    /// crucially — any directory an already-collected outer rule ignores (finding 2: don't descend
-    /// into an excluded directory to read a nested gitignore that could wrongly un-ignore its
-    /// contents). `dir` is absolute; `self.stack` is grown in place so outer rules govern the
-    /// descent decision for their children.
-    fn collect_gitignores(&mut self, dir: &Path) {
-        if dir.join(".gitignore").is_file() {
-            let rel_dir = dir.strip_prefix(&self.root).unwrap_or(Path::new("")).to_path_buf();
-            let mut builder = GitignoreBuilder::new(dir);
-            // `add` returns an Option<Error> for partial-parse problems; ignore it (best-effort,
-            // matching ripgrep's own tolerance) rather than failing the whole walk.
-            let _ = builder.add(dir.join(".gitignore"));
-            if let Ok(gitignore) = builder.build() {
-                self.stack.push(ScopedGitignore { rel_dir, gitignore });
-            }
+    /// Seed the stack with the ancestor `.gitignore` chain from the matcher `base` (worktree root)
+    /// down to and including `root`. These are the rules Git applies to paths under a subdirectory
+    /// `config.root` (finding 3). No-op when `base == root` (the chain is just `root` itself, which
+    /// the nested scan also covers — dedup in [`push_gitignore_in`] keeps it single).
+    fn collect_ancestor_gitignores(&mut self) {
+        // Build the list of directories from base down to root: base, base/a, base/a/b, …, root.
+        let Ok(rel) = self.root.strip_prefix(&self.base) else {
+            return;
+        };
+        // Collect the component names first so `self` isn't borrowed across the mutating pushes.
+        let names: Vec<PathBuf> = rel
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(PathBuf::from(name)),
+                _ => None,
+            })
+            .collect();
+        let mut dir = self.base.clone();
+        self.push_gitignore_in(&dir);
+        for name in names {
+            dir.push(name);
+            self.push_gitignore_in(&dir);
         }
+    }
+
+    /// Recursively collect + compile nested `.gitignore` files at or below `dir`, pruning floor
+    /// dirs and — crucially — any directory an already-collected outer rule ignores (finding 2:
+    /// don't descend into an excluded directory to read a nested gitignore that could wrongly
+    /// un-ignore its contents). `dir` is absolute; the stack is grown in place so outer rules
+    /// govern the descent decision for their children.
+    fn collect_nested_gitignores(&mut self, dir: &Path) {
+        self.push_gitignore_in(dir);
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -204,12 +274,35 @@ impl IgnoreMatcher {
             if self.is_ignored(&child, true) {
                 continue;
             }
-            self.collect_gitignores(&child);
+            self.collect_nested_gitignores(&child);
+        }
+    }
+
+    /// Compile the `.gitignore` directly inside `dir` (if any) anchored at `dir`, and push it to
+    /// the stack with `rel_dir` relative to `base`. Idempotent: a `.gitignore` already in the
+    /// stack (the ancestor chain and the nested scan can overlap at `root`) is not added twice.
+    fn push_gitignore_in(&mut self, dir: &Path) {
+        let Ok(rel_dir) = dir.strip_prefix(&self.base) else {
+            return;
+        };
+        let rel_dir = rel_dir.to_path_buf();
+        if self.stack.iter().any(|scoped| scoped.rel_dir == rel_dir) {
+            return; // already compiled (ancestor chain ↔ nested scan overlap at `root`).
+        }
+        if !dir.join(".gitignore").is_file() {
+            return;
+        }
+        let mut builder = GitignoreBuilder::new(dir);
+        // `add` returns an Option<Error> for partial-parse problems; ignore it (best-effort,
+        // matching ripgrep's own tolerance) rather than failing the whole walk.
+        let _ = builder.add(dir.join(".gitignore"));
+        if let Ok(gitignore) = builder.build() {
+            self.stack.push(ScopedGitignore { rel_dir, gitignore });
         }
     }
 }
 
-/// Whether any component of the (repo-relative) `rel` path is a floor directory name.
+/// Whether any component of the (`config.root`-relative) `rel` path is a floor directory name.
 fn rel_contains_floor_dir(rel: &Path) -> bool {
     rel.components().any(|component| component.as_os_str().to_str().is_some_and(is_floor_dir))
 }
@@ -227,10 +320,27 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
+    /// Compile scoping discovery to the whole root (the common case in these unit tests).
+    fn compile(root: &Path) -> IgnoreMatcher {
+        IgnoreMatcher::compile(root, &[])
+    }
+
+    /// Initialize a real (empty) Git repo at `dir` so worktree-root resolution returns `dir`. Used
+    /// by the ancestor-chain test; the others don't need git (base falls back to `root`).
+    fn git_init(dir: &Path) {
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init failed (git must be on PATH for this test)");
+    }
+
     #[test]
     fn floor_dirs_ignored_without_any_gitignore() {
         let tmp = tempdir();
-        let m = IgnoreMatcher::compile(&tmp);
+        let m = compile(&tmp);
         assert!(m.is_ignored(&tmp.join("target"), true));
         assert!(m.is_ignored(&tmp.join("target/debug/foo.rs"), false));
         assert!(m.is_ignored(&tmp.join(".rag-rat"), true));
@@ -246,7 +356,7 @@ mod tests {
         write(&tmp.join("src/lib.rs"), "fn a() {}\n");
         write(&tmp.join("generated/out.rs"), "fn b() {}\n");
         write(&tmp.join("src/old.bak"), "x\n");
-        let m = IgnoreMatcher::compile(&tmp);
+        let m = compile(&tmp);
         assert!(m.is_ignored(&tmp.join("generated"), true), "gitignored dir");
         assert!(m.is_ignored(&tmp.join("generated/out.rs"), false), "file under gitignored dir");
         assert!(m.is_ignored(&tmp.join("src/old.bak"), false), "gitignored glob");
@@ -261,7 +371,7 @@ mod tests {
         write(&tmp.join("sub/.gitignore"), "vendor.rs\n");
         write(&tmp.join("sub/vendor.rs"), "x\n");
         write(&tmp.join("vendor.rs"), "x\n");
-        let m = IgnoreMatcher::compile(&tmp);
+        let m = compile(&tmp);
         assert!(m.is_ignored(&tmp.join("sub/vendor.rs"), false), "nested rule applies in subtree");
         assert!(
             !m.is_ignored(&tmp.join("vendor.rs"), false),
@@ -276,7 +386,7 @@ mod tests {
         write(&tmp.join(".gitignore"), "build/\n!build/keep.rs\n");
         write(&tmp.join("build/keep.rs"), "x\n");
         write(&tmp.join("build/drop.rs"), "x\n");
-        let m = IgnoreMatcher::compile(&tmp);
+        let m = compile(&tmp);
         // NOTE: `build` is also a FLOOR dir, so the floor wins regardless of negation — assert that
         // the floor is unconditional. (A non-floor whitelisted dir is covered by the next test.)
         assert!(
@@ -295,7 +405,7 @@ mod tests {
         write(&tmp.join(".gitignore"), "gen/\n!gen/\ngen/skip/\n");
         write(&tmp.join("gen/a.rs"), "x\n");
         write(&tmp.join("gen/skip/b.rs"), "x\n");
-        let m = IgnoreMatcher::compile(&tmp);
+        let m = compile(&tmp);
         assert!(!m.is_ignored(&tmp.join("gen/a.rs"), false), "re-included dir's file un-ignored");
         assert!(m.is_ignored(&tmp.join("gen/skip/b.rs"), false), "re-ignored subdir still out");
         fs::remove_dir_all(&tmp).ok();
@@ -311,7 +421,7 @@ mod tests {
         write(&tmp.join("gen/.gitignore"), "!keep.rs\n");
         write(&tmp.join("gen/keep.rs"), "x\n");
         write(&tmp.join("gen/drop.rs"), "x\n");
-        let m = IgnoreMatcher::compile(&tmp);
+        let m = compile(&tmp);
         assert!(
             m.is_ignored(&tmp.join("gen/keep.rs"), false),
             "nested negation under an ignored parent must NOT re-include",
@@ -324,13 +434,12 @@ mod tests {
     fn flat_negation_unignores_non_floor_file() {
         // Distinct from the nested case: a SINGLE gitignore with `gen/` + `!gen/keep.rs` does NOT
         // re-include either, because git can't reach inside an excluded directory even from the
-        // same file. Both stay ignored. (This is the git-correct behavior; the pre-fix stack
-        // wrongly un-ignored here.)
+        // same file. Both stay ignored. (This is the git-correct behavior.)
         let tmp = tempdir();
         write(&tmp.join(".gitignore"), "gen/\n!gen/keep.rs\n");
         write(&tmp.join("gen/keep.rs"), "x\n");
         write(&tmp.join("gen/drop.rs"), "x\n");
-        let m = IgnoreMatcher::compile(&tmp);
+        let m = compile(&tmp);
         assert!(m.is_ignored(&tmp.join("gen/keep.rs"), false), "no reinclude under excluded dir");
         assert!(m.is_ignored(&tmp.join("gen/drop.rs"), false), "sibling still ignored");
         fs::remove_dir_all(&tmp).ok();
@@ -345,7 +454,7 @@ mod tests {
         let root = outer.join("my-repo");
         write(&root.join("src/lib.rs"), "fn a() {}\n");
         write(&root.join("target/debug/built.rs"), "fn b() {}\n");
-        let m = IgnoreMatcher::compile(&root);
+        let m = compile(&root);
         assert!(
             !m.is_ignored(&root.join("src/lib.rs"), false),
             "repo under a floor-named ancestor still indexes its files",
@@ -357,12 +466,72 @@ mod tests {
         fs::remove_dir_all(outer.parent().unwrap()).ok();
     }
 
+    #[test]
+    fn worktree_root_gitignore_governs_subdirectory_config_root() {
+        // FINDING 3 (round 3): `config.root` is a subdirectory (`crates`) of a larger Git worktree.
+        // The worktree-root `.gitignore` rules Git would apply to paths under that subdirectory
+        // must be honored — files Git ignores must not be indexed.
+        let wt = tempdir();
+        git_init(&wt);
+        // Worktree-root .gitignore ignores every `*.gen.rs` and the `vendored/` dir, repo-wide.
+        write(&wt.join(".gitignore"), "*.gen.rs\nvendored/\n");
+        let sub = wt.join("crates");
+        write(&sub.join("lib.rs"), "fn a() {}\n");
+        write(&sub.join("schema.gen.rs"), "fn g() {}\n");
+        write(&sub.join("vendored/dep.rs"), "fn v() {}\n");
+
+        // Compile with `config.root = crates` — the ancestor chain must pull in the worktree-root
+        // `.gitignore` even though it sits ABOVE config.root.
+        let m = IgnoreMatcher::compile(&sub, &[PathBuf::from(".")]);
+        assert!(!m.is_ignored(&sub.join("lib.rs"), false), "normal source under subdir indexes");
+        assert!(
+            m.is_ignored(&sub.join("schema.gen.rs"), false),
+            "worktree-root glob applies under the subdir config.root (finding 3)",
+        );
+        assert!(
+            m.is_ignored(&sub.join("vendored/dep.rs"), false),
+            "worktree-root dir rule applies under the subdir config.root (finding 3)",
+        );
+        fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn discovery_does_not_walk_unignored_sibling_outside_targets() {
+        // ROUND 3 (scoping): a large unignored sibling dir OUTSIDE the configured target trees must
+        // not be scanned for nested `.gitignore`s. We assert by behavior: a nested `.gitignore` in
+        // the sibling is never compiled, so it has no effect on classification — and, conversely, a
+        // nested `.gitignore` INSIDE the target tree IS picked up.
+        let root = tempdir();
+        // Target tree: `src`. Sibling tree: `huge` (not a target).
+        write(&root.join("src/.gitignore"), "skip.rs\n");
+        write(&root.join("src/skip.rs"), "x\n");
+        // Sibling's nested gitignore would, if scanned, ignore `marker.rs`. Scoped discovery must
+        // NOT read it, so `marker.rs` stays unignored.
+        write(&root.join("huge/.gitignore"), "marker.rs\n");
+        write(&root.join("huge/marker.rs"), "x\n");
+
+        let m = IgnoreMatcher::compile(&root, &[PathBuf::from("src")]);
+        // In-target nested gitignore is honored.
+        assert!(
+            m.is_ignored(&root.join("src/skip.rs"), false),
+            "in-target nested gitignore honored"
+        );
+        // Out-of-target sibling's nested gitignore was never compiled → no effect.
+        assert!(
+            !m.is_ignored(&root.join("huge/marker.rs"), false),
+            "sibling outside target trees is not scanned for nested gitignores (scoping)",
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
     fn tempdir() -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("ragrat-ignore-{}-{id}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // Canonicalize so the absolute paths we build match what worktree-root resolution returns
+        // (macOS /tmp is a symlink to /private/tmp; git reports the canonical form).
+        dir.canonicalize().unwrap_or(dir)
     }
 }

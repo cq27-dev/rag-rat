@@ -125,7 +125,7 @@ mod tests {
         write(&root.join("skip.rs"), "fn e() {}\n");
 
         let target = rust_target();
-        let ignore = IgnoreMatcher::compile(&root);
+        let ignore = IgnoreMatcher::compile(&root, &target.directories);
         let mut found = walk_target(&root, &target, &ignore).unwrap();
         found.sort();
         let rel: Vec<String> = found

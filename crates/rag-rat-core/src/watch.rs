@@ -135,6 +135,34 @@ fn kind_is_mutation(kind: &EventKind) -> bool {
     }
 }
 
+/// Directories whose `.gitignore` the watcher must subscribe to so a root-rule edit is *delivered*
+/// (round-3 finding 1). The target dirs the watcher already watches recursively are *below*
+/// `config.root`; when `config.root` is itself a subdirectory of a larger Git worktree, the
+/// worktree-root `.gitignore` (and any ancestor `.gitignore` down to `config.root`) sits ABOVE them
+/// and would otherwise never produce an event. This returns the ancestor chain from the worktree
+/// root down to and including `config.root`. In a non-git tree (or when `config.root` *is* the
+/// worktree root) it returns just `config.root` — already covered by the recursive target watches,
+/// so the extra non-recursive watch is a harmless no-op duplicate.
+fn gitignore_watch_dirs(root: &Path) -> Vec<PathBuf> {
+    let base = crate::index::git_history::worktree_root(root).filter(|wt| root.starts_with(wt));
+    let mut dirs = Vec::new();
+    if let Some(base) = base
+        && let Ok(rel) = root.strip_prefix(&base)
+    {
+        let mut dir = base;
+        dirs.push(dir.clone());
+        for component in rel.components() {
+            if let std::path::Component::Normal(name) = component {
+                dir.push(name);
+                dirs.push(dir.clone());
+            }
+        }
+    } else {
+        dirs.push(root.to_path_buf());
+    }
+    dirs
+}
+
 /// Whether `path`'s file name is `.gitignore`. A mutation to any `**/.gitignore` changes the
 /// repo's ignore rules, so it is a relevant event (issue #62 / PR #66 finding 4) even though
 /// `.gitignore` is not a configured target language — the pass it fires recompiles the matcher and
@@ -272,12 +300,25 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
             let _ = notify_watcher.watch(&config.root.join(dir), RecursiveMode::Recursive);
         }
     }
+    // Round-3 finding 1: when `config.root` is a subdirectory of a larger Git worktree, the target
+    // dirs are below `config.root`, so a watch scoped to them never sees an edit to the
+    // *worktree-root* (or any ancestor) `.gitignore` that lives ABOVE them — those root-rule
+    // changes would never recompile the matcher. Subscribe (non-recursively, to avoid
+    // re-watching the whole worktree) to every directory on the ancestor chain from the
+    // worktree root down to `config.root`, so a `.gitignore` mutation there is delivered.
+    // `gitignore_watch_dirs` returns the chain (always including `config.root`); the
+    // non-recursive watch only delivers events for files directly in each dir, which is exactly
+    // where each ancestor `.gitignore` sits.
+    for dir in gitignore_watch_dirs(&config.root) {
+        let _ = notify_watcher.watch(&dir, RecursiveMode::NonRecursive);
+    }
     // Compile the repo's `.gitignore` rules for event classification — the same matcher the
     // discover walk uses (issue #62), so an ignored path never fires a pass. Recompiled whenever a
     // `.gitignore` mutation is observed (finding 3) so the running classifier never applies stale
     // rules; each pass's discover walk also compiles its own fresh matcher, so the index itself is
     // always current regardless.
-    let mut ignore = IgnoreMatcher::compile(&config.root);
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
     // Fleet hot-upgrade: also watch the installed binary's directory so a new `cargo install`
     // rename triggers a fleet-wide upgrade. Watch the directory (not the file) so the atomic
     // rename — which replaces the inode — is still observed.
@@ -319,7 +360,7 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
                     if kind_is_mutation(&event.kind)
                         && event.paths.iter().any(|path| is_gitignore_path(path))
                     {
-                        ignore = IgnoreMatcher::compile(&config.root);
+                        ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
                     }
                 }
                 if event_targets_binary(fleet_bin.as_deref(), &event) {
@@ -404,7 +445,7 @@ mod tests {
             local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
         };
-        let ignore = IgnoreMatcher::compile(&root);
+        let ignore = IgnoreMatcher::compile(&root, &[]);
 
         // A real source edit under the target fires.
         let src = root.join("crates/lib.rs");
@@ -436,9 +477,9 @@ mod tests {
 
     #[test]
     fn gitignore_edit_is_relevant_and_recompile_reflects_new_rules() {
-        // FINDINGS 3 + 4: a `.gitignore` mutation must (4) fire a pass even though `.gitignore` is
-        // not a target language, and (3) recompiling the matcher must make subsequent
-        // classification honor the new rules — so a now-ignored file stops firing and a
+        // EARLIER-ROUND FINDINGS (kept correct): a `.gitignore` mutation must fire a pass even
+        // though `.gitignore` is not a target language, AND recompiling the matcher must make
+        // subsequent classification honor the new rules — so a now-ignored file stops firing and a
         // now-unignored file resumes.
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
@@ -463,7 +504,7 @@ mod tests {
             watch: WatchConfig::default(),
         };
 
-        let ignore = IgnoreMatcher::compile(&root);
+        let ignore = IgnoreMatcher::compile(&root, &[]);
         let secret = root.join("crates/secret.rs");
         // Before the rule edit: a normal source edit fires.
         assert!(event_is_relevant(&config, &ignore, &mutation_event(secret.clone())), "fires pre");
@@ -475,10 +516,10 @@ mod tests {
         let nested_gi = mutation_event(root.join("crates/.gitignore"));
         assert!(event_is_relevant(&config, &ignore, &nested_gi), "nested gitignore edit fires");
 
-        // Now the user adds `secret.rs` to `.gitignore`; recompiling (finding 3) must make the
-        // classifier drop it.
+        // Now the user adds `secret.rs` to `.gitignore`; recompiling must make the classifier drop
+        // it.
         std::fs::write(root.join(".gitignore"), "secret.rs\n").unwrap();
-        let ignore = IgnoreMatcher::compile(&root);
+        let ignore = IgnoreMatcher::compile(&root, &[]);
         assert!(
             !event_is_relevant(&config, &ignore, &mutation_event(secret)),
             "recompiled matcher honors the new ignore rule (now-ignored file stops firing)",
@@ -491,6 +532,65 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn worktree_root_gitignore_edit_recompiles_for_subdir_config_root() {
+        // FINDING 1 + 3 combined (test d for the subdirectory case): `config.root` is a subdir of a
+        // Git worktree. A live edit to the WORKTREE-ROOT `.gitignore` (above config.root) must,
+        // after recompiling the shared matcher, drop a now-ignored file under the subdir and keep
+        // an unrelated one firing — proving ancestor rules are honored AND the recompile
+        // takes effect.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let wt = std::env::temp_dir().join(format!("ragrat-wtgi-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(wt.join("crates")).unwrap();
+        let wt = wt.canonicalize().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&wt)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init failed (git must be on PATH)");
+        std::fs::write(wt.join(".gitignore"), "").unwrap();
+
+        let sub = wt.join("crates"); // config.root is the subdirectory.
+        let target_dirs = vec![PathBuf::from(".")];
+        let config = Config {
+            root: sub.clone(),
+            database: sub.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: target_dirs.clone(),
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            watch: WatchConfig::default(),
+        };
+
+        // Before: a source file under the subdir fires.
+        let ignore = IgnoreMatcher::compile(&sub, &target_dirs);
+        let secret = sub.join("secret.rs");
+        assert!(event_is_relevant(&config, &ignore, &mutation_event(secret.clone())), "fires pre");
+
+        // Edit the WORKTREE-ROOT `.gitignore` to ignore `secret.rs` repo-wide, then recompile.
+        std::fs::write(wt.join(".gitignore"), "secret.rs\n").unwrap();
+        let ignore = IgnoreMatcher::compile(&sub, &target_dirs);
+        assert!(
+            !event_is_relevant(&config, &ignore, &mutation_event(secret)),
+            "worktree-root rule (above config.root) drops the file after recompile (finding 1 + 3)",
+        );
+        assert!(
+            event_is_relevant(&config, &ignore, &mutation_event(sub.join("keep.rs"))),
+            "an unrelated source file under the subdir still fires",
+        );
+
+        std::fs::remove_dir_all(&wt).ok();
     }
 
     #[test]
@@ -545,5 +645,113 @@ mod tests {
         let d = Debounce::new(Duration::from_millis(400), Duration::from_millis(2500));
         assert!(d.due_in(Instant::now()).is_none());
         assert!(!d.should_fire(Instant::now()));
+    }
+
+    #[test]
+    fn gitignore_watch_dirs_includes_worktree_root_for_subdir_config_root() {
+        // FINDING 1 (round 3): when `config.root` is a subdirectory of a Git worktree, the watcher
+        // must also subscribe to the ancestor chain up to the worktree root so a root-`.gitignore`
+        // edit (which lives ABOVE the recursively-watched target dirs) is delivered.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let wt = std::env::temp_dir().join(format!("ragrat-wdirs-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(wt.join("crates/app")).unwrap();
+        let wt = wt.canonicalize().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&wt)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init failed (git must be on PATH)");
+
+        let sub = wt.join("crates/app");
+        let dirs = gitignore_watch_dirs(&sub);
+        // The chain from the worktree root down to config.root, inclusive.
+        assert_eq!(dirs.first(), Some(&wt), "worktree root is watched (finding 1)");
+        assert!(dirs.contains(&wt.join("crates")), "intermediate ancestor watched");
+        assert_eq!(dirs.last(), Some(&sub), "config.root itself is watched");
+
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn gitignore_watch_dirs_non_git_tree_is_just_root() {
+        // Outside a Git worktree the chain collapses to just `config.root` (already covered by the
+        // recursive target watches) — no ancestor sweep above an un-versioned directory.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("ragrat-wdirs-ng-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        // Best-effort: only meaningful when /tmp isn't itself inside a git worktree. If it is,
+        // skip.
+        if crate::index::git_history::worktree_root(&root).is_some() {
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+        assert_eq!(gitignore_watch_dirs(&root), vec![root.clone()]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn root_gitignore_edit_is_delivered_to_a_real_watcher() {
+        // FINDING 1 end-to-end (test d): a live edit to the worktree-root `.gitignore` — which sits
+        // ABOVE the target dirs — must actually be *delivered* by the notify watcher once we
+        // subscribe to `gitignore_watch_dirs`. We spawn a real recommended_watcher over exactly the
+        // dirs the watcher subscribes to (target dir + ancestor chain) and assert the edit arrives.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let wt = std::env::temp_dir().join(format!("ragrat-deliv-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(wt.join("crates")).unwrap();
+        let wt = wt.canonicalize().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&wt)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init failed (git must be on PATH)");
+        std::fs::write(wt.join(".gitignore"), "").unwrap();
+
+        let sub = wt.join("crates"); // config.root is the subdirectory.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Ok(mut w) = recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) else {
+            std::fs::remove_dir_all(&wt).ok();
+            return; // no watcher backend available (sandboxed CI) — nothing to assert.
+        };
+        // Subscribe exactly as watcher_main does: the (recursive) target dir + the gitignore chain.
+        w.watch(&sub, RecursiveMode::Recursive).unwrap();
+        for dir in gitignore_watch_dirs(&sub) {
+            let _ = w.watch(&dir, RecursiveMode::NonRecursive);
+        }
+
+        // Edit the worktree-root `.gitignore` (above config.root).
+        std::fs::write(wt.join(".gitignore"), "secret.rs\n").unwrap();
+
+        // Drain events for up to ~3s; assert at least one references the root `.gitignore`.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut delivered = false;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(Ok(event)) =>
+                    if event.paths.iter().any(|p| is_gitignore_path(p)) {
+                        delivered = true;
+                        break;
+                    },
+                Ok(Err(_)) => {},
+                Err(RecvTimeoutError::Timeout) => {},
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        drop(w);
+        std::fs::remove_dir_all(&wt).ok();
+        assert!(delivered, "root .gitignore edit above config.root must be delivered (finding 1)");
     }
 }

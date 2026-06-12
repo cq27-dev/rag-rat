@@ -625,6 +625,15 @@ fn count_table(conn: &Connection, table: &str) -> anyhow::Result<u64> {
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
+/// The enclosing Git worktree root for `root` (the directory `git rev-parse --show-toplevel`
+/// reports), or `None` when `root` is not inside a Git worktree (or `git` is unavailable). This is
+/// the single place the codebase shells `--show-toplevel`; reuse it rather than adding a parallel
+/// git call (the ignore matcher anchors its `.gitignore` ancestor stack here — issue #62 finding 3:
+/// a `config.root` that is a subdirectory of a larger worktree must honor the worktree-root rules).
+pub(crate) fn worktree_root(root: &Path) -> Option<PathBuf> {
+    git_output(root, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+}
+
 fn git_repo(root: &Path) -> Option<GitRepo> {
     let worktree_root = git_output(root, &["rev-parse", "--show-toplevel"])?;
     let head = git_output(root, &["rev-parse", "HEAD"])?;

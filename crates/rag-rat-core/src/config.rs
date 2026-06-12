@@ -166,6 +166,23 @@ impl FromStr for TargetKind {
 }
 
 impl Config {
+    /// The deduplicated set of target directories (relative to [`Config::root`]) across all
+    /// targets, in stable order. Used to scope `.gitignore` nested-discovery to the indexed trees
+    /// (see [`crate::index::ignore_rules::IgnoreMatcher::compile`]) instead of recursing the whole
+    /// root into unindexed siblings.
+    pub fn target_directories(&self) -> Vec<PathBuf> {
+        let mut seen = BTreeSet::new();
+        let mut dirs = Vec::new();
+        for target in &self.targets {
+            for dir in &target.directories {
+                if seen.insert(dir.clone()) {
+                    dirs.push(dir.clone());
+                }
+            }
+        }
+        dirs
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let text = fs::read_to_string(path)?;
