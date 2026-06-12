@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 16;
+pub const LATEST_SCHEMA_VERSION: u32 = 17;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -72,6 +72,10 @@ const MIGRATION_016_ID: &str = "016_symbol_line_spans";
 const MIGRATION_016_CHECKSUM: &str = "sha256:rag-rat-symbol-line-spans-v16";
 const MIGRATION_016_DESCRIPTION: &str = "Store start_line/end_line on symbols so readers skip the \
                                          per-symbol chunk-containment subqueries";
+const MIGRATION_017_ID: &str = "017_edge_callee_byte_range";
+const MIGRATION_017_CHECKSUM: &str = "sha256:rag-rat-edge-callee-byte-range-v17";
+const MIGRATION_017_DESCRIPTION: &str =
+    "Add callee identifier byte range to edges for the SCIP occurrence join (#61 prerequisite)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -156,6 +160,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_015_ID, MIGRATION_015_CHECKSUM, MIGRATION_015_DESCRIPTION)?;
     apply_symbol_line_spans(conn)?;
     record_migration(conn, MIGRATION_016_ID, MIGRATION_016_CHECKSUM, MIGRATION_016_DESCRIPTION)?;
+    apply_edge_callee_byte_range(conn)?;
+    record_migration(conn, MIGRATION_017_ID, MIGRATION_017_CHECKSUM, MIGRATION_017_DESCRIPTION)?;
     Ok(())
 }
 

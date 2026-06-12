@@ -37,6 +37,17 @@ pub(crate) fn call_target_name(node: Node<'_>, text: &str) -> Option<String> {
         .map(|name| short_name(&name).to_string())
         .or_else(|| first_identifier_text(node, text))
 }
+/// The callee identifier node for a call expression — the same token [`call_target_name`] names,
+/// returned as a node so its byte range can be recorded (SCIP occurrences key on the identifier's
+/// position, #67). Points at the FINAL `::`/`.` segment (the callee name itself), matching how
+/// `call_target_name`'s `short_name` collapses a path to its tail. `None` when no clean identifier
+/// node is available — never guess a wrong range.
+pub(crate) fn call_target_node(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("function")
+        .and_then(last_identifier_node)
+        .or_else(|| first_identifier_node(node))
+        .map(final_segment_node)
+}
 pub(crate) fn scoped_receiver_name(node: Node<'_>, text: &str) -> Option<String> {
     let function = node.child_by_field_name("function").unwrap_or(node);
     let value = node_text(function, text);
@@ -91,6 +102,53 @@ pub(crate) fn collect_identifiers(node: Node<'_>, text: &str, out: &mut Vec<Stri
     for child in node.named_children(&mut cursor) {
         collect_identifiers(child, text, out);
     }
+}
+/// Node-returning twin of [`first_identifier_text`]: the first identifier-kind node in document
+/// order, so its byte range can be recorded for the SCIP join (#67). Same traversal, so the node it
+/// returns is exactly the token whose text [`first_identifier_text`] would have produced.
+pub(crate) fn first_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if is_identifier_kind(child.kind()) {
+            return Some(child);
+        }
+        if let Some(found) = first_identifier_node(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+/// Node-returning twin of [`last_identifier_text`]: the last identifier-kind node under `node`.
+pub(crate) fn last_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
+    identifier_nodes_under(node).into_iter().last()
+}
+/// Node-returning twin of [`identifiers_under`]: every identifier-kind node under `node`, in the
+/// same document order, so the callee (`.last()`) and receiver (`.first()`) nodes line up 1:1 with
+/// the strings the TS/Kotlin/C extractors already pick out of [`identifiers_under`]. The byte range
+/// of the matching node is what the SCIP join keys on (#67).
+pub(crate) fn identifier_nodes_under<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut out = Vec::new();
+    collect_identifier_nodes(node, &mut out);
+    out
+}
+fn collect_identifier_nodes<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>) {
+    if is_identifier_kind(node.kind()) {
+        out.push(node);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_identifier_nodes(child, out);
+    }
+}
+/// Narrow a scoped/dotted identifier node (`scoped_identifier` / `scoped_type_identifier`, whose
+/// text is the full `a::b::c`) down to its final segment — the callee/type name `c`. The
+/// tree-sitter grammars expose the tail as the `name` field; without it (a plain `identifier`) the
+/// node is already the final segment, so return it unchanged. This makes the recorded byte range
+/// cover only the callee identifier, matching how `short_name` collapses the printed name and how
+/// SCIP keys the occurrence.
+pub(crate) fn final_segment_node(node: Node<'_>) -> Node<'_> {
+    node.child_by_field_name("name").unwrap_or(node)
 }
 pub(crate) fn is_identifier_kind(kind: &str) -> bool {
     matches!(
@@ -201,15 +259,25 @@ pub(crate) fn insert_candidates(
         }
         // prepare_cached: this INSERT runs once per edge. conn.execute
         // recompiles the SQL every call; the cached statement compiles once per connection.
+        // NULL when the candidate has no callee identifier range (non-call / file-level edges)
+        // (#67).
+        let (callee_start_byte, callee_end_byte) = match candidate.callee_span {
+            Some(range) => (
+                Some(i64::try_from(range.start_byte).unwrap_or(0)),
+                Some(i64::try_from(range.end_byte).unwrap_or(0)),
+            ),
+            None => (None, None),
+        };
         conn.prepare_cached(
             "
             INSERT INTO edges(
                 source_file_id, from_symbol_id, from_name, to_name,
                 target_qualified_name, evidence, receiver_hint,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
+                callee_start_byte, callee_end_byte,
                 edge_kind, confidence
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ",
         )?
         .execute(params![
@@ -224,6 +292,8 @@ pub(crate) fn insert_candidates(
             candidate.source_span.end_line,
             candidate.source_span.start_byte,
             candidate.source_span.end_byte,
+            callee_start_byte,
+            callee_end_byte,
             candidate.edge_kind.as_str(),
             candidate.confidence.as_str(),
         ])?;

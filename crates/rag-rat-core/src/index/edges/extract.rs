@@ -74,6 +74,7 @@ pub(crate) fn contains_edges(symbols: &[IndexedSymbol]) -> Vec<EdgeCandidate> {
                 evidence: Some(child.qualified_name.clone()),
                 receiver_hint: None,
                 source_span: child.span(),
+                callee_span: None,
                 edge_kind: EdgeKind::Contains,
                 confidence: EdgeConfidence::Exact,
             });
@@ -191,6 +192,7 @@ pub(crate) fn rust_edges(
                         target_qualified_name: target_qualified_name(node, text),
                         receiver_hint: scoped_receiver_name(node, text),
                     },
+                    call_target_node(node).map(CalleeRange::of_node),
                 ));
             }
             // A scoped call receiver is a type reference only when it names a type. By Rust
@@ -207,6 +209,12 @@ pub(crate) fn rust_edges(
                     receiver,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                    // The type is the receiver — the LEADING `::` segment (`Foo` in `Foo::bar()`)
+                    // — so anchor the range on the function path's first
+                    // identifier, not its tail.
+                    node.child_by_field_name("function")
+                        .and_then(first_identifier_node)
+                        .map(CalleeRange::of_node),
                 ));
             }
         },
@@ -220,6 +228,7 @@ pub(crate) fn rust_edges(
                     EdgeKind::UsesMacro,
                     EdgeConfidence::NameOnly,
                     EdgeContext::default(),
+                    first_identifier_node(node).map(CalleeRange::of_node),
                 ));
             },
         "impl_item" => rust_impl_edges(text, node, symbols, out),
@@ -231,6 +240,7 @@ pub(crate) fn rust_edges(
                     name,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                    last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             }
         },
@@ -262,6 +272,9 @@ pub(crate) fn rust_impl_edges(
             evidence: Some(edge_evidence(node, text)),
             receiver_hint: None,
             source_span: span_for_node(node),
+            // The trait/type names here come from string-splitting the impl header, not from a
+            // located identifier node, so there is no clean callee range to record (#67).
+            callee_span: None,
             edge_kind: EdgeKind::Implements,
             confidence: EdgeConfidence::NameOnly,
         });
@@ -272,6 +285,9 @@ pub(crate) fn rust_impl_edges(
             type_name.clone(),
             EdgeKind::ReferencesType,
             EdgeConfidence::NameOnly,
+            // `type_name` is string-split from the impl header, not a located node — no range
+            // (#67).
+            None,
         ));
     }
 }
@@ -306,8 +322,11 @@ pub(crate) fn typescript_edges(
                 ));
             },
         "call_expression" | "new_expression" => {
-            let identifiers =
-                identifiers_under(node.child_by_field_name("function").unwrap_or(node), text);
+            let function = node.child_by_field_name("function").unwrap_or(node);
+            let identifiers = identifiers_under(function, text);
+            // Parallel to `identifiers` (same traversal order), so `.last()`/`.first()` pick the
+            // node for the same token the string Vec does (#67).
+            let identifier_nodes = identifier_nodes_under(function);
             if let Some(name) = identifiers.last().cloned().or_else(|| call_target_name(node, text))
             {
                 let edge_kind = if node.kind() == "new_expression" {
@@ -329,6 +348,8 @@ pub(crate) fn typescript_edges(
                             .filter(|_| identifiers.len() > 1)
                             .cloned(),
                     },
+                    // The callee is the final segment — `.last()`, matching `identifiers.last()`.
+                    identifier_nodes.last().copied().map(CalleeRange::of_node),
                 ));
             }
             if let Some(receiver) = identifiers.first().filter(|_| identifiers.len() > 1).cloned() {
@@ -338,6 +359,13 @@ pub(crate) fn typescript_edges(
                     receiver,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                    // The type is the receiver — the FIRST segment, matching
+                    // `identifiers.first()`.
+                    identifier_nodes
+                        .first()
+                        .filter(|_| identifier_nodes.len() > 1)
+                        .copied()
+                        .map(CalleeRange::of_node),
                 ));
             }
         },
@@ -349,6 +377,7 @@ pub(crate) fn typescript_edges(
                     name,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                    first_identifier_node(node).map(CalleeRange::of_node),
                 ));
             }
         },
@@ -360,6 +389,9 @@ pub(crate) fn typescript_edges(
                     name,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                    // `node` is itself the `type_identifier` token — its range is the callee
+                    // range.
+                    Some(CalleeRange::of_node(node)),
                 ));
             }
         },
@@ -388,6 +420,9 @@ pub(crate) fn kotlin_edges(
         },
         "call_expression" => {
             let identifiers = identifiers_under(node, text);
+            // Parallel to `identifiers` (same node, same traversal order) so the callee `.last()`
+            // and receiver/constructor `.first()` nodes line up with the string picks (#67).
+            let identifier_nodes = identifier_nodes_under(node);
             if let Some(name) =
                 identifiers.last().cloned().or_else(|| first_identifier_text(node, text))
             {
@@ -405,6 +440,7 @@ pub(crate) fn kotlin_edges(
                             .filter(|_| identifiers.len() > 1)
                             .cloned(),
                     },
+                    identifier_nodes.last().copied().map(CalleeRange::of_node),
                 ));
             }
             if let Some(receiver) = identifiers.first().filter(|_| identifiers.len() > 1).cloned() {
@@ -414,17 +450,26 @@ pub(crate) fn kotlin_edges(
                     receiver,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                    identifier_nodes
+                        .first()
+                        .filter(|_| identifier_nodes.len() > 1)
+                        .copied()
+                        .map(CalleeRange::of_node),
                 ));
             }
             if let Some(constructor) =
                 identifiers.first().filter(|name| looks_like_type_name(name)).cloned()
             {
+                // Both the type reference and the construct point at the constructor — the FIRST
+                // identifier (matching `identifiers.first()`).
+                let constructor_range = identifier_nodes.first().copied().map(CalleeRange::of_node);
                 out.push(symbol_edge(
                     symbols,
                     node,
                     constructor.clone(),
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                    constructor_range,
                 ));
                 out.push(symbol_edge_with_context(
                     symbols,
@@ -434,6 +479,7 @@ pub(crate) fn kotlin_edges(
                     EdgeKind::Constructs,
                     EdgeConfidence::NameOnly,
                     EdgeContext::default(),
+                    constructor_range,
                 ));
             }
         },
@@ -445,6 +491,7 @@ pub(crate) fn kotlin_edges(
                     name,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                    last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             },
         "delegation_specifier" | "supertype" | "super_type" => {
@@ -455,6 +502,7 @@ pub(crate) fn kotlin_edges(
                     name,
                     EdgeKind::Implements,
                     EdgeConfidence::NameOnly,
+                    last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             }
         },
@@ -488,8 +536,10 @@ pub(crate) fn c_like_edges(
             }
         },
         "call_expression" => {
-            let identifiers =
-                identifiers_under(node.child_by_field_name("function").unwrap_or(node), text);
+            let function = node.child_by_field_name("function").unwrap_or(node);
+            let identifiers = identifiers_under(function, text);
+            // Parallel to `identifiers` so the callee `.last()` node matches the string pick (#67).
+            let identifier_nodes = identifier_nodes_under(function);
             if let Some(name) = identifiers.last().cloned().or_else(|| call_target_name(node, text))
             {
                 out.push(symbol_edge_with_context(
@@ -506,6 +556,7 @@ pub(crate) fn c_like_edges(
                             .filter(|_| identifiers.len() > 1)
                             .cloned(),
                     },
+                    identifier_nodes.last().copied().map(CalleeRange::of_node),
                 ));
             }
         },
@@ -517,6 +568,7 @@ pub(crate) fn c_like_edges(
                     name,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                    last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             }
         },
@@ -539,6 +591,8 @@ pub(crate) fn file_edge(
         evidence: Some(edge_evidence(node, text)),
         receiver_hint: None,
         source_span: span_for_node(node),
+        // File-level edges (imports / exports / mod) have no callee identifier to anchor (#67).
+        callee_span: None,
         edge_kind,
         confidence,
     }
@@ -549,6 +603,7 @@ pub(crate) fn symbol_edge(
     to_name: String,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
+    callee_span: Option<CalleeRange>,
 ) -> EdgeCandidate {
     symbol_edge_with_context(
         symbols,
@@ -558,8 +613,10 @@ pub(crate) fn symbol_edge(
         edge_kind,
         confidence,
         EdgeContext::default(),
+        callee_span,
     )
 }
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn symbol_edge_with_context(
     symbols: &[IndexedSymbol],
     node: Node<'_>,
@@ -568,6 +625,11 @@ pub(crate) fn symbol_edge_with_context(
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
     context: EdgeContext,
+    // Byte range of the callee identifier token (the final `::`/`.` segment), or `None` when no
+    // clean identifier node is available. `node` here is the whole call/reference expression, so
+    // it can't be used for this — the caller locates the identifier via the `*_node` helpers
+    // and passes its range. See [`CalleeRange`] and #67.
+    callee_span: Option<CalleeRange>,
 ) -> EdgeCandidate {
     let byte = node.start_byte();
     let source = containing_symbol(symbols, byte);
@@ -579,6 +641,7 @@ pub(crate) fn symbol_edge_with_context(
         evidence: (!text.is_empty()).then(|| edge_evidence(node, text)),
         receiver_hint: context.receiver_hint,
         source_span: span_for_node(node),
+        callee_span,
         edge_kind,
         confidence,
     }

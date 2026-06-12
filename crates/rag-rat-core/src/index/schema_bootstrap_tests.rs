@@ -247,6 +247,9 @@ fn migrate_adds_edge_name_columns_before_indexing_them() {
     assert!(columns.contains(&"source_end_byte".to_string()));
     assert!(columns.contains(&"target_start_line".to_string()));
     assert!(columns.contains(&"target_end_line".to_string()));
+    // The SCIP-oracle prerequisite columns (#67) are added additively to a legacy edges table.
+    assert!(columns.contains(&"callee_start_byte".to_string()));
+    assert!(columns.contains(&"callee_end_byte".to_string()));
     assert_eq!(table_count(&db, "idx_edges_from_name"), 1);
     assert_eq!(table_count(&db, "idx_edges_to_name"), 1);
 
@@ -1629,6 +1632,155 @@ fn caller() {
         }),
         "helper callers: {callers:?}"
     );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The callee identifier byte range (#67) stored on the single edge matching
+/// `from LIKE %from% AND to_name LIKE %to% AND edge_kind`, as `Option<(start, end)>`.
+/// `None` means the column is NULL (no callee range recorded).
+fn callee_byte_range(
+    db: &IndexDatabase,
+    from: &str,
+    to: &str,
+    edge_kind: &str,
+) -> Option<(i64, i64)> {
+    let (start, end) = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                SELECT callee_start_byte, callee_end_byte
+                FROM edges
+                WHERE edge_kind = ?1
+                  AND COALESCE(from_name, '') LIKE ?2
+                  AND to_name LIKE ?3
+                ",
+            params![edge_kind, format!("%{from}%"), format!("%{to}%")],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .unwrap();
+    match (start, end) {
+        (Some(start), Some(end)) => Some((start, end)),
+        _ => None,
+    }
+}
+
+#[test]
+fn calls_name_edge_stores_callee_identifier_byte_range_not_whole_call() {
+    // #67: SCIP occurrences key on the callee identifier token, but source_start_byte covers the
+    // whole call_expression. The new callee_*_byte columns must span exactly the identifier:
+    //   `foo`   in `foo(a, b)`     (plain call)
+    //   `method` in `obj.method(x)` (final segment of a method call)
+    //   `c`     in `a::b::c()`     (final segment of a path call)
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let source = r#"
+fn foo(a: u32, b: u32) -> u32 {
+    a + b
+}
+
+mod nested {
+    pub mod inner {
+        pub fn c() {}
+    }
+}
+
+struct Obj;
+
+impl Obj {
+    fn method(&self, _x: u32) {}
+}
+
+fn driver() {
+    let obj = Obj;
+    foo(1, 2);
+    obj.method(3);
+    nested::inner::c();
+}
+"#;
+    fs::write(root.join("src/lib.rs"), source).unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let assert_callee = |to: &str, expected: &str| {
+        let (start, end) = callee_byte_range(&db, "driver", to, "calls_name")
+            .unwrap_or_else(|| panic!("no callee range for driver -> {to}"));
+        let (start, end) = (start as usize, end as usize);
+        assert_eq!(
+            &source[start..end],
+            expected,
+            "callee range for driver -> {to} should be exactly `{expected}`, got `{}`",
+            &source[start..end]
+        );
+        // It must NOT be the whole call expression (that would include the `(`).
+        assert!(
+            !source[start..end].contains('('),
+            "callee range for driver -> {to} must not span the whole call: `{}`",
+            &source[start..end]
+        );
+    };
+
+    assert_callee("foo", "foo");
+    assert_callee("method", "method");
+    assert_callee("c", "c");
+
+    // A `contains` edge (parent symbol -> child symbol) has no callee identifier → NULL.
+    let contains = callee_byte_range(&db, "Obj", "method", "contains");
+    assert_eq!(contains, None, "contains edges must have a NULL callee range");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn imports_edge_has_null_callee_byte_range() {
+    // #67: file-level edges (imports / exports) carry no callee identifier range.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "mod worker;\n\nfn touch() {\n    worker::run();\n}\n")
+        .unwrap();
+    fs::write(root.join("src/worker.rs"), "pub fn run() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let import = callee_byte_range(&db, "src/lib.rs", "worker", "imports");
+    assert_eq!(import, None, "imports edges must have a NULL callee range");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn c_calls_name_edge_stores_callee_identifier_byte_range() {
+    // #67: at least one non-Rust language. A C call `helper(runtime)` stores the range of `helper`,
+    // not the whole `helper(runtime)` call expression.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let source = r#"
+typedef struct Runtime Runtime;
+
+struct Runtime {
+  int state;
+};
+
+int helper(Runtime *runtime) {
+  return runtime->state;
+}
+
+int runtime_open(Runtime *runtime) {
+  return helper(runtime);
+}
+"#;
+    fs::write(root.join("src/runtime.c"), source).unwrap();
+    let config = source_config(root.clone(), Language::C);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (start, end) = callee_byte_range(&db, "runtime_open", "helper", "calls_name")
+        .expect("no callee range for runtime_open -> helper");
+    let (start, end) = (start as usize, end as usize);
+    assert_eq!(&source[start..end], "helper", "C callee range must span exactly `helper`");
 
     fs::remove_dir_all(root).unwrap();
 }

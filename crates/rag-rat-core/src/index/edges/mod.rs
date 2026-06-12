@@ -64,6 +64,26 @@ impl EdgeConfidence {
     }
 }
 
+/// Byte range of the callee identifier token (the final `::`/`.` segment of the called name), as
+/// `text[start_byte..end_byte]`. Distinct from `EdgeCandidate.source_span`, which covers the whole
+/// `call_expression`. SCIP occurrences key on the identifier token's position, so the SCIP-oracle
+/// join (#61) needs this range; `(line, col)` in the document's position encoding is derived at
+/// join time from the checkout bytes, so only the byte range is stored. Set only for
+/// symbol-referencing edges (built via `symbol_edge`/`symbol_edge_with_context`); `None` for
+/// file-level / `contains` edges and for constructs where a clean identifier node isn't available.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CalleeRange {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+impl CalleeRange {
+    /// The byte range of a tree-sitter node — the callee identifier token's `start_byte..end_byte`.
+    pub(crate) fn of_node(node: Node<'_>) -> Self {
+        CalleeRange { start_byte: node.start_byte(), end_byte: node.end_byte() }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeCandidate {
     from_symbol_id: Option<i64>,
@@ -73,6 +93,9 @@ pub(crate) struct EdgeCandidate {
     evidence: Option<String>,
     receiver_hint: Option<String>,
     source_span: EdgeSpan,
+    /// Byte range of the callee identifier token; see [`CalleeRange`]. `None` for non-symbol
+    /// edges.
+    callee_span: Option<CalleeRange>,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
 }
@@ -194,6 +217,14 @@ impl CompactSpan {
 /// ids and the span shrinks to [`CompactSpan`], taking the per-edge footprint from ~184 bytes (with
 /// five owned `Option<String>`) to ~64 — the dominant lever on full-rebuild peak RSS, since the
 /// edge accumulator is held in full until resolution.
+///
+/// The callee identifier byte range is two bare `u32`s, NOT `Option<CalleeRange>`: `u32::MAX` is
+/// the none-sentinel (mirroring [`OptSym`]'s niche), so the optional range costs 8 bytes flat
+/// rather than the 24 an `Option<(usize, usize)>` would. Safe because graph-parsed files are
+/// bounded at `MAX_GRAPH_PARSE_BYTES` (512_000), so every real byte offset fits `u32` with
+/// `u32::MAX` free as the sentinel. Footprint delta: +8 bytes/edge (~64 → ~72) — at the kernel's
+/// ~11M candidates that is ~88 MB of additional accumulator, held only until the single
+/// resolve-and-insert pass.
 struct CompactEdge {
     from_symbol_id: Option<i64>,
     from_name: OptSym,
@@ -202,8 +233,39 @@ struct CompactEdge {
     evidence: OptSym,
     receiver_hint: OptSym,
     source_span: CompactSpan,
+    /// Callee identifier byte range; `u32::MAX` in `callee_start_byte` is the `None` sentinel.
+    callee_start_byte: u32,
+    callee_end_byte: u32,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
+}
+
+impl CompactEdge {
+    /// `u32::MAX` sentinel marking an absent callee range (mirrors [`OptSym::NONE`]).
+    const CALLEE_NONE: u32 = u32::MAX;
+
+    /// Pack `Option<CalleeRange>` into the two `u32` fields, clamping like [`CompactSpan`] and
+    /// using `u32::MAX` for `None`. A real offset can never collide with the sentinel: it is
+    /// bounded by `MAX_GRAPH_PARSE_BYTES` ≪ `u32::MAX`.
+    fn pack_callee(span: Option<CalleeRange>) -> (u32, u32) {
+        match span {
+            Some(range) => {
+                let clamp = |value: usize| u32::try_from(value).unwrap_or(0);
+                (clamp(range.start_byte), clamp(range.end_byte))
+            },
+            None => (Self::CALLEE_NONE, Self::CALLEE_NONE),
+        }
+    }
+
+    /// The stored callee byte range as nullable `i64`s for the edge-row insert: `(NULL, NULL)` when
+    /// the sentinel marks an absent range, otherwise the two offsets.
+    fn callee_byte_columns(&self) -> (Option<i64>, Option<i64>) {
+        if self.callee_start_byte == Self::CALLEE_NONE {
+            (None, None)
+        } else {
+            (Some(i64::from(self.callee_start_byte)), Some(i64::from(self.callee_end_byte)))
+        }
+    }
 }
 
 /// Symbols (with real DB ids) and edge candidates (with their source file id) accumulated across
@@ -247,6 +309,7 @@ impl FullRebuildGraph {
         let from_symbol_id = candidate.from_symbol_id.and_then(|local| {
             usize::try_from(local).ok().and_then(|index| db_ids.get(index)).copied()
         });
+        let (callee_start_byte, callee_end_byte) = CompactEdge::pack_callee(candidate.callee_span);
         let compact = CompactEdge {
             from_symbol_id,
             from_name: self.arena.intern_opt(candidate.from_name.as_deref()),
@@ -257,6 +320,8 @@ impl FullRebuildGraph {
             evidence: self.arena.intern_opt(candidate.evidence.as_deref()),
             receiver_hint: self.arena.intern_opt(candidate.receiver_hint.as_deref()),
             source_span: CompactSpan::from_span(candidate.source_span),
+            callee_start_byte,
+            callee_end_byte,
             edge_kind: candidate.edge_kind,
             confidence: candidate.confidence,
         };

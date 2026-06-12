@@ -441,6 +441,19 @@ pub(crate) fn apply_symbol_line_spans(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 
+pub(crate) fn apply_edge_callee_byte_range(conn: &Connection) -> rusqlite::Result<()> {
+    // Byte range of the callee identifier token on symbol-referencing edges (the SCIP-oracle
+    // prerequisite, #67). `source_start_byte`/`source_end_byte` cover the whole call_expression;
+    // SCIP occurrences key on the identifier token, so these two columns carry its range instead.
+    // Additive + NULLABLE on purpose: existing rows and non-call edges (contains / imports /
+    // exports / file-level) keep NULL, so the change is byte-identical for prior data. `(line,
+    // col)` in the document's position encoding is derived at join time from checkout bytes —
+    // not stored.
+    add_column_if_missing(conn, "edges", "callee_start_byte", "INTEGER")?;
+    add_column_if_missing(conn, "edges", "callee_end_byte", "INTEGER")?;
+    Ok(())
+}
+
 pub(crate) fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
     let mut stmt = conn.prepare(
         "
@@ -484,6 +497,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_014_ID => Some(14),
             MIGRATION_015_ID => Some(15),
             MIGRATION_016_ID => Some(16),
+            MIGRATION_017_ID => Some(17),
             _ => None,
         })
         .max()
@@ -509,6 +523,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_014_ID
             | MIGRATION_015_ID
             | MIGRATION_016_ID
+            | MIGRATION_017_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -531,6 +546,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_014_ID => migration.checksum != MIGRATION_014_CHECKSUM,
         MIGRATION_015_ID => migration.checksum != MIGRATION_015_CHECKSUM,
         MIGRATION_016_ID => migration.checksum != MIGRATION_016_CHECKSUM,
+        MIGRATION_017_ID => migration.checksum != MIGRATION_017_CHECKSUM,
         _ => false,
     }
 }

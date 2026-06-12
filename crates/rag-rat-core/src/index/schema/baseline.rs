@@ -109,6 +109,10 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             evidence TEXT,
             receiver_hint TEXT,
             resolution TEXT NOT NULL DEFAULT 'unresolved',
+            -- Callee identifier byte range (the SCIP occurrence key, #67); NULL for non-call /
+            -- file-level edges. source_*_byte covers the whole call_expression, these the token.
+            callee_start_byte INTEGER,
+            callee_end_byte INTEGER,
             edge_kind TEXT NOT NULL,
             confidence TEXT NOT NULL,
             FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE,

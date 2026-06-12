@@ -186,16 +186,21 @@ pub(crate) fn resolve_and_insert_edges(
                     (None, confidence, None, None, "unresolved")
                 },
             };
+        // NULL when the sentinel marks an absent callee range; see
+        // `CompactEdge::callee_byte_columns`.
+        let (callee_start_byte, callee_end_byte) = candidate.callee_byte_columns();
         conn.prepare_cached(
             "
             INSERT INTO edges(
                 source_file_id, from_symbol_id, from_name, to_name,
                 target_qualified_name, evidence, receiver_hint,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
+                callee_start_byte, callee_end_byte,
                 edge_kind, confidence,
                 to_symbol_id, target_start_line, target_end_line, resolution
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19)
             ",
         )?
         .execute(params![
@@ -210,6 +215,8 @@ pub(crate) fn resolve_and_insert_edges(
             i64::from(candidate.source_span.end_line),
             i64::from(candidate.source_span.start_byte),
             i64::from(candidate.source_span.end_byte),
+            callee_start_byte,
+            callee_end_byte,
             candidate.edge_kind.as_str(),
             confidence.as_str(),
             to_symbol_id,
