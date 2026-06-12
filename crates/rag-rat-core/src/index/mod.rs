@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod edges;
 pub mod git_history;
 pub mod github;
+pub mod ignore_rules;
 pub mod parser;
 pub mod schema;
 pub mod symbols;
@@ -622,8 +623,11 @@ fn collect_index_files(config: &Config) -> anyhow::Result<Vec<IndexFile>> {
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
 
+    // Compile the repo's `.gitignore` rules (root + nested) once, shared across targets, so the
+    // walker skips the same paths the watcher's `event_is_relevant` will (issue #62).
+    let ignore = ignore_rules::IgnoreMatcher::compile(&config.root);
     for target in targets {
-        for file in walker::walk_target(&config.root, target)? {
+        for file in walker::walk_target(&config.root, target, &ignore)? {
             let relative_path = file.strip_prefix(&config.root)?.to_path_buf();
             if !seen.insert(relative_path.clone()) {
                 continue;

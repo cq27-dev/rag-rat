@@ -22,6 +22,7 @@ use notify::{Event, RecursiveMode, Watcher as _, recommended_watcher};
 use crate::config::Config;
 use crate::fleet;
 use crate::index::ai::ReconcileOptions;
+use crate::index::ignore_rules::IgnoreMatcher;
 use crate::index::{IndexDatabase, target_for_path};
 use crate::locks::{self, FileLock};
 
@@ -135,10 +136,17 @@ fn kind_is_mutation(kind: &EventKind) -> bool {
 }
 
 /// A relevant event is a rescan/overflow notice, or a *content-mutating* event whose path matches a
-/// configured target — classification only decides *whether to fire a pass*, not what to index (the
-/// discover sweep does that). Ignored paths (`.rag-rat/`, `target/`, …) never match a target, so
-/// they never fire; read-only events never fire regardless of path (see [`kind_is_mutation`]).
-fn event_is_relevant(config: &Config, event: &Event) -> bool {
+/// configured target and is **not** ignored by the repo's compiled `.gitignore` rules + floor
+/// (issue #62). Classification only decides *whether to fire a pass*, not what to index (the
+/// discover sweep does that). The walker and watcher share one [`IgnoreMatcher`] so a path the
+/// walker won't index also won't fire a re-index here — no drift. Read-only events never fire
+/// regardless of path (see [`kind_is_mutation`]).
+///
+/// The event path may be a just-deleted file, so dir-ness can't be stat'd; we pass `is_dir = false`
+/// to the gitignore match. That is sound for the floor (component-name check is dir-ness-agnostic)
+/// and for file globs; the only gap is a `foo/`-dir-only gitignore rule on a removed directory,
+/// which at worst fires one extra harmless idempotent pass.
+fn event_is_relevant(config: &Config, ignore: &IgnoreMatcher, event: &Event) -> bool {
     if event.need_rescan() {
         return true;
     }
@@ -146,6 +154,9 @@ fn event_is_relevant(config: &Config, event: &Event) -> bool {
         return false;
     }
     event.paths.iter().any(|path| {
+        if ignore.is_ignored(path, false) {
+            return false;
+        }
         path.strip_prefix(&config.root)
             .ok()
             .is_some_and(|relative| target_for_path(config, relative).is_some())
@@ -247,6 +258,11 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
             let _ = notify_watcher.watch(&config.root.join(dir), RecursiveMode::Recursive);
         }
     }
+    // Compile the repo's `.gitignore` rules once for event classification — the same matcher the
+    // discover walk uses (issue #62), so an ignored path never fires a pass. Recompiled only at
+    // watcher start; a `.gitignore` edit is itself a mutation event that fires a pass, and each
+    // pass's discover walk recompiles, so the index stays correct even if this classifier lags.
+    let ignore = IgnoreMatcher::compile(&config.root);
     // Fleet hot-upgrade: also watch the installed binary's directory so a new `cargo install`
     // rename triggers a fleet-wide upgrade. Watch the directory (not the file) so the atomic
     // rename — which replaces the inode — is still observed.
@@ -279,7 +295,7 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
         match rx.recv_timeout(wait) {
             Ok(Ok(event)) => {
                 let now = Instant::now();
-                if event_is_relevant(&config, &event) {
+                if event_is_relevant(&config, &ignore, &event) {
                     debounce.on_event(now);
                 }
                 if event_targets_binary(fleet_bin.as_deref(), &event) {
@@ -329,7 +345,70 @@ fn shutdown_discover(config: &Config) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use notify::event::{CreateKind, ModifyKind};
+
     use super::*;
+    use crate::config::{
+        Config, EmbeddingConfig, LocalAiConfig, ResolvedTarget, TargetKind, WatchConfig,
+    };
+    use crate::language::Language;
+
+    fn mutation_event(path: PathBuf) -> Event {
+        Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path)
+    }
+
+    #[test]
+    fn event_is_relevant_skips_gitignored_paths_consistently_with_walker() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ragrat-watchev-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(root.join("crates")).unwrap();
+        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("crates")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            watch: WatchConfig::default(),
+        };
+        let ignore = IgnoreMatcher::compile(&root);
+
+        // A real source edit under the target fires.
+        let src = root.join("crates/lib.rs");
+        assert!(event_is_relevant(&config, &ignore, &mutation_event(src)), "source edit fires");
+
+        // A floor dir (target/) never fires, even though it would be language-matched.
+        let built = root.join("target/debug/foo.rs");
+        assert!(!event_is_relevant(&config, &ignore, &mutation_event(built)), "floor dir skipped");
+
+        // A gitignored dir under root never fires.
+        let generated = root.join("gen/out.rs");
+        assert!(
+            !event_is_relevant(&config, &ignore, &mutation_event(generated)),
+            "gitignored skipped",
+        );
+
+        // A read of a watched source file never fires (anti-feedback gate), even if not ignored.
+        let read = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+            .add_path(root.join("crates/lib.rs"));
+        assert!(!event_is_relevant(&config, &ignore, &read), "reads never fire");
+
+        // A creation under the target fires.
+        let created =
+            Event::new(EventKind::Create(CreateKind::File)).add_path(root.join("crates/new.rs"));
+        assert!(event_is_relevant(&config, &ignore, &created), "new source file fires");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn debounce_fires_after_quiet_window() {
