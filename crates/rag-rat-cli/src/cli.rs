@@ -259,9 +259,9 @@ pub(crate) struct OracleRunArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct OracleStatusArgs {
-    /// The oracle tool to report on (default: rust-analyzer).
-    #[arg(long, value_enum, default_value_t = OracleToolArg::RustAnalyzer)]
-    pub tool: OracleToolArg,
+    /// Report on one oracle tool only (default: every known tool).
+    #[arg(long, value_enum)]
+    pub tool: Option<OracleToolArg>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

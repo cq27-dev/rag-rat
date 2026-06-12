@@ -243,21 +243,30 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
 }
 
 /// `rag-rat oracle status` — verdict counts for the latest run in this checkout, plus whether the
-/// indexer tool is installed (its probe, a `Blocked` line when absent, never an error).
+/// indexer tool is installed (its probe, a `Blocked` line when absent, never an error). Always an
+/// ARRAY of per-tool objects: every known tool by default, one element under `--tool` — the shape
+/// stays stable as language backends (#71 TS, #72 Kotlin) join the registry.
 fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<()> {
-    let tool = args.tool.core();
-    let availability = db.probe_oracle_tool(tool);
-    // Use the most recent run's version for the verdict counts; no run → no counts (status is a
-    // read-only sibling — nothing to report against).
-    let status = match db.latest_oracle_run_version(tool)? {
-        Some(version) => Some(db.oracle_status(tool, &version)?),
-        None => None,
+    let tools: Vec<rag_rat_core::index::oracle::OracleTool> = match args.tool {
+        Some(tool) => vec![tool.core()],
+        None => rag_rat_core::index::oracle::OracleTool::ALL.to_vec(),
     };
-    print_json(&serde_json::json!({
-        "tool": tool.as_db_str(),
-        "tool_available": availability,
-        "verdicts": status,
-    }))
+    let mut entries = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let availability = db.probe_oracle_tool(tool);
+        // Use the most recent run's version for the verdict counts; no run → no counts (status is
+        // a read-only sibling — nothing to report against).
+        let status = match db.latest_oracle_run_version(tool)? {
+            Some(version) => Some(db.oracle_status(tool, &version)?),
+            None => None,
+        };
+        entries.push(serde_json::json!({
+            "tool": tool.as_db_str(),
+            "tool_available": availability,
+            "verdicts": status,
+        }));
+    }
+    print_json(&entries)
 }
 pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;

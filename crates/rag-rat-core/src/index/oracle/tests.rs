@@ -3064,3 +3064,30 @@ fn moniker_binding_validation_statuses() {
     h.conn.execute("DELETE FROM logical_symbol_monikers", []).unwrap();
     assert_eq!(moniker_status(&h), "unverified");
 }
+
+/// Several defs containment-map to one logical symbol (a struct's fields have no symbol row, so
+/// they map up to the enclosing struct alongside its own def). The stored moniker must be the
+/// DETERMINISTIC best — shortest, then lexicographic — i.e. the symbol's own moniker, never an
+/// arbitrary member's (HashMap-order last-writer would silently break relocation between runs).
+#[test]
+fn moniker_for_symbol_with_member_defs_is_the_symbols_own() {
+    let h = Harness::new();
+    // `struct Config { db: u32 }` — one symbol row spanning the whole struct.
+    let defs = h.add_file("defs.rs", "struct Config { db: u32 }\n");
+    let sym = h.add_symbol_qualified(defs, "Config", "defs.rs::Config", "struct", 0, 25);
+    h.add_logical_symbol(3003, "defs.rs", "Config", "defs.rs::Config", sym);
+
+    let struct_moniker = "rust-analyzer cargo test_crate 0.1.0 Config#";
+    let field_moniker = "rust-analyzer cargo test_crate 0.1.0 Config#db.";
+    let bytes = scip_bytes_docs(vec![("defs.rs", vec![
+        // Field def first so a naive insertion-order winner would pick it.
+        occurrence(0, 16, 18, field_moniker, SymbolRole::Definition as i32),
+        occurrence(0, 7, 13, struct_moniker, SymbolRole::Definition as i32),
+    ])]);
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
+
+    assert_eq!(report.monikers_written, 1, "one row per logical symbol, not per def");
+    let (moniker, ..) = h.moniker(3003).expect("moniker row written");
+    assert_eq!(moniker, struct_moniker, "the symbol's own (shortest) moniker wins");
+}

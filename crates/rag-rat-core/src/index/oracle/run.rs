@@ -230,8 +230,18 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
     // a tool-driven run — the production snapshot must both still match those bytes, or the
     // mapping landed in the wrong coordinate space and would anchor the moniker to the wrong
     // symbol. `local N` symbols never reach here (dropped at parse).
+    //
+    // SEVERAL defs can containment-map to ONE logical symbol: a struct's fields / consts / enum
+    // variants have no symbol row of their own, so their def occurrences map up to the enclosing
+    // symbol alongside the symbol's own def. The stored moniker must be DETERMINISTIC — a binding
+    // records it at create time and relocation later re-matches it against a fresh run's rows, so
+    // a last-writer-wins over HashMap iteration order would silently break relocation whenever the
+    // arbitrary winner changed between runs. Pick the best moniker per logical symbol instead:
+    // shortest, then lexicographic. SCIP member monikers extend the parent's descriptor chain
+    // (`…Struct#field.` vs `…Struct#`), so shortest selects the symbol's own moniker.
     let indexed_shas =
         store::indexed_file_shas_in_scope(conn, input.commit_sha, input.worktree_id)?;
+    let mut best_monikers: HashMap<i64, &str> = HashMap::new();
     for (scip_symbol, def) in &index.definitions {
         let disk = disk_sha.get(&def.path).map(String::as_str);
         if disk.is_none() || indexed_shas.get(&def.path).map(String::as_str) != disk {
@@ -248,12 +258,22 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         let Some(logical_symbol_id) = store::logical_symbol_id_for_member(conn, symbol_id)? else {
             continue;
         };
+        best_monikers
+            .entry(logical_symbol_id)
+            .and_modify(|best| {
+                if (scip_symbol.len(), scip_symbol.as_str()) < (best.len(), *best) {
+                    *best = scip_symbol;
+                }
+            })
+            .or_insert(scip_symbol);
+    }
+    for (logical_symbol_id, moniker) in &best_monikers {
         store::write_logical_symbol_moniker(
             conn,
             input.tool,
             input.tool_version,
-            logical_symbol_id,
-            scip_symbol,
+            *logical_symbol_id,
+            moniker,
         )?;
         report.monikers_written += 1;
     }

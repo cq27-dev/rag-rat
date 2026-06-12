@@ -329,6 +329,10 @@ pub enum OracleTool {
 }
 
 impl OracleTool {
+    /// Every known oracle tool, for "report on all tools" surfaces (`oracle status` with no
+    /// `--tool`). Later language backends (#71 TS, #72 Kotlin) extend this alongside the enum.
+    pub const ALL: &[OracleTool] = &[Self::RustAnalyzer];
+
     pub fn as_db_str(self) -> &'static str {
         match self {
             Self::RustAnalyzer => "rust-analyzer",
@@ -421,8 +425,10 @@ pub struct OracleReport {
     pub no_occurrence: u64,
     /// `edge_oracle` rows written this pass.
     pub rows_written: u64,
-    /// `logical_symbol_monikers` rows written this pass — in-corpus SCIP definitions mapped to a
-    /// logical symbol (#70).
+    /// `logical_symbol_monikers` rows written this pass — distinct logical symbols whose moniker
+    /// an in-corpus SCIP definition supplied (#70). Several defs can map to one logical symbol
+    /// (fields/variants map up to the enclosing symbol); only the deterministic best (shortest)
+    /// moniker is written, so this counts rows, not defs.
     pub monikers_written: u64,
     pub status: String,
 }
