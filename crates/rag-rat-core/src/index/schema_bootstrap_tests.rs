@@ -1565,6 +1565,25 @@ fn idle_discover_sweep_does_not_rewrite_indexed_at_ms() {
 }
 
 #[test]
+fn index_discover_reporting_flags_content_changes() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let config = git_history_test_config(&root);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    // No change → reports false, so the watch loop skips the reconcile / memory-validate tail.
+    let (_db, changed) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!changed, "an unchanged discover sweep must report no content change");
+
+    // A new file on disk → reports true.
+    fs::write(root.join("docs/extra.md"), "# Extra\nbody text\n").unwrap();
+    let (_db, changed) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(changed, "a discover sweep that indexes a new file must report a content change");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn indexes_rust_graph_edges_from_tree_sitter() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);

@@ -10,6 +10,7 @@ impl IndexDatabase {
         F: FnMut(IndexProgress),
     {
         Self::index_incremental_with_progress(config, IndexMode::Changed, &mut progress)
+            .map(|(db, _)| db)
     }
 
     pub fn index_discover(config: &Config) -> anyhow::Result<Self> {
@@ -21,28 +22,36 @@ impl IndexDatabase {
         F: FnMut(IndexProgress),
     {
         Self::index_incremental_with_progress(config, IndexMode::Discover, &mut progress)
+            .map(|(db, _)| db)
+    }
+
+    /// Like [`Self::index_discover`], but also reports whether the pass changed index *content*
+    /// (a file was added / edited / removed). The watch loop uses this to skip the
+    /// reconcile / memory-validate tail on an idle no-change sweep (issue #63).
+    pub fn index_discover_reporting(config: &Config) -> anyhow::Result<(Self, bool)> {
+        Self::index_incremental_with_progress(config, IndexMode::Discover, &mut |_| {})
     }
 
     fn index_incremental_with_progress<F>(
         config: &Config,
         mode: IndexMode,
         progress: &mut F,
-    ) -> anyhow::Result<Self>
+    ) -> anyhow::Result<(Self, bool)>
     where
         F: FnMut(IndexProgress),
     {
         if !config.database.exists() {
-            return Self::rebuild_with_progress(config, progress);
+            return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
         if Self::migration_check(&config.database)?.state == schema::SchemaState::Missing {
-            return Self::rebuild_with_progress(config, progress);
+            return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
 
         let mut db = Self::open(&config.database)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
         if db.indexed_file_count()? == 0 {
-            return Self::rebuild_with_progress(config, progress);
+            return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
         progress(IndexProgress::Started { database: config.database.clone(), mode });
         // Gate the git-history reload: `apply_prepared` is a full `git log` re-read (O(total
@@ -57,7 +66,7 @@ impl IndexDatabase {
             progress(IndexProgress::IndexingGitHistory);
             Some(spawn_git_history_prepare(&config.root))
         };
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<bool> {
             // BEGIN IMMEDIATE: acquire the write lock up front so a racing writer waits out
             // busy_timeout instead of failing the deferred read→write upgrade with SQLITE_BUSY.
             db.storage.execute_batch("BEGIN IMMEDIATE")?;
@@ -99,7 +108,9 @@ impl IndexDatabase {
                 db.storage.execute_batch("ROLLBACK")?;
             }
             progress(IndexProgress::Finished { files: indexed });
-            Ok(())
+            // Report whether index *content* changed (files added / edited / removed), so the
+            // watch loop can skip the reconcile / memory-validate tail on an idle sweep.
+            Ok(indexed > 0)
         })();
         if result.is_err() {
             if let Some(handle) = git_history.take() {
@@ -107,8 +118,8 @@ impl IndexDatabase {
             }
             let _ = db.storage.execute_batch("ROLLBACK");
         }
-        result?;
-        Ok(db)
+        let content_changed = result?;
+        Ok((db, content_changed))
     }
 
     pub fn index_targets(&self, config: &Config) -> anyhow::Result<()> {

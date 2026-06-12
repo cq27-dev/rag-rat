@@ -100,7 +100,16 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
 }
 
 fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
-    let db = IndexDatabase::index_discover(config)?;
+    let (db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
+    // Idle backstop (issue #63, facet 2): when the sweep changed no content, skip the reconcile /
+    // gc / memory-validate tail — an idle server should do no work past discovery. `run_gc` (every
+    // GC_EVERY_PASSES) still forces a full tail, so the cases that DON'T flip content_changed are
+    // still caught within that bound: a freshly-installed embedder, an embedding backlog left by a
+    // time-capped reconcile (PASS_RECONCILE_MAX_SECONDS), and drifted memory anchors. Any real
+    // content change runs the full tail immediately.
+    if !content_changed && !run_gc {
+        return Ok(());
+    }
     let runtime = &config.local_ai.embedding.runtime;
     let options = ReconcileOptions {
         batch_size: Some(runtime.batch_size),
