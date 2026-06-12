@@ -84,13 +84,25 @@ impl IndexDatabase {
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
             };
-            let mut mutated = indexed > 0 || source_root_changed || git_meta_changed;
+            // Self-heal stale worktree-overlay rows (#87): a dirty-then-committed file's overlay
+            // row otherwise lingers forever, shadowing its (correct) committed row in every
+            // scoped read and colliding with a later full rebuild. Runs AFTER the indexing step
+            // so a freshly discovered committed row can take over. Read-only when there is
+            // nothing to heal, preserving the idle-pass no-write invariant (#63).
+            let healed = match git_changed_paths(&config.root) {
+                Ok(changes) => db.heal_stale_overlay_rows(&changes)?,
+                // Non-git roots have no commit scope; overlays are their canonical rows.
+                Err(_) => 0,
+            };
+            let mut mutated = indexed > 0 || healed > 0 || source_root_changed || git_meta_changed;
             // None when the gate above found git history already current — skip the reload.
             if let Some(handle) = git_history.take() {
                 db.apply_prepared_git_history(&config.root, handle)?;
                 mutated = true;
             }
-            if indexed > 0 {
+            // Healing can delete overlay symbols (NULLing their in-edges via
+            // `remove_file_in_scope`), so it needs the same re-derive tail as real file changes.
+            if indexed > 0 || healed > 0 {
                 progress(IndexProgress::RebuildingLogicalSymbols);
                 db.rebuild_logical_symbols()?;
                 progress(IndexProgress::ResolvingGraph);
@@ -108,9 +120,10 @@ impl IndexDatabase {
                 db.storage.execute_batch("ROLLBACK")?;
             }
             progress(IndexProgress::Finished { files: indexed });
-            // Report whether index *content* changed (files added / edited / removed), so the
-            // watch loop can skip the reconcile / memory-validate tail on an idle sweep.
-            Ok(indexed > 0)
+            // Report whether index *content* changed (files added / edited / removed, or stale
+            // overlays healed — symbols move scope), so the watch loop can skip the
+            // reconcile / memory-validate tail on an idle sweep.
+            Ok(indexed > 0 || healed > 0)
         })();
         if result.is_err() {
             if let Some(handle) = git_history.take() {
@@ -226,6 +239,76 @@ impl IndexDatabase {
                 file
             })
             .collect()
+    }
+
+    /// Drop or re-stamp stale worktree-overlay rows: overlay rows of the active worktree whose
+    /// path is NOT currently dirty (#87). They arise when a dirty file is committed (or its edit
+    /// reverted) and the cleanup pass never ran — e.g. a binary upgrade or schema migration cut
+    /// the old watcher off mid-session. Left alone they shadow the committed row in every scoped
+    /// read (queries see stale content) and collide with a later full rebuild's insert.
+    ///
+    /// Per stale overlay row:
+    /// - a row exists at `(path, active_commit, '')` → DELETE the overlay (cascade via
+    ///   `remove_file_in_scope`); the committed row takes over.
+    /// - no committed row, and the overlay's `sha256` matches the disk bytes (the path is clean, so
+    ///   disk == HEAD) → RE-STAMP the row to the commit scope in place. The row id — and every
+    ///   chunk/symbol/embedding/oracle row and memory binding hanging off it — survives.
+    /// - no committed row and the sha differs (checkout moved under a stale overlay) → leave it;
+    ///   the next discover pass reindexes the path at the commit scope (sha mismatch), and the pass
+    ///   after that takes the first branch.
+    ///
+    /// Returns the number of rows healed. Purely a read when nothing is stale, so an idle pass
+    /// stays write-free (#63). Non-git contexts (`active_commit_sha` empty) are untouched —
+    /// overlay rows ARE their canonical scope.
+    pub(super) fn heal_stale_overlay_rows(
+        &self,
+        changes: &GitChangedPaths,
+    ) -> anyhow::Result<usize> {
+        if self.active_commit_sha.is_empty() {
+            return Ok(0);
+        }
+        let overlays: Vec<(i64, String, String)> = {
+            let conn = self.storage.connection();
+            let mut stmt = conn.prepare(
+                "SELECT id, path, sha256 FROM main.files
+                 WHERE worktree_id = ?1 AND worktree_id != '' AND kind != 'deleted'",
+            )?;
+            let rows = stmt.query_map([&self.active_worktree_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut healed = 0usize;
+        for (file_id, path, sha) in overlays {
+            if changes.changed.contains(Path::new(&path)) {
+                continue; // genuinely dirty — the overlay is the canonical row
+            }
+            let committed_exists: bool = self.storage.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.files
+                 WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = '')",
+                params![path, self.active_commit_sha],
+                |row| row.get(0),
+            )?;
+            if committed_exists {
+                self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
+                healed += 1;
+                continue;
+            }
+            let disk_matches = self
+                .storage
+                .source_root()
+                .map(|root| root.join(&path))
+                .and_then(|full| std::fs::read(full).ok())
+                .is_some_and(|bytes| hex_sha256(&bytes) == sha);
+            if disk_matches {
+                self.storage.connection().execute(
+                    "UPDATE main.files SET commit_sha = ?2, worktree_id = '' WHERE id = ?1",
+                    params![file_id, self.active_commit_sha],
+                )?;
+                healed += 1;
+            }
+        }
+        Ok(healed)
     }
 
     fn apply_incremental_file_plan<F>(

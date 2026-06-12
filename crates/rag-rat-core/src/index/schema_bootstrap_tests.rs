@@ -7036,3 +7036,155 @@ fn orientation_composes_through_read_only_connection() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// A git fixture with one committed source file, configured like production (absolute DB path).
+fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+    fs::write(root.join("src/lib.rs"), "pub fn stable() -> i32 { 1 }\n").unwrap();
+    fs::write(root.join("src/extra.rs"), "pub fn extra() -> i32 { 2 }\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "init"]);
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+    (root, config)
+}
+
+/// Insert a worktree-overlay `files` row mirroring an existing committed row's content — the
+/// stale leftover a dirty-then-committed file leaves behind when its cleanup never ran (#87).
+fn insert_stale_overlay_row(db: &IndexDatabase, path: &str, worktree_id: &str) -> i64 {
+    let (sha, language, kind): (String, String, String) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT sha256, language, kind FROM main.files WHERE path = ?1 AND commit_sha != ''",
+            [path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id) VALUES (?1, ?2, ?3, ?4, 0, 0, '', ?5)",
+            rusqlite::params![path, language, kind, sha, worktree_id],
+        )
+        .unwrap();
+    db.storage.connection().last_insert_rowid()
+}
+
+/// #87: a full rebuild must be authoritative for the whole checkout. A stale overlay row shadows
+/// its committed counterpart, which exempted the committed row from the clear stage — the rebuild
+/// then collided on UNIQUE(path, commit_sha, worktree_id) and FAILED. With the fix, the rebuild
+/// succeeds and leaves exactly one row per path, at the commit scope.
+#[test]
+fn full_rebuild_survives_stale_overlay_rows() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let worktree_id = db.active_worktree_id.clone();
+    let commit = db.active_commit_sha.clone();
+    assert!(!commit.is_empty(), "fixture must be a real git checkout");
+    insert_stale_overlay_row(&db, "src/lib.rs", &worktree_id);
+    drop(db);
+
+    let db = IndexDatabase::rebuild(&config).expect("rebuild must survive stale overlay rows");
+
+    let rows: Vec<(String, String)> = {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT commit_sha, worktree_id FROM main.files WHERE path = 'src/lib.rs' AND \
+                 kind != 'deleted'",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(rows.len(), 1, "exactly one row per path after an authoritative rebuild: {rows:?}");
+    assert_eq!(rows[0], (commit, String::new()), "the clean tree indexes at the commit scope");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// #87 (self-heal half): an incremental pass drops a stale overlay row whose path is clean.
+/// With a committed counterpart present the overlay is removed outright; without one, the row is
+/// RE-STAMPED to the commit scope in place (same row id — chunks/symbols/embeddings/memory
+/// bindings all survive).
+#[test]
+fn incremental_pass_heals_stale_overlay_rows() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let worktree_id = db.active_worktree_id.clone();
+    let commit = db.active_commit_sha.clone();
+
+    // Case A: stale overlay WITH a committed counterpart -> deleted, committed row takes over.
+    insert_stale_overlay_row(&db, "src/lib.rs", &worktree_id);
+    // Case B: stale overlay WITHOUT a committed counterpart (its content matches disk) ->
+    // re-stamped to the commit scope in place.
+    let restamp_id = insert_stale_overlay_row(&db, "src/extra.rs", &worktree_id);
+    db.storage
+        .connection()
+        .execute("DELETE FROM main.files WHERE path = 'src/extra.rs' AND commit_sha != ''", [])
+        .unwrap();
+    drop(db);
+
+    let db = IndexDatabase::index_discover_with_progress(&config, |_| {}).unwrap();
+
+    let overlays: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM main.files WHERE worktree_id != '' AND kind != 'deleted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(overlays, 0, "a clean tree leaves no overlay rows behind");
+
+    let lib_rows: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM main.files WHERE path = 'src/lib.rs' AND kind != 'deleted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lib_rows, 1, "the committed row takes over from the deleted overlay");
+
+    let (extra_id, extra_commit): (i64, String) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT id, commit_sha FROM main.files WHERE path = 'src/extra.rs' AND kind != \
+             'deleted'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(extra_commit, commit, "the orphan overlay is re-stamped to the commit scope");
+    assert_eq!(
+        extra_id, restamp_id,
+        "re-stamp is in place — the row id (and ids hanging off it) survive"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

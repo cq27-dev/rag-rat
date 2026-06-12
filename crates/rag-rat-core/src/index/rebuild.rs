@@ -96,6 +96,16 @@ impl IndexDatabase {
 
     fn clear_full_rebuild_tables(&self) -> anyhow::Result<()> {
         // Stage the active context's file ids, then cascade-delete them and their derived rows.
+        //
+        // AUTHORITATIVE (load-bearing, #87): a full rebuild owns the WHOLE checkout, so the
+        // commit-scope staging deliberately does NOT mirror the scope VIEW's shadowing rule.
+        // The view excludes a committed row whose path has a worktree-overlay row (overlay
+        // wins for reads) — but exempting it from the CLEAR left it behind to collide with the
+        // rebuild's fresh insert at the same `(path, commit_sha, '')` whenever a stale overlay
+        // lingered (a dirty-then-committed file whose cleanup never ran), failing the whole
+        // rebuild with a UNIQUE constraint error. Stage every row of the active commit AND
+        // every row of the active worktree, shadowed or not. A sibling worktree at the same
+        // commit self-heals on its next discover pass (its missing paths reindex).
         self.storage.execute_batch(
             "
             CREATE TEMP TABLE IF NOT EXISTS staged_file_ids(id INTEGER PRIMARY KEY);
@@ -110,13 +120,7 @@ impl IndexDatabase {
             SELECT id
             FROM main.files
             WHERE commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
-              AND commit_sha != ''
-              AND path NOT IN (
-                  SELECT path FROM main.files
-                  WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
-             'worktree_id')
-                    AND worktree_id != ''
-              );
+              AND commit_sha != '';
             ",
         )?;
         self.delete_staged_files_cascade()?;
