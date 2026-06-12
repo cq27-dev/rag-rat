@@ -133,10 +133,24 @@ pub(crate) fn default_eval_path(config: &Config, file_name: &str) -> PathBuf {
 }
 
 pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
-    let db = open_index(config)?;
     match &args.command {
-        OracleCommand::Run(run_args) => oracle_run(config, &db, run_args),
-        OracleCommand::Status(status_args) => oracle_status(&db, status_args),
+        OracleCommand::Run(run_args) => {
+            // `oracle run` WRITES `edge_oracle` / `oracle_runs`, so it must serialize with the
+            // background watcher / `index` exactly like `maintenance` does. A concurrent indexer
+            // can delete+reinsert `edges` (cascading `edge_oracle`) between the pass loading edge
+            // ids and writing verdicts — FK failures / verdicts against a moving graph. Hold the
+            // write lock for the whole run, acquired BEFORE opening the DB so the indexer can't
+            // slip in between open and the pass. `status` is read-only — no lock.
+            let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
+                &rag_rat_core::locks::write_lock_path(&config.database),
+            )?;
+            let db = open_index(config)?;
+            oracle_run(config, &db, run_args)
+        },
+        OracleCommand::Status(status_args) => {
+            let db = open_index(config)?;
+            oracle_status(&db, status_args)
+        },
     }
 }
 
@@ -660,4 +674,123 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
             "skipped_by_policy": plan.embeddings.skipped_by_policy,
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use rag_rat_core::config::{ResolvedTarget, TargetKind};
+    use rag_rat_core::language::Language;
+    use rag_rat_core::locks::{FileLock, write_lock_path};
+    use rag_rat_core::{Config, IndexDatabase};
+
+    use crate::cli::{OracleArgs, OracleCommand, OracleRunArgs, OracleToolArg};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_config() -> (PathBuf, Config) {
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-oracle-lock-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n")
+            .unwrap();
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+        };
+        (root, config)
+    }
+
+    fn run_args() -> OracleArgs {
+        // The `--scip` path is deterministic (no rust-analyzer); an empty (zero-byte) `.scip` is a
+        // valid empty SCIP index → the pass completes writing no verdicts. We only assert the LOCK
+        // discipline here, not the verdict content.
+        OracleArgs {
+            command: OracleCommand::Run(OracleRunArgs {
+                tool: OracleToolArg::RustAnalyzer,
+                scip: None, // set per-test to a written empty `.scip`
+            }),
+        }
+    }
+
+    /// #82 finding 5: `oracle run` acquires the repo write lock for the duration, so it can't race a
+    /// concurrent indexer. We hold the write lock, kick off `oracle run` on a thread, and assert it
+    /// does NOT complete while the lock is held; releasing the lock lets it finish.
+    #[test]
+    fn oracle_run_blocks_on_write_lock() {
+        let (root, config) = temp_config();
+        IndexDatabase::rebuild(&config).unwrap();
+        // A valid empty SCIP index (zero-byte protobuf message) for the deterministic `--scip`
+        // path.
+        let scip_path = root.join("empty.scip");
+        std::fs::write(&scip_path, []).unwrap();
+        let mut args = run_args();
+        if let OracleCommand::Run(run) = &mut args.command {
+            run.scip = Some(scip_path);
+        }
+
+        // Hold the write lock the run must contend for.
+        let lock = FileLock::acquire_blocking(&write_lock_path(&config.database)).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = super::oracle(&config, &args);
+            let _ = tx.send(result.is_ok());
+        });
+
+        // While we hold the lock, the run must be blocked acquiring it — nothing arrives.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "oracle run completed while the write lock was held — it must block on the lock"
+        );
+
+        // Release the lock; the run proceeds and completes.
+        drop(lock);
+        let ok =
+            rx.recv_timeout(Duration::from_secs(20)).expect("oracle run completes after unlock");
+        assert!(ok, "oracle run should succeed once the lock is free");
+        handle.join().unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The lock is RELEASED after `oracle run` returns — a subsequent acquire succeeds immediately,
+    /// proving the run doesn't leak the lock (which would wedge the watcher/index).
+    #[test]
+    fn oracle_run_releases_write_lock_after_completion() {
+        let (root, config) = temp_config();
+        IndexDatabase::rebuild(&config).unwrap();
+        let scip_path = root.join("empty.scip");
+        std::fs::write(&scip_path, []).unwrap();
+        let mut args = run_args();
+        if let OracleCommand::Run(run) = &mut args.command {
+            run.scip = Some(scip_path);
+        }
+
+        super::oracle(&config, &args).unwrap();
+
+        // The lock is free now — a non-blocking acquire must succeed.
+        let lock = FileLock::try_acquire(&write_lock_path(&config.database)).unwrap();
+        assert!(lock.is_some(), "oracle run must release the write lock when it returns");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

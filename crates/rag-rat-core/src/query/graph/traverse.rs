@@ -281,6 +281,34 @@ pub(crate) fn normalize_confidence(value: &str) -> &'static str {
         _ => "name_only",
     }
 }
+/// Effective confidence ordering AFTER oracle enrichment, lowest rank = highest priority (so a
+/// stable ascending sort puts the strongest tier first). `compiler` (the SCIP oracle tier) ranks
+/// ABOVE `exact` — that is the whole point of the tier — then the heuristic ladder. Unknown strings
+/// rank last so a future tier can't silently jump the queue. Used to re-sort the overfetched
+/// candidate set before truncating to the caller's limit, so a compiler-upgraded low-confidence
+/// edge isn't dropped by the heuristic `LIMIT` (#82 finding 4).
+pub(crate) fn effective_confidence_rank(confidence: &str) -> u8 {
+    match confidence {
+        "compiler" => 0,
+        "exact" => 1,
+        "syntactic" => 2,
+        "name_only" => 3,
+        "ambiguous" => 4,
+        _ => 5,
+    }
+}
+/// The overfetch cap for an oracle-aware traversal: traverse this many heuristic candidates so a
+/// compiler-upgraded low-confidence edge — which the heuristic ranks below the `limit` cutoff — is
+/// still in the candidate set when enrichment + re-sort run, before truncating back to `limit`.
+/// `4x` with a floor of 200 gives generous headroom for the common small `limit`; the `5000`
+/// ceiling caps the extra headroom so a pathological `limit` can't materialize the whole graph, but
+/// the result is never below `limit` itself (we must still fetch what the caller asked for). An
+/// edge upgraded beyond this window is the accepted residual (the heuristic already ranked it very
+/// far down) (#82 finding 4).
+pub(crate) fn oracle_overfetch_limit(limit: u32) -> u32 {
+    let headroom = limit.saturating_mul(4).clamp(200, 5000);
+    limit.max(headroom)
+}
 pub(crate) fn false_positive_risk(
     summary: &GraphTraversalSummary,
     mode: GraphResolutionMode,

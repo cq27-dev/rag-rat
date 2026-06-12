@@ -2220,18 +2220,36 @@ fn name_only_recovery_rate_excludes_exact_upgrades() {
 
 /// Seed one edge with a written verdict and return `(harness, edge_id, file_sha)`. The verdict's
 /// `file_sha` matches the file's recorded sha (current), so it surfaces; tests that want staleness
-/// drift the edge's file sha afterward.
+/// drift the edge's file sha afterward. When `in_corpus` is set, a real `target` symbol is inserted
+/// and the verdict resolves to its id — so the def-drift gate (`resolved_symbol_id` must still
+/// EXIST in `symbols`) is satisfied for current verdicts. `None` (external) verdicts skip that
+/// gate.
 fn seed_verdict(
     kind: OracleResolutionKind,
     scip_symbol: &str,
-    resolved_symbol_id: Option<i64>,
+    in_corpus: bool,
 ) -> (Harness, i64, String) {
+    let (h, edge, file_sha, _resolved) = seed_verdict_full(kind, scip_symbol, in_corpus);
+    (h, edge, file_sha)
+}
+
+/// Like [`seed_verdict`] but also returns the in-corpus `resolved_symbol_id` (when any), so a test
+/// can delete/reindex that definition symbol and assert the verdict stops surfacing (#82 finding
+/// 3).
+fn seed_verdict_full(
+    kind: OracleResolutionKind,
+    scip_symbol: &str,
+    in_corpus: bool,
+) -> (Harness, i64, String, Option<i64>) {
     let h = Harness::new();
     let f = h.add_file("a.rs", "fn caller() { target(); }\n");
     let file_sha: String = h
         .conn
         .query_row("SELECT sha256 FROM files WHERE id = ?1", params![f], |r| r.get(0))
         .unwrap();
+    // An in-corpus resolution must point at a symbol that EXISTS — the def-drift gate in
+    // `EDGE_ORACLE_CURRENT_PREDICATE` filters a dangling `resolved_symbol_id`.
+    let resolved_symbol_id = in_corpus.then(|| h.add_symbol(f, "target", 3, 9));
     let edge = h.add_edge(f, "target", 14, 20, "NameOnly", None);
     store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
         edge_id: edge,
@@ -2241,15 +2259,14 @@ fn seed_verdict(
         kind,
     })
     .unwrap();
-    (h, edge, file_sha)
+    (h, edge, file_sha, resolved_symbol_id)
 }
 
 /// A CURRENT verdict (its `file_sha` matches `files.sha256`) is returned by the surfacing read —
 /// the `Compiler` tier data.
 #[test]
 fn current_verdict_is_surfaced_for_edge() {
-    let (h, edge, _sha) =
-        seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", Some(1));
+    let (h, edge, _sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", true);
     let verdicts =
         store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
             .unwrap();
@@ -2262,8 +2279,7 @@ fn current_verdict_is_surfaced_for_edge() {
 /// The surfacing read excludes it — the edge reverts to heuristic display, never `Compiler`.
 #[test]
 fn drifted_file_verdict_is_not_surfaced() {
-    let (h, edge, _sha) =
-        seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", Some(1));
+    let (h, edge, _sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", true);
     // The file's content changed since the verdict was computed: its sha now differs from
     // `edge_oracle.file_sha`, so the current-content predicate filters the verdict out.
     h.conn.execute("UPDATE files SET sha256 = 'drifted-sha' WHERE path = 'a.rs'", []).unwrap();
@@ -2273,13 +2289,36 @@ fn drifted_file_verdict_is_not_surfaced() {
     assert!(verdicts.is_empty(), "a drifted file's verdict must not surface as Compiler");
 }
 
+/// Def-drift revert (#82 finding 3): an in-corpus verdict keeps its callsite file unchanged (so the
+/// `file_sha` gate still matches), but its resolved DEFINITION symbol is deleted/reinserted by
+/// incremental reindexing — the old `resolved_symbol_id` dangles. The surfacing read must drop the
+/// verdict (the def the compiler resolved to no longer exists), reverting to heuristic display.
+#[test]
+fn resolved_def_drift_verdict_is_not_surfaced() {
+    let (h, edge, _sha, resolved) =
+        seed_verdict_full(OracleResolutionKind::Upgrade, "scip x `target`().", true);
+    let resolved = resolved.expect("in-corpus verdict has a resolved symbol id");
+    // Sanity: while the resolved def symbol exists, the verdict surfaces.
+    let before =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    assert!(before.contains_key(&edge), "current in-corpus verdict surfaces before def drift");
+    // The def file was reindexed: AUTOINCREMENT mints new ids, so the old resolved symbol id is
+    // gone. Model that by deleting the resolved symbol row.
+    h.conn.execute("DELETE FROM symbols WHERE id = ?1", params![resolved]).unwrap();
+    let after =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    assert!(after.is_empty(), "a verdict whose resolved definition drifted must not surface");
+}
+
 /// Dirty/overlay (uncommitted) edges never surface `Compiler`: an edge whose file lives in a
 /// different `(commit_sha, worktree_id)` scope than the active checkout is out of the scope join,
 /// so its verdict is never returned for the active checkout. (Models the overlay edge — the
 /// compiler hasn't seen the uncommitted edit; the oracle row binds to commit-scoped rows only.)
 #[test]
 fn out_of_scope_verdict_is_not_surfaced() {
-    let (h, edge, sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", Some(1));
+    let (h, edge, sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", true);
     // Query the SAME edge under a sibling worktree scope: the scope join excludes it.
     let verdicts = store::current_oracle_verdicts_for_edges(
         &h.conn,
@@ -2301,7 +2340,7 @@ fn resolved_external_label_surfaces_package() {
     let (h, edge, _sha) = seed_verdict(
         OracleResolutionKind::ResolvedExternal,
         "scip-rust cargo tokio 1.0 `spawn`().",
-        None,
+        false,
     );
     let verdicts =
         store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])

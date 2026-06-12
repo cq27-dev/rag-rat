@@ -928,15 +928,7 @@ impl IndexDatabase {
         options: &crate::query::graph::GraphTraversalOptions,
     ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
         let options = self.graph_options_with_logical_group(options)?;
-        let mut hops = crate::query::graph::traverse_with_options(
-            self.storage.connection(),
-            symbol,
-            true,
-            limit,
-            &options,
-        )?;
-        self.enrich_hops_with_oracle(&mut hops)?;
-        Ok(hops)
+        self.traverse_with_oracle(symbol, true, limit, &options)
     }
 
     /// Upgrade graph hops to the `Compiler` confidence tier where a CURRENT, in-scope `edge_oracle`
@@ -994,6 +986,20 @@ impl IndexDatabase {
             };
             match verdict.kind {
                 oracle::OracleResolutionKind::Upgrade | oracle::OracleResolutionKind::Confirm => {
+                    // Hydrate the hop's target from the compiler's `resolved_symbol_id` BEFORE
+                    // promoting to `compiler` — for an `Upgrade` on a `NameOnly`/`Ambiguous` edge
+                    // the heuristic target is missing or wrong, so promoting confidence without
+                    // moving the target would attach the compiler tier to a heuristic/absent
+                    // target (#82 finding 2). If the resolved symbol can't be surfaced (it was
+                    // deleted/reinserted, so its qualified name is gone — though the def-drift gate
+                    // in `EDGE_ORACLE_CURRENT_PREDICATE` already filters that case), do NOT
+                    // promote.
+                    let Some(resolved_name) = verdict.resolved_qualified_name.clone() else {
+                        continue;
+                    };
+                    hop.to_symbol = Some(resolved_name.clone());
+                    hop.target_qualified_name = Some(resolved_name);
+                    hop.verified_target_symbol = true;
                     hop.confidence = "compiler".to_string();
                     hop.resolution_reason = Some(verdict.resolution_reason());
                 },
@@ -1006,6 +1012,43 @@ impl IndexDatabase {
             }
         }
         Ok(())
+    }
+
+    /// Traverse, surface the `Compiler` tier, then rank-and-truncate so a compiler-upgraded edge is
+    /// never dropped by the heuristic limit (#82 finding 4).
+    ///
+    /// The heuristic `traverse_with_options` orders by heuristic confidence and applies `LIMIT`
+    /// BEFORE oracle enrichment runs — so a low-confidence edge the compiler would upgrade to
+    /// `compiler` (the tier ABOVE `exact`) can fall below the cutoff and never be fetched, even
+    /// though it should outrank the `exact`/`syntactic` neighbors that displaced it. To fix the
+    /// ordering we OVERFETCH (traverse with an inflated cap), enrich the larger candidate set,
+    /// RE-SORT by EFFECTIVE confidence (`compiler` > `exact` > `syntactic` > `name_only` >
+    /// `ambiguous`) with a stable tiebreak on the heuristic order, and only THEN truncate to
+    /// `limit`. The overfetch cap is bounded so a huge `limit` can't blow up the candidate set; an
+    /// edge upgraded beyond the overfetch window is the residual we accept (the heuristic already
+    /// ranked it far down, and the window is generous).
+    fn traverse_with_oracle(
+        &self,
+        symbol: &str,
+        reverse: bool,
+        limit: u32,
+        options: &crate::query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
+        let overfetch = crate::query::graph::oracle_overfetch_limit(limit);
+        let mut hops = crate::query::graph::traverse_with_options(
+            self.storage.connection(),
+            symbol,
+            reverse,
+            overfetch,
+            options,
+        )?;
+        self.enrich_hops_with_oracle(&mut hops)?;
+        // Stable sort by effective (post-enrichment) confidence so a `compiler` upgrade rises above
+        // the heuristic `exact`/`syntactic` edges that out-ranked it in the SQL ORDER BY. Stable
+        // keeps the heuristic order within a tier.
+        hops.sort_by_key(|hop| crate::query::graph::effective_confidence_rank(&hop.confidence));
+        hops.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(hops)
     }
 
     pub fn trace_callees(
@@ -1023,15 +1066,7 @@ impl IndexDatabase {
         options: &crate::query::graph::GraphTraversalOptions,
     ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
         let options = self.graph_options_with_logical_group(options)?;
-        let mut hops = crate::query::graph::traverse_with_options(
-            self.storage.connection(),
-            symbol,
-            false,
-            limit,
-            &options,
-        )?;
-        self.enrich_hops_with_oracle(&mut hops)?;
-        Ok(hops)
+        self.traverse_with_oracle(symbol, false, limit, &options)
     }
 
     pub fn graph_traversal_report(
@@ -1043,14 +1078,12 @@ impl IndexDatabase {
         options: &crate::query::graph::GraphTraversalOptions,
     ) -> anyhow::Result<crate::query::graph::GraphTraversalReport> {
         let options = self.graph_options_with_logical_group(options)?;
-        let mut results = crate::query::graph::traverse_with_options(
-            self.storage.connection(),
-            &symbol.qualified_name,
-            reverse,
-            limit,
-            &options,
-        )?;
-        self.enrich_hops_with_oracle(&mut results)?;
+        // Overfetch + enrich + re-rank + truncate so a compiler-upgraded edge survives the limit
+        // (#82 finding 4). `traversal_summary` below still describes the FULL matching population
+        // (its own COUNT query, independent of the returned window), so passing the truncated
+        // `results.len()` as the returned count stays correct.
+        let results =
+            self.traverse_with_oracle(&symbol.qualified_name, reverse, limit, &options)?;
         let mut summary = crate::query::graph::traversal_summary(
             self.storage.connection(),
             &symbol.qualified_name,
@@ -1326,7 +1359,18 @@ impl IndexDatabase {
                 .to_string(),
                 heuristic_target: comparison.heuristic_target,
                 callee_name: comparison.callee_name,
-                resolved_external: resolved_external_label(&comparison.scip_symbol),
+                // Label `resolved-external` ONLY for a contradiction the compiler resolved OUTSIDE
+                // the corpus (`resolved_symbol_id IS NULL`). A Rust SCIP symbol carries a
+                // crate/package component even for the LOCAL crate (`scip-rust crate held-mini …`),
+                // so deriving the label from `scip_symbol` alone would mislabel an IN-CORPUS
+                // contradiction (the compiler resolved to a *different* in-corpus symbol) as
+                // `resolved-external(<local-crate>)` (#82 finding 1). An in-corpus contradiction is
+                // a same-corpus disagreement, not an external placement.
+                resolved_external: comparison
+                    .resolved_symbol_id
+                    .is_none()
+                    .then(|| resolved_external_label(&comparison.scip_symbol))
+                    .flatten(),
                 scip_symbol: comparison.scip_symbol,
                 callsite: Some(crate::query::graph::Callsite {
                     path: comparison.callsite_path,
@@ -1511,16 +1555,19 @@ impl IndexDatabase {
         limit: u32,
         options: &crate::query::impact::ImpactSurfaceOptions,
     ) -> anyhow::Result<crate::query::impact::ImpactSurfaceReport> {
-        let mut report = crate::query::impact::impact_surface_report_for_symbol(
+        // Surface the `Compiler` tier on impact's direct graph neighbors too (same read-side JOIN
+        // as trace_callees/find_callers). The enrichment is now injected INTO the builder so it
+        // runs over the OVERFETCHED candidate set before the re-rank + limit truncation (#82
+        // finding
+        // 4) and before the memory-evidence edge-id collection — so a compiler-upgraded neighbor
+        // can't be dropped by the heuristic limit, and downstream counts see the final window.
+        let report = crate::query::impact::impact_surface_report_for_symbol(
             self.storage.connection(),
             symbol,
             limit,
             options,
+            |hops| self.enrich_hops_with_oracle(hops),
         )?;
-        // Surface the `Compiler` tier on impact's direct graph neighbors too (same read-side JOIN
-        // as trace_callees/find_callers), so the coding preflight shows compiler-grade resolutions.
-        self.enrich_hops_with_oracle(&mut report.direct_semantic_callers)?;
-        self.enrich_hops_with_oracle(&mut report.direct_semantic_callees)?;
         Ok(report)
     }
 
@@ -1984,6 +2031,225 @@ mod oracle_surfacing_tests {
         assert_eq!(c.edge_id, edge_id);
         assert_eq!(c.heuristic_confidence, "exact");
         assert_eq!(c.resolved_external.as_deref(), Some("resolved-external(other)"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #82 finding 1: an IN-CORPUS contradiction (the compiler resolved the callee to a DIFFERENT
+    /// in-corpus symbol than the heuristic) must NOT be labeled `resolved-external`. A Rust SCIP
+    /// symbol carries a crate/package component even for the LOCAL crate, so deriving the label
+    /// from `scip_symbol` alone would mislabel it as `resolved-external(held-mini)`.
+    #[test]
+    fn in_corpus_contradiction_is_not_labeled_resolved_external() {
+        let root = temp_root();
+        // Two in-corpus defs. The heuristic resolves `target()` to `target`; the compiler resolves
+        // the same callsite to the OTHER in-corpus def `other` → in-corpus Contradict.
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn caller() { target(); } fn target() {} fn other() {}\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let (edge_id, cs, ce, path) = call_edge(&db);
+        // Force the heuristic edge to look in-corpus-resolved to `target` (Exact + to_symbol_id).
+        let target_sym: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE edges SET confidence = 'Exact', resolution = 'exact', to_symbol_id = ?2 \
+                 WHERE id = ?1",
+                params![edge_id, target_sym],
+            )
+            .unwrap();
+        // The compiler resolves the callee to the in-corpus def `other` (a LOCAL-crate SCIP
+        // symbol), whose definition occurrence sits at `other`'s recorded byte span.
+        let (other_start, other_end): (i64, i64) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT start_byte, end_byte FROM symbols WHERE name = 'other' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let symbol = "scip-rust crate held-mini `other`().";
+        let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((other_start, other_end)));
+        db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+
+        let compare = db.compare_graph_to_scip().unwrap();
+        assert_eq!(compare.summary.contradictions, 1, "{compare:?}");
+        let c = &compare.contradictions[0];
+        assert_eq!(c.edge_id, edge_id);
+        // The disagreement is in-corpus → no external label, even though the SCIP symbol names the
+        // local crate.
+        assert_eq!(
+            c.resolved_external, None,
+            "an in-corpus contradiction must not be labeled resolved-external"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #82 finding 2: an `Upgrade` on a heuristic-unresolved edge must surface the SCIP-RESOLVED
+    /// symbol as the hop's target, not the heuristic's missing/heuristic one. We strip the
+    /// heuristic resolution (NameOnly, no `to_symbol_id`) and let the compiler resolve in-corpus,
+    /// then read FORWARD from `caller` (robust for an unresolved edge) and assert the hop's target
+    /// moved to the compiler-resolved symbol.
+    #[test]
+    fn upgrade_hydrates_target_from_compiler_resolution() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let (edge_id, cs, ce, path) = call_edge(&db);
+        let target_qualified: String = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT qualified_name FROM symbols WHERE name = 'target' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (target_start, target_end): (i64, i64) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT start_byte, end_byte FROM symbols WHERE name = 'target' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        // Demote the heuristic edge to a genuine miss: NameOnly, no resolved target / qualified
+        // name. A promotion that didn't MOVE the target would surface this absent one.
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE edges SET confidence = 'NameOnly', resolution = 'name_only', to_symbol_id \
+                 = NULL, target_qualified_name = NULL WHERE id = ?1",
+                params![edge_id],
+            )
+            .unwrap();
+        let symbol = "scip-rust crate held-mini `target`().";
+        let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((target_start, target_end)));
+        let report = db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+        assert!(report.upgraded >= 1, "expected an Upgrade, got {report:?}");
+
+        let callees = db
+            .trace_callees_with_options("caller", 50, &crate::query::graph::GraphTraversalOptions {
+                include_unresolved: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let hop = callees.iter().find(|h| h.edge_id == edge_id).expect("call edge present");
+        assert_eq!(hop.confidence, "compiler", "an Upgrade surfaces the compiler tier");
+        // The target moved to the SCIP-resolved symbol, not the heuristic's absent target.
+        assert_eq!(hop.to_symbol.as_deref(), Some(target_qualified.as_str()));
+        assert_eq!(hop.target_qualified_name.as_deref(), Some(target_qualified.as_str()));
+        assert!(hop.verified_target_symbol, "the compiler-resolved target is verified");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #82 finding 4: a compiler-`Upgrade`d low-confidence neighbor must appear within `limit` even
+    /// when more `Exact` neighbors than `limit` outrank it heuristically. Oracle enrichment runs
+    /// AFTER the heuristic-ordered limit, so without overfetch+re-rank the upgraded edge is
+    /// dropped.
+    #[test]
+    fn compiler_upgrade_survives_heuristic_limit() {
+        let root = temp_root();
+        // Single line so byte offsets == char offsets (ASCII) for the `.scip` occurrence. `pull` is
+        // the upgrade target; two of its three callers are Exact (high heuristic rank), the third
+        // is a name-only miss the compiler upgrades.
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn pull() {} fn a() { pull(); } fn b() { pull(); } fn c() { pull(); }\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // Find the three call edges to `pull`. Make two of them Exact (high heuristic rank) and the
+        // third a NameOnly miss the compiler will upgrade.
+        let edges: Vec<(i64, i64, i64, String)> = {
+            let conn = db.storage.connection();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT edges.id, edges.callee_start_byte, edges.callee_end_byte, files.path \
+                     FROM edges JOIN files ON files.id = edges.source_file_id WHERE \
+                     edges.edge_kind = 'calls_name' AND edges.callee_start_byte IS NOT NULL ORDER \
+                     BY edges.id",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?)))
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(edges.len(), 3, "three calls to pull");
+        let pull_sym: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT id FROM symbols WHERE name = 'pull' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let (pull_start, pull_end): (i64, i64) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT start_byte, end_byte FROM symbols WHERE name = 'pull' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        // Edges 0,1: Exact resolved to `pull`. Edge 2: NameOnly miss (the upgrade candidate).
+        let conn = db.storage.connection();
+        for (edge_id, ..) in &edges[..2] {
+            conn.execute(
+                "UPDATE edges SET confidence = 'Exact', resolution = 'exact', to_symbol_id = ?2 \
+                 WHERE id = ?1",
+                params![edge_id, pull_sym],
+            )
+            .unwrap();
+        }
+        let (upgrade_edge, ucs, uce, path) = edges[2].clone();
+        // NameOnly (heuristically low rank, below the Exact callers) but still target-resolved to
+        // `pull` so the reverse traversal includes it as a candidate. The oracle still classifies
+        // it an Upgrade (the heuristic didn't resolve it Exact/Syntactic-in-corpus), and
+        // the re-rank must lift it above the Exact callers within the limit.
+        conn.execute(
+            "UPDATE edges SET confidence = 'NameOnly', resolution = 'name_only', to_symbol_id = \
+             ?2 WHERE id = ?1",
+            params![upgrade_edge, pull_sym],
+        )
+        .unwrap();
+
+        // The compiler upgrades ONLY the name-only edge to the in-corpus `pull` def.
+        let symbol = "scip-rust crate held-mini `pull`().";
+        let scip = scip_with(&path, ucs, uce, symbol, Some(&path), Some((pull_start, pull_end)));
+        let report = db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+        assert!(report.upgraded >= 1, "expected an Upgrade, got {report:?}");
+
+        // limit = 1: heuristically the two Exact callers outrank the name-only one, so without the
+        // overfetch+re-rank the compiler upgrade is dropped. With it, the compiler tier wins.
+        let callers = db
+            .find_callers_with_options("pull", 1, &crate::query::graph::GraphTraversalOptions {
+                include_unresolved: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(callers.len(), 1, "limit honored");
+        assert_eq!(
+            callers[0].edge_id, upgrade_edge,
+            "the compiler-upgraded neighbor must rank into the limit ahead of Exact neighbors"
+        );
+        assert_eq!(callers[0].confidence, "compiler");
 
         let _ = fs::remove_dir_all(&root);
     }

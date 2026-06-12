@@ -337,17 +337,30 @@ pub(crate) fn count_edge_oracle_scoped(
 }
 
 /// The CURRENT-content predicate appended to [`EDGE_ORACLE_SCOPE_JOIN`] for any READ that surfaces
-/// a verdict in query output (the `Compiler` tier). A verdict is valid for display ONLY when the
-/// file it was computed against is unchanged — `edge_oracle.file_sha == files.sha256` for the
-/// edge's current source file. A drifted/changed file's `file_sha` differs, so the verdict is
-/// filtered out here and the edge reverts to heuristic display (`oracle-stale`), never `Compiler`.
+/// a verdict in query output (the `Compiler` tier). A verdict is valid for display ONLY when BOTH:
+///
+/// 1. **The callsite file is unchanged** — `edge_oracle.file_sha == files.sha256` for the edge's
+///    current source file. A drifted/changed callsite's `file_sha` differs, so the verdict is
+///    filtered out and the edge reverts to heuristic display (`oracle-stale`), never `Compiler`.
+/// 2. **The resolved definition is unchanged** (in-corpus verdicts only) — the resolved symbol
+///    `edge_oracle.resolved_symbol_id` STILL EXISTS in the active scope. The callsite gate (1)
+///    alone misses *definition* drift: an `Upgrade`/`Confirm` keeps surfacing after the resolved
+///    *def* file changed or its symbol was deleted/reinserted, because the callsite file is
+///    untouched so its sha still matches (#82 finding 3). Since `symbols.id` is AUTOINCREMENT,
+///    reindexing the def file mints NEW ids and the old `resolved_symbol_id` dangles — so an
+///    `EXISTS` against `symbols.id` reverts the verdict to heuristic the moment the def file is
+///    reindexed. `resolved-external` verdicts (`resolved_symbol_id IS NULL`) skip this clause —
+///    there is no in-corpus def to drift.
+///
 /// This is the read-side mirror of the run-time content-integrity gate (run.rs) and the staleness
 /// key `(file_sha, tool, tool_version)`.
 ///
 /// (The eval/status COUNTS in [`count_edge_oracle_scoped`] deliberately do NOT apply this — they
 /// describe the persisted verdict population for precision/recall, which is content-addressed by
 /// the run, not the live display. Only the surfacing reads gate on currency.)
-pub(crate) const EDGE_ORACLE_CURRENT_PREDICATE: &str = " AND edge_oracle.file_sha = files.sha256";
+pub(crate) const EDGE_ORACLE_CURRENT_PREDICATE: &str =
+    " AND edge_oracle.file_sha = files.sha256 AND (edge_oracle.resolved_symbol_id IS NULL OR \
+     EXISTS (SELECT 1 FROM symbols WHERE symbols.id = edge_oracle.resolved_symbol_id))";
 
 /// One current, in-scope oracle verdict for an edge, surfaced in graph/impact query output as the
 /// `Compiler` tier. `package` is the external dependency name for `resolved-external` verdicts
@@ -355,6 +368,15 @@ pub(crate) const EDGE_ORACLE_CURRENT_PREDICATE: &str = " AND edge_oracle.file_sh
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeOracleVerdict {
     pub(crate) kind: OracleResolutionKind,
+    /// The qualified name of the verdict's in-corpus `resolved_symbol_id` (joined at read time),
+    /// `None` when the verdict is external (`resolved_symbol_id IS NULL`) or the resolved symbol
+    /// no longer exists. An `Upgrade`'s target is hydrated from THIS name — never the
+    /// heuristic edge's stale/heuristic target — and an `Upgrade` whose resolved symbol can't
+    /// be surfaced (`None`) is NOT promoted to `compiler`: we won't attach the tier to a
+    /// target we can't name (#82 finding 2). The def-drift gate in
+    /// `EDGE_ORACLE_CURRENT_PREDICATE` already filters a deleted/reinserted resolved symbol,
+    /// so in practice this is `None` only for externals.
+    pub(crate) resolved_qualified_name: Option<String>,
     pub(crate) scip_symbol: String,
     pub(crate) tool: OracleTool,
     pub(crate) tool_version: String,
@@ -408,8 +430,15 @@ pub(crate) fn current_oracle_verdicts_for_edges(
     for chunk in edge_ids.chunks(900) {
         let placeholders =
             (0..chunk.len()).map(|i| format!("?{}", i + 5)).collect::<Vec<_>>().join(", ");
+        // The resolved symbol's qualified name is pulled via a correlated subquery (not a trailing
+        // JOIN) so the shared `EDGE_ORACLE_SCOPE_JOIN`/`..._CURRENT_PREDICATE` strings — which end
+        // in a WHERE — stay the single source of the scope+current predicate. A deleted/reinserted
+        // resolved symbol yields NULL here, so the `Upgrade` target can't be surfaced and the hop
+        // is left heuristic (#82 finding 2).
         let sql = format!(
             "SELECT edge_oracle.edge_id, edge_oracle.kind, edge_oracle.resolved_symbol_id, \
+             (SELECT qualified_name FROM symbols WHERE symbols.id = \
+             edge_oracle.resolved_symbol_id), \
              edge_oracle.scip_symbol{EDGE_ORACLE_SCOPE_JOIN}{EDGE_ORACLE_CURRENT_PREDICATE} AND \
              edge_oracle.edge_id IN ({placeholders})"
         );
@@ -426,17 +455,21 @@ pub(crate) fn current_oracle_verdicts_for_edges(
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
             let edge_id: i64 = row.get(0)?;
             let kind: String = row.get(1)?;
-            let resolved_symbol_id: Option<i64> = row.get(2)?;
-            let scip_symbol: String = row.get(3)?;
-            Ok((edge_id, kind, resolved_symbol_id, scip_symbol))
+            // Column 2 (`resolved_symbol_id`) is selected so the def-drift EXISTS clause in the
+            // CURRENT predicate can reference it, but the verdict carries the joined NAME, not the
+            // raw id.
+            let resolved_qualified_name: Option<String> = row.get(3)?;
+            let scip_symbol: String = row.get(4)?;
+            Ok((edge_id, kind, resolved_qualified_name, scip_symbol))
         })?;
         for row in rows {
-            let (edge_id, kind, _resolved_symbol_id, scip_symbol) = row?;
+            let (edge_id, kind, resolved_qualified_name, scip_symbol) = row?;
             let Some(kind) = OracleResolutionKind::from_db_str(&kind) else {
                 continue;
             };
             out.insert(edge_id, EdgeOracleVerdict {
                 kind,
+                resolved_qualified_name,
                 scip_symbol,
                 tool,
                 tool_version: tool_version.to_string(),
@@ -458,6 +491,14 @@ pub(crate) struct EdgeOracleComparison {
     pub(crate) heuristic_confidence: String,
     pub(crate) heuristic_target: Option<String>,
     pub(crate) callee_name: Option<String>,
+    /// Our `symbols.id` when the compiler resolved this callee to an IN-CORPUS symbol (an
+    /// in-corpus `Contradict`: the compiler picked a different in-corpus target), `None` when
+    /// it placed the callee in a dependency. `compare_graph_to_scip` labels
+    /// `resolved_external` ONLY when this is `None` — a Rust SCIP symbol carries a
+    /// crate/package component even for the LOCAL crate, so deriving `resolved-external` from
+    /// `scip_symbol` alone would mislabel an in-corpus contradiction as
+    /// `resolved-external(<local-crate>)` (#82 finding 1).
+    pub(crate) resolved_symbol_id: Option<i64>,
     pub(crate) scip_symbol: String,
     pub(crate) callsite_path: String,
     pub(crate) callsite_line: i64,
@@ -482,7 +523,8 @@ pub(crate) fn current_oracle_comparisons(
     let sql = format!(
         "SELECT edge_oracle.edge_id, edge_oracle.kind, edges.edge_kind, edges.confidence, (SELECT \
          qualified_name FROM symbols WHERE symbols.id = edges.to_symbol_id), edges.to_name, \
-         edge_oracle.scip_symbol, files.path, COALESCE(NULLIF(edges.source_start_line, 0), 1) \
+         edge_oracle.resolved_symbol_id, edge_oracle.scip_symbol, files.path, \
+         COALESCE(NULLIF(edges.source_start_line, 0), 1) \
          {EDGE_ORACLE_SCOPE_JOIN}{EDGE_ORACLE_CURRENT_PREDICATE} ORDER BY files.path, \
          edges.source_start_line"
     );
@@ -497,9 +539,10 @@ pub(crate) fn current_oracle_comparisons(
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
-                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(6)?,
                 row.get::<_, String>(7)?,
-                row.get::<_, i64>(8)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
             ))
         })?;
     let mut out = Vec::new();
@@ -511,6 +554,7 @@ pub(crate) fn current_oracle_comparisons(
             heuristic_confidence,
             heuristic_target,
             callee_name,
+            resolved_symbol_id,
             scip_symbol,
             callsite_path,
             callsite_line,
@@ -525,6 +569,7 @@ pub(crate) fn current_oracle_comparisons(
             heuristic_confidence,
             heuristic_target,
             callee_name,
+            resolved_symbol_id,
             scip_symbol,
             callsite_path,
             callsite_line,
