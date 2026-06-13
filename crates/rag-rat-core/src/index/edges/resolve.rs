@@ -515,9 +515,9 @@ pub(crate) fn allow_unqualified_fallback(
 /// exempt from crate-aware import suppression (#61 Project B) even when the file also imports a
 /// same-named external item.
 fn targets_local_qualified_path(target_qualified_name: Option<&str>) -> bool {
-    target_qualified_name.is_some_and(|path| {
-        path.starts_with("crate::") || path.starts_with("self::") || path.starts_with("super::")
-    })
+    target_qualified_name
+        .and_then(|path| path.split_once("::"))
+        .is_some_and(|(root, _)| matches!(root, "crate" | "self" | "super"))
 }
 pub(crate) fn is_external_rust_root(value: &str) -> bool {
     matches!(
