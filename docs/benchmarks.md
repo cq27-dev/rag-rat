@@ -109,29 +109,36 @@ indexed `.rs` file (no subset caveat).
 |---|---|---|
 | Rust files indexed | 1,349 | the cargo workspace |
 | Heuristic `calls_name` resolved (in-corpus) | 14.6% | most calls in cargo target std/deps, which a single-repo name resolver can't bind in-corpus |
-| **Compiler precision (blended)** | **79.8%** | confirmed / (confirmed + contradicted), over every judged edge kind |
-| — `calls_name` | **87.5%** | function-call resolution (13,469 / 1,918) |
-| — `references_type` | **72.5%** | type references (12,189 / 4,623) — after the type-only resolution fix below |
+| **Compiler precision (blended)** | **81.4%** | confirmed / (confirmed + contradicted), over every judged edge kind |
+| — `calls_name` | **88.6%** | function-call resolution (15,907 / 2,045) |
+| — `references_type` | **73.4%** | type references (12,012 / 4,356) — after the resolution fixes below |
 | **Call recall** | **95.4%** | covered / (covered + oracle-only) — the graph had a `calls_name` edge for ~all calls the compiler saw |
-| Confirmed | 26,146 | heuristic target matched the compiler's |
-| Contradicted | 7,198 | heuristic bound a different target than the compiler |
-| Upgraded | 58,994 | edges promoted to `Compiler`-tier confidence |
-| Resolved-external | 67,589 | calls the compiler bound to std / a dependency crate (the bulk of cargo's calls) |
+| Confirmed | 28,216 | heuristic target matched the compiler's |
+| Contradicted | 6,437 | heuristic bound a different target than the compiler |
+| Upgraded | 56,916 | edges promoted to `Compiler`-tier confidence |
+| Resolved-external | 68,358 | calls/refs the compiler bound to std / a dependency crate (the bulk of cargo's) |
 
-Read the two side by side: **call resolution `calls_name` — C 91.8% vs Rust 87.5%**; blended C 91.5%
-vs Rust 79.8%. Rust's lower blend is its `references_type` at 72.5% — a softer version of the same
-type-resolution challenge. Two things keep it there: (1) **cross-crate workspace references** — a
-type defined in the `cargo` crate but referenced from a sibling member (`benchsuite`, tests) is
-emitted by rust-analyzer as an external moniker with no local definition, so the oracle can't credit
-rag-rat's (often correct) in-corpus binding — a measurement floor, not a real error; (2) **external-
-dependency name collisions** — a bare `Url`/`Write` bound to a local same-named type when the real
-target is the `url` crate or `std::io::Write`, which needs `use`-aware resolution to fix. The
-type-only resolution fix (a `references_type` reference no longer binds to a non-type symbol — an
-`impl` block, module, etc. — in Rust/C/C++) removed 621 such mis-binds and lifted `references_type`
-70.2% → 72.5%. Recall: C 44.3% (oracle sees only the compiled `defconfig` subset) vs Rust 95.4%
-(rust-analyzer sees the whole workspace). The low 14.6% in-corpus call rate is not a weakness: cargo
-calls overwhelmingly into `std`/dependency crates, and the oracle correctly bins **67.6k** of those
-as `resolved-external` rather than forcing a wrong in-corpus target.
+Read the two side by side: **call resolution `calls_name` — C 91.8% vs Rust 88.6%**; blended C 91.5%
+vs Rust 81.4%. Rust's lower blend is its `references_type` at 73.4%. Three resolution fixes lifted the
+Rust numbers from a 78.4% blend:
+- **type-only resolution** (a `references_type` reference no longer binds to a non-type symbol — an
+  `impl` block, module, etc. — in Rust/C/C++): removed 621 mis-binds, `references_type` 70.2% → 72.5%.
+- **semantic scope paths** (symbols carry a `scope_path` like `Workspace::new` that aligns with an
+  edge's source path, so the strong qualified match fires for methods instead of bare-name guessing):
+  `calls_name` 87.5% → 88.6%, blended → 80.9%.
+- **crate-aware import scope** (a name `use`d from an external dependency crate isn't bound to a local
+  same-named symbol — local workspace crates are told apart from deps by scanning the corpus's
+  Cargo.toml manifests): `references_type` 72.5% → 73.4%, blended → 81.4%.
+
+What keeps `references_type` at ~73% rather than higher is mostly **not a resolver bug**: a large
+share is **cross-crate workspace references** — a type defined in the `cargo` crate but referenced
+from a sibling member is emitted by rust-analyzer as an external moniker with no local definition, so
+the oracle can't credit rag-rat's *correct* in-corpus binding. That's a measurement floor; real
+`references_type` precision is meaningfully above the reported number. Recall: C 44.3% (oracle sees
+only the compiled `defconfig` subset) vs Rust 95.4% (rust-analyzer sees the whole workspace). The low
+14.6% in-corpus call rate is not a weakness: cargo calls overwhelmingly into `std`/dependency crates,
+and the oracle correctly bins **68k** of those as `resolved-external` rather than forcing a wrong
+in-corpus target.
 
 Run them yourself: `oracle-kernel.yml` / `tools/kernel-c-oracle.sh` (C) and `oracle-rust.yml` /
 `tools/rust-scip-oracle.sh` (Rust). Both pin the SCIP indexer via `tools/bench.Containerfile`, so the
