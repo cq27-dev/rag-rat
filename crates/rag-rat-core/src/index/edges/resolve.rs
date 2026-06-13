@@ -925,10 +925,16 @@ mod tests {
         let user = add_file(&conn, "a.rs", NEW);
         let defs = add_file(&conn, "b.rs", NEW);
         add_import_edge(&conn, user, "Url", "use url::Url;");
+        // A lowercase external import — a value-receiver method call must NOT be suppressed.
+        add_import_edge(&conn, user, "config", "use external_dep::config;");
         add_symbol_scope(&conn, defs, "parse", "b.rs::parse_url", "Url::parse");
         let widget = add_symbol_scope(&conn, defs, "parse", "b.rs::parse_widget", "Widget::parse");
+        // `config.build()` extracts as tqn `config::build` (helpers rewrites `.`→`::`); the head is
+        // a local value receiver, not an external type path.
+        let build = add_symbol_scope(&conn, defs, "build", "b.rs::cfg_build", "config::build");
         let external = add_edge(&conn, user, "parse", "Url::parse");
         let local = add_edge(&conn, user, "parse", "Widget::parse");
+        let value_recv = add_edge(&conn, user, "build", "config::build");
 
         crate::index::install_scope_view(&conn, NEW, "").unwrap();
         resolve_all_edges(&conn).unwrap();
@@ -939,5 +945,12 @@ mod tests {
 
         let (to, _, _) = edge_state(&conn, local);
         assert_eq!(to, Some(widget), "`Widget::parse` (local receiver) resolves normally");
+
+        let (to, _, _) = edge_state(&conn, value_recv);
+        assert_eq!(
+            to,
+            Some(build),
+            "`config.build()` (lowercase value receiver) must NOT be suppressed by the import"
+        );
     }
 }

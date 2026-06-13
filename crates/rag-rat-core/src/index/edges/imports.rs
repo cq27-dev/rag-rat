@@ -75,6 +75,8 @@ fn crate_root_name(manifest: &toml::Value) -> Option<String> {
 pub(crate) fn parse_use(use_text: &str) -> Option<(String, Vec<String>)> {
     let rest = strip_use_visibility(use_text.trim())?;
     let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
+    // Drop a leading path separator (`use ::external::X;`) so the root is `external`, not empty.
+    let tree = tree.strip_prefix("::").unwrap_or(tree);
     // First `::`-segment, then its first whitespace token — strips a brace-free root alias
     // (`use my_crate as alias;` → root `my_crate`, not `my_crate as alias`).
     let root = tree
@@ -224,16 +226,25 @@ impl ImportScope {
     /// (target_qualified_name `Url::parse`) where `Url` was `use`d from the external `url` crate.
     /// The leaf `parse` itself isn't imported, so [`is_external_import`] on the callee name misses
     /// it; the new scope-path lookup would otherwise bind `Url::parse` to an in-repo `Url::parse`.
-    /// Keyed on `target_qualified_name`'s `::`-head only (not the value-receiver hint), so a method
-    /// call on a local value (`url.parse()`, no `::` path) is never suppressed.
+    ///
+    /// Gated on a TYPE-LIKE (uppercase) head. `target_qualified_name` rewrites `.`→`::`
+    /// (helpers::target_qualified_name), so a value-receiver method call `config.build()` arrives
+    /// here as `config::build` and is INDISTINGUISHABLE from a path call by punctuation alone.
+    /// Suppressing it would drop a valid local method call whenever the receiver's name happens to
+    /// match an imported leaf. The realistic mis-bind this guards against is a PascalCase type
+    /// collision (`Url::parse` → a same-named local `impl Url`); module/value heads are snake_case,
+    /// so the uppercase gate keeps the type case and leaves lowercase heads to fall through
+    /// (fail open — a missed suppression, never a dropped local bind).
     pub(crate) fn is_external_qualified_root(
         &self,
         file_id: i64,
         target_qualified_name: Option<&str>,
     ) -> bool {
-        target_qualified_name
-            .and_then(|qualified| qualified.split_once("::"))
-            .is_some_and(|(root, _)| self.is_external_import(file_id, root))
+        target_qualified_name.and_then(|qualified| qualified.split_once("::")).is_some_and(
+            |(root, _)| {
+                root.starts_with(char::is_uppercase) && self.is_external_import(file_id, root)
+            },
+        )
     }
 }
 
@@ -280,6 +291,8 @@ mod tests {
         assert_eq!(parsed("use a::{b::{C, D}, E};"), Some(("a".into(), s(&["C", "D", "E"]))));
         // Glob binds no specific name (fail open).
         assert_eq!(parse_use("use foo::*;"), Some(("foo".to_string(), Vec::new())));
+        // Leading `::` (absolute path): root is the real crate, not empty.
+        assert_eq!(parsed("use ::external::X;"), Some(("external".into(), s(&["X"]))));
         // Not a `use` statement.
         assert_eq!(parse_use("mod foo;"), None);
     }
