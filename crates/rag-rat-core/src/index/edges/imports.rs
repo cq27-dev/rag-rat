@@ -51,10 +51,13 @@ pub(crate) fn local_crate_roots(root: &Path) -> HashSet<String> {
         // Renamed / path-dependency aliases: `local_alias = { path = "…", package = "real" }` lets
         // the import KEY (`use local_alias::…`) differ from the package's canonical crate name, so
         // the key must itself count as a local root or the bare reference OVER-suppresses (a
-        // dropped LOCAL bind — the harmful direction, #97 item 2). The key is the crate
-        // root written in source, so it needs no `-`→`_` normalization (a `use` path can't
-        // contain `-`).
-        collect_path_dependency_aliases(&manifest, &mut roots);
+        // dropped LOCAL bind — the harmful direction, #97 item 2). The key is `-`→`_` normalized
+        // before insertion because a dependency KEY may contain `-` (`foo-bar = { path = … }`) yet
+        // Rust imports it as `use foo_bar::…` (RFC 940 / Cargo's crate-name rule), the same
+        // normalization `lib_crate_root_name` applies to package names.
+        if let Some(manifest_dir) = manifest_dir {
+            collect_path_dependency_aliases(&manifest, manifest_dir, root, &mut roots);
+        }
     }
     roots
 }
@@ -65,14 +68,24 @@ pub(crate) fn local_crate_roots(root: &Path) -> HashSet<String> {
 /// and no autodiscovered `src/lib.rs`): such a package is not importable, so contributing its name
 /// as a root would wrongly mark a same-named EXTERNAL dependency as local and skip suppression
 /// (#97 item 3). The `src/lib.rs` probe mirrors Cargo's lib autodiscovery and is resolved relative
-/// to the manifest directory.
+/// to the manifest directory; `[package] autolib = false` disables that autodiscovery, so a stray
+/// `src/lib.rs` in a bin-only package does NOT count as a lib target (#97 item 4). An EXPLICIT
+/// `[lib]` table still contributes regardless of `autolib` — that flag only governs autodiscovery.
 fn lib_crate_root_name(manifest: &toml::Value, manifest_dir: Option<&Path>) -> Option<String> {
     let lib = manifest.get("lib");
     if let Some(lib_name) = lib.and_then(|lib| lib.get("name")).and_then(|name| name.as_str()) {
         return Some(lib_name.replace('-', "_"));
     }
-    let has_lib_target =
-        lib.is_some() || manifest_dir.is_some_and(|dir| dir.join("src").join("lib.rs").is_file());
+    // `[package] autolib = false` turns off `src/lib.rs` autodiscovery; an explicit `[lib]` table
+    // is still honored above and below.
+    let autolib_enabled = manifest
+        .get("package")
+        .and_then(|package| package.get("autolib"))
+        .and_then(toml::Value::as_bool)
+        != Some(false);
+    let has_lib_target = lib.is_some()
+        || (autolib_enabled
+            && manifest_dir.is_some_and(|dir| dir.join("src").join("lib.rs").is_file()));
     if !has_lib_target {
         return None;
     }
@@ -80,22 +93,79 @@ fn lib_crate_root_name(manifest: &toml::Value, manifest_dir: Option<&Path>) -> O
     Some(package.replace('-', "_"))
 }
 
-/// Add every `[dependencies]` / `[workspace.dependencies]` KEY whose value carries a `path` key to
-/// `roots` — these are local path dependencies whose import name is the KEY (possibly renamed via
-/// the `package` key), so the bare-reference scope must treat the key as a local crate root (#97
-/// item 2). A string dependency (`serde = "1"`) or a non-`path` table dependency is external and
-/// contributes nothing.
-fn collect_path_dependency_aliases(manifest: &toml::Value, roots: &mut HashSet<String>) {
-    let deps_tables = [
-        manifest.get("dependencies"),
-        manifest.get("workspace").and_then(|workspace| workspace.get("dependencies")),
-    ];
-    for table in deps_tables.into_iter().flatten().filter_map(toml::Value::as_table) {
+/// Add every path-dependency KEY whose target resolves INSIDE `root` to `roots` — these are local
+/// path dependencies whose import name is the KEY (possibly renamed via the `package` key), so the
+/// bare-reference scope must treat the key as a local crate root (#97 item 2). A string dependency
+/// (`serde = "1"`) or a non-`path` table dependency is external and contributes nothing.
+///
+/// Scans the normal, dev, and build dependency tables, plus every `[target.*.dependencies/.dev-
+/// dependencies/.build-dependencies]` table and `[workspace.dependencies]`: path aliases declared
+/// for tests/examples/build scripts/cfg-specific modules feed indexed Rust files too, so a
+/// `use local_alias::…` from any of them must resolve local (#97 item 4).
+///
+/// The key is `-`→`_` normalized before insertion (#97 item 1 / P1): a dependency KEY may contain
+/// `-` yet Rust imports it as `use foo_bar::…`, so the raw key would never match a `use` root.
+///
+/// A `path` pointing OUTSIDE the indexed `root` is NOT added (#97 item 5): that crate has no
+/// symbols in this index, so localizing its alias would let a same-named in-corpus symbol wrongly
+/// bind. The target is resolved relative to `manifest_dir`; an unresolvable path (canonicalize
+/// fails — the sibling isn't checked out) is treated as outside the corpus and skipped.
+fn collect_path_dependency_aliases(
+    manifest: &toml::Value,
+    manifest_dir: &Path,
+    root: &Path,
+    roots: &mut HashSet<String>,
+) {
+    for table in dependency_tables(manifest) {
         for (key, spec) in table {
-            if spec.get("path").is_some() {
-                roots.insert(key.clone());
+            let Some(path) = spec.get("path").and_then(toml::Value::as_str) else { continue };
+            if path_dependency_is_in_corpus(manifest_dir, path, root) {
+                roots.insert(key.replace('-', "_"));
             }
         }
+    }
+}
+
+/// Every dependency table in a manifest that can carry a path alias bound into indexed Rust: the
+/// top-level `[dependencies]` / `[dev-dependencies]` / `[build-dependencies]`, `[workspace.
+/// dependencies]`, and each per-platform `[target.<cfg>.{dependencies,dev-dependencies,build-
+/// dependencies}]` table.
+fn dependency_tables(manifest: &toml::Value) -> Vec<&toml::value::Table> {
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut tables = Vec::new();
+    for kind in KINDS {
+        tables.extend(manifest.get(kind).and_then(toml::Value::as_table));
+    }
+    tables.extend(
+        manifest
+            .get("workspace")
+            .and_then(|workspace| workspace.get("dependencies"))
+            .and_then(toml::Value::as_table),
+    );
+    // `[target.<cfg>.dependencies]` etc.: each `<cfg>` is its own sub-table holding the dependency
+    // kinds.
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for cfg in targets.values() {
+            for kind in KINDS {
+                tables.extend(cfg.get(kind).and_then(toml::Value::as_table));
+            }
+        }
+    }
+    tables
+}
+
+/// Whether a path dependency's target directory resolves to a location under the indexed `root`
+/// (#97 item 5). `manifest_dir` is the directory of the manifest declaring the dependency; `path`
+/// is the relative `path = "…"` value. Canonicalizes both so `../` traversal and symlinks compare
+/// honestly; if the target can't be canonicalized (it isn't present on disk), it can't hold indexed
+/// symbols, so it's treated as outside the corpus.
+fn path_dependency_is_in_corpus(manifest_dir: &Path, path: &str, root: &Path) -> bool {
+    let Ok(target) = manifest_dir.join(path).canonicalize() else { return false };
+    match root.canonicalize() {
+        Ok(canonical_root) => target.starts_with(&canonical_root),
+        // Root not canonicalizable (shouldn't happen — we just walked it) — fall back to the raw
+        // root so we don't drop every alias.
+        Err(_) => target.starts_with(root),
     }
 }
 
@@ -385,17 +455,26 @@ mod tests {
     /// imports under its KEY (`use local_alias::…`), which differs from the package's canonical
     /// crate name. The key must be a local root or a bare reference through it OVER-suppresses (a
     /// dropped LOCAL bind). String/non-path table deps are external and contribute nothing.
+    /// #97 item 1 (P1): a hyphenated alias KEY (`foo-bar = { path = … }`) imports as `use foo_bar`,
+    /// so the key is `-`→`_` normalized before insertion. All path targets here live INSIDE the
+    /// corpus, so #97 item 5 keeps them (the out-of-corpus exclusion has its own test).
     #[test]
     fn local_crate_roots_recognizes_path_dependency_aliases() {
         let dir = std::env::temp_dir().join(format!("rr-path-alias-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        // In-corpus path-dependency targets (must exist on disk so item-5 corpus containment keeps
+        // them). The alias is the KEY, independent of the target directory name.
+        for target in ["real-crate", "other", "hyph-target", "crates/ws"] {
+            std::fs::create_dir_all(dir.join(target)).unwrap();
+        }
         std::fs::write(
             dir.join("Cargo.toml"),
-            "[package]\nname=\"app\"\n[dependencies]\nlocal_alias = { path = \"../real-crate\", \
-             package = \"real-crate\" }\nplain_path = { path = \"../other\" }\nserde = \
-             \"1\"\n[workspace.dependencies]\nws_local = { path = \"crates/ws\" }\n",
+            "[package]\nname=\"app\"\n[dependencies]\nlocal_alias = { path = \"real-crate\", \
+             package = \"real-crate\" }\nplain_path = { path = \"other\" }\nhyphen-alias = { path \
+             = \"hyph-target\" }\nserde = \"1\"\n[workspace.dependencies]\nws_local = { path = \
+             \"crates/ws\" }\n",
         )
         .unwrap();
         let roots = local_crate_roots(&dir);
@@ -409,12 +488,89 @@ mod tests {
             "path dep without `package` still local; got {roots:?}"
         );
         assert!(
+            roots.contains("hyphen_alias"),
+            "hyphenated alias KEY is `-`→`_` normalized (item 1); got {roots:?}"
+        );
+        assert!(
+            !roots.contains("hyphen-alias"),
+            "the raw hyphenated key must NOT survive (it can never match a `use` root); got \
+             {roots:?}"
+        );
+        assert!(
             roots.contains("ws_local"),
             "[workspace.dependencies] path dep is local; got {roots:?}"
         );
         assert!(
             !roots.contains("serde"),
             "a string (external) dep is not a local root; got {roots:?}"
+        );
+    }
+
+    /// #97 item 4: path-dep aliases declared in `[dev-dependencies]`, `[build-dependencies]`, and
+    /// `[target.<cfg>.dependencies]` feed indexed Rust (tests/examples/build scripts/cfg modules),
+    /// so a `use alias::…` from any of those must resolve local too. All targets are in-corpus.
+    #[test]
+    fn local_crate_roots_scans_dev_build_target_dependency_tables() {
+        let dir = std::env::temp_dir().join(format!("rr-dep-tables-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        for target in ["dev-dep", "build-dep", "cfg-dep"] {
+            std::fs::create_dir_all(dir.join(target)).unwrap();
+        }
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname=\"app\"\n[dev-dependencies]\ndev_local = { path = \"dev-dep\" \
+             }\n[build-dependencies]\nbuild_local = { path = \"build-dep\" \
+             }\n[target.'cfg(unix)'.dependencies]\ncfg_local = { path = \"cfg-dep\" }\n",
+        )
+        .unwrap();
+        let roots = local_crate_roots(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(roots.contains("dev_local"), "[dev-dependencies] path dep is local; got {roots:?}");
+        assert!(
+            roots.contains("build_local"),
+            "[build-dependencies] path dep is local; got {roots:?}"
+        );
+        assert!(
+            roots.contains("cfg_local"),
+            "[target.*.dependencies] path dep is local; got {roots:?}"
+        );
+    }
+
+    /// #97 item 5: a `path = "…"` dependency pointing OUTSIDE the indexed root has no symbols in this
+    /// index, so localizing its alias would let a same-named in-corpus symbol wrongly bind. Only
+    /// in-corpus path deps become local roots.
+    #[test]
+    fn local_crate_roots_excludes_out_of_corpus_path_deps() {
+        let base = std::env::temp_dir().join(format!("rr-corpus-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("indexed");
+        // A SIBLING crate outside the indexed root — present on disk, but not in the corpus.
+        std::fs::create_dir_all(base.join("sibling/src")).unwrap();
+        std::fs::write(base.join("sibling/src/lib.rs"), "").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("inside")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"app\"\n[dependencies]\noutside_alias = { path = \"../sibling\" \
+             }\ninside_alias = { path = \"inside\" }\nmissing_alias = { path = \"nope\" }\n",
+        )
+        .unwrap();
+        let roots = local_crate_roots(&root);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !roots.contains("outside_alias"),
+            "a path dep outside the indexed root is NOT a local root; got {roots:?}"
+        );
+        assert!(
+            roots.contains("inside_alias"),
+            "a path dep inside the indexed root IS a local root; got {roots:?}"
+        );
+        assert!(
+            !roots.contains("missing_alias"),
+            "a path dep whose target doesn't exist can't hold indexed symbols; got {roots:?}"
         );
     }
 
@@ -455,6 +611,40 @@ mod tests {
         assert!(
             roots.contains("explicit"),
             "an explicit [lib] table contributes its root; got {roots:?}"
+        );
+    }
+
+    /// #97 item 4 (autolib): `[package] autolib = false` disables `src/lib.rs` autodiscovery, so a
+    /// bin-only package that keeps a stray `src/lib.rs` is NOT importable and must not contribute a
+    /// root (otherwise a same-named external dep gets misclassified local). An EXPLICIT `[lib]`
+    /// table still contributes — `autolib` only governs autodiscovery.
+    #[test]
+    fn local_crate_roots_respects_autolib_false() {
+        let dir = std::env::temp_dir().join(format!("rr-autolib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Stray src/lib.rs but autolib disabled → name colliding with external `clap` stays
+        // external.
+        std::fs::create_dir_all(dir.join("tool/src")).unwrap();
+        std::fs::write(dir.join("tool/Cargo.toml"), "[package]\nname=\"clap\"\nautolib=false\n")
+            .unwrap();
+        std::fs::write(dir.join("tool/src/lib.rs"), "").unwrap();
+        // autolib false but an EXPLICIT [lib] table still makes it importable.
+        std::fs::create_dir_all(dir.join("explicit/src")).unwrap();
+        std::fs::write(
+            dir.join("explicit/Cargo.toml"),
+            "[package]\nname=\"explicit\"\nautolib=false\n[lib]\npath=\"src/lib.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("explicit/src/lib.rs"), "").unwrap();
+        let roots = local_crate_roots(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !roots.contains("clap"),
+            "autolib=false disables src/lib.rs autodiscovery; got {roots:?}"
+        );
+        assert!(
+            roots.contains("explicit"),
+            "an explicit [lib] table contributes regardless of autolib; got {roots:?}"
         );
     }
 

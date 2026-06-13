@@ -145,16 +145,22 @@ pub(crate) fn rust_edges(
             // Imports edge's `evidence` with `imports::parse_use` (#61). The default
             // `edge_evidence` truncates to 240 chars, which drops the late leaves of a
             // long braced `use foo::{…, X}` — those names then go un-suppressed (#97
-            // item 1). Carry the FULL normalized use text on Imports edges so every
-            // leaf survives the round trip.
-            let use_evidence = use_declaration_evidence(node, text);
+            // item 1). One edge carrying the FULL normalized use text is enough:
+            // `parse_use` returns EVERY leaf from it, so a single `add_use`
+            // populates the whole {leaf → root} map for this `use`. So attach the full text to only
+            // the FIRST emitted Imports edge and let the rest carry the standard truncated evidence
+            // — cloning the untruncated text into every leaf's edge would expand a few-hundred-KB
+            // `use` into GBs of transient `String`s before the interner dedupes them (#97 item 3).
+            let mut full_use_evidence = Some(use_declaration_evidence(node, text));
             for name in names {
                 if !is_rust_path_keyword(&name) {
+                    let evidence =
+                        full_use_evidence.take().unwrap_or_else(|| edge_evidence(node, text));
                     out.push(file_edge_with_evidence(
                         path,
                         node,
                         name,
-                        Some(use_evidence.clone()),
+                        Some(evidence),
                         EdgeKind::Imports,
                         EdgeConfidence::NameOnly,
                     ));
