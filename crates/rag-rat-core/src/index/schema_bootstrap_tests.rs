@@ -158,7 +158,10 @@ fn file_progress_reports_first_final_and_decile_boundaries() {
 }
 
 #[test]
-fn compatible_open_requires_recorded_schema_version() {
+fn open_auto_migrates_a_legacy_schema_without_version_table() {
+    // A pre-schema_version index (real tables, no version ledger) reads as `Older`. Opening it must
+    // migrate it forward automatically — a developer never hand-runs `migrate` for our own derived
+    // data.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join(".rag-rat")).unwrap();
@@ -168,14 +171,48 @@ fn compatible_open_requires_recorded_schema_version() {
     conn.execute_batch("DROP TABLE schema_version;").unwrap();
     drop(conn);
 
-    let status = IndexDatabase::migration_check(&database).unwrap();
-    assert_eq!(status.state, schema::SchemaState::Older);
-    let err = IndexDatabase::open(&database).unwrap_err().to_string();
-    assert!(err.contains("run `rag-rat migrate`"), "{err}");
-
-    let migrated = IndexDatabase::migrate(&database).unwrap();
-    assert_eq!(migrated.state, schema::SchemaState::Compatible);
+    assert_eq!(
+        IndexDatabase::migration_check(&database).unwrap().state,
+        schema::SchemaState::Older
+    );
+    // Open succeeds (no manual migrate), and the schema is current afterward.
     IndexDatabase::open(&database).unwrap();
+    assert_eq!(
+        IndexDatabase::migration_check(&database).unwrap().state,
+        schema::SchemaState::Compatible
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn open_auto_migrates_a_forward_older_schema_to_latest() {
+    // The binary-upgrade case: a fully-migrated index missing only the newest migration row reads
+    // as `Older` (current_version < latest). Opening it re-applies forward to latest in place.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join(".rag-rat")).unwrap();
+    let database = root.join(".rag-rat/index.sqlite");
+    IndexDatabase::migrate(&database).unwrap();
+    // Drop the newest applied migration so the stored version lags this binary by one.
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute(
+        "DELETE FROM schema_version WHERE id = (SELECT id FROM schema_version ORDER BY id DESC \
+         LIMIT 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let before = IndexDatabase::migration_check(&database).unwrap();
+    assert_eq!(before.state, schema::SchemaState::Older);
+    assert_eq!(before.current_version, before.latest_version - 1);
+
+    IndexDatabase::open(&database).unwrap();
+
+    let after = IndexDatabase::migration_check(&database).unwrap();
+    assert_eq!(after.state, schema::SchemaState::Compatible);
+    assert_eq!(after.current_version, after.latest_version);
 
     fs::remove_dir_all(root).unwrap();
 }

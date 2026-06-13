@@ -268,19 +268,40 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
     })
 }
 
-pub fn check_compatible(conn: &Connection) -> anyhow::Result<()> {
-    let status = status(conn)?;
-    match status.state {
+/// Make the open-able index schema current, migrating FORWARD automatically when it lags this
+/// binary. The index is rag-rat's own derived data, so upgrading the binary must never make a
+/// developer hand-run `migrate` (or play devops) to get queries/memory writes working again — an
+/// `Older` schema is applied in place here. Migrations are additive and idempotent (the same
+/// `apply` the `migrate` command runs on `Older`), so bringing a partly-migrated DB to latest is
+/// safe and a no-op for already-present tables/columns.
+///
+/// Only genuinely unrecoverable states still refuse:
+/// - `Newer`: created by a future rag-rat — this binary can't apply migrations it doesn't have, and
+///   downgrading derived data isn't safe.
+/// - `Dirty`: a partial/crashed migration or checksum mismatch — needs a clean `index --full`.
+/// - `Missing`: there is no index at this path yet — nothing to migrate; build one first.
+pub fn ensure_compatible_or_migrate(conn: &Connection) -> anyhow::Result<()> {
+    let current = status(conn)?;
+    match current.state {
         SchemaState::Compatible => Ok(()),
-        SchemaState::Missing => {
-            anyhow::bail!(
-                "{}",
-                "index schema is not initialized; run `rag-rat migrate`, `rag-rat index`, or \
-                 `rag-rat index --full`"
-            )
+        // Forward migration is automatic. Apply, then re-verify we actually reached Compatible so a
+        // silent half-migration can't slip through as "opened fine".
+        SchemaState::Older => {
+            apply(conn)?;
+            let after = status(conn)?;
+            if after.state == SchemaState::Compatible {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "auto-migration left the schema {:?}, not compatible; rebuild the derived \
+                     index with `rag-rat index --full`",
+                    after.state
+                )
+            }
         },
-        SchemaState::Older => anyhow::bail!("{}", status.message),
-        SchemaState::Newer => anyhow::bail!("{}", status.message),
-        SchemaState::Dirty => anyhow::bail!("{}", status.message),
+        SchemaState::Missing => anyhow::bail!(
+            "no index at this path yet; build one with `rag-rat index` or `rag-rat index --full`"
+        ),
+        SchemaState::Newer | SchemaState::Dirty => anyhow::bail!("{}", current.message),
     }
 }

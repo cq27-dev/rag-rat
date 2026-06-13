@@ -11,7 +11,9 @@ impl IndexDatabase {
 
     fn open_with_graph_check(path: &Path, check_graph: bool) -> anyhow::Result<Self> {
         let mut storage = IndexConnection::open(path)?;
-        schema::check_compatible(storage.connection())?;
+        // Forward schema migrations are automatic on open (the index is our own derived data — a
+        // binary upgrade must not require a manual `migrate`). Only Newer/Dirty/Missing refuse.
+        schema::ensure_compatible_or_migrate(storage.connection())?;
         ai::ensure_model_manifest(storage.connection())?;
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
             storage.set_source_root(PathBuf::from(root));
