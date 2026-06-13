@@ -198,8 +198,8 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
                 current_version: 0,
                 latest_version: LATEST_SCHEMA_VERSION,
                 migrations: Vec::new(),
-                message: "legacy index schema has no schema_version table; run `rag-rat migrate` \
-                          or rebuild the derived index with `rag-rat index --full`"
+                message: "legacy index schema has no schema_version table; it migrates forward \
+                          automatically on open (or rebuild with `rag-rat index --full`)"
                     .to_string(),
             }
         } else {
@@ -208,8 +208,8 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
                 current_version: 0,
                 latest_version: LATEST_SCHEMA_VERSION,
                 migrations: Vec::new(),
-                message: "index schema is not initialized; run `rag-rat migrate` or build the \
-                          derived index with `rag-rat index --full`"
+                message: "index schema is not initialized; build the derived index with `rag-rat \
+                          index` or `rag-rat index --full`"
                     .to_string(),
             }
         });
@@ -254,8 +254,8 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
             current_version,
             latest_version: LATEST_SCHEMA_VERSION,
             migrations,
-            message: "index schema is older than this rag-rat; run `rag-rat migrate` or rebuild \
-                      the derived index with `rag-rat index --full`"
+            message: "index schema is older than this rag-rat; it migrates forward automatically \
+                      on open (or rebuild with `rag-rat index --full`)"
                 .to_string(),
         });
     }

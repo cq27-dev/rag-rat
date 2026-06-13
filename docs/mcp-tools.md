@@ -12,7 +12,6 @@ Install the binary from a local checkout:
 
 ```bash
 cargo install --path tools/rag-rat --bin rag-rat --features fastembed
-rag-rat migrate --config /home/kk/src/held/rag-rat.toml
 rag-rat index --discover --config /home/kk/src/held/rag-rat.toml
 rag-rat models install fastembed-all-minilm-l6-v2 --config /home/kk/src/held/rag-rat.toml
 rag-rat reconcile --changed-first --limit 500 --batch-size 64 --config /home/kk/src/held/rag-rat.toml

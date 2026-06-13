@@ -38,9 +38,6 @@ pub(crate) enum Command {
     /// Report schema, storage, discovery, targets, and index health as JSON.
     Doctor,
 
-    /// Apply or check pending schema migrations.
-    Migrate(MigrateArgs),
-
     /// Search the index (lexical + semantic).
     Query(QueryArgs),
 
@@ -111,13 +108,6 @@ pub(crate) struct IndexArgs {
     /// Run the background file watcher in the foreground until interrupted.
     #[arg(long)]
     pub watch: bool,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct MigrateArgs {
-    /// Check migration state without applying (non-zero exit if incompatible).
-    #[arg(long)]
-    pub check: bool,
 }
 
 #[derive(Debug, Args)]

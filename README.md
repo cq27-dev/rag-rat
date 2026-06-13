@@ -115,7 +115,7 @@ rag-rat init
 ```
 
 `rag-rat init` scans the repository, prompts for languages and path bindings, writes
-`rag-rat.toml`, migrates the SQLite schema, indexes the repo, and offers to install/reconcile the
+`rag-rat.toml`, indexes the repo, and offers to install/reconcile the
 local embedding model. At the end it can also register the MCP server for Claude Code or Codex and
 install the optional git maintenance hooks.
 
@@ -195,7 +195,6 @@ exclude = [".git/**", ".rag-rat/**", "target/**", "node_modules/**"]
 Then run the pieces directly:
 
 ```bash
-rag-rat migrate
 rag-rat index --discover
 rag-rat doctor
 ```
@@ -447,7 +446,6 @@ Supported MCP tools:
 
 Supported operational commands:
 
-- `migrate` / `migrate --check`
 - `doctor`
 - `index_status`
 - `heal_index`
@@ -521,8 +519,6 @@ rag-rat index --discover
 rag-rat index --full
 rag-rat init
 rag-rat doctor
-rag-rat migrate --check
-rag-rat migrate
 rag-rat github sync --from-refs
 rag-rat github sync --issue cq27-dev/rag-rat#42
 rag-rat github sync --from-refs --offline

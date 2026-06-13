@@ -1,7 +1,7 @@
 use super::*;
 use crate::cli::{
     BriefArgs, ClustersArgs, EvalArgs, GithubArgs, GithubCommand, HookAction, HooksArgs, IndexArgs,
-    MaintenanceArgs, MemoryArgs, MemoryCommand, MigrateArgs, ModelsArgs, ModelsCommand, OracleArgs,
+    MaintenanceArgs, MemoryArgs, MemoryCommand, ModelsArgs, ModelsCommand, OracleArgs,
     OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs, ReconcileArgs,
 };
 
@@ -364,18 +364,6 @@ pub(crate) fn set_env_if_absent(key: &str, value: Option<u32>) {
     unsafe {
         env::set_var(key, value.to_string());
     }
-}
-pub(crate) fn migrate(config: &Config, args: &MigrateArgs) -> anyhow::Result<()> {
-    let status = if args.check {
-        IndexDatabase::migration_check(&config.database)?
-    } else {
-        IndexDatabase::migrate(&config.database)?
-    };
-    print_json(&status)?;
-    if args.check && status.state != rag_rat_core::index::schema::SchemaState::Compatible {
-        anyhow::bail!("{}", status.message);
-    }
-    Ok(())
 }
 pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
     let schema = IndexDatabase::migration_check(&config.database)?;

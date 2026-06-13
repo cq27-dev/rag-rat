@@ -43,7 +43,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Init(_) | Cmd::ClaudeHook => unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
         Cmd::Doctor => doctor(&config)?,
-        Cmd::Migrate(args) => migrate(&config, &args)?,
         Cmd::Query(args) => query(&config, &args)?,
         Cmd::Brief(args) => brief(&config, &args)?,
         Cmd::Clusters(args) => clusters(&config, &args)?,

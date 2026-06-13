@@ -15,6 +15,10 @@ impl IndexDatabase {
         // binary upgrade must not require a manual `migrate`). Only Newer/Dirty/Missing refuse.
         schema::ensure_compatible_or_migrate(storage.connection())?;
         ai::ensure_model_manifest(storage.connection())?;
+        // Recover a previously-downloaded fastembed model into the manifest automatically (used to
+        // be the `migrate` command's job, which is gone — the binary owns its derived state, no
+        // manual step). No-op when the `fastembed` feature is off or no cached model is present.
+        ai::recover_cached_fastembed_model(storage.connection())?;
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
