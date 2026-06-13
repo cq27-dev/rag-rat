@@ -53,6 +53,13 @@ impl IndexDatabase {
             mem_trace("after clear_full_rebuild_tables (purge)");
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
+            // Local crate roots (#61 Project B): the workspace's own crate names, for crate-aware
+            // import resolution. Written BEFORE index_targets so the resolve pass sees them.
+            let crate_roots = super::edges::local_crate_roots(&config.root);
+            db.set_meta(
+                "local_crate_roots",
+                &crate_roots.into_iter().collect::<Vec<_>>().join("\n"),
+            )?;
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
             mem_trace("after index_targets (edges resolved+inserted)");

@@ -1,12 +1,15 @@
 mod extract;
 mod helpers;
+mod imports;
 mod intern;
 mod resolve;
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 pub(crate) use extract::*;
 pub(crate) use helpers::*;
+pub(crate) use imports::local_crate_roots;
 use intern::{OptSym, StrArena, Sym};
 pub(crate) use resolve::*;
 use rusqlite::{Connection, params};
@@ -411,4 +414,8 @@ pub(crate) struct ResolveSymbolRequest<'a> {
     receiver_hint: Option<&'a str>,
     source_file_id: i64,
     source_language: Option<&'a str>,
+    /// `name` is brought into this file by a `use` from an EXTERNAL dependency crate (#61 Project
+    /// B). When set, the name denotes that dependency's item, so resolution must NOT bind it to a
+    /// local same-named symbol — it stays unresolved (the oracle bins it `resolved-external`).
+    imported_external: bool,
 }

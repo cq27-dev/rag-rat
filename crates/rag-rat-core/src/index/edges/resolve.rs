@@ -20,6 +20,28 @@ use super::*;
 pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let symbols = all_symbols(conn)?;
     let index = SymbolIndex::build(&symbols);
+    // Crate-aware import scope (#61 Project B): the active checkout's Imports edges → per-file
+    // {leaf name → crate root}, so resolution suppresses a local bind when the name is `use`d from
+    // an external dependency. Scoped via the `files` TEMP VIEW like the resolution query below.
+    let mut import_scope = imports::ImportScope::new(imports::load_local_roots(conn));
+    {
+        let mut stmt = conn.prepare(
+            "SELECT d.source_file_id, tn.value, d.evidence FROM edges_data d JOIN files ON \
+             files.id = d.source_file_id JOIN edge_strings ek ON ek.id = d.edge_kind_id LEFT JOIN \
+             edge_strings tn ON tn.id = d.to_name_id WHERE ek.value = 'imports'",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let file_id: i64 = row.get(0)?;
+            let to_name: Option<String> = row.get(1)?;
+            let evidence: Option<String> = row.get(2)?;
+            if let (Some(to_name), Some(evidence)) = (to_name, evidence)
+                && let Some(root) = imports::use_root(&evidence)
+            {
+                import_scope.add_import(file_id, short_name(to_name.trim()), root);
+            }
+        }
+    }
     // Read/write `edges_data` directly (#79): this loop is per-edge hot on every incremental
     // pass, so the strings it needs come from explicit dictionary joins and the verdict UPDATEs
     // write pre-interned ids instead of paying the view triggers' per-row probes. The `files`
@@ -66,6 +88,8 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
                 receiver_hint: receiver_hint.as_deref(),
                 source_file_id,
                 source_language: index.file_language.get(&source_file_id).copied(),
+                imported_external: import_scope
+                    .is_external_import(source_file_id, short_name(&to_name)),
             },
             &index,
         );
@@ -156,6 +180,23 @@ pub(crate) fn resolve_and_insert_edges(
     // dominant resolve-phase structure at kernel scale. Byte-identical: a `file_id` never recurs in
     // a later block, so per-file reset makes exactly the dedup decisions a global per-`file_id` set
     // would; `file_id` therefore drops out of the key (constant within each reset window).
+    // Crate-aware import scope (#61 Project B): map each file's `use`d leaf names to their crate
+    // root from the accumulated Imports edges, so resolution can suppress a bind to a local symbol
+    // when the name actually comes from an external dependency crate.
+    let mut import_scope = imports::ImportScope::new(imports::load_local_roots(conn));
+    for (file_id, candidate) in &edges {
+        if candidate.edge_kind == EdgeKind::Imports
+            && let Some(evidence) = arena.get_opt(candidate.evidence)
+            && let Some(root) = imports::use_root(evidence)
+        {
+            import_scope.add_import(
+                *file_id,
+                short_name(arena.get(candidate.to_name).trim()),
+                root,
+            );
+        }
+    }
+
     let mut seen = BTreeSet::new();
     let mut seen_file_id: Option<i64> = None;
     let mut interner = EdgeStringInterner::default();
@@ -196,6 +237,7 @@ pub(crate) fn resolve_and_insert_edges(
                 receiver_hint,
                 source_file_id: *file_id,
                 source_language: index.file_language.get(file_id).copied(),
+                imported_external: import_scope.is_external_import(*file_id, short_name(to_name)),
             },
             &index,
         );
@@ -282,6 +324,15 @@ pub(crate) fn resolve_symbol<'a>(
     let kind_matches = |symbol: &IndexedSymbol| {
         request.edge_kind != EdgeKind::UsesMacro.as_str() || symbol.kind == "macro"
     };
+    // Crate-aware import suppression (#61 Project B): the name is `use`d from an external
+    // dependency crate, so it denotes that dependency's item — never a local same-named symbol.
+    // Leave it unresolved (the SCIP oracle bins it `resolved-external`). This kills the
+    // external-dep collisions (`Url` → local instead of the `url` crate) WITHOUT touching
+    // correct cross-crate binds into local workspace crates (those roots are in the local-crate
+    // set, so not external).
+    if request.imported_external {
+        return None;
+    }
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
         // Semantic SCOPE-PATH match first (#61). An edge's `target_qualified_name` is a source-code
         // path (`Workspace::new`), which aligns with a symbol's `scope_path`
