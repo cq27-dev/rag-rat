@@ -20,8 +20,27 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             indexed_revision TEXT NOT NULL DEFAULT '',
             commit_sha TEXT NOT NULL DEFAULT '',
             worktree_id TEXT NOT NULL DEFAULT '',
+            -- Owning Cargo package (#61, V022): the per-package local-crate-root set lives in
+            -- `packages`; NULL → fall open to the global `index_meta.local_crate_roots`.
+            package_id INTEGER,
             UNIQUE(path, commit_sha, worktree_id)
         );
+
+        -- One row per Cargo manifest in the corpus, scoped by (commit_sha, worktree_id) like files
+        -- (#61, V022). `local_roots_json` holds this package's own importable crate roots — the
+        -- workspace crate names (global union) plus this manifest's in-corpus path-dependency \
+         alias
+        -- keys — so a `use alias::…` resolves local only for the package that declares the alias.
+        CREATE TABLE IF NOT EXISTS packages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            manifest_dir TEXT NOT NULL,
+            commit_sha TEXT NOT NULL DEFAULT '',
+            worktree_id TEXT NOT NULL DEFAULT '',
+            local_roots_json TEXT NOT NULL DEFAULT '[]',
+            UNIQUE(manifest_dir, commit_sha, worktree_id)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_packages_scope ON packages(commit_sha, worktree_id);
 
         CREATE TABLE IF NOT EXISTS chunks(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +148,14 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             resolution_id INTEGER NOT NULL,
             callee_start_byte INTEGER,
             callee_end_byte INTEGER,
+            -- Module-aware import scope (#61, V022): the enclosing module/block byte range a Rust
+            -- `use` (or inline `mod`) is scoped to, plus the enclosing module body's start byte as
+            -- `import_mod_id`. DEDICATED — not a callee_* overload — so the oracle's
+            -- `callee_start_byte IS NOT NULL` candidate filter is untouched. NULL on non-import \
+         edges.
+            import_scope_start_byte INTEGER,
+            import_scope_end_byte INTEGER,
+            import_mod_id INTEGER,
             edge_kind_id INTEGER NOT NULL,
             confidence_id INTEGER NOT NULL,
             FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE,

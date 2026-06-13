@@ -452,6 +452,46 @@ pub(crate) fn apply_symbol_scope_path(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 
+/// V022 (#61 per-package + module-aware import-scope rework). Additive + idempotent, so it is
+/// byte-identical under both a fresh full `apply()` and a forward-only migrate from an older index.
+///
+/// `packages`: one row per Cargo manifest in the corpus, scoped by `(commit_sha, worktree_id)` like
+/// `files`. `local_roots_json` is this package's own importable crate roots — the workspace crate
+/// names (global union) PLUS this manifest's in-corpus path-dependency alias keys — so a
+/// `use alias::…` resolves local for the package that declares the alias and external everywhere
+/// else (#1: per-package locality). `files.package_id` points each file at its owning package
+/// (NULL → fall open to the global `index_meta.local_crate_roots` set).
+///
+/// Edge columns are DEDICATED (`import_scope_*`, `import_mod_id`), NOT a callee_* overload: the
+/// oracle's candidate filter is `callee_start_byte IS NOT NULL`, and overloading that column with a
+/// non-identifier scope range would drag import rows into the SCIP occurrence join (the #100
+/// collision). With dedicated NULL-on-non-import columns the oracle filter stays correct untouched.
+/// They are added to `edges_data` (the real table); the `edges` compatibility view is recreated by
+/// `ensure_edges_view` below so readers/tests can write them through the view.
+pub(crate) fn apply_per_package_import_scope(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS packages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            manifest_dir TEXT NOT NULL,
+            commit_sha TEXT NOT NULL DEFAULT '',
+            worktree_id TEXT NOT NULL DEFAULT '',
+            local_roots_json TEXT NOT NULL DEFAULT '[]',
+            UNIQUE(manifest_dir, commit_sha, worktree_id)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_packages_scope ON packages(commit_sha, worktree_id);
+        ",
+    )?;
+    add_column_if_missing(conn, "files", "package_id", "INTEGER")?;
+    // The dedicated import-scope columns on the REAL edge table (the `edges` symbol is a view
+    // post-V020) are added + the compatibility view recreated by `ensure_edges_view`, which owns
+    // the view↔table column contract and is idempotent. (It already ran at V020; rerun so a
+    // forward-migrate from a pre-V022 index that somehow skipped the V020 rerun still converges.)
+    ensure_edges_view(conn)?;
+    Ok(())
+}
+
 pub(crate) fn apply_edge_callee_byte_range(conn: &Connection) -> rusqlite::Result<()> {
     // Byte range of the callee identifier token on symbol-referencing edges (the SCIP-oracle
     // prerequisite, #67). `source_start_byte`/`source_end_byte` cover the whole call_expression;
@@ -616,6 +656,14 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     if legacy_table.is_some() {
         return Ok(());
     }
+    // The view body below references the dedicated import-scope columns (V022). This function runs
+    // at V020 too — BEFORE V022 in the linear apply — and on a forward-migrate from an older
+    // view-shaped DB whose `edges_data` predates them, so guarantee they exist here (idempotent)
+    // before the view is (re)defined against them. Without this the V020 CREATE VIEW resolves
+    // `d.import_scope_start_byte` against a table that lacks it and fails (#61).
+    add_column_if_missing(conn, "edges_data", "import_scope_start_byte", "INTEGER")?;
+    add_column_if_missing(conn, "edges_data", "import_scope_end_byte", "INTEGER")?;
+    add_column_if_missing(conn, "edges_data", "import_mod_id", "INTEGER")?;
     conn.execute_batch(
         "
         -- Recreate unconditionally: the view's definition evolves (e.g. the appended *_id
@@ -644,6 +692,16 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                res.value AS resolution,
                d.callee_start_byte,
                d.callee_end_byte,
+               -- Import-scope columns (#61 per-package/per-module rework, V022): the enclosing
+               -- module/block byte range a Rust `use` is lexically scoped to, plus the enclosing
+               -- module body's id, so a bare reference is suppressed by this import only inside
+               -- that scope. DEDICATED columns (not the callee_* overload) so the oracle's
+               -- `callee_start_byte IS NOT NULL` candidate filter stays correct — import rows \
+         leave
+               -- callee_* NULL and never enter the SCIP occurrence join. NULL on non-import edges.
+               d.import_scope_start_byte,
+               d.import_scope_end_byte,
+               d.import_mod_id,
                ek.value AS edge_kind,
                conf.value AS confidence,
                -- The raw dictionary ids, appended after the legacy shape: hot predicates that the
@@ -683,6 +741,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 target_start_line, target_end_line, target_qualified_name_id, evidence,
                 receiver_hint_id, resolution_id, callee_start_byte, callee_end_byte,
+                import_scope_start_byte, import_scope_end_byte, import_mod_id,
                 edge_kind_id, confidence_id
             )
             VALUES (
@@ -698,6 +757,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 (SELECT id FROM edge_strings
                  WHERE value = COALESCE(NEW.resolution, 'unresolved')),
                 NEW.callee_start_byte, NEW.callee_end_byte,
+                NEW.import_scope_start_byte, NEW.import_scope_end_byte, NEW.import_mod_id,
                 (SELECT id FROM edge_strings WHERE value = NEW.edge_kind),
                 (SELECT id FROM edge_strings WHERE value = NEW.confidence)
             );
@@ -730,6 +790,9 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 resolution_id = (SELECT id FROM edge_strings WHERE value = NEW.resolution),
                 callee_start_byte = NEW.callee_start_byte,
                 callee_end_byte = NEW.callee_end_byte,
+                import_scope_start_byte = NEW.import_scope_start_byte,
+                import_scope_end_byte = NEW.import_scope_end_byte,
+                import_mod_id = NEW.import_mod_id,
                 edge_kind_id = (SELECT id FROM edge_strings WHERE value = NEW.edge_kind),
                 confidence_id = (SELECT id FROM edge_strings WHERE value = NEW.confidence)
             WHERE id = OLD.id;
@@ -892,6 +955,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_019_ID => Some(19),
             MIGRATION_020_ID => Some(20),
             MIGRATION_021_ID => Some(21),
+            MIGRATION_022_ID => Some(22),
             _ => None,
         })
         .max()
@@ -922,6 +986,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_019_ID
             | MIGRATION_020_ID
             | MIGRATION_021_ID
+            | MIGRATION_022_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -949,6 +1014,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_019_ID => migration.checksum != MIGRATION_019_CHECKSUM,
         MIGRATION_020_ID => migration.checksum != MIGRATION_020_CHECKSUM,
         MIGRATION_021_ID => migration.checksum != MIGRATION_021_CHECKSUM,
+        MIGRATION_022_ID => migration.checksum != MIGRATION_022_CHECKSUM,
         _ => false,
     }
 }
