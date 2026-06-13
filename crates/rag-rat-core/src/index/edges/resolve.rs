@@ -86,7 +86,11 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
                 source_file_id,
                 source_language: index.file_language.get(&source_file_id).copied(),
                 imported_external: import_scope
-                    .is_external_import(source_file_id, short_name(&to_name)),
+                    .is_external_import(source_file_id, short_name(&to_name))
+                    || import_scope.is_external_qualified_root(
+                        source_file_id,
+                        target_qualified_name.as_deref(),
+                    ),
             },
             &index,
         );
@@ -229,7 +233,8 @@ pub(crate) fn resolve_and_insert_edges(
                 receiver_hint,
                 source_file_id: *file_id,
                 source_language: index.file_language.get(file_id).copied(),
-                imported_external: import_scope.is_external_import(*file_id, short_name(to_name)),
+                imported_external: import_scope.is_external_import(*file_id, short_name(to_name))
+                    || import_scope.is_external_qualified_root(*file_id, target_qualified_name),
             },
             &index,
         );
@@ -907,5 +912,32 @@ mod tests {
             Some(local),
             "`path` is the use PREFIX, not a binding — local `path` resolves"
         );
+    }
+
+    /// #61 Project B (Codex review resolve.rs:89): a path-qualified call whose RECEIVER is an
+    /// external import (`Url::parse`, with `use url::Url`) must not bind to an in-repo `Url::parse`
+    /// via the scope-path lookup — the leaf `parse` isn't itself imported, so the receiver root has
+    /// to be checked. A call through a LOCAL receiver (`Widget::parse`) still resolves.
+    #[test]
+    fn qualified_call_through_an_external_receiver_is_suppressed() {
+        let conn = seeded_conn();
+        set_local_crate_roots(&conn, "mycrate");
+        let user = add_file(&conn, "a.rs", NEW);
+        let defs = add_file(&conn, "b.rs", NEW);
+        add_import_edge(&conn, user, "Url", "use url::Url;");
+        add_symbol_scope(&conn, defs, "parse", "b.rs::parse_url", "Url::parse");
+        let widget = add_symbol_scope(&conn, defs, "parse", "b.rs::parse_widget", "Widget::parse");
+        let external = add_edge(&conn, user, "parse", "Url::parse");
+        let local = add_edge(&conn, user, "parse", "Widget::parse");
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, resolution) = edge_state(&conn, external);
+        assert_eq!(to, None, "`Url::parse` (external receiver) must not bind a local `Url::parse`");
+        assert_eq!(resolution, "unresolved");
+
+        let (to, _, _) = edge_state(&conn, local);
+        assert_eq!(to, Some(widget), "`Widget::parse` (local receiver) resolves normally");
     }
 }

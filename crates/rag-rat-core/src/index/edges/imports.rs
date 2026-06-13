@@ -75,7 +75,13 @@ fn crate_root_name(manifest: &toml::Value) -> Option<String> {
 pub(crate) fn parse_use(use_text: &str) -> Option<(String, Vec<String>)> {
     let rest = strip_use_visibility(use_text.trim())?;
     let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
-    let root = tree.split("::").next().map(str::trim).filter(|seg| !seg.is_empty())?;
+    // First `::`-segment, then its first whitespace token — strips a brace-free root alias
+    // (`use my_crate as alias;` → root `my_crate`, not `my_crate as alias`).
+    let root = tree
+        .split("::")
+        .next()
+        .and_then(|seg| seg.split_whitespace().next())
+        .filter(|seg| !seg.is_empty())?;
     let mut leaves = Vec::new();
     collect_use_leaves(tree, &mut leaves);
     Some((root.to_string(), leaves))
@@ -213,6 +219,22 @@ impl ImportScope {
         };
         !self.local_roots.contains(root) && !matches!(root.as_str(), "crate" | "self" | "super")
     }
+
+    /// Whether a path-qualified reference's RECEIVER/root names an external import — `Url::parse`
+    /// (target_qualified_name `Url::parse`) where `Url` was `use`d from the external `url` crate.
+    /// The leaf `parse` itself isn't imported, so [`is_external_import`] on the callee name misses
+    /// it; the new scope-path lookup would otherwise bind `Url::parse` to an in-repo `Url::parse`.
+    /// Keyed on `target_qualified_name`'s `::`-head only (not the value-receiver hint), so a method
+    /// call on a local value (`url.parse()`, no `::` path) is never suppressed.
+    pub(crate) fn is_external_qualified_root(
+        &self,
+        file_id: i64,
+        target_qualified_name: Option<&str>,
+    ) -> bool {
+        target_qualified_name
+            .and_then(|qualified| qualified.split_once("::"))
+            .is_some_and(|(root, _)| self.is_external_import(file_id, root))
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +271,8 @@ mod tests {
         assert_eq!(parsed("pub use crate::a::B;"), Some(("crate".into(), s(&["B"]))));
         // `as` alias: the alias is the bound name.
         assert_eq!(parsed("use foo::Bar as Baz;"), Some(("foo".into(), s(&["Baz"]))));
+        // Brace-free ROOT alias: the root is the pre-`as` crate, the leaf is the alias.
+        assert_eq!(parsed("use my_crate as local;"), Some(("my_crate".into(), s(&["local"]))));
         assert_eq!(parsed("use foo::{Bar as Baz, Qux};"), Some(("foo".into(), s(&["Baz", "Qux"]))));
         // `self` in a group binds the parent segment.
         assert_eq!(parsed("use a::b::{self, C};"), Some(("a".into(), s(&["C", "b"]))));
