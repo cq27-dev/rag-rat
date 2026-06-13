@@ -184,12 +184,35 @@ fn split_top_level(inner: &str) -> Vec<&str> {
     parts
 }
 
-/// Per-file map of imported leaf name → the crate root it was imported from, plus the local-crate
-/// set, so resolution can tell an external-dependency import from a local one.
+/// One `use`-introduced binding of a leaf name: the crate root it came from and the BYTE RANGE of
+/// the enclosing module/block the `use` is scoped to (#96). A reference is suppressed by this
+/// binding only when its source byte falls inside `[scope_start, scope_end)` — so
+/// `mod a { use url::Url }` does not suppress a local `Url` in `mod b`. A top-level `use` records
+/// the whole-file range, reproducing the previous per-file behavior for the common case.
+#[derive(Clone)]
+struct ImportBinding {
+    root: String,
+    scope_start: usize,
+    scope_end: usize,
+}
+
+impl ImportBinding {
+    /// Whether a reference at `ref_byte` is lexically inside this `use`'s scope. Half-open range:
+    /// the enclosing body's `start_byte..end_byte` (Rust `use` items are order-independent within
+    /// their module, so the whole body, not "from the `use` onward", is the scope).
+    fn covers(&self, ref_byte: usize) -> bool {
+        ref_byte >= self.scope_start && ref_byte < self.scope_end
+    }
+}
+
+/// Per-file map of imported leaf name → the scoped bindings of that name, plus the local-crate set,
+/// so resolution can tell an external-dependency import from a local one AND confine the
+/// suppression to the lexical scope each `use` actually governs (#96). A name can be `use`d more
+/// than once in one file (different modules/blocks), so each name carries a LIST of bindings.
 #[derive(Default)]
 pub(crate) struct ImportScope {
     local_roots: HashSet<String>,
-    by_file: HashMap<i64, HashMap<String, String>>,
+    by_file: HashMap<i64, HashMap<String, Vec<ImportBinding>>>,
 }
 
 impl ImportScope {
@@ -197,35 +220,55 @@ impl ImportScope {
         Self { local_roots, by_file: HashMap::new() }
     }
 
-    /// Record a `use` statement's bindings for `file_id`: every leaf name it brings into scope →
-    /// the crate root it came from. Idempotent — the same evidence text arrives once per identifier
-    /// in the imports edge stream, and re-recording the same (leaf → root) is a no-op.
-    pub(crate) fn add_use(&mut self, file_id: i64, use_text: &str) {
+    /// Record a `use` statement's bindings for `file_id`, scoped to `[scope_start, scope_end)` (the
+    /// enclosing module/block byte range carried on the Imports edge, see `enclosing_use_scope`):
+    /// every leaf name it brings into scope → a binding to the crate root it came from. Idempotent
+    /// in effect — the same (leaf, root, scope) arrives once per identifier in the imports edge
+    /// stream, and a duplicate binding is dropped so a name's binding list stays the distinct set.
+    pub(crate) fn add_use(&mut self, file_id: i64, use_text: &str, scope: (usize, usize)) {
         let Some((root, leaves)) = parse_use(use_text) else { return };
+        let (scope_start, scope_end) = scope;
         let file = self.by_file.entry(file_id).or_default();
         for leaf in leaves {
-            file.insert(leaf, root.clone());
+            let bindings = file.entry(leaf).or_default();
+            let binding = ImportBinding { root: root.clone(), scope_start, scope_end };
+            if !bindings.iter().any(|existing| {
+                existing.root == binding.root
+                    && existing.scope_start == binding.scope_start
+                    && existing.scope_end == binding.scope_end
+            }) {
+                bindings.push(binding);
+            }
         }
     }
 
-    /// Whether `name` in `file_id` was imported from an EXTERNAL dependency crate — not a local
-    /// workspace crate, not `crate`/`self`/`super`. When true, the name denotes that dependency's
-    /// item and must NOT bind to a local same-named symbol. Fails OPEN: with no local-crate set
-    /// (non-Cargo corpus / manifest scan found nothing), nothing is ever suppressed.
-    pub(crate) fn is_external_import(&self, file_id: i64, name: &str) -> bool {
+    /// Whether `name`, referenced at `ref_byte` in `file_id`, was imported from an EXTERNAL
+    /// dependency crate by a `use` whose scope COVERS that reference — not a local workspace crate,
+    /// not `crate`/`self`/`super`. When true, the name denotes that dependency's item and must NOT
+    /// bind to a local same-named symbol. Fails OPEN: with no local-crate set (non-Cargo corpus /
+    /// manifest scan found nothing), nothing is ever suppressed. Per-module scoping (#96): a `use`
+    /// only suppresses references inside its enclosing module/block, so a same-named local item in
+    /// a sibling module stays resolvable.
+    pub(crate) fn is_external_import(&self, file_id: i64, name: &str, ref_byte: usize) -> bool {
         if self.local_roots.is_empty() {
             return false;
         }
-        let Some(root) = self.by_file.get(&file_id).and_then(|names| names.get(name)) else {
+        let Some(bindings) = self.by_file.get(&file_id).and_then(|names| names.get(name)) else {
             return false;
         };
-        !self.local_roots.contains(root) && !matches!(root.as_str(), "crate" | "self" | "super")
+        bindings.iter().any(|binding| {
+            binding.covers(ref_byte)
+                && !self.local_roots.contains(&binding.root)
+                && !matches!(binding.root.as_str(), "crate" | "self" | "super")
+        })
     }
 
     /// Whether a path-qualified reference's RECEIVER/root names an external import — `Url::parse`
     /// (target_qualified_name `Url::parse`) where `Url` was `use`d from the external `url` crate.
     /// The leaf `parse` itself isn't imported, so [`is_external_import`] on the callee name misses
     /// it; the new scope-path lookup would otherwise bind `Url::parse` to an in-repo `Url::parse`.
+    /// `ref_byte` confines the check to the receiver `use`'s lexical scope, like
+    /// [`is_external_import`].
     ///
     /// Gated on a TYPE-LIKE (uppercase) head. `target_qualified_name` rewrites `.`→`::`
     /// (helpers::target_qualified_name), so a value-receiver method call `config.build()` arrives
@@ -239,10 +282,12 @@ impl ImportScope {
         &self,
         file_id: i64,
         target_qualified_name: Option<&str>,
+        ref_byte: usize,
     ) -> bool {
         target_qualified_name.and_then(|qualified| qualified.split_once("::")).is_some_and(
             |(root, _)| {
-                root.starts_with(char::is_uppercase) && self.is_external_import(file_id, root)
+                root.starts_with(char::is_uppercase)
+                    && self.is_external_import(file_id, root, ref_byte)
             },
         )
     }
@@ -297,26 +342,56 @@ mod tests {
         assert_eq!(parse_use("mod foo;"), None);
     }
 
+    /// A whole-file scope, as a top-level `use` records (`enclosing_use_scope` → `0..text.len()`).
+    /// Lets the non-scoping assertions read `is_external_import` with a reference byte that always
+    /// falls inside scope.
+    const WHOLE_FILE: (usize, usize) = (0, usize::MAX);
+
     #[test]
     fn external_import_distinguishes_local_from_dependency() {
         let mut scope = ImportScope::new(HashSet::from(["cargo".to_string()]));
-        scope.add_use(1, "use url::Url;"); // external dep
-        scope.add_use(1, "use cargo::core::Workspace;"); // local workspace crate
-        scope.add_use(1, "use std::path::{Path, PathBuf};"); // std = external
-        scope.add_use(1, "use crate::a::Helper;"); // local (crate-relative)
-        assert!(scope.is_external_import(1, "Url"), "url is an external dep");
-        assert!(scope.is_external_import(1, "Path"), "std is external");
-        assert!(!scope.is_external_import(1, "Workspace"), "cargo is a local workspace crate");
-        assert!(!scope.is_external_import(1, "Helper"), "crate-rooted is local");
+        scope.add_use(1, "use url::Url;", WHOLE_FILE); // external dep
+        scope.add_use(1, "use cargo::core::Workspace;", WHOLE_FILE); // local workspace crate
+        scope.add_use(1, "use std::path::{Path, PathBuf};", WHOLE_FILE); // std = external
+        scope.add_use(1, "use crate::a::Helper;", WHOLE_FILE); // local (crate-relative)
+        assert!(scope.is_external_import(1, "Url", 0), "url is an external dep");
+        assert!(scope.is_external_import(1, "Path", 0), "std is external");
+        assert!(!scope.is_external_import(1, "Workspace", 0), "cargo is a local workspace crate");
+        assert!(!scope.is_external_import(1, "Helper", 0), "crate-rooted is local");
         assert!(
-            !scope.is_external_import(1, "path"),
+            !scope.is_external_import(1, "path", 0),
             "the `std::path` PREFIX is not a binding — a local `path` must stay resolvable"
         );
         assert!(
-            !scope.is_external_import(1, "Unimported"),
+            !scope.is_external_import(1, "Unimported", 0),
             "an unimported name is never suppressed"
         );
-        assert!(!scope.is_external_import(2, "Url"), "scoped per file");
+        assert!(!scope.is_external_import(2, "Url", 0), "scoped per file");
+    }
+
+    /// #96: two `use`s of the same leaf name in disjoint module scopes within one file. A reference
+    /// is suppressed only when its byte falls inside the `use`'s scope — so a bare `Url` in
+    /// `mod a` (where `use url::Url` lives) is external, while a `Url` in `mod b` (a local
+    /// definition, no external `use` in scope) is NOT suppressed.
+    #[test]
+    fn import_scope_is_confined_to_the_enclosing_module() {
+        let mut scope = ImportScope::new(HashSet::from(["mycrate".to_string()]));
+        // `mod a { use url::Url; }` spans bytes 10..40; `mod b { /* local Url */ }` spans 50..90.
+        scope.add_use(1, "use url::Url;", (10, 40));
+        // A reference inside `mod a`'s body is the external `url::Url`.
+        assert!(
+            scope.is_external_import(1, "Url", 25),
+            "a `Url` ref inside the importing module is the external dep"
+        );
+        // A reference inside `mod b` (outside the `use`'s scope) is the LOCAL `Url`, not
+        // suppressed.
+        assert!(
+            !scope.is_external_import(1, "Url", 60),
+            "a `Url` ref in a sibling module without the `use` in scope must stay resolvable (#96)"
+        );
+        // The boundary is half-open: a ref at the scope's end byte is outside it.
+        assert!(!scope.is_external_import(1, "Url", 40), "scope end is exclusive");
+        assert!(scope.is_external_import(1, "Url", 10), "scope start is inclusive");
     }
 
     #[test]
@@ -340,7 +415,7 @@ mod tests {
     #[test]
     fn empty_local_set_fails_open() {
         let mut scope = ImportScope::new(HashSet::new());
-        scope.add_use(1, "use url::Url;");
-        assert!(!scope.is_external_import(1, "Url"), "no manifests → suppress nothing");
+        scope.add_use(1, "use url::Url;", WHOLE_FILE);
+        assert!(!scope.is_external_import(1, "Url", 0), "no manifests → suppress nothing");
     }
 }

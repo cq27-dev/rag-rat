@@ -74,6 +74,11 @@ impl EdgeConfidence {
 /// join time from the checkout bytes, so only the byte range is stored. Set only for
 /// symbol-referencing edges (built via `symbol_edge`/`symbol_edge_with_context`); `None` for
 /// file-level / `contains` edges and for constructs where a clean identifier node isn't available.
+///
+/// OVERLOADED on Imports edges (#96): a Rust `use` has no callee identifier, so this slot instead
+/// carries the `use`'s enclosing-module/block byte range (see `enclosing_use_scope`), which
+/// per-module import suppression range-tests references against. The two uses never collide — an
+/// Imports edge is never SCIP-joined and a `calls_name` edge never carries a `use` scope.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CalleeRange {
     start_byte: usize,

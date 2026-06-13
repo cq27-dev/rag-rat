@@ -141,15 +141,21 @@ pub(crate) fn rust_edges(
         "use_declaration" => {
             let names = identifiers_under(node, text);
             let is_reexport = node_text(node, text).trim_start().starts_with("pub use ");
+            // Per-module import scope (#96): a Rust `use` is scoped to its enclosing module/block,
+            // not the whole file. Record that body's byte range on the Imports edge (carried in the
+            // otherwise-unused callee range for file-level edges) so resolution suppresses a bare
+            // reference only when it falls within the `use`'s scope. Top-level `use` → whole file.
+            let scope = enclosing_use_scope(node, text);
             for name in names {
                 if !is_rust_path_keyword(&name) {
-                    out.push(file_edge(
+                    out.push(file_edge_scoped(
                         path,
                         node,
                         text,
                         name,
                         EdgeKind::Imports,
                         EdgeConfidence::NameOnly,
+                        Some(scope),
                     ));
                 }
             }
@@ -575,6 +581,25 @@ pub(crate) fn c_like_edges(
         _ => {},
     }
 }
+/// The enclosing-scope byte range of a Rust `use_declaration`: the nearest ancestor body that
+/// introduces a lexical scope (`mod m { … }`'s `declaration_list`, or a `block` for a block-scoped
+/// `use`), so a bare reference is suppressed by this `use` only when it falls inside that body. A
+/// top-level `use` has no such ancestor and scopes the WHOLE file (`0..text.len()`) — matching the
+/// previous per-file behavior for the common case. Rust `use` items are order-independent within
+/// their module, so the full body range (not "from the `use` onward") is the correct scope (#96).
+pub(crate) fn enclosing_use_scope(node: Node<'_>, text: &str) -> CalleeRange {
+    let mut parent = node.parent();
+    while let Some(ancestor) = parent {
+        if matches!(ancestor.kind(), "declaration_list" | "block") {
+            return CalleeRange {
+                start_byte: ancestor.start_byte(),
+                end_byte: ancestor.end_byte(),
+            };
+        }
+        parent = ancestor.parent();
+    }
+    CalleeRange { start_byte: 0, end_byte: text.len() }
+}
 pub(crate) fn file_edge(
     path: &Path,
     node: Node<'_>,
@@ -582,6 +607,22 @@ pub(crate) fn file_edge(
     to_name: String,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
+) -> EdgeCandidate {
+    file_edge_scoped(path, node, text, to_name, edge_kind, confidence, None)
+}
+/// `file_edge` plus an optional scope range carried in the callee-range slot. File-level edges have
+/// no callee identifier (#67), so the otherwise-unused `callee_start_byte`/`callee_end_byte`
+/// columns carry a Rust `use`'s enclosing-module byte range for per-module import suppression
+/// (#96).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn file_edge_scoped(
+    path: &Path,
+    node: Node<'_>,
+    text: &str,
+    to_name: String,
+    edge_kind: EdgeKind,
+    confidence: EdgeConfidence,
+    scope: Option<CalleeRange>,
 ) -> EdgeCandidate {
     EdgeCandidate {
         from_symbol_id: None,
@@ -591,8 +632,9 @@ pub(crate) fn file_edge(
         evidence: Some(edge_evidence(node, text)),
         receiver_hint: None,
         source_span: span_for_node(node),
-        // File-level edges (imports / exports / mod) have no callee identifier to anchor (#67).
-        callee_span: None,
+        // File-level edges (imports / exports / mod) have no callee identifier to anchor (#67); for
+        // a Rust `use` this slot instead carries the enclosing-module scope range (#96).
+        callee_span: scope,
         edge_kind,
         confidence,
     }
@@ -644,5 +686,78 @@ pub(crate) fn symbol_edge_with_context(
         callee_span,
         edge_kind,
         confidence,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    /// The (to_name, callee scope range) of every Imports edge a Rust source string produces. The
+    /// scope range is the enclosing-module/block byte range #96 records on the `use`'s edge,
+    /// carried in the otherwise-unused callee-byte slot.
+    fn import_scopes(src: &str) -> Vec<(String, Option<(usize, usize)>)> {
+        let candidates =
+            syntactic_edges(Path::new("a.rs"), Language::Rust, src, &[]).expect("parses");
+        candidates
+            .into_iter()
+            .filter(|candidate| candidate.edge_kind == EdgeKind::Imports)
+            .map(|candidate| {
+                (candidate.to_name, candidate.callee_span.map(|r| (r.start_byte, r.end_byte)))
+            })
+            .collect()
+    }
+
+    /// #96: a top-level `use` scopes the WHOLE file; a `use` inside `mod a { … }` scopes that
+    /// module's body (`declaration_list`) byte range, so resolution range-tests references against
+    /// the exact lexical scope rather than the whole file.
+    #[test]
+    fn enclosing_use_scope_is_the_module_body_not_the_file() {
+        let src = "use top::A;\nmod a { use url::Url; }\n";
+        let scopes = import_scopes(src);
+        // Imports edges carry the FULL `use` path as `to_name` (`top::A`, `url::Url`).
+        let top =
+            scopes.iter().find(|(name, _)| name == "top::A").expect("top-level import recorded");
+        assert_eq!(top.1, Some((0, src.len())), "a top-level `use` scopes the whole file");
+
+        // `mod a { use url::Url; }` — the body `declaration_list` is `{ use url::Url; }`.
+        let body_start = src.find("{ use").expect("mod body present");
+        let body_end = src.rfind('}').expect("mod body closes") + 1;
+        let url = scopes
+            .iter()
+            .find(|(name, _)| name == "url::Url")
+            .expect("module-scoped import recorded");
+        assert_eq!(
+            url.1,
+            Some((body_start, body_end)),
+            "a `use` inside `mod a` scopes only `mod a`'s body"
+        );
+    }
+
+    /// #96: a block-scoped `use` (inside a `fn` body) and a nested-module `use` both scope to their
+    /// nearest enclosing body, not the file.
+    #[test]
+    fn enclosing_use_scope_handles_block_and_nested_module() {
+        let block_src = "fn f() { use url::Url; let _x = Url; }\n";
+        let block_scopes = import_scopes(block_src);
+        let block_start = block_src.find("{ use").expect("fn body present");
+        let block_end = block_src.rfind('}').expect("fn body closes") + 1;
+        assert_eq!(
+            block_scopes.iter().find(|(name, _)| name == "url::Url").unwrap().1,
+            Some((block_start, block_end)),
+            "a block-scoped `use` scopes the enclosing block"
+        );
+
+        let nested_src = "mod a { mod inner { use url::Url; } }\n";
+        let nested_scopes = import_scopes(nested_src);
+        let inner_start = nested_src.find("{ use").expect("inner body present");
+        let inner_end = nested_src.find("; }").expect("inner body closes") + 3;
+        assert_eq!(
+            nested_scopes.iter().find(|(name, _)| name == "url::Url").unwrap().1,
+            Some((inner_start, inner_end)),
+            "a `use` in a nested module scopes the INNERMOST module body"
+        );
     }
 }

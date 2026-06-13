@@ -21,21 +21,27 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let symbols = all_symbols(conn)?;
     let index = SymbolIndex::build(&symbols);
     // Crate-aware import scope (#61 Project B): the active checkout's Imports edges → per-file
-    // {leaf name → crate root}, so resolution suppresses a local bind when the name is `use`d from
-    // an external dependency. Scoped via the `files` TEMP VIEW like the resolution query below.
+    // {leaf name → scoped crate-root bindings}, so resolution suppresses a local bind when the name
+    // is `use`d from an external dependency. Scoped via the `files` TEMP VIEW like the resolution
+    // query below. Per-module scope (#96): a Rust `use`'s enclosing-module/block byte range rides
+    // in the Imports edge's callee-byte columns (file-level edges have no callee identifier), so
+    // the suppression is confined to references inside that scope. Absent columns → whole-file
+    // scope.
     let mut import_scope = imports::ImportScope::new(imports::load_local_roots(conn));
     {
         let mut stmt = conn.prepare(
-            "SELECT d.source_file_id, d.evidence FROM edges_data d JOIN files ON files.id = \
-             d.source_file_id JOIN edge_strings ek ON ek.id = d.edge_kind_id WHERE ek.value = \
-             'imports'",
+            "SELECT d.source_file_id, d.evidence, d.callee_start_byte, d.callee_end_byte FROM \
+             edges_data d JOIN files ON files.id = d.source_file_id JOIN edge_strings ek ON ek.id \
+             = d.edge_kind_id WHERE ek.value = 'imports'",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let file_id: i64 = row.get(0)?;
             let evidence: Option<String> = row.get(1)?;
+            let scope_start: Option<i64> = row.get(2)?;
+            let scope_end: Option<i64> = row.get(3)?;
             if let Some(evidence) = evidence {
-                import_scope.add_use(file_id, &evidence);
+                import_scope.add_use(file_id, &evidence, use_scope(scope_start, scope_end));
             }
         }
     }
@@ -46,11 +52,11 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let mut interner = EdgeStringInterner::default();
     let mut stmt = conn.prepare(
         "SELECT d.id, d.source_file_id, tn.value, tqn.value, ek.value, conf.value, d.evidence, \
-         rh.value FROM edges_data d JOIN files ON files.id = d.source_file_id LEFT JOIN \
-         edge_strings tn ON tn.id = d.to_name_id LEFT JOIN edge_strings tqn ON tqn.id = \
-         d.target_qualified_name_id LEFT JOIN edge_strings ek ON ek.id = d.edge_kind_id LEFT JOIN \
-         edge_strings conf ON conf.id = d.confidence_id LEFT JOIN edge_strings rh ON rh.id = \
-         d.receiver_hint_id ORDER BY d.id",
+         rh.value, d.source_start_byte FROM edges_data d JOIN files ON files.id = \
+         d.source_file_id LEFT JOIN edge_strings tn ON tn.id = d.to_name_id LEFT JOIN \
+         edge_strings tqn ON tqn.id = d.target_qualified_name_id LEFT JOIN edge_strings ek ON \
+         ek.id = d.edge_kind_id LEFT JOIN edge_strings conf ON conf.id = d.confidence_id LEFT \
+         JOIN edge_strings rh ON rh.id = d.receiver_hint_id ORDER BY d.id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -62,6 +68,7 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
             row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, i64>(8)?,
         ))
     })?;
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
@@ -74,8 +81,11 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
         current_confidence,
         evidence,
         receiver_hint,
+        source_start_byte,
     ) in rows
     {
+        // The reference's source byte selects which in-scope `use` items can suppress it (#96).
+        let ref_byte = usize::try_from(source_start_byte).unwrap_or(0);
         let resolution = resolve_symbol(
             ResolveSymbolRequest {
                 name: &to_name,
@@ -85,12 +95,15 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
                 receiver_hint: receiver_hint.as_deref(),
                 source_file_id,
                 source_language: index.file_language.get(&source_file_id).copied(),
-                imported_external: import_scope
-                    .is_external_import(source_file_id, short_name(&to_name))
-                    || import_scope.is_external_qualified_root(
-                        source_file_id,
-                        target_qualified_name.as_deref(),
-                    ),
+                imported_external: import_scope.is_external_import(
+                    source_file_id,
+                    short_name(&to_name),
+                    ref_byte,
+                ) || import_scope.is_external_qualified_root(
+                    source_file_id,
+                    target_qualified_name.as_deref(),
+                    ref_byte,
+                ),
             },
             &index,
         );
@@ -183,13 +196,18 @@ pub(crate) fn resolve_and_insert_edges(
     // would; `file_id` therefore drops out of the key (constant within each reset window).
     // Crate-aware import scope (#61 Project B): map each file's `use`d leaf names to their crate
     // root from the accumulated Imports edges, so resolution can suppress a bind to a local symbol
-    // when the name actually comes from an external dependency crate.
+    // when the name actually comes from an external dependency crate. Per-module scope (#96): the
+    // `use`'s enclosing-module/block byte range rides in the candidate's callee-byte columns (a
+    // Rust `use` has no callee identifier), so suppression is confined to references inside it.
+    // This must stay in EXACT parity with the DB path in `resolve_all_edges` above — same scope
+    // source (callee bytes → `use_scope`), same `ref_byte` (the edge's source start byte).
     let mut import_scope = imports::ImportScope::new(imports::load_local_roots(conn));
     for (file_id, candidate) in &edges {
         if candidate.edge_kind == EdgeKind::Imports
             && let Some(evidence) = arena.get_opt(candidate.evidence)
         {
-            import_scope.add_use(*file_id, evidence);
+            let (scope_start, scope_end) = candidate.callee_byte_columns();
+            import_scope.add_use(*file_id, evidence, use_scope(scope_start, scope_end));
         }
     }
 
@@ -224,6 +242,9 @@ pub(crate) fn resolve_and_insert_edges(
         let target_qualified_name = arena.get_opt(candidate.target_qualified_name);
         let evidence = arena.get_opt(candidate.evidence);
         let receiver_hint = arena.get_opt(candidate.receiver_hint);
+        // The reference's source byte selects which in-scope `use` items suppress it (#96) — the DB
+        // path reads the same value from `d.source_start_byte`, keeping the two drivers in parity.
+        let ref_byte = usize::try_from(candidate.source_span.start_byte).unwrap_or(0);
         let resolution = resolve_symbol(
             ResolveSymbolRequest {
                 name: to_name,
@@ -233,8 +254,15 @@ pub(crate) fn resolve_and_insert_edges(
                 receiver_hint,
                 source_file_id: *file_id,
                 source_language: index.file_language.get(file_id).copied(),
-                imported_external: import_scope.is_external_import(*file_id, short_name(to_name))
-                    || import_scope.is_external_qualified_root(*file_id, target_qualified_name),
+                imported_external: import_scope.is_external_import(
+                    *file_id,
+                    short_name(to_name),
+                    ref_byte,
+                ) || import_scope.is_external_qualified_root(
+                    *file_id,
+                    target_qualified_name,
+                    ref_byte,
+                ),
             },
             &index,
         );
@@ -514,6 +542,19 @@ pub(crate) fn allow_unqualified_fallback(
         return false;
     }
     true
+}
+/// The byte range a Rust `use` is scoped to (#96), read from the Imports edge's callee-byte
+/// columns (which carry the enclosing-module/block range, not a callee identifier, for `use`s).
+/// NULL columns — a pre-#96 index, or a non-Rust import edge that never set them — fall back to the
+/// WHOLE-FILE range (`0..usize::MAX`), reproducing the previous per-file suppression so an older DB
+/// resolves exactly as before and only loses the per-module precision. Both resolve drivers call
+/// this with the same inputs so their suppression is identical.
+fn use_scope(scope_start: Option<i64>, scope_end: Option<i64>) -> (usize, usize) {
+    match (scope_start, scope_end) {
+        (Some(start), Some(end)) =>
+            (usize::try_from(start).unwrap_or(0), usize::try_from(end).unwrap_or(usize::MAX)),
+        _ => (0, usize::MAX),
+    }
 }
 /// Whether an edge's `target_qualified_name` is an explicitly LOCAL-rooted path (`crate::…`,
 /// `self::…`, `super::…`) — code disambiguating a local item with a qualifier. Such a reference is
@@ -858,6 +899,77 @@ mod tests {
             params![source_file_id, to_name, evidence],
         )
         .unwrap();
+    }
+
+    /// An Imports edge whose enclosing-`use`-scope byte range is recorded in the callee-byte
+    /// columns (#96), exactly as `enclosing_use_scope` does on a real `use_declaration`.
+    fn add_import_edge_scoped(
+        conn: &Connection,
+        source_file_id: i64,
+        to_name: &str,
+        evidence: &str,
+        scope: (i64, i64),
+    ) {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, \
+             confidence, resolution, evidence, callee_start_byte, callee_end_byte) VALUES (?1, \
+             ?2, '', 'imports', 'NameOnly', 'unresolved', ?3, ?4, ?5)",
+            params![source_file_id, to_name, evidence, scope.0, scope.1],
+        )
+        .unwrap();
+    }
+
+    /// A reference edge positioned at `source_start_byte`, so per-module suppression (#96) can
+    /// range-test it against the `use`'s scope.
+    fn add_edge_at(
+        conn: &Connection,
+        source_file_id: i64,
+        to_name: &str,
+        target_qualified_name: &str,
+        source_start_byte: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, \
+             confidence, resolution, source_start_byte) VALUES (?1, ?2, ?3, 'calls_name', \
+             'NameOnly', 'unresolved', ?4)",
+            params![source_file_id, to_name, target_qualified_name, source_start_byte],
+        )
+        .unwrap();
+        conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+    }
+
+    /// #96: a single file with `mod a { use url::Url; }` and `mod b { struct Url; }`. The `use` is
+    /// scoped to `mod a`'s body, so a bare `Url` reference inside `mod a` is suppressed (external
+    /// `url::Url`), while a bare `Url` reference inside `mod b` binds to the LOCAL `Url` — the
+    /// per-file scope of #61 wrongly suppressed both.
+    #[test]
+    fn import_scope_is_per_module_not_per_file() {
+        let conn = seeded_conn();
+        set_local_crate_roots(&conn, "mycrate");
+        let user = add_file(&conn, "a.rs", NEW);
+        // `mod a { use url::Url; }` body spans bytes 10..40; `mod b { struct Url; … }` spans
+        // 50..90.
+        let local = add_symbol(&conn, user, "Url", "crate::a::b::Url");
+        add_import_edge_scoped(&conn, user, "Url", "use url::Url;", (10, 40));
+        // A `Url` reference inside `mod a` (byte 25) is the external import — suppressed.
+        let in_mod_a = add_edge_at(&conn, user, "Url", "", 25);
+        // A `Url` reference inside `mod b` (byte 60) is outside the `use`'s scope — binds local.
+        let in_mod_b = add_edge_at(&conn, user, "Url", "", 60);
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, resolution) = edge_state(&conn, in_mod_a);
+        assert_eq!(to, None, "`Url` inside `mod a` is the external `url::Url` — suppressed");
+        assert_eq!(resolution, "unresolved");
+
+        let (to, _, _) = edge_state(&conn, in_mod_b);
+        assert_eq!(
+            to,
+            Some(local),
+            "`Url` inside `mod b` is outside the `use`'s scope — the local `Url` must resolve \
+             (#96)"
+        );
     }
 
     /// #61 Project B: a bare reference to a name `use`d from an EXTERNAL crate (`url::Url`) must not
