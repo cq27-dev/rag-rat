@@ -295,15 +295,16 @@ impl IndexDatabase {
         let mut symbol_ids = Vec::with_capacity(symbols.len());
         for symbol in symbols {
             conn.prepare_cached(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, \
-                 end_byte, start_line, end_line, signature, docs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO symbols(file_id, language, name, qualified_name, scope_path, kind, \
+                 start_byte, end_byte, start_line, end_line, signature, docs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?
             .execute(params![
                 file_id,
                 language.as_str(),
                 symbol.name,
                 symbol.qualified_name,
+                symbol.scope_path,
                 symbol.kind,
                 i64::try_from(symbol.start_byte)?,
                 i64::try_from(symbol.end_byte)?,

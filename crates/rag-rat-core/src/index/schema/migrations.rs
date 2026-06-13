@@ -441,6 +441,17 @@ pub(crate) fn apply_symbol_line_spans(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 
+pub(crate) fn apply_symbol_scope_path(conn: &Connection) -> rusqlite::Result<()> {
+    // The symbol's SEMANTIC scope path (enclosing type/module/namespace names + own name, e.g.
+    // `Workspace::new`) — the resolver's qualified-match key, aligned with edges' source-derived
+    // `target_qualified_name`. Distinct from `qualified_name` (file-path form, kept as the stable
+    // identity for logical-symbol grouping + memory anchoring, untouched here). NULLABLE: existing
+    // rows read as `COALESCE(scope_path,'')` until a full reindex repopulates real values; the
+    // resolver simply skips the scope path until then (#61).
+    add_column_if_missing(conn, "symbols", "scope_path", "TEXT")?;
+    Ok(())
+}
+
 pub(crate) fn apply_edge_callee_byte_range(conn: &Connection) -> rusqlite::Result<()> {
     // Byte range of the callee identifier token on symbol-referencing edges (the SCIP-oracle
     // prerequisite, #67). `source_start_byte`/`source_end_byte` cover the whole call_expression;
@@ -880,6 +891,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_018_ID => Some(18),
             MIGRATION_019_ID => Some(19),
             MIGRATION_020_ID => Some(20),
+            MIGRATION_021_ID => Some(21),
             _ => None,
         })
         .max()
@@ -909,6 +921,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_018_ID
             | MIGRATION_019_ID
             | MIGRATION_020_ID
+            | MIGRATION_021_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -935,6 +948,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_018_ID => migration.checksum != MIGRATION_018_CHECKSUM,
         MIGRATION_019_ID => migration.checksum != MIGRATION_019_CHECKSUM,
         MIGRATION_020_ID => migration.checksum != MIGRATION_020_CHECKSUM,
+        MIGRATION_021_ID => migration.checksum != MIGRATION_021_CHECKSUM,
         _ => false,
     }
 }

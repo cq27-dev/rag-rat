@@ -219,6 +219,37 @@ fn assert_symbol(symbols: &[parser::ParsedSymbol], kind: &str, name: &str) {
     );
 }
 
+/// #61: `scope_path` encodes the enclosing semantic scope (module + impl type), ending in the
+/// symbol's own name — the resolution key that aligns with an edge's source-derived
+/// `target_qualified_name`. A top-level item's scope_path is just its name.
+#[test]
+fn scope_path_encodes_enclosing_module_and_impl_type() {
+    let text = "\
+mod core {
+    pub struct Client;
+    impl Client {
+        pub fn new() -> Self { Self }
+    }
+}
+pub fn entry() {}
+";
+    let symbols = parser::parse_symbols(Path::new("src/lib.rs"), Language::Rust, text).unwrap();
+    let scope_of = |name: &str, kind: &str| {
+        symbols
+            .iter()
+            .find(|s| s.name == name && s.kind == kind)
+            .map(|s| s.scope_path.as_str())
+            .unwrap_or("<missing>")
+    };
+    assert_eq!(
+        scope_of("new", "function"),
+        "core::Client::new",
+        "method carries module + impl type"
+    );
+    assert_eq!(scope_of("Client", "struct"), "core::Client", "type carries its module");
+    assert_eq!(scope_of("entry", "function"), "entry", "a top-level item is just its name");
+}
+
 fn assert_no_symbol(symbols: &[parser::ParsedSymbol], kind: &str, name: &str) {
     assert!(
         !symbols.iter().any(|symbol| symbol.kind == kind && symbol.name == name),

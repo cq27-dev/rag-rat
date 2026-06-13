@@ -8,6 +8,14 @@ use crate::language::Language;
 pub struct ParsedSymbol {
     pub name: String,
     pub qualified_name: String,
+    /// The SEMANTIC scope path: the symbol's enclosing type/module/namespace names joined with
+    /// `::`, ending in its own name (a method `new` in `impl Workspace` in `mod core` →
+    /// `core::Workspace::new`; a free function → just its name). Distinct from
+    /// `qualified_name` (file-path form, the stable identity for logical-symbol grouping +
+    /// memory anchoring). `scope_path` ALIGNS with an edge's source-derived
+    /// `target_qualified_name` (`Workspace::new`), so the resolver's strong qualified-match
+    /// path fires instead of collapsing to collision-prone bare-name matching (#61).
+    pub scope_path: String,
     pub kind: String,
     pub start_byte: usize,
     pub end_byte: usize,
@@ -258,6 +266,44 @@ fn has_body(node: Node<'_>) -> bool {
     node.child_by_field_name("body").is_some()
 }
 
+/// The semantic scope path for a symbol node: enclosing type/module/namespace/trait names
+/// (outermost first) joined with `::`, ending in the symbol's own `name`. A top-level free function
+/// or type yields just its name. See [`ParsedSymbol::scope_path`].
+fn scope_path(language: Language, node: Node<'_>, text: &str, name: &str) -> String {
+    let mut segments = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if let Some(segment) = scope_segment(language, parent, text) {
+            segments.push(segment);
+        }
+        current = parent.parent();
+    }
+    segments.reverse();
+    segments.push(name.to_string());
+    segments.join("::")
+}
+
+/// The scope-name contributed by an ENCLOSING node, if it introduces a named scope (a module, the
+/// type an `impl` is for, a class/trait/namespace). Returns `None` for nodes that don't nest a
+/// scope, so the walk skips blocks/expressions and only collects real path segments.
+fn scope_segment(language: Language, node: Node<'_>, text: &str) -> Option<String> {
+    let name_node = match (language, node.kind()) {
+        (Language::Rust, "mod_item" | "trait_item") => child_name(node)?,
+        (Language::Rust, "impl_item") => impl_name(node)?,
+        (Language::TypeScript, "class_declaration" | "interface_declaration") => child_name(node)?,
+        (Language::TypeScript, "internal_module" | "module" | "namespace_declaration") =>
+            child_name(node)?,
+        (Language::Kotlin, "class_declaration" | "object_declaration") => child_name(node)?,
+        (Language::Cpp, "namespace_definition") => child_name(node)?,
+        (
+            Language::C | Language::Cpp,
+            "struct_specifier" | "union_specifier" | "class_specifier",
+        ) if has_body(node) => child_name(node)?,
+        _ => return None,
+    };
+    node_text(name_node, text)
+}
+
 fn companion_name(node: Node<'_>) -> Option<Node<'_>> {
     for index in 0..node.child_count() {
         let Some(index) = u32::try_from(index).ok() else {
@@ -335,8 +381,10 @@ fn make_symbol(
     // node (O(1) struct field) instead of rescanning the file text for newlines. `row` is 0-based.
     let start_line = node.start_position().row + 1;
     let end_line = node.end_position().row + 1;
+    let scope_path = scope_path(language, node, text, &name);
     ParsedSymbol {
         qualified_name: format!("{}::{name}", path.to_string_lossy().replace('\\', "/")),
+        scope_path,
         name,
         kind: kind.to_string(),
         start_byte,

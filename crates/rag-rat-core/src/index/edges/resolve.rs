@@ -283,6 +283,38 @@ pub(crate) fn resolve_symbol<'a>(
         request.edge_kind != EdgeKind::UsesMacro.as_str() || symbol.kind == "macro"
     };
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
+        // Semantic SCOPE-PATH match first (#61). An edge's `target_qualified_name` is a source-code
+        // path (`Workspace::new`), which aligns with a symbol's `scope_path`
+        // (`core::Workspace::new`) — NOT with the file-path `qualified_name` below, which a
+        // source path never equals. Exact hit → `Exact`; a unique enclosing-scope suffix
+        // match → `Syntactic`. This is what lets the strong qualified path fire for
+        // methods/nested items instead of collapsing to bare-name matching. On ambiguity,
+        // fall through rather than guess.
+        if let Some(symbol) = index
+            .by_scope_path
+            .get(qualified)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|symbol| kind_matches(symbol))
+        {
+            return Some((symbol, EdgeConfidence::Exact, "scope_exact"));
+        }
+        let scope_suffix = format!("::{qualified}");
+        let scope_matches = index
+            .by_name
+            .get(qn_tail(qualified))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|symbol| kind_matches(symbol) && symbol.scope_path.ends_with(&scope_suffix))
+            .collect::<Vec<_>>();
+        match scope_matches.as_slice() {
+            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "scope_suffix")),
+            [_, ..] if same_logical_symbol(&scope_matches) =>
+                return Some((scope_matches[0], EdgeConfidence::Syntactic, "logical_variant")),
+            _ => {},
+        }
         // Exact qualified-name match (bucket entries already share `qualified_name == qualified`).
         if let Some(symbol) = index
             .by_qualified

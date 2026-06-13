@@ -13,6 +13,9 @@ pub struct SymbolFact {
 pub struct Symbol {
     pub name: String,
     pub qualified_name: String,
+    /// Semantic scope path (see [`parser::ParsedSymbol::scope_path`]) — the resolution key that
+    /// aligns with edges' source-derived `target_qualified_name`.
+    pub scope_path: String,
     pub kind: String,
     pub start_byte: usize,
     pub end_byte: usize,
@@ -35,6 +38,7 @@ pub fn from_parsed(parsed: &[parser::ParsedSymbol]) -> Vec<Symbol> {
         .map(|symbol| Symbol {
             name: symbol.name.clone(),
             qualified_name: symbol.qualified_name.clone(),
+            scope_path: symbol.scope_path.clone(),
             kind: symbol.kind.clone(),
             start_byte: symbol.start_byte,
             end_byte: symbol.end_byte,

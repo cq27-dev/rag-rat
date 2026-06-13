@@ -194,7 +194,8 @@ pub(crate) fn symbols_for_file(
         "
         SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, \
          symbols.qualified_name, symbols.kind,
-               symbols.start_byte, symbols.end_byte, symbols.start_line, symbols.end_line
+               symbols.start_byte, symbols.end_byte, symbols.start_line, symbols.end_line, \
+         COALESCE(symbols.scope_path, '')
         FROM symbols
         WHERE file_id = ?1
         ORDER BY symbols.start_byte, symbols.end_byte
@@ -212,7 +213,8 @@ pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol
         "
         SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, \
          symbols.qualified_name, symbols.kind,
-               symbols.start_byte, symbols.end_byte, symbols.start_line, symbols.end_line
+               symbols.start_byte, symbols.end_byte, symbols.start_line, symbols.end_line, \
+         COALESCE(symbols.scope_path, '')
         FROM symbols
         JOIN files ON files.id = symbols.file_id
         ORDER BY symbols.qualified_name
@@ -235,6 +237,7 @@ pub(crate) fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSym
         end_byte,
         start_line: row.get(8)?,
         end_line: row.get(9)?,
+        scope_path: row.get(10)?,
     })
 }
 /// Intern one string into `edge_strings`, returning its id (#79). `INSERT OR IGNORE` + lookup —

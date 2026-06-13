@@ -2196,7 +2196,10 @@ fn indexes_real_world_rust_graph_patterns() {
 
     assert_edge(&db, "src/lib.rs", "worker", "imports", "Syntactic");
     assert_edge(&db, "src/lib.rs", "Worker", "exports", "Syntactic");
-    assert_edge(&db, "entry", "new", "calls_name", "NameOnly");
+    // `Worker::new()` / `Client::new()` now resolve via the semantic scope path (`Worker::new` /
+    // `Client::new`) → Exact, where bare-name matching previously left two same-named `new` methods
+    // ambiguous (NameOnly) (#61 scope-path resolution).
+    assert_edge(&db, "entry", "new", "calls_name", "Exact");
     assert_edge(&db, "entry", "Client", "references_type", "Syntactic");
     assert_edge(&db, "drive", "serve", "calls_name", "NameOnly");
     assert_edge(&db, "drive", "GenericRunner", "references_type", "Syntactic");
@@ -3329,9 +3332,12 @@ fn indexes_real_world_kotlin_graph_patterns() {
     assert_edge(&db, "src/Main.kt", "ExternalFactory", "imports", "NameOnly");
     assert_edge(&db, "Worker", "companion", "contains", "Exact");
     assert_edge(&db, "companion", "create", "contains", "Exact");
-    assert_edge(&db, "syncOnce", "create", "calls_name", "Syntactic");
+    // `Worker.create()` / `SingletonRunner.run()` now resolve via the semantic scope path
+    // (`Worker::create` / `SingletonRunner::run`) → Exact, where they were a weaker suffix match
+    // before (#61 scope-path resolution).
+    assert_edge(&db, "syncOnce", "create", "calls_name", "Exact");
     assert_edge(&db, "syncOnce", "Worker", "references_type", "Syntactic");
-    assert_edge(&db, "syncOnce", "run", "calls_name", "Syntactic");
+    assert_edge(&db, "syncOnce", "run", "calls_name", "Exact");
     assert_edge(&db, "syncOnce", "SingletonRunner", "references_type", "Syntactic");
     assert_edge(&db, "syncOnce", "ExternalFactory", "calls_name", "NameOnly");
     assert_edge(&db, "syncOnce", "ExternalFactory", "references_type", "NameOnly");
