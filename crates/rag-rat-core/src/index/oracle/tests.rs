@@ -802,6 +802,28 @@ fn edge_join_candidates_filters_null_range_and_scopes_by_worktree() {
     assert!(store::edge_join_candidates(&h.conn, "other-commit-sha", WORKTREE).unwrap().is_empty());
 }
 
+/// An `imports` edge whose callee byte columns carry a non-NULL range (since #96 a Rust `use`
+/// stores its enclosing-module SCOPE range there, not a callee identifier) must NOT become an
+/// oracle candidate — the NULL filter alone no longer scopes the population, so the edge-kind
+/// allowlist excludes it (#100). The judged sibling kinds on the same file still join.
+#[test]
+fn edge_join_candidates_excludes_imports_scope_range() {
+    let h = Harness::new();
+    let file = h.add_file("lib.rs", "use crate::foo;\nfn f() { bar(); }\n");
+    // The #96 import-scope edge: a non-NULL callee range that is a module SCOPE, not an identifier.
+    let import_edge = h.add_edge_with_kind(file, "crate::foo", 0, 34, "imports", "Exact", None);
+    // Judged kinds carrying a real callee identifier range stay candidates.
+    let call_edge = h.add_edge_with_kind(file, "bar", 25, 28, "calls_name", "NameOnly", None);
+    let type_edge = h.add_edge_with_kind(file, "Foo", 4, 14, "references_type", "Exact", None);
+
+    let candidates = store::edge_join_candidates(&h.conn, COMMIT, WORKTREE).unwrap();
+    let ids: Vec<i64> = candidates.iter().map(|c| c.edge_id).collect();
+    // The imports edge is filtered out despite its non-NULL callee range; the judged kinds remain
+    // (ordered by callee_start_byte: references_type at 4 before calls_name at 25).
+    assert!(!ids.contains(&import_edge), "imports edge must not be an oracle candidate");
+    assert_eq!(ids, vec![type_edge, call_edge]);
+}
+
 /// `symbol_spans_for_path` returns the file's symbols ordered by start byte, scoped to the path +
 /// commit/worktree, and empty for an unknown path.
 #[test]

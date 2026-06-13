@@ -57,6 +57,16 @@ pub(crate) struct EdgeJoinCandidate {
 /// *call* and must be excluded from the recall numerator (the population-mismatch finding, #81).
 pub(crate) const CALL_EDGE_KIND: &str = "calls_name";
 
+/// The edge kinds the oracle judges: symbol-referencing edges whose callee byte range is a callee
+/// *identifier token* SCIP occurrences key on. The NULL filter alone is NOT a sufficient candidate
+/// scope — since #96 a Rust `imports` edge overloads `callee_start_byte`/`callee_end_byte` with its
+/// enclosing-module *scope* range (a non-identifier span), so a NULL-only filter would feed import
+/// rows into occurrence classification and inflate `no_occurrence` (#100). File-level kinds
+/// (`imports` / `exports` / `contains`) are excluded here so only identifier-anchored edges reach
+/// the join. Keep this in step with the kinds `index::edges::extract` attaches a `CalleeRange` to.
+pub(crate) const ORACLE_JUDGED_EDGE_KINDS: &[&str] =
+    &["calls_name", "references_type", "uses_macro", "implements", "constructs"];
+
 /// One symbol's identity + byte span within a file, for mapping a SCIP definition range back to our
 /// symbol table by containment overlap.
 #[derive(Debug, Clone)]
@@ -67,14 +77,22 @@ pub(crate) struct SymbolSpan {
 }
 
 /// Load every edge candidate that carries a callee identifier byte range, joined to its source
-/// file's path + content sha. Only call-shaped edges set `callee_start_byte`, so the NULL filter
-/// scopes this to exactly the rows the SCIP occurrence join can act on. Scoped to the active
-/// commit/worktree via the `files` row the edge points at.
+/// file's path + content sha. Two filters jointly scope the candidate set to rows the SCIP
+/// occurrence join can act on: a non-NULL callee byte range AND an [`ORACLE_JUDGED_EDGE_KINDS`]
+/// membership check. The kind filter is load-bearing — since #96 a Rust `imports` edge stores its
+/// enclosing-module *scope* range (not a callee identifier) in the callee byte columns, so a
+/// NULL-only filter would drag import rows into occurrence classification and corrupt the metrics
+/// (#100). Scoped to the active commit/worktree via the `files` row the edge points at.
 pub(crate) fn edge_join_candidates(
     conn: &Connection,
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<Vec<EdgeJoinCandidate>> {
+    let judged_kinds = ORACLE_JUDGED_EDGE_KINDS
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut stmt = conn.prepare(&format!(
         "
         SELECT edges.id,
@@ -89,6 +107,7 @@ pub(crate) fn edge_join_candidates(
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.callee_start_byte IS NOT NULL
           AND edges.callee_end_byte IS NOT NULL
+          AND edges.edge_kind IN ({judged_kinds})
           AND {scope}
         ORDER BY files.path, edges.callee_start_byte
         ",
