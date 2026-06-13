@@ -1,5 +1,12 @@
 use super::*;
 
+/// Whether any path in an iterator has the filename `Cargo.toml` — the gate for the crate-roots
+/// refresh on an incremental pass (#95). Evaluated against both changed and deleted paths so that
+/// a crate removal is also captured.
+fn paths_include_cargo_toml<'a>(mut paths: impl Iterator<Item = &'a Path>) -> bool {
+    paths.any(|p| p.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml"))
+}
+
 impl IndexDatabase {
     pub fn index_changed(config: &Config) -> anyhow::Result<Self> {
         Self::index_changed_with_progress(config, |_| {})
@@ -79,7 +86,10 @@ impl IndexDatabase {
                 db.set_meta_if_changed("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             let git_meta_changed = db.write_git_meta(&config.root)?;
-            let indexed = match mode {
+            // Each indexing function returns (file_count, manifest_in_change_set): the manifest
+            // flag drives the crate-roots refresh below, gating the manifest walk on whether the
+            // change set actually contains a Cargo.toml (#95).
+            let (indexed, manifest_in_change_set) = match mode {
                 IndexMode::Changed => db.index_changed_files_with_progress(config, progress)?,
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
@@ -103,6 +113,15 @@ impl IndexDatabase {
             // Healing can delete overlay symbols (NULLing their in-edges via
             // `remove_file_in_scope`), so it needs the same re-derive tail as real file changes.
             if indexed > 0 || healed > 0 {
+                // Refresh local_crate_roots BEFORE resolve_edges so the resolve pass sees the
+                // updated workspace crate set (#95). Only when a Cargo.toml is in the change
+                // set — an ordinary file edit must NOT pay the manifest walk (issue #63 invariant).
+                // `set_meta_if_changed` ensures a Cargo.toml that changed content but kept the
+                // same crate set is also a no-op write, preserving the idle-pass no-write
+                // invariant.
+                if manifest_in_change_set {
+                    db.refresh_local_crate_roots_if_changed(&config.root)?;
+                }
                 progress(IndexProgress::RebuildingLogicalSymbols);
                 db.rebuild_logical_symbols()?;
                 progress(IndexProgress::ResolvingGraph);
@@ -190,34 +209,75 @@ impl IndexDatabase {
         Ok(total)
     }
 
+    /// Returns `(file_count, manifest_in_change_set)`. The manifest flag is true when any path in
+    /// the git change set (changed or deleted) has the filename `Cargo.toml`, signalling that the
+    /// workspace crate set may have changed and `local_crate_roots` should be refreshed before the
+    /// resolve pass (#95).
     fn index_changed_files_with_progress<F>(
         &self,
         config: &Config,
         progress: &mut F,
-    ) -> anyhow::Result<usize>
+    ) -> anyhow::Result<(usize, bool)>
     where
         F: FnMut(IndexProgress),
     {
         progress(IndexProgress::Discovering);
         let changes = git_changed_paths(&config.root)?;
+        let manifest_in_change_set =
+            paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
+                || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path));
         let files = collect_changed_index_files(config, &changes)?;
         let files = self.assign_file_scopes(files, &changes);
-        self.apply_incremental_file_plan(files, changes.deleted, progress)
+        let count = self.apply_incremental_file_plan(files, changes.deleted, progress)?;
+        Ok((count, manifest_in_change_set))
     }
 
+    /// Returns `(file_count, manifest_in_change_set)`. The manifest flag is true when any path in
+    /// the git change set OR the discover plan's file list (for new, as-yet-untracked manifests)
+    /// has the filename `Cargo.toml` (#95).
     fn index_discovered_files_with_progress<F>(
         &self,
         config: &Config,
         progress: &mut F,
-    ) -> anyhow::Result<usize>
+    ) -> anyhow::Result<(usize, bool)>
     where
         F: FnMut(IndexProgress),
     {
         progress(IndexProgress::Discovering);
         let plan = discovery_plan(self.storage.connection(), config)?;
         let changes = git_changed_paths(&config.root).unwrap_or_default();
+        // A Cargo.toml may enter the change set via git status (tracked edit/add/delete) OR via
+        // the discovery plan's file list (a new, untracked manifest not yet committed). Check both
+        // so a freshly added Cargo.toml is not missed simply because it is untracked.
+        let manifest_in_change_set =
+            paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
+                || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path))
+                || paths_include_cargo_toml(plan.files.iter().map(|f| f.relative_path.as_path()));
         let files = self.assign_file_scopes(plan.files, &changes);
-        self.apply_incremental_file_plan(files, plan.deleted, progress)
+        let count = self.apply_incremental_file_plan(files, plan.deleted, progress)?;
+        Ok((count, manifest_in_change_set))
+    }
+
+    /// Recompute `local_crate_roots` from the workspace manifests and persist the result only when
+    /// it differs from the stored value. Called on incremental passes that contain a `Cargo.toml`
+    /// in the change set, before `resolve_edges`, so the resolve pass uses the current crate set.
+    ///
+    /// ORDERING INVARIANT (#95): must run BEFORE `resolve_edges` / `resolve_all_edges`. The
+    /// resolver loads `local_crate_roots` from `index_meta` at the start of its pass; if the
+    /// root set is refreshed afterward, the pass uses stale data and `use new_crate::X` stays
+    /// misclassified as external until the next rebuild.
+    ///
+    /// Uses `set_meta_if_changed` so a manifest edit that leaves the crate-name set unchanged is a
+    /// no-op write, preserving the #63 idle-pass invariant.
+    pub(super) fn refresh_local_crate_roots_if_changed(&self, root: &Path) -> anyhow::Result<()> {
+        let roots = super::edges::local_crate_roots(root);
+        let serialized = {
+            let mut sorted: Vec<&str> = roots.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            sorted.join("\n")
+        };
+        self.set_meta_if_changed("local_crate_roots", &serialized)?;
+        Ok(())
     }
 
     fn assign_file_scopes(

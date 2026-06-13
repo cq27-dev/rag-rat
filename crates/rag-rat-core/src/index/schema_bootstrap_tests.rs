@@ -7194,3 +7194,139 @@ fn incremental_pass_heals_stale_overlay_rows() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Helper: read the stored `local_crate_roots` from `index_meta` as a sorted vec.
+fn stored_crate_roots(db: &IndexDatabase) -> Vec<String> {
+    let raw = db
+        .storage
+        .connection()
+        .query_row("SELECT value FROM index_meta WHERE key = 'local_crate_roots'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap_or_default();
+    let mut roots: Vec<String> =
+        raw.lines().filter(|line| !line.is_empty()).map(str::to_string).collect();
+    roots.sort();
+    roots
+}
+
+/// #95: an incremental pass that includes a new `Cargo.toml` in its git change set must refresh
+/// `local_crate_roots` BEFORE `resolve_edges` runs, so a `use new_crate::X` reference resolves as
+/// local rather than external.
+///
+/// `Cargo.toml` is not an indexable language (`Language::from_path` returns `None`), so the
+/// discover plan never contains it. The only reliable detection path is `git_changed_paths`, which
+/// reports any staged or unstaged file — including a new, untracked `Cargo.toml`. Both `Changed`
+/// and `Discover` modes check this path; the test uses `index_discover` since it's the watcher's
+/// normal mode.
+#[test]
+fn incremental_discover_refreshes_local_crate_roots_when_cargo_toml_in_git_changes() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("crates/alpha/src")).unwrap();
+    fs::write(root.join("crates/alpha/src/lib.rs"), "pub fn seed() {}\n").unwrap();
+
+    // Initialise a git repo so git_changed_paths works.
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+
+    // Commit alpha's manifest so it is clean (not in git status); the root set starts with `alpha`.
+    fs::write(
+        root.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "init"]);
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("crates")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let initial_roots = stored_crate_roots(&db);
+    assert!(initial_roots.contains(&"alpha".to_string()), "initial roots: {initial_roots:?}");
+    drop(db);
+
+    // Add a second crate WITHOUT a full rebuild — this is the bug scenario (#95). The Cargo.toml
+    // is an untracked new file, so git_changed_paths reports it as "changed".
+    fs::create_dir_all(root.join("crates/beta/src")).unwrap();
+    fs::write(
+        root.join("crates/beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/beta/src/lib.rs"), "pub fn beta() {}\n").unwrap();
+
+    // Incremental discover — must detect the new Cargo.toml via git_changed_paths and refresh
+    // local_crate_roots before the resolve pass.
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    let updated_roots = stored_crate_roots(&db);
+    assert!(
+        updated_roots.contains(&"beta".to_string()),
+        "beta must appear in local_crate_roots after discover; got: {updated_roots:?}"
+    );
+    assert!(
+        updated_roots.contains(&"alpha".to_string()),
+        "alpha must still be in local_crate_roots; got: {updated_roots:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// #95 (idle-pass invariant, #63): a discover sweep where no Cargo.toml is in the change set must
+/// NOT rewrite `local_crate_roots` — the #63 no-write-on-idle constraint applies.
+///
+/// Verified by injecting a sentinel value into `local_crate_roots` before the idle pass and
+/// asserting that the sentinel survives unchanged afterward (if the pass rewrote the key, it would
+/// be replaced with the actual computed set instead).
+#[test]
+fn incremental_discover_does_not_rewrite_local_crate_roots_on_idle_pass() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn stable() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+
+    // Rebuild to create the index; no Cargo.toml in the target set, so local_crate_roots is empty.
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Inject a sentinel into local_crate_roots to detect whether the idle pass overwrites it.
+    db.storage
+        .connection()
+        .execute(
+            "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('local_crate_roots', \
+             '__sentinel__')",
+            [],
+        )
+        .unwrap();
+    drop(db);
+
+    // Idle discover: the file did not change, so the pass must not touch the DB at all.
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    let roots_after = db
+        .storage
+        .connection()
+        .query_row("SELECT value FROM index_meta WHERE key = 'local_crate_roots'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        roots_after, "__sentinel__",
+        "idle discover must not rewrite local_crate_roots (#63 invariant); got: {roots_after:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
