@@ -75,6 +75,7 @@ pub(crate) fn contains_edges(symbols: &[IndexedSymbol]) -> Vec<EdgeCandidate> {
                 receiver_hint: None,
                 source_span: child.span(),
                 callee_span: None,
+                import_scope: None,
                 edge_kind: EdgeKind::Contains,
                 confidence: EdgeConfidence::Exact,
             });
@@ -141,15 +142,32 @@ pub(crate) fn rust_edges(
         "use_declaration" => {
             let names = identifiers_under(node, text);
             let is_reexport = node_text(node, text).trim_start().starts_with("pub use ");
+            // Module-aware import scope (#61): a Rust `use` is scoped to its enclosing module body
+            // (or block, for a block-local `use`), not the whole file. Record that scope + the
+            // enclosing module's id on the dedicated import-scope columns so resolution suppresses
+            // a bare reference only inside the `use`'s scope (parent-`mod` `use`s don't
+            // reach a child `mod`). Top-level `use` → whole file, `MOD_FILE_ROOT`.
+            let scope = enclosing_use_scope(node, text);
+            // The crate-aware scope rebuilds its {leaf → root} map by re-parsing an Imports edge's
+            // `evidence` with `imports::parse_use`; `parse_use` returns EVERY leaf, so ONE edge
+            // carrying the FULL (untruncated) use text populates the whole map for this `use`.
+            // Attach the full text to only the FIRST emitted Imports edge — the default
+            // `edge_evidence` truncates at 240 chars and would drop late braced leaves (#97 item 1)
+            // — and let the rest carry standard evidence, so a multi-hundred-KB `use` isn't cloned
+            // into every leaf's edge (#97 item 3).
+            let mut full_use_evidence = Some(use_declaration_evidence(node, text));
             for name in names {
                 if !is_rust_path_keyword(&name) {
-                    out.push(file_edge(
+                    let evidence =
+                        full_use_evidence.take().unwrap_or_else(|| edge_evidence(node, text));
+                    out.push(file_edge_scoped(
                         path,
                         node,
-                        text,
                         name,
+                        Some(evidence),
                         EdgeKind::Imports,
                         EdgeConfidence::NameOnly,
+                        Some(scope),
                     ));
                 }
             }
@@ -170,13 +188,19 @@ pub(crate) fn rust_edges(
         },
         "mod_item" =>
             if let Some(name) = child_name_text(node, text) {
-                out.push(file_edge(
+                // An INLINE `mod foo { … }` carries its body range + its own id as the import scope
+                // so resolution can rebuild the per-file module interval set (the ref→mod-id
+                // lookup) from edges alone, WITHOUT the tree (#61) — including modules that contain
+                // no `use`. A non-inline `mod foo;` has no body and introduces no scope (NULL).
+                let scope = inline_mod_scope(node);
+                out.push(file_edge_scoped(
                     path,
                     node,
-                    text,
                     name,
+                    Some(edge_evidence(node, text)),
                     EdgeKind::Imports,
                     EdgeConfidence::NameOnly,
+                    scope,
                 ));
             },
         "call_expression" => {
@@ -275,6 +299,7 @@ pub(crate) fn rust_impl_edges(
             // The trait/type names here come from string-splitting the impl header, not from a
             // located identifier node, so there is no clean callee range to record (#67).
             callee_span: None,
+            import_scope: None,
             edge_kind: EdgeKind::Implements,
             confidence: EdgeConfidence::NameOnly,
         });
@@ -593,9 +618,86 @@ pub(crate) fn file_edge(
         source_span: span_for_node(node),
         // File-level edges (imports / exports / mod) have no callee identifier to anchor (#67).
         callee_span: None,
+        import_scope: None,
         edge_kind,
         confidence,
     }
+}
+/// `file_edge` with caller-supplied evidence and an optional module-aware import scope, for the
+/// `use_declaration` / inline `mod_item` arms (#61). The Imports edge carries the untruncated `use`
+/// text (so the crate-aware scope re-parses every braced leaf, #97) plus the enclosing scope range
+/// and module id in the DEDICATED `import_scope_*` / `import_mod_id` columns — never the `callee_*`
+/// columns, which stay NULL on file-level edges so the oracle join is unaffected.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn file_edge_scoped(
+    path: &Path,
+    node: Node<'_>,
+    to_name: String,
+    evidence: Option<String>,
+    edge_kind: EdgeKind,
+    confidence: EdgeConfidence,
+    import_scope: Option<ImportScopeRange>,
+) -> EdgeCandidate {
+    EdgeCandidate {
+        from_symbol_id: None,
+        from_name: Some(path.to_string_lossy().replace('\\', "/")),
+        to_name,
+        target_qualified_name: None,
+        evidence,
+        receiver_hint: None,
+        source_span: span_for_node(node),
+        callee_span: None,
+        import_scope,
+        edge_kind,
+        confidence,
+    }
+}
+/// The module-aware scope of a Rust `use_declaration` (#61): walk ancestors to the nearest body
+/// that resets import scope. A nested `mod m { … }`'s `declaration_list` is the scope AND its start
+/// byte is the enclosing-module id. A `block` (fn body / inner block) does NOT reset import scope
+/// (uses are inherited), but a block-local `use` is itself confined to the block — so a `block`
+/// hit narrows the SCOPE to the block range while the module id is taken from the block's own
+/// nearest-enclosing module. A top-level `use` has no such ancestor: it scopes the whole file with
+/// `MOD_FILE_ROOT`. Rust `use` items are order-independent within their scope, so the WHOLE body
+/// range (not "from the `use` onward") is correct.
+pub(crate) fn enclosing_use_scope(node: Node<'_>, text: &str) -> ImportScopeRange {
+    let mut parent = node.parent();
+    let mut block_scope: Option<(usize, usize)> = None;
+    while let Some(ancestor) = parent {
+        match ancestor.kind() {
+            // The nearest module body: it both bounds a module-level `use` and supplies the module
+            // id for a block-local one (the first block we passed through narrowed the scope).
+            "declaration_list" if ancestor.parent().is_some_and(|p| p.kind() == "mod_item") => {
+                let mod_start = i64::try_from(ancestor.start_byte()).unwrap_or(MOD_FILE_ROOT);
+                let (scope_start, scope_end) =
+                    block_scope.unwrap_or((ancestor.start_byte(), ancestor.end_byte()));
+                return ImportScopeRange { scope_start, scope_end, mod_id: mod_start };
+            },
+            // Record only the INNERMOST (first-seen) block as the confining scope; outer blocks
+            // don't widen it. Don't return yet — keep walking for the enclosing module id.
+            "block" if block_scope.is_none() => {
+                block_scope = Some((ancestor.start_byte(), ancestor.end_byte()));
+            },
+            _ => {},
+        }
+        parent = ancestor.parent();
+    }
+    // No enclosing module: top-level `use` (or block-local at file root). Scope is the block if we
+    // saw one, else the whole file; module id is the file root.
+    let (scope_start, scope_end) = block_scope.unwrap_or((0, text.len()));
+    ImportScopeRange { scope_start, scope_end, mod_id: MOD_FILE_ROOT }
+}
+/// The body range of an INLINE `mod foo { … }` as an import scope whose `mod_id` is its own body
+/// start — so resolution rebuilds the per-file module interval set from these edges (#61). `None`
+/// for a non-inline `mod foo;` (no body, introduces no scope).
+pub(crate) fn inline_mod_scope(node: Node<'_>) -> Option<ImportScopeRange> {
+    let body = node.child_by_field_name("body")?;
+    let scope_start = body.start_byte();
+    Some(ImportScopeRange {
+        scope_start,
+        scope_end: body.end_byte(),
+        mod_id: i64::try_from(scope_start).unwrap_or(MOD_FILE_ROOT),
+    })
 }
 pub(crate) fn symbol_edge(
     symbols: &[IndexedSymbol],
@@ -642,6 +744,7 @@ pub(crate) fn symbol_edge_with_context(
         receiver_hint: context.receiver_hint,
         source_span: span_for_node(node),
         callee_span,
+        import_scope: None,
         edge_kind,
         confidence,
     }

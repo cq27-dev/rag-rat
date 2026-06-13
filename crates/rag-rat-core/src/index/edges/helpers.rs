@@ -183,6 +183,14 @@ pub(crate) fn edge_evidence(node: Node<'_>, text: &str) -> String {
         .take(240)
         .collect()
 }
+/// Whitespace-normalized but UNTRUNCATED node text, for a `use_declaration`'s evidence. The
+/// crate-aware import scope re-parses this with `imports::parse_use` (#61); the 240-char cap in
+/// [`edge_evidence`] would drop the late leaves of a long braced `use foo::{…, X}`, leaving those
+/// names un-suppressed (#97 item 1). A `use` statement is bounded and small, so storing it in full
+/// is cheap.
+pub(crate) fn use_declaration_evidence(node: Node<'_>, text: &str) -> String {
+    node_text(node, text).split_whitespace().collect::<Vec<_>>().join(" ")
+}
 pub(crate) fn short_name(name: &str) -> &str {
     name.rsplit([':', '.', '#', '/']).find(|part| !part.is_empty()).unwrap_or(name)
 }
@@ -321,6 +329,17 @@ pub(crate) fn insert_candidates(
             ),
             None => (None, None),
         };
+        // Module-aware import scope (#61): the dedicated columns, NULL on non-import edges so the
+        // oracle's `callee_start_byte IS NOT NULL` candidate filter never sees them.
+        let (import_scope_start_byte, import_scope_end_byte, import_mod_id) =
+            match candidate.import_scope {
+                Some(scope) => (
+                    Some(i64::try_from(scope.scope_start).unwrap_or(0)),
+                    Some(i64::try_from(scope.scope_end).unwrap_or(0)),
+                    Some(scope.mod_id),
+                ),
+                None => (None, None, None),
+            };
         // Direct interned write to edges_data (#79): the view's INSTEAD OF insert would work but
         // costs 8 dictionary probes per row in SQL, and `last_insert_rowid` does not survive an
         // INSTEAD OF trigger.
@@ -339,9 +358,11 @@ pub(crate) fn insert_candidates(
                 target_qualified_name_id, evidence, receiver_hint_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 callee_start_byte, callee_end_byte,
+                import_scope_start_byte, import_scope_end_byte, import_mod_id,
                 edge_kind_id, confidence_id, resolution_id
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19)
             ",
         )?
         .execute(params![
@@ -358,6 +379,9 @@ pub(crate) fn insert_candidates(
             candidate.source_span.end_byte,
             callee_start_byte,
             callee_end_byte,
+            import_scope_start_byte,
+            import_scope_end_byte,
+            import_mod_id,
             edge_kind_id,
             confidence_id,
             resolution_id,

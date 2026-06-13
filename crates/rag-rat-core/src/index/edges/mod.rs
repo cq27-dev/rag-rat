@@ -9,7 +9,7 @@ use std::path::Path;
 
 pub(crate) use extract::*;
 pub(crate) use helpers::*;
-pub(crate) use imports::local_crate_roots;
+pub(crate) use imports::scan_packages;
 use intern::{OptSym, StrArena, Sym};
 pub(crate) use resolve::*;
 use rusqlite::{Connection, params};
@@ -87,6 +87,25 @@ impl CalleeRange {
     }
 }
 
+/// Module-aware import scope of a Rust `use` (or the body range of an inline `mod`), stored on
+/// Imports edges in the DEDICATED `import_scope_*` / `import_mod_id` columns (#61 per-package +
+/// module-aware rework). For a `use`: `[scope_start, scope_end)` is the enclosing module body — or
+/// the enclosing block, for a block-local `use` — and `mod_id` is the enclosing module body's start
+/// byte (`MOD_FILE_ROOT` for a top-level `use`). For an inline `mod foo { … }`: the range is the
+/// module body and `mod_id` is its own start byte, so resolution can rebuild the per-file module
+/// interval set (the ref→mod-id lookup) from these edges WITHOUT the tree. Kept off the `callee_*`
+/// columns so the oracle's `callee_start_byte IS NOT NULL` candidate filter is untouched.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImportScopeRange {
+    pub(crate) scope_start: usize,
+    pub(crate) scope_end: usize,
+    pub(crate) mod_id: i64,
+}
+
+/// Sentinel `import_mod_id` for a top-level `use` / a file-root reference: no enclosing module
+/// body. `-1` because a real `mod_id` is a module body's `start_byte` (≥ 0).
+pub(crate) const MOD_FILE_ROOT: i64 = -1;
+
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeCandidate {
     from_symbol_id: Option<i64>,
@@ -99,6 +118,9 @@ pub(crate) struct EdgeCandidate {
     /// Byte range of the callee identifier token; see [`CalleeRange`]. `None` for non-symbol
     /// edges.
     callee_span: Option<CalleeRange>,
+    /// Module-aware import scope; see [`ImportScopeRange`]. `Some` only for Rust Imports edges (a
+    /// `use`'s enclosing scope, or an inline `mod`'s body range); `None` for every other edge.
+    import_scope: Option<ImportScopeRange>,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
 }
@@ -243,6 +265,12 @@ struct CompactEdge {
     /// Callee identifier byte range; `u32::MAX` in `callee_start_byte` is the `None` sentinel.
     callee_start_byte: u32,
     callee_end_byte: u32,
+    /// Module-aware import scope (#61); `u32::MAX` in `import_scope_start_byte` is the `None`
+    /// sentinel (a non-import edge). `import_mod_id` is a real `i64` ([`MOD_FILE_ROOT`] = -1 for a
+    /// top-level `use`), so it cannot carry the niche — the start-byte sentinel gates it.
+    import_scope_start_byte: u32,
+    import_scope_end_byte: u32,
+    import_mod_id: i64,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
 }
@@ -271,6 +299,48 @@ impl CompactEdge {
             (None, None)
         } else {
             (Some(i64::from(self.callee_start_byte)), Some(i64::from(self.callee_end_byte)))
+        }
+    }
+
+    /// Pack `Option<ImportScopeRange>` into the two `u32` scope-byte fields + the `i64` mod-id,
+    /// using `u32::MAX` in the start byte for `None` (mirrors `pack_callee`). The start sentinel —
+    /// not `mod_id` — gates presence, because `MOD_FILE_ROOT` (-1) is itself a valid stored mod id.
+    fn pack_import_scope(scope: Option<ImportScopeRange>) -> (u32, u32, i64) {
+        match scope {
+            Some(range) => {
+                let clamp = |value: usize| u32::try_from(value).unwrap_or(0);
+                (clamp(range.scope_start), clamp(range.scope_end), range.mod_id)
+            },
+            None => (Self::CALLEE_NONE, Self::CALLEE_NONE, MOD_FILE_ROOT),
+        }
+    }
+
+    /// The stored import scope as an [`ImportScopeRange`], or `None` for a non-import edge. Used by
+    /// the full-rebuild driver to feed `ImportScope::add_use` from the in-memory accumulator (the
+    /// twin of the DB driver reading the `import_scope_*` columns).
+    fn import_scope_range(&self) -> Option<ImportScopeRange> {
+        if self.import_scope_start_byte == Self::CALLEE_NONE {
+            None
+        } else {
+            Some(ImportScopeRange {
+                scope_start: self.import_scope_start_byte as usize,
+                scope_end: self.import_scope_end_byte as usize,
+                mod_id: self.import_mod_id,
+            })
+        }
+    }
+
+    /// The stored import-scope range as nullable `i64`s for the edge-row insert: `(NULL, NULL,
+    /// NULL)` for a non-import edge, otherwise `(scope_start, scope_end, mod_id)`.
+    fn import_scope_columns(&self) -> (Option<i64>, Option<i64>, Option<i64>) {
+        if self.import_scope_start_byte == Self::CALLEE_NONE {
+            (None, None, None)
+        } else {
+            (
+                Some(i64::from(self.import_scope_start_byte)),
+                Some(i64::from(self.import_scope_end_byte)),
+                Some(self.import_mod_id),
+            )
         }
     }
 }
@@ -318,6 +388,8 @@ impl FullRebuildGraph {
             usize::try_from(local).ok().and_then(|index| db_ids.get(index)).copied()
         });
         let (callee_start_byte, callee_end_byte) = CompactEdge::pack_callee(candidate.callee_span);
+        let (import_scope_start_byte, import_scope_end_byte, import_mod_id) =
+            CompactEdge::pack_import_scope(candidate.import_scope);
         let compact = CompactEdge {
             from_symbol_id,
             from_name: self.arena.intern_opt(candidate.from_name.as_deref()),
@@ -330,6 +402,9 @@ impl FullRebuildGraph {
             source_span: CompactSpan::from_span(candidate.source_span),
             callee_start_byte,
             callee_end_byte,
+            import_scope_start_byte,
+            import_scope_end_byte,
+            import_mod_id,
             edge_kind: candidate.edge_kind,
             confidence: candidate.confidence,
         };
