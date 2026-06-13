@@ -158,10 +158,10 @@ fn file_progress_reports_first_final_and_decile_boundaries() {
 }
 
 #[test]
-fn open_auto_migrates_a_legacy_schema_without_version_table() {
-    // A pre-schema_version index (real tables, no version ledger) reads as `Older`. Opening it must
-    // migrate it forward automatically — a developer never hand-runs `migrate` for our own derived
-    // data.
+fn open_refuses_a_legacy_schema_without_version_table() {
+    // A pre-ledger index (real tables, no schema_version) reads as `Older`, but forward-only
+    // migration can't know what's already applied — re-running data migrations would clobber
+    // current values — so open REFUSES it and points at a rebuild rather than risk corruption.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join(".rag-rat")).unwrap();
@@ -175,8 +175,44 @@ fn open_auto_migrates_a_legacy_schema_without_version_table() {
         IndexDatabase::migration_check(&database).unwrap().state,
         schema::SchemaState::Older
     );
-    // Open succeeds (no manual migrate), and the schema is current afterward.
+    let err = IndexDatabase::open(&database).unwrap_err().to_string();
+    assert!(err.contains("rebuild"), "{err}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn forward_migration_does_not_rerun_already_applied_migrations() {
+    // The forward-only guarantee (#103 review): opening a v(latest-1) index must apply ONLY the
+    // missing migration, never re-run an applied one. Migration 005 does an unconditional
+    // `UPDATE edges SET resolution = …` that would downgrade modern resolver reasons on every
+    // upgrade open if the whole ladder re-ran. Witness: stamp 005's row with a sentinel
+    // applied_at_ms; if 005 re-ran, record_migration (INSERT OR REPLACE) overwrites it with now_ms.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join(".rag-rat")).unwrap();
+    let database = root.join(".rag-rat/index.sqlite");
+    IndexDatabase::migrate(&database).unwrap();
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute("UPDATE schema_version SET applied_at_ms = 1 WHERE id LIKE '005%'", []).unwrap();
+    conn.execute(
+        "DELETE FROM schema_version WHERE id = (SELECT id FROM schema_version ORDER BY id DESC \
+         LIMIT 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
     IndexDatabase::open(&database).unwrap();
+
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let applied_005: i64 = conn
+        .query_row("SELECT applied_at_ms FROM schema_version WHERE id LIKE '005%'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    drop(conn);
+    assert_eq!(applied_005, 1, "migration 005 was re-applied on open — forward-only is broken");
     assert_eq!(
         IndexDatabase::migration_check(&database).unwrap().state,
         schema::SchemaState::Compatible
@@ -188,7 +224,7 @@ fn open_auto_migrates_a_legacy_schema_without_version_table() {
 #[test]
 fn open_auto_migrates_a_forward_older_schema_to_latest() {
     // The binary-upgrade case: a fully-migrated index missing only the newest migration row reads
-    // as `Older` (current_version < latest). Opening it re-applies forward to latest in place.
+    // as `Older` (current_version < latest). Opening it applies only the missing migration forward.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join(".rag-rat")).unwrap();

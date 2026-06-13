@@ -146,46 +146,162 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
     record_migration(conn, MIGRATION_001_ID, MIGRATION_001_CHECKSUM, MIGRATION_001_DESCRIPTION)?;
-    apply_embedding_vector_metadata(conn)?;
-    record_migration(conn, MIGRATION_002_ID, MIGRATION_002_CHECKSUM, MIGRATION_002_DESCRIPTION)?;
-    apply_derived_artifact_reconcile_metadata(conn)?;
-    record_migration(conn, MIGRATION_003_ID, MIGRATION_003_CHECKSUM, MIGRATION_003_DESCRIPTION)?;
-    apply_edge_source_target_spans(conn)?;
-    record_migration(conn, MIGRATION_004_ID, MIGRATION_004_CHECKSUM, MIGRATION_004_DESCRIPTION)?;
-    apply_edge_evidence_and_resolution(conn)?;
-    record_migration(conn, MIGRATION_005_ID, MIGRATION_005_CHECKSUM, MIGRATION_005_DESCRIPTION)?;
-    apply_embedding_policy_and_input_hash(conn)?;
-    record_migration(conn, MIGRATION_006_ID, MIGRATION_006_CHECKSUM, MIGRATION_006_DESCRIPTION)?;
-    apply_logical_symbol_groups(conn)?;
-    record_migration(conn, MIGRATION_007_ID, MIGRATION_007_CHECKSUM, MIGRATION_007_DESCRIPTION)?;
-    apply_commit_addressable_worktrees(conn)?;
-    record_migration(conn, MIGRATION_008_ID, MIGRATION_008_CHECKSUM, MIGRATION_008_DESCRIPTION)?;
-    apply_github_ref_sync(conn)?;
-    record_migration(conn, MIGRATION_009_ID, MIGRATION_009_CHECKSUM, MIGRATION_009_DESCRIPTION)?;
-    apply_symbol_facts(conn)?;
-    record_migration(conn, MIGRATION_010_ID, MIGRATION_010_CHECKSUM, MIGRATION_010_DESCRIPTION)?;
-    apply_repo_memories(conn)?;
-    record_migration(conn, MIGRATION_011_ID, MIGRATION_011_CHECKSUM, MIGRATION_011_DESCRIPTION)?;
-    apply_repo_memory_call_paths(conn)?;
-    record_migration(conn, MIGRATION_012_ID, MIGRATION_012_CHECKSUM, MIGRATION_012_DESCRIPTION)?;
-    apply_graph_file_lookup_indexes(conn)?;
-    record_migration(conn, MIGRATION_013_ID, MIGRATION_013_CHECKSUM, MIGRATION_013_DESCRIPTION)?;
-    apply_memory_binding_signals(conn)?;
-    record_migration(conn, MIGRATION_014_ID, MIGRATION_014_CHECKSUM, MIGRATION_014_DESCRIPTION)?;
-    apply_repo_memory_call_path_edges(conn)?;
-    record_migration(conn, MIGRATION_015_ID, MIGRATION_015_CHECKSUM, MIGRATION_015_DESCRIPTION)?;
-    apply_symbol_line_spans(conn)?;
-    record_migration(conn, MIGRATION_016_ID, MIGRATION_016_CHECKSUM, MIGRATION_016_DESCRIPTION)?;
-    apply_edge_callee_byte_range(conn)?;
-    record_migration(conn, MIGRATION_017_ID, MIGRATION_017_CHECKSUM, MIGRATION_017_DESCRIPTION)?;
-    apply_oracle_tables(conn)?;
-    record_migration(conn, MIGRATION_018_ID, MIGRATION_018_CHECKSUM, MIGRATION_018_DESCRIPTION)?;
-    apply_scip_moniker_anchors(conn)?;
-    record_migration(conn, MIGRATION_019_ID, MIGRATION_019_CHECKSUM, MIGRATION_019_DESCRIPTION)?;
-    apply_edge_string_interning(conn)?;
-    record_migration(conn, MIGRATION_020_ID, MIGRATION_020_CHECKSUM, MIGRATION_020_DESCRIPTION)?;
-    apply_symbol_scope_path(conn)?;
-    record_migration(conn, MIGRATION_021_ID, MIGRATION_021_CHECKSUM, MIGRATION_021_DESCRIPTION)?;
+    // The additive migrations on top of the baseline, in order. Same list `migrate_forward` walks,
+    // so a fresh DB (here) and an existing DB behind by N apply exactly the same steps.
+    for step in ADDITIVE_MIGRATIONS {
+        (step.apply)(conn)?;
+        record_migration(conn, step.id, step.checksum, step.description)?;
+    }
+    Ok(())
+}
+
+/// One additive migration layered on the baseline (001): its identity + the function that applies
+/// it. Single source of truth for both `apply` (fresh DB, runs all) and `migrate_forward` (existing
+/// DB, runs only the unapplied ones).
+struct Migration {
+    id: &'static str,
+    checksum: &'static str,
+    description: &'static str,
+    apply: fn(&Connection) -> rusqlite::Result<()>,
+}
+
+const ADDITIVE_MIGRATIONS: &[Migration] = &[
+    Migration {
+        id: MIGRATION_002_ID,
+        checksum: MIGRATION_002_CHECKSUM,
+        description: MIGRATION_002_DESCRIPTION,
+        apply: apply_embedding_vector_metadata,
+    },
+    Migration {
+        id: MIGRATION_003_ID,
+        checksum: MIGRATION_003_CHECKSUM,
+        description: MIGRATION_003_DESCRIPTION,
+        apply: apply_derived_artifact_reconcile_metadata,
+    },
+    Migration {
+        id: MIGRATION_004_ID,
+        checksum: MIGRATION_004_CHECKSUM,
+        description: MIGRATION_004_DESCRIPTION,
+        apply: apply_edge_source_target_spans,
+    },
+    Migration {
+        id: MIGRATION_005_ID,
+        checksum: MIGRATION_005_CHECKSUM,
+        description: MIGRATION_005_DESCRIPTION,
+        apply: apply_edge_evidence_and_resolution,
+    },
+    Migration {
+        id: MIGRATION_006_ID,
+        checksum: MIGRATION_006_CHECKSUM,
+        description: MIGRATION_006_DESCRIPTION,
+        apply: apply_embedding_policy_and_input_hash,
+    },
+    Migration {
+        id: MIGRATION_007_ID,
+        checksum: MIGRATION_007_CHECKSUM,
+        description: MIGRATION_007_DESCRIPTION,
+        apply: apply_logical_symbol_groups,
+    },
+    Migration {
+        id: MIGRATION_008_ID,
+        checksum: MIGRATION_008_CHECKSUM,
+        description: MIGRATION_008_DESCRIPTION,
+        apply: apply_commit_addressable_worktrees,
+    },
+    Migration {
+        id: MIGRATION_009_ID,
+        checksum: MIGRATION_009_CHECKSUM,
+        description: MIGRATION_009_DESCRIPTION,
+        apply: apply_github_ref_sync,
+    },
+    Migration {
+        id: MIGRATION_010_ID,
+        checksum: MIGRATION_010_CHECKSUM,
+        description: MIGRATION_010_DESCRIPTION,
+        apply: apply_symbol_facts,
+    },
+    Migration {
+        id: MIGRATION_011_ID,
+        checksum: MIGRATION_011_CHECKSUM,
+        description: MIGRATION_011_DESCRIPTION,
+        apply: apply_repo_memories,
+    },
+    Migration {
+        id: MIGRATION_012_ID,
+        checksum: MIGRATION_012_CHECKSUM,
+        description: MIGRATION_012_DESCRIPTION,
+        apply: apply_repo_memory_call_paths,
+    },
+    Migration {
+        id: MIGRATION_013_ID,
+        checksum: MIGRATION_013_CHECKSUM,
+        description: MIGRATION_013_DESCRIPTION,
+        apply: apply_graph_file_lookup_indexes,
+    },
+    Migration {
+        id: MIGRATION_014_ID,
+        checksum: MIGRATION_014_CHECKSUM,
+        description: MIGRATION_014_DESCRIPTION,
+        apply: apply_memory_binding_signals,
+    },
+    Migration {
+        id: MIGRATION_015_ID,
+        checksum: MIGRATION_015_CHECKSUM,
+        description: MIGRATION_015_DESCRIPTION,
+        apply: apply_repo_memory_call_path_edges,
+    },
+    Migration {
+        id: MIGRATION_016_ID,
+        checksum: MIGRATION_016_CHECKSUM,
+        description: MIGRATION_016_DESCRIPTION,
+        apply: apply_symbol_line_spans,
+    },
+    Migration {
+        id: MIGRATION_017_ID,
+        checksum: MIGRATION_017_CHECKSUM,
+        description: MIGRATION_017_DESCRIPTION,
+        apply: apply_edge_callee_byte_range,
+    },
+    Migration {
+        id: MIGRATION_018_ID,
+        checksum: MIGRATION_018_CHECKSUM,
+        description: MIGRATION_018_DESCRIPTION,
+        apply: apply_oracle_tables,
+    },
+    Migration {
+        id: MIGRATION_019_ID,
+        checksum: MIGRATION_019_CHECKSUM,
+        description: MIGRATION_019_DESCRIPTION,
+        apply: apply_scip_moniker_anchors,
+    },
+    Migration {
+        id: MIGRATION_020_ID,
+        checksum: MIGRATION_020_CHECKSUM,
+        description: MIGRATION_020_DESCRIPTION,
+        apply: apply_edge_string_interning,
+    },
+    Migration {
+        id: MIGRATION_021_ID,
+        checksum: MIGRATION_021_CHECKSUM,
+        description: MIGRATION_021_DESCRIPTION,
+        apply: apply_symbol_scope_path,
+    },
+];
+
+/// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
+/// existing index that lags this binary. Unlike [`apply`], it never re-runs an already-applied
+/// migration, so a data backfill like 005's resolution rewrite (an unconditional UPDATE) cannot
+/// clobber current values on a routine open. The caller guarantees the baseline (001) is present (a
+/// versioned ledger exists); a ledger-less legacy DB is refused upstream, not force-migrated.
+pub fn migrate_forward(conn: &Connection) -> anyhow::Result<()> {
+    let applied: std::collections::HashSet<String> =
+        applied_migrations(conn)?.into_iter().map(|migration| migration.id).collect();
+    for step in ADDITIVE_MIGRATIONS {
+        if !applied.contains(step.id) {
+            (step.apply)(conn)?;
+            record_migration(conn, step.id, step.checksum, step.description)?;
+        }
+    }
     Ok(())
 }
 
@@ -198,8 +314,8 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
                 current_version: 0,
                 latest_version: LATEST_SCHEMA_VERSION,
                 migrations: Vec::new(),
-                message: "legacy index schema has no schema_version table; it migrates forward \
-                          automatically on open (or rebuild with `rag-rat index --full`)"
+                message: "legacy index schema has no version ledger; rebuild the derived index \
+                          with `rag-rat index --full`"
                     .to_string(),
             }
         } else {
@@ -284,10 +400,21 @@ pub fn ensure_compatible_or_migrate(conn: &Connection) -> anyhow::Result<()> {
     let current = status(conn)?;
     match current.state {
         SchemaState::Compatible => Ok(()),
-        // Forward migration is automatic. Apply, then re-verify we actually reached Compatible so a
-        // silent half-migration can't slip through as "opened fine".
+        // Forward migration is automatic — but FORWARD-ONLY: apply just the unapplied migrations,
+        // never the whole ladder. Re-running an applied data migration (e.g. 005's unconditional
+        // `UPDATE edges SET resolution = …`) would clobber current resolver reasons on a routine
+        // open. Forward-only needs a real version ledger to know what's applied; a legacy DB with
+        // NO schema_version table (current_version 0) can't be safely advanced — we'd have to
+        // re-run those data migrations — so it's refused, not force-migrated. Re-verify Compatible
+        // so a half-migration can't slip through as "opened fine".
         SchemaState::Older => {
-            apply(conn)?;
+            if !table_exists(conn, "schema_version")? {
+                anyhow::bail!(
+                    "legacy index schema has no version ledger and can't be safely migrated \
+                     forward; rebuild with `rag-rat index --full`"
+                );
+            }
+            migrate_forward(conn)?;
             let after = status(conn)?;
             if after.state == SchemaState::Compatible {
                 Ok(())
