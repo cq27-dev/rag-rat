@@ -409,19 +409,32 @@ fn graph_boost(conn: &Connection, hit: &SearchHit, terms: &[String]) -> anyhow::
         return Ok(0.0);
     };
     let qualified = qualified_symbol_name(symbol);
+    // Runs once PER CANDIDATE during ranking (~limit*8 times), so it is the hottest edge query in
+    // the search path. After interning (#79) it MUST filter on `from_name_id` / `to_name_id` (the
+    // INTEGER columns carrying `idx_edges_from_name` / `idx_edges_to_name`), not on the `edges`
+    // view's computed `from_name` / `to_name` values — a value predicate through the view cannot
+    // use those indexes, so it degrades to a full `edges_data` scan that joins the dictionary on
+    // every row (the query_warm instruction + random-I/O blow-up). The value→id subqueries are
+    // constant (≤2 ids each), keeping the index seek; the dictionary joins then reconstruct the
+    // display strings only for the index-matched rows.
     let mut stmt = conn.prepare(
         "
-        SELECT edge_kind, confidence, from_name, to_name
-        FROM edges
-        WHERE from_name IN (?1, ?2) OR to_name IN (?1, ?2)
+        SELECT ek.value, conf.value, fn.value, tn.value
+        FROM edges_data d
+        JOIN edge_strings ek ON ek.id = d.edge_kind_id
+        JOIN edge_strings conf ON conf.id = d.confidence_id
+        LEFT JOIN edge_strings fn ON fn.id = d.from_name_id
+        JOIN edge_strings tn ON tn.id = d.to_name_id
+        WHERE d.from_name_id IN (SELECT id FROM edge_strings WHERE value IN (?1, ?2))
+           OR d.to_name_id IN (SELECT id FROM edge_strings WHERE value IN (?1, ?2))
         ORDER BY
-            CASE confidence
+            CASE conf.value
                 WHEN 'Exact' THEN 0
                 WHEN 'Syntactic' THEN 1
                 WHEN 'NameOnly' THEN 2
                 ELSE 3
             END,
-            edge_kind
+            ek.value
         LIMIT 64
         ",
     )?;
@@ -624,6 +637,37 @@ mod tests {
     }
 
     #[test]
+    /// Regression guard (#79 query_warm): `graph_boost` runs once per candidate (~limit*8), so its
+    /// `from_name`/`to_name` filter MUST stay on the `from_name_id`/`to_name_id` INTEGER indexes.
+    /// Through the `edges` view a value predicate degrades to a full edges_data scan that joins the
+    /// dictionary per row (the 5x blow-up). Pin the plan: the candidate filter uses the int index.
+    #[test]
+    fn graph_boost_uses_the_name_id_indexes() {
+        let conn = seeded_conn();
+        let plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT ek.value FROM edges_data d
+                 JOIN edge_strings ek ON ek.id = d.edge_kind_id
+                 WHERE d.from_name_id IN (SELECT id FROM edge_strings WHERE value IN ('a', 'b'))
+                    OR d.to_name_id IN (SELECT id FROM edge_strings WHERE value IN ('a', 'b'))",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("idx_edges_from_name") && plan.contains("idx_edges_to_name"),
+            "graph_boost candidate filter must use the name_id indexes, got plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN d "),
+            "graph_boost must not full-scan edges_data, got plan:\n{plan}"
+        );
+    }
+
     fn search_lexical_only_returns_bm25_hits_without_embeddings() {
         let conn = seeded_conn();
         let hits = search_lexical_only(&conn, "election retry", 5, false).unwrap();
