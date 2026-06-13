@@ -125,13 +125,13 @@ pub(crate) fn install_scope_view(
             DROP VIEW IF EXISTS temp.files;
             CREATE TEMP VIEW temp.files AS
             SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id
+         indexed_revision, commit_sha, worktree_id, package_id
             FROM main.files
             WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
          'worktree_id') AND worktree_id != '' AND kind != 'deleted'
             UNION ALL
             SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id
+         indexed_revision, commit_sha, worktree_id, package_id
             FROM main.files
             WHERE commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
               AND commit_sha != ''

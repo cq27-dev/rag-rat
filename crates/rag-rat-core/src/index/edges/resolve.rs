@@ -1,4 +1,63 @@
+use std::collections::HashSet;
+
 use super::*;
+
+/// Build an [`ImportScopeRange`] from the three dedicated edge columns, or `None` when the start
+/// byte is NULL (a non-import edge). The DB driver's twin of `CompactEdge::import_scope_range`
+/// (the full-rebuild path) — they must stay in lockstep (#61 both-driver parity).
+fn import_scope_from_row(
+    scope_start: Option<i64>,
+    scope_end: Option<i64>,
+    mod_id: Option<i64>,
+) -> Option<ImportScopeRange> {
+    let scope_start = scope_start?;
+    Some(ImportScopeRange {
+        scope_start: usize::try_from(scope_start).unwrap_or(0),
+        scope_end: usize::try_from(scope_end.unwrap_or(0)).unwrap_or(0),
+        mod_id: mod_id.unwrap_or(MOD_FILE_ROOT),
+    })
+}
+
+/// Load the per-package local-crate sets + the file→package mapping for the ACTIVE CHECKOUT into
+/// `scope` (#61 per-package locality). `packages.local_roots_json` is a JSON string array of crate
+/// roots. Both reads are scoped through the per-connection `files`/`packages` rows of the active
+/// commit/worktree — a missing/empty `packages` table (non-Cargo corpus, pre-V022 index) leaves the
+/// scope's per-package maps empty so every file falls open to the global set. Shared by BOTH
+/// drivers so the per-package model is identical (#61 both-driver parity).
+fn load_package_roots_into_scope(
+    conn: &Connection,
+    scope: &mut imports::ImportScope,
+) -> anyhow::Result<()> {
+    // packages: id → local_roots (JSON array). Unscoped read of the whole table is fine — a
+    // package id is unique across scopes (its own PK), and files only reference ids in their scope.
+    {
+        let mut stmt = match conn.prepare("SELECT id, local_roots_json FROM packages") {
+            Ok(stmt) => stmt,
+            // No `packages` table (pre-V022 / non-Cargo): nothing to load, fall open.
+            Err(_) => return Ok(()),
+        };
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (package_id, roots_json) = row?;
+            let roots: HashSet<String> = serde_json::from_str(&roots_json).unwrap_or_default();
+            scope.set_package_roots(package_id, roots);
+        }
+    }
+    // files → package_id, scoped to the active checkout via the `files` TEMP VIEW (overlay wins,
+    // dead scopes excluded), matching the symbol/edge resolution scope.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT files.id, files.package_id FROM files WHERE files.package_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (file_id, package_id) = row?;
+            scope.set_file_package(file_id, package_id);
+        }
+    }
+    Ok(())
+}
 
 /// Re-resolve the ACTIVE CHECKOUT's edges against the ACTIVE CHECKOUT's symbols.
 ///
@@ -20,13 +79,19 @@ use super::*;
 pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let symbols = all_symbols(conn)?;
     let index = SymbolIndex::build(&symbols);
-    // Crate-aware import scope (#61 Project B): the active checkout's Imports edges → per-file
-    // {leaf name → crate root}, so resolution suppresses a local bind when the name is `use`d from
-    // an external dependency. Scoped via the `files` TEMP VIEW like the resolution query below.
+    // Per-package + module-aware import scope (#61): the active checkout's Imports edges → per-file
+    // module-scoped bindings, plus the per-package local-crate sets, so resolution suppresses a
+    // local bind only when the name is `use`d from an external dependency in that reference's
+    // module + package. Scoped via the `files` TEMP VIEW like the resolution query below.
     let mut import_scope = imports::ImportScope::new(imports::load_local_roots(conn));
+    load_package_roots_into_scope(conn, &mut import_scope)?;
     {
+        // The dedicated import-scope columns (NULL on non-import edges); the `use` text rides in
+        // `evidence`. Building the per-file module interval set here is once-per-pass, not
+        // per-edge.
         let mut stmt = conn.prepare(
-            "SELECT d.source_file_id, d.evidence FROM edges_data d JOIN files ON files.id = \
+            "SELECT d.source_file_id, d.evidence, d.import_scope_start_byte, \
+             d.import_scope_end_byte, d.import_mod_id FROM edges_data d JOIN files ON files.id = \
              d.source_file_id JOIN edge_strings ek ON ek.id = d.edge_kind_id WHERE ek.value = \
              'imports'",
         )?;
@@ -34,11 +99,13 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
         while let Some(row) = rows.next()? {
             let file_id: i64 = row.get(0)?;
             let evidence: Option<String> = row.get(1)?;
+            let scope = import_scope_from_row(row.get(2)?, row.get(3)?, row.get(4)?);
             if let Some(evidence) = evidence {
-                import_scope.add_use(file_id, &evidence);
+                import_scope.add_use(file_id, &evidence, scope);
             }
         }
     }
+    import_scope.finalize();
     // Read/write `edges_data` directly (#79): this loop is per-edge hot on every incremental
     // pass, so the strings it needs come from explicit dictionary joins and the verdict UPDATEs
     // write pre-interned ids instead of paying the view triggers' per-row probes. The `files`
@@ -46,11 +113,11 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let mut interner = EdgeStringInterner::default();
     let mut stmt = conn.prepare(
         "SELECT d.id, d.source_file_id, tn.value, tqn.value, ek.value, conf.value, d.evidence, \
-         rh.value FROM edges_data d JOIN files ON files.id = d.source_file_id LEFT JOIN \
-         edge_strings tn ON tn.id = d.to_name_id LEFT JOIN edge_strings tqn ON tqn.id = \
-         d.target_qualified_name_id LEFT JOIN edge_strings ek ON ek.id = d.edge_kind_id LEFT JOIN \
-         edge_strings conf ON conf.id = d.confidence_id LEFT JOIN edge_strings rh ON rh.id = \
-         d.receiver_hint_id ORDER BY d.id",
+         rh.value, d.source_start_byte FROM edges_data d JOIN files ON files.id = \
+         d.source_file_id LEFT JOIN edge_strings tn ON tn.id = d.to_name_id LEFT JOIN \
+         edge_strings tqn ON tqn.id = d.target_qualified_name_id LEFT JOIN edge_strings ek ON \
+         ek.id = d.edge_kind_id LEFT JOIN edge_strings conf ON conf.id = d.confidence_id LEFT \
+         JOIN edge_strings rh ON rh.id = d.receiver_hint_id ORDER BY d.id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -62,6 +129,7 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
             row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, i64>(8)?,
         ))
     })?;
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
@@ -74,8 +142,11 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
         current_confidence,
         evidence,
         receiver_hint,
+        source_start_byte,
     ) in rows
     {
+        // The reference's byte position drives the module-aware covering test (#61).
+        let ref_byte = usize::try_from(source_start_byte).unwrap_or(0);
         let resolution = resolve_symbol(
             ResolveSymbolRequest {
                 name: &to_name,
@@ -85,12 +156,15 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
                 receiver_hint: receiver_hint.as_deref(),
                 source_file_id,
                 source_language: index.file_language.get(&source_file_id).copied(),
-                imported_external: import_scope
-                    .is_external_import(source_file_id, short_name(&to_name))
-                    || import_scope.is_external_qualified_root(
-                        source_file_id,
-                        target_qualified_name.as_deref(),
-                    ),
+                imported_external: import_scope.is_external_import(
+                    source_file_id,
+                    short_name(&to_name),
+                    ref_byte,
+                ) || import_scope.is_external_qualified_root(
+                    source_file_id,
+                    target_qualified_name.as_deref(),
+                    ref_byte,
+                ),
             },
             &index,
         );
@@ -181,17 +255,22 @@ pub(crate) fn resolve_and_insert_edges(
     // dominant resolve-phase structure at kernel scale. Byte-identical: a `file_id` never recurs in
     // a later block, so per-file reset makes exactly the dedup decisions a global per-`file_id` set
     // would; `file_id` therefore drops out of the key (constant within each reset window).
-    // Crate-aware import scope (#61 Project B): map each file's `use`d leaf names to their crate
-    // root from the accumulated Imports edges, so resolution can suppress a bind to a local symbol
-    // when the name actually comes from an external dependency crate.
+    // Per-package + module-aware import scope (#61): from the accumulated Imports edges, build each
+    // file's module-scoped bindings + the per-file module interval set, plus the per-package local-
+    // crate sets — so resolution suppresses a bind to a local symbol only when the name comes from
+    // an external dependency in that reference's module + package. EXACT PARITY with the DB driver
+    // `resolve_all_edges`: identical `add_use(file, use_text, scope)` + `finalize()` +
+    // `is_external_*` calls, same fail-open; the only difference is the source (in-memory
+    // accumulator vs DB rows).
     let mut import_scope = imports::ImportScope::new(imports::load_local_roots(conn));
+    load_package_roots_into_scope(conn, &mut import_scope)?;
     for (file_id, candidate) in &edges {
-        if candidate.edge_kind == EdgeKind::Imports
-            && let Some(evidence) = arena.get_opt(candidate.evidence)
-        {
-            import_scope.add_use(*file_id, evidence);
+        if candidate.edge_kind == EdgeKind::Imports {
+            let evidence = arena.get_opt(candidate.evidence).unwrap_or("");
+            import_scope.add_use(*file_id, evidence, candidate.import_scope_range());
         }
     }
+    import_scope.finalize();
 
     let mut seen = BTreeSet::new();
     let mut seen_file_id: Option<i64> = None;
@@ -224,6 +303,9 @@ pub(crate) fn resolve_and_insert_edges(
         let target_qualified_name = arena.get_opt(candidate.target_qualified_name);
         let evidence = arena.get_opt(candidate.evidence);
         let receiver_hint = arena.get_opt(candidate.receiver_hint);
+        // The reference's byte position drives the module-aware covering test (#61) — same input
+        // the DB driver reads from `source_start_byte`.
+        let ref_byte = candidate.source_span.start_byte as usize;
         let resolution = resolve_symbol(
             ResolveSymbolRequest {
                 name: to_name,
@@ -233,8 +315,15 @@ pub(crate) fn resolve_and_insert_edges(
                 receiver_hint,
                 source_file_id: *file_id,
                 source_language: index.file_language.get(file_id).copied(),
-                imported_external: import_scope.is_external_import(*file_id, short_name(to_name))
-                    || import_scope.is_external_qualified_root(*file_id, target_qualified_name),
+                imported_external: import_scope.is_external_import(
+                    *file_id,
+                    short_name(to_name),
+                    ref_byte,
+                ) || import_scope.is_external_qualified_root(
+                    *file_id,
+                    target_qualified_name,
+                    ref_byte,
+                ),
             },
             &index,
         );
@@ -259,6 +348,9 @@ pub(crate) fn resolve_and_insert_edges(
         // NULL when the sentinel marks an absent callee range; see
         // `CompactEdge::callee_byte_columns`.
         let (callee_start_byte, callee_end_byte) = candidate.callee_byte_columns();
+        // NULL on non-import edges; the dedicated import-scope columns (#61).
+        let (import_scope_start_byte, import_scope_end_byte, import_mod_id) =
+            candidate.import_scope_columns();
         // Interned ids straight into edges_data (#79); the memo keeps repeated names to one map
         // probe, so the bulk path writes pure integers.
         let from_name_id = interner.get_opt(conn, from_name)?;
@@ -275,11 +367,12 @@ pub(crate) fn resolve_and_insert_edges(
                 target_qualified_name_id, evidence, receiver_hint_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 callee_start_byte, callee_end_byte,
+                import_scope_start_byte, import_scope_end_byte, import_mod_id,
                 edge_kind_id, confidence_id,
                 to_symbol_id, target_start_line, target_end_line, resolution_id
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19)
+             ?18, ?19, ?20, ?21, ?22)
             ",
         )?
         .execute(params![
@@ -296,6 +389,9 @@ pub(crate) fn resolve_and_insert_edges(
             i64::from(candidate.source_span.end_byte),
             callee_start_byte,
             callee_end_byte,
+            import_scope_start_byte,
+            import_scope_end_byte,
+            import_mod_id,
             edge_kind_id,
             confidence_id,
             to_symbol_id,
@@ -951,6 +1047,174 @@ mod tests {
             to,
             Some(build),
             "`config.build()` (lowercase value receiver) must NOT be suppressed by the import"
+        );
+    }
+
+    /// Insert an Imports edge carrying the dedicated module-aware scope columns (the V022 shape):
+    /// `[scope_start, scope_end)` + `mod_id`. For an inline `mod`, pass `mod_id == scope_start`.
+    fn add_import_edge_scoped(
+        conn: &Connection,
+        source_file_id: i64,
+        to_name: &str,
+        evidence: &str,
+        scope_start: i64,
+        scope_end: i64,
+        mod_id: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, \
+             confidence, resolution, evidence, import_scope_start_byte, import_scope_end_byte, \
+             import_mod_id) VALUES (?1, ?2, '', 'imports', 'NameOnly', 'unresolved', ?3, ?4, ?5, \
+             ?6)",
+            params![source_file_id, to_name, evidence, scope_start, scope_end, mod_id],
+        )
+        .unwrap();
+    }
+
+    /// A `calls_name`/reference edge whose call site sits at `source_start_byte` (drives the
+    /// module-aware covering test).
+    fn add_edge_at_byte(
+        conn: &Connection,
+        source_file_id: i64,
+        to_name: &str,
+        target_qualified_name: &str,
+        source_start_byte: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, \
+             confidence, resolution, source_start_byte) VALUES (?1, ?2, ?3, 'calls_name', \
+             'NameOnly', 'unresolved', ?4)",
+            params![source_file_id, to_name, target_qualified_name, source_start_byte],
+        )
+        .unwrap();
+        conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+    }
+
+    /// #61 (#4 via the DB driver): a `use url::Url` in a parent module must NOT suppress a `Url`
+    /// reference inside a CHILD module — the module-aware scope columns + inline-`mod` ranges flow
+    /// through `resolve_all_edges`, not just the unit-level `ImportScope`. A reference in the
+    /// parent module IS suppressed.
+    #[test]
+    fn module_aware_suppression_through_db_driver() {
+        let conn = seeded_conn();
+        set_local_crate_roots(&conn, "mycrate");
+        let user = add_file(&conn, "a.rs", NEW);
+        let defs = add_file(&conn, "b.rs", NEW);
+        // A local `Url` definition the bare references could (wrongly) bind to.
+        let local = add_symbol(&conn, defs, "Url", "crate::b::Url");
+        add_symbol(&conn, user, "user_fn", "crate::a::user_fn");
+        // Inline modules: parent a body [0,200), child b body [80,160) nested inside.
+        add_import_edge_scoped(&conn, user, "a", "mod a", 0, 200, 0);
+        add_import_edge_scoped(&conn, user, "b", "mod b", 80, 160, 80);
+        // `use url::Url;` lives directly in mod a (enclosing mod_id 0).
+        add_import_edge_scoped(&conn, user, "Url", "use url::Url;", 0, 200, 0);
+        // A `Url` reference inside child mod b (byte 100) and one in mod a itself (byte 40).
+        let in_child = add_edge_at_byte(&conn, user, "Url", "", 100);
+        let in_parent = add_edge_at_byte(&conn, user, "Url", "", 40);
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, _) = edge_state(&conn, in_child);
+        assert_eq!(
+            to,
+            Some(local),
+            "the parent module's `use url::Url` must not reach a reference in child mod b"
+        );
+        let (to, _, resolution) = edge_state(&conn, in_parent);
+        assert_eq!(
+            to, None,
+            "a `Url` reference in mod a itself IS suppressed by a's `use url::Url`"
+        );
+        assert_eq!(resolution, "unresolved");
+    }
+
+    fn add_package(conn: &Connection, manifest_dir: &str, roots_json: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO packages(manifest_dir, commit_sha, worktree_id, local_roots_json) VALUES \
+             (?1, ?2, '', ?3)",
+            params![manifest_dir, NEW, roots_json],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// #61 (#1 via the DB driver): a `path`-dep alias is local for the package that declares it and
+    /// EXTERNAL for a package that does not — `files.package_id` + `packages.local_roots_json` flow
+    /// through `resolve_all_edges`.
+    #[test]
+    fn per_package_alias_suppression_through_db_driver() {
+        let conn = seeded_conn();
+        // Global fallback union has both crates; per-package sets differ.
+        set_local_crate_roots(&conn, "myws\nlocal");
+        let pkg_a = add_package(&conn, "a", "[\"myws\",\"local\"]");
+        let pkg_b = add_package(&conn, "b", "[\"myws\"]");
+        let file_a = add_file(&conn, "a/src/lib.rs", NEW);
+        let file_b = add_file(&conn, "b/src/lib.rs", NEW);
+        conn.execute("UPDATE main.files SET package_id = ?2 WHERE id = ?1", params![file_a, pkg_a])
+            .unwrap();
+        conn.execute("UPDATE main.files SET package_id = ?2 WHERE id = ?1", params![file_b, pkg_b])
+            .unwrap();
+        // A local `Thing` definition both files' bare refs could bind to.
+        let local = add_symbol(&conn, file_a, "Thing", "crate::a::Thing");
+        add_import_edge_scoped(&conn, file_a, "Thing", "use local::Thing;", 0, 9999, MOD_FILE_ROOT);
+        add_import_edge_scoped(&conn, file_b, "Thing", "use local::Thing;", 0, 9999, MOD_FILE_ROOT);
+        let ref_a = add_edge_at_byte(&conn, file_a, "Thing", "", 100);
+        let ref_b = add_edge_at_byte(&conn, file_b, "Thing", "", 100);
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, _) = edge_state(&conn, ref_a);
+        assert_eq!(to, Some(local), "in package A, `local` is its own alias — a LOCAL crate");
+        let (to, _, resolution) = edge_state(&conn, ref_b);
+        assert_eq!(
+            to, None,
+            "in package B, `local` is an EXTERNAL crate — the bare ref is suppressed"
+        );
+        assert_eq!(resolution, "unresolved");
+    }
+
+    /// The dedicated import-scope columns must NOT perturb the SCIP-oracle candidate set: import
+    /// edges leave `callee_start_byte` NULL, so `edge_join_candidates` (whose filter is
+    /// `callee_start_byte IS NOT NULL`) never sees them — this is why the columns are DEDICATED and
+    /// the `ORACLE_JUDGED_EDGE_KINDS` band-aid (#100) is unnecessary.
+    #[test]
+    fn oracle_unaffected_by_import_scope_columns() {
+        let conn = seeded_conn();
+        let user = add_file(&conn, "a.rs", NEW);
+        // An import edge with scope columns set but callee_* NULL.
+        add_import_edge_scoped(&conn, user, "Url", "use url::Url;", 0, 200, 0);
+        // A call edge that DOES carry a callee range (the oracle's real candidate).
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+             callee_start_byte, callee_end_byte) VALUES (?1, 'parse', 'calls_name', 'NameOnly', \
+             'unresolved', 10, 15)",
+            params![user],
+        )
+        .unwrap();
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        // The oracle's candidate filter is exactly `callee_start_byte IS NOT NULL` (store.rs
+        // `edge_join_candidates`). Mirror it here: only the call edge qualifies; the import edge —
+        // despite its populated import_scope_* columns — leaves callee_* NULL and is excluded.
+        let candidate_kinds: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT edge_kind FROM edges WHERE callee_start_byte IS NOT NULL AND \
+                     callee_end_byte IS NOT NULL ORDER BY edge_kind",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            candidate_kinds,
+            vec!["calls_name".to_string()],
+            "only the call edge (non-NULL callee range) is an oracle candidate; the import edge's \
+             scope columns must not pull it in"
         );
     }
 }
