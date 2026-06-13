@@ -120,7 +120,13 @@ pub struct SchemaStatus {
     pub message: String,
 }
 
-pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
+/// Provision the baseline (001) idempotently: the schema_version ledger, then `apply_baseline`
+/// (all `CREATE … IF NOT EXISTS`) wrapped in the dirty marker so a crash mid-baseline is
+/// detectable, then record 001. Shared by [`apply`] (fresh DB) and [`migrate_forward`] (existing DB
+/// behind by N). LOAD-BEARING for forward-only: a pre-interning (≤v19) DB lacks shared tables like
+/// `edge_strings`/`edges_data` that later migrations INSERT into, so the baseline must run BEFORE
+/// any forward step replays — exactly what the old full `apply` did before the ladder.
+fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_version(
@@ -145,9 +151,13 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         return Err(err);
     }
     conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
-    record_migration(conn, MIGRATION_001_ID, MIGRATION_001_CHECKSUM, MIGRATION_001_DESCRIPTION)?;
-    // The additive migrations on top of the baseline, in order. Same list `migrate_forward` walks,
-    // so a fresh DB (here) and an existing DB behind by N apply exactly the same steps.
+    record_migration(conn, MIGRATION_001_ID, MIGRATION_001_CHECKSUM, MIGRATION_001_DESCRIPTION)
+}
+
+pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
+    provision_baseline(conn)?;
+    // Every additive migration in order. A fresh DB runs them all; data backfills on empty tables
+    // are no-ops. (An EXISTING DB takes the forward-only path via `migrate_forward`, not this.)
     for step in ADDITIVE_MIGRATIONS {
         (step.apply)(conn)?;
         record_migration(conn, step.id, step.checksum, step.description)?;
@@ -289,11 +299,14 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
-/// existing index that lags this binary. Unlike [`apply`], it never re-runs an already-applied
-/// migration, so a data backfill like 005's resolution rewrite (an unconditional UPDATE) cannot
-/// clobber current values on a routine open. The caller guarantees the baseline (001) is present (a
-/// versioned ledger exists); a ledger-less legacy DB is refused upstream, not force-migrated.
+/// existing index that lags this binary. It first provisions the baseline idempotently (so a
+/// ≤v19 DB that predates a shared table like `edge_strings`/`edges_data` has it before a later
+/// migration INSERTs into it), then replays just the unapplied steps. Unlike [`apply`], it never
+/// re-runs an already-applied migration, so a data backfill like 005's resolution rewrite (an
+/// unconditional UPDATE) cannot clobber current values on a routine open. The caller guarantees a
+/// versioned ledger exists; a ledger-less legacy DB is refused upstream, not force-migrated.
 pub fn migrate_forward(conn: &Connection) -> anyhow::Result<()> {
+    provision_baseline(conn)?;
     let applied: std::collections::HashSet<String> =
         applied_migrations(conn)?.into_iter().map(|migration| migration.id).collect();
     for step in ADDITIVE_MIGRATIONS {

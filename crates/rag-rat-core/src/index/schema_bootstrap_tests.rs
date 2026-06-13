@@ -222,6 +222,50 @@ fn forward_migration_does_not_rerun_already_applied_migrations() {
 }
 
 #[test]
+fn forward_migration_reprovisions_missing_baseline_tables() {
+    // Forward-only must run the idempotent baseline BEFORE replaying steps (#103 review): a ≤v19
+    // index predates shared tables (e.g. edge_strings) that a later migration INSERTs into.
+    // Simulate by dropping the edges view + edge_strings and the two newest ledger rows so the
+    // index reads as pre-interning; open must reprovision the table and reach Compatible rather
+    // than fail on a missing-table INSERT.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join(".rag-rat")).unwrap();
+    let database = root.join(".rag-rat/index.sqlite");
+    IndexDatabase::migrate(&database).unwrap();
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "DROP VIEW IF EXISTS edges;
+         DROP TABLE IF EXISTS edge_strings;
+         DELETE FROM schema_version WHERE id LIKE '021%' OR id LIKE '020%';",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        IndexDatabase::migration_check(&database).unwrap().state,
+        schema::SchemaState::Older
+    );
+    IndexDatabase::open(&database).unwrap();
+    assert_eq!(
+        IndexDatabase::migration_check(&database).unwrap().state,
+        schema::SchemaState::Compatible
+    );
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let edge_strings_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'edge_strings'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    assert_eq!(edge_strings_exists, 1, "baseline did not reprovision edge_strings before replay");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn open_auto_migrates_a_forward_older_schema_to_latest() {
     // The binary-upgrade case: a fully-migrated index missing only the newest migration row reads
     // as `Older` (current_version < latest). Opening it applies only the missing migration forward.
