@@ -110,18 +110,27 @@ impl IndexDatabase {
                 db.apply_prepared_git_history(&config.root, handle)?;
                 mutated = true;
             }
+            // Refresh local_crate_roots when a Cargo.toml is in the change set — must happen
+            // OUTSIDE the `indexed > 0 || healed > 0` gate (#95). When the only changed path
+            // is a Cargo.toml (no indexable Rust file touched), `indexed` and `healed` are both
+            // 0, so the old inner position skipped the refresh and left the crate set stale until
+            // the next full rebuild. The manifest gate ensures we never pay the walk on an
+            // ordinary file-edit pass (#63 invariant for non-manifest changes).
+            // `refresh_local_crate_roots_if_changed` returns whether it wrote a new value, so we
+            // can trigger the re-resolve even when no file was indexed.
+            let roots_changed = if manifest_in_change_set {
+                db.refresh_local_crate_roots_if_changed(&config.root)?
+            } else {
+                false
+            };
+            if roots_changed {
+                mutated = true;
+            }
             // Healing can delete overlay symbols (NULLing their in-edges via
             // `remove_file_in_scope`), so it needs the same re-derive tail as real file changes.
-            if indexed > 0 || healed > 0 {
-                // Refresh local_crate_roots BEFORE resolve_edges so the resolve pass sees the
-                // updated workspace crate set (#95). Only when a Cargo.toml is in the change
-                // set — an ordinary file edit must NOT pay the manifest walk (issue #63 invariant).
-                // `set_meta_if_changed` ensures a Cargo.toml that changed content but kept the
-                // same crate set is also a no-op write, preserving the idle-pass no-write
-                // invariant.
-                if manifest_in_change_set {
-                    db.refresh_local_crate_roots_if_changed(&config.root)?;
-                }
+            // Also re-resolve when roots changed but no file was indexed — the updated crate set
+            // must take effect so `use new_crate::X` resolves correctly (#95).
+            if indexed > 0 || healed > 0 || roots_changed {
                 progress(IndexProgress::RebuildingLogicalSymbols);
                 db.rebuild_logical_symbols()?;
                 progress(IndexProgress::ResolvingGraph);
@@ -269,15 +278,14 @@ impl IndexDatabase {
     ///
     /// Uses `set_meta_if_changed` so a manifest edit that leaves the crate-name set unchanged is a
     /// no-op write, preserving the #63 idle-pass invariant.
-    pub(super) fn refresh_local_crate_roots_if_changed(&self, root: &Path) -> anyhow::Result<()> {
+    pub(super) fn refresh_local_crate_roots_if_changed(&self, root: &Path) -> anyhow::Result<bool> {
         let roots = super::edges::local_crate_roots(root);
         let serialized = {
             let mut sorted: Vec<&str> = roots.iter().map(String::as_str).collect();
             sorted.sort_unstable();
             sorted.join("\n")
         };
-        self.set_meta_if_changed("local_crate_roots", &serialized)?;
-        Ok(())
+        self.set_meta_if_changed("local_crate_roots", &serialized)
     }
 
     fn assign_file_scopes(

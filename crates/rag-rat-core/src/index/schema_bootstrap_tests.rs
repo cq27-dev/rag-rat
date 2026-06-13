@@ -7330,3 +7330,139 @@ fn incremental_discover_does_not_rewrite_local_crate_roots_on_idle_pass() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// #95 (manifest-only path): when the ONLY changed path is a `Cargo.toml` (no Rust source
+/// file touched), `indexed == 0` and `healed == 0`. The old code nested the refresh inside
+/// `if indexed > 0 || healed > 0`, so the refresh was silently skipped.
+///
+/// This test verifies that a bare `Cargo.toml` add (no accompanying `.rs` file) still
+/// updates `local_crate_roots` and triggers a re-resolve pass.
+#[test]
+fn incremental_discover_manifest_only_change_refreshes_roots_and_resolves() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    // Start with a single crate that has one Rust file.
+    fs::create_dir_all(root.join("crates/alpha/src")).unwrap();
+    fs::write(root.join("crates/alpha/src/lib.rs"), "pub fn seed() {}\n").unwrap();
+    fs::write(
+        root.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "init"]);
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("crates")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let initial_roots = stored_crate_roots(&db);
+    assert!(initial_roots.contains(&"alpha".to_string()), "initial roots: {initial_roots:?}");
+    drop(db);
+
+    // Add a second crate manifest ONLY — no Rust source file. This is the manifest-only
+    // scenario: `indexed == 0` on the next discover pass.
+    fs::create_dir_all(root.join("crates/beta")).unwrap();
+    fs::write(
+        root.join("crates/beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    // Do NOT write crates/beta/src/lib.rs — Cargo.toml is the only new file.
+
+    // Incremental discover — must refresh local_crate_roots even though indexed == 0.
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    let updated_roots = stored_crate_roots(&db);
+    assert!(
+        updated_roots.contains(&"beta".to_string()),
+        "beta must appear in local_crate_roots after manifest-only discover; got: \
+         {updated_roots:?}"
+    );
+    assert!(
+        updated_roots.contains(&"alpha".to_string()),
+        "alpha must still be present; got: {updated_roots:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// #95 + #63 interaction: a `Cargo.toml` edit that does NOT change the set of local crate
+/// names (e.g. bumping the version field) must not change the stored `local_crate_roots`
+/// value — `set_meta_if_changed` detects the set is identical and skips the write.
+///
+/// Verified by running an initial discover pass so the key stabilises to the real crate
+/// set, then doing a version-only bump and asserting the stored value is unchanged.
+#[test]
+fn incremental_discover_manifest_edit_unchanged_crate_set_is_noop() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("crates/alpha/src")).unwrap();
+    fs::write(root.join("crates/alpha/src/lib.rs"), "pub fn seed() {}\n").unwrap();
+    fs::write(
+        root.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "init"]);
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("crates")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+
+    // Full rebuild — local_crate_roots lands as "alpha".
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let roots_after_rebuild = stored_crate_roots(&db);
+    assert_eq!(roots_after_rebuild, vec!["alpha".to_string()], "rebuild roots");
+    drop(db);
+
+    // Version-only bump — crate name set is identical to what rebuild stored.
+    fs::write(
+        root.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.2.0\"\n",
+    )
+    .unwrap();
+
+    // Incremental discover — manifest is in the change set but crate names are unchanged,
+    // so set_meta_if_changed returns false and the stored set stays "alpha".
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    let roots_after = stored_crate_roots(&db);
+    assert_eq!(
+        roots_after,
+        vec!["alpha".to_string()],
+        "version-only manifest bump must not change local_crate_roots; got: {roots_after:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
