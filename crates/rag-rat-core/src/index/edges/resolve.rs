@@ -26,19 +26,16 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let mut import_scope = imports::ImportScope::new(imports::load_local_roots(conn));
     {
         let mut stmt = conn.prepare(
-            "SELECT d.source_file_id, tn.value, d.evidence FROM edges_data d JOIN files ON \
-             files.id = d.source_file_id JOIN edge_strings ek ON ek.id = d.edge_kind_id LEFT JOIN \
-             edge_strings tn ON tn.id = d.to_name_id WHERE ek.value = 'imports'",
+            "SELECT d.source_file_id, d.evidence FROM edges_data d JOIN files ON files.id = \
+             d.source_file_id JOIN edge_strings ek ON ek.id = d.edge_kind_id WHERE ek.value = \
+             'imports'",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let file_id: i64 = row.get(0)?;
-            let to_name: Option<String> = row.get(1)?;
-            let evidence: Option<String> = row.get(2)?;
-            if let (Some(to_name), Some(evidence)) = (to_name, evidence)
-                && let Some(root) = imports::use_root(&evidence)
-            {
-                import_scope.add_import(file_id, short_name(to_name.trim()), root);
+            let evidence: Option<String> = row.get(1)?;
+            if let Some(evidence) = evidence {
+                import_scope.add_use(file_id, &evidence);
             }
         }
     }
@@ -187,13 +184,8 @@ pub(crate) fn resolve_and_insert_edges(
     for (file_id, candidate) in &edges {
         if candidate.edge_kind == EdgeKind::Imports
             && let Some(evidence) = arena.get_opt(candidate.evidence)
-            && let Some(root) = imports::use_root(evidence)
         {
-            import_scope.add_import(
-                *file_id,
-                short_name(arena.get(candidate.to_name).trim()),
-                root,
-            );
+            import_scope.add_use(*file_id, evidence);
         }
     }
 
@@ -330,7 +322,12 @@ pub(crate) fn resolve_symbol<'a>(
     // external-dep collisions (`Url` → local instead of the `url` crate) WITHOUT touching
     // correct cross-crate binds into local workspace crates (those roots are in the local-crate
     // set, so not external).
-    if request.imported_external {
+    //
+    // EXCEPTION: an explicitly LOCAL-qualified reference (`crate::Url`, `self::Url`, `super::Url`)
+    // names a local item by construction — the qualifier overrides the bare-leaf import. Don't
+    // suppress it just because the file also imports a same-named external item; fall through so
+    // the qualified path can bind.
+    if request.imported_external && !targets_local_qualified_path(request.target_qualified_name) {
         return None;
     }
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
@@ -341,15 +338,25 @@ pub(crate) fn resolve_symbol<'a>(
         // match → `Syntactic`. This is what lets the strong qualified path fire for
         // methods/nested items instead of collapsing to bare-name matching. On ambiguity,
         // fall through rather than guess.
-        if let Some(symbol) = index
+        //
+        // `scope_path` is NOT file-unique (a workspace with two crates each declaring
+        // `mod core { impl Workspace { fn new } }` has two symbols with scope_path
+        // `core::Workspace::new`), so an exact hit may be ambiguous — DON'T stamp the first one
+        // `Exact`. Bind only a unique hit (or one logical symbol's variants); otherwise fall
+        // through to the file-path/bare-name logic, which is itself ambiguity-aware.
+        let scope_exact = index
             .by_scope_path
             .get(qualified)
             .into_iter()
             .flatten()
             .copied()
-            .find(|symbol| kind_matches(symbol))
-        {
-            return Some((symbol, EdgeConfidence::Exact, "scope_exact"));
+            .filter(|symbol| kind_matches(symbol))
+            .collect::<Vec<_>>();
+        match scope_exact.as_slice() {
+            [symbol] => return Some((*symbol, EdgeConfidence::Exact, "scope_exact")),
+            [_, ..] if same_logical_symbol(&scope_exact) =>
+                return Some((scope_exact[0], EdgeConfidence::Syntactic, "logical_variant")),
+            _ => {},
         }
         let scope_suffix = format!("::{qualified}");
         let scope_matches = index
@@ -502,6 +509,15 @@ pub(crate) fn allow_unqualified_fallback(
         return false;
     }
     true
+}
+/// Whether an edge's `target_qualified_name` is an explicitly LOCAL-rooted path (`crate::…`,
+/// `self::…`, `super::…`) — code disambiguating a local item with a qualifier. Such a reference is
+/// exempt from crate-aware import suppression (#61 Project B) even when the file also imports a
+/// same-named external item.
+fn targets_local_qualified_path(target_qualified_name: Option<&str>) -> bool {
+    target_qualified_name.is_some_and(|path| {
+        path.starts_with("crate::") || path.starts_with("self::") || path.starts_with("super::")
+    })
 }
 pub(crate) fn is_external_rust_root(value: &str) -> bool {
     matches!(
@@ -764,5 +780,132 @@ mod tests {
 
         let (to, _, _) = edge_state(&conn, ref_struct);
         assert_eq!(to, Some(gadget), "a type reference still resolves to a struct definition");
+    }
+
+    fn add_symbol_scope(
+        conn: &Connection,
+        file_id: i64,
+        name: &str,
+        qualified: &str,
+        scope_path: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name, scope_path, kind, \
+             start_byte, end_byte, start_line, end_line) VALUES (?1, 'rust', ?2, ?3, ?4, \
+             'function', 0, 10, 1, 1)",
+            params![file_id, name, qualified, scope_path],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// #61: `scope_path` is NOT file-unique. When two symbols in different files share a scope_path,
+    /// an exact scope match is AMBIGUOUS and must NOT bind one as `Exact` — it falls through.
+    #[test]
+    fn scope_exact_does_not_bind_an_ambiguous_scope_path() {
+        let conn = seeded_conn();
+        let f1 = add_file(&conn, "a.rs", NEW);
+        let f2 = add_file(&conn, "b.rs", NEW);
+        let caller = add_file(&conn, "c.rs", NEW);
+        // Two distinct symbols sharing the SAME scope_path (a multi-crate same-name collision).
+        add_symbol_scope(&conn, f1, "build", "a.rs::build", "core::Builder::build");
+        add_symbol_scope(&conn, f2, "build", "b.rs::build", "core::Builder::build");
+        let edge = add_edge(&conn, caller, "build", "core::Builder::build");
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, resolution) = edge_state(&conn, edge);
+        assert_eq!(to, None, "an ambiguous scope_path must not silently bind one at Exact");
+        assert_eq!(resolution, "unresolved");
+    }
+
+    /// The positive control: a UNIQUE scope_path binds `Exact` via `scope_exact`.
+    #[test]
+    fn scope_exact_binds_a_unique_scope_path() {
+        let conn = seeded_conn();
+        let defs = add_file(&conn, "b.rs", NEW);
+        let caller = add_file(&conn, "c.rs", NEW);
+        let target = add_symbol_scope(&conn, defs, "build", "b.rs::build", "core::Builder::build");
+        let edge = add_edge(&conn, caller, "build", "core::Builder::build");
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, resolution) = edge_state(&conn, edge);
+        assert_eq!(to, Some(target));
+        assert_eq!(resolution, "scope_exact");
+    }
+
+    fn set_local_crate_roots(conn: &Connection, roots: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('local_crate_roots', ?1)",
+            params![roots],
+        )
+        .unwrap();
+    }
+
+    fn add_import_edge(conn: &Connection, source_file_id: i64, to_name: &str, evidence: &str) {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, \
+             confidence, resolution, evidence) VALUES (?1, ?2, '', 'imports', 'NameOnly', \
+             'unresolved', ?3)",
+            params![source_file_id, to_name, evidence],
+        )
+        .unwrap();
+    }
+
+    /// #61 Project B: a bare reference to a name `use`d from an EXTERNAL crate (`url::Url`) must not
+    /// bind to a local same-named symbol — but an explicitly LOCAL-qualified `crate::Url` reference
+    /// in the same file still must (the qualifier overrides the import; Codex review
+    /// resolve.rs:334).
+    #[test]
+    fn external_import_suppresses_bare_but_not_locally_qualified() {
+        let conn = seeded_conn();
+        set_local_crate_roots(&conn, "mycrate");
+        let user = add_file(&conn, "a.rs", NEW);
+        let defs = add_file(&conn, "b.rs", NEW);
+        let local = add_symbol(&conn, defs, "Url", "crate::b::Url");
+        add_import_edge(&conn, user, "Url", "use url::Url;");
+        let bare = add_edge(&conn, user, "Url", "");
+        let qualified = add_edge(&conn, user, "Url", "crate::Url");
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, resolution) = edge_state(&conn, bare);
+        assert_eq!(to, None, "a bare `Url` from the external `url` crate must not bind locally");
+        assert_eq!(resolution, "unresolved");
+
+        let (to, _, _) = edge_state(&conn, qualified);
+        assert_eq!(
+            to,
+            Some(local),
+            "explicit `crate::Url` names the local item despite the import"
+        );
+    }
+
+    /// #61 Project B (Codex review imports.rs:87 / resolve.rs:41): the imports edge stream emits the
+    /// path PREFIX of a braced `use` (`std::path`) as well as the real bindings, so the scope must
+    /// be built from parsed bindings — a local `path` must stay resolvable next to `use
+    /// std::path::{…}`.
+    #[test]
+    fn use_path_prefix_does_not_suppress_a_local_name() {
+        let conn = seeded_conn();
+        set_local_crate_roots(&conn, "mycrate");
+        let user = add_file(&conn, "a.rs", NEW);
+        let local = add_symbol(&conn, user, "path", "crate::a::path");
+        add_import_edge(&conn, user, "Path", "use std::path::{Path, PathBuf};");
+        let call = add_edge(&conn, user, "path", "");
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, _) = edge_state(&conn, call);
+        assert_eq!(
+            to,
+            Some(local),
+            "`path` is the use PREFIX, not a binding — local `path` resolves"
+        );
     }
 }
