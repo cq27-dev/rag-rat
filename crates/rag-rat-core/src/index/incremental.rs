@@ -79,7 +79,7 @@ impl IndexDatabase {
                 db.set_meta_if_changed("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             let git_meta_changed = db.write_git_meta(&config.root)?;
-            let indexed = match mode {
+            let (indexed, manifest_in_change_set) = match mode {
                 IndexMode::Changed => db.index_changed_files_with_progress(config, progress)?,
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
@@ -100,9 +100,28 @@ impl IndexDatabase {
                 db.apply_prepared_git_history(&config.root, handle)?;
                 mutated = true;
             }
+            // Per-package import scope (#61, salvaging #95's ordering): rewrite `packages` +
+            // reassign `files.package_id` + refresh the global `local_crate_roots` union BEFORE the
+            // resolve pass, so the resolver sees the current package map. Run it when a file was
+            // (re)indexed (a new/edited .rs needs its package_id) OR a Cargo.toml is in the change
+            // set (the crate set may have changed) — OUTSIDE the `indexed>0 || healed>0` gate, so a
+            // manifest-only change (no Rust file touched, indexed==0) still refreshes (#95 bug:
+            // the refresh was nested inside that gate and was skipped, leaving the crate set stale
+            // until the next full rebuild). `refresh_packages` returns whether the global union
+            // changed, which forces a re-resolve even when no file was indexed.
+            let roots_changed = if indexed > 0 || healed > 0 || manifest_in_change_set {
+                db.refresh_packages(&config.root)?
+            } else {
+                false
+            };
+            if roots_changed {
+                mutated = true;
+            }
             // Healing can delete overlay symbols (NULLing their in-edges via
             // `remove_file_in_scope`), so it needs the same re-derive tail as real file changes.
-            if indexed > 0 || healed > 0 {
+            // Also re-resolve when the crate set changed but no file was indexed (a manifest-only
+            // change) so `use new_crate::X` resolves correctly (#95).
+            if indexed > 0 || healed > 0 || roots_changed {
                 progress(IndexProgress::RebuildingLogicalSymbols);
                 db.rebuild_logical_symbols()?;
                 progress(IndexProgress::ResolvingGraph);
@@ -185,39 +204,61 @@ impl IndexDatabase {
             }
             // `prepared` (this wave's chunk texts / symbols / edge candidates) drops here.
         }
+        // Per-package import scope (#61): write `packages` + `files.package_id` + the global
+        // `local_crate_roots` union now — files are inserted, but the resolve below has not run, so
+        // it reads the fresh package assignment. (`set_context` installs the `files` scope view at
+        // open, so the scoped reads in the resolve see these rows.)
+        self.refresh_packages(&config.root)?;
         edges::resolve_and_insert_edges(self.storage.connection(), graph)?;
 
         Ok(total)
     }
 
+    /// Returns `(file_count, manifest_in_change_set)`. The manifest flag is true when any changed
+    /// or deleted path is a `Cargo.toml`, signalling the workspace crate set may have changed
+    /// and the `packages` map should be refreshed before the resolve pass (#61, salvaging #95).
     fn index_changed_files_with_progress<F>(
         &self,
         config: &Config,
         progress: &mut F,
-    ) -> anyhow::Result<usize>
+    ) -> anyhow::Result<(usize, bool)>
     where
         F: FnMut(IndexProgress),
     {
         progress(IndexProgress::Discovering);
         let changes = git_changed_paths(&config.root)?;
+        let manifest_in_change_set =
+            paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
+                || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path));
         let files = collect_changed_index_files(config, &changes)?;
         let files = self.assign_file_scopes(files, &changes);
-        self.apply_incremental_file_plan(files, changes.deleted, progress)
+        let count = self.apply_incremental_file_plan(files, changes.deleted, progress)?;
+        Ok((count, manifest_in_change_set))
     }
 
+    /// Returns `(file_count, manifest_in_change_set)`. The manifest flag also consults the
+    /// discovery plan's file list, so a NEW (untracked, not-yet-committed) `Cargo.toml` is
+    /// caught even though git status would not list it as changed (#61, salvaging #95).
     fn index_discovered_files_with_progress<F>(
         &self,
         config: &Config,
         progress: &mut F,
-    ) -> anyhow::Result<usize>
+    ) -> anyhow::Result<(usize, bool)>
     where
         F: FnMut(IndexProgress),
     {
         progress(IndexProgress::Discovering);
         let plan = discovery_plan(self.storage.connection(), config)?;
         let changes = git_changed_paths(&config.root).unwrap_or_default();
+        let manifest_in_change_set =
+            paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
+                || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path))
+                || paths_include_cargo_toml(
+                    plan.files.iter().map(|file| file.relative_path.as_path()),
+                );
         let files = self.assign_file_scopes(plan.files, &changes);
-        self.apply_incremental_file_plan(files, plan.deleted, progress)
+        let count = self.apply_incremental_file_plan(files, plan.deleted, progress)?;
+        Ok((count, manifest_in_change_set))
     }
 
     fn assign_file_scopes(
@@ -352,4 +393,11 @@ impl IndexDatabase {
 
         Ok(files.len() + deleted_count)
     }
+}
+
+/// Whether any path in an iterator is a `Cargo.toml` — the gate for the per-package refresh on an
+/// incremental pass (#61, salvaging #95). Checked against both changed and deleted paths so a crate
+/// removal also triggers the refresh.
+fn paths_include_cargo_toml<'a>(mut paths: impl Iterator<Item = &'a Path>) -> bool {
+    paths.any(|path| path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml"))
 }

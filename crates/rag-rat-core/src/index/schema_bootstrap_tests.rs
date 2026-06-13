@@ -6710,6 +6710,166 @@ fn table_columns(db: &IndexDatabase, table: &str) -> Vec<String> {
     stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(Result::unwrap).collect()
 }
 
+fn conn_table_columns(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(Result::unwrap).collect()
+}
+
+fn conn_table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+        [table],
+        |_| Ok(()),
+    )
+    .optional()
+    .unwrap()
+    .is_some()
+}
+
+/// V022 bootstrap (fresh-applies-all): a brand-new index applies every migration through V022 and
+/// ends with the `packages` table, `files.package_id`, and the three DEDICATED edge import-scope
+/// columns — and the `edges` compatibility view surfaces them. The oracle's `callee_*` columns are
+/// untouched (the columns are dedicated, not a callee overload).
+#[test]
+fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 22);
+    assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
+
+    let package_cols = conn_table_columns(&conn, "packages");
+    for expected in ["id", "manifest_dir", "commit_sha", "worktree_id", "local_roots_json"] {
+        assert!(package_cols.contains(&expected.to_string()), "packages missing {expected}");
+    }
+    assert!(
+        conn_table_columns(&conn, "files").contains(&"package_id".to_string()),
+        "files.package_id is added"
+    );
+    // Dedicated columns on the real edge table — NOT a callee_* overload.
+    let edges_data_cols = conn_table_columns(&conn, "edges_data");
+    for expected in ["import_scope_start_byte", "import_scope_end_byte", "import_mod_id"] {
+        assert!(edges_data_cols.contains(&expected.to_string()), "edges_data missing {expected}");
+    }
+    assert!(
+        edges_data_cols.contains(&"callee_start_byte".to_string()),
+        "the oracle's callee_start_byte column is untouched"
+    );
+    // The compatibility view surfaces the new columns (so writers/tests can set them).
+    let edges_view_cols = conn_table_columns(&conn, "edges");
+    for expected in ["import_scope_start_byte", "import_scope_end_byte", "import_mod_id"] {
+        assert!(edges_view_cols.contains(&expected.to_string()), "edges view missing {expected}");
+    }
+    // The packages-scope index exists.
+    assert!(
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_packages_scope'",
+            [],
+            |_| Ok(())
+        )
+        .optional()
+        .unwrap()
+        .is_some(),
+        "idx_packages_scope is created"
+    );
+}
+
+/// V022 forward-only migrate (older→latest): an index lacking the V022 artifacts (the `packages`
+/// table, `files.package_id`, the edge import-scope columns, and the V022 schema_version row) is
+/// re-`apply`ed and converges to V22 with all artifacts present — proving the migration is additive
+/// and idempotent on top of an older shape, the auto-migrate-forward path (#102).
+#[test]
+fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // Simulate a pre-V022 index: drop the V022 artifacts and its schema_version row. (SQLite ≥3.35
+    // supports DROP COLUMN; the bundled rusqlite is current.)
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS packages;
+        DROP INDEX IF EXISTS idx_packages_scope;
+        DROP VIEW IF EXISTS edges;
+        DROP TRIGGER IF EXISTS edges_view_insert;
+        DROP TRIGGER IF EXISTS edges_view_update;
+        DROP TRIGGER IF EXISTS edges_view_delete;
+        ALTER TABLE files DROP COLUMN package_id;
+        ALTER TABLE edges_data DROP COLUMN import_scope_start_byte;
+        ALTER TABLE edges_data DROP COLUMN import_scope_end_byte;
+        ALTER TABLE edges_data DROP COLUMN import_mod_id;
+        DELETE FROM schema_version WHERE id = '022_per_package_import_scope';
+        ",
+    )
+    .unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 21, "now looks like a V21 index");
+    assert!(!conn_table_exists(&conn, "packages"));
+
+    // Forward-migrate: re-running apply (the Older→apply path) converges to V22.
+    schema::apply(&conn).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, 22);
+    assert!(conn_table_exists(&conn, "packages"), "forward migrate creates packages");
+    assert!(conn_table_columns(&conn, "files").contains(&"package_id".to_string()));
+    let edges_data_cols = conn_table_columns(&conn, "edges_data");
+    for expected in ["import_scope_start_byte", "import_scope_end_byte", "import_mod_id"] {
+        assert!(edges_data_cols.contains(&expected.to_string()), "forward migrate adds {expected}");
+    }
+    // The view was rebuilt and surfaces the columns (a SELECT must not fail).
+    conn.query_row("SELECT import_mod_id FROM edges LIMIT 1", [], |_| Ok(())).optional().unwrap();
+}
+
+/// End-to-end through the FULL-REBUILD driver (`resolve_and_insert_edges`): a real `rebuild` of a
+/// tiny Cargo workspace must apply per-package + module-aware import scope. A bare reference to a
+/// name `use`d from an EXTERNAL crate stays unresolved; a same-named LOCAL workspace symbol still
+/// resolves from the package that owns it. This is the full-driver half of the both-driver parity
+/// (the DB driver is covered by `module_aware_suppression_through_db_driver`).
+#[test]
+fn full_rebuild_applies_per_package_import_scope() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // A workspace crate `myapp` with a LOCAL `Helper` and an EXTERNAL `use std::fmt::Display`.
+    // `Helper` referenced via a local crate path resolves; a `Display` reference does not bind to a
+    // (hypothetical) local symbol because it is use'd from std.
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"myapp\"\n").unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "use std::fmt::Display;\npub struct Helper;\npub struct Display;\npub fn run() {\n    let \
+         _ = Display;\n    let _ = Helper;\n}\n",
+    )
+    .unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // The `packages` table was populated with myapp's root crate.
+    let package_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0)).unwrap();
+    assert!(package_count >= 1, "rebuild writes a packages row for the manifest");
+    // Every indexed file got a package_id (the single root package owns src/lib.rs).
+    let unassigned: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files WHERE package_id IS NULL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(unassigned, 0, "the file is assigned to its owning package");
+
+    // The `Display` reference (use'd from external std) must NOT bind to the local `Display`
+    // struct.
+    let display_bound: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE to_name = 'Display' AND edge_kind = \
+             'references_type' AND to_symbol_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        display_bound, 0,
+        "a `Display` use'd from external std must not bind to the local `Display` struct"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn indexed_revision_count(db: &IndexDatabase) -> i64 {
     db.storage
         .connection()

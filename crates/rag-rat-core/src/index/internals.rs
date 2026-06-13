@@ -697,6 +697,81 @@ impl IndexDatabase {
         self.set_meta("graph_index_version", GRAPH_INDEX_VERSION)
     }
 
+    /// Rewrite the `packages` rows for the ACTIVE scope from the corpus's Cargo manifests and
+    /// assign `files.package_id`, then persist the GLOBAL local-crate-root union to
+    /// `index_meta.local_crate_roots` (#61 per-package import scope). Returns whether the global
+    /// union changed (so an incremental pass can trigger a re-resolve only when it must).
+    ///
+    /// Scoped by `(active_commit_sha, active_worktree_id)` like `files`: each pass owns its scope's
+    /// rows (DELETE + reinsert), and a sibling worktree's package rows are untouched. A file is
+    /// assigned the package whose RELATIVE `manifest_dir` is the longest prefix of the file's
+    /// stored path (the root manifest's empty dir is the catch-all). Resolution falls open to
+    /// the global set for any file left with NULL `package_id` (no manifest matched / non-Cargo
+    /// corpus).
+    pub(super) fn refresh_packages(&self, root: &Path) -> anyhow::Result<bool> {
+        let (global_roots, packages) = super::edges::scan_packages(root);
+        let conn = self.storage.connection();
+        // Replace this scope's package rows. The id is reassigned each rebuild, which is fine — it
+        // is referenced only by this scope's freshly-written files.package_id below.
+        conn.execute("DELETE FROM packages WHERE commit_sha = ?1 AND worktree_id = ?2", params![
+            self.active_commit_sha,
+            self.active_worktree_id
+        ])?;
+        // (manifest_dir, package_id), kept for the longest-prefix file assignment. Sort longest dir
+        // first so the first matching prefix is the most specific package.
+        let mut package_ids: Vec<(String, i64)> = Vec::with_capacity(packages.len());
+        for package in &packages {
+            let roots_json = serde_json::to_string(
+                &package.local_roots.iter().collect::<std::collections::BTreeSet<_>>(),
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO packages(manifest_dir, commit_sha, worktree_id, \
+                 local_roots_json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    package.manifest_dir,
+                    self.active_commit_sha,
+                    self.active_worktree_id,
+                    roots_json
+                ],
+            )?;
+            package_ids.push((package.manifest_dir.clone(), conn.last_insert_rowid()));
+        }
+        package_ids.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.len()));
+
+        // Assign package_id for every file in the active scope by longest manifest-dir prefix. A
+        // file at `crates/foo/src/x.rs` belongs to the package rooted at `crates/foo` (dir `crates/
+        // foo`), not the workspace root (dir ``) — so the path must continue with `/` after the
+        // prefix (or equal it), and the empty-dir root manifest matches anything as the fallback.
+        let files: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, path FROM main.files WHERE commit_sha = ?1 AND worktree_id = ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![self.active_commit_sha, self.active_worktree_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (file_id, path) in files {
+            let package_id = package_ids.iter().find_map(|(dir, id)| {
+                let in_package = dir.is_empty()
+                    || path == *dir
+                    || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+                in_package.then_some(*id)
+            });
+            conn.execute("UPDATE main.files SET package_id = ?2 WHERE id = ?1", params![
+                file_id, package_id
+            ])?;
+        }
+
+        let serialized = {
+            let mut sorted: Vec<&str> = global_roots.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            sorted.join("\n")
+        };
+        self.set_meta_if_changed("local_crate_roots", &serialized)
+    }
+
     pub(super) fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
         self.storage.connection().execute(
             "INSERT INTO index_meta(key, value) VALUES (?1, ?2)
