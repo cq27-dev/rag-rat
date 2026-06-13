@@ -15,7 +15,8 @@ pub(crate) fn import_export_items(
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.edge_kind IN ('imports', 'exports')
-          AND (edges.to_symbol_id = ?1 OR edges.to_name = ?2)
+          AND (edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM edge_strings WHERE \
+         value = ?2))
         ORDER BY files.kind, files.path, edges.edge_kind
         LIMIT ?3
         ",

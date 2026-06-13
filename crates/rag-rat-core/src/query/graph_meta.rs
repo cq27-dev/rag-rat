@@ -245,7 +245,8 @@ fn count_callers(conn: &Connection, symbol: &PrimarySymbol) -> anyhow::Result<u6
         SELECT COUNT(DISTINCT COALESCE(from_symbol_id, -id))
         FROM edges
         WHERE edge_kind IN ('calls_name', 'constructs', 'uses_macro')
-          AND (to_symbol_id = ?1 OR (to_symbol_id IS NULL AND to_name = ?2))
+          AND (to_symbol_id = ?1 OR (to_symbol_id IS NULL AND to_name_id = (SELECT id FROM \
+         edge_strings WHERE value = ?2)))
         ",
         params![symbol.id, symbol.name],
         |row| row.get::<_, i64>(0),
@@ -348,7 +349,8 @@ fn callers(
           AND source_symbols.start_byte >= source_chunks.start_byte
           AND source_symbols.start_byte < source_chunks.end_byte
         WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_macro')
-          AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name = ?2))
+          AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
+         (SELECT id FROM edge_strings WHERE value = ?2)))
         ORDER BY
           CASE edges.confidence
             WHEN 'Exact' THEN 0

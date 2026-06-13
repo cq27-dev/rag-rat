@@ -363,7 +363,7 @@ pub(crate) fn hidden_unresolved_candidate_count(
               AND (
                 edges.target_qualified_name = ?1
                 OR edges.target_qualified_name LIKE ?2
-                OR edges.to_name = ?3
+                OR edges.to_name_id = (SELECT id FROM edge_strings WHERE value = ?3)
               )
             "
         )

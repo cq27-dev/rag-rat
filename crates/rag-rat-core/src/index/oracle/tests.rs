@@ -3540,3 +3540,43 @@ fn v020_converts_a_legacy_edges_table() {
         conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
     assert_eq!(verdicts, 0, "edge_oracle FK was re-pointed at edges_data");
 }
+
+/// The query_warm regression (#79 follow-up): an OR-branch string equality on a dictionary
+/// column cannot be transformed by the planner through the view's value joins — it silently
+/// picks a non-selective index (`to_symbol_id IS NULL` scans most of the table) instead of
+/// `idx_edges_to_name`. Hot readers therefore compare the view's exposed `to_name_id` against a
+/// constant dictionary-lookup subquery. This pins the PLAN: the caller-count predicate shape
+/// must drive the to_name int index, and the legacy string form must never silently return.
+#[test]
+fn or_branch_name_predicates_use_the_to_name_index() {
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    let plan = |sql: &str| -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows.join("\n")
+    };
+
+    // The production count_callers / callers() / traversal predicate shape.
+    let fixed = plan(
+        "SELECT COUNT(*) FROM edges WHERE edge_kind IN ('calls_name','constructs','uses_macro') \
+         AND (to_symbol_id = 5 OR (to_symbol_id IS NULL AND to_name_id = (SELECT id FROM \
+         edge_strings WHERE value = 'x')))",
+    );
+    assert!(
+        fixed.contains("idx_edges_to_name"),
+        "the OR's name branch must drive the to_name int index, got plan:\n{fixed}"
+    );
+
+    // Simple equality through the view still transforms on its own (no subquery needed).
+    let simple = plan("SELECT id FROM edges WHERE to_name = 'x'");
+    assert!(
+        simple.contains("idx_edges_to_name"),
+        "plain to_name equality must use the int index, got plan:\n{simple}"
+    );
+}

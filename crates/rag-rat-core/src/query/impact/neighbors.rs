@@ -114,7 +114,9 @@ pub(crate) fn impact_graph_predicate(reverse: bool, mode: GraphResolutionMode) -
         (false, GraphResolutionMode::Syntactic) =>
             "(edges.from_symbol_id = ?1 OR edges.from_name = ?2)
              AND (edges.to_symbol_id IS NOT NULL OR edges.target_qualified_name IS NOT NULL)",
-        (true, GraphResolutionMode::Fuzzy) => "edges.to_symbol_id = ?1 OR edges.to_name = ?2",
+        (true, GraphResolutionMode::Fuzzy) =>
+            "edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM edge_strings WHERE \
+             value = ?2)",
         (false, GraphResolutionMode::Fuzzy) => "edges.from_symbol_id = ?1 OR edges.from_name = ?2",
     }
 }
@@ -132,7 +134,8 @@ pub(crate) fn import_export_dependents(
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.edge_kind IN ('imports', 'exports')
-          AND (edges.to_symbol_id = ?1 OR edges.to_name = ?2)
+          AND (edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM edge_strings WHERE \
+         value = ?2))
         ORDER BY files.kind, files.path, edges.edge_kind
         ",
     )?;

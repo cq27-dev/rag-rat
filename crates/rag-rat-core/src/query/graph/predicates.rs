@@ -64,7 +64,8 @@ pub(crate) fn reverse_predicate(mode: GraphResolutionMode, logical: bool) -> &'s
                  OR to_symbols.qualified_name LIKE ?2
                  OR edges.target_qualified_name = ?1
                  OR edges.target_qualified_name LIKE ?2
-                 OR (?4 = 'true' AND edges.to_name = ?3)",
+                 OR (?4 = 'true' AND edges.to_name_id =
+                        (SELECT id FROM edge_strings WHERE value = ?3))",
         };
     }
     match mode {
@@ -82,7 +83,8 @@ pub(crate) fn reverse_predicate(mode: GraphResolutionMode, logical: bool) -> &'s
              OR to_symbols.qualified_name LIKE ?2
              OR edges.target_qualified_name = ?1
              OR edges.target_qualified_name LIKE ?2
-             OR (?4 = 'true' AND edges.to_name = ?3)",
+             OR (?4 = 'true' AND edges.to_name_id =
+                    (SELECT id FROM edge_strings WHERE value = ?3))",
     }
 }
 pub(crate) fn reverse_tier(mode: GraphResolutionMode) -> &'static str {
@@ -98,7 +100,8 @@ pub(crate) fn reverse_tier(mode: GraphResolutionMode) -> &'static str {
             "CASE
                 WHEN edges.to_symbol_id IS NOT NULL THEN 0
                 WHEN edges.target_qualified_name = ?1 OR edges.target_qualified_name LIKE ?2 THEN 1
-                WHEN ?4 = 'true' AND edges.to_name = ?3 THEN 2
+                WHEN ?4 = 'true' AND edges.to_name_id =
+                    (SELECT id FROM edge_strings WHERE value = ?3) THEN 2
                 ELSE 4
              END",
     }

@@ -607,7 +607,14 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.execute_batch(
         "
-        CREATE VIEW IF NOT EXISTS edges AS
+        -- Recreate unconditionally: the view's definition evolves (e.g. the appended *_id
+        -- columns below), and CREATE IF NOT EXISTS would freeze an older shape in any DB that
+        -- already has one. Dropping the view drops its INSTEAD OF triggers too.
+        DROP TRIGGER IF EXISTS edges_view_insert;
+        DROP TRIGGER IF EXISTS edges_view_update;
+        DROP TRIGGER IF EXISTS edges_view_delete;
+        DROP VIEW IF EXISTS edges;
+        CREATE VIEW edges AS
         SELECT d.id,
                d.source_file_id,
                d.from_symbol_id,
@@ -627,7 +634,18 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                d.callee_start_byte,
                d.callee_end_byte,
                ek.value AS edge_kind,
-               conf.value AS confidence
+               conf.value AS confidence,
+               -- The raw dictionary ids, appended after the legacy shape: hot predicates that the
+               -- planner cannot transform through the value joins (an OR-branch string equality
+               -- picks a non-selective index otherwise — the query_warm regression) compare these
+               -- against a constant `(SELECT id FROM edge_strings WHERE value = ?)` instead.
+               d.from_name_id,
+               d.to_name_id,
+               d.target_qualified_name_id,
+               d.receiver_hint_id,
+               d.edge_kind_id,
+               d.confidence_id,
+               d.resolution_id
         FROM edges_data d
         LEFT JOIN edge_strings fn ON fn.id = d.from_name_id
         LEFT JOIN edge_strings tn ON tn.id = d.to_name_id
