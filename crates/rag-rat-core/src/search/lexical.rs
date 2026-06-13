@@ -636,7 +636,6 @@ mod tests {
         conn
     }
 
-    #[test]
     /// Regression guard (#79 query_warm): `graph_boost` runs once per candidate (~limit*8), so its
     /// `from_name`/`to_name` filter MUST stay on the `from_name_id`/`to_name_id` INTEGER indexes.
     /// Through the `edges` view a value predicate degrades to a full edges_data scan that joins the
@@ -668,6 +667,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn search_lexical_only_returns_bm25_hits_without_embeddings() {
         let conn = seeded_conn();
         let hits = search_lexical_only(&conn, "election retry", 5, false).unwrap();
