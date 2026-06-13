@@ -183,6 +183,14 @@ pub(crate) fn edge_evidence(node: Node<'_>, text: &str) -> String {
         .take(240)
         .collect()
 }
+/// Whitespace-normalized but UNTRUNCATED node text, for a `use_declaration`'s evidence. The
+/// crate-aware import scope re-parses this with `imports::parse_use` (#61); the 240-char cap in
+/// [`edge_evidence`] would drop the late leaves of a long braced `use foo::{…, X}`, leaving those
+/// names un-suppressed (#97 item 1). A `use` statement is bounded and small, so storing it in full
+/// is cheap.
+pub(crate) fn use_declaration_evidence(node: Node<'_>, text: &str) -> String {
+    node_text(node, text).split_whitespace().collect::<Vec<_>>().join(" ")
+}
 pub(crate) fn short_name(name: &str) -> &str {
     name.rsplit([':', '.', '#', '/']).find(|part| !part.is_empty()).unwrap_or(name)
 }

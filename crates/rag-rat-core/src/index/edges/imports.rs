@@ -40,24 +40,63 @@ pub(crate) fn local_crate_roots(root: &Path) -> HashSet<String> {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-        let Ok(value) = toml::from_str::<toml::Value>(&text) else { continue };
-        if let Some(name) = crate_root_name(&value) {
+        // Parse with the serde entry point (`toml::from_str`), NOT `text.parse::<toml::Value>()`:
+        // `toml::Value`'s `FromStr` compiles but does not parse a full Cargo.toml document — it
+        // returns Err on a valid manifest, silently emptying the local set.
+        let Ok(manifest) = toml::from_str::<toml::Value>(&text) else { continue };
+        let manifest_dir = entry.path().parent();
+        if let Some(name) = lib_crate_root_name(&manifest, manifest_dir) {
             roots.insert(name);
         }
+        // Renamed / path-dependency aliases: `local_alias = { path = "…", package = "real" }` lets
+        // the import KEY (`use local_alias::…`) differ from the package's canonical crate name, so
+        // the key must itself count as a local root or the bare reference OVER-suppresses (a
+        // dropped LOCAL bind — the harmful direction, #97 item 2). The key is the crate
+        // root written in source, so it needs no `-`→`_` normalization (a `use` path can't
+        // contain `-`).
+        collect_path_dependency_aliases(&manifest, &mut roots);
     }
     roots
 }
 
-/// The crate root identifier used in `use` paths: `[lib].name` if set, else the package name with
-/// `-` normalized to `_` (Cargo's crate-name rule: `cargo-credential` → `cargo_credential`).
-fn crate_root_name(manifest: &toml::Value) -> Option<String> {
-    if let Some(lib_name) =
-        manifest.get("lib").and_then(|lib| lib.get("name")).and_then(|name| name.as_str())
-    {
+/// The crate root identifier used in `use` paths when this manifest defines an importable LIBRARY:
+/// `[lib].name` if the table sets one, else the package name (`-`→`_`, Cargo's crate-name rule:
+/// `cargo-credential` → `cargo_credential`). Returns `None` for a BIN-ONLY member (no `[lib]` table
+/// and no autodiscovered `src/lib.rs`): such a package is not importable, so contributing its name
+/// as a root would wrongly mark a same-named EXTERNAL dependency as local and skip suppression
+/// (#97 item 3). The `src/lib.rs` probe mirrors Cargo's lib autodiscovery and is resolved relative
+/// to the manifest directory.
+fn lib_crate_root_name(manifest: &toml::Value, manifest_dir: Option<&Path>) -> Option<String> {
+    let lib = manifest.get("lib");
+    if let Some(lib_name) = lib.and_then(|lib| lib.get("name")).and_then(|name| name.as_str()) {
         return Some(lib_name.replace('-', "_"));
+    }
+    let has_lib_target =
+        lib.is_some() || manifest_dir.is_some_and(|dir| dir.join("src").join("lib.rs").is_file());
+    if !has_lib_target {
+        return None;
     }
     let package = manifest.get("package")?.get("name")?.as_str()?;
     Some(package.replace('-', "_"))
+}
+
+/// Add every `[dependencies]` / `[workspace.dependencies]` KEY whose value carries a `path` key to
+/// `roots` — these are local path dependencies whose import name is the KEY (possibly renamed via
+/// the `package` key), so the bare-reference scope must treat the key as a local crate root (#97
+/// item 2). A string dependency (`serde = "1"`) or a non-`path` table dependency is external and
+/// contributes nothing.
+fn collect_path_dependency_aliases(manifest: &toml::Value, roots: &mut HashSet<String>) {
+    let deps_tables = [
+        manifest.get("dependencies"),
+        manifest.get("workspace").and_then(|workspace| workspace.get("dependencies")),
+    ];
+    for table in deps_tables.into_iter().flatten().filter_map(toml::Value::as_table) {
+        for (key, spec) in table {
+            if spec.get("path").is_some() {
+                roots.insert(key.clone());
+            }
+        }
+    }
 }
 
 /// Parse a Rust `use` statement into its crate root and the leaf NAMES it actually binds into
@@ -323,18 +362,100 @@ mod tests {
     fn local_crate_roots_scans_workspace_manifests() {
         let dir = std::env::temp_dir().join(format!("rr-crate-roots-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        // Both members carry a `src/lib.rs` so each is an importable LIBRARY (autodiscovery) and
+        // contributes its package name as a root (#97 item 3 gates this on a lib target).
+        std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("crates/foo-bar/src")).unwrap();
         std::fs::write(
             dir.join("Cargo.toml"),
             "[workspace]\nmembers=[\"crates/*\"]\n[package]\nname=\"cargo\"\n",
         )
         .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
         std::fs::write(dir.join("crates/foo-bar/Cargo.toml"), "[package]\nname=\"foo-bar\"\n")
             .unwrap();
+        std::fs::write(dir.join("crates/foo-bar/src/lib.rs"), "").unwrap();
         let roots = local_crate_roots(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(roots.contains("cargo"), "top package; got {roots:?}");
         assert!(roots.contains("foo_bar"), "hyphen→underscore normalized; got {roots:?}");
+    }
+
+    /// #97 item 2: a renamed / path dependency (`local_alias = { path = …, package = "real" }`)
+    /// imports under its KEY (`use local_alias::…`), which differs from the package's canonical
+    /// crate name. The key must be a local root or a bare reference through it OVER-suppresses (a
+    /// dropped LOCAL bind). String/non-path table deps are external and contribute nothing.
+    #[test]
+    fn local_crate_roots_recognizes_path_dependency_aliases() {
+        let dir = std::env::temp_dir().join(format!("rr-path-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname=\"app\"\n[dependencies]\nlocal_alias = { path = \"../real-crate\", \
+             package = \"real-crate\" }\nplain_path = { path = \"../other\" }\nserde = \
+             \"1\"\n[workspace.dependencies]\nws_local = { path = \"crates/ws\" }\n",
+        )
+        .unwrap();
+        let roots = local_crate_roots(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            roots.contains("local_alias"),
+            "renamed path-dep KEY is a local root; got {roots:?}"
+        );
+        assert!(
+            roots.contains("plain_path"),
+            "path dep without `package` still local; got {roots:?}"
+        );
+        assert!(
+            roots.contains("ws_local"),
+            "[workspace.dependencies] path dep is local; got {roots:?}"
+        );
+        assert!(
+            !roots.contains("serde"),
+            "a string (external) dep is not a local root; got {roots:?}"
+        );
+    }
+
+    /// #97 item 3: a BIN-ONLY member (no `[lib]` table, no `src/lib.rs`) is not importable, so it
+    /// must NOT contribute its package name as a root — otherwise a same-named external dependency
+    /// (`use clap::…` where a local bin is also named `clap`) is wrongly treated as local and
+    /// suppression is skipped. A LIBRARY member still contributes its root.
+    #[test]
+    fn local_crate_roots_skips_bin_only_packages() {
+        let dir = std::env::temp_dir().join(format!("rr-bin-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A bin-only crate whose name collides with the external `clap` dependency.
+        std::fs::create_dir_all(dir.join("tool/src")).unwrap();
+        std::fs::write(dir.join("tool/Cargo.toml"), "[package]\nname=\"clap\"\n").unwrap();
+        std::fs::write(dir.join("tool/src/main.rs"), "fn main() {}").unwrap();
+        // A real library member (autodiscovered src/lib.rs) that DOES contribute its root.
+        std::fs::create_dir_all(dir.join("lib-crate/src")).unwrap();
+        std::fs::write(dir.join("lib-crate/Cargo.toml"), "[package]\nname=\"lib-crate\"\n")
+            .unwrap();
+        std::fs::write(dir.join("lib-crate/src/lib.rs"), "").unwrap();
+        // A member declaring an explicit [lib] table (no src/lib.rs needed).
+        std::fs::create_dir_all(dir.join("explicit/src")).unwrap();
+        std::fs::write(
+            dir.join("explicit/Cargo.toml"),
+            "[package]\nname=\"explicit\"\n[lib]\npath=\"src/thing.rs\"\n",
+        )
+        .unwrap();
+        let roots = local_crate_roots(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !roots.contains("clap"),
+            "a bin-only package name is not a local root; got {roots:?}"
+        );
+        assert!(
+            roots.contains("lib_crate"),
+            "an autodiscovered lib contributes its root; got {roots:?}"
+        );
+        assert!(
+            roots.contains("explicit"),
+            "an explicit [lib] table contributes its root; got {roots:?}"
+        );
     }
 
     #[test]
@@ -342,5 +463,41 @@ mod tests {
         let mut scope = ImportScope::new(HashSet::new());
         scope.add_use(1, "use url::Url;");
         assert!(!scope.is_external_import(1, "Url"), "no manifests → suppress nothing");
+    }
+
+    /// #97 item 1: a braced `use` longer than the 240-char `edge_evidence` cap must still mark its
+    /// LATE leaf external. The Imports edges produced by extraction now carry the UNTRUNCATED use
+    /// text, so the per-file scope built from that evidence sees every leaf — including one pushed
+    /// past byte 240 by many earlier bindings.
+    #[test]
+    fn long_braced_use_marks_a_late_leaf_external() {
+        // Pad with enough early leaves that `LateLeaf` lands well past char 240; each is a real
+        // brace binding, so the source `use` is valid.
+        let early = (0..60).map(|i| format!("Early{i}")).collect::<Vec<_>>().join(", ");
+        let src = format!("use external_dep::{{{early}, LateLeaf}};");
+        assert!(src.len() > 240, "fixture must exceed the truncation cap; len {}", src.len());
+
+        // Extract real Imports edges (the path that used to truncate) and rebuild the scope from
+        // their evidence, exactly as the resolve drivers do.
+        let edges = crate::index::edges::syntactic_edges(
+            std::path::Path::new("a.rs"),
+            crate::language::Language::Rust,
+            &src,
+            &[],
+        )
+        .unwrap();
+        let mut scope = ImportScope::new(HashSet::from(["mycrate".to_string()]));
+        for edge in &edges {
+            if edge.edge_kind == crate::index::edges::EdgeKind::Imports
+                && let Some(evidence) = edge.evidence.as_deref()
+            {
+                scope.add_use(1, evidence);
+            }
+        }
+        assert!(
+            scope.is_external_import(1, "LateLeaf"),
+            "a leaf past the 240-char cap must still be marked external"
+        );
+        assert!(scope.is_external_import(1, "Early0"), "early leaves stay external too");
     }
 }

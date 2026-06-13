@@ -141,13 +141,20 @@ pub(crate) fn rust_edges(
         "use_declaration" => {
             let names = identifiers_under(node, text);
             let is_reexport = node_text(node, text).trim_start().starts_with("pub use ");
+            // The crate-aware import scope rebuilds its per-file {leaf → root} map by re-parsing an
+            // Imports edge's `evidence` with `imports::parse_use` (#61). The default
+            // `edge_evidence` truncates to 240 chars, which drops the late leaves of a
+            // long braced `use foo::{…, X}` — those names then go un-suppressed (#97
+            // item 1). Carry the FULL normalized use text on Imports edges so every
+            // leaf survives the round trip.
+            let use_evidence = use_declaration_evidence(node, text);
             for name in names {
                 if !is_rust_path_keyword(&name) {
-                    out.push(file_edge(
+                    out.push(file_edge_with_evidence(
                         path,
                         node,
-                        text,
                         name,
+                        Some(use_evidence.clone()),
                         EdgeKind::Imports,
                         EdgeConfidence::NameOnly,
                     ));
@@ -583,12 +590,32 @@ pub(crate) fn file_edge(
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
 ) -> EdgeCandidate {
+    file_edge_with_evidence(
+        path,
+        node,
+        to_name,
+        Some(edge_evidence(node, text)),
+        edge_kind,
+        confidence,
+    )
+}
+/// Like [`file_edge`] but with caller-supplied evidence — used by the `use_declaration` arm to
+/// carry the UNTRUNCATED use text so the crate-aware import scope can re-parse every braced leaf
+/// (#97).
+pub(crate) fn file_edge_with_evidence(
+    path: &Path,
+    node: Node<'_>,
+    to_name: String,
+    evidence: Option<String>,
+    edge_kind: EdgeKind,
+    confidence: EdgeConfidence,
+) -> EdgeCandidate {
     EdgeCandidate {
         from_symbol_id: None,
         from_name: Some(path.to_string_lossy().replace('\\', "/")),
         to_name,
         target_qualified_name: None,
-        evidence: Some(edge_evidence(node, text)),
+        evidence,
         receiver_hint: None,
         source_span: span_for_node(node),
         // File-level edges (imports / exports / mod) have no callee identifier to anchor (#67).
