@@ -102,7 +102,7 @@ pub fn parse_bash_search(command: &str) -> Option<(String, Option<String>)> {
         return None; // substitution: ambiguous
     }
     // Split into pipeline/sequence segments; examine each for a search command.
-    for segment in split_top_level(command) {
+    for (piped, segment) in split_top_level(command) {
         let tokens = shell_tokens(&segment)?;
         let mut tokens = tokens.as_slice();
         // Skip env-var prefixes (FOO=bar) before the command word.
@@ -115,6 +115,14 @@ pub fn parse_bash_search(command: &str) -> Option<(String, Option<String>)> {
             return None; // grep as an argument of these is ambiguous
         }
         if !SEARCH_COMMANDS.contains(&base) {
+            continue;
+        }
+        // A search command DOWNSTREAM of a pipe is filtering another tool's output
+        // (`cargo test | grep …`, `gh … | rg …`), not a code search — skip it so augmentation
+        // doesn't fire on incidental greps (#138). A grep that is the pipeline HEAD (`grep … |
+        // head`) or a sequenced command (`cd x && rg …`) is a real search and still
+        // matches.
+        if piped {
             continue;
         }
         let mut pattern: Option<String> = None;
@@ -143,14 +151,20 @@ pub fn parse_bash_search(command: &str) -> Option<(String, Option<String>)> {
 }
 
 /// Split on top-level `|`, `&&`, `||`, `;` (quote-aware); also drop a leading `cd …` segment.
+/// Each returned segment carries a `piped` flag: true when it was preceded by a single `|` (i.e. it
+/// consumes the previous command's output). `||`, `&&`, `;`, `&`, and the first segment are not
+/// piped — they're independent commands. This lets the caller tell a real grep (pipeline head or
+/// sequenced) from an incidental output filter (#138).
 ///
 /// Quote characters are preserved verbatim into the segment so that [`shell_tokens`] can
 /// strip them itself — a top-level separator inside quotes must not split, and a quoted
 /// pattern (`rg "quoted pattern" src`) must survive intact for re-tokenization.
-fn split_top_level(command: &str) -> Vec<String> {
+fn split_top_level(command: &str) -> Vec<(bool, String)> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
+    // Whether the segment currently being accumulated was preceded by a single `|`.
+    let mut piped = false;
     let mut chars = command.chars().peekable();
     while let Some(ch) = chars.next() {
         match (quote, ch) {
@@ -165,26 +179,34 @@ fn split_top_level(command: &str) -> Vec<String> {
                 quote = Some(ch);
                 current.push(ch);
             },
-            (None, '|' | ';') => {
-                if chars.peek() == Some(&'|') {
+            (None, '|') => {
+                let double = chars.peek() == Some(&'|');
+                if double {
                     chars.next();
                 }
-                segments.push(std::mem::take(&mut current));
+                segments.push((piped, std::mem::take(&mut current)));
+                // A single `|` pipes into the next segment; `||` (logical or) does not.
+                piped = !double;
+            },
+            (None, ';') => {
+                segments.push((piped, std::mem::take(&mut current)));
+                piped = false;
             },
             (None, '&') => {
                 if chars.peek() == Some(&'&') {
                     chars.next();
                 }
-                segments.push(std::mem::take(&mut current));
+                segments.push((piped, std::mem::take(&mut current)));
+                piped = false;
             },
             (None, c) => current.push(c),
         }
     }
-    segments.push(current);
+    segments.push((piped, current));
     segments
         .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && !s.starts_with("cd ") && *s != "cd")
+        .map(|(piped, s)| (piped, s.trim().to_string()))
+        .filter(|(_, s)| !s.is_empty() && !s.starts_with("cd ") && *s != "cd")
         .collect()
 }
 
@@ -619,7 +641,8 @@ mod tests {
             ("cd crates && rg spawn_listener", "spawn_listener", None),
             ("FOO=1 rg spawn_listener", "spawn_listener", None),
             ("rg -A 3 -B 2 needle haystack/", "needle", Some("haystack/")),
-            ("git log | rg fix", "fix", None),
+            // grep is the pipeline HEAD (a real search piped into a pager) → still matches.
+            ("rg foo | head", "foo", None),
             (r#"rg "quoted pattern" src"#, "quoted pattern", Some("src")),
         ];
         for (cmd, pattern, path) in positives {
@@ -635,6 +658,12 @@ mod tests {
             "echo `rg foo`",                             // backticks: ambiguous
             "xargs grep foo",                            // xargs: ambiguous
             "groups",                                    // not grep
+            // #138: grep DOWNSTREAM of a pipe is filtering another tool's output, not a code
+            // search — must not augment.
+            "git log | rg fix",
+            "cargo test | grep result",
+            "gh run view | grep -i error",
+            "cargo clippy | grep -E warning",
         ];
         for cmd in negatives {
             assert!(parse_bash_search(cmd).is_none(), "false positive for {cmd}");
