@@ -1871,12 +1871,27 @@ impl IndexDatabase {
     }
 
     /// Resolve a mixed list of explicit seed selectors (numeric symbol ids, symbol paths, or bare
-    /// names) to in-index symbol ids at the query boundary. A numeric string is a raw symbol id; an
-    /// ambiguous or missing name is SKIPPED (counted in `unresolved`), never fatal — one bad name
-    /// must not sink the whole call. Resolution order per non-numeric entry: `symbol_path` exact,
-    /// then `symbol` (name), mirroring `SymbolSelector` precedence.
+    /// names) to in-index symbol ids at the query boundary. A numeric string is a raw symbol id; a
+    /// name that resolves to nothing in the active scope is SKIPPED (counted in `unresolved`),
+    /// never fatal — one bad name must not sink the whole call. Resolution order per
+    /// non-numeric entry: `symbol_path` (EXACT qualified name) first; only if that resolves to
+    /// exactly one symbol do we use it — otherwise we fall through to a bare-NAME lookup.
+    ///
+    /// Personalization is a teleport SET, not a single-symbol picker: a bare name therefore seeds
+    /// ALL of its in-scope matches (the type PLUS its `impl` blocks/methods all carry the type's
+    /// name — that whole entity is exactly what we want to bias toward), rather than skipping on
+    /// ambiguity the way a `memory rebind`-style resolver would. Skipping on >1 match was the Phase
+    /// 4 UX bug: any type with impls (essentially every type) matched >1 symbol, so the
+    /// headline `--personalize <Type>` resolved to nothing and silently fell back to global
+    /// ranking.
     fn resolve_seed_selectors(&self, selectors: &[String]) -> anyhow::Result<ResolvedSeeds> {
         use crate::query::symbol::SymbolSelector;
+
+        // Cap per-name expansion so a very common name (matched by hundreds of symbols) can't flood
+        // the teleport set and wash out the signal. 25 comfortably covers a type plus its impls/
+        // methods (the intended entity) while bounding pathological names; the overall `symbol_ids`
+        // is sort+dedup'd below so a name and an explicit id that overlap don't double-count.
+        const PER_NAME_SEED_CAP: u32 = 25;
 
         let mut symbol_ids = Vec::new();
         let mut unresolved = 0_u64;
@@ -1889,10 +1904,10 @@ impl IndexDatabase {
                 symbol_ids.push(id);
                 continue;
             }
-            // Try `symbol_path` (exact qualified name) FIRST, then fall back to a bare-name lookup
-            // — `SymbolSelector` short-circuits on the first set field, so the two must be SEPARATE
-            // selectors. `allow_ambiguous: false` makes a multi-candidate name resolve to
-            // `Err(disambiguation)` → we skip it (record the miss); a missing one is `Ok(None)`.
+            // Try `symbol_path` (EXACT qualified name) FIRST: an unambiguous fully-qualified name
+            // resolves to exactly one symbol and we use it as-is. `allow_ambiguous: false` makes a
+            // multi-candidate qualified name resolve to `Err(disambiguation)` → fall through to the
+            // bare-name expansion below; a missing one is `Ok(None)` → also fall through.
             let by_path = SymbolSelector {
                 logical_symbol_id: None,
                 symbol_id: None,
@@ -1900,23 +1915,28 @@ impl IndexDatabase {
                 symbol: None,
                 language: None,
                 allow_ambiguous: false,
-                // `limit >= 2` so an ambiguous name surfaces >1 candidate and resolves to
-                // `Err(disambiguation)` (skipped) — a `limit` of 1 would silently pick the first.
                 limit: 8,
             };
+            if let Ok(Some(hit)) = self.select_symbol(&by_path)? {
+                symbol_ids.push(hit.symbol_id);
+                continue;
+            }
+            // Bare-NAME fallback: resolve to ALL in-scope matches (capped) and seed every one.
+            // `symbol_candidates` → `lookup_candidates` reads through the per-connection scoped
+            // `files` view (overlay rows win, non-active checkouts excluded), so these ids are
+            // already scope-correct — keep that path; do not query raw tables.
             let by_name = SymbolSelector {
                 symbol_path: None,
                 symbol: Some(entry.to_string()),
-                ..by_path.clone()
+                allow_ambiguous: true,
+                limit: PER_NAME_SEED_CAP,
+                ..by_path
             };
-            let resolved = match self.select_symbol(&by_path)? {
-                Ok(Some(hit)) => Some(hit),
-                // No exact qualified-name match → try the bare name.
-                Ok(None) | Err(_) => self.select_symbol(&by_name)?.ok().flatten(),
-            };
-            match resolved {
-                Some(hit) => symbol_ids.push(hit.symbol_id),
-                None => unresolved += 1,
+            let candidates = self.symbol_candidates(&by_name)?.candidates;
+            if candidates.is_empty() {
+                unresolved += 1;
+            } else {
+                symbol_ids.extend(candidates.into_iter().map(|hit| hit.symbol_id));
             }
         }
         symbol_ids.sort_unstable();
@@ -3248,33 +3268,49 @@ mod oracle_surfacing_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Ambiguous names are skipped (not fatal): two symbols share a name → the seed resolves to
-    /// neither, counts the miss, and falls through to global with a reason.
+    /// A name that matches MULTIPLE in-scope symbols seeds ALL of them — personalization is a
+    /// teleport SET, so `--personalize Thing` (where `Thing` is a struct plus its impls) biases
+    /// toward the whole entity, NOT skip-on-ambiguity. This is the Phase 4 UX-bug fix: any type
+    /// with impls used to resolve to nothing and fall back to global.
     #[test]
-    fn ambiguous_name_seed_is_skipped() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
-            return;
-        }
+    fn multi_match_name_seeds_all_in_scope_symbols() {
         let root = temp_root();
-        // `dup` defined twice across two files → name `dup` is ambiguous.
-        fs::write(root.join("src/lib.rs"), "pub fn dup() {}\n").unwrap();
-        fs::write(root.join("src/other.rs"), "pub fn dup() {}\n").unwrap();
+        // A struct `Thing` plus two `impl Thing` blocks → the bare name `Thing` matches the struct
+        // row AND the impl rows (impl blocks carry the type's name), i.e. ≥ 2 symbols share
+        // "Thing".
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub struct Thing;\nimpl Thing { pub fn a(&self) {} }\nimpl Thing { pub fn b(&self) \
+             {} }\n",
+        )
+        .unwrap();
         let config = rust_config(root.clone());
         let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // Sanity: the bare name really does match more than one symbol.
+        let match_count: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM symbols WHERE name = 'Thing'", [], |r| r.get(0))
+            .unwrap();
+        assert!(match_count >= 2, "the struct + its impls all carry the name: {match_count}");
 
         let result = db
             .important_symbols(ImportantSymbolsRequest {
                 limit: 20,
-                personalize: vec!["dup".to_string()],
+                personalize: vec!["Thing".to_string()],
                 auto_seed_from_diff: false,
             })
             .unwrap();
-        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::Global);
-        assert_eq!(
-            result.seed_source.expect("reports provenance").skipped.no_symbols,
-            1,
-            "an ambiguous name is skipped, not fatal"
+        // PERSONALIZED, not global: the multi-match name resolved to multiple seeds.
+        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+        let seed = result.seed_source.expect("reports provenance");
+        assert_eq!(seed.kind, crate::query::pagerank::SeedKind::Explicit);
+        assert!(
+            seed.symbol_seed_count >= 2,
+            "all of the name's in-scope symbols are seeded: {seed:?}"
         );
+        assert_eq!(seed.skipped.no_symbols, 0, "a matched name is never counted as a miss");
         let _ = fs::remove_dir_all(&root);
     }
 
