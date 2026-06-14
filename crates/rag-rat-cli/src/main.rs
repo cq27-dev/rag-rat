@@ -231,6 +231,9 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_core::Config) {
         config: &rag_rat_core::Config,
         tool: OracleTool,
     ) -> anyhow::Result<()> {
+        // Stamp the run's start before the subprocess so an overlapping watcher reindex can't make
+        // it look fresher than the edits it skips and wedge the next staleness decision (#145).
+        let started_at_ms = now_epoch_ms();
         let pre_spawn_sha = with_oracle_write_lock(config, |db| db.oracle_pre_spawn_snapshot())?;
         let scip_output = config
             .database
@@ -244,12 +247,13 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_core::Config) {
             oracle::ScipProduction::Blocked { .. } => Ok(()),
             oracle::ScipProduction::Produced { version, bytes, production_sha } => {
                 with_oracle_write_lock(config, |db| {
-                    db.run_oracle(
+                    db.run_oracle_at(
                         tool,
                         &version,
                         &bytes,
                         Some(&production_sha),
                         Some(&pre_spawn_sha),
+                        started_at_ms,
                     )
                 })?;
                 Ok(())

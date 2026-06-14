@@ -74,6 +74,10 @@ pub struct ImpactCompleteness {
     pub parser_failures: u64,
     pub stale_files: u64,
     pub memory_status: ImpactMemoryStatus,
+    /// Sections that returned exactly `limit` rows and were therefore capped — more results may
+    /// exist (no silent caps, #49). Empty when nothing was truncated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub truncated_sections: Vec<String>,
     pub caveats: Vec<String>,
 }
 
@@ -227,6 +231,31 @@ pub fn impact_surface_report_for_symbol(
             text_fallback_hits.len()
         ));
     }
+    // No silent caps (#49): a section that returns exactly `limit` rows was capped and may hide
+    // more. Name every capped section so the agent can raise `limit` or narrow the query instead of
+    // trusting a truncated list as complete.
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let truncated_sections: Vec<String> = [
+        ("direct_semantic_callers", direct_semantic_callers.len()),
+        ("direct_semantic_callees", direct_semantic_callees.len()),
+        ("import_export_dependents", import_export_dependents.len()),
+        ("tests_touching_symbol_path", tests_touching_symbol_path.len()),
+        ("docs_mentioning_symbol_path", docs_mentioning_symbol_path.len()),
+        ("text_fallback_hits", text_fallback_hits.len()),
+        ("recent_commits_touching_symbol_path", recent_commits_touching_symbol_path.len()),
+        ("github_rationale_issues_prs", github_rationale_issues_prs.len()),
+    ]
+    .into_iter()
+    .filter(|&(_, len)| limit_usize != 0 && len >= limit_usize)
+    .map(|(name, _)| name.to_string())
+    .collect();
+    if !truncated_sections.is_empty() {
+        caveats.push(format!(
+            "Sections truncated at limit={limit}: {}. More results may exist — raise `limit` or \
+             narrow the query.",
+            truncated_sections.join(", ")
+        ));
+    }
     Ok(ImpactSurfaceReport {
         query: ImpactSurfaceQuery {
             symbol_id: Some(symbol.symbol_id),
@@ -255,6 +284,7 @@ pub fn impact_surface_report_for_symbol(
                 .unwrap_or(u64::MAX),
                 stale: u64::try_from(repo_memories.stale.len()).unwrap_or(u64::MAX),
             },
+            truncated_sections,
             caveats,
         },
         direct_semantic_callers,

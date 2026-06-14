@@ -7859,3 +7859,51 @@ fn read_only_open_serves_current_index_and_declines_when_heal_is_owed() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn impact_report_flags_a_section_truncated_at_limit() {
+    // #49: a section capped at `limit` must be named in `truncated_sections` and a caveat — no
+    // silent caps. Three callers of `hub` with limit=2 → `direct_semantic_callers` is truncated.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn hub() {}\npub fn a() { hub(); }\npub fn b() { hub(); }\npub fn c() { hub(); }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let hub = db.symbols("hub", Some(Language::Rust), 10).unwrap().remove(0);
+    let report =
+        db.impact_surface_report_for_selected_symbol(&hub, 2, &Default::default()).unwrap();
+    assert_eq!(report.direct_semantic_callers.len(), 2, "callers truncated to the limit");
+    assert!(
+        report
+            .completeness_and_caveats
+            .truncated_sections
+            .contains(&"direct_semantic_callers".to_string()),
+        "the capped section must be named: {:?}",
+        report.completeness_and_caveats
+    );
+    assert!(
+        report
+            .completeness_and_caveats
+            .caveats
+            .iter()
+            .any(|caveat| caveat.contains("truncated at limit")),
+        "a human caveat must mention truncation: {:?}",
+        report.completeness_and_caveats.caveats
+    );
+
+    // A generous limit truncates nothing.
+    let full = db.impact_surface_report_for_selected_symbol(&hub, 50, &Default::default()).unwrap();
+    assert!(
+        full.completeness_and_caveats.truncated_sections.is_empty(),
+        "nothing should be flagged when under the limit: {:?}",
+        full.completeness_and_caveats.truncated_sections
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

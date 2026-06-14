@@ -62,13 +62,29 @@ impl IndexDatabase {
         production_sha: Option<&std::collections::HashMap<String, String>>,
         pre_spawn_sha: Option<&std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<OracleReport> {
+        self.run_oracle_at(tool, tool_version, scip_bytes, production_sha, pre_spawn_sha, now_ms())
+    }
+
+    /// As [`Self::run_oracle`], but records the run's `started_at` as `started_at_ms` — the moment
+    /// the caller began the run (its pre-spawn snapshot), not completion time. The tool-driven path
+    /// passes this so the auto-run staleness gate isn't wedged by a run that overlapped a watcher
+    /// reindex (#145).
+    pub fn run_oracle_at(
+        &self,
+        tool: OracleTool,
+        tool_version: &str,
+        scip_bytes: &[u8],
+        production_sha: Option<&std::collections::HashMap<String, String>>,
+        pre_spawn_sha: Option<&std::collections::HashMap<String, String>>,
+        started_at_ms: i64,
+    ) -> anyhow::Result<OracleReport> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!(
                 "index has no source_root metadata; rebuild required for the oracle pass"
             );
         };
         let root = root.to_path_buf();
-        oracle::run_oracle(
+        oracle::run_oracle_at(
             self.storage.connection(),
             tool,
             tool_version,
@@ -78,6 +94,7 @@ impl IndexDatabase {
             &root,
             production_sha,
             pre_spawn_sha,
+            started_at_ms,
         )
     }
 

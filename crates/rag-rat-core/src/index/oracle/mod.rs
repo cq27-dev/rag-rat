@@ -57,6 +57,8 @@ pub(crate) use store::{EdgeOracleComparison, EdgeOracleVerdict};
 /// [`run::OracleRunInput::pre_spawn_sha`].
 // The args mirror `OracleRunInput`'s fields one-to-one (this is the public thin adapter to it), so
 // a params struct would only re-wrap what callers already pass positionally.
+/// Run + record stamped at `now_ms()` — for callers without a controlled spawn moment (a pre-built
+/// `--scip`, tests). The tool-driven path uses [`run_oracle_at`] with the real start time (#145).
 #[allow(clippy::too_many_arguments)]
 pub fn run_oracle(
     conn: &Connection,
@@ -69,6 +71,36 @@ pub fn run_oracle(
     production_sha: Option<&HashMap<String, String>>,
     pre_spawn_sha: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<OracleReport> {
+    run_oracle_at(
+        conn,
+        tool,
+        tool_version,
+        commit_sha,
+        worktree_id,
+        scip_bytes,
+        checkout_root,
+        production_sha,
+        pre_spawn_sha,
+        super::now_ms(),
+    )
+}
+
+/// As [`run_oracle`], but records `oracle_runs.started_at = started_at_ms` (the moment the run
+/// began, captured before the tool subprocess) instead of completion time, so the auto-run
+/// staleness gate isn't wedged by a run that overlapped a watcher reindex (#145).
+#[allow(clippy::too_many_arguments)]
+pub fn run_oracle_at(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+    scip_bytes: &[u8],
+    checkout_root: &Path,
+    production_sha: Option<&HashMap<String, String>>,
+    pre_spawn_sha: Option<&HashMap<String, String>>,
+    started_at_ms: i64,
+) -> anyhow::Result<OracleReport> {
     run::run(conn, &OracleRunInput {
         tool,
         tool_version,
@@ -78,6 +110,7 @@ pub fn run_oracle(
         checkout_root,
         production_sha,
         pre_spawn_sha,
+        started_at_ms,
     })
 }
 
@@ -264,15 +297,17 @@ pub fn run_oracle_with_tool(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<OracleRunOutcome> {
-    // Snapshot the indexed shas BEFORE spawning the tool — the pre-spawn gate (#83) needs the
-    // state from before the subprocess could observe any source, so a mid-subprocess reindex is
-    // detectable at the join.
+    // The run begins here, before the tool subprocess — stamp `started_at` from this moment so a
+    // watcher reindex during the (slow) subprocess doesn't make the run look fresher than the edits
+    // it skips (#145). Snapshot the indexed shas BEFORE spawning too — the pre-spawn gate (#83)
+    // needs the state from before the subprocess could observe any source.
+    let started_at_ms = super::now_ms();
     let pre_spawn_sha = pre_spawn_snapshot(conn, commit_sha, worktree_id)?;
     match produce_scip_with_tool(tool, checkout_root, scip_output)? {
         ScipProduction::Blocked { tool, program, hint } =>
             Ok(OracleRunOutcome::Blocked { tool, program, hint }),
         ScipProduction::Produced { version, bytes, production_sha } => {
-            let report = run_oracle(
+            let report = run_oracle_at(
                 conn,
                 tool,
                 &version,
@@ -282,6 +317,7 @@ pub fn run_oracle_with_tool(
                 checkout_root,
                 Some(&production_sha),
                 Some(&pre_spawn_sha),
+                started_at_ms,
             )?;
             Ok(OracleRunOutcome::Completed {
                 tool: tool.as_db_str().to_string(),

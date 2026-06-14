@@ -53,6 +53,10 @@ pub(crate) struct OracleRunInput<'a> {
     /// ABA (an edit reverted to byte-identical content) is acceptable — the verdict is then
     /// correct anyway.
     pub(crate) pre_spawn_sha: Option<&'a HashMap<String, String>>,
+    /// Unix-epoch ms when the run actually BEGAN (the pre-spawn snapshot moment), recorded as
+    /// `oracle_runs.started_at`. Must be the start, not completion: the auto-run staleness gate
+    /// keys on it (#145).
+    pub(crate) started_at_ms: i64,
 }
 
 /// Run the oracle join over all current edge candidates and persist verdicts + a run row.
@@ -373,12 +377,13 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
     );
 
     report.status = "Completed".to_string();
-    store::record_oracle_run(
+    store::record_oracle_run_at(
         conn,
         input.tool,
         input.tool_version,
         input.commit_sha,
         input.worktree_id,
+        input.started_at_ms,
         &report.status,
         &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
     )?;

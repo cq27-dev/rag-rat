@@ -344,6 +344,9 @@ pub(crate) fn write_edge_oracle(
 /// `worktree_id` scopes the run to the active checkout so the status read's `last_run_meta` can
 /// distinguish this checkout's run from a sibling worktree's run under the same
 /// `(tool, tool_version, commit_sha)`.
+/// Record a run stamped at `now_ms()`. Test-only convenience over [`record_oracle_run_at`]; every
+/// production path threads the real start time through `record_oracle_run_at` (#145).
+#[cfg(test)]
 pub(crate) fn record_oracle_run(
     conn: &Connection,
     tool: OracleTool,
@@ -353,6 +356,34 @@ pub(crate) fn record_oracle_run(
     status: &str,
     stats_json: &str,
 ) -> anyhow::Result<i64> {
+    record_oracle_run_at(
+        conn,
+        tool,
+        tool_version,
+        commit_sha,
+        worktree_id,
+        now_ms(),
+        status,
+        stats_json,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_oracle_run_at(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+    started_at_ms: i64,
+    status: &str,
+    stats_json: &str,
+) -> anyhow::Result<i64> {
+    // `started_at_ms` is the moment the run actually BEGAN (the pre-spawn snapshot), passed in by
+    // the caller — NOT `now_ms()` at completion. The auto-run staleness gate compares this
+    // against the index's last-change clock; stamping completion time made a run that
+    // overlapped a watcher reindex look fresher than the edits it skipped, wedging the gate at
+    // NotStale (#145).
     conn.execute(
         "
         INSERT INTO oracle_runs(
@@ -365,7 +396,7 @@ pub(crate) fn record_oracle_run(
             tool_version,
             commit_sha,
             worktree_id,
-            now_ms(),
+            started_at_ms,
             status,
             stats_json
         ],

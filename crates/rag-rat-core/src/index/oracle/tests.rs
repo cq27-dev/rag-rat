@@ -923,6 +923,32 @@ fn staleness_key_distinguishes_rows_by_file_sha_tool_and_version() {
     assert_eq!(other_version, 0);
 }
 
+/// #145: `record_oracle_run_at` persists the PASSED start time, not `now_ms()`/completion — so the
+/// auto-run staleness gate keys on when the run BEGAN, not when it finished (a run that overlapped
+/// a watcher reindex must not look fresher than the edits it skipped).
+#[test]
+fn record_oracle_run_at_persists_the_passed_start_time() {
+    let h = Harness::new();
+    // Deliberately far in the past: if the impl stamped `now_ms()` instead, this would not match.
+    let started_at_ms = 1_000_000_i64;
+    store::record_oracle_run_at(
+        &h.conn,
+        TOOL,
+        VERSION,
+        COMMIT,
+        WORKTREE,
+        started_at_ms,
+        "Completed",
+        "{}",
+    )
+    .unwrap();
+    assert_eq!(
+        store::latest_run_started_at(&h.conn, TOOL, COMMIT, WORKTREE).unwrap(),
+        Some(started_at_ms),
+        "started_at must be the value the caller passed, not completion time"
+    );
+}
+
 /// `record_oracle_run` inserts a run row and returns its id; `count_edge_oracle_scoped` tallies
 /// only the requested kind for the tool/version within the active checkout.
 #[test]
