@@ -726,7 +726,14 @@ pub(crate) fn anchor_health_counts(
     Ok(health)
 }
 
-pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryValidationReport> {
+pub(crate) fn validate_memories(
+    conn: &Connection,
+    active_root: Option<&std::path::Path>,
+) -> anyhow::Result<RepoMemoryValidationReport> {
+    // The off-index filesystem fallback (#98) resolves binding paths against the active checkout
+    // root when known (correct under a multi-worktree shared DB), else the persisted source_root.
+    let fs_root = effective_fs_root(conn, active_root);
+    let fs_root = fs_root.as_deref();
     let mut stmt = conn.prepare(
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line,
@@ -750,7 +757,7 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
         let mut binding = row?;
         let original_binding_id = binding.binding_id.clone();
         report.checked += 1;
-        let status = validate_binding(conn, &mut binding)?;
+        let status = validate_binding(conn, &mut binding, fs_root)?;
         let updated = conn.execute(
             "
             UPDATE OR IGNORE repo_memory_bindings

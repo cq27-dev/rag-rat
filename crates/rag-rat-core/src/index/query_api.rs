@@ -1760,7 +1760,10 @@ impl IndexDatabase {
     pub fn memory_validate(
         &self,
     ) -> anyhow::Result<crate::query::memory::RepoMemoryValidationReport> {
-        crate::query::memory::validate_memories(self.storage.connection())
+        crate::query::memory::validate_memories(
+            self.storage.connection(),
+            self.storage.source_root(),
+        )
     }
 
     pub fn memory_doctor(&self) -> anyhow::Result<Vec<crate::query::memory::MemoryDoctorEntry>> {

@@ -1,8 +1,11 @@
+use std::path::{Component, Path, PathBuf};
+
 use super::*;
 
 pub(crate) fn validate_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
+    fs_root: Option<&Path>,
 ) -> anyhow::Result<String> {
     match binding.binding_kind.as_str() {
         "logical_symbol" => validate_logical_symbol_binding(conn, binding),
@@ -11,8 +14,8 @@ pub(crate) fn validate_binding(
         "edge" => validate_edge_binding(conn, binding),
         "call_path" => validate_call_path_binding(conn, binding),
         "scip_moniker" => validate_moniker_binding(conn, binding),
-        "path" => validate_path_binding(conn, binding),
-        "dir" => validate_dir_binding(conn, binding),
+        "path" => validate_path_binding(conn, binding, fs_root),
+        "dir" => validate_dir_binding(conn, binding, fs_root),
         "commit" | "github" => Ok("unverified".to_string()),
         _ => Ok("unverified".to_string()),
     }
@@ -24,16 +27,18 @@ pub(crate) fn validate_binding(
 /// A dir holding ONLY non-indexed file types (shell scripts, `.yml` workflows, Containerfiles)
 /// has no `files` rows by construction, so [`dir_has_files`] sees it as empty even though the
 /// directory is alive in the repo. Before declaring `gone`, fall back to a filesystem existence
-/// check against the index `source_root` (#98) so an area anchor to such a directory stays current.
+/// check against `fs_root` (the active checkout root; #98) so an area anchor to such a directory
+/// stays current.
 pub(crate) fn validate_dir_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
+    fs_root: Option<&Path>,
 ) -> anyhow::Result<String> {
     let dir = binding.path.clone().unwrap_or_else(|| binding.binding_id.clone());
     if dir_has_files(conn, &dir)? {
         return Ok("current".to_string());
     }
-    Ok(if dir_exists_on_disk(conn, &dir) { "current" } else { "gone" }.to_string())
+    Ok(if dir_exists_on_disk(fs_root, &dir) { "current" } else { "gone" }.to_string())
 }
 pub(crate) fn validate_logical_symbol_binding(
     conn: &Connection,
@@ -339,6 +344,7 @@ pub(crate) fn validate_bound_chunk(
 pub(crate) fn validate_path_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
+    fs_root: Option<&Path>,
 ) -> anyhow::Result<String> {
     let Some(path) = binding.path.as_deref() else {
         return Ok("unverified".to_string());
@@ -354,12 +360,14 @@ pub(crate) fn validate_path_binding(
         // No `files` row — but `files` holds only files in the configured indexed language set, so
         // a binding to a path OUTSIDE that set (a Containerfile, shell script, `.yml` workflow,
         // `.toml` config) has no row by construction and is indistinguishable from a deleted file
-        // by the index alone. Fall back to a filesystem existence check against the index
-        // `source_root` before declaring `gone` — acting on a false `gone` would delete valid
-        // guidance (#98). A BARE path is an area anchor → `current` while the file is present; a
-        // SPANNED `path:start-end` binding has no chunk to hash → `unverified` (alive but
-        // un-content-verifiable), never `gone`.
-        let status = match path_exists_on_disk(conn, path) {
+        // by the index alone. Fall back to a filesystem existence check against `fs_root` (the
+        // active checkout root) before declaring `gone` — acting on a false `gone` would delete
+        // valid guidance (#98). A BARE path is an area anchor → `current` while the file is
+        // present; a SPANNED `path:start-end` binding has no chunk to hash → `unverified`
+        // (alive but un-content-verifiable), never `gone`. The target must be a FILE: a
+        // path binding names a file, so a directory now occupying that name leaves the file
+        // genuinely `gone`.
+        let status = match path_is_file_on_disk(fs_root, path) {
             true if binding.start_line.is_none() && binding.end_line.is_none() => "current",
             true => "unverified",
             false => "gone",
@@ -380,30 +388,52 @@ pub(crate) fn validate_path_binding(
         _ => Ok("current".to_string()),
     }
 }
-/// The indexed checkout's `source_root` (the on-disk repo root), persisted in `index_meta` at
-/// open/rebuild/incremental. `None` on a raw connection that never recorded it (some test fixtures)
-/// — callers then skip the filesystem fallback and behave as if the target is absent.
-fn source_root(conn: &Connection) -> Option<std::path::PathBuf> {
+/// The persisted `source_root` (the on-disk repo root recorded in `index_meta` at
+/// open/rebuild/incremental). `None` on a raw connection that never recorded it (some test
+/// fixtures). This is a SINGLE shared value — under a shared DB across git worktrees it reflects
+/// whichever worktree last indexed, which is why [`validate_memories`] prefers the caller-supplied
+/// active checkout root and only falls back to this (#98 review).
+fn persisted_source_root(conn: &Connection) -> Option<PathBuf> {
     conn.query_row("SELECT value FROM index_meta WHERE key = 'source_root'", [], |row| {
         row.get::<_, String>(0)
     })
     .optional()
     .ok()
     .flatten()
-    .map(std::path::PathBuf::from)
+    .map(PathBuf::from)
 }
 
-/// Whether `path` (repo-root-relative) resolves to an existing file under the index `source_root`
-/// — the off-index existence check for non-indexed file types (#98). `false` when `source_root` is
-/// unknown, so a connection without it falls back to the pre-#98 `gone` behavior.
-fn path_exists_on_disk(conn: &Connection, path: &str) -> bool {
-    source_root(conn).is_some_and(|root| root.join(path).exists())
+/// The filesystem root the off-index existence checks resolve against: the caller-supplied ACTIVE
+/// checkout root (`storage.source_root`, correct under a multi-worktree shared DB) when known, else
+/// the single persisted `index_meta.source_root` (#98 review).
+pub(crate) fn effective_fs_root(conn: &Connection, active_root: Option<&Path>) -> Option<PathBuf> {
+    active_root.map(Path::to_path_buf).or_else(|| persisted_source_root(conn))
 }
 
-/// Whether `dir` (repo-root-relative, `""` = repo root) resolves to an existing directory under the
-/// index `source_root` — the off-index dir existence check (#98).
-fn dir_exists_on_disk(conn: &Connection, dir: &str) -> bool {
-    source_root(conn).is_some_and(|root| root.join(dir).is_dir())
+/// Whether a binding's stored `path`/`dir` honors the repo-root-relative contract: not absolute and
+/// free of any `..` / root-prefix component that could escape `source_root` (#98 review). A binding
+/// violating it is treated as not-on-disk, so a stray absolute/`..` path can't keep an out-of-repo
+/// file's anchor alive. A leading `./` (`CurDir`) and an empty string (the repo root) are fine.
+fn is_repo_relative(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
+/// Whether `path` (repo-root-relative) resolves to an existing FILE under `root` — the off-index
+/// existence check for non-indexed file types (#98). `false` when `root` is unknown (so a
+/// connection without a source_root falls back to the pre-#98 `gone` behavior) or the path is not
+/// repo-relative.
+fn path_is_file_on_disk(root: Option<&Path>, path: &str) -> bool {
+    root.is_some_and(|root| is_repo_relative(path) && root.join(path).is_file())
+}
+
+/// Whether `dir` (repo-root-relative, `""` = repo root) resolves to an existing directory under
+/// `root` — the off-index dir existence check (#98).
+fn dir_exists_on_disk(root: Option<&Path>, dir: &str) -> bool {
+    root.is_some_and(|root| is_repo_relative(dir) && root.join(dir).is_dir())
 }
 
 pub(crate) fn source_hash_for_memory(
