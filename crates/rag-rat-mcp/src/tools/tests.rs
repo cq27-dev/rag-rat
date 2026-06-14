@@ -217,6 +217,25 @@ fn enum_like_tool_args_reject_unknown_values_during_decoding() {
 }
 
 #[test]
+fn index_status_surfaces_version_when_cached_and_enabled() {
+    let (root, config) = mixed_config();
+    IndexDatabase::rebuild(&config).unwrap();
+    // Seed a clearly-newer cached crates.io result next to the index (cache_path is public; the
+    // network refresh that normally writes this is out of band).
+    let cache = rag_rat_core::version_check::cache_path(&config.database);
+    std::fs::write(&cache, r#"{"latest_version":"99.0.0","checked_at_ms":1}"#).unwrap();
+
+    let status = call_tool_for_config(&config, "index_status", json!({})).unwrap();
+    let version = status.get("version").expect("index_status surfaces a version field");
+    assert_eq!(version["current_version"], rag_rat_core::version_check::current_version());
+    assert_eq!(version["latest_version"], "99.0.0");
+    assert_eq!(version["update_available"], true);
+    assert_eq!(version["update_command"], "cargo install rag-rat --force");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn mcp_tool_calls_preserve_compatibility_shapes() {
     let (root, config) = mixed_config();
     let db = IndexDatabase::rebuild(&config).unwrap();

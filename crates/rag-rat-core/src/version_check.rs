@@ -117,7 +117,14 @@ pub fn fetch_latest() -> Option<String> {
         .ok()?
         .into_string()
         .ok()?;
-    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    parse_latest_response(&body)
+}
+
+/// Extract `crate.max_version` from a crates.io `/api/v1/crates/<name>` JSON body. `None` on
+/// malformed JSON or a missing/non-string field — the fail-open parse half of [`fetch_latest`],
+/// split out so it's testable without the network.
+fn parse_latest_response(body: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
     json.get("crate")?.get("max_version")?.as_str().map(str::to_string)
 }
 
@@ -207,6 +214,47 @@ mod tests {
     #[test]
     fn cached_status_is_none_when_disabled() {
         assert_eq!(cached_status(false, Path::new("/x/.rag-rat/index.sqlite")), None);
+    }
+
+    #[test]
+    fn cached_status_enabled_reflects_the_cache() {
+        let dir = std::env::temp_dir().join(format!("rr-vcheck-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rag-rat")).unwrap();
+        let database = dir.join(".rag-rat").join("index.sqlite");
+
+        // No cache yet: enabled → Some, but latest unknown and no update claimed.
+        let s = cached_status(true, &database).expect("enabled → Some");
+        assert_eq!(s.current_version, current_version());
+        assert_eq!(s.latest_version, None);
+        assert!(!s.update_available);
+
+        // A clearly-newer cached version flips update_available against the running version.
+        write_cache(&database, &CachedVersion {
+            latest_version: "99.0.0".into(),
+            checked_at_ms: 1,
+        });
+        let s = cached_status(true, &database).expect("enabled → Some");
+        assert_eq!(s.latest_version.as_deref(), Some("99.0.0"));
+        assert!(s.update_available, "99.0.0 is newer than the running {}", current_version());
+        assert_eq!(s.update_command, "cargo install rag-rat --force");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_latest_response_extracts_max_version_fail_open() {
+        assert_eq!(
+            parse_latest_response(r#"{"crate":{"name":"rag-rat","max_version":"0.6.0"}}"#),
+            Some("0.6.0".to_string())
+        );
+        assert_eq!(parse_latest_response("definitely not json"), None);
+        assert_eq!(parse_latest_response(r#"{"crate":{}}"#), None, "missing max_version");
+        assert_eq!(parse_latest_response("{}"), None, "missing crate");
+        assert_eq!(
+            parse_latest_response(r#"{"crate":{"max_version":123}}"#),
+            None,
+            "non-string max_version is ignored, not coerced"
+        );
     }
 
     #[test]

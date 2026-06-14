@@ -271,9 +271,16 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
 /// it out of band); `None` when version checking is disabled or no check has been cached yet, so a
 /// fresh repo or an opted-out user sees nothing.
 fn version_check_line(config: &Config) -> Option<String> {
-    use rag_rat_core::version_check;
-    let status = version_check::cached_status(config.version_check.enabled, &config.database)?;
-    let latest = status.latest_version?;
+    let status =
+        rag_rat_core::version_check::cached_status(config.version_check.enabled, &config.database)?;
+    version_line(&status)
+}
+
+/// Format the digest version line from a status (pure, so it's testable without a config/cache).
+/// `None` when the latest version is unknown (no successful check cached yet) — stay quiet rather
+/// than print a half-answer.
+fn version_line(status: &rag_rat_core::version_check::VersionStatus) -> Option<String> {
+    let latest = status.latest_version.as_deref()?;
     if status.update_available {
         Some(format!(
             "\n⚠ rag-rat update available: {} → {} — run `{}`\n",
@@ -523,6 +530,42 @@ mod tests {
     use rag_rat_core::query::tree::{DirTree, TreeNode};
 
     use super::*;
+
+    // ─── version line ─────────────────────────────────────────────────────────
+
+    fn status(latest: Option<&str>, update: bool) -> rag_rat_core::version_check::VersionStatus {
+        rag_rat_core::version_check::VersionStatus {
+            current_version: "0.5.0".to_string(),
+            latest_version: latest.map(str::to_string),
+            update_available: update,
+            update_command: "cargo install rag-rat --force".to_string(),
+            checked_at_ms: latest.map(|_| 1),
+        }
+    }
+
+    #[test]
+    fn version_line_nags_when_behind() {
+        let line = version_line(&status(Some("0.6.0"), true)).expect("a behind status renders");
+        assert!(line.contains("update available"), "got: {line}");
+        assert!(line.contains("0.5.0 → 0.6.0"), "states current → latest: {line}");
+        assert!(
+            line.contains("cargo install rag-rat --force"),
+            "states the update command: {line}"
+        );
+    }
+
+    #[test]
+    fn version_line_is_quiet_when_current() {
+        let line =
+            version_line(&status(Some("0.5.0"), false)).expect("an up-to-date status renders");
+        assert!(line.contains("0.5.0 (latest on crates.io)"), "got: {line}");
+        assert!(!line.contains("update available"), "no nag when current: {line}");
+    }
+
+    #[test]
+    fn version_line_is_none_when_latest_unknown() {
+        assert_eq!(version_line(&status(None, false)), None, "no cached check → no line");
+    }
 
     // ─── HookInput parsing ────────────────────────────────────────────────────
 
