@@ -34,12 +34,29 @@ impl IndexConnection {
     /// the file. WAL databases serve concurrent read-only opens; a DB that has never been
     /// opened for write errors here, which callers treat as "no context".
     pub fn open_read_only(path: &Path) -> anyhow::Result<Self> {
+        Self::open_read_only_with_busy_timeout(path, std::time::Duration::from_millis(100))
+    }
+
+    /// Read-only open that waits out a concurrent writer (the watcher mid-pass, a lazy heal)
+    /// instead of failing fast. Used by the MCP read tools: a `SQLITE_OPEN_READ_ONLY` connection
+    /// can never acquire the main write lock, so a served read is structurally immune to being
+    /// locked out by a writer — and the longer busy_timeout only matters for the brief WAL
+    /// checkpoint window. See [#143]. The 100ms `open_read_only` stays fast for the latency-
+    /// critical grep-augment hook, which prefers "no context" over blocking.
+    pub fn open_read_only_blocking(path: &Path) -> anyhow::Result<Self> {
+        Self::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))
+    }
+
+    fn open_read_only_with_busy_timeout(
+        path: &Path,
+        busy_timeout: std::time::Duration,
+    ) -> anyhow::Result<Self> {
         use rusqlite::OpenFlags;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(std::time::Duration::from_millis(100))?;
+        conn.busy_timeout(busy_timeout)?;
         Ok(Self { conn, database_path: path.to_path_buf(), source_root: None })
     }
 

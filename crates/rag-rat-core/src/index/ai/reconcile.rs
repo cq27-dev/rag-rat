@@ -1,6 +1,15 @@
 use super::*;
 
 pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
+    // Read-first: skip the (write-locking) DML entirely when the manifest already matches what we
+    // would write. `ensure_model_manifest` runs on EVERY `IndexDatabase::open*`, so issuing
+    // unconditional INSERT/UPDATE/DELETE here made every open — including read-only MCP tools —
+    // take the SQLite write lock, serializing them against the watcher and other clients and
+    // surfacing "database is locked" under concurrency (#143). After the first open establishes
+    // the manifest, every later open is a handful of SELECTs and never touches the write lock.
+    if model_manifest_is_current(conn)? {
+        return Ok(());
+    }
     remove_legacy_models(conn)?;
     upsert_model(conn, HASH_MODEL_ID, "embedding", Some(HASH_EMBEDDING_DIM), "hash", false)?;
     upsert_model(
@@ -21,6 +30,47 @@ pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
     )?;
     normalize_embedding_model_versions(conn)?;
     Ok(())
+}
+
+/// Read-only test of whether `ensure_model_manifest` would be a no-op — i.e. the manifest is
+/// already in its target state. Mirrors exactly the three writes in `ensure_model_manifest`:
+/// no legacy model rows linger, all three current models are present (`upsert_model` is
+/// `ON CONFLICT DO NOTHING`, so presence is the only condition), and no `chunk_embeddings` row
+/// still carries the pre-normalization `'v1'` model_version. Used both to short-circuit the open
+/// write path (#143) and to let the read-only MCP open refuse to serve when a manifest write is
+/// still owed (falling back to the read-write open, which heals once).
+pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<bool> {
+    for model_id in LEGACY_MODEL_IDS {
+        let lingering: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ai_models WHERE model_id = ?1)
+                 OR EXISTS(SELECT 1 FROM chunk_embeddings WHERE model_id = ?1)
+                 OR EXISTS(SELECT 1 FROM index_meta WHERE key = ?2 AND value = ?1)",
+            params![model_id, ACTIVE_EMBEDDING_MODEL_META],
+            |row| row.get(0),
+        )?;
+        if lingering {
+            return Ok(false);
+        }
+    }
+    for model_id in [HASH_MODEL_ID, FASTEMBED_MODEL_ID, MODEL2VEC_MODEL_ID] {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ai_models WHERE model_id = ?1)",
+            params![model_id],
+            |row| row.get(0),
+        )?;
+        if !present {
+            return Ok(false);
+        }
+    }
+    let stale_version: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM chunk_embeddings
+             WHERE model_version = 'v1' AND model_id IN (?1, ?2)
+         )",
+        params![HASH_MODEL_ID, FASTEMBED_MODEL_ID],
+        |row| row.get(0),
+    )?;
+    Ok(!stale_version)
 }
 
 pub(crate) fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
@@ -771,5 +821,61 @@ pub(crate) fn install_model2vec_model(conn: &Connection, model_id: &str) -> anyh
             params![model_id, MODEL2VEC_MISSING_FEATURE_MESSAGE],
         )?;
         anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
+    }
+}
+
+#[cfg(test)]
+mod manifest_idempotence_tests {
+    use super::*;
+    use crate::storage::IndexConnection;
+
+    // #143: `ensure_model_manifest` runs on every `IndexDatabase::open*`. It must be a no-op (no
+    // write lock) once the manifest is current, or every read tool serializes on the SQLite writer.
+    #[test]
+    fn ensure_model_manifest_does_not_write_when_already_current() {
+        let dir = std::env::temp_dir().join(format!("ragrat-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+
+        // First open establishes the manifest (a write); afterward the read-only check sees it.
+        {
+            let rw = IndexConnection::open(&db).unwrap();
+            crate::index::schema::apply(rw.connection()).unwrap();
+            assert!(
+                !model_manifest_is_current(rw.connection()).unwrap(),
+                "a freshly applied schema has no model rows yet"
+            );
+            ensure_model_manifest(rw.connection()).unwrap();
+            assert!(model_manifest_is_current(rw.connection()).unwrap());
+        }
+
+        // A current manifest means ensure_model_manifest issues NO DML — prove it by running it on
+        // a read-only connection, which would error if any INSERT/UPDATE/DELETE executed.
+        {
+            let ro = IndexConnection::open_read_only_blocking(&db).unwrap();
+            assert!(model_manifest_is_current(ro.connection()).unwrap());
+            ensure_model_manifest(ro.connection())
+                .expect("a current manifest must not write on a read-only connection");
+        }
+
+        // A lingering legacy model row flips the check back to "needs work".
+        {
+            let rw = IndexConnection::open(&db).unwrap();
+            rw.connection()
+                .execute(
+                    "INSERT INTO ai_models(model_id, capability, embedding_dim, runtime, \
+                     installed, disabled, status, installed_at_ms) VALUES (?1, 'embedding', 384, \
+                     'hash', 0, 0, 'MissingModel', NULL)",
+                    params![LEGACY_MODEL_IDS[0]],
+                )
+                .unwrap();
+            assert!(
+                !model_manifest_is_current(rw.connection()).unwrap(),
+                "a lingering legacy model must require a manifest write"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -601,12 +601,38 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
     call_tool_with_db(&db, name, arguments)
 }
 
+/// Tools that only read the index. They open a read-only connection so a concurrent writer can
+/// never lock them out (#143). This is a writer DENY-list, not a reader allow-list, on purpose: a
+/// newly added read tool is read-only by default (worst case: it falls back to a read-write open).
+/// Every tool listed here mutates the index — keep it in sync with the write handlers in
+/// `handlers.rs` (`tool_classification_covers_every_tool` guards that no tool is missed).
+fn is_read_only_tool(name: &str) -> bool {
+    !matches!(
+        name,
+        "heal_index"
+            | "memory_create"
+            | "memory_rebind"
+            | "memory_update"
+            | "memory_mark_obsolete"
+            | "memory_validate"
+    )
+}
+
 pub fn call_tool_for_config(
     config: &Config,
     name: &str,
     arguments: Value,
 ) -> anyhow::Result<Value> {
-    let db = IndexDatabase::open_config(config)?;
+    // Read tools open read-only (never take the write lock); fall back to the read-write open only
+    // when the index still owes a heal/migrate write. Write tools always open read-write.
+    let db = if is_read_only_tool(name) {
+        match IndexDatabase::try_open_config_read_only(config)? {
+            Some(db) => db,
+            None => IndexDatabase::open_config(config)?,
+        }
+    } else {
+        IndexDatabase::open_config(config)?
+    };
     let mut result = call_tool_with_db(&db, name, arguments)?;
     // Surface the crates.io version status on `index_status` so an agent can see (and relay) when a
     // newer rag-rat is published. Read-only: it reads the cached check (refreshed out of band),

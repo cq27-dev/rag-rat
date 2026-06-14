@@ -740,3 +740,30 @@ fn unique_temp_root() -> PathBuf {
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("rag-rat-mcp-test-{}-{id}", std::process::id()))
 }
+
+#[test]
+fn read_only_classification_covers_every_tool_and_denies_writers() {
+    // #143: the read-only fast path must classify EVERY tool, and exactly the mutating tools must
+    // be denied read-only access. Drift either lock-contends a read tool (slow) or hands a write
+    // tool a read-only connection (runtime failure).
+    const WRITERS: &[&str] = &[
+        "heal_index",
+        "memory_create",
+        "memory_rebind",
+        "memory_update",
+        "memory_mark_obsolete",
+        "memory_validate",
+    ];
+    for writer in WRITERS {
+        assert!(TOOL_NAMES.contains(writer), "writer {writer} is not a registered tool");
+        assert!(!is_read_only_tool(writer), "{writer} mutates the index — must not be read-only");
+    }
+    for name in TOOL_NAMES {
+        let expected_read_only = !WRITERS.contains(name);
+        assert_eq!(
+            is_read_only_tool(name),
+            expected_read_only,
+            "tool {name} is misclassified for the read-only open path"
+        );
+    }
+}
