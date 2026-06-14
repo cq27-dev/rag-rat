@@ -119,6 +119,92 @@ fn mcp_stdio_smoke_lists_and_calls_core_tools() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// Regression guard: every tool advertised by `tools/list` (built from `TOOL_NAMES`) must be
+/// ROUTABLE by `tools/call`. The two are built from different sources — `list_tools` from
+/// `TOOL_NAMES`, the call router from the `#[tool]`-annotated methods — so a tool added to one but
+/// not the other is advertised yet uncallable (the SDK answers "tool not found"). `memory_rebind`
+/// regressed exactly this way: it was in `TOOL_NAMES` + handlers + schema but had no `#[tool]`
+/// method. Calling each tool with empty args is fine here: a routable tool answers with a result or
+/// an argument/validation error — only an unroutable one yields "tool not found".
+#[test]
+fn mcp_stdio_every_advertised_tool_is_routable() {
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn open_database() {}\n").unwrap();
+    fs::write(
+        root.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+    let config_path = root.join("rag-rat.toml");
+    let config = Config::load(&config_path).unwrap();
+    rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_rag-rat");
+    let mut child = Command::new(binary)
+        .arg("mcp")
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "rag-rat-test", "version": "0.1"}}
+        }),
+    );
+    let _ = recv(&mut reader);
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+    );
+    send(&mut stdin, json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = recv(&mut reader);
+    let advertised = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        advertised.contains(&"memory_rebind".to_string()),
+        "memory_rebind should be advertised"
+    );
+
+    let mut unroutable = Vec::new();
+    for (offset, name) in advertised.iter().enumerate() {
+        let id = 100 + offset as i64;
+        send(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": name, "arguments": {}}
+            }),
+        );
+        let response = recv(&mut reader);
+        if response["error"]["message"].as_str() == Some("tool not found") {
+            unroutable.push(name.clone());
+        }
+    }
+    stop(child);
+    fs::remove_dir_all(root).unwrap();
+
+    assert!(
+        unroutable.is_empty(),
+        "tools advertised by tools/list but not routable by tools/call: {unroutable:?}"
+    );
+}
+
 #[test]
 fn mcp_stdio_json_flag_emits_json_not_toon() {
     // `rag-rat mcp --json` is the MCP-side escape hatch: MCP has no per-call flag, so the output

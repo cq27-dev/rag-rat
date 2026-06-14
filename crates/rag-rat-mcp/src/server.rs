@@ -13,8 +13,9 @@ use serde_json::{Map, Value, json};
 use crate::tools::{
     BlameChunkArgs, CompareGraphTextArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs,
     MemoryCreateArgs, MemoryForCallPathArgs, MemoryForPathArgs, MemoryForSymbolArgs, MemoryIdArgs,
-    MemorySearchArgs, MemoryUpdateArgs, PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs,
-    ReadChunkArgs, RepoBriefArgs, RepoClustersArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
+    MemoryRebindArgs, MemorySearchArgs, MemoryUpdateArgs, PapertrailChunkArgs,
+    PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs, RepoBriefArgs, RepoClustersArgs,
+    SearchArgs, SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -370,6 +371,18 @@ impl RagRatService {
         Parameters(args): Parameters<MemoryCreateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("memory_create", json!(args))
+    }
+
+    #[tool(
+        name = "memory_rebind",
+        description = "Re-anchor an existing repo memory to a different symbol, chunk, path, or \
+                       other source location after it moved or was renamed."
+    )]
+    fn memory_rebind(
+        &self,
+        Parameters(args): Parameters<MemoryRebindArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_rebind", json!(args))
     }
 
     #[tool(
