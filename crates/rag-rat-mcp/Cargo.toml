@@ -1,6 +1,6 @@
 [package]
 name = "rag-rat-mcp"
-version = "0.4.0"
+version.workspace = true
 description = "MCP server tools for rag-rat repository search, symbol graph traversal, rationale lookup, and source-bound memories."
 authors.workspace = true
 edition.workspace = true
@@ -13,7 +13,7 @@ categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-rag-rat-core = { version = "0.4.0", path = "../rag-rat-core", default-features = false }
+rag-rat-core = { workspace = true }
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true

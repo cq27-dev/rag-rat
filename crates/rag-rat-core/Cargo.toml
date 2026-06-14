@@ -1,6 +1,6 @@
 [package]
 name = "rag-rat-core"
-version = "0.4.0"
+version.workspace = true
 description = "Repository evidence engine for source chunks, symbols, graph edges, Git history, GitHub rationale, and source-bound memories."
 authors.workspace = true
 edition.workspace = true

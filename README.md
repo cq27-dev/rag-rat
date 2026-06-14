@@ -710,6 +710,12 @@ returning search or `read_chunk` results.
 
 GitHub sync is explicit and uses `gh api`; normal query tools read the local SQLite cache.
 
+## Releasing
+
+Releases are automated by [release-plz](https://release-plz.dev): the three crates ship in lockstep
+at one version, merging the auto-generated Release PR publishes them to crates.io and cuts a single
+`vX.Y.Z` tag. See [docs/releasing.md](docs/releasing.md).
+
 ## License
 
 `rag-rat` is licensed under the MIT License. See [LICENSE](LICENSE).
