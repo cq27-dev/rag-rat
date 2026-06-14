@@ -18,7 +18,7 @@ rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/cq27-dev/rag-rat"
 readme = "README.md"
-keywords = ["rag", "mcp", "code-search", "tree-sitter", "embeddings"]
+keywords = ["rag", "mcp", "code-search", "tree-sitter", "scip"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
