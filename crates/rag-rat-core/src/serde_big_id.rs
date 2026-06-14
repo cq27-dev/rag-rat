@@ -19,6 +19,13 @@ use std::fmt;
 use serde::de::{self, Deserialize, Deserializer, Unexpected, Visitor};
 use serde::{Serialize, Serializer};
 
+/// JSON's largest exactly-representable integer, `2^53 - 1`. A number outside `±MAX_SAFE_INTEGER`
+/// can't survive a JSON-number parse that goes through an f64, so by the time such a value reaches
+/// us as a number it has almost certainly already been rounded — accepting it would silently look
+/// up the WRONG id. The numeric deserialize path is therefore bounded to the safe range; anything
+/// larger MUST arrive as a string (#130 review).
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
 /// An `i64` that serializes as a decimal string and deserializes from either a string or a number.
 /// Private — the public surface is the `big_id` / `big_id_opt` serde modules.
 struct BigId(i64);
@@ -35,23 +42,36 @@ impl<'de> Deserialize<'de> for BigId {
     }
 }
 
+/// The error for a numeric id outside the JSON safe-integer range — such a value can't be trusted
+/// (it may already be f64-rounded), so we reject it and point the caller at the string form.
+fn unsafe_number_message(value: impl fmt::Display) -> String {
+    format!(
+        "id {value} is outside JSON's safe-integer range (±2^53-1) and may have been rounded; \
+         pass it as a string"
+    )
+}
+
 struct BigIdVisitor;
 
 impl Visitor<'_> for BigIdVisitor {
     type Value = BigId;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("an i64 as a decimal string or a JSON number")
+        f.write_str("an i64 as a decimal string, or a JSON number within ±(2^53-1)")
     }
 
     fn visit_i64<E: de::Error>(self, value: i64) -> Result<BigId, E> {
+        if !(-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value) {
+            return Err(E::custom(unsafe_number_message(value)));
+        }
         Ok(BigId(value))
     }
 
     fn visit_u64<E: de::Error>(self, value: u64) -> Result<BigId, E> {
-        i64::try_from(value)
-            .map(BigId)
-            .map_err(|_| E::invalid_value(Unexpected::Unsigned(value), &self))
+        if value > MAX_SAFE_INTEGER as u64 {
+            return Err(E::custom(unsafe_number_message(value)));
+        }
+        Ok(BigId(value as i64))
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<BigId, E> {
@@ -128,10 +148,26 @@ mod tests {
     }
 
     #[test]
-    fn required_big_id_still_accepts_a_number_for_back_compat() {
+    fn required_big_id_still_accepts_a_safe_number_for_back_compat() {
         // A small in-safe-range value sent as a JSON number must still deserialize.
         let back: Req = serde_json::from_str(r#"{"id":1001}"#).unwrap();
         assert_eq!(back.id, 1001);
+        // The boundary value 2^53-1 is still accepted as a number.
+        let edge: Req = serde_json::from_str(r#"{"id":9007199254740991}"#).unwrap();
+        assert_eq!(edge.id, 9_007_199_254_740_991);
+    }
+
+    #[test]
+    fn unsafe_number_is_rejected_so_a_rounded_id_never_silently_binds() {
+        // A value above 2^53 sent as a JSON NUMBER may already be f64-rounded; reject it rather
+        // than look up the wrong id. The same value as a STRING is exact and accepted (#130
+        // review).
+        let as_number = serde_json::from_str::<Req>(r#"{"id":2574604874062343519}"#);
+        assert!(as_number.is_err(), "an unsafe numeric id must be rejected, not silently accepted");
+        let as_string: Req = serde_json::from_str(r#"{"id":"2574604874062343519"}"#).unwrap();
+        assert_eq!(as_string.id, BIG);
+        // The optional variant rejects an unsafe number too.
+        assert!(serde_json::from_str::<Opt>(r#"{"id":2574604874062343519}"#).is_err());
     }
 
     #[test]
