@@ -33,7 +33,9 @@ thiserror = "2.0"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-std"] }
 # TOON (Token-Oriented Object Notation): the default render for CLI + MCP output. ~34% fewer tokens
 # than compact JSON on uniform-row payloads, neutral on nested ones — see rag_rat_core::output.
-toon-format = "0.5.0"
+# default-features = false drops its `cli` feature (ratatui/crossterm/arboard/syntect/tiktoken-rs/…)
+# — we only need the library encode/decode surface.
+toon-format = { version = "0.5.0", default-features = false }
 toml = "1.1"
 # Grammar crates are exact-pinned so parser node coverage changes deliberately.
 tree-sitter = "=0.26.9"

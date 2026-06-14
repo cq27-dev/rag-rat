@@ -551,6 +551,11 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
         MemoryCommand::List { kind } => {
             let db = open_index(config)?;
             let summaries = db.memory_list(kind.as_deref())?;
+            // The global `--json` emits the structured list (a caller parsing stdout gets JSON, not
+            // the human lines below).
+            if output_format() == OutputFormat::Json {
+                return print_output(&summaries);
+            }
             if summaries.is_empty() {
                 eprintln!("No memories found.");
                 return Ok(());
@@ -568,6 +573,10 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
             let Some(memory) = db.memory_get(memory_id)? else {
                 anyhow::bail!("memory `{memory_id}` not found");
             };
+            // The global `--json` emits the structured memory instead of the human view below.
+            if output_format() == OutputFormat::Json {
+                return print_output(&memory);
+            }
             println!("Title:      {}", memory.title);
             println!("Kind:       {} / {} / {}", memory.kind, memory.status, memory.confidence);
             println!();

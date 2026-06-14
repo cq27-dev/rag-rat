@@ -63,7 +63,7 @@ echo "rust-scip-oracle: rag-rat index --full" >&2
 
 # The rust-analyzer oracle pass over the whole workspace (stdout = clean JSON report).
 echo "rust-scip-oracle: oracle run --tool rust-analyzer" >&2
-( cd "$RDIR" && "$RAG_RAT_BIN" oracle run --tool rust-analyzer ) > "$WORK/oracle-report.json"
+( cd "$RDIR" && "$RAG_RAT_BIN" oracle run --tool rust-analyzer --json ) > "$WORK/oracle-report.json"
 
 python3 - "$DB" "$WORK/oracle-report.json" "$BMF_OUT" "$CARGO_TAG" <<'PY'
 import json, sqlite3, sys

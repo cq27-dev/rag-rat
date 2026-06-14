@@ -70,7 +70,7 @@ echo "kernel-c-oracle: rag-rat index --full" >&2
 
 # The scip-clang oracle pass over the compiled subset (stdout = clean JSON report).
 echo "kernel-c-oracle: oracle run --tool scip-clang" >&2
-( cd "$KDIR" && "$RAG_RAT_BIN" oracle run --tool scip-clang ) > "$WORK/oracle-report.json"
+( cd "$KDIR" && "$RAG_RAT_BIN" oracle run --tool scip-clang --json ) > "$WORK/oracle-report.json"
 
 python3 - "$DB" "$WORK/oracle-report.json" "$TUS" "$BMF_OUT" "$KERNEL_TAG" <<'PY'
 import json, sqlite3, sys
