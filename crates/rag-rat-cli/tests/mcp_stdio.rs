@@ -119,6 +119,70 @@ fn mcp_stdio_smoke_lists_and_calls_core_tools() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn mcp_stdio_json_flag_emits_json_not_toon() {
+    // `rag-rat mcp --json` is the MCP-side escape hatch: MCP has no per-call flag, so the output
+    // format is chosen once at launch. With it, tool results are JSON (parseable directly), not the
+    // default TOON (which `serde_json::from_str` would reject).
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn open_database() {}\n").unwrap();
+    fs::write(
+        root.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+    let config_path = root.join("rag-rat.toml");
+    let config = Config::load(&config_path).unwrap();
+    rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_rag-rat");
+    let mut child = Command::new(binary)
+        .arg("mcp")
+        .arg("--json")
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "rag-rat-test", "version": "0.1"}}
+        }),
+    );
+    let _ = recv(&mut reader);
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+    );
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "semantic_search", "arguments": {"query": "database", "limit": 1}}
+        }),
+    );
+    let response = recv(&mut reader);
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    // The escape hatch: this parses as JSON directly (a TOON `[N]{cols}:` payload would not).
+    let parsed: Value = serde_json::from_str(text)
+        .unwrap_or_else(|err| panic!("MCP result under --json is not valid JSON ({err}):\n{text}"));
+    assert!(parsed.is_array() || parsed.is_object(), "expected a JSON array/object, got: {text}");
+
+    stop(child);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn send(stdin: &mut impl Write, value: Value) {
     writeln!(stdin, "{}", serde_json::to_string(&value).unwrap()).unwrap();
     stdin.flush().unwrap();

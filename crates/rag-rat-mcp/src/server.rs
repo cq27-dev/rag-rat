@@ -20,6 +20,10 @@ use crate::tools::{
 #[derive(Clone)]
 pub struct RagRatService {
     config: Config,
+    /// Output format for tool results. Defaults to TOON (denser for the LLM that reads them); set
+    /// to JSON when the server was launched as `rag-rat mcp --json` — MCP has no per-call flag, so
+    /// the choice is made once at launch (the CLI `--json` flag flows in via `run_stdio`).
+    output_format: rag_rat_core::OutputFormat,
     /// In-flight tool-call counter, observed by the hot-upgrade teardown so it drains at a request
     /// boundary before `exec`. Present only on Unix, where hot-upgrade is supported.
     #[cfg(unix)]
@@ -27,9 +31,10 @@ pub struct RagRatService {
 }
 
 impl RagRatService {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, output_format: rag_rat_core::OutputFormat) -> Self {
         Self {
             config,
+            output_format,
             #[cfg(unix)]
             inflight: crate::upgrade::Inflight::new(),
         }
@@ -51,8 +56,9 @@ impl RagRatService {
         // MCP tool results are text content read by an LLM, so render TOON by default — it is
         // materially denser than JSON on the uniform-row payloads that dominate these tools, and
         // ties JSON on nested ones. `render` falls back to compact JSON on a TOON encode error, so
-        // a tool result is never lost. No per-call flag: MCP default is TOON.
-        let text = rag_rat_core::render(&value, rag_rat_core::OutputFormat::Toon);
+        // a tool result is never lost. JSON is reachable by launching `rag-rat mcp --json`
+        // (the format is chosen once at launch; MCP has no per-call flag).
+        let text = rag_rat_core::render(&value, self.output_format);
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 }
@@ -471,17 +477,20 @@ impl ServerHandler for RagRatService {
     }
 }
 
-pub async fn run_stdio(config: Config) -> anyhow::Result<()> {
+pub async fn run_stdio(
+    config: Config,
+    output_format: rag_rat_core::OutputFormat,
+) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        run_stdio_unix(config).await
+        run_stdio_unix(config, output_format).await
     }
     #[cfg(not(unix))]
     {
         // Keep the index fresh while a session is connected; dropping the watcher on shutdown
         // runs a final timeout-skip pass. (Hot-upgrade is Unix-only.)
         let _watcher = rag_rat_core::watch::Watcher::spawn(config.clone());
-        let service = RagRatService::new(config).serve(stdio()).await?;
+        let service = RagRatService::new(config, output_format).serve(stdio()).await?;
         service.waiting().await?;
         Ok(())
     }
@@ -503,7 +512,10 @@ impl Drop for AbortOnDrop {
 /// Unix `run_stdio`: serves over a [`crate::upgrade::GatedStdin`] so a `SIGUSR1` can hot-`exec`
 /// the newly installed binary in place, and resumes (skipping `initialize`) when handed off to.
 #[cfg(unix)]
-async fn run_stdio_unix(config: Config) -> anyhow::Result<()> {
+async fn run_stdio_unix(
+    config: Config,
+    output_format: rag_rat_core::OutputFormat,
+) -> anyhow::Result<()> {
     use std::sync::Arc;
 
     use rmcp::service::serve_directly;
@@ -512,7 +524,7 @@ async fn run_stdio_unix(config: Config) -> anyhow::Result<()> {
     use crate::upgrade::{self, GatedStdin, Upgrade, UpgradeGate};
 
     let gate = UpgradeGate::new();
-    let service = RagRatService::new(config.clone());
+    let service = RagRatService::new(config.clone(), output_format);
     let inflight = service.inflight();
 
     let transport = (GatedStdin::new(tokio::io::stdin(), Arc::clone(&gate)), tokio::io::stdout());

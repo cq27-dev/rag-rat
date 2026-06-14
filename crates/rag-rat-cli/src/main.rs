@@ -65,7 +65,14 @@ fn main() -> anyhow::Result<()> {
                 .worker_threads(2)
                 .enable_all()
                 .build()?
-                .block_on(rag_rat_mcp::server::run_stdio(config))?;
+                .block_on(rag_rat_mcp::server::run_stdio(
+                    config,
+                    if cli.json {
+                        rag_rat_core::OutputFormat::Json
+                    } else {
+                        rag_rat_core::OutputFormat::Toon
+                    },
+                ))?;
         },
         Cmd::Memory(args) => memory(&config, &args)?,
         Cmd::Github(args) => github(&config, &args)?,
