@@ -531,7 +531,9 @@ For commands that print a human summary by default (`reconcile --plan`, `eval`, 
 `--json` selects their structured JSON output instead of the summary.
 
 The MCP server's tool results default to TOON as well — they are text content read by an LLM, so the
-denser encoding is both valid and cheaper. There is no per-call flag; MCP output is always TOON.
+denser encoding is both valid and cheaper. MCP has no per-call flag, so the format is chosen once at
+launch: start the server as `rag-rat mcp --json` (in your MCP client config's `args`) to get JSON
+tool results instead — the escape hatch for a client that still parses tool text as JSON.
 
 ```bash
 rag-rat index

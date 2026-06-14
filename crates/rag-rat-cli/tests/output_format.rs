@@ -50,11 +50,7 @@ fn run(config_path: &PathBuf, json: bool, args: &[&str]) -> String {
     }
     cmd.args(args);
     let out = cmd.output().unwrap();
-    assert!(
-        out.status.success(),
-        "`{args:?}` failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "`{args:?}` failed: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap()
 }
 
