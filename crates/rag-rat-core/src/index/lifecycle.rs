@@ -1,5 +1,11 @@
 use super::*;
 
+/// How long an `open` waits for the index write lock before giving up on auto-migrating a schema
+/// that lags this binary. Generous — a concurrent migrator (or a watcher maintenance pass holding
+/// the lock) finishes well within it; a timeout surfaces an explicit error, never a silent
+/// half-open.
+const SCHEMA_MIGRATE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_with_graph_check(path, true)
@@ -11,7 +17,30 @@ impl IndexDatabase {
 
     fn open_with_graph_check(path: &Path, check_graph: bool) -> anyhow::Result<Self> {
         let mut storage = IndexConnection::open(path)?;
-        schema::check_compatible(storage.connection())?;
+        // Forward schema migrations are automatic on open (the index is our own derived data — a
+        // binary upgrade must not require a manual `migrate`). Only Newer/Dirty/Missing refuse.
+        //
+        // An `Older` schema is migrated UNDER THE INDEX WRITE LOCK: auto-migration now fires from
+        // ordinary read/MCP opens, so a hot-restarted server and a concurrent `query` could both
+        // observe `Older` and race `add_column_if_missing`'s check-then-ALTER into a
+        // duplicate-column DDL failure. Serializing on `write_lock_path` makes one opener
+        // migrate while the other waits, then re-checks under the lock (the waiter sees
+        // `Compatible` and does nothing). Compatible/Newer/Dirty/Missing need no lock —
+        // `ensure_compatible_or_migrate` returns or refuses without writing.
+        if schema::status(storage.connection())?.state == schema::SchemaState::Older {
+            let _lock = crate::locks::FileLock::acquire_timeout(
+                &crate::locks::write_lock_path(path),
+                SCHEMA_MIGRATE_LOCK_TIMEOUT,
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "timed out waiting for the index write lock to auto-migrate the schema"
+                )
+            })?;
+            schema::ensure_compatible_or_migrate(storage.connection())?;
+        } else {
+            schema::ensure_compatible_or_migrate(storage.connection())?;
+        }
         ai::ensure_model_manifest(storage.connection())?;
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
             storage.set_source_root(PathBuf::from(root));

@@ -39,9 +39,11 @@ index, so switching the backend in the config takes effect after re-running `rag
 backends have different vector dimensions, so switching re-embeds from scratch.
 
 The database stores explicit schema migrations in `schema_version` with migration id,
-`applied_at_ms`, checksum, and description. `rag-rat migrate --check` verifies compatibility without
-changing source files; `rag-rat migrate` applies the current SQLite index schema. Normal runtime
-opens refuse older, newer, dirty, or partial schemas instead of silently altering tables.
+`applied_at_ms`, checksum, and description. Opening the index **migrates an older schema forward
+automatically** — the migration ladder is additive and idempotent, so a binary upgrade needs no
+manual step. Only a *newer* schema (created by a future rag-rat — can't downgrade), a *dirty* or
+checksum-mismatched schema (rebuild with `rag-rat index --full`), or a *missing* index (build it
+first) is refused. `rag-rat doctor` reports the schema state without changing anything.
 
 Simple bindings map a language to directories:
 
