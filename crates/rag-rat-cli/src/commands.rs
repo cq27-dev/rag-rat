@@ -93,7 +93,13 @@ pub(crate) fn important_symbols(
     args: &ImportantSymbolsArgs,
 ) -> anyhow::Result<()> {
     let db = open_index(config)?;
-    print_output(&db.important_symbols(args.limit.unwrap_or(20) as usize, &args.personalize)?)
+    // CLI stays global-by-default: no auto-seed from the git diff (`auto_seed_from_diff: false`).
+    // Only an explicit `--personalize` seeds — the intentional divergence from the MCP default.
+    print_output(&db.important_symbols(rag_rat_core::index::ImportantSymbolsRequest {
+        limit: args.limit.unwrap_or(20) as usize,
+        personalize: args.personalize.clone(),
+        auto_seed_from_diff: false,
+    })?)
 }
 pub(crate) fn dump_config(config: &Config) -> anyhow::Result<()> {
     let targets = config

@@ -1,7 +1,47 @@
+use rusqlite::OptionalExtension;
+
 use super::*;
 use crate::index::oracle::{
     self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls,
 };
+use crate::query::pagerank::{ImportantSymbolsResult, SymbolImportance};
+
+/// Inputs to [`IndexDatabase::important_symbols`]. The seed (`personalize`) takes names, paths, or
+/// numeric ids; `auto_seed_from_diff` is the MCP-only default (seed from the current git diff when
+/// no explicit seed is given) — the CLI passes `false` so it stays global-by-default. The
+/// intentional MCP/CLI divergence is acceptance-invariant #1.
+pub struct ImportantSymbolsRequest {
+    pub limit: usize,
+    pub personalize: Vec<String>,
+    pub auto_seed_from_diff: bool,
+}
+
+/// Explicit seed selectors resolved to in-graph symbol ids, plus the count that resolved to nothing
+/// (ambiguous / missing — skipped, not fatal).
+struct ResolvedSeeds {
+    symbol_ids: Vec<i64>,
+    unresolved: u64,
+}
+
+/// The git-diff auto-seed, mapped through the scoped `files` view, with provenance counts.
+#[derive(Default)]
+struct DiffSeed {
+    symbol_ids: Vec<i64>,
+    changed_paths: u64,
+    indexed_paths: u64,
+    skipped: crate::query::pagerank::SkippedSeeds,
+}
+
+/// What one changed path contributed to the diff seed.
+enum ChangedPathSymbols {
+    /// The path is indexed (non-generated) in the active scope; its symbol ids (possibly empty for
+    /// a config/markdown file or a parser gap).
+    Symbols(Vec<i64>),
+    /// The path is indexed as a generated artifact — deliberately excluded from the seed.
+    Generated,
+    /// The path is not in the active scope's `files` view at all.
+    None,
+}
 
 impl IndexDatabase {
     /// Run a SCIP-oracle pass from a pre-built `.scip` over the current (active commit/worktree)
@@ -1676,20 +1716,243 @@ impl IndexDatabase {
     /// (contradicted edges dropped, upgrades retargeted, confirmed/upgraded edges weighted above
     /// heuristic) — otherwise the heuristic graph with confidence weighting. The oracle lookup is
     /// gated on a run existing, so absent oracle data it costs nothing (no scan).
+    /// Rank load-bearing symbols, returning the labeled [`ImportantSymbolsResult`] (mode + seed
+    /// provenance), per the spec's "three scales". Seed resolution happens HERE, at the query
+    /// boundary, because it needs both the symbol index (name/path → id) and git (the working-set
+    /// diff) — `query::pagerank` stays a pure ranking primitive over raw ids.
+    ///
+    /// Seed precedence:
+    /// - explicit `request.personalize` (names / paths / numeric ids) → `SeedKind::Explicit`;
+    /// - else, if `request.auto_seed_from_diff` (the MCP default), the current git diff →
+    ///   `SeedKind::GitDiff`;
+    /// - else (the CLI default, or an explicit empty/`global` selector) → global, un-seeded.
+    ///
+    /// A seed intent that resolves to NO in-graph symbol (bad names only, or a diff with no indexed
+    /// symbols) does NOT hard-error: it falls through to global ranking but REPORTS the
+    /// fall-through (`mode = global …` + `reason` + the diff counts), so the caller sees WHY it
+    /// was un-seeded.
     pub fn important_symbols(
         &self,
-        limit: usize,
-        personalize_to: &[i64],
-    ) -> anyhow::Result<Vec<crate::query::pagerank::SymbolImportance>> {
+        request: ImportantSymbolsRequest,
+    ) -> anyhow::Result<ImportantSymbolsResult> {
+        use crate::query::pagerank::{ImportanceMode, SeedKind, SeedSource, SkippedSeeds};
+
         let oracle_effects = self.symbol_importance_oracle_effects()?;
-        crate::query::pagerank::important_symbols(
-            self.storage.connection(),
-            crate::query::pagerank::ImportanceOptions {
-                limit,
-                personalize_to,
-                oracle_effects: oracle_effects.as_ref(),
-            },
-        )
+        let rank = |seed: &[i64]| -> anyhow::Result<Vec<SymbolImportance>> {
+            crate::query::pagerank::important_symbols(
+                self.storage.connection(),
+                crate::query::pagerank::ImportanceOptions {
+                    limit: request.limit,
+                    personalize_to: seed,
+                    oracle_effects: oracle_effects.as_ref(),
+                },
+            )
+        };
+
+        // Explicit names/paths/ids win over the auto-diff default.
+        if !request.personalize.is_empty() {
+            let resolved = self.resolve_seed_selectors(&request.personalize)?;
+            let symbols = rank(&resolved.symbol_ids)?;
+            let seed_source = SeedSource {
+                kind: SeedKind::Explicit,
+                // Explicit seeds are names, not paths — no path population to report.
+                changed_paths: 0,
+                indexed_paths: 0,
+                symbol_seed_count: resolved.symbol_ids.len() as u64,
+                skipped: SkippedSeeds { no_symbols: resolved.unresolved, ..Default::default() },
+            };
+            // Every explicit name missed → no graph seed → global ranking, but say so.
+            if resolved.symbol_ids.is_empty() {
+                return Ok(ImportantSymbolsResult {
+                    mode: ImportanceMode::Global,
+                    seed_source: Some(seed_source),
+                    reason: Some("no named symbols resolved to the active scope".to_string()),
+                    diff_paths_considered: None,
+                    diff_paths_with_symbols: None,
+                    symbols,
+                });
+            }
+            return Ok(ImportantSymbolsResult {
+                mode: ImportanceMode::PersonalizedToChanges,
+                seed_source: Some(seed_source),
+                reason: None,
+                diff_paths_considered: None,
+                diff_paths_with_symbols: None,
+                symbols,
+            });
+        }
+
+        // No explicit seed. CLI stays global-by-default; only the MCP default auto-seeds from diff.
+        if !request.auto_seed_from_diff {
+            return Ok(ImportantSymbolsResult {
+                mode: ImportanceMode::Global,
+                seed_source: None,
+                reason: None,
+                diff_paths_considered: None,
+                diff_paths_with_symbols: None,
+                symbols: rank(&[])?,
+            });
+        }
+
+        let diff = self.diff_seed()?;
+        let symbols = rank(&diff.symbol_ids)?;
+        // The diff had changes but none mapped to an indexed symbol (markdown/config/generated/
+        // deleted-only changes, or parser gaps): fall back to global, but report it with counts.
+        if diff.symbol_ids.is_empty() {
+            return Ok(ImportantSymbolsResult {
+                mode: ImportanceMode::Global,
+                seed_source: Some(SeedSource {
+                    kind: SeedKind::GitDiff,
+                    changed_paths: diff.changed_paths,
+                    indexed_paths: diff.indexed_paths,
+                    symbol_seed_count: 0,
+                    skipped: diff.skipped,
+                }),
+                reason: Some("no symbols found in current diff".to_string()),
+                diff_paths_considered: Some(diff.changed_paths),
+                diff_paths_with_symbols: Some(diff.indexed_paths),
+                symbols,
+            });
+        }
+        Ok(ImportantSymbolsResult {
+            mode: ImportanceMode::PersonalizedToChanges,
+            seed_source: Some(SeedSource {
+                kind: SeedKind::GitDiff,
+                changed_paths: diff.changed_paths,
+                indexed_paths: diff.indexed_paths,
+                symbol_seed_count: diff.symbol_ids.len() as u64,
+                skipped: diff.skipped,
+            }),
+            reason: None,
+            diff_paths_considered: None,
+            diff_paths_with_symbols: None,
+            symbols,
+        })
+    }
+
+    /// Resolve a mixed list of explicit seed selectors (numeric symbol ids, symbol paths, or bare
+    /// names) to in-index symbol ids at the query boundary. A numeric string is a raw symbol id; an
+    /// ambiguous or missing name is SKIPPED (counted in `unresolved`), never fatal — one bad name
+    /// must not sink the whole call. Resolution order per non-numeric entry: `symbol_path` exact,
+    /// then `symbol` (name), mirroring `SymbolSelector` precedence.
+    fn resolve_seed_selectors(&self, selectors: &[String]) -> anyhow::Result<ResolvedSeeds> {
+        use crate::query::symbol::SymbolSelector;
+
+        let mut symbol_ids = Vec::new();
+        let mut unresolved = 0_u64;
+        for raw in selectors {
+            let entry = raw.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if let Ok(id) = entry.parse::<i64>() {
+                symbol_ids.push(id);
+                continue;
+            }
+            // Try `symbol_path` (exact qualified name) FIRST, then fall back to a bare-name lookup
+            // — `SymbolSelector` short-circuits on the first set field, so the two must be SEPARATE
+            // selectors. `allow_ambiguous: false` makes a multi-candidate name resolve to
+            // `Err(disambiguation)` → we skip it (record the miss); a missing one is `Ok(None)`.
+            let by_path = SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: Some(entry.to_string()),
+                symbol: None,
+                language: None,
+                allow_ambiguous: false,
+                // `limit >= 2` so an ambiguous name surfaces >1 candidate and resolves to
+                // `Err(disambiguation)` (skipped) — a `limit` of 1 would silently pick the first.
+                limit: 8,
+            };
+            let by_name = SymbolSelector {
+                symbol_path: None,
+                symbol: Some(entry.to_string()),
+                ..by_path.clone()
+            };
+            let resolved = match self.select_symbol(&by_path)? {
+                Ok(Some(hit)) => Some(hit),
+                // No exact qualified-name match → try the bare name.
+                Ok(None) | Err(_) => self.select_symbol(&by_name)?.ok().flatten(),
+            };
+            match resolved {
+                Some(hit) => symbol_ids.push(hit.symbol_id),
+                None => unresolved += 1,
+            }
+        }
+        symbol_ids.sort_unstable();
+        symbol_ids.dedup();
+        Ok(ResolvedSeeds { symbol_ids, unresolved })
+    }
+
+    /// Auto-seed from the current git diff (the MCP default). Maps the changed paths through the
+    /// per-connection scoped `files` view to in-scope symbol ids, bucketing the paths that
+    /// contribute no seed (deleted, generated, no-symbols) for provenance.
+    fn diff_seed(&self) -> anyhow::Result<DiffSeed> {
+        let Some(root) = self.storage.source_root() else {
+            // No source root → no working tree to diff (e.g. a bare/copied index). Treat as an
+            // empty diff, not an error: the caller falls through to global with a reason.
+            return Ok(DiffSeed::default());
+        };
+        let changed = crate::index::git_changed_paths(root)?;
+        let changed_paths = (changed.changed.len() + changed.deleted.len()) as u64;
+        let mut seed = DiffSeed { changed_paths, ..Default::default() };
+        // Deleted/renamed-away paths can never carry an in-scope symbol — count and skip them.
+        seed.skipped.deleted = changed.deleted.len() as u64;
+
+        let mut symbol_ids = Vec::new();
+        for path in &changed.changed {
+            let path = crate::index::path_string_for_seed(path);
+            match self.symbol_ids_for_changed_path(&path)? {
+                ChangedPathSymbols::Symbols(ids) if !ids.is_empty() => {
+                    seed.indexed_paths += 1;
+                    symbol_ids.extend(ids);
+                },
+                // Indexed as a generated artifact: real but deliberately excluded from the seed.
+                ChangedPathSymbols::Generated => seed.skipped.generated += 1,
+                // In the working set but contributes no in-scope symbol (config/markdown, parser
+                // gap, or not indexed at all).
+                ChangedPathSymbols::Symbols(_) | ChangedPathSymbols::None =>
+                    seed.skipped.no_symbols += 1,
+            }
+        }
+        symbol_ids.sort_unstable();
+        symbol_ids.dedup();
+        seed.symbol_ids = symbol_ids;
+        Ok(seed)
+    }
+
+    /// Map ONE changed path to its in-scope symbol ids, classifying via the per-connection scoped
+    /// `files` view. SCOPED-VIEW REQUIREMENT (#89): the JOIN goes through `files` (the TEMP VIEW
+    /// installed per connection — overlay rows win, other commits/worktrees excluded), NEVER raw
+    /// `main.symbols`/`main.files`. Querying raw tables here would seed PageRank from symbols
+    /// belonging to a non-active checkout (or shadowed committed rows), corrupting a per-scope
+    /// ranking with cross-scope identity — the exact failure the scope view exists to prevent.
+    fn symbol_ids_for_changed_path(&self, path: &str) -> anyhow::Result<ChangedPathSymbols> {
+        let conn = self.storage.connection();
+        // First: is the path indexed in the active scope at all, and is it generated? `files` is
+        // the scoped view, so a path outside the active checkout returns no row → `None`.
+        let generated: Option<bool> = conn
+            .query_row("SELECT generated FROM files WHERE path = ?1", [path], |row| {
+                row.get::<_, i64>(0).map(|flag| flag != 0)
+            })
+            .optional()?;
+        let Some(generated) = generated else {
+            return Ok(ChangedPathSymbols::None);
+        };
+        if generated {
+            return Ok(ChangedPathSymbols::Generated);
+        }
+        // SCOPED-VIEW REQUIREMENT (#89): join symbols to the `files` scope view, not raw tables, so
+        // only symbols of the ACTIVE version of this file become PageRank seeds.
+        let mut stmt = conn.prepare(
+            "SELECT symbols.id
+             FROM symbols
+             JOIN files ON files.id = symbols.file_id
+             WHERE files.path = ?1",
+        )?;
+        let ids =
+            stmt.query_map([path], |row| row.get::<_, i64>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(ChangedPathSymbols::Symbols(ids))
     }
 
     /// Build the `edge_id -> EdgeOracleEffect` map that makes [`Self::important_symbols`]
@@ -2397,7 +2660,7 @@ mod oracle_surfacing_tests {
         let other_qn = name_of(other_id);
 
         // Heuristic ranking (no oracle run yet): `target` carries the call's rank, `other` none.
-        let before = db.important_symbols(20, &[]).unwrap();
+        let before = global_ranking(&db);
         assert!(
             score_of(&before, &target_qn) > 0.0,
             "heuristically `target` carries rank: {before:?}"
@@ -2414,7 +2677,7 @@ mod oracle_surfacing_tests {
 
         // SCIP-aware ranking: the edge is retargeted to the compiler's `other` — rank flows there,
         // and the contradicted heuristic target `target` loses it.
-        let after = db.important_symbols(20, &[]).unwrap();
+        let after = global_ranking(&db);
         assert!(
             score_of(&after, &other_qn) > score_of(&after, &target_qn),
             "rank flows to the compiler's resolved callee, not the heuristic guess: {after:?}"
@@ -2742,6 +3005,277 @@ mod oracle_surfacing_tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Global (un-seeded) ranking — the common assertion shape: no explicit seed, no auto-diff.
+    fn global_ranking(db: &IndexDatabase) -> Vec<crate::query::pagerank::SymbolImportance> {
+        db.important_symbols(ImportantSymbolsRequest {
+            limit: 20,
+            personalize: Vec::new(),
+            auto_seed_from_diff: false,
+        })
+        .unwrap()
+        .symbols
+    }
+
+    /// A real committed git checkout where `caller` calls `target`, plus an UNCOMMITTED edit that
+    /// adds `fn touched()` to a second file — so `git_changed_paths` reports a non-empty diff with
+    /// an indexed symbol. Returns the db; `touched.rs` is the changed file.
+    fn checkout_with_dirty_indexed_symbol() -> (IndexDatabase, PathBuf) {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        fs::write(root.join("src/touched.rs"), "pub fn placeholder() {}\n").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        // Edit a tracked file AFTER commit → an uncommitted working-tree change with a real symbol.
+        fs::write(root.join("src/touched.rs"), "pub fn placeholder() {} pub fn touched() {}\n")
+            .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        (db, root)
+    }
+
+    /// Name/path/id seed resolution: a valid name resolves to a personalized ranking; a missing
+    /// name is skipped (counted, not fatal); an all-missing seed falls through to global WITH a
+    /// reason.
+    #[test]
+    fn explicit_seed_resolves_names_and_skips_misses() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // A real name + a bogus one: the bogus is skipped (no_symbols += 1), the real one seeds.
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["target".to_string(), "does_not_exist_anywhere".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(result.mode.label(), "importance relative to your current changes");
+        let seed = result.seed_source.expect("explicit seed reports provenance");
+        assert_eq!(seed.kind, crate::query::pagerank::SeedKind::Explicit);
+        assert_eq!(seed.symbol_seed_count, 1, "only the real name seeded");
+        assert_eq!(seed.skipped.no_symbols, 1, "the bogus name is skipped, not fatal");
+        assert!(result.reason.is_none());
+
+        // A raw numeric id is accepted verbatim (the `target` symbol id).
+        let target_id: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let by_id = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec![target_id.to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(by_id.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+
+        // All-missing seed → global fall-through WITH a reason (never silent, never an error).
+        let all_missing = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["nope_a".to_string(), "nope_b".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(all_missing.mode, crate::query::pagerank::ImportanceMode::Global);
+        assert!(all_missing.reason.is_some(), "all-missing explicit seed reports why it's global");
+        assert_eq!(all_missing.seed_source.unwrap().skipped.no_symbols, 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Ambiguous names are skipped (not fatal): two symbols share a name → the seed resolves to
+    /// neither, counts the miss, and falls through to global with a reason.
+    #[test]
+    fn ambiguous_name_seed_is_skipped() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = temp_root();
+        // `dup` defined twice across two files → name `dup` is ambiguous.
+        fs::write(root.join("src/lib.rs"), "pub fn dup() {}\n").unwrap();
+        fs::write(root.join("src/other.rs"), "pub fn dup() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["dup".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::Global);
+        assert_eq!(
+            result.seed_source.expect("reports provenance").skipped.no_symbols,
+            1,
+            "an ambiguous name is skipped, not fatal"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Auto-seed maps the git diff to symbols THROUGH the scoped `files` view: a dirty indexed file
+    /// yields a personalized result whose seed provenance is `git_diff`.
+    #[test]
+    fn auto_seed_from_diff_picks_changed_symbols() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let (db, root) = checkout_with_dirty_indexed_symbol();
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+        let seed = result.seed_source.expect("auto-seed reports provenance");
+        assert_eq!(seed.kind, crate::query::pagerank::SeedKind::GitDiff);
+        assert!(seed.indexed_paths >= 1, "the dirty indexed file counted: {seed:?}");
+        assert!(seed.symbol_seed_count >= 1, "the changed file's symbol seeded: {seed:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Diff with NO indexed symbols (a changed markdown file only) → global mode, a reason, and the
+    /// diff counts, NOT a silent fall-through.
+    #[test]
+    fn diff_without_symbols_falls_back_to_global_with_reason() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        // The only working-tree change is a markdown file — never indexed as a Rust symbol.
+        fs::write(root.join("NOTES.md"), "# notes\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::Global);
+        assert_eq!(result.reason.as_deref(), Some("no symbols found in current diff"));
+        assert_eq!(result.diff_paths_with_symbols, Some(0));
+        let seed = result.seed_source.expect("a fall-through still reports the diff it tried");
+        assert!(seed.changed_paths >= 1, "the markdown change was considered: {seed:?}");
+        assert_eq!(seed.symbol_seed_count, 0);
+        assert!(!result.symbols.is_empty(), "global ranking still returns the spine");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Deleted and generated changed paths are counted in `skipped`, not seeded.
+    #[test]
+    fn deleted_and_generated_paths_counted_in_skipped() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = temp_root();
+        fs::create_dir_all(root.join("gen")).unwrap();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        fs::write(root.join("src/doomed.rs"), "pub fn doomed() {}\n").unwrap();
+        fs::write(root.join("gen/out.rs"), "pub fn generated_fn() {}\n").unwrap();
+        // A config with a Generated target for `gen/` so `out.rs` indexes generated.
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![
+                ResolvedTarget {
+                    name: "rust".to_string(),
+                    language: Language::Rust,
+                    directories: vec![PathBuf::from("src")],
+                    include: vec!["src/".to_string()],
+                    exclude: Vec::new(),
+                    kind: TargetKind::Source,
+                },
+                ResolvedTarget {
+                    name: "gen".to_string(),
+                    language: Language::Rust,
+                    directories: vec![PathBuf::from("gen")],
+                    include: vec!["gen/".to_string()],
+                    exclude: Vec::new(),
+                    kind: TargetKind::Generated,
+                },
+            ],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+        };
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // Working-tree changes: delete a tracked file, and edit the generated one.
+        fs::remove_file(root.join("src/doomed.rs")).unwrap();
+        fs::write(root.join("gen/out.rs"), "pub fn generated_fn() {} pub fn more() {}\n").unwrap();
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        let seed = result.seed_source.expect("reports provenance");
+        assert_eq!(seed.skipped.deleted, 1, "the removed file is counted deleted: {seed:?}");
+        assert_eq!(seed.skipped.generated, 1, "the generated file is counted generated: {seed:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance invariant #1: with a non-empty diff carrying an indexed symbol, MCP defaults
+    /// (auto-seed ON) ⇒ PERSONALIZED, while CLI defaults (auto-seed OFF) ⇒ GLOBAL. The intentional
+    /// divergence — easy to "clean up" into uniformity by accident, so it's pinned.
+    #[test]
+    fn mcp_auto_seeds_but_cli_stays_global_on_a_nonempty_diff() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let (db, root) = checkout_with_dirty_indexed_symbol();
+
+        // MCP default: auto_seed_from_diff = true → personalized.
+        let mcp = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        assert_eq!(
+            mcp.mode,
+            crate::query::pagerank::ImportanceMode::PersonalizedToChanges,
+            "MCP no-personalize + non-empty diff ⇒ personalized"
+        );
+
+        // CLI default: auto_seed_from_diff = false → global even with the same non-empty diff.
+        let cli = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(
+            cli.mode,
+            crate::query::pagerank::ImportanceMode::Global,
+            "CLI no-personalize ⇒ global, even with a non-empty diff"
+        );
+        assert!(cli.seed_source.is_none(), "CLI global carries no seed provenance");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// #82 P2 regression: `find_callers` with NO oracle data must return the IDENTICAL membership

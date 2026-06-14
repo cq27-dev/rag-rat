@@ -233,11 +233,14 @@ pub struct ImportantSymbolsArgs {
     /// Max load-bearing symbols to return.
     #[serde(default = "default_repo_brief_limit")]
     pub limit: u32,
-    /// Symbol ids to bias importance toward (the symbols you're editing/querying) — the random
-    /// surfer teleports back to these, lifting the spine *they* depend on. Empty = global
-    /// importance.
+    /// Symbols to bias importance toward (the symbols you're editing/querying) — names, symbol
+    /// paths, or numeric ids; the random surfer teleports back to these, lifting the spine *they*
+    /// depend on. A numeric value is a raw symbol id; otherwise it's resolved by symbol path then
+    /// name (ambiguous/missing entries are skipped, never fatal). LEAVE EMPTY to auto-seed from
+    /// your current git diff (the default — "importance relative to your current changes").
+    /// Pass a single `"global"` to force whole-repo PageRank instead.
     #[serde(default)]
-    pub personalize: Vec<i64>,
+    pub personalize: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -736,8 +739,11 @@ pub fn description(name: &str) -> &'static str {
         "important_symbols" =>
             "Rank the most load-bearing symbols by weighted PageRank over the call/type/import \
              edge graph — what the rest of the code most depends on. Run before editing to see the \
-             spine you shouldn't reinvent or break. Pass `personalize` (symbol ids you're working \
-             on) to bias the ranking toward the spine those symbols depend on.",
+             spine you shouldn't reinvent or break. By DEFAULT (no `personalize`) it auto-seeds \
+             from your current git diff, returning importance relative to your current changes; \
+             pass `personalize` (names, symbol paths, or ids you're working on) to seed it \
+             explicitly, or a single `\"global\"` to force whole-repo PageRank. The result is a \
+             labeled object: `mode` (which scale), `seed_source` (seed provenance), and `symbols`.",
         "ffi_surface" =>
             "Find the FFI surface: #[uniffi::export] items, exported impl members, and generated \
              binding artifacts (detected by path). Empty in repos without FFI.",

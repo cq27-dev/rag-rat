@@ -78,7 +78,7 @@ pub(crate) fn call_tool_with_db(
         },
         "important_symbols" => {
             let args: ImportantSymbolsArgs = serde_json::from_value(arguments)?;
-            json!(db.important_symbols(args.limit as usize, &args.personalize)?)
+            json!(important_symbols_tool(db, args)?)
         },
         "ffi_surface" => {
             let args: LimitArgs = serde_json::from_value(arguments)?;
@@ -573,6 +573,32 @@ pub(crate) fn memory_for_symbol_tool(
         Ok(None) => Ok(Value::Null),
         Err(disambiguation) => Ok(json!(disambiguation)),
     }
+}
+
+/// `important_symbols` over MCP: auto-seeds from the current git diff when no `personalize` is
+/// given (the headline default). A single `"global"` selector (or an all-empty list) is the
+/// explicit override that forces whole-repo PageRank — distinct from "no arg", which auto-seeds.
+/// Returns the labeled [`ImportantSymbolsResult`] (mode + seed provenance), not a bare array.
+fn important_symbols_tool(
+    db: &IndexDatabase,
+    args: ImportantSymbolsArgs,
+) -> anyhow::Result<rag_rat_core::query::pagerank::ImportantSymbolsResult> {
+    let meaningful: Vec<String> =
+        args.personalize.into_iter().filter(|entry| !entry.trim().is_empty()).collect();
+    let force_global = meaningful.len() == 1 && meaningful[0].eq_ignore_ascii_case("global");
+    let (personalize, auto_seed_from_diff) = if force_global {
+        // Explicit global override: drop the selector, do NOT auto-seed.
+        (Vec::new(), false)
+    } else {
+        // No explicit seed → auto-seed from the diff (MCP default). With seeds → personalize.
+        let auto_seed = meaningful.is_empty();
+        (meaningful, auto_seed)
+    };
+    db.important_symbols(rag_rat_core::index::ImportantSymbolsRequest {
+        limit: args.limit as usize,
+        personalize,
+        auto_seed_from_diff,
+    })
 }
 
 pub(crate) fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {

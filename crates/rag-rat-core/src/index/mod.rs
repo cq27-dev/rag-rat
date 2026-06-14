@@ -18,6 +18,7 @@ mod query_api;
 mod rebuild;
 
 pub(crate) use lifecycle::install_scope_view;
+pub use query_api::ImportantSymbolsRequest;
 
 #[cfg(test)]
 mod anchor_tests;
@@ -426,7 +427,7 @@ fn is_likely_parser_gap_kind(kind: &str) -> bool {
     matches!(kind, "parser_call_extraction" | "parser_failure")
 }
 
-fn is_generated_path(path: &str) -> bool {
+pub(crate) fn is_generated_path(path: &str) -> bool {
     path.contains("/generated/")
         || path.contains("/generated-web/")
         || path.ends_with(".d.ts")
@@ -615,9 +616,9 @@ struct DiscoveryPlan {
 }
 
 #[derive(Debug, Default)]
-struct GitChangedPaths {
-    changed: BTreeSet<PathBuf>,
-    deleted: BTreeSet<PathBuf>,
+pub(crate) struct GitChangedPaths {
+    pub(crate) changed: BTreeSet<PathBuf>,
+    pub(crate) deleted: BTreeSet<PathBuf>,
 }
 
 fn collect_index_files(config: &Config) -> anyhow::Result<Vec<IndexFile>> {
@@ -1008,7 +1009,7 @@ pub(crate) fn target_for_path(
     })
 }
 
-fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> {
+pub(crate) fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> {
     let repo = gix::discover(root)?;
     let worktree_root = repo
         .workdir()
@@ -1145,6 +1146,12 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// `path_string` for the read path: the importance auto-seed normalizes a `git_changed_paths` entry
+/// to the same `/`-separated form the `files` table stores, so the scoped-view lookup matches.
+pub(crate) fn path_string_for_seed(path: &Path) -> String {
+    path_string(path)
 }
 
 #[cfg(test)]

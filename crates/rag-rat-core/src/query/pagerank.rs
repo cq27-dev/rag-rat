@@ -135,6 +135,95 @@ pub fn pagerank(n: usize, out_edges: &Adjacency, personalize: Option<&[f64]>) ->
     rank
 }
 
+/// Which importance scale a result was computed on. The label string is the contract the spec's
+/// "three scales" table pins — agents read it to know whether they're looking at GLOBAL or
+/// PERSONALIZED PageRank, so they must NEVER be presented as comparable. (The third scale, "local
+/// structural load", is a different surface — `impact_surface`/search enrichment — not this tool.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportanceMode {
+    /// No (effective) seeds — live whole-graph PageRank.
+    Global,
+    /// Seeded (by name/id or auto-diff) — PageRank biased toward the working set.
+    PersonalizedToChanges,
+}
+
+impl ImportanceMode {
+    /// The agent-facing label. Matches the spec's three-scale table verbatim.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global PageRank importance",
+            Self::PersonalizedToChanges => "importance relative to your current changes",
+        }
+    }
+}
+
+impl Serialize for ImportanceMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
+/// How the personalization seed was produced. `git_diff` = auto-seeded from the working set (the
+/// MCP default); `explicit` = the caller named symbols (ids/names/paths).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedKind {
+    GitDiff,
+    Explicit,
+}
+
+/// Seeds that were considered but did not contribute a graph node, bucketed by why. Present only on
+/// an auto-diff seed (`git_diff`); an explicit seed reports its misses via `skipped.no_symbols` too
+/// but has no deleted/generated notion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SkippedSeeds {
+    /// Changed paths that no longer exist on disk (deleted/renamed-away) — git-diff only.
+    pub deleted: u64,
+    /// Changed paths classified as generated artifacts — git-diff only.
+    pub generated: u64,
+    /// Considered seeds (paths or names) that resolved to no symbol in the active scope.
+    pub no_symbols: u64,
+}
+
+/// Provenance of the personalization seed, present only when the result is seeded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SeedSource {
+    pub kind: SeedKind,
+    /// Paths the seed considered (git-diff: changed paths; explicit: 0 — explicit seeds are names,
+    /// not paths).
+    pub changed_paths: u64,
+    /// Of `changed_paths`, how many were indexed in the active scope (git-diff only).
+    pub indexed_paths: u64,
+    /// Symbol ids that became graph seeds.
+    pub symbol_seed_count: u64,
+    pub skipped: SkippedSeeds,
+}
+
+/// The labeled result of an importance query: the mode + seed provenance carry more for an agent
+/// than the bare ranking does. This is the output contract for the CLI/MCP `important_symbols`
+/// surface (a labeled object, NOT a bare array).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ImportantSymbolsResult {
+    pub mode: ImportanceMode,
+    /// Present only when the result is seeded (mode = personalized OR a fall-through that still
+    /// computed a seed source). Absent for an un-seeded global query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed_source: Option<SeedSource>,
+    /// Present only on a fall-through to global from an intended seed (e.g. the diff had no
+    /// indexed symbols) — a short human-readable reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Diff paths considered, surfaced on a fall-through so the caller sees WHY the seed was
+    /// empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_paths_considered: Option<u64>,
+    /// Of the considered diff paths, how many yielded any indexed symbol — `0` on the no-symbols
+    /// fall-through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_paths_with_symbols: Option<u64>,
+    pub symbols: Vec<SymbolImportance>,
+}
+
 /// A ranked load-bearing symbol.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SymbolImportance {
