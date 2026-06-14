@@ -464,7 +464,7 @@ impl RagRatService {
 impl ServerHandler for RagRatService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("rag-rat", "0.3.1"))
+            .with_server_info(Implementation::new("rag-rat", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Read-only-source repo intelligence. Index and auto-heal writes are confined to \
                  the configured SQLite database.",
