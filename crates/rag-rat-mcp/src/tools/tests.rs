@@ -742,6 +742,35 @@ fn unique_temp_root() -> PathBuf {
 }
 
 #[test]
+fn read_tool_lazy_write_retries_read_write_not_readonly_error() {
+    // #143 review: read tools open read-only, but a few lazily WRITE on a cold path — here
+    // `read_chunk` calls `mark_file_deleted` when its source file is gone on disk. That write fails
+    // on the read-only connection with SQLITE_READONLY; the dispatcher must transparently retry the
+    // call on a read-write connection, so the caller gets the domain error (chunk gone), NEVER a
+    // raw read-only violation.
+    let (root, config) = mixed_config();
+    IndexDatabase::rebuild(&config).unwrap();
+
+    let search =
+        call_tool_for_config(&config, "semantic_search", json!({"query": "alpha"})).unwrap();
+    let hit = search.as_array().unwrap().first().expect("a semantic hit").clone();
+    let chunk_id = hit["chunk_id"].as_i64().unwrap();
+    let path = hit["path"].as_str().unwrap().to_string();
+
+    // Remove the source file → `read_chunk` takes the mark_file_deleted (write) branch.
+    std::fs::remove_file(root.join(&path)).unwrap();
+
+    let result = call_tool_for_config(&config, "read_chunk", json!({"chunk_id": chunk_id}));
+    let err = result.expect_err("a deleted-source chunk reports gone");
+    assert!(
+        !rag_rat_core::storage::is_readonly_violation(&err),
+        "the lazy write must be retried read-write, never surfaced as SQLITE_READONLY: {err:?}"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn read_only_classification_covers_every_tool_and_denies_writers() {
     // #143: the read-only fast path must classify EVERY tool, and exactly the mutating tools must
     // be denied read-only access. Drift either lock-contends a read tool (slow) or hands a write

@@ -623,21 +623,33 @@ pub fn call_tool_for_config(
     name: &str,
     arguments: Value,
 ) -> anyhow::Result<Value> {
-    // Read tools open read-only (never take the write lock); fall back to the read-write open only
-    // when the index still owes a heal/migrate write. Write tools always open read-write.
-    let db = if is_read_only_tool(name) {
-        match IndexDatabase::try_open_config_read_only(config)? {
-            Some(db) => db,
-            None => IndexDatabase::open_config(config)?,
+    // Read tools run on a lock-free read-only connection (#143). Two fall-backs to the read-write
+    // open: (1) `try_open_config_read_only` returns `None` when the index still owes a heal/migrate
+    // write; (2) a handful of read tools lazily WRITE on a cold path (`semantic_search` heals stale
+    // FTS, `read_chunk` heals a stale/deleted file, `git_blame_chunk` fills the blame cache), which
+    // fails on the read-only connection with `SQLITE_READONLY` — we detect that and retry the whole
+    // call read-write (which performs the heal). The warm path never writes, so it stays lock-free.
+    if is_read_only_tool(name)
+        && let Some(db) = IndexDatabase::try_open_config_read_only(config)?
+    {
+        match call_tool_with_db(&db, name, arguments.clone()) {
+            Ok(result) => return finalize_tool_result(config, name, result),
+            Err(err) if rag_rat_core::storage::is_readonly_violation(&err) => {
+                // A lazy write hit the read-only connection — fall through to the read-write open.
+            },
+            Err(err) => return Err(err),
         }
-    } else {
-        IndexDatabase::open_config(config)?
-    };
-    let mut result = call_tool_with_db(&db, name, arguments)?;
-    // Surface the crates.io version status on `index_status` so an agent can see (and relay) when a
-    // newer rag-rat is published. Read-only: it reads the cached check (refreshed out of band),
-    // never the network, so the tool stays fast. Omitted entirely when version checking is
-    // disabled.
+    }
+    let db = IndexDatabase::open_config(config)?;
+    let result = call_tool_with_db(&db, name, arguments)?;
+    finalize_tool_result(config, name, result)
+}
+
+/// Post-process a tool result before returning it. Currently only `index_status`: surface the
+/// crates.io version status so an agent can see (and relay) when a newer rag-rat is published.
+/// Read-only — it reads the cached check (refreshed out of band), never the network, so the tool
+/// stays fast; omitted entirely when version checking is disabled.
+fn finalize_tool_result(config: &Config, name: &str, mut result: Value) -> anyhow::Result<Value> {
     if name == "index_status"
         && let Some(version) = rag_rat_core::version_check::cached_status(
             config.version_check.enabled,
