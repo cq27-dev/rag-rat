@@ -37,10 +37,15 @@ pub struct SymbolHit {
     pub importance: Option<crate::query::load_bearing::ImportanceEnrichment>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct SymbolLookup {
     pub candidates: Vec<SymbolHit>,
     pub disambiguation_required: bool,
+    /// Files among the candidates whose on-disk content differs from the index (dirty relative to
+    /// HEAD/overlay) and that the lazy heal did not bring current — so a candidate's line numbers
+    /// may be stale (#147/#148). Empty in the common case (heal succeeded or nothing was dirty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stale_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +106,7 @@ pub fn lookup_candidates(
     Ok(SymbolLookup {
         disambiguation_required: needs_disambiguation(&candidates, selector.allow_ambiguous),
         candidates,
+        stale_files: Vec::new(),
     })
 }
 

@@ -416,8 +416,88 @@ impl IndexDatabase {
     ) -> anyhow::Result<crate::query::symbol::SymbolLookup> {
         let mut lookup =
             crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
+        // #147: symbol rows aren't anchor-relocated like chunks, so a file edited since indexing
+        // returns stale line numbers. Heal the matched files inline (bounded, like
+        // search_with_heal) and re-resolve so positions/ids are current; #148: report any
+        // file still dirty after.
+        let paths: Vec<String> = lookup.candidates.iter().map(|c| c.path.clone()).collect();
+        let stale = self.stale_source_paths(&paths)?;
+        if !stale.is_empty() {
+            self.heal_stale_paths(&stale)?; // NeedsReindex beyond the cap
+            let healed =
+                crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
+            if healed.candidates.is_empty() && !lookup.candidates.is_empty() {
+                // A `symbol_id` selector can't survive a reindex (ids are reassigned per #149), so
+                // the re-resolve finds nothing. Keep the pre-heal candidates rather than return
+                // empty, but flag the files as stale so the caller knows the positions are old.
+                lookup.stale_files = stale;
+            } else {
+                lookup = healed;
+                let healed_paths: Vec<String> =
+                    lookup.candidates.iter().map(|c| c.path.clone()).collect();
+                lookup.stale_files = self.stale_source_paths(&healed_paths)?;
+            }
+        }
         self.enrich_symbol_hits_with_load_bearing(&mut lookup.candidates)?;
         Ok(lookup)
+    }
+
+    /// The indexed `files.sha256` for `path` in the ACTIVE checkout (via the per-connection `files`
+    /// scope view), or `None` when the path isn't indexed in this scope.
+    fn indexed_sha_for_path(&self, path: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .storage
+            .connection()
+            .query_row("SELECT sha256 FROM files WHERE path = ?1 LIMIT 1", [path], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?)
+    }
+
+    /// Of `paths`, those whose on-disk content differs from the indexed sha (or are unreadable) —
+    /// results drawn from them may be stale relative to the working tree. Deduped; paths not
+    /// indexed in scope are skipped (nothing to be stale against); no source root → empty
+    /// (bare/copied index). One file read + hash per distinct path — callers pass the small
+    /// result set, not the whole corpus.
+    fn stale_source_paths(&self, paths: &[String]) -> anyhow::Result<Vec<String>> {
+        let Some(root) = self.storage.source_root().map(Path::to_path_buf) else {
+            return Ok(Vec::new());
+        };
+        let mut stale = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for path in paths {
+            if !seen.insert(path.as_str()) {
+                continue;
+            }
+            let Some(indexed) = self.indexed_sha_for_path(path)? else {
+                continue;
+            };
+            match fs::read(root.join(path)) {
+                Ok(bytes) if hex_sha256(&bytes) == indexed => {},
+                _ => stale.push(path.clone()),
+            }
+        }
+        Ok(stale)
+    }
+
+    /// Reindex stale files inline so the next read sees current positions (#147), mirroring
+    /// `search_with_heal`: bounded by `MAX_AUTO_HEAL_FILES_PER_CALL` (raises `NeedsReindex` beyond
+    /// it so a huge dirty set can't turn a read into an unbounded rebuild), then sync FTS.
+    fn heal_stale_paths(&self, stale: &[String]) -> anyhow::Result<()> {
+        if stale.is_empty() {
+            return Ok(());
+        }
+        if stale.len() > MAX_AUTO_HEAL_FILES_PER_CALL {
+            anyhow::bail!(IndexError::NeedsReindex {
+                stale_files: stale.len(),
+                cap: MAX_AUTO_HEAL_FILES_PER_CALL,
+            });
+        }
+        for path in stale {
+            self.heal_file(Path::new(path))?;
+        }
+        self.sync_fts()?;
+        Ok(())
     }
 
     pub fn select_symbol(
@@ -1737,6 +1817,32 @@ impl IndexDatabase {
             &mut report.direct_semantic_callers,
             &mut report.direct_semantic_callees,
         )?;
+        // #148: flag how many of the result's files are dirty relative to the index, so the impact
+        // surface isn't read as current when the working tree has moved under it. Flag-only here
+        // (not heal): impact spans an unbounded neighbor set, so an inline heal can't be bounded
+        // the way symbol_lookup's matched-file heal is — the agent re-runs symbol_lookup
+        // (which heals) for a specific symbol if it needs fresh positions. Covers the
+        // selected symbol's file, the direct caller/callee call-site files, and the
+        // current-source item sections.
+        let mut result_paths = vec![symbol.path.clone()];
+        for hop in
+            report.direct_semantic_callers.iter().chain(report.direct_semantic_callees.iter())
+        {
+            if let Some(callsite) = &hop.callsite {
+                result_paths.push(callsite.path.clone());
+            }
+        }
+        for item in report
+            .import_export_dependents
+            .iter()
+            .chain(report.tests_touching_symbol_path.iter())
+            .chain(report.docs_mentioning_symbol_path.iter())
+            .chain(report.text_fallback_hits.iter())
+        {
+            result_paths.push(item.path.clone());
+        }
+        report.completeness_and_caveats.stale_files =
+            u64::try_from(self.stale_source_paths(&result_paths)?.len()).unwrap_or(u64::MAX);
         Ok(report)
     }
 

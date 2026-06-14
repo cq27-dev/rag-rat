@@ -7932,3 +7932,72 @@ fn impact_report_flags_a_section_truncated_at_limit() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn symbol_lookup_heals_stale_line_numbers_after_an_edit() {
+    // #147: symbol rows aren't anchor-relocated like chunks, so an edit shifts their byte/line
+    // positions until reindex. symbol_candidates must lazily heal the matched file and return
+    // current positions (and report no residual stale files).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("target".to_string()),
+        language: None,
+        allow_ambiguous: true,
+        limit: 10,
+    };
+    let before = db.symbol_candidates(&selector).unwrap();
+    let before_byte = before.candidates[0].start_byte;
+    assert!(before.stale_files.is_empty(), "clean index has no stale files");
+
+    // Shift `target` down on disk WITHOUT reindexing — the index is now stale for this file.
+    fs::write(root.join("src/lib.rs"), "// a\n// b\n// c\npub fn target() {}\n").unwrap();
+
+    let after = db.symbol_candidates(&selector).unwrap();
+    assert!(after.stale_files.is_empty(), "matched file was healed: {:?}", after.stale_files);
+    assert!(
+        after.candidates[0].start_byte > before_byte,
+        "healed lookup reflects the shifted position: {} !> {before_byte}",
+        after.candidates[0].start_byte
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn impact_completeness_flags_dirty_result_files() {
+    // #148: a result file dirty vs the index is counted in completeness.stale_files. Resolve via
+    // the non-healing `symbols()` so the edit isn't healed away before impact sees it.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn hub() {}\npub fn a() { hub(); }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let hub = db.symbols("hub", Some(Language::Rust), 10).unwrap().remove(0);
+    let clean =
+        db.impact_surface_report_for_selected_symbol(&hub, 20, &Default::default()).unwrap();
+    assert_eq!(clean.completeness_and_caveats.stale_files, 0, "nothing dirty right after rebuild");
+
+    // Edit the symbol's file on disk without reindexing.
+    fs::write(root.join("src/lib.rs"), "// shifted\npub fn hub() {}\npub fn a() { hub(); }\n")
+        .unwrap();
+    let dirty =
+        db.impact_surface_report_for_selected_symbol(&hub, 20, &Default::default()).unwrap();
+    assert!(
+        dirty.completeness_and_caveats.stale_files >= 1,
+        "the dirty symbol file must be flagged: {:?}",
+        dirty.completeness_and_caveats
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
