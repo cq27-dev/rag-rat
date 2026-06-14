@@ -54,6 +54,9 @@ pub(crate) enum Command {
     /// Ownership / co-change clusters.
     Clusters(ClustersArgs),
 
+    /// Rank the most load-bearing symbols by weighted PageRank over the edge graph.
+    ImportantSymbols(ImportantSymbolsArgs),
+
     /// Run the stdio MCP server.
     Mcp,
 
@@ -145,6 +148,13 @@ pub(crate) struct BriefArgs {
     /// Omit drive-by repo memories.
     #[arg(long)]
     pub no_memories: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ImportantSymbolsArgs {
+    /// Max load-bearing symbols to return.
+    #[arg(long)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Args)]

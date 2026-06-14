@@ -11,11 +11,11 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, tool, tool_handler,
 use serde_json::{Map, Value, json};
 
 use crate::tools::{
-    BlameChunkArgs, CompareGraphTextArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs,
-    MemoryCreateArgs, MemoryForCallPathArgs, MemoryForPathArgs, MemoryForSymbolArgs, MemoryIdArgs,
-    MemoryRebindArgs, MemorySearchArgs, MemoryUpdateArgs, PapertrailChunkArgs,
-    PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs, RepoBriefArgs, RepoClustersArgs,
-    SearchArgs, SymbolArgs, SymbolGraphArgs,
+    BlameChunkArgs, CompareGraphTextArgs, EmptyArgs, HealIndexArgs, ImpactArgs,
+    ImportantSymbolsArgs, LimitArgs, MemoryCreateArgs, MemoryForCallPathArgs, MemoryForPathArgs,
+    MemoryForSymbolArgs, MemoryIdArgs, MemoryRebindArgs, MemorySearchArgs, MemoryUpdateArgs,
+    PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs, RepoBriefArgs,
+    RepoClustersArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -169,6 +169,18 @@ impl RagRatService {
         Parameters(args): Parameters<RepoClustersArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("repo_clusters", json!(args))
+    }
+
+    #[tool(
+        name = "important_symbols",
+        description = "Rank the most load-bearing symbols by weighted PageRank over the edge \
+                       graph — the spine to not reinvent or break. Run before editing."
+    )]
+    fn important_symbols(
+        &self,
+        Parameters(args): Parameters<ImportantSymbolsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("important_symbols", json!(args))
     }
 
     #[tool(

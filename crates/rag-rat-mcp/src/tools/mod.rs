@@ -133,6 +133,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "impact_surface",
     "repo_brief",
     "repo_clusters",
+    "important_symbols",
     "ffi_surface",
     "docs_for_symbol",
     "read_chunk",
@@ -225,6 +226,13 @@ pub struct RepoClustersArgs {
     pub include_memories: bool,
     #[serde(default = "default_min_cluster_size")]
     pub min_cluster_size: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ImportantSymbolsArgs {
+    /// Max load-bearing symbols to return.
+    #[serde(default = "default_repo_brief_limit")]
+    pub limit: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -720,6 +728,10 @@ pub fn description(name: &str) -> &'static str {
         "repo_clusters" =>
             "Map the repo into ownership clusters from path proximity, graph edges, and git \
              co-touch — a cheap overview of subsystems and their representative files.",
+        "important_symbols" =>
+            "Rank the most load-bearing symbols by weighted PageRank over the call/type/import \
+             edge graph — what the rest of the code most depends on. Run before editing to see the \
+             spine you shouldn't reinvent or break.",
         "ffi_surface" =>
             "Find the FFI surface: #[uniffi::export] items, exported impl members, and generated \
              binding artifacts (detected by path). Empty in repos without FFI.",
@@ -813,6 +825,7 @@ pub fn schema(name: &str) -> Value {
         "impact_surface" => schema_for::<ImpactArgs>(),
         "repo_brief" => schema_for::<RepoBriefArgs>(),
         "repo_clusters" => schema_for::<RepoClustersArgs>(),
+        "important_symbols" => schema_for::<ImportantSymbolsArgs>(),
         "ffi_surface" => schema_for::<LimitArgs>(),
         "read_chunk" => schema_for::<ReadChunkArgs>(),
         "git_history_for_path" | "github_refs_for_path" => schema_for::<PathHistoryArgs>(),

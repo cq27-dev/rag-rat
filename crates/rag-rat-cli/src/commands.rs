@@ -4,9 +4,10 @@ use rag_rat_core::OutputFormat;
 
 use super::*;
 use crate::cli::{
-    BriefArgs, ClustersArgs, EvalArgs, GithubArgs, GithubCommand, HookAction, HooksArgs, IndexArgs,
-    MaintenanceArgs, MemoryArgs, MemoryCommand, ModelsArgs, ModelsCommand, OracleArgs,
-    OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs, ReconcileArgs,
+    BriefArgs, ClustersArgs, EvalArgs, GithubArgs, GithubCommand, HookAction, HooksArgs,
+    ImportantSymbolsArgs, IndexArgs, MaintenanceArgs, MemoryArgs, MemoryCommand, ModelsArgs,
+    ModelsCommand, OracleArgs, OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs,
+    ReconcileArgs,
 };
 
 /// Process-wide output format, set once from the global `--json` flag in `main` before any command
@@ -86,6 +87,13 @@ pub(crate) fn clusters(config: &Config, args: &ClustersArgs) -> anyhow::Result<(
         include_memories: !args.no_memories,
         min_cluster_size: args.min_cluster_size.unwrap_or(2),
     })?)
+}
+pub(crate) fn important_symbols(
+    config: &Config,
+    args: &ImportantSymbolsArgs,
+) -> anyhow::Result<()> {
+    let db = open_index(config)?;
+    print_output(&db.important_symbols(args.limit.unwrap_or(20) as usize, &[])?)
 }
 pub(crate) fn dump_config(config: &Config) -> anyhow::Result<()> {
     let targets = config

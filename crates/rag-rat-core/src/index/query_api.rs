@@ -1668,6 +1668,20 @@ impl IndexDatabase {
         crate::query::clusters::repo_clusters(self.storage.connection(), options)
     }
 
+    /// Top load-bearing symbols by weighted PageRank over the active checkout's edge graph (#108).
+    /// `personalize_to` biases importance toward those symbol ids (changed/query symbols); empty =
+    /// global.
+    pub fn important_symbols(
+        &self,
+        limit: usize,
+        personalize_to: &[i64],
+    ) -> anyhow::Result<Vec<crate::query::pagerank::SymbolImportance>> {
+        crate::query::pagerank::important_symbols(
+            self.storage.connection(),
+            crate::query::pagerank::ImportanceOptions { limit, personalize_to },
+        )
+    }
+
     pub fn memory_create(
         &self,
         request: crate::query::memory::RepoMemoryCreate,

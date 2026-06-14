@@ -76,6 +76,10 @@ pub(crate) fn call_tool_with_db(
                 min_cluster_size: args.min_cluster_size,
             })?)
         },
+        "important_symbols" => {
+            let args: ImportantSymbolsArgs = serde_json::from_value(arguments)?;
+            json!(db.important_symbols(args.limit as usize, &[])?)
+        },
         "ffi_surface" => {
             let args: LimitArgs = serde_json::from_value(arguments)?;
             json!(db.ffi_surface(args.limit)?)
