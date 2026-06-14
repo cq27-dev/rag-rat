@@ -489,6 +489,12 @@ pub(crate) fn apply_per_package_import_scope(conn: &Connection) -> rusqlite::Res
     // the view↔table column contract and is idempotent. (It already ran at V020; rerun so a
     // forward-migrate from a pre-V022 index that somehow skipped the V020 rerun still converges.)
     ensure_edges_view(conn)?;
+    // This migration only adds the package/scope COLUMNS — it does not backfill `packages` /
+    // `files.package_id` or re-derive the `import_scope_*` edge columns on existing rows. That
+    // backfill rides the `GRAPH_INDEX_VERSION` bump (→ 7) instead: an upgraded index has a stale
+    // `graph_index_version`, so `ensure_graph_index_current` re-resolves on next open and (per the
+    // `refresh_packages` call added to that path) repopulates the scope. Without the version bump
+    // the new per-package behavior would never engage post-migration.
     Ok(())
 }
 

@@ -661,6 +661,15 @@ impl IndexDatabase {
         self.storage.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| -> anyhow::Result<()> {
             self.storage.connection().execute("DELETE FROM edges_data", [])?;
+            // Repopulate the per-package import scope BEFORE re-resolving (#61). A bare
+            // version-bump re-resolve would re-derive `import_scope_*` on the new edges
+            // but read NULL `files.package_id` + an empty `packages` table (V022 only
+            // ADDED the columns; it did not backfill them), so every file would fall
+            // open to the global union and the new per-package behavior would never
+            // engage on a migrated index. `refresh_packages` writes `packages` +
+            // `files.package_id` + the global `local_crate_roots` union for the active
+            // scope so `resolve_edges` below sees the current package map.
+            self.refresh_packages(&root)?;
             let files = self.graph_reindex_files()?;
             for file in files {
                 if file.kind == TargetKind::Generated || file.language == Language::Markdown {
@@ -699,8 +708,15 @@ impl IndexDatabase {
 
     /// Rewrite the `packages` rows for the ACTIVE scope from the corpus's Cargo manifests and
     /// assign `files.package_id`, then persist the GLOBAL local-crate-root union to
-    /// `index_meta.local_crate_roots` (#61 per-package import scope). Returns whether the global
-    /// union changed (so an incremental pass can trigger a re-resolve only when it must).
+    /// `index_meta.local_crate_roots` (#61 per-package import scope). Returns whether the package
+    /// map changed (so an incremental pass can trigger a re-resolve only when it must).
+    ///
+    /// "Changed" is reported when EITHER the global union changed OR any package's per-scope
+    /// `(manifest_dir, local_roots_json)` set changed. Reporting only the global union missed a
+    /// per-package alias move/add/remove that leaves the union identical (e.g. moving a path-dep
+    /// alias from member A to member B): the union is the same, but A and B now resolve `use
+    /// alias::…` differently, so the edges must be re-resolved. A union-only signal left those
+    /// results stale until an unrelated Rust edit or a full rebuild.
     ///
     /// Scoped by `(active_commit_sha, active_worktree_id)` like `files`: each pass owns its scope's
     /// rows (DELETE + reinsert), and a sibling worktree's package rows are untouched. A file is
@@ -711,6 +727,19 @@ impl IndexDatabase {
     pub(super) fn refresh_packages(&self, root: &Path) -> anyhow::Result<bool> {
         let (global_roots, packages) = super::edges::scan_packages(root);
         let conn = self.storage.connection();
+        // Snapshot this scope's existing package map BEFORE the DELETE so a per-package alias
+        // change (same global union) is still detected as a change → forces a re-resolve.
+        let previous_package_map: std::collections::BTreeMap<String, String> = {
+            let mut stmt = conn.prepare(
+                "SELECT manifest_dir, local_roots_json FROM packages WHERE commit_sha = ?1 AND \
+                 worktree_id = ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![self.active_commit_sha, self.active_worktree_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+            rows.collect::<Result<_, _>>()?
+        };
         // Replace this scope's package rows. The id is reassigned each rebuild, which is fine — it
         // is referenced only by this scope's freshly-written files.package_id below.
         conn.execute("DELETE FROM packages WHERE commit_sha = ?1 AND worktree_id = ?2", params![
@@ -720,6 +749,9 @@ impl IndexDatabase {
         // (manifest_dir, package_id), kept for the longest-prefix file assignment. Sort longest dir
         // first so the first matching prefix is the most specific package.
         let mut package_ids: Vec<(String, i64)> = Vec::with_capacity(packages.len());
+        // The freshly-written map, compared against `previous_package_map` below.
+        let mut current_package_map: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         for package in &packages {
             let roots_json = serde_json::to_string(
                 &package.local_roots.iter().collect::<std::collections::BTreeSet<_>>(),
@@ -734,22 +766,29 @@ impl IndexDatabase {
                     roots_json
                 ],
             )?;
+            current_package_map.insert(package.manifest_dir.clone(), roots_json);
             package_ids.push((package.manifest_dir.clone(), conn.last_insert_rowid()));
         }
+        let package_map_changed = current_package_map != previous_package_map;
         package_ids.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.len()));
 
         // Assign package_id for every file in the active scope by longest manifest-dir prefix. A
         // file at `crates/foo/src/x.rs` belongs to the package rooted at `crates/foo` (dir `crates/
         // foo`), not the workspace root (dir ``) — so the path must continue with `/` after the
         // prefix (or equal it), and the empty-dir root manifest matches anything as the fallback.
+        //
+        // Read through the `files` TEMP VIEW (#89), NOT `main.files` with a both-columns-equal
+        // predicate. The scope view is the UNION encoded by `install_scope_view`: clean rows are
+        // `(commit_sha=HEAD, worktree_id='')`, dirty overlays are `(commit_sha='',
+        // worktree_id=active)`, and the overlay shadows its committed twin. A both-equal
+        // `main.files` filter matched NEITHER case in a real checkout (clean rows have an empty
+        // worktree_id, overlays an empty commit_sha), leaving every file's package_id NULL so the
+        // resolver fell open to the global union — the per-package alias leak this change fixes.
+        // The view's `id` is `main.files.id`, so the UPDATE below targets the real row by its key.
         let files: Vec<(i64, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT id, path FROM main.files WHERE commit_sha = ?1 AND worktree_id = ?2",
-            )?;
-            let rows = stmt
-                .query_map(params![self.active_commit_sha, self.active_worktree_id], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?;
+            let mut stmt = conn.prepare("SELECT id, path FROM files")?;
+            let rows =
+                stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         for (file_id, path) in files {
@@ -769,7 +808,8 @@ impl IndexDatabase {
             sorted.sort_unstable();
             sorted.join("\n")
         };
-        self.set_meta_if_changed("local_crate_roots", &serialized)
+        let union_changed = self.set_meta_if_changed("local_crate_roots", &serialized)?;
+        Ok(union_changed || package_map_changed)
     }
 
     pub(super) fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {

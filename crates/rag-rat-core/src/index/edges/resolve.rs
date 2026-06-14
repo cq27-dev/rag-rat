@@ -45,7 +45,10 @@ fn load_package_roots_into_scope(
         }
     }
     // files → package_id, scoped to the active checkout via the `files` TEMP VIEW (overlay wins,
-    // dead scopes excluded), matching the symbol/edge resolution scope.
+    // dead scopes excluded), matching the symbol/edge resolution scope. Any non-null package_id in
+    // the active scope means the corpus is a Cargo project — so a bin-only crate (empty root set)
+    // still suppresses external imports rather than failing open (#4). This is scope-correct: it
+    // reads the active checkout's files, not the unscoped `packages` table above.
     {
         let mut stmt = conn.prepare(
             "SELECT files.id, files.package_id FROM files WHERE files.package_id IS NOT NULL",
@@ -54,6 +57,7 @@ fn load_package_roots_into_scope(
         for row in rows {
             let (file_id, package_id) = row?;
             scope.set_file_package(file_id, package_id);
+            scope.mark_has_manifests();
         }
     }
     Ok(())

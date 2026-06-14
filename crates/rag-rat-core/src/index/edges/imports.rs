@@ -75,13 +75,34 @@ pub(crate) fn scan_packages(root: &Path) -> (HashSet<String>, Vec<PackageRoots>)
             manifests.push((dir, manifest));
         }
     }
+    // The workspace root: the manifest declaring `[workspace]`. Its `[workspace.dependencies]`
+    // table holds the `path` for any member dep written `{ workspace = true }`, and that path
+    // is relative to the WORKSPACE ROOT dir (not the inheriting member's). Captured once so the
+    // per-package pass can resolve inherited path-dep aliases (#5).
+    let workspace_deps = manifests
+        .iter()
+        .find(|(_, manifest)| manifest.get("workspace").is_some())
+        .map(|(dir, manifest)| WorkspaceDeps {
+            root_dir: dir.clone(),
+            table: manifest
+                .get("workspace")
+                .and_then(|workspace| workspace.get("dependencies"))
+                .and_then(toml::Value::as_table)
+                .cloned(),
+        });
     // Second pass: per-package roots = the workspace union plus this manifest's in-corpus path-dep
     // alias keys (only that package treats those aliases as local — #1).
     let mut packages = Vec::with_capacity(manifests.len());
     let mut global_roots = workspace_roots.clone();
     for (manifest_dir, manifest) in &manifests {
         let mut local_roots = workspace_roots.clone();
-        collect_path_dependency_aliases(manifest, manifest_dir, root, &mut local_roots);
+        collect_path_dependency_aliases(
+            manifest,
+            manifest_dir,
+            root,
+            workspace_deps.as_ref(),
+            &mut local_roots,
+        );
         // The global fallback union also includes every alias key, so a file with no package row
         // still fails open the same way the pre-#61 single-set did.
         global_roots.extend(local_roots.iter().cloned());
@@ -127,6 +148,14 @@ fn lib_crate_root_name(manifest: &toml::Value, manifest_dir: Option<&Path>) -> O
     Some(package.replace('-', "_"))
 }
 
+/// The workspace root's `[workspace.dependencies]` table and the dir it lives in. A member dep
+/// written `local = { workspace = true }` inherits its real `path` from this table, and that path
+/// is relative to `root_dir` (the workspace root), not the inheriting member's dir (#5).
+struct WorkspaceDeps {
+    root_dir: std::path::PathBuf,
+    table: Option<toml::value::Table>,
+}
+
 /// Add every path-dependency KEY whose target resolves INSIDE `root` to `roots` — these are local
 /// path dependencies whose import name is the KEY (possibly renamed via the `package` key), so the
 /// bare-reference scope must treat the key as a local crate root (#97 item 2). A string dependency
@@ -139,16 +168,42 @@ fn lib_crate_root_name(manifest: &toml::Value, manifest_dir: Option<&Path>) -> O
 /// `use foo_bar::…`). A `path` pointing OUTSIDE the indexed `root` is NOT added (#97 item 5): that
 /// crate has no symbols in this index, so localizing its alias would let a same-named in-corpus
 /// symbol wrongly bind.
+///
+/// A member dep `local = { workspace = true }` carries no `path` of its own — its path lives in the
+/// workspace root's `[workspace.dependencies]` and is relative to the WORKSPACE ROOT dir. Such a
+/// dep is resolved against `workspace_deps` so the inherited path-dep alias is still treated as
+/// local in the member (#5); without it, `use local::Thing` in the member was misclassified
+/// external.
 fn collect_path_dependency_aliases(
     manifest: &toml::Value,
     manifest_dir: &Path,
     root: &Path,
+    workspace_deps: Option<&WorkspaceDeps>,
     roots: &mut HashSet<String>,
 ) {
     for table in dependency_tables(manifest) {
         for (key, spec) in table {
-            let Some(path) = spec.get("path").and_then(toml::Value::as_str) else { continue };
-            if path_dependency_is_in_corpus(manifest_dir, path, root) {
+            // A direct `path` on the dep: resolve relative to THIS manifest's dir.
+            if let Some(path) = spec.get("path").and_then(toml::Value::as_str) {
+                if path_dependency_is_in_corpus(manifest_dir, path, root) {
+                    roots.insert(key.replace('-', "_"));
+                }
+                continue;
+            }
+            // `{ workspace = true }`: inherit the `path` from `[workspace.dependencies]`, resolved
+            // relative to the WORKSPACE ROOT dir (#5).
+            let inherits_workspace =
+                spec.get("workspace").and_then(toml::Value::as_bool) == Some(true);
+            if inherits_workspace
+                && let Some(ws) = workspace_deps
+                && let Some(path) = ws
+                    .table
+                    .as_ref()
+                    .and_then(|table| table.get(key))
+                    .and_then(|inherited| inherited.get("path"))
+                    .and_then(toml::Value::as_str)
+                && path_dependency_is_in_corpus(&ws.root_dir, path, root)
+            {
                 roots.insert(key.replace('-', "_"));
             }
         }
@@ -353,11 +408,25 @@ pub(crate) struct ImportScope {
     file_package: HashMap<i64, i64>,
     package_roots: HashMap<i64, HashSet<String>>,
     global_roots: HashSet<String>,
+    /// Whether the indexed corpus is a Cargo project at all (at least one `Cargo.toml` found).
+    /// This is DISTINCT from an empty root set: a Cargo project of only BIN targets has no
+    /// importable library crate names and no path-dep aliases, so its root set is empty — yet
+    /// `use url::Url;` in it still names the EXTERNAL `url` crate and must suppress a local
+    /// `Url`. Only a genuinely non-Cargo corpus (no manifest at all) fails open. Set true by
+    /// [`Self::mark_has_manifests`] when any package row is loaded.
+    has_manifests: bool,
 }
 
 impl ImportScope {
     pub(crate) fn new(global_roots: HashSet<String>) -> Self {
         Self { global_roots, ..Self::default() }
+    }
+
+    /// Record that the corpus has at least one Cargo manifest — so an empty root set is read as
+    /// "Cargo project with no library crates" (still suppress external imports), not "non-Cargo
+    /// corpus" (fail open). See [`Self::has_manifests`].
+    pub(crate) fn mark_has_manifests(&mut self) {
+        self.has_manifests = true;
     }
 
     /// Map a file to its owning package (so its bindings consult that package's local-crate set).
@@ -484,7 +553,10 @@ impl ImportScope {
     /// is suppressed.
     pub(crate) fn is_external_import(&self, file_id: i64, name: &str, ref_byte: usize) -> bool {
         let local_roots = self.roots_for_file(file_id);
-        if local_roots.is_empty() {
+        // Fail open ONLY for a non-Cargo corpus (no manifest scanned). A Cargo project with no
+        // library crates (bin-only) has an empty root set but still suppresses external imports —
+        // `use url::Url;` names the external `url` crate there too (#97-followup item 4).
+        if local_roots.is_empty() && !self.has_manifests {
             return false;
         }
         let Some(root) = self.covering_root(file_id, name, ref_byte) else {
@@ -602,6 +674,22 @@ mod tests {
         scope.add_use(1, "use url::Url;", Some(scope_at_file_root(0, usize::MAX)));
         scope.finalize();
         assert!(!scope.is_external_import(1, "Url", 100), "no manifests → suppress nothing");
+    }
+
+    /// #4: a bin-only Cargo crate has an EMPTY local-root set (no importable lib name, no path-dep
+    /// aliases) yet IS a Cargo project — `use url::Url;` names the external `url` crate and must
+    /// still suppress a local `Url`. Only a genuinely non-Cargo corpus fails open. The
+    /// discriminator is `mark_has_manifests`, not the emptiness of the root set.
+    #[test]
+    fn bin_only_crate_still_suppresses_external_imports() {
+        let mut scope = ImportScope::new(HashSet::new());
+        scope.mark_has_manifests(); // a Cargo manifest exists, just no library crate roots
+        scope.add_use(1, "use url::Url;", Some(scope_at_file_root(0, usize::MAX)));
+        scope.finalize();
+        assert!(
+            scope.is_external_import(1, "Url", 100),
+            "a bin-only Cargo crate still suppresses an external import despite an empty root set"
+        );
     }
 
     /// #1 (per-package locality): a `path`-dep alias `local` is local for crate A (which declares
@@ -820,6 +908,50 @@ mod tests {
             !pkg_b.local_roots.contains("a_only"),
             "package b never declared the alias — must not be local for it; got {:?}",
             pkg_b.local_roots
+        );
+    }
+
+    /// #5: a member dep written `local = { workspace = true }` inherits its `path` from the root
+    /// `[workspace.dependencies]` table (path relative to the WORKSPACE ROOT dir). The member must
+    /// treat `local` as a local crate root so `use local::Thing` resolves local — without inherited
+    /// resolution it was dropped as external.
+    #[test]
+    fn scan_packages_resolves_inherited_workspace_path_dep() {
+        let root = std::env::temp_dir().join(format!("rr-ws-inherit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Workspace root declares the path dep in [workspace.dependencies]; path is relative to the
+        // workspace root dir.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"member\"]\n[package]\nname=\"ws_root\"\n[workspace.\
+             dependencies]\nlocal = { path = \"shared\" }\n",
+        )
+        .unwrap();
+        // The shared crate the alias points at.
+        std::fs::create_dir_all(root.join("shared/src")).unwrap();
+        std::fs::write(root.join("shared/Cargo.toml"), "[package]\nname=\"shared\"\n").unwrap();
+        std::fs::write(root.join("shared/src/lib.rs"), "").unwrap();
+        // The member inherits the dep with `{ workspace = true }` — no path of its own.
+        std::fs::create_dir_all(root.join("member/src")).unwrap();
+        std::fs::write(
+            root.join("member/Cargo.toml"),
+            "[package]\nname=\"member\"\n[dependencies]\nlocal = { workspace = true }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("member/src/lib.rs"), "").unwrap();
+        let (global, packages) = scan_packages(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            global.contains("local"),
+            "the inherited workspace path-dep alias is in the global union; got {global:?}"
+        );
+        let member = packages.iter().find(|p| p.manifest_dir == "member").expect("member package");
+        assert!(
+            member.local_roots.contains("local"),
+            "the member inherits the workspace path-dep alias as a LOCAL root; got {:?}",
+            member.local_roots
         );
     }
 }

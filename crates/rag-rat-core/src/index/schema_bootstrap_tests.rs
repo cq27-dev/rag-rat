@@ -7290,6 +7290,65 @@ fn full_rebuild_survives_stale_overlay_rows() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// #1: in a REAL git checkout the active context is `(commit_sha=HEAD, worktree_id=<root path>)`
+/// while a clean file row is `(commit_sha=HEAD, worktree_id='')`. `refresh_packages` once SELECTed
+/// files with BOTH columns equal to the active values, which matches NEITHER a clean row (empty
+/// worktree_id) nor an overlay (empty commit_sha) — so `files.package_id` stayed NULL and the
+/// resolver fell open to the global union, leaking per-package aliases. Reading through the `files`
+/// scope VIEW assigns package_id correctly. Prior tests missed this: they used non-git fixtures
+/// where `active_worktree_id` is empty, so the both-equal predicate accidentally matched.
+#[test]
+fn clean_checkout_file_gets_package_id_assigned() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("crates/foo/src")).unwrap();
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+    // A two-crate Cargo workspace so the package map is non-trivial.
+    fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[\"crates/*\"]\n").unwrap();
+    fs::write(root.join("crates/foo/Cargo.toml"), "[package]\nname=\"foo\"\n").unwrap();
+    fs::write(root.join("crates/foo/src/lib.rs"), "pub fn foo() -> i32 { 1 }\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "init"]);
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("crates")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert!(!db.active_commit_sha.is_empty(), "fixture must be a real git checkout");
+    assert!(!db.active_worktree_id.is_empty(), "a real checkout has a non-empty worktree id");
+
+    let package_id: Option<i64> = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT package_id FROM main.files WHERE path = 'crates/foo/src/lib.rs' AND kind != \
+             'deleted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        package_id.is_some(),
+        "a normal clean-checkout file in a Cargo project must have package_id populated, not NULL"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// #87 (self-heal half): an incremental pass drops a stale overlay row whose path is clean.
 /// With a committed counterpart present the overlay is removed outright; without one, the row is
 /// RE-STAMPED to the commit scope in place (same row id — chunks/symbols/embeddings/memory
