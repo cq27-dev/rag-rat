@@ -94,6 +94,17 @@ Development config without installing:
 `tools/list` is served by `rmcp` and exposes typed JSON schemas derived from the same request structs
 used by the handlers. Existing tool names and response fields are kept stable for current MCP clients.
 
+### Response encoding (TOON)
+
+Tool **results** are returned as **TOON** (Token-Oriented Object Notation), not JSON. TOON is a
+token-efficient text encoding that renders uniform result rows (caller lists, symbol candidates,
+clusters) as a dense `[N]{cols}:` table — measured ~30% smaller than compact JSON on those payloads,
+and never larger in practice (it ties compact JSON on nested shapes). Because MCP results are text
+content consumed by an LLM, the denser encoding is both valid and cheaper. There is no per-call flag;
+MCP output is always TOON. The JSON snippets below describe the **logical shape** of each response —
+the same fields, just shown in JSON for readability. (The `rag-rat` CLI mirrors this: it defaults to
+TOON and takes a global `--json` flag for JSON output.)
+
 `symbol_lookup` is the candidate-selection step for symbol-shaped tools. It returns:
 
 ```json

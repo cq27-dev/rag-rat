@@ -512,6 +512,27 @@ See [`docs/bencher.md`](docs/bencher.md) for how the signals are wired.
 Commands read `rag-rat.toml` by default. Use `--config <path>` when running from another directory
 or with another repository profile.
 
+### Output format
+
+By default the CLI emits **TOON** (Token-Oriented Object Notation) — a token-efficient text
+encoding that renders uniform result rows (`query`, `clusters`, symbol/caller lists) as a dense
+`[N]{cols}:` table. On those payloads TOON is ~30% smaller than compact JSON (and well under half
+the size of pretty JSON); on nested payloads it ties compact JSON, so it never costs more in
+practice. Pass the global `--json` flag (before or after the subcommand) when a JSON parser must
+read the output:
+
+```bash
+rag-rat query "semantic recall"           # TOON (default)
+rag-rat --json query "semantic recall"    # JSON
+rag-rat query "semantic recall" --json    # JSON (global flag, either position)
+```
+
+For commands that print a human summary by default (`reconcile --plan`, `eval`, `memory doctor`),
+`--json` selects their structured JSON output instead of the summary.
+
+The MCP server's tool results default to TOON as well — they are text content read by an LLM, so the
+denser encoding is both valid and cheaper. There is no per-call flag; MCP output is always TOON.
+
 ```bash
 rag-rat index
 rag-rat index --changed
