@@ -18,10 +18,13 @@ rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["signal", "sync", "io-util", "net", "time"] }
+tokio = { workspace = true, features = ["sync", "io-util"] }
 
+# `net` / `time` / `signal` are consumed only by the unix-gated hot-upgrade (`upgrade.rs`) and hook
+# listener (`claude_hook.rs::listener`) — dead on non-unix targets, so gate them there (#54).
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+tokio = { workspace = true, features = ["net", "time", "signal"] }
 
 [features]
 default = ["fastembed", "model2vec"]
