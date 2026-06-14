@@ -49,6 +49,10 @@ pub(crate) struct InitPlan {
     languages: Vec<Language>,
     bindings: BTreeMap<Language, Vec<PathBuf>>,
     backend: EmbeddingBackend,
+    /// Whether to write `[oracle] auto_run = true` — the opt-in background refresh of
+    /// compiler-grade (SCIP) importance ranking. Default false (matches `OracleConfig`'s
+    /// default).
+    oracle_auto_run: bool,
 }
 
 #[derive(Debug, Default)]
@@ -221,6 +225,7 @@ mod tests {
                 (Language::TypeScript, vec![PathBuf::from("web/src"), PathBuf::from("app/src")]),
             ]),
             backend: EmbeddingBackend::Model2Vec,
+            oracle_auto_run: false,
         };
 
         let text = render_config(&plan);
@@ -231,6 +236,21 @@ mod tests {
         assert!(text.contains("typescript = [\"web/src\", \"app/src\"]"));
         assert!(text.contains("[local_ai.embedding]"));
         assert!(text.contains("model = \"model2vec\""));
+        // The oracle section is always rendered so the knob is discoverable; default is OFF.
+        assert!(text.contains("[oracle]"));
+        assert!(text.contains("auto_run = false"));
+    }
+
+    #[test]
+    fn render_config_enables_oracle_auto_run_when_opted_in() {
+        let plan = InitPlan {
+            root_value: ".".to_string(),
+            languages: vec![Language::Rust],
+            bindings: BTreeMap::from([(Language::Rust, vec![PathBuf::from("src")])]),
+            backend: EmbeddingBackend::FastEmbed,
+            oracle_auto_run: true,
+        };
+        assert!(render_config(&plan).contains("auto_run = true"));
     }
 
     #[test]

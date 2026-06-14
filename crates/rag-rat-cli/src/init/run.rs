@@ -106,7 +106,27 @@ pub(crate) fn prompt_plan(
     }
 
     let backend = prompt_backend(scan)?;
-    Ok(InitPlan { root_value, languages, bindings, backend })
+    let oracle_auto_run = prompt_oracle_auto_run()?;
+    Ok(InitPlan { root_value, languages, bindings, backend, oracle_auto_run })
+}
+
+/// Offer the opt-in background oracle. Default NO: it needs a language tool (e.g. rust-analyzer) on
+/// PATH and spends CPU on a throttled SCIP pass, so it should be a deliberate choice. Writing
+/// `auto_run = false` either way keeps the knob visible in the generated config.
+pub(crate) fn prompt_oracle_auto_run() -> anyhow::Result<bool> {
+    println!();
+    println!(
+        "Compiler-grade ranking: a background pass can refresh SCIP-based importance ranking as \
+         the"
+    );
+    println!(
+        "repo changes (needs a language tool such as rust-analyzer on PATH; runs only in the MCP"
+    );
+    println!("server, heavily throttled). You can flip `[oracle] auto_run` later.");
+    Ok(Confirm::new()
+        .with_prompt("Enable background compiler-grade ranking refresh?")
+        .default(false)
+        .interact()?)
 }
 pub(crate) fn prompt_backend(scan: &RepoScan) -> anyhow::Result<EmbeddingBackend> {
     let estimate = estimated_chunks(scan.total_source_bytes);
@@ -154,7 +174,8 @@ pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
         })
         .collect();
     let backend = recommend_backend(estimated_chunks(scan.total_source_bytes));
-    InitPlan { root_value, languages, bindings, backend }
+    // Non-interactive default mirrors `OracleConfig`'s default: off until explicitly enabled.
+    InitPlan { root_value, languages, bindings, backend, oracle_auto_run: false }
 }
 pub(crate) fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
     eprintln!("init: migrating SQLite schema");

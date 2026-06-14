@@ -204,8 +204,13 @@ pub struct SeedSource {
     pub changed_paths: u64,
     /// Of `changed_paths`, how many were indexed in the active scope (git-diff only).
     pub indexed_paths: u64,
-    /// Symbol ids that became graph seeds.
+    /// Seeds that resolved to a symbol id in the active scope (before graph membership is
+    /// checked).
     pub symbol_seed_count: u64,
+    /// Of `symbol_seed_count`, how many actually became nodes in the ranked graph. When this is
+    /// `0` the seeds had no effect and the ranking is global despite the resolved seeds (#142
+    /// review).
+    pub effective_seed_count: u64,
     pub skipped: SkippedSeeds,
 }
 
@@ -250,6 +255,17 @@ pub const RANKING_HINT_RUN_ORACLE: &str =
 pub const RANKING_HINT_AUTO_RUN: &str =
     "heuristic ranking — compiler ranking refreshes in the background";
 
+/// The outcome of [`important_symbols`]: the ranked symbols plus how many of the requested seeds
+/// actually became nodes in the ranked graph. `effective_seed_count == 0` with a non-empty
+/// `personalize_to` means the seeds had NO effect (they resolved to symbols that are not endpoints
+/// of any resolved edge), so the ranking is really global — the caller must label it `Global`, not
+/// `PersonalizedToChanges`. Always `0` for an unseeded (global) query. (#142 review)
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankedImportance {
+    pub symbols: Vec<SymbolImportance>,
+    pub effective_seed_count: u64,
+}
+
 /// A ranked load-bearing symbol.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SymbolImportance {
@@ -281,7 +297,7 @@ pub struct ImportanceOptions<'a> {
 pub fn important_symbols(
     conn: &Connection,
     options: ImportanceOptions<'_>,
-) -> anyhow::Result<Vec<SymbolImportance>> {
+) -> anyhow::Result<RankedImportance> {
     // Resolved symbol→symbol edges in the active checkout: both endpoints non-null, source file in
     // the scope view. `edge_strings` resolves the edge-kind and confidence ids to their names — the
     // kind sets the base weight, the confidence scales it (a name-only guess flows less rank than a
@@ -306,7 +322,7 @@ pub fn important_symbols(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(RankedImportance { symbols: Vec::new(), effective_seed_count: 0 });
     }
 
     // Map symbol ids to a dense 0..n index space.
@@ -340,18 +356,22 @@ pub fn important_symbols(
     out_edges.resize_with(symbol_ids.len(), Vec::new);
 
     // Personalization: 1.0 on each seed symbol that is present in the graph, else uniform.
+    // `effective_seed_count` is how many seeds actually landed as graph nodes — the caller uses it
+    // to avoid labeling a ranking "personalized" when no seed had any effect (#142 review).
+    let mut effective_seed_count: u64 = 0;
     let personalize: Option<Vec<f64>> = if options.personalize_to.is_empty() {
         None
     } else {
         let mut vector = vec![0.0_f64; symbol_ids.len()];
-        let mut any = false;
         for id in options.personalize_to {
-            if let Some(&idx) = index_of.get(id) {
+            if let Some(&idx) = index_of.get(id)
+                && vector[idx] == 0.0
+            {
                 vector[idx] = 1.0;
-                any = true;
+                effective_seed_count += 1;
             }
         }
-        any.then_some(vector)
+        (effective_seed_count > 0).then_some(vector)
     };
 
     let scores = pagerank(symbol_ids.len(), &out_edges, personalize.as_deref());
@@ -390,7 +410,7 @@ pub fn important_symbols(
         let Some((qualified_name, kind, path)) = row else { continue };
         out.push(SymbolImportance { symbol_id, qualified_name, path, kind, score: scores[idx] });
     }
-    Ok(out)
+    Ok(RankedImportance { symbols: out, effective_seed_count })
 }
 
 #[cfg(test)]
@@ -514,7 +534,7 @@ mod tests {
             .unwrap();
         }
 
-        let out = important_symbols(&conn, opts(10, &[])).unwrap();
+        let out = important_symbols(&conn, opts(10, &[])).unwrap().symbols;
         assert!(!out.is_empty(), "graph has edges → results");
         assert_eq!(out[0].qualified_name, "a::hub", "the called hub ranks first: {out:?}");
         assert_eq!(out[0].path, "a.rs");
@@ -523,7 +543,7 @@ mod tests {
         // No resolved symbol→symbol edges → empty (not an error).
         let bare = Connection::open_in_memory().unwrap();
         schema::apply(&bare).unwrap();
-        assert!(important_symbols(&bare, opts(10, &[])).unwrap().is_empty());
+        assert!(important_symbols(&bare, opts(10, &[])).unwrap().symbols.is_empty());
     }
 
     /// Insert `n` symbols (`s1..sn`, ids `1..=n`) plus `edges` as `(from_id, to_id)` calls, all in
@@ -562,11 +582,11 @@ mod tests {
     fn limit_truncates_and_a_huge_limit_is_safe() {
         let conn = graph_conn(3, &[(1, 3), (2, 3)]);
         // `limit` truncates to fewer than the node count.
-        let one = important_symbols(&conn, opts(1, &[])).unwrap();
+        let one = important_symbols(&conn, opts(1, &[])).unwrap().symbols;
         assert_eq!(one.len(), 1, "limit caps the result count");
         // An absurd limit clamps to the node count via MAX_RESULTS — no panic, no overflow, no
         // tens-of-thousands of point lookups.
-        let huge = important_symbols(&conn, opts(u32::MAX as usize, &[])).unwrap();
+        let huge = important_symbols(&conn, opts(u32::MAX as usize, &[])).unwrap().symbols;
         assert_eq!(huge.len(), 3, "bounded by the graph, never by the caller's limit");
     }
 
@@ -575,7 +595,9 @@ mod tests {
         // Two disjoint symmetric 2-cycles: {1↔2} and {3↔4}. Globally all four are balanced;
         // personalizing toward symbol 1 must lift its cluster (1,2) above the other (3,4).
         let conn = graph_conn(4, &[(1, 2), (2, 1), (3, 4), (4, 3)]);
-        let out = important_symbols(&conn, opts(4, &[1])).unwrap();
+        let ranked = important_symbols(&conn, opts(4, &[1])).unwrap();
+        assert_eq!(ranked.effective_seed_count, 1, "the seed (symbol 1) is a graph node");
+        let out = ranked.symbols;
         let top_two: Vec<&str> = out.iter().take(2).map(|s| s.qualified_name.as_str()).collect();
         assert!(
             top_two.iter().all(|q| *q == "a::s1" || *q == "a::s2"),
@@ -633,7 +655,7 @@ mod tests {
         // 1 calls 2 (Exact) and 3 (NameOnly), same kind → the exactly-resolved callee outranks the
         // name-only guess purely on confidence.
         let conn = conf_conn(3, &[(1, 2, "Exact"), (1, 3, "NameOnly")]);
-        let out = important_symbols(&conn, opts(10, &[])).unwrap();
+        let out = important_symbols(&conn, opts(10, &[])).unwrap().symbols;
         assert!(
             score_of(&out, "a::s2") > score_of(&out, "a::s3"),
             "higher-confidence callee ranks higher: {out:?}"
@@ -651,7 +673,8 @@ mod tests {
             personalize_to: &[],
             oracle_effects: Some(&effects),
         })
-        .unwrap();
+        .unwrap()
+        .symbols;
         assert_eq!(out[0].qualified_name, "a::s3", "the surviving callee ranks first: {out:?}");
         assert!(
             !out.iter().any(|s| s.qualified_name == "a::s2"),
@@ -670,7 +693,8 @@ mod tests {
             personalize_to: &[],
             oracle_effects: Some(&effects),
         })
-        .unwrap();
+        .unwrap()
+        .symbols;
         assert_eq!(out[0].qualified_name, "a::s3", "rank flows to the retargeted symbol: {out:?}");
         assert!(
             !out.iter().any(|s| s.qualified_name == "a::s2"),
@@ -689,7 +713,8 @@ mod tests {
             personalize_to: &[],
             oracle_effects: Some(&effects),
         })
-        .unwrap();
+        .unwrap()
+        .symbols;
         assert!(
             score_of(&out, "a::s2") > score_of(&out, "a::s3"),
             "the confirmed edge outranks an equal-confidence unverified one: {out:?}"
@@ -702,14 +727,15 @@ mod tests {
         // absent oracle introduces no behavioral dependency, it's just the confidence-weighted
         // path.
         let conn = conf_conn(3, &[(1, 2, "Exact"), (1, 3, "NameOnly")]);
-        let none = important_symbols(&conn, opts(10, &[])).unwrap();
+        let none = important_symbols(&conn, opts(10, &[])).unwrap().symbols;
         let empty: HashMap<i64, EdgeOracleEffect> = HashMap::new();
         let empty_map = important_symbols(&conn, ImportanceOptions {
             limit: 10,
             personalize_to: &[],
             oracle_effects: Some(&empty),
         })
-        .unwrap();
+        .unwrap()
+        .symbols;
         assert_eq!(none, empty_map, "None and an empty effects map rank identically");
     }
 }

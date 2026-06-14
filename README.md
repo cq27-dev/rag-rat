@@ -190,6 +190,14 @@ language = "markdown"
 directories = ["."]
 include = ["**/*.md"]
 exclude = [".git/**", ".rag-rat/**", "target/**", "node_modules/**"]
+
+# Optional: background refresh of compiler-grade (SCIP) importance ranking. Off by default.
+# Needs a language tool on PATH (e.g. rust-analyzer); the throttled pass runs only in the MCP
+# server. `rag-rat init` asks whether to enable this.
+[oracle]
+auto_run = false
+# auto_run_quiet_period_secs = 900    # wait this long after the last index change before a run
+# auto_run_min_interval_secs = 21600  # never re-run more often than this
 ```
 
 Then run the pieces directly:
@@ -602,6 +610,10 @@ name = "android-kotlin"
 language = "kotlin"
 directories = ["android/src/main/java"]
 include = ["**/*.kt"]
+
+# Opt-in background compiler-grade ranking refresh (off by default; needs e.g. rust-analyzer).
+[oracle]
+auto_run = false
 ```
 
 ## Git Hooks

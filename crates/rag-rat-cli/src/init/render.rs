@@ -18,6 +18,14 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
         let dirs = plan.bindings.get(language).cloned().unwrap_or_default();
         text.push_str(&format!("{} = [{}]\n", language.as_str(), quoted_paths(&dirs)));
     }
+    text.push('\n');
+    text.push_str("[oracle]\n");
+    text.push_str(
+        "# Background auto-refresh of compiler-grade (SCIP) importance ranking. Needs a \
+         language\n# tool on PATH (e.g. rust-analyzer); runs throttled in the MCP server only. \
+         Default off.\n",
+    );
+    text.push_str(&format!("auto_run = {}\n", plan.oracle_auto_run));
     text
 }
 pub(crate) fn quoted_paths(paths: &[PathBuf]) -> String {

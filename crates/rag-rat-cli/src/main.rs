@@ -166,11 +166,17 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_core::Config) {
     let config = config.clone();
     std::thread::spawn(move || {
         loop {
+            // Sleep BEFORE the first decision. This thread is spawned just before `run_stdio`
+            // starts the file watcher, so an immediate first tick could run the oracle against the
+            // pre-watcher index — missing any unindexed working-tree changes, recording them as
+            // skipped/drifted documents, and then letting the min-interval gate block a corrected
+            // run for hours. One poll interval lets the watcher's initial maintenance pass index
+            // those changes first. (#142 review)
+            std::thread::sleep(poll);
             // Each tick re-opens the index so a fresh `(commit_sha, worktree_id)` checkout (the
             // server outlives branch switches) and the latest `indexed_at_ms` are read anew. All
             // fail-open: any error just waits for the next tick.
             let _ = maybe_run_oracle_once(&config, quiet_period_ms, min_interval_ms);
-            std::thread::sleep(poll);
         }
     });
 

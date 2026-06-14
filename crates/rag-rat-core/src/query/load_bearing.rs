@@ -86,7 +86,11 @@ impl Serialize for LoadBearingBucket {
 /// Today the only non-heuristic tier is `compiler` (a confirmed/upgraded in-edge), so the enum has
 /// one variant — it exists so the field is a self-describing label (`oracle_tier: "compiler"`)
 /// rather than a bare bool, and so a later backend can add tiers without changing the field shape.
+// `rename_all = "snake_case"` so the serialized label matches `as_str()` and the documented
+// contract (`"compiler"`), not the variant's `"Compiler"` — MCP/CLI consumers key off the lower
+// form. (#142 review)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OracleTier {
     /// At least one in-edge was confirmed/upgraded by a SCIP oracle — compiler-grade.
     Compiler,
@@ -256,6 +260,28 @@ mod tests {
 
     use super::*;
     use crate::index::{install_scope_view, schema};
+
+    /// #142 review: the wire label for the oracle tier must match `as_str()` and the documented
+    /// contract (`"compiler"`), not the variant name `"Compiler"` — MCP/CLI consumers key off the
+    /// lower form.
+    #[test]
+    fn oracle_tier_serializes_as_lowercase_compiler() {
+        assert_eq!(OracleTier::Compiler.as_str(), "compiler");
+        assert_eq!(
+            serde_json::to_value(OracleTier::Compiler).unwrap(),
+            serde_json::json!("compiler")
+        );
+        // …and through the enrichment that actually carries it on the wire.
+        let enrichment = ImportanceEnrichment {
+            label: "local structural load",
+            signal: "scoped weighted fan-in",
+            score: 1.0,
+            bucket: LoadBearingBucket::High,
+            oracle_tier: Some(OracleTier::Compiler),
+        };
+        let value = serde_json::to_value(&enrichment).unwrap();
+        assert_eq!(value["oracle_tier"], serde_json::json!("compiler"));
+    }
 
     /// A connection with the schema applied and a single active scope (committed `sha`, no
     /// worktree), ready for fan-in queries against the `files` view.

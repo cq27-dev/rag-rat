@@ -4,7 +4,7 @@ use super::*;
 use crate::index::oracle::{
     self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls,
 };
-use crate::query::pagerank::{ImportantSymbolsResult, SymbolImportance};
+use crate::query::pagerank::ImportantSymbolsResult;
 
 /// Inputs to [`IndexDatabase::important_symbols`]. The seed (`personalize`) takes names, paths, or
 /// numeric ids; `auto_seed_from_diff` is the MCP-only default (seed from the current git diff when
@@ -1773,7 +1773,7 @@ impl IndexDatabase {
         let ranking_hint: Option<String> = oracle_effects
             .is_none()
             .then(|| crate::query::pagerank::RANKING_HINT_RUN_ORACLE.to_string());
-        let rank = |seed: &[i64]| -> anyhow::Result<Vec<SymbolImportance>> {
+        let rank = |seed: &[i64]| -> anyhow::Result<crate::query::pagerank::RankedImportance> {
             crate::query::pagerank::important_symbols(
                 self.storage.connection(),
                 crate::query::pagerank::ImportanceOptions {
@@ -1787,25 +1787,33 @@ impl IndexDatabase {
         // Explicit names/paths/ids win over the auto-diff default.
         if !request.personalize.is_empty() {
             let resolved = self.resolve_seed_selectors(&request.personalize)?;
-            let symbols = rank(&resolved.symbol_ids)?;
+            let ranked = rank(&resolved.symbol_ids)?;
             let seed_source = SeedSource {
                 kind: SeedKind::Explicit,
                 // Explicit seeds are names, not paths — no path population to report.
                 changed_paths: 0,
                 indexed_paths: 0,
                 symbol_seed_count: resolved.symbol_ids.len() as u64,
+                effective_seed_count: ranked.effective_seed_count,
                 skipped: SkippedSeeds { no_symbols: resolved.unresolved, ..Default::default() },
             };
-            // Every explicit name missed → no graph seed → global ranking, but say so.
-            if resolved.symbol_ids.is_empty() {
+            // No seed reached the graph — either nothing resolved, or the resolved symbols are not
+            // endpoints of any edge — so the ranking is actually global. Label it Global and say
+            // why, rather than implying it is personalized to the named symbols. (#142 review)
+            if ranked.effective_seed_count == 0 {
+                let reason = if resolved.symbol_ids.is_empty() {
+                    "no named symbols resolved to the active scope"
+                } else {
+                    "named symbols are not connected in the graph"
+                };
                 return Ok(ImportantSymbolsResult {
                     mode: ImportanceMode::Global,
                     seed_source: Some(seed_source),
-                    reason: Some("no named symbols resolved to the active scope".to_string()),
+                    reason: Some(reason.to_string()),
                     diff_paths_considered: None,
                     diff_paths_with_symbols: None,
                     ranking_hint: ranking_hint.clone(),
-                    symbols,
+                    symbols: ranked.symbols,
                 });
             }
             return Ok(ImportantSymbolsResult {
@@ -1815,7 +1823,7 @@ impl IndexDatabase {
                 diff_paths_considered: None,
                 diff_paths_with_symbols: None,
                 ranking_hint,
-                symbols,
+                symbols: ranked.symbols,
             });
         }
 
@@ -1828,29 +1836,37 @@ impl IndexDatabase {
                 diff_paths_considered: None,
                 diff_paths_with_symbols: None,
                 ranking_hint: ranking_hint.clone(),
-                symbols: rank(&[])?,
+                symbols: rank(&[])?.symbols,
             });
         }
 
         let diff = self.diff_seed()?;
-        let symbols = rank(&diff.symbol_ids)?;
-        // The diff had changes but none mapped to an indexed symbol (markdown/config/generated/
-        // deleted-only changes, or parser gaps): fall back to global, but report it with counts.
-        if diff.symbol_ids.is_empty() {
+        let ranked = rank(&diff.symbol_ids)?;
+        // The diff produced no effective graph seed — either no changed path mapped to an indexed
+        // symbol (markdown/config/generated/deleted-only, parser gaps) OR the symbols it resolved
+        // are isolated in the graph — so the ranking is actually global. Report it with counts and
+        // the reason rather than mislabeling it personalized. (#142 review)
+        if ranked.effective_seed_count == 0 {
+            let reason = if diff.symbol_ids.is_empty() {
+                "no symbols found in current diff"
+            } else {
+                "diff symbols are not connected in the graph"
+            };
             return Ok(ImportantSymbolsResult {
                 mode: ImportanceMode::Global,
                 seed_source: Some(SeedSource {
                     kind: SeedKind::GitDiff,
                     changed_paths: diff.changed_paths,
                     indexed_paths: diff.indexed_paths,
-                    symbol_seed_count: 0,
+                    symbol_seed_count: diff.symbol_ids.len() as u64,
+                    effective_seed_count: 0,
                     skipped: diff.skipped,
                 }),
-                reason: Some("no symbols found in current diff".to_string()),
+                reason: Some(reason.to_string()),
                 diff_paths_considered: Some(diff.changed_paths),
                 diff_paths_with_symbols: Some(diff.indexed_paths),
                 ranking_hint: ranking_hint.clone(),
-                symbols,
+                symbols: ranked.symbols,
             });
         }
         Ok(ImportantSymbolsResult {
@@ -1860,13 +1876,14 @@ impl IndexDatabase {
                 changed_paths: diff.changed_paths,
                 indexed_paths: diff.indexed_paths,
                 symbol_seed_count: diff.symbol_ids.len() as u64,
+                effective_seed_count: ranked.effective_seed_count,
                 skipped: diff.skipped,
             }),
             reason: None,
             diff_paths_considered: None,
             diff_paths_with_symbols: None,
             ranking_hint,
-            symbols,
+            symbols: ranked.symbols,
         })
     }
 
@@ -1953,7 +1970,13 @@ impl IndexDatabase {
             // empty diff, not an error: the caller falls through to global with a reason.
             return Ok(DiffSeed::default());
         };
-        let changed = crate::index::git_changed_paths(root)?;
+        // A configured source root that is not a git worktree (or has no HEAD, or git is absent)
+        // must NOT fail the whole tool: auto-seed-from-diff is a best-effort default, so treat any
+        // git error as an empty diff and let the caller fall through to global — mirroring the
+        // other index paths that tolerate missing git with empty metadata. (#142 review)
+        let Ok(changed) = crate::index::git_changed_paths(root) else {
+            return Ok(DiffSeed::default());
+        };
         let changed_paths = (changed.changed.len() + changed.deleted.len()) as u64;
         let mut seed = DiffSeed { changed_paths, ..Default::default() };
         // Deleted/renamed-away paths can never carry an in-scope symbol — count and skip them.
@@ -2124,6 +2147,10 @@ impl IndexDatabase {
         callees: &mut [crate::query::graph::GraphHop],
     ) -> anyhow::Result<()> {
         use crate::query::load_bearing::{self, OracleContext};
+        // Nothing to enrich → don't pay the oracle lookup. (#142 review)
+        if callers.is_empty() && callees.is_empty() {
+            return Ok(());
+        }
         let effects = self.load_bearing_oracle_effects()?;
         let oracle = OracleContext { effects: effects.as_ref() };
         let enrich = |hop: &mut crate::query::graph::GraphHop,
@@ -2157,6 +2184,10 @@ impl IndexDatabase {
     /// oracle fetch for the whole batch.
     fn enrich_search_hits_with_load_bearing(&self, hits: &mut [SearchHit]) -> anyhow::Result<()> {
         use crate::query::load_bearing::{self, OracleContext};
+        // Nothing to enrich → don't pay the oracle lookup. (#142 review)
+        if hits.is_empty() {
+            return Ok(());
+        }
         let effects = self.load_bearing_oracle_effects()?;
         let oracle = OracleContext { effects: effects.as_ref() };
         for hit in hits.iter_mut() {
@@ -2180,6 +2211,10 @@ impl IndexDatabase {
         hits: &mut [crate::query::symbol::SymbolHit],
     ) -> anyhow::Result<()> {
         use crate::query::load_bearing::{self, OracleContext};
+        // Nothing to enrich → don't pay the oracle lookup. (#142 review)
+        if hits.is_empty() {
+            return Ok(());
+        }
         let effects = self.load_bearing_oracle_effects()?;
         let oracle = OracleContext { effects: effects.as_ref() };
         for hit in hits.iter_mut() {
@@ -3197,7 +3232,11 @@ mod oracle_surfacing_tests {
 
     /// A real committed git checkout where `caller` calls `target`, plus an UNCOMMITTED edit that
     /// adds `fn touched()` to a second file — so `git_changed_paths` reports a non-empty diff with
-    /// an indexed symbol. Returns the db; `touched.rs` is the changed file.
+    /// an indexed symbol. `touched` CALLS `placeholder` so it is an endpoint of a resolved edge,
+    /// i.e. an actual node in the PageRank graph — a seed must reach the graph to personalize the
+    /// ranking (an isolated changed symbol now correctly falls back to global; see
+    /// `seed_resolving_only_to_isolated_symbols_is_labeled_global`). Returns the db; `touched.rs`
+    /// is the changed file.
     fn checkout_with_dirty_indexed_symbol() -> (IndexDatabase, PathBuf) {
         let root = temp_root();
         fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
@@ -3205,9 +3244,13 @@ mod oracle_surfacing_tests {
         git(&root, &["init", "-q"]);
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-q", "-m", "init"]);
-        // Edit a tracked file AFTER commit → an uncommitted working-tree change with a real symbol.
-        fs::write(root.join("src/touched.rs"), "pub fn placeholder() {} pub fn touched() {}\n")
-            .unwrap();
+        // Edit a tracked file AFTER commit → an uncommitted working-tree change with a real symbol
+        // that participates in the graph (touched → placeholder).
+        fs::write(
+            root.join("src/touched.rs"),
+            "pub fn placeholder() {} pub fn touched() { placeholder(); }\n",
+        )
+        .unwrap();
         let config = rust_config(root.clone());
         let db = IndexDatabase::rebuild(&config).unwrap();
         (db, root)
@@ -3264,6 +3307,77 @@ mod oracle_surfacing_tests {
         assert_eq!(all_missing.mode, crate::query::pagerank::ImportanceMode::Global);
         assert!(all_missing.reason.is_some(), "all-missing explicit seed reports why it's global");
         assert_eq!(all_missing.seed_source.unwrap().skipped.no_symbols, 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #142 review: a seed that RESOLVES to real symbols which are not endpoints of any resolved
+    /// edge has no effect on the ranking, so the result must be labeled `Global` (with a reason and
+    /// `effective_seed_count = 0`), NOT `PersonalizedToChanges` — otherwise the caller is told the
+    /// ranking is "relative to your changes" when it is actually global.
+    #[test]
+    fn seed_resolving_only_to_isolated_symbols_is_labeled_global() {
+        let root = temp_root();
+        // `caller -> target` is the only edge; `island` is a real symbol with no edges, so it never
+        // enters the PageRank graph.
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn caller() { target(); } fn target() {} fn island() {}\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["island".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(
+            result.mode,
+            crate::query::pagerank::ImportanceMode::Global,
+            "an isolated seed yields a global ranking, not a personalized one"
+        );
+        let seed = result.seed_source.expect("seed provenance is still reported");
+        assert_eq!(seed.symbol_seed_count, 1, "the name resolved to exactly one symbol");
+        assert_eq!(seed.effective_seed_count, 0, "but that symbol is not a graph node");
+        assert_eq!(result.reason.as_deref(), Some("named symbols are not connected in the graph"));
+
+        // Contrast: a connected seed (`target`) genuinely personalizes.
+        let connected = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["target".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(connected.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+        assert_eq!(connected.seed_source.unwrap().effective_seed_count, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #142 review: auto-seed-from-diff in a source root that is NOT a git worktree must not fail
+    /// the tool — it is best-effort, so it falls through to a global ranking (with a reason)
+    /// instead of propagating the git error. (`temp_root()` is deliberately not `git init`-ed.)
+    #[test]
+    fn auto_seed_outside_a_git_worktree_falls_back_to_global() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::Global);
+        assert!(!result.symbols.is_empty(), "the global ranking is still computed");
 
         let _ = fs::remove_dir_all(&root);
     }
