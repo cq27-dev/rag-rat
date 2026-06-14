@@ -7412,6 +7412,47 @@ fn full_rebuild_survives_stale_overlay_rows() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// #59: a FOREIGN file row — a path the real tree never produces — leaked into the index at the
+/// ACTIVE scope (the held-mini footgun: a test redirected its DB to the shared self-index and wrote
+/// fixture-relative paths under the repo's own commit). It must neither survive a full rebuild nor
+/// wedge it on UNIQUE(path, commit_sha, worktree_id). The authoritative clear (#87) stages the
+/// whole active commit, so a rebuild removes the leaked row and the self-index self-heals — no
+/// manual `.rag-rat` wipe.
+#[test]
+fn full_rebuild_clears_foreign_leaked_rows_at_the_active_scope() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let commit = db.active_commit_sha.clone();
+    assert!(!commit.is_empty(), "fixture must be a real git checkout");
+    // A path the real tree does not contain, leaked at the active commit scope (worktree_id='', the
+    // shared clean-row scope real files index at).
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id) VALUES ('src/foreign_leak.rs', 'rust', 'source', 'leak', 0, \
+             0, ?1, '')",
+            rusqlite::params![commit],
+        )
+        .unwrap();
+    drop(db);
+
+    let db = IndexDatabase::rebuild(&config)
+        .expect("rebuild must survive and clear foreign leaked rows");
+    let leaked: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM main.files WHERE path = 'src/foreign_leak.rs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(leaked, 0, "the authoritative full rebuild clears foreign rows at the active scope");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// #1 / #106: in a REAL git checkout the active context is `(commit_sha=HEAD, worktree_id=<root
 /// path>)` while a clean file row is `(commit_sha=HEAD, worktree_id='')`. The file→package mapping
 /// is computed at LOAD time (`load_package_roots_into_scope`) by longest-`manifest_dir`-prefix over
