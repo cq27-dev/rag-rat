@@ -7736,3 +7736,83 @@ pub fn caller_three() -> i32 { load_bearing_hub() }
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Phase 3 regression: a CALLEE neighbor whose call was written with a `::` path carries a
+/// source-level `target_qualified_name` (e.g. `crate::helper::deep_helper`) that does NOT match
+/// rag-rat's `path::name` `qualified_name`. The enrichment must resolve such callees by
+/// `to_symbol` (the verified rag-rat `path::name` target) FIRST — resolving by
+/// `target_qualified_name` first leaves every qualified-call callee un-enriched. The sibling test
+/// above misses this: its callees are bare calls, so `target_qualified_name` is `None` and the
+/// fallback to `to_symbol` masks the wrong-order bug.
+#[test]
+fn load_bearing_enrichment_present_on_qualified_callee_neighbor() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // `deep_helper` is reached only via the `crate::helper::deep_helper()` path, so its callee
+    // edge carries a `target_qualified_name` of `crate::helper::deep_helper` — divergent from the
+    // rag-rat `path::name` `qualified_name`. Two callers give it fan-in ≥ 1 (so its scoped
+    // weighted fan-in is `Some`).
+    fs::write(
+        root.join("src/helper.rs"),
+        r#"
+pub fn deep_helper() -> i32 { 7 }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod helper;
+pub fn qualified_caller_one() -> i32 { crate::helper::deep_helper() }
+pub fn qualified_caller_two() -> i32 { crate::helper::deep_helper() }
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let caller_selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("qualified_caller_one".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: false,
+        limit: 10,
+    };
+    let caller =
+        db.select_symbol(&caller_selector).unwrap().unwrap().expect("qualified caller symbol");
+    let report = db
+        .impact_surface_report_for_selected_symbol(
+            &caller,
+            50,
+            &crate::query::impact::ImpactSurfaceOptions::default(),
+        )
+        .unwrap();
+
+    let callee_hop = report
+        .direct_semantic_callees
+        .iter()
+        .find(|hop| hop.to_symbol.as_deref().is_some_and(|s| s.ends_with("deep_helper")))
+        .expect("the qualified callee neighbor is surfaced");
+    // The callee carries the divergent source-level qualified name — the exact shape that
+    // un-enriched callees in the wild (`self::storage::connection`, etc.).
+    assert!(
+        callee_hop
+            .target_qualified_name
+            .as_deref()
+            .is_some_and(|q| q.contains("::") && !q.contains('/')),
+        "callee carries a source-level (non path::name) target_qualified_name: {:?}",
+        callee_hop.target_qualified_name
+    );
+    let importance = callee_hop
+        .importance
+        .as_ref()
+        .expect("the qualified callee neighbor carries the load-bearing enrichment");
+    assert_eq!(importance.label, "local structural load", "labeled, not PageRank");
+    assert_eq!(importance.signal, "scoped weighted fan-in");
+    assert!(importance.score > 0.0, "two callers give the callee positive fan-in");
+
+    fs::remove_dir_all(root).unwrap();
+}

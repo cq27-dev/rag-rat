@@ -2145,7 +2145,7 @@ impl IndexDatabase {
             enrich(hop, neighbor.as_deref())?;
         }
         for hop in callees.iter_mut() {
-            let neighbor = hop.target_qualified_name.clone().or_else(|| hop.to_symbol.clone());
+            let neighbor = hop.to_symbol.clone().or_else(|| hop.target_qualified_name.clone());
             enrich(hop, neighbor.as_deref())?;
         }
         Ok(())
