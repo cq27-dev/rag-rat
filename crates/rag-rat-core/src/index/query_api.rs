@@ -426,10 +426,15 @@ impl IndexDatabase {
             self.heal_stale_paths(&stale)?; // NeedsReindex beyond the cap
             let healed =
                 crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
-            if healed.candidates.is_empty() && !lookup.candidates.is_empty() {
-                // A `symbol_id` selector can't survive a reindex (ids are reassigned per #149), so
-                // the re-resolve finds nothing. Keep the pre-heal candidates rather than return
-                // empty, but flag the files as stale so the caller knows the positions are old.
+            // A `symbol_id` selector can't survive a reindex (ids are reassigned per #149), so a
+            // re-resolve by the OLD id finds nothing even though the symbol still exists — keep the
+            // pre-heal candidates, flagged stale. For a name/symbol_path/logical selector an empty
+            // re-resolve means the symbol was genuinely deleted/renamed by the edit, so we must NOT
+            // resurrect a ghost with dead ids and old offsets — return the (empty) healed result.
+            if healed.candidates.is_empty()
+                && !lookup.candidates.is_empty()
+                && selector.symbol_id.is_some()
+            {
                 lookup.stale_files = stale;
             } else {
                 lookup = healed;
@@ -440,6 +445,25 @@ impl IndexDatabase {
         }
         self.enrich_symbol_hits_with_load_bearing(&mut lookup.candidates)?;
         Ok(lookup)
+    }
+
+    /// The active-scope file path that defines `qualified_name` (lowest symbol id on a tie), or
+    /// `None` if unresolved — used to fold a direct callee's DEFINITION file into impact staleness.
+    /// Scoped through the per-connection `files` view, like `active_symbol_id_for_qualified_name`.
+    fn file_for_qualified_name(&self, qualified_name: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .storage
+            .connection()
+            .query_row(
+                "SELECT files.path FROM symbols
+                 JOIN files ON files.id = symbols.file_id
+                 WHERE symbols.qualified_name = ?1
+                 ORDER BY symbols.id
+                 LIMIT 1",
+                [qualified_name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
     }
 
     /// The indexed `files.sha256` for `path` in the ACTIVE checkout (via the per-connection `files`
@@ -1830,6 +1854,16 @@ impl IndexDatabase {
         {
             if let Some(callsite) = &hop.callsite {
                 result_paths.push(callsite.path.clone());
+            }
+        }
+        // A direct callee resolves to a DEFINITION in another file; if THAT file changed, the
+        // resolution is stale even though the call-site file didn't — so add each returned callee's
+        // target definition file, not just its call site (#151 review).
+        for hop in report.direct_semantic_callees.iter() {
+            if let Some(name) = hop.to_symbol.as_deref().or(hop.target_qualified_name.as_deref())
+                && let Some(path) = self.file_for_qualified_name(name)?
+            {
+                result_paths.push(path);
             }
         }
         for item in report

@@ -8001,3 +8001,110 @@ fn impact_completeness_flags_dirty_result_files() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn symbol_lookup_does_not_resurrect_a_deleted_symbol_after_heal() {
+    // #151 review (P1): when an edit deletes/renames a symbol, healing the stale file and
+    // re-resolving by NAME returns nothing — symbol_candidates must NOT keep the pre-heal ghost
+    // (dead id, old offsets). The pre-heal fallback is only for symbol_id selectors.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn doomed() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let by_name = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("doomed".to_string()),
+        language: None,
+        allow_ambiguous: true,
+        limit: 10,
+    };
+    assert!(!db.symbol_candidates(&by_name).unwrap().candidates.is_empty(), "found before delete");
+
+    // The edit removes `doomed` entirely.
+    fs::write(root.join("src/lib.rs"), "pub fn something_else() {}\n").unwrap();
+
+    let after = db.symbol_candidates(&by_name).unwrap();
+    assert!(
+        after.candidates.is_empty(),
+        "a deleted symbol must not be resurrected after heal: {:?}",
+        after.candidates
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn symbol_lookup_by_id_keeps_pre_heal_candidate_flagged_stale() {
+    // #151 review (P1): a symbol_id selector can't survive a reindex (ids reassigned), so the
+    // re-resolve is empty — keep the pre-heal candidate flagged stale rather than vanish.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn keep() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // `symbols()` does not heal, so this id is from the clean index.
+    let id = db.symbols("keep", Some(Language::Rust), 10).unwrap().remove(0).symbol_id;
+    fs::write(root.join("src/lib.rs"), "// a\n// b\npub fn keep() {}\n").unwrap();
+
+    let by_id = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: Some(id),
+        symbol_path: None,
+        symbol: None,
+        language: None,
+        allow_ambiguous: true,
+        limit: 10,
+    };
+    let res = db.symbol_candidates(&by_id).unwrap();
+    assert!(!res.candidates.is_empty(), "symbol_id selector keeps the pre-heal candidate");
+    assert!(!res.stale_files.is_empty(), "and flags the file stale: {:?}", res.stale_files);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn impact_completeness_flags_a_dirty_callee_definition_file() {
+    // #151 review (P2): a callee defined in another file that's edited makes the resolution stale;
+    // the callee's DEFINITION file must be counted, not just the call-site file.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn caller() { crate::b::callee(); }\n").unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn callee() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let caller = db.symbols("caller", Some(Language::Rust), 10).unwrap().remove(0);
+    let clean =
+        db.impact_surface_report_for_selected_symbol(&caller, 20, &Default::default()).unwrap();
+    let resolved_to_b = clean
+        .direct_semantic_callees
+        .iter()
+        .any(|hop| hop.to_symbol.as_deref().is_some_and(|s| s.contains("b.rs")));
+    assert!(
+        resolved_to_b,
+        "callee resolved cross-file to b.rs: {:?}",
+        clean.direct_semantic_callees
+    );
+    assert_eq!(clean.completeness_and_caveats.stale_files, 0, "nothing dirty yet");
+
+    // Edit ONLY the callee's definition file (b.rs), not the call-site file (a.rs).
+    fs::write(root.join("src/b.rs"), "// shifted\npub fn callee() {}\n").unwrap();
+    let dirty =
+        db.impact_surface_report_for_selected_symbol(&caller, 20, &Default::default()).unwrap();
+    assert!(
+        dirty.completeness_and_caveats.stale_files >= 1,
+        "the dirty callee definition file must be flagged: {:?}",
+        dirty.completeness_and_caveats
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
