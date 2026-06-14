@@ -2311,6 +2311,8 @@ impl IndexDatabase {
         callee_edge_ids: &[i64],
         limit: u32,
     ) -> anyhow::Result<crate::query::memory::RepoMemoryEvidence> {
+        // This wrapper exposes only the evidence; the impact builder consumes the truncation flag
+        // directly from the core fn.
         crate::query::memory::memory_evidence_for_symbol_and_edges(
             self.storage.connection(),
             symbol,
@@ -2318,6 +2320,7 @@ impl IndexDatabase {
             callee_edge_ids,
             limit,
         )
+        .map(|(evidence, _truncated)| evidence)
     }
 
     pub fn memory_for_call_path_hash(

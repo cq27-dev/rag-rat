@@ -198,7 +198,7 @@ pub fn impact_surface_report_for_symbol(
     } else {
         Vec::new()
     };
-    let repo_memories = if options.include_memories {
+    let (repo_memories, memories_truncated) = if options.include_memories {
         let caller_edge_ids =
             direct_semantic_callers.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
         let callee_edge_ids =
@@ -211,12 +211,15 @@ pub fn impact_surface_report_for_symbol(
             limit,
         )?
     } else {
-        RepoMemoryEvidence {
-            direct: Vec::new(),
-            path_crossed: Vec::new(),
-            call_path_crossed: Vec::new(),
-            stale: Vec::new(),
-        }
+        (
+            RepoMemoryEvidence {
+                direct: Vec::new(),
+                path_crossed: Vec::new(),
+                call_path_crossed: Vec::new(),
+                stale: Vec::new(),
+            },
+            false,
+        )
     };
     let mut caveats = vec![
         "Graph evidence is tree-sitter/syntactic, not compiler-grade name resolution.".to_string(),
@@ -244,20 +247,13 @@ pub fn impact_surface_report_for_symbol(
         ("text_fallback_hits", text_fallback_hits.len()),
         ("recent_commits_touching_symbol_path", recent_commits_touching_symbol_path.len()),
         ("github_rationale_issues_prs", github_rationale_issues_prs.len()),
-        // `repo_memories` is also capped at `limit` per lane (memory_evidence_for_symbol_and_edges
-        // queries each at `limit`); flag it when any active lane fills the cap (#146 review).
-        (
-            "repo_memories",
-            repo_memories
-                .direct
-                .len()
-                .max(repo_memories.path_crossed.len())
-                .max(repo_memories.call_path_crossed.len()),
-        ),
     ]
     .into_iter()
     .filter(|&(_, len)| limit_usize != 0 && len >= limit_usize)
     .map(|(name, _)| name.to_string())
+    // `repo_memories` is capped per lane inside memory_evidence; its `memories_truncated` flag
+    // accounts for rows split off to `stale` (which the active-lane lengths would miss), #146 review.
+    .chain(memories_truncated.then(|| "repo_memories".to_string()))
     .collect();
     if !truncated_sections.is_empty() {
         caveats.push(format!(

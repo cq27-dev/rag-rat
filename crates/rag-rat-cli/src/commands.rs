@@ -296,13 +296,14 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
     // including DURING the subprocess, which the post-exit `production_sha` snapshot cannot see —
     // is skipped, never mis-joined. A reindex slipping in between this lock release and the spawn
     // is detected by the same gate.
-    let pre_spawn_sha = with_oracle_write_lock(config, |db| db.oracle_pre_spawn_snapshot())?;
-    // Stamp `started_at` right AFTER the pre-spawn snapshot (which read the indexed state this run
-    // covers) and before the tool subprocess: later than the indexed_at it's based on (so a run
-    // that covers fresh state isn't falsely judged stale even if the write-lock wait was long),
-    // yet before any mid-run reindex (so a run that misses one IS judged stale). (#145 + #146
-    // review)
-    let started_at_ms = crate::now_epoch_ms();
+    // Stamp `started_at` INSIDE the same write-lock as the pre-spawn snapshot, so no watcher
+    // reindex can land between reading the indexed state and recording the start. Under the lock,
+    // started_at corresponds exactly to the indexed state this run covers: ≥ that indexed_at (so a
+    // run covering fresh state isn't falsely judged stale even after a long lock wait) yet before
+    // any mid-run reindex (so a run that misses one IS judged stale). (#145 + #146 review)
+    let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
+        Ok((crate::now_epoch_ms(), db.oracle_pre_spawn_snapshot()?))
+    })?;
     let scip_output = config
         .database
         .parent()

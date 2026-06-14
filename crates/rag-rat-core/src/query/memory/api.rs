@@ -286,21 +286,28 @@ pub(crate) fn memory_evidence_for_symbol_and_edges(
     caller_edge_ids: &[i64],
     callee_edge_ids: &[i64],
     limit: u32,
-) -> anyhow::Result<RepoMemoryEvidence> {
-    let (direct, mut stale) = split_active_stale(memories_for_symbol(conn, symbol, limit)?);
+) -> anyhow::Result<(RepoMemoryEvidence, bool)> {
     let mut all_edges = caller_edge_ids.to_vec();
     all_edges.extend_from_slice(callee_edge_ids);
-    let (path_crossed, crossed_stale) =
-        split_active_stale(memories_for_edges(conn, &all_edges, limit)?);
+    // Each lane is independently capped at `limit` by its query. Detect truncation from the
+    // PRE-split row counts: `split_active_stale` partitions a lane into active + stale, so an
+    // active lane can sit below `limit` even though the query was capped (rows went to stale) —
+    // counting active lanes alone misses that (#146 review). A lane that returned `limit` rows
+    // may hide more.
+    let direct_rows = memories_for_symbol(conn, symbol, limit)?;
+    let edge_rows = memories_for_edges(conn, &all_edges, limit)?;
+    let call_path_rows =
+        call_path_memories_for_crossed(conn, caller_edge_ids, callee_edge_ids, limit)?;
+    let cap = limit as usize;
+    let truncated = cap != 0
+        && (direct_rows.len() >= cap || edge_rows.len() >= cap || call_path_rows.len() >= cap);
+
+    let (direct, mut stale) = split_active_stale(direct_rows);
+    let (path_crossed, crossed_stale) = split_active_stale(edge_rows);
     stale.extend(crossed_stale);
-    let (call_path_crossed, call_path_stale) = split_active_stale(call_path_memories_for_crossed(
-        conn,
-        caller_edge_ids,
-        callee_edge_ids,
-        limit,
-    )?);
+    let (call_path_crossed, call_path_stale) = split_active_stale(call_path_rows);
     stale.extend(call_path_stale);
-    Ok(RepoMemoryEvidence { direct, path_crossed, call_path_crossed, stale })
+    Ok((RepoMemoryEvidence { direct, path_crossed, call_path_crossed, stale }, truncated))
 }
 /// Surface call-path memories whose server-derived hash this traversal crossed: compute the
 /// single-edge hash for every crossed edge and the two-edge `caller -> callee` hash for each
