@@ -220,6 +220,11 @@ pub fn compose(
     // Seen set for memory dedup — preserves insertion order (symbol-bound first, then FTS,
     // then path-bound), unlike the old sort+dedup which ordered by creation-time ID.
     let mut seen_memory_ids: HashSet<String> = HashSet::new();
+    // Within-call dedup of symbol hits by (path, qualified_name): `symbol::lookup` can return the
+    // same logical symbol once per concrete row (overloads, multiple definitions, re-export rows),
+    // which otherwise renders as N identical "Known symbols" lines — same defect as the lexical
+    // lane (#139).
+    let mut seen_symbol_keys: HashSet<String> = HashSet::new();
 
     if let Some(ident) = extract_symbol_identifier(&normalized) {
         // Symbol lane. Bare name for qualified queries: `Watcher::spawn` → `spawn`.
@@ -227,7 +232,7 @@ pub fn compose(
         for hit in symbol::lookup(conn, bare, None, MAX_SYMBOLS)? {
             symbol_lane_had_hits = true;
             let key = format!("{}:{}", hit.path, hit.qualified_name);
-            if dedupe.symbol_keys.contains(&key) {
+            if dedupe.symbol_keys.contains(&key) || !seen_symbol_keys.insert(key.clone()) {
                 continue;
             }
             let (callers, callees) = edge_counts(conn, &hit)?;
@@ -529,6 +534,38 @@ mod tests {
         assert!(lines[0].contains("a.rs:1-9"), "first line is a.rs once: {lines:?}");
         assert!(lines[1].contains("b.rs:2-3"), "second is b.rs: {lines:?}");
         assert!(!lines.iter().any(|l| l.contains("c.rs")), "weak hit dropped: {lines:?}");
+    }
+
+    /// #139 (symbol lane): two symbol rows sharing (path, qualified_name) — overloads / cfg
+    /// variants / re-export rows — must render once, not once per row.
+    #[test]
+    fn symbol_lane_dedups_duplicate_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0)",
+            [],
+        )
+        .unwrap();
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                                     end_byte, signature, docs)
+                 VALUES (1, 'rust', 'foo', 'a::foo', 'function', 0, 10, 'fn foo()', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let out = compose(&conn, "foo", None, &DedupeFilter::default())
+            .unwrap()
+            .expect("symbol lane augments");
+        assert_eq!(
+            out.context.matches("`a::foo`").count(),
+            1,
+            "duplicate symbol rows must render once:\n{}",
+            out.context
+        );
     }
 
     fn seeded_conn() -> Connection {

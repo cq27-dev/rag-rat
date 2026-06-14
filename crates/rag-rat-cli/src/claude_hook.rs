@@ -180,13 +180,22 @@ fn split_top_level(command: &str) -> Vec<(bool, String)> {
                 current.push(ch);
             },
             (None, '|') => {
-                let double = chars.peek() == Some(&'|');
-                if double {
-                    chars.next();
-                }
+                // `|` pipes into the next segment; `|&` (bash shorthand for `2>&1 |`) also pipes
+                // (stdout+stderr) so the next segment is still a downstream filter; `||` (logical
+                // or) does NOT pipe — it's an independent command.
+                let next_piped = match chars.peek() {
+                    Some('|') => {
+                        chars.next();
+                        false
+                    },
+                    Some('&') => {
+                        chars.next();
+                        true
+                    },
+                    _ => true,
+                };
                 segments.push((piped, std::mem::take(&mut current)));
-                // A single `|` pipes into the next segment; `||` (logical or) does not.
-                piped = !double;
+                piped = next_piped;
             },
             (None, ';') => {
                 segments.push((piped, std::mem::take(&mut current)));
@@ -664,6 +673,8 @@ mod tests {
             "cargo test | grep result",
             "gh run view | grep -i error",
             "cargo clippy | grep -E warning",
+            "cargo test |& grep result", // |& pipes stdout+stderr → still a downstream filter
+            "cargo clippy |& rg warning",
         ];
         for cmd in negatives {
             assert!(parse_bash_search(cmd).is_none(), "false positive for {cmd}");
