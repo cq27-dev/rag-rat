@@ -20,12 +20,20 @@ pub(crate) fn validate_binding(
 /// Validate a `dir` binding: current while at least one indexed file lives at or under the
 /// directory, gone otherwise. Dir bindings are descriptive anchors with no `source_text_hash`
 /// — they never go stale, only current or gone.
+///
+/// A dir holding ONLY non-indexed file types (shell scripts, `.yml` workflows, Containerfiles)
+/// has no `files` rows by construction, so [`dir_has_files`] sees it as empty even though the
+/// directory is alive in the repo. Before declaring `gone`, fall back to a filesystem existence
+/// check against the index `source_root` (#98) so an area anchor to such a directory stays current.
 pub(crate) fn validate_dir_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
     let dir = binding.path.clone().unwrap_or_else(|| binding.binding_id.clone());
-    Ok(if dir_has_files(conn, &dir)? { "current" } else { "gone" }.to_string())
+    if dir_has_files(conn, &dir)? {
+        return Ok("current".to_string());
+    }
+    Ok(if dir_exists_on_disk(conn, &dir) { "current" } else { "gone" }.to_string())
 }
 pub(crate) fn validate_logical_symbol_binding(
     conn: &Connection,
@@ -343,7 +351,20 @@ pub(crate) fn validate_path_binding(
         )
         .optional()?;
     let Some(current_hash) = current_hash else {
-        return Ok("gone".to_string());
+        // No `files` row — but `files` holds only files in the configured indexed language set, so
+        // a binding to a path OUTSIDE that set (a Containerfile, shell script, `.yml` workflow,
+        // `.toml` config) has no row by construction and is indistinguishable from a deleted file
+        // by the index alone. Fall back to a filesystem existence check against the index
+        // `source_root` before declaring `gone` — acting on a false `gone` would delete valid
+        // guidance (#98). A BARE path is an area anchor → `current` while the file is present; a
+        // SPANNED `path:start-end` binding has no chunk to hash → `unverified` (alive but
+        // un-content-verifiable), never `gone`.
+        let status = match path_exists_on_disk(conn, path) {
+            true if binding.start_line.is_none() && binding.end_line.is_none() => "current",
+            true => "unverified",
+            false => "gone",
+        };
+        return Ok(status.to_string());
     };
     // A BARE path binding (no line span) is an AREA anchor, like a `dir` binding: the claim is
     // "this note is about this file", not "this file's bytes are X" — so it is current while the
@@ -359,6 +380,32 @@ pub(crate) fn validate_path_binding(
         _ => Ok("current".to_string()),
     }
 }
+/// The indexed checkout's `source_root` (the on-disk repo root), persisted in `index_meta` at
+/// open/rebuild/incremental. `None` on a raw connection that never recorded it (some test fixtures)
+/// — callers then skip the filesystem fallback and behave as if the target is absent.
+fn source_root(conn: &Connection) -> Option<std::path::PathBuf> {
+    conn.query_row("SELECT value FROM index_meta WHERE key = 'source_root'", [], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
+    .map(std::path::PathBuf::from)
+}
+
+/// Whether `path` (repo-root-relative) resolves to an existing file under the index `source_root`
+/// — the off-index existence check for non-indexed file types (#98). `false` when `source_root` is
+/// unknown, so a connection without it falls back to the pre-#98 `gone` behavior.
+fn path_exists_on_disk(conn: &Connection, path: &str) -> bool {
+    source_root(conn).is_some_and(|root| root.join(path).exists())
+}
+
+/// Whether `dir` (repo-root-relative, `""` = repo root) resolves to an existing directory under the
+/// index `source_root` — the off-index dir existence check (#98).
+fn dir_exists_on_disk(conn: &Connection, dir: &str) -> bool {
+    source_root(conn).is_some_and(|root| root.join(dir).is_dir())
+}
+
 pub(crate) fn source_hash_for_memory(
     conn: &Connection,
     memory_id: &str,
