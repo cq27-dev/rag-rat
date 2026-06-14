@@ -28,6 +28,15 @@ mod init;
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Pin the process-wide output format from the global flag before any command runs, so
+    // `print_output` renders TOON by default and JSON under `--json` without threading the format
+    // through every command signature.
+    set_output_format(if cli.json {
+        rag_rat_core::OutputFormat::Json
+    } else {
+        rag_rat_core::OutputFormat::Toon
+    });
+
     // These commands must work without a config file present — `init` creates one, and the
     // Claude Code hook entrypoint reads its event from stdin. Everything else needs a config.
     match &cli.command {
@@ -66,7 +75,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Reconcile(args) => reconcile(&config, &args)?,
         Cmd::Gc => {
             let db = open_index(&config)?;
-            print_json(&db.gc()?)?;
+            print_output(&db.gc()?)?;
         },
         Cmd::Eval(args) => eval(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,

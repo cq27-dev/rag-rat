@@ -19,6 +19,13 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value = "rag-rat.toml")]
     pub config: String,
 
+    /// Emit JSON instead of the default TOON (Token-Oriented Object Notation). TOON is denser for
+    /// LLM consumers; pass --json when a JSON parser must read the output. For commands that print
+    /// a human summary by default (`reconcile --plan`, `eval`, `memory doctor`), --json also
+    /// selects their structured output.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -176,9 +183,6 @@ pub(crate) struct ReconcileArgs {
     /// Report the reconcile plan without computing embeddings.
     #[arg(long)]
     pub plan: bool,
-    /// Emit JSON (implied for --plan when set together).
-    #[arg(long)]
-    pub json: bool,
     /// Cap on chunks to embed this pass.
     #[arg(long)]
     pub limit: Option<u32>,
@@ -217,9 +221,6 @@ pub(crate) struct EvalArgs {
     /// Defaults to <root>/evals/oracle.scip when present; absent → oracle metrics skipped.
     #[arg(long)]
     pub scip: Option<PathBuf>,
-    /// Emit JSON instead of the summary.
-    #[arg(long)]
-    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -287,10 +288,7 @@ pub(crate) enum MemoryCommand {
     /// Show one memory by id.
     Show { memory_id: String },
     /// Report non-current anchors with rebind suggestions.
-    Doctor {
-        #[arg(long)]
-        json: bool,
-    },
+    Doctor,
     /// Re-anchor a memory to a symbol, path, or chunk.
     Rebind {
         memory_id: String,
@@ -410,6 +408,16 @@ mod tests {
     fn config_defaults_to_rag_rat_toml() {
         let cli = Cli::try_parse_from(["rag-rat", "gc"]).expect("parse");
         assert_eq!(cli.config, "rag-rat.toml");
+    }
+
+    #[test]
+    fn json_flag_defaults_off_and_is_global() {
+        // Absent → TOON (false). Present after the subcommand (global) → JSON (true).
+        let default = Cli::try_parse_from(["rag-rat", "gc"]).expect("parse");
+        assert!(!default.json, "--json must default off (TOON is the default render)");
+
+        let flagged = Cli::try_parse_from(["rag-rat", "query", "foo", "--json"]).expect("parse");
+        assert!(flagged.json, "--json must be accepted globally, after the subcommand");
     }
 
     #[test]

@@ -1,9 +1,30 @@
+use std::sync::OnceLock;
+
+use rag_rat_core::OutputFormat;
+
 use super::*;
 use crate::cli::{
     BriefArgs, ClustersArgs, EvalArgs, GithubArgs, GithubCommand, HookAction, HooksArgs, IndexArgs,
     MaintenanceArgs, MemoryArgs, MemoryCommand, ModelsArgs, ModelsCommand, OracleArgs,
     OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs, ReconcileArgs,
 };
+
+/// Process-wide output format, set once from the global `--json` flag in `main` before any command
+/// runs. A `OnceLock` keeps `print_output` (~30 call sites) from threading an `OutputFormat`
+/// through every command signature; it defaults to TOON if `main` never sets it (e.g. a unit test
+/// calling a command helper directly).
+static OUTPUT_FORMAT: OnceLock<OutputFormat> = OnceLock::new();
+
+/// Set the global output format. Called once from `main` from the parsed `--json` flag; a second
+/// call is a no-op (`OnceLock::set` returns `Err`), so tests can't accidentally clobber it.
+pub(crate) fn set_output_format(format: OutputFormat) {
+    let _ = OUTPUT_FORMAT.set(format);
+}
+
+/// The format `print_output` renders in — TOON unless `main` set JSON from `--json`.
+pub(crate) fn output_format() -> OutputFormat {
+    OUTPUT_FORMAT.get().copied().unwrap_or_default()
+}
 
 pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     if args.watch {
@@ -33,7 +54,7 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     if doctor_count > 0 {
         eprintln!("⚠ {doctor_count} repo memories need re-anchoring — run 'rag-rat memory doctor'");
     }
-    print_json(&db.status(&config.database)?)
+    print_output(&db.status(&config.database)?)
 }
 pub(crate) fn query(config: &Config, args: &QueryArgs) -> anyhow::Result<()> {
     let query = args.query.join(" ");
@@ -45,12 +66,12 @@ pub(crate) fn query(config: &Config, args: &QueryArgs) -> anyhow::Result<()> {
         print_query_explain(&db.search_explain(&query, 10, false)?);
         return Ok(());
     }
-    print_json(&db.search(&query, 10, false)?)
+    print_output(&db.search(&query, 10, false)?)
 }
 pub(crate) fn brief(config: &Config, args: &BriefArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     let mode = rag_rat_core::query::repo_brief::RepoBriefMode::parse(args.mode.as_deref())?;
-    print_json(&db.repo_brief(rag_rat_core::query::repo_brief::RepoBriefOptions {
+    print_output(&db.repo_brief(rag_rat_core::query::repo_brief::RepoBriefOptions {
         mode,
         limit: args.limit.unwrap_or(10),
         include_generated: args.include_generated,
@@ -59,7 +80,7 @@ pub(crate) fn brief(config: &Config, args: &BriefArgs) -> anyhow::Result<()> {
 }
 pub(crate) fn clusters(config: &Config, args: &ClustersArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
-    print_json(&db.repo_clusters(rag_rat_core::query::clusters::RepoClustersOptions {
+    print_output(&db.repo_clusters(rag_rat_core::query::clusters::RepoClustersOptions {
         limit: args.limit.unwrap_or(10),
         include_generated: args.include_generated,
         include_memories: !args.no_memories,
@@ -81,7 +102,7 @@ pub(crate) fn dump_config(config: &Config) -> anyhow::Result<()> {
             })
         })
         .collect::<Vec<_>>();
-    print_json(&serde_json::json!({
+    print_output(&serde_json::json!({
         "root": config.root,
         "database": config.database,
         "local_ai": {
@@ -114,8 +135,10 @@ pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
         }),
     };
     let report = rag_rat_core::eval::run(config, &options)?;
-    if args.json || options.update_baseline {
-        print_json(&report)?;
+    // `eval` prints a greppable human summary by default; the global `--json` (or a baseline
+    // rewrite, which needs the machine record) switches to the structured report.
+    if output_format() == OutputFormat::Json || options.update_baseline {
+        print_output(&report)?;
     } else {
         print_eval_summary(&report);
     }
@@ -190,7 +213,7 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
         let report = with_oracle_write_lock(config, |db| {
             db.run_oracle_from_scip(tool, &tool_version, &scip_bytes)
         })?;
-        return print_json(&serde_json::json!({
+        return print_output(&serde_json::json!({
             "outcome": "completed",
             "tool": tool.as_db_str(),
             "tool_version": tool_version,
@@ -210,7 +233,7 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
         rag_rat_core::index::oracle::probe_oracle_tool(tool)
     {
         eprintln!("oracle: {hint}");
-        return print_json(&rag_rat_core::index::oracle::OracleRunOutcome::Blocked {
+        return print_output(&rag_rat_core::index::oracle::OracleRunOutcome::Blocked {
             tool,
             program,
             hint,
@@ -238,7 +261,7 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
     match production? {
         rag_rat_core::index::oracle::ScipProduction::Blocked { tool, program, hint } => {
             eprintln!("oracle: {hint}");
-            print_json(&rag_rat_core::index::oracle::OracleRunOutcome::Blocked {
+            print_output(&rag_rat_core::index::oracle::OracleRunOutcome::Blocked {
                 tool,
                 program,
                 hint,
@@ -259,7 +282,7 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
             let report = with_oracle_write_lock(config, |db| {
                 db.run_oracle(tool, &version, &bytes, Some(&production_sha), Some(&pre_spawn_sha))
             })?;
-            print_json(&serde_json::json!({
+            print_output(&serde_json::json!({
                 "outcome": "completed",
                 "tool": tool.as_db_str(),
                 "tool_version": version,
@@ -293,21 +316,23 @@ fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<
             "verdicts": status,
         }));
     }
-    print_json(&entries)
+    print_output(&entries)
 }
 pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     match &args.command {
-        None | Some(ModelsCommand::List) => print_json(&db.list_models()?),
-        Some(ModelsCommand::Install { model_id }) => print_json(&db.install_model(model_id)?),
+        None | Some(ModelsCommand::List) => print_output(&db.list_models()?),
+        Some(ModelsCommand::Install { model_id }) => print_output(&db.install_model(model_id)?),
     }
 }
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     if args.plan {
         let plan = db.reconcile_plan()?;
-        if args.json {
-            print_json(&plan)?;
+        // `--plan` prints a human summary by default; the global `--json` switches to the
+        // structured plan.
+        if output_format() == OutputFormat::Json {
+            print_output(&plan)?;
         } else {
             print_reconcile_plan(&plan);
         }
@@ -332,7 +357,7 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
     if non_current > 0 {
         eprintln!("⚠ {non_current} repo memories need re-anchoring — run 'rag-rat memory doctor'");
     }
-    print_json(&report)
+    print_output(&report)
 }
 pub(crate) fn run_watch(config: Config) -> anyhow::Result<()> {
     let Some(_watcher) = rag_rat_core::watch::Watcher::spawn(config.clone()) else {
@@ -378,7 +403,7 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
         } else {
             (None, None, None)
         };
-    print_json(&serde_json::json!({
+    print_output(&serde_json::json!({
         "config_root": config.root,
         "database": config.database,
         "schema": schema,
@@ -428,11 +453,13 @@ fn chunk_bind_target(chunk_id: i64) -> rag_rat_core::query::memory::RepoMemoryBi
 
 pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
     match &args.command {
-        MemoryCommand::Doctor { json } => {
+        MemoryCommand::Doctor => {
             let db = open_index(config)?;
             let entries = db.memory_doctor()?;
-            if *json {
-                print_json(&entries)?;
+            // Human-readable rebind suggestions by default; the global `--json` emits the
+            // structured doctor entries instead.
+            if output_format() == OutputFormat::Json {
+                print_output(&entries)?;
                 let any_gone = entries.iter().any(|e| e.anchor_status == "gone");
                 if any_gone {
                     anyhow::bail!("one or more memories have gone anchors");
@@ -519,7 +546,7 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                      --symbol-id <id>, --path <path>, --chunk <id>, or --dir <dir>"
                 );
             };
-            print_json(&db.memory_rebind(memory_id, bind)?)
+            print_output(&db.memory_rebind(memory_id, bind)?)
         },
         MemoryCommand::List { kind } => {
             let db = open_index(config)?;
@@ -567,7 +594,7 @@ pub(crate) fn github(config: &Config, args: &GithubArgs) -> anyhow::Result<()> {
             } else {
                 anyhow::bail!("github sync needs --from-refs or --issue <owner/repo#number>");
             };
-            print_json(&report)
+            print_output(&report)
         },
     }
 }
@@ -584,7 +611,7 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
                 install_hook(&git.hooks_dir, hook)?;
                 installed.push(*hook);
             }
-            print_json(&serde_json::json!({
+            print_output(&serde_json::json!({
                 "status": "installed",
                 "repo_root": git.worktree_root,
                 "git_dir": git.git_dir,
@@ -608,7 +635,7 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
                     kept.push(*hook);
                 }
             }
-            print_json(&serde_json::json!({
+            print_output(&serde_json::json!({
                 "status": "uninstalled",
                 "hooks_dir": git.hooks_dir,
                 "removed": removed,
@@ -629,7 +656,7 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
                     })
                 })
                 .collect::<Vec<_>>();
-            print_json(&serde_json::json!({
+            print_output(&serde_json::json!({
                 "repo_root": git.worktree_root,
                 "git_dir": git.git_dir,
                 "git_common_dir": git.git_common_dir,
@@ -648,7 +675,7 @@ pub(crate) fn claude_hooks(config: &Config, subcommand: &str, global: bool) -> a
             if changed {
                 claude_settings::write_settings(&path, &settings)?;
             }
-            print_json(&serde_json::json!({
+            print_output(&serde_json::json!({
                 "status": if changed { "installed" } else { "already_installed" },
                 "settings_path": path,
                 "matchers": ["Grep", "Bash"],
@@ -659,14 +686,14 @@ pub(crate) fn claude_hooks(config: &Config, subcommand: &str, global: bool) -> a
             if changed {
                 claude_settings::write_settings(&path, &settings)?;
             }
-            print_json(&serde_json::json!({
+            print_output(&serde_json::json!({
                 "status": if changed { "uninstalled" } else { "not_installed" },
                 "settings_path": path,
             }))
         },
         "status" => {
             let status = claude_settings::hook_status(&settings);
-            print_json(&serde_json::json!({
+            print_output(&serde_json::json!({
                 "settings_path": path,
                 "pretooluse_installed": status.pretooluse,
                 "session_start_installed": status.session_start,
@@ -684,7 +711,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     let started = Instant::now();
 
     if trigger == "post-checkout" && branch_checkout.as_deref() == Some("0") {
-        print_json(&serde_json::json!({
+        print_output(&serde_json::json!({
             "trigger": trigger,
             "status": "skipped",
             "reason": "file checkout",
@@ -728,7 +755,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // leaving stale anchors until a manual memory_validate.
     let memory_validation = db.memory_validate().ok();
     let plan = db.reconcile_plan()?;
-    print_json(&serde_json::json!({
+    print_output(&serde_json::json!({
         "trigger": trigger,
         "status": "complete",
         "old_head": old_head,

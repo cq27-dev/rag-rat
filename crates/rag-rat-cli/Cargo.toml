@@ -26,6 +26,10 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+# MCP tool results render as TOON; integration tests decode them back to JSON Values to assert.
+toon-format.workspace = true
+
 [features]
 default = ["fastembed", "model2vec"]
 fastembed = ["rag-rat-core/fastembed", "rag-rat-mcp/fastembed"]

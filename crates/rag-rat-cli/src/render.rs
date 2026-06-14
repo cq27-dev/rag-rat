@@ -212,8 +212,11 @@ pub(crate) fn render_github_sync_progress(
         },
     }
 }
-pub(crate) fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+/// Print a serializable result in the process-wide output format (TOON by default, JSON under
+/// `--json`). Renamed from `print_json` because it is no longer always JSON — the format is the
+/// global flag's choice, read from `output_format()`.
+pub(crate) fn print_output(value: &impl serde::Serialize) -> anyhow::Result<()> {
+    println!("{}", rag_rat_core::render(value, output_format()));
     Ok(())
 }
 pub(crate) fn render_index_progress(progress: IndexProgress) {
