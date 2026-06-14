@@ -25,7 +25,11 @@ const MAX_RESULTS: usize = 500;
 
 /// Per-edge-kind weight: structural dependencies (calls, impls) carry full importance; weaker
 /// associations (imports, containment) carry less. Unknown kinds default to `1.0`.
-fn edge_weight(kind: &str) -> f64 {
+///
+/// `pub(crate)` so the scoped-weighted-fan-in enrichment (`query::load_bearing`, the third
+/// importance scale) reuses the SAME weight table — this is the single source of truth for
+/// edge-kind weighting; do not duplicate it.
+pub(crate) fn edge_weight(kind: &str) -> f64 {
     match kind {
         "calls_name" | "implements" => 1.0,
         "references_type" | "constructs" => 0.7,
@@ -41,7 +45,10 @@ fn edge_weight(kind: &str) -> f64 {
 /// it should flow less of the source's rank to that callee than a structurally-resolved call.
 /// Unknown values default to `1.0` (same defensive posture as [`edge_weight`]). A SCIP-verified
 /// edge bypasses this entirely and uses [`COMPILER_FACTOR`].
-fn confidence_factor(confidence: &str) -> f64 {
+///
+/// `pub(crate)` so `query::load_bearing` reuses the SAME confidence table for scoped-weighted
+/// fan-in — single source of truth; do not duplicate.
+pub(crate) fn confidence_factor(confidence: &str) -> f64 {
     match confidence {
         "Exact" => 1.0,
         "Syntactic" => 0.85,
@@ -56,7 +63,10 @@ fn confidence_factor(confidence: &str) -> f64 {
 /// normalizes each source node's out-weights, the bonus only changes the outcome at a *mixed*
 /// source (some edges compiler-verified, some heuristic), tilting that node's rank toward the
 /// verified callees; it is a no-op at a node whose edges are all the same tier.
-const COMPILER_FACTOR: f64 = 1.2;
+///
+/// `pub(crate)` so `query::load_bearing` weights an oracle-confirmed in-edge at the compiler tier
+/// in scoped-weighted fan-in — single source of truth; do not duplicate.
+pub(crate) const COMPILER_FACTOR: f64 = 1.2;
 
 /// What a current, in-scope SCIP oracle verdict does to an edge during ranking, keyed by `edge_id`.
 /// Built by the query layer from `OracleResolutionKind` so this module stays free of oracle types.

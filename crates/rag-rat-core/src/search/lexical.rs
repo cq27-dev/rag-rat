@@ -33,6 +33,13 @@ pub struct SearchHit {
     pub graph: Option<GraphEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_components: Option<ScoreComponents>,
+    /// LOCAL structural-load signal (scoped weighted fan-in) for the hit's symbol — the THIRD
+    /// importance scale, NOT PageRank. Attached by the search/`symbol_lookup` enrichment pass over
+    /// the symbol a hit resolves to (`chunks.symbol_path` → the active-scope symbol). `None` when
+    /// the hit has no symbol, the symbol has no in-edges in scope, or it wasn't enriched. See
+    /// `crate::query::load_bearing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub importance: Option<crate::query::load_bearing::ImportanceEnrichment>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -277,6 +284,7 @@ fn bm25_candidates(
             summary: snippet(&text, query),
             graph: None,
             score_components: None,
+            importance: None,
         })
     })?;
 
@@ -345,6 +353,7 @@ fn vector_candidates(
                     summary: snippet(&text, query),
                     graph: None,
                     score_components: None,
+                    importance: None,
                 },
                 blob,
             ))

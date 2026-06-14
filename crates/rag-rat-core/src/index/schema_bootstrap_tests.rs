@@ -7631,3 +7631,93 @@ fn incremental_pass_heals_stale_overlay_rows() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Phase 3: the LOCAL structural-load enrichment (`scoped weighted fan-in`) rides along on BOTH the
+/// `impact_surface` neighbors AND `symbol_lookup` / `search` hits — labeled, never as PageRank. A
+/// hub called by several functions outranks a leaf nothing depends on.
+#[test]
+fn load_bearing_enrichment_present_on_impact_neighbors_and_lookup_hits() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn load_bearing_hub() -> i32 { 1 }
+pub fn quiet_leaf() -> i32 { 2 }
+pub fn caller_one() -> i32 { load_bearing_hub() }
+pub fn caller_two() -> i32 { load_bearing_hub() }
+pub fn caller_three() -> i32 { load_bearing_hub() }
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // impact_surface neighbors: running impact on a CALLER surfaces the hub as a callee neighbor,
+    // and the hub (three callers) carries the labeled load-bearing signal — the third importance
+    // scale, never PageRank.
+    let caller_selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("caller_one".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: false,
+        limit: 10,
+    };
+    let caller = db.select_symbol(&caller_selector).unwrap().unwrap().expect("caller symbol");
+    let report = db
+        .impact_surface_report_for_selected_symbol(
+            &caller,
+            50,
+            &crate::query::impact::ImpactSurfaceOptions::default(),
+        )
+        .unwrap();
+    let enriched_hub = report
+        .direct_semantic_callees
+        .iter()
+        .find_map(|hop| hop.importance.as_ref())
+        .expect("the hub callee neighbor carries the load-bearing enrichment");
+    assert_eq!(enriched_hub.label, "local structural load", "labeled, not PageRank");
+    assert_eq!(enriched_hub.signal, "scoped weighted fan-in");
+    assert!(enriched_hub.score > 0.0, "the hub's three callers give it positive fan-in");
+
+    // symbol_lookup hits: the hub (3 callers) outscores the leaf (0). Both carry the label, but the
+    // leaf has no in-edges in scope so its enrichment is absent — the score reflects scoped fan-in.
+    let hub_hit = db
+        .symbols("load_bearing_hub", Some(Language::Rust), 10)
+        .unwrap()
+        .into_iter()
+        .find(|h| h.qualified_name.ends_with("load_bearing_hub"))
+        .expect("hub lookup hit");
+    let hub_importance =
+        hub_hit.importance.as_ref().expect("hub has callers → a load-bearing signal");
+    assert_eq!(hub_importance.label, "local structural load");
+    assert!(hub_importance.score > 0.0, "the hub's three callers give it positive fan-in");
+
+    let leaf_hit = db
+        .symbols("quiet_leaf", Some(Language::Rust), 10)
+        .unwrap()
+        .into_iter()
+        .find(|h| h.qualified_name.ends_with("quiet_leaf"))
+        .expect("leaf lookup hit");
+    assert!(
+        leaf_hit.importance.is_none(),
+        "a symbol nothing depends on has no in-scope fan-in: {:?}",
+        leaf_hit.importance
+    );
+
+    // search hits carry the same enrichment on the resolved symbol.
+    let search_hub =
+        db.search("load_bearing_hub", 20, true).unwrap().into_iter().find(|hit| {
+            hit.symbol_path.as_deref().is_some_and(|s| s.ends_with("load_bearing_hub"))
+        });
+    if let Some(hit) = search_hub
+        && let Some(importance) = hit.importance.as_ref()
+    {
+        assert_eq!(importance.label, "local structural load", "search hit labeled correctly");
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}

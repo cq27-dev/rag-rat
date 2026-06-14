@@ -273,6 +273,12 @@ pub struct GraphHop {
     pub shown_by_default: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callsite: Option<Callsite>,
+    /// LOCAL structural-load signal (scoped weighted fan-in) for this neighbor — the THIRD
+    /// importance scale, NOT PageRank. Attached by the `impact_surface` enrichment pass over the
+    /// neighbors a result already holds. `None` when the neighbor has no in-edges in the active
+    /// scope or wasn't enriched. See `crate::query::load_bearing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub importance: Option<crate::query::load_bearing::ImportanceEnrichment>,
 }
 
 #[derive(Debug, Clone, Serialize)]

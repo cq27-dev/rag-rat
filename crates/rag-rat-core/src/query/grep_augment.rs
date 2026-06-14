@@ -514,6 +514,7 @@ mod tests {
             summary: format!("{path} summary"),
             graph: None,
             score_components: None,
+            importance: None,
         }
     }
 

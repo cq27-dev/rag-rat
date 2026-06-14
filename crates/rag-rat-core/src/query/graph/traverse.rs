@@ -149,6 +149,9 @@ pub(crate) fn traverse_with_options(
                 line: callsite_start,
                 span: [callsite_start, callsite_end],
             }),
+            // Filled by the `impact_surface` load-bearing enrichment pass (`IndexDatabase`), which
+            // has the active scope + oracle context; heuristic traversal leaves it absent.
+            importance: None,
         })
     })?;
     let mut hops = Vec::new();

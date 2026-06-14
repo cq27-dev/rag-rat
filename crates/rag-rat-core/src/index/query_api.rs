@@ -325,6 +325,7 @@ impl IndexDatabase {
             graph_mode,
             graph_limit,
         )?;
+        self.enrich_search_hits_with_load_bearing(&mut hits)?;
         Ok(hits)
     }
 
@@ -364,6 +365,7 @@ impl IndexDatabase {
             graph_mode,
             graph_limit,
         )?;
+        self.enrich_search_hits_with_load_bearing(&mut hits)?;
         Ok(hits)
     }
 
@@ -373,14 +375,20 @@ impl IndexDatabase {
         language: Option<Language>,
         limit: u32,
     ) -> anyhow::Result<Vec<crate::query::symbol::SymbolHit>> {
-        crate::query::symbol::lookup(self.storage.connection(), name, language, limit)
+        let mut hits =
+            crate::query::symbol::lookup(self.storage.connection(), name, language, limit)?;
+        self.enrich_symbol_hits_with_load_bearing(&mut hits)?;
+        Ok(hits)
     }
 
     pub fn symbol_candidates(
         &self,
         selector: &crate::query::symbol::SymbolSelector,
     ) -> anyhow::Result<crate::query::symbol::SymbolLookup> {
-        crate::query::symbol::lookup_candidates(self.storage.connection(), selector)
+        let mut lookup =
+            crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
+        self.enrich_symbol_hits_with_load_bearing(&mut lookup.candidates)?;
+        Ok(lookup)
     }
 
     pub fn select_symbol(
@@ -1626,6 +1634,7 @@ impl IndexDatabase {
                     summary: bounded_summary(&text),
                     graph: None,
                     score_components: None,
+                    importance: None,
                 })
             },
         )?;
@@ -1684,12 +1693,20 @@ impl IndexDatabase {
         // finding
         // 4) and before the memory-evidence edge-id collection — so a compiler-upgraded neighbor
         // can't be dropped by the heuristic limit, and downstream counts see the final window.
-        let report = crate::query::impact::impact_surface_report_for_symbol(
+        let mut report = crate::query::impact::impact_surface_report_for_symbol(
             self.storage.connection(),
             symbol,
             limit,
             options,
             |hops| self.enrich_hops_with_oracle(hops),
+        )?;
+        // Attach the LOCAL structural-load signal (scoped weighted fan-in — the third importance
+        // scale, NOT PageRank) to the direct graph neighbors AFTER the oracle re-rank + truncate,
+        // so it scores exactly the neighbors the report returns. One gated oracle fetch is
+        // reused across all neighbors.
+        self.enrich_neighbors_with_load_bearing(
+            &mut report.direct_semantic_callers,
+            &mut report.direct_semantic_callees,
         )?;
         Ok(report)
     }
@@ -2015,6 +2032,121 @@ impl IndexDatabase {
             }
         }
         Ok(effects)
+    }
+
+    /// The active-scope symbol id for a qualified name, resolved THROUGH the per-connection `files`
+    /// scope view so a foreign scope's same-named symbol never matches (the same #89 discipline the
+    /// fan-in query uses). `None` when no in-scope symbol has that qualified name. When more than
+    /// one in-scope symbol shares the name (overloads / cfg twins) the lowest id is returned —
+    /// the fan-in is computed per concrete symbol id, and the load-bearing signal is a coarse
+    /// bucket, so picking a stable representative is acceptable for the enrichment.
+    fn active_symbol_id_for_qualified_name(
+        &self,
+        qualified_name: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .storage
+            .connection()
+            .query_row(
+                "SELECT s.id FROM symbols s
+                 JOIN files ON files.id = s.file_id
+                 WHERE s.qualified_name = ?1
+                 ORDER BY s.id
+                 LIMIT 1",
+                [qualified_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// Build the load-bearing oracle context ONCE for an enrichment call: reuse the same gated
+    /// verdict map `important_symbols` uses (a single existence probe short-circuits the
+    /// no-oracle-ever path), and hold it for the whole pass so no symbol triggers its own verdict
+    /// scan. The returned owned map is borrowed into an [`OracleContext`] per symbol below.
+    fn load_bearing_oracle_effects(
+        &self,
+    ) -> anyhow::Result<
+        Option<std::collections::HashMap<i64, crate::query::pagerank::EdgeOracleEffect>>,
+    > {
+        self.symbol_importance_oracle_effects()
+    }
+
+    /// Attach the LOCAL structural-load enrichment (scoped weighted fan-in — the third importance
+    /// scale, NOT PageRank) to `impact_surface` neighbors. The neighbor whose load we score is the
+    /// edge's FAR end: for a CALLER hop that's `from_symbol`, for a CALLEE hop that's `to_symbol`.
+    /// The oracle effect map is fetched ONCE and reused across every hop.
+    fn enrich_neighbors_with_load_bearing(
+        &self,
+        callers: &mut [crate::query::graph::GraphHop],
+        callees: &mut [crate::query::graph::GraphHop],
+    ) -> anyhow::Result<()> {
+        use crate::query::load_bearing::{self, OracleContext};
+        let effects = self.load_bearing_oracle_effects()?;
+        let oracle = OracleContext { effects: effects.as_ref() };
+        let enrich = |hop: &mut crate::query::graph::GraphHop,
+                      neighbor: Option<&str>|
+         -> anyhow::Result<()> {
+            let Some(name) = neighbor else { return Ok(()) };
+            let Some(symbol_id) = self.active_symbol_id_for_qualified_name(name)? else {
+                return Ok(());
+            };
+            hop.importance = load_bearing::scoped_weighted_fan_in(
+                self.storage.connection(),
+                symbol_id,
+                &oracle,
+            )?;
+            Ok(())
+        };
+        for hop in callers.iter_mut() {
+            let neighbor = hop.from_symbol.clone();
+            enrich(hop, neighbor.as_deref())?;
+        }
+        for hop in callees.iter_mut() {
+            let neighbor = hop.target_qualified_name.clone().or_else(|| hop.to_symbol.clone());
+            enrich(hop, neighbor.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// Attach the load-bearing enrichment to search hits, scoring each hit's symbol (resolved from
+    /// `chunk.symbol_path`, which is the chunk's qualified name) through the active scope. Hits
+    /// with no symbol, or whose symbol has no in-scope in-edges, are left un-enriched. One
+    /// oracle fetch for the whole batch.
+    fn enrich_search_hits_with_load_bearing(&self, hits: &mut [SearchHit]) -> anyhow::Result<()> {
+        use crate::query::load_bearing::{self, OracleContext};
+        let effects = self.load_bearing_oracle_effects()?;
+        let oracle = OracleContext { effects: effects.as_ref() };
+        for hit in hits.iter_mut() {
+            let Some(symbol_path) = hit.symbol_path.clone() else { continue };
+            let Some(symbol_id) = self.active_symbol_id_for_qualified_name(&symbol_path)? else {
+                continue;
+            };
+            hit.importance = load_bearing::scoped_weighted_fan_in(
+                self.storage.connection(),
+                symbol_id,
+                &oracle,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Attach the load-bearing enrichment to `symbol_lookup` hits (each carries its own
+    /// `symbol_id`). One oracle fetch for the whole batch.
+    fn enrich_symbol_hits_with_load_bearing(
+        &self,
+        hits: &mut [crate::query::symbol::SymbolHit],
+    ) -> anyhow::Result<()> {
+        use crate::query::load_bearing::{self, OracleContext};
+        let effects = self.load_bearing_oracle_effects()?;
+        let oracle = OracleContext { effects: effects.as_ref() };
+        for hit in hits.iter_mut() {
+            hit.importance = load_bearing::scoped_weighted_fan_in(
+                self.storage.connection(),
+                hit.symbol_id,
+                &oracle,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn memory_create(
@@ -2943,6 +3075,7 @@ mod oracle_surfacing_tests {
             verified_target_symbol: false,
             shown_by_default: true,
             callsite: None,
+            importance: None,
         };
         let hops = vec![
             hop(Some("resolved-external(tokio)")),

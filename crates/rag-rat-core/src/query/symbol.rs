@@ -29,6 +29,12 @@ pub struct SymbolHit {
     pub end_byte: i64,
     pub signature: Option<String>,
     pub docs: Option<String>,
+    /// LOCAL structural-load signal (scoped weighted fan-in) for this symbol — the THIRD
+    /// importance scale, NOT PageRank. Attached by the `symbol_lookup` enrichment pass. `None`
+    /// when the symbol has no in-edges in the active scope or wasn't enriched. See
+    /// `crate::query::load_bearing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub importance: Option<crate::query::load_bearing::ImportanceEnrichment>,
 }
 
 #[derive(Debug, Serialize)]
@@ -397,6 +403,7 @@ fn symbol_hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolHit> {
         end_byte: row.get(9)?,
         signature: row.get(10)?,
         docs: row.get(11)?,
+        importance: None,
     })
 }
 

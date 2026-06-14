@@ -3,6 +3,7 @@ pub mod graph;
 pub mod graph_meta;
 pub mod grep_augment;
 pub mod impact;
+pub mod load_bearing;
 pub mod memory;
 pub mod orientation;
 pub mod pagerank;
