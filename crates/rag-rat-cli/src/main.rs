@@ -62,6 +62,11 @@ fn main() -> anyhow::Result<()> {
             // read a fresh result without ever blocking startup or a request. Fail-open
             // (#version-check).
             spawn_detached_version_refresh(&config);
+            // Keep SCIP-grade ranking self-maintaining: a heavily-throttled detached thread runs
+            // the oracle when the active checkout's index is stale AND quiet (opt-in
+            // via `[oracle] auto_run`, default OFF). Mirrors the version-refresh thread
+            // — fail-open, dies with the process. No-op unless enabled.
+            spawn_detached_oracle_auto_run(&config);
             // The MCP server is an stdio JSON-RPC loop (one client, mostly serial) plus a SIGUSR1
             // task; the file watcher runs on its own OS thread and CPU-heavy indexing is rayon, not
             // tokio. The default runtime's ~num_cpus workers are therefore idle overhead, so cap it
@@ -130,6 +135,133 @@ fn spawn_detached_version_refresh(config: &rag_rat_core::Config) {
             std::thread::sleep(POLL);
         }
     });
+}
+
+/// Background thread that keeps SCIP-grade ranking fresh for the long-lived MCP server without a
+/// manual `oracle run`: poll on a sub-quiet-period cadence and, when the active checkout's index is
+/// stale AND has been quiet long enough AND the min-interval floor has elapsed, run the oracle for
+/// each known tool. Opt-in (`[oracle] auto_run`, default OFF) — returns immediately when disabled,
+/// so short-lived CLI/hook commands (which never reach `Cmd::Mcp`) never spawn it.
+///
+/// Mirrors [`spawn_detached_version_refresh`]: detached, best-effort, fail-open (`let _ = …`), dies
+/// with the process (a hot-upgrade re-exec re-spawns it). Each run uses the SAME lock-free
+/// production path as `oracle run` — `produce_scip_with_tool` OUTSIDE the write lock, only the
+/// pre-spawn snapshot + the join briefly serialized (#82/#83) — so the watcher is never starved
+/// through the minutes-long subprocess, and the #82/#83 TOCTOU gates stay armed. A `Blocked`
+/// outcome (tool not installed) is a no-op: the loop simply sleeps to the next tick rather than
+/// spinning on it.
+fn spawn_detached_oracle_auto_run(config: &rag_rat_core::Config) {
+    use rag_rat_core::index::oracle::{self, AutoRunDecision, AutoRunInputs, OracleTool};
+    if !config.oracle.auto_run {
+        return;
+    }
+    // Poll well under the quiet period so a checkout that goes quiet is picked up within roughly
+    // one quiet window, while the between-tick cost (a cheap meta + `oracle_runs` read, gated
+    // by the pure decision before any subprocess) stays negligible. Floor the cadence so a tiny
+    // configured quiet period can't busy-loop.
+    let quiet_secs = config.oracle.auto_run_quiet_period_secs;
+    let poll = std::time::Duration::from_secs((quiet_secs / 4).max(60));
+    let quiet_period_ms = saturating_secs_to_ms(quiet_secs);
+    let min_interval_ms = saturating_secs_to_ms(config.oracle.auto_run_min_interval_secs);
+    let config = config.clone();
+    std::thread::spawn(move || {
+        loop {
+            // Each tick re-opens the index so a fresh `(commit_sha, worktree_id)` checkout (the
+            // server outlives branch switches) and the latest `indexed_at_ms` are read anew. All
+            // fail-open: any error just waits for the next tick.
+            let _ = maybe_run_oracle_once(&config, quiet_period_ms, min_interval_ms);
+            std::thread::sleep(poll);
+        }
+    });
+
+    /// One throttled pass: read the staleness inputs for each tool, ask the pure gate, and on `Run`
+    /// take the lock-free production path. Returns `Ok(())` even when nothing ran — the caller only
+    /// uses it to swallow errors fail-open.
+    fn maybe_run_oracle_once(
+        config: &rag_rat_core::Config,
+        quiet_period_ms: i64,
+        min_interval_ms: i64,
+    ) -> anyhow::Result<()> {
+        let now_ms = now_epoch_ms();
+        // `indexed_at_ms` is the active checkout's last index-change clock; without it we can't
+        // judge staleness, so skip this tick.
+        let last_index_change_ms = {
+            let db = open_index(config)?;
+            match db.status(&config.database)?.indexed_at_ms {
+                Some(ms) => ms,
+                None => return Ok(()),
+            }
+        };
+        for &tool in OracleTool::ALL {
+            // Cheap probe before any decision: an uninstalled tool can never run, so don't even
+            // read its run history.
+            if matches!(oracle::probe_oracle_tool(tool), oracle::ToolAvailability::Blocked { .. }) {
+                continue;
+            }
+            let last_run_ms = {
+                let db = open_index(config)?;
+                db.latest_oracle_run_started_at(tool)?
+            };
+            let decision = oracle::auto_run_decision(AutoRunInputs {
+                enabled: true,
+                now_ms,
+                last_index_change_ms,
+                last_run_ms,
+                quiet_period_ms,
+                min_interval_ms,
+            });
+            if decision == AutoRunDecision::Run {
+                let _ = run_oracle_tool_background(config, tool);
+            }
+        }
+        Ok(())
+    }
+
+    /// The lock-free `oracle run` body for one tool, sans CLI output. Mirrors
+    /// `commands::oracle_run`: snapshot the pre-spawn shas under the write lock, produce the
+    /// `.scip` OUTSIDE the lock, then run only the join/write under the lock. A `Blocked`
+    /// production is a no-op (returns `Ok`).
+    fn run_oracle_tool_background(
+        config: &rag_rat_core::Config,
+        tool: OracleTool,
+    ) -> anyhow::Result<()> {
+        let pre_spawn_sha = with_oracle_write_lock(config, |db| db.oracle_pre_spawn_snapshot())?;
+        let scip_output = config
+            .database
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("rag-rat-oracle-auto-{}.scip", std::process::id()));
+        let production = oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
+        let _ = fs::remove_file(&scip_output);
+        match production? {
+            oracle::ScipProduction::Blocked { .. } => Ok(()),
+            oracle::ScipProduction::Produced { version, bytes, production_sha } => {
+                with_oracle_write_lock(config, |db| {
+                    db.run_oracle(
+                        tool,
+                        &version,
+                        &bytes,
+                        Some(&production_sha),
+                        Some(&pre_spawn_sha),
+                    )
+                })?;
+                Ok(())
+            },
+        }
+    }
+
+    /// Saturating seconds → ms for the throttle inputs (a wild config value can't overflow `i64`).
+    fn saturating_secs_to_ms(secs: u64) -> i64 {
+        i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000)
+    }
+}
+
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Load the config, mapping a missing file to a friendly hint instead of a raw IO error.

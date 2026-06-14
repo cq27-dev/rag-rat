@@ -16,6 +16,35 @@ pub struct Config {
     pub local_ai: LocalAiConfig,
     pub watch: WatchConfig,
     pub version_check: VersionCheckConfig,
+    pub oracle: OracleConfig,
+}
+
+/// Background auto-fresh oracle (`[oracle]`). Opt-in; default OFF. When `auto_run` is enabled, the
+/// long-lived `rag-rat mcp` server runs the SCIP oracle for the active checkout when the index is
+/// stale and quiet, heavily throttled by two gates (a long quiet-period debounce + a
+/// minimum-interval floor) — see [`crate::index::oracle::auto_run_decision`]. SCIP production takes
+/// minutes while edits arrive in seconds, so edge-collapsing alone would thrash; both gates are
+/// required. Fail-open and detached: it never blocks a request and dies with the server process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleConfig {
+    /// Run the oracle in the background on the MCP server (default false — opt in explicitly).
+    pub auto_run: bool,
+    /// Run only after the index has been quiet (no change) for at least this long. The debounce
+    /// that keeps an active editing session from triggering a minutes-long SCIP pass on every
+    /// save.
+    pub auto_run_quiet_period_secs: u64,
+    /// And at most once this often, regardless of churn. The minimum-interval floor.
+    pub auto_run_min_interval_secs: u64,
+}
+
+impl Default for OracleConfig {
+    fn default() -> Self {
+        Self {
+            auto_run: false,
+            auto_run_quiet_period_secs: 900,
+            auto_run_min_interval_secs: 21_600,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,8 +249,9 @@ impl Config {
         let local_ai = LocalAiConfig::try_from(raw.local_ai)?;
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
+        let oracle = raw.oracle.into();
 
-        Ok(Self { root, database, targets, local_ai, watch, version_check })
+        Ok(Self { root, database, targets, local_ai, watch, version_check, oracle })
     }
 }
 
@@ -347,6 +377,8 @@ struct RawConfig {
     #[serde(default)]
     version_check: RawVersionCheck,
     #[serde(default)]
+    oracle: RawOracle,
+    #[serde(default)]
     target_bindings: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "target")]
     target: Vec<RawTarget>,
@@ -380,6 +412,28 @@ struct RawVersionCheck {
 impl From<RawVersionCheck> for VersionCheckConfig {
     fn from(raw: RawVersionCheck) -> Self {
         Self { enabled: raw.enabled.unwrap_or(VersionCheckConfig::default().enabled) }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawOracle {
+    auto_run: Option<bool>,
+    auto_run_quiet_period_secs: Option<u64>,
+    auto_run_min_interval_secs: Option<u64>,
+}
+
+impl From<RawOracle> for OracleConfig {
+    fn from(raw: RawOracle) -> Self {
+        let default = OracleConfig::default();
+        Self {
+            auto_run: raw.auto_run.unwrap_or(default.auto_run),
+            auto_run_quiet_period_secs: raw
+                .auto_run_quiet_period_secs
+                .unwrap_or(default.auto_run_quiet_period_secs),
+            auto_run_min_interval_secs: raw
+                .auto_run_min_interval_secs
+                .unwrap_or(default.auto_run_min_interval_secs),
+        }
     }
 }
 
@@ -646,6 +700,33 @@ mod tests {
             toml::from_str("[index]\nroot = \".\"\n\n[version_check]\nenabled = false\n").unwrap();
         let version_check: VersionCheckConfig = raw.version_check.into();
         assert!(!version_check.enabled, "[version_check] enabled = false opts out");
+    }
+
+    #[test]
+    fn oracle_defaults_off_and_parses_overrides() {
+        let default: OracleConfig = RawOracle::default().into();
+        assert!(!default.auto_run, "background oracle is OFF by default");
+        assert_eq!(default.auto_run_quiet_period_secs, 900);
+        assert_eq!(default.auto_run_min_interval_secs, 21_600);
+
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [oracle]
+            auto_run = true
+            auto_run_quiet_period_secs = 60
+            auto_run_min_interval_secs = 3600
+            "#,
+        )
+        .unwrap();
+        let oracle: OracleConfig = raw.oracle.into();
+        assert_eq!(oracle, OracleConfig {
+            auto_run: true,
+            auto_run_quiet_period_secs: 60,
+            auto_run_min_interval_secs: 3600,
+        });
     }
 
     #[test]

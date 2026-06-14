@@ -231,8 +231,24 @@ pub struct ImportantSymbolsResult {
     /// fall-through.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff_paths_with_symbols: Option<u64>,
+    /// One-line nudge surfaced ONLY when this ranking used heuristic data (no current SCIP-oracle
+    /// run for the checkout): compiler-grade ranking is available via `oracle run` (or, when
+    /// the background auto-fresh oracle is enabled, refreshing on its own). Absent once a run
+    /// exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranking_hint: Option<String>,
     pub symbols: Vec<SymbolImportance>,
 }
+
+/// The heuristic-only nudge (no oracle run for the checkout). The static, config-unaware wording
+/// the core query emits; the CLI/MCP wrappers swap in [`RANKING_HINT_AUTO_RUN`] when `[oracle]
+/// auto_run` is on.
+pub const RANKING_HINT_RUN_ORACLE: &str =
+    "heuristic ranking — run `oracle run` for compiler-grade ranking";
+/// The heuristic-only nudge variant for when the background auto-fresh oracle is enabled: no manual
+/// action needed, compiler verdicts will arrive on the next throttled pass.
+pub const RANKING_HINT_AUTO_RUN: &str =
+    "heuristic ranking — compiler ranking refreshes in the background";
 
 /// A ranked load-bearing symbol.
 #[derive(Debug, Clone, PartialEq, Serialize)]

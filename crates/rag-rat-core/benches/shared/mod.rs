@@ -66,6 +66,7 @@ pub fn bench_config(subdir: &str) -> Config {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     }
 }
 

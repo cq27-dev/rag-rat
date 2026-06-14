@@ -188,6 +188,18 @@ impl IndexDatabase {
         )
     }
 
+    /// The `started_at` (Unix-epoch ms) of the most recent oracle run for `tool` in this checkout,
+    /// or `None` when none exists — the staleness clock the background auto-fresh oracle (Phase
+    /// 5) compares against the index's `indexed_at_ms` to decide whether verdicts are stale.
+    pub fn latest_oracle_run_started_at(&self, tool: OracleTool) -> anyhow::Result<Option<i64>> {
+        oracle::latest_run_started_at(
+            self.storage.connection(),
+            tool,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )
+    }
+
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
         let mut counts = BTreeMap::new();
         let mut stmt = self
@@ -1755,6 +1767,12 @@ impl IndexDatabase {
         use crate::query::pagerank::{ImportanceMode, SeedKind, SeedSource, SkippedSeeds};
 
         let oracle_effects = self.symbol_importance_oracle_effects()?;
+        // Heuristic-only ranking (no oracle run for this checkout) earns a one-line nudge that
+        // compiler-grade ranking is available. The config-unaware wording lives here; CLI/MCP swap
+        // in the auto-run variant when `[oracle] auto_run` is on.
+        let ranking_hint: Option<String> = oracle_effects
+            .is_none()
+            .then(|| crate::query::pagerank::RANKING_HINT_RUN_ORACLE.to_string());
         let rank = |seed: &[i64]| -> anyhow::Result<Vec<SymbolImportance>> {
             crate::query::pagerank::important_symbols(
                 self.storage.connection(),
@@ -1786,6 +1804,7 @@ impl IndexDatabase {
                     reason: Some("no named symbols resolved to the active scope".to_string()),
                     diff_paths_considered: None,
                     diff_paths_with_symbols: None,
+                    ranking_hint: ranking_hint.clone(),
                     symbols,
                 });
             }
@@ -1795,6 +1814,7 @@ impl IndexDatabase {
                 reason: None,
                 diff_paths_considered: None,
                 diff_paths_with_symbols: None,
+                ranking_hint,
                 symbols,
             });
         }
@@ -1807,6 +1827,7 @@ impl IndexDatabase {
                 reason: None,
                 diff_paths_considered: None,
                 diff_paths_with_symbols: None,
+                ranking_hint: ranking_hint.clone(),
                 symbols: rank(&[])?,
             });
         }
@@ -1828,6 +1849,7 @@ impl IndexDatabase {
                 reason: Some("no symbols found in current diff".to_string()),
                 diff_paths_considered: Some(diff.changed_paths),
                 diff_paths_with_symbols: Some(diff.indexed_paths),
+                ranking_hint: ranking_hint.clone(),
                 symbols,
             });
         }
@@ -1843,6 +1865,7 @@ impl IndexDatabase {
             reason: None,
             diff_paths_considered: None,
             diff_paths_with_symbols: None,
+            ranking_hint,
             symbols,
         })
     }
@@ -2364,6 +2387,7 @@ mod oracle_surfacing_tests {
             local_ai: Default::default(),
             watch: Default::default(),
             version_check: Default::default(),
+            oracle: Default::default(),
         }
     }
 
@@ -3347,6 +3371,7 @@ mod oracle_surfacing_tests {
             local_ai: Default::default(),
             watch: Default::default(),
             version_check: Default::default(),
+            oracle: Default::default(),
         };
         git(&root, &["init", "-q"]);
         git(&root, &["add", "-A"]);

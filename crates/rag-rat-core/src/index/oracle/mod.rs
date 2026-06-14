@@ -18,6 +18,7 @@
 //! - `status.rs`— status type surfaced like `local_ai_status`.
 //! - `store.rs` — `oracle_runs` / `edge_oracle` read + write helpers.
 
+mod auto_run;
 mod join;
 mod manifest;
 mod run;
@@ -30,6 +31,7 @@ mod tests;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use auto_run::{AutoRunDecision, AutoRunInputs, auto_run_decision};
 pub(crate) use join::package_of;
 pub use manifest::{ToolAvailability, ToolManifest};
 use run::OracleRunInput;
@@ -379,6 +381,18 @@ pub fn latest_run_tool_version(
     worktree_id: &str,
 ) -> anyhow::Result<Option<String>> {
     store::latest_run_tool_version(conn, tool, commit_sha, worktree_id)
+}
+
+/// The `started_at` (Unix-epoch ms) of the most recent run for `tool` in the active checkout, or
+/// `None` when no run exists — the staleness clock the background auto-fresh oracle compares
+/// against the index's `indexed_at_ms`. See [`auto_run_decision`].
+pub fn latest_run_started_at(
+    conn: &Connection,
+    tool: OracleTool,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<Option<i64>> {
+    store::latest_run_started_at(conn, tool, commit_sha, worktree_id)
 }
 
 /// Load the CURRENT, in-scope `edge_oracle` verdicts joined to their heuristic edge resolution —

@@ -398,6 +398,32 @@ pub(crate) fn latest_run_tool_version(
     Ok(version)
 }
 
+/// The `started_at` (Unix-epoch ms) of the most recent run for `tool` **in the active checkout**,
+/// or `None` when no run exists. The staleness clock the background auto-fresh oracle compares
+/// against the index's `indexed_at_ms` (see [`crate::index::oracle::auto_run_decision`]): a run
+/// that started after the last index change means the verdicts are current. Scoped to `(commit_sha,
+/// worktree_id)` — the sibling of [`latest_run_tool_version`], ordered the same way.
+pub(crate) fn latest_run_started_at(
+    conn: &Connection,
+    tool: OracleTool,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<Option<i64>> {
+    let started_at = conn
+        .query_row(
+            "
+            SELECT started_at FROM oracle_runs
+            WHERE tool = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+            ",
+            params![tool.as_db_str(), commit_sha, worktree_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok();
+    Ok(started_at)
+}
+
 /// Whether ANY oracle run exists in the active checkout, across all tools — one query to short out
 /// the per-tool [`latest_run_tool_version`] probes on the dominant "no oracle ever" path (where the
 /// table is empty, so this returns instantly). Scoped to `(commit_sha, worktree_id)`.
