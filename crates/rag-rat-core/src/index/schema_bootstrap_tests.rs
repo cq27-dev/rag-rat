@@ -25,6 +25,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -1404,6 +1405,7 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
         ],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let status = db.status(&config.database).unwrap();
@@ -1517,6 +1519,7 @@ fn rag_rat_config(root: &Path) -> Config {
         targets: git_history_targets(),
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     }
 }
 
@@ -2460,6 +2463,7 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -3151,6 +3155,7 @@ where
         ],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let symbol = db.symbols("spawn_blocking", Some(Language::Rust), 10).unwrap().remove(0);
@@ -3914,6 +3919,7 @@ fn parser_failures_report_paths() {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -5797,6 +5803,7 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -5875,6 +5882,7 @@ fn repo_clusters_groups_cotouched_files() {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -5963,6 +5971,7 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     }
 }
 
@@ -5984,6 +5993,7 @@ fn source_config(root: PathBuf, language: Language) -> Config {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     }
 }
 
@@ -6389,6 +6399,7 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -6612,6 +6623,7 @@ fn dir_tree_truncates_at_max_nodes() {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -6752,6 +6764,7 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -7350,6 +7363,7 @@ fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
     (root, config)
 }
@@ -7509,6 +7523,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();

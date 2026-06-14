@@ -3162,6 +3162,7 @@ dependencies = [
  "tree-sitter-kotlin-ng",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "ureq 2.12.1",
 ]
 
 [[package]]

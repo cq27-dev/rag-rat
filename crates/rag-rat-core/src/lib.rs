@@ -9,6 +9,7 @@ pub mod query;
 pub mod search;
 pub mod serde_big_id;
 pub mod storage;
+pub mod version_check;
 pub mod watch;
 
 pub use config::{Config, ResolvedTarget, TargetKind, WatchConfig};

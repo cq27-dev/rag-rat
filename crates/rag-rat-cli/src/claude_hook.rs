@@ -260,7 +260,28 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
     let o = rag_rat_core::query::orientation::orientation(conn.connection(), root)?;
     let (live, enabled) = watcher_state(&config);
     print!("{}", format_digest(&o, live, enabled));
+    if let Some(line) = version_check_line(&config) {
+        print!("{line}");
+    }
     Ok(())
+}
+
+/// One digest line stating the running version vs the latest published on crates.io, with the
+/// update command when behind. Reads the cached check only (no network — the MCP server refreshes
+/// it out of band); `None` when version checking is disabled or no check has been cached yet, so a
+/// fresh repo or an opted-out user sees nothing.
+fn version_check_line(config: &Config) -> Option<String> {
+    use rag_rat_core::version_check;
+    let status = version_check::cached_status(config.version_check.enabled, &config.database)?;
+    let latest = status.latest_version?;
+    if status.update_available {
+        Some(format!(
+            "\n⚠ rag-rat update available: {} → {} — run `{}`\n",
+            status.current_version, latest, status.update_command
+        ))
+    } else {
+        Some(format!("\nrag-rat {} (latest on crates.io)\n", status.current_version))
+    }
 }
 
 /// PreToolUse path (grep augmentation).

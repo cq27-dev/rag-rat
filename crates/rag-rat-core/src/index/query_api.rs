@@ -1882,6 +1882,7 @@ mod oracle_surfacing_tests {
             }],
             local_ai: Default::default(),
             watch: Default::default(),
+            version_check: Default::default(),
         }
     }
 

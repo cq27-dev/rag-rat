@@ -674,6 +674,7 @@ fn mixed_config() -> (PathBuf, Config) {
         ],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     })
 }
 
@@ -694,6 +695,7 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     })
 }
 
@@ -711,6 +713,7 @@ fn rust_config(root: PathBuf) -> Config {
         }],
         local_ai: Default::default(),
         watch: Default::default(),
+        version_check: Default::default(),
     }
 }
 

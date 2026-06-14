@@ -86,6 +86,10 @@ pub(crate) enum Command {
 
     /// Print the resolved configuration as JSON.
     DumpConfig,
+
+    /// Check crates.io for a newer published rag-rat, refresh the cache, and print current vs
+    /// latest.
+    VersionCheck,
 }
 
 #[derive(Debug, Args)]

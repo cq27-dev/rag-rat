@@ -56,6 +56,11 @@ fn main() -> anyhow::Result<()> {
         Cmd::Brief(args) => brief(&config, &args)?,
         Cmd::Clusters(args) => clusters(&config, &args)?,
         Cmd::Mcp => {
+            // Refresh the crates.io version cache out of band (a detached thread on this long-lived
+            // server) when stale + opted-in, so `index_status` and the next SessionStart digest
+            // read a fresh result without ever blocking startup or a request. Fail-open
+            // (#version-check).
+            spawn_detached_version_refresh(&config);
             // The MCP server is an stdio JSON-RPC loop (one client, mostly serial) plus a SIGUSR1
             // task; the file watcher runs on its own OS thread and CPU-heavy indexing is rayon, not
             // tokio. The default runtime's ~num_cpus workers are therefore idle overhead, so cap it
@@ -87,9 +92,34 @@ fn main() -> anyhow::Result<()> {
         Cmd::Eval(args) => eval(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,
         Cmd::DumpConfig => dump_config(&config)?,
+        Cmd::VersionCheck => version_check(&config)?,
     }
 
     Ok(())
+}
+
+/// Spawn a detached best-effort crates.io refresh (no-op when disabled or still fresh). Detached so
+/// it never blocks the caller; the thread outlives the call on a long-lived server and is harmless
+/// on a short-lived one (it simply may not finish — the next invocation retries).
+fn spawn_detached_version_refresh(config: &rag_rat_core::Config) {
+    use rag_rat_core::version_check;
+    if !config.version_check.enabled {
+        return;
+    }
+    let database = config.database.clone();
+    std::thread::spawn(move || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if version_check::needs_refresh(
+            version_check::read_cache(&database).as_ref(),
+            now,
+            version_check::DEFAULT_TTL_MS,
+        ) {
+            let _ = version_check::refresh(&database);
+        }
+    });
 }
 
 /// Load the config, mapping a missing file to a friendly hint instead of a raw IO error.

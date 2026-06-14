@@ -607,7 +607,21 @@ pub fn call_tool_for_config(
     arguments: Value,
 ) -> anyhow::Result<Value> {
     let db = IndexDatabase::open_config(config)?;
-    call_tool_with_db(&db, name, arguments)
+    let mut result = call_tool_with_db(&db, name, arguments)?;
+    // Surface the crates.io version status on `index_status` so an agent can see (and relay) when a
+    // newer rag-rat is published. Read-only: it reads the cached check (refreshed out of band),
+    // never the network, so the tool stays fast. Omitted entirely when version checking is
+    // disabled.
+    if name == "index_status"
+        && let Some(version) = rag_rat_core::version_check::cached_status(
+            config.version_check.enabled,
+            &config.database,
+        )
+        && let Some(obj) = result.as_object_mut()
+    {
+        obj.insert("version".to_string(), serde_json::json!(version));
+    }
+    Ok(result)
 }
 
 impl MemoryCreateArgs {

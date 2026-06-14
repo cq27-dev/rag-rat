@@ -41,6 +41,9 @@ serde_json = "1.0"
 sha2 = "0.11"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-std"] }
+# Minimal blocking HTTP for the crates.io version check (and future GitHub/GitLab/Bitbucket REST).
+# rustls (no system OpenSSL); gzip off — the responses are tiny. The only HTTP at the core edge.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 # TOON (Token-Oriented Object Notation): the default render for CLI + MCP output. ~34% fewer tokens
 # than compact JSON on uniform-row payloads, neutral on nested ones — see rag_rat_core::output.
 # default-features = false drops its `cli` feature (ratatui/crossterm/arboard/syntect/tiktoken-rs/…)

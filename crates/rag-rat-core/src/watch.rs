@@ -453,6 +453,7 @@ mod tests {
             }],
             local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
+            version_check: Default::default(),
         };
         let ignore = IgnoreMatcher::compile(&root, &[]);
 
@@ -511,6 +512,7 @@ mod tests {
             }],
             local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
+            version_check: Default::default(),
         };
 
         let ignore = IgnoreMatcher::compile(&root, &[]);
@@ -580,6 +582,7 @@ mod tests {
             }],
             local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
+            version_check: Default::default(),
         };
 
         // Before: a source file under the subdir fires.

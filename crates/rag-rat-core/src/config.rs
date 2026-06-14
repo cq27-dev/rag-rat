@@ -15,6 +15,21 @@ pub struct Config {
     pub targets: Vec<ResolvedTarget>,
     pub local_ai: LocalAiConfig,
     pub watch: WatchConfig,
+    pub version_check: VersionCheckConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionCheckConfig {
+    /// Check crates.io for a newer published `rag-rat` and surface it to agents/operators (default
+    /// true). Opt out with `[version_check] enabled = false` in `rag-rat.toml`. The check is
+    /// best-effort, cached, and never blocks; disabling it makes no network calls at all.
+    pub enabled: bool,
+}
+
+impl Default for VersionCheckConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,8 +219,9 @@ impl Config {
         let targets = resolve_targets(&root, raw.target_bindings, raw.target)?;
         let local_ai = LocalAiConfig::try_from(raw.local_ai)?;
         let watch = raw.watch.into();
+        let version_check = raw.version_check.into();
 
-        Ok(Self { root, database, targets, local_ai, watch })
+        Ok(Self { root, database, targets, local_ai, watch, version_check })
     }
 }
 
@@ -329,6 +345,8 @@ struct RawConfig {
     #[serde(default)]
     watch: RawWatch,
     #[serde(default)]
+    version_check: RawVersionCheck,
+    #[serde(default)]
     target_bindings: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "target")]
     target: Vec<RawTarget>,
@@ -351,6 +369,17 @@ impl From<RawWatch> for WatchConfig {
             max_latency_ms: raw.max_latency_ms.unwrap_or(default.max_latency_ms),
             periodic_sweep_secs: raw.periodic_sweep_secs.unwrap_or(default.periodic_sweep_secs),
         }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawVersionCheck {
+    enabled: Option<bool>,
+}
+
+impl From<RawVersionCheck> for VersionCheckConfig {
+    fn from(raw: RawVersionCheck) -> Self {
+        Self { enabled: raw.enabled.unwrap_or(VersionCheckConfig::default().enabled) }
     }
 }
 
@@ -606,6 +635,17 @@ mod tests {
             max_latency_ms: 4000,
             periodic_sweep_secs: 0,
         });
+    }
+
+    #[test]
+    fn version_check_defaults_on_and_parses_opt_out() {
+        let default: VersionCheckConfig = RawVersionCheck::default().into();
+        assert!(default.enabled, "version check is opted in by default");
+
+        let raw: RawConfig =
+            toml::from_str("[index]\nroot = \".\"\n\n[version_check]\nenabled = false\n").unwrap();
+        let version_check: VersionCheckConfig = raw.version_check.into();
+        assert!(!version_check.enabled, "[version_check] enabled = false opts out");
     }
 
     #[test]

@@ -112,6 +112,21 @@ index are enforced with file locks under the index directory; the index DB is sh
 worktrees (a relative `database` resolves against the main worktree). File locks are unreliable on
 NFS and WSL2 `drvfs`/`9p` (`/mnt/...`) mounts — keep the repo on a native filesystem.
 
+`[version_check]` controls the best-effort check for a newer published `rag-rat` on crates.io,
+surfaced to agents/operators in the SessionStart digest and the `index_status` MCP tool's `version`
+field (current vs latest + the `cargo install rag-rat --force` update command):
+
+```toml
+[version_check]
+enabled = true   # opted in by default; false makes zero network calls
+```
+
+The check is **cached** (refreshed at most once a day, out of band by the long-lived `rag-rat mcp`
+server) and **fail-open** — offline, a non-200, or a parse miss simply yields no version info, never
+an error, and **never blocks** session start (reads only the cache; `rag-rat version-check` refreshes
+it synchronously on demand). The cache lives at `<index-dir>/version-check.json`. Set
+`enabled = false` to disable the feature entirely (no crates.io requests).
+
 `rag-rat hooks install` writes generated `post-checkout`, `post-merge`, `post-rewrite`, and
 `post-commit` hooks to the current worktree's Git hooks directory. Those hooks call `rag-rat
 maintenance --max-seconds 30` in the background so branch switches, merges, rebases, and commits
