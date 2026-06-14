@@ -7876,6 +7876,26 @@ fn impact_report_flags_a_section_truncated_at_limit() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let hub = db.symbols("hub", Some(Language::Rust), 10).unwrap().remove(0);
+
+    // Three repo memories bound to `hub` so the memory section is also over the limit — the
+    // truncation report must cover it, not just the non-memory vectors (#146 review).
+    for i in 0..3 {
+        db.memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Decision".to_string(),
+            title: format!("hub note {i}"),
+            body: "why hub is load-bearing".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec![],
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(hub.symbol_id),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    }
+
     let report =
         db.impact_surface_report_for_selected_symbol(&hub, 2, &Default::default()).unwrap();
     assert_eq!(report.direct_semantic_callers.len(), 2, "callers truncated to the limit");
@@ -7885,6 +7905,11 @@ fn impact_report_flags_a_section_truncated_at_limit() {
             .truncated_sections
             .contains(&"direct_semantic_callers".to_string()),
         "the capped section must be named: {:?}",
+        report.completeness_and_caveats
+    );
+    assert!(
+        report.completeness_and_caveats.truncated_sections.contains(&"repo_memories".to_string()),
+        "the capped memory section must be named too: {:?}",
         report.completeness_and_caveats
     );
     assert!(

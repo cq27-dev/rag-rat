@@ -68,7 +68,7 @@ fn last_run_meta(
             SELECT status, commit_sha FROM oracle_runs
             WHERE tool = ?1 AND tool_version = ?2
               AND commit_sha = ?3 AND worktree_id = ?4
-            ORDER BY started_at DESC, id DESC
+            ORDER BY id DESC
             LIMIT 1
             ",
             rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],

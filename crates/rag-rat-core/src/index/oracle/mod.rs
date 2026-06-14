@@ -297,12 +297,13 @@ pub fn run_oracle_with_tool(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<OracleRunOutcome> {
-    // The run begins here, before the tool subprocess — stamp `started_at` from this moment so a
-    // watcher reindex during the (slow) subprocess doesn't make the run look fresher than the edits
-    // it skips (#145). Snapshot the indexed shas BEFORE spawning too — the pre-spawn gate (#83)
-    // needs the state from before the subprocess could observe any source.
-    let started_at_ms = super::now_ms();
+    // Snapshot the indexed shas BEFORE spawning the tool — the pre-spawn gate (#83) needs the state
+    // from before the subprocess could observe any source.
     let pre_spawn_sha = pre_spawn_snapshot(conn, commit_sha, worktree_id)?;
+    // Stamp the run's start right after that snapshot (the indexed state it covers) and before the
+    // subprocess: later than the indexed_at it's based on, yet before any mid-run reindex, so the
+    // auto-run staleness gate is neither falsely rerun nor wrongly skipped. (#145 + #146 review)
+    let started_at_ms = super::now_ms();
     match produce_scip_with_tool(tool, checkout_root, scip_output)? {
         ScipProduction::Blocked { tool, program, hint } =>
             Ok(OracleRunOutcome::Blocked { tool, program, hint }),

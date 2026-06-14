@@ -244,6 +244,16 @@ pub fn impact_surface_report_for_symbol(
         ("text_fallback_hits", text_fallback_hits.len()),
         ("recent_commits_touching_symbol_path", recent_commits_touching_symbol_path.len()),
         ("github_rationale_issues_prs", github_rationale_issues_prs.len()),
+        // `repo_memories` is also capped at `limit` per lane (memory_evidence_for_symbol_and_edges
+        // queries each at `limit`); flag it when any active lane fills the cap (#146 review).
+        (
+            "repo_memories",
+            repo_memories
+                .direct
+                .len()
+                .max(repo_memories.path_crossed.len())
+                .max(repo_memories.call_path_crossed.len()),
+        ),
     ]
     .into_iter()
     .filter(|&(_, len)| limit_usize != 0 && len >= limit_usize)

@@ -231,10 +231,12 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_core::Config) {
         config: &rag_rat_core::Config,
         tool: OracleTool,
     ) -> anyhow::Result<()> {
-        // Stamp the run's start before the subprocess so an overlapping watcher reindex can't make
-        // it look fresher than the edits it skips and wedge the next staleness decision (#145).
-        let started_at_ms = now_epoch_ms();
         let pre_spawn_sha = with_oracle_write_lock(config, |db| db.oracle_pre_spawn_snapshot())?;
+        // Stamp AFTER the pre-spawn snapshot (the indexed state this run covers) and before the
+        // subprocess: later than the indexed_at it's based on, yet before any mid-run reindex — so
+        // the staleness gate neither falsely reruns nor wrongly skips a refresh. (#145 + #146
+        // review)
+        let started_at_ms = now_epoch_ms();
         let scip_output = config
             .database
             .parent()

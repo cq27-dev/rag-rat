@@ -408,6 +408,12 @@ pub(crate) fn record_oracle_run_at(
 /// the version the surfacing reads (the `Compiler` tier) key on: query output should show the
 /// verdicts the last `oracle run` for this checkout produced. Scoped to `(commit_sha, worktree_id)`
 /// so a sibling worktree's run can't dictate this checkout's displayed tool version.
+///
+/// Ordered by `id DESC` = INSERTION order = COMPLETION order (the row is written at the end of
+/// `run::run`, under the write lock). NOT `started_at DESC`: since #145 `started_at` is the run's
+/// START, which is no longer monotonic with completion — two overlapping runs (a manual + the
+/// background auto-run) can finish in the opposite order they started, and the authoritative
+/// `edge_oracle` writer is the one that finished LAST (highest id), not the one that started last.
 pub(crate) fn latest_run_tool_version(
     conn: &Connection,
     tool: OracleTool,
@@ -419,7 +425,7 @@ pub(crate) fn latest_run_tool_version(
             "
             SELECT tool_version FROM oracle_runs
             WHERE tool = ?1 AND commit_sha = ?2 AND worktree_id = ?3
-            ORDER BY started_at DESC, id DESC
+            ORDER BY id DESC
             LIMIT 1
             ",
             params![tool.as_db_str(), commit_sha, worktree_id],
@@ -429,11 +435,13 @@ pub(crate) fn latest_run_tool_version(
     Ok(version)
 }
 
-/// The `started_at` (Unix-epoch ms) of the most recent run for `tool` **in the active checkout**,
-/// or `None` when no run exists. The staleness clock the background auto-fresh oracle compares
-/// against the index's `indexed_at_ms` (see [`crate::index::oracle::auto_run_decision`]): a run
-/// that started after the last index change means the verdicts are current. Scoped to `(commit_sha,
-/// worktree_id)` — the sibling of [`latest_run_tool_version`], ordered the same way.
+/// The `started_at` (Unix-epoch ms) of the LAST-COMPLETED run for `tool` **in the active
+/// checkout**, or `None` when no run exists. The staleness clock the background auto-fresh oracle
+/// compares against the index's `indexed_at_ms` (see [`crate::index::oracle::auto_run_decision`]):
+/// a run that started after the last index change means its verdicts are current. Scoped to
+/// `(commit_sha, worktree_id)` — the sibling of [`latest_run_tool_version`], ordered the same way
+/// (`id DESC` = completion order, so the start time returned belongs to the run whose verdicts are
+/// actually live; see that fn for why started_at ordering is wrong since #145).
 pub(crate) fn latest_run_started_at(
     conn: &Connection,
     tool: OracleTool,
@@ -445,7 +453,7 @@ pub(crate) fn latest_run_started_at(
             "
             SELECT started_at FROM oracle_runs
             WHERE tool = ?1 AND commit_sha = ?2 AND worktree_id = ?3
-            ORDER BY started_at DESC, id DESC
+            ORDER BY id DESC
             LIMIT 1
             ",
             params![tool.as_db_str(), commit_sha, worktree_id],
