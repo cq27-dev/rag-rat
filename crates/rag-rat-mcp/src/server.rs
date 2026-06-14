@@ -48,8 +48,11 @@ impl RagRatService {
         let _inflight = self.inflight.guard();
         let value = crate::tools::call_tool_for_config(&self.config, name, value)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
-        let text = serde_json::to_string_pretty(&value)
-            .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
+        // MCP tool results are text content read by an LLM, so render TOON by default — it is
+        // materially denser than JSON on the uniform-row payloads that dominate these tools, and
+        // ties JSON on nested ones. `render` falls back to compact JSON on a TOON encode error, so
+        // a tool result is never lost. No per-call flag: MCP default is TOON.
+        let text = rag_rat_core::render(&value, rag_rat_core::OutputFormat::Toon);
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 }

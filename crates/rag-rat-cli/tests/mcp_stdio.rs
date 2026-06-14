@@ -131,9 +131,12 @@ fn recv(reader: &mut impl BufRead) -> Value {
     serde_json::from_str(&line).unwrap()
 }
 
+/// Decode an MCP tool result into a JSON `Value`. Tool results are rendered as TOON (the server
+/// default), so the text is TOON, not JSON — decode it back through `toon_format` to assert on it.
 fn response_text_json(response: Value) -> Value {
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
-    serde_json::from_str(text).unwrap()
+    toon_format::decode(text, &toon_format::DecodeOptions::default())
+        .unwrap_or_else(|err| panic!("MCP result is not valid TOON ({err}):\n{text}"))
 }
 
 fn stop(mut child: Child) {

@@ -35,7 +35,7 @@ fn sigusr1_hot_upgrade_resumes_session_in_place() {
     session.initialize();
 
     let before = session.call_semantic_search();
-    assert!(before["chunk_id"].as_i64().is_some(), "tool call works before upgrade");
+    assert!(before.contains("chunk_id"), "tool call works before upgrade: {before}");
 
     session.send_sigusr1();
     wait_for(&sentinel, Duration::from_secs(20)); // the wrapper ran ⇒ we `exec`'d the new binary.
@@ -43,7 +43,7 @@ fn sigusr1_hot_upgrade_resumes_session_in_place() {
     // No re-`initialize`: a cold server would reject this. A successful result proves the resumed
     // process skipped the handshake via `serve_directly`.
     let after = session.call_semantic_search();
-    assert!(after["chunk_id"].as_i64().is_some(), "session resumed transparently after exec");
+    assert!(after.contains("chunk_id"), "session resumed transparently after exec: {after}");
 
     // The grep-augment hook socket must answer *after* the in-place `exec`: the old process's lock
     // fd and bound socket died with the exec'd image, so the resumed process has to re-run the
@@ -172,8 +172,9 @@ impl Session {
         self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}));
     }
 
-    /// Issue a `semantic_search` tool call and return its decoded first hit (or the raw payload).
-    fn call_semantic_search(&mut self) -> Value {
+    /// Issue a `semantic_search` tool call and return its raw text result. MCP results are rendered
+    /// as TOON (not JSON), so callers assert on the text rather than parsing it as JSON.
+    fn call_semantic_search(&mut self) -> String {
         let id = self.take_id();
         self.send(json!({
             "jsonrpc": "2.0",
@@ -182,11 +183,10 @@ impl Session {
             "params": {"name": "semantic_search", "arguments": {"query": "search", "limit": 1}}
         }));
         let response = self.recv();
-        let text = response["result"]["content"][0]["text"]
+        response["result"]["content"][0]["text"]
             .as_str()
-            .unwrap_or_else(|| panic!("tool call had no text result: {response}"));
-        let hits: Value = serde_json::from_str(text).unwrap();
-        hits.as_array().and_then(|array| array.first().cloned()).unwrap_or(hits)
+            .unwrap_or_else(|| panic!("tool call had no text result: {response}"))
+            .to_string()
     }
 
     fn send_sigusr1(&self) {
