@@ -283,8 +283,11 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
         json!({"symbol": "cfg_helper", "allow_ambiguous": true}),
     )
     .unwrap();
+    // logical_symbol_id crosses the MCP boundary as a STRING (#130: a 64-bit hash > 2^53 can't be a
+    // JSON number without rounding). Read it as a string and pass it straight back to the other
+    // tools — the round-trip the fix guarantees.
     let logical_symbol_id =
-        lookup["candidates"].as_array().unwrap()[0]["logical_symbol_id"].as_i64().unwrap();
+        lookup["candidates"].as_array().unwrap()[0]["logical_symbol_id"].as_str().unwrap();
     let memory = call_tool(
             &config.database,
             "memory_create",

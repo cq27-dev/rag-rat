@@ -231,6 +231,9 @@ pub struct RepoClustersArgs {
 pub struct SymbolArgs {
     pub symbol: Option<String>,
     pub symbol_path: Option<String>,
+    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
+    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub language: Option<String>,
@@ -245,6 +248,9 @@ pub struct SymbolArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolGraphArgs {
     pub symbol: Option<String>,
+    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
+    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub symbol_path: Option<String>,
@@ -272,6 +278,9 @@ pub struct SymbolGraphArgs {
 pub struct CompareGraphTextArgs {
     pub pattern: String,
     pub symbol: Option<String>,
+    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
+    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub symbol_path: Option<String>,
@@ -298,6 +307,9 @@ pub struct ImpactArgs {
     pub query: Option<String>,
     pub symbol: Option<String>,
     pub symbol_path: Option<String>,
+    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
+    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub resolution: Option<McpGraphResolutionMode>,
@@ -433,6 +445,9 @@ impl McpMemorySource {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MemoryBindArgs {
+    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
+    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub chunk_id: Option<i64>,
@@ -444,7 +459,11 @@ pub struct MemoryBindArgs {
     pub github_owner: Option<String>,
     pub github_repo: Option<String>,
     pub github_number: Option<i64>,
+    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[schemars(with = "Option<String>")]
     pub start_logical_symbol_id: Option<i64>,
+    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[schemars(with = "Option<String>")]
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
     pub path_summary: Option<String>,
@@ -498,6 +517,9 @@ pub struct MemorySearchArgs {
 pub struct MemoryForSymbolArgs {
     pub symbol: Option<String>,
     pub symbol_path: Option<String>,
+    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
+    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     #[serde(default)]

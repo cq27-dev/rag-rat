@@ -7,6 +7,7 @@ pub mod locks;
 pub mod output;
 pub mod query;
 pub mod search;
+pub mod serde_big_id;
 pub mod storage;
 pub mod watch;
 

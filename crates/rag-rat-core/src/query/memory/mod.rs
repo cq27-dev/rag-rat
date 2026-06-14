@@ -49,7 +49,11 @@ pub struct RepoMemoryBinding {
     pub start_line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_line: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Content-derived 64-bit hash > 2^53 — emit as a string so JSON clients don't round it (#130).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_big_id::big_id_opt::serialize"
+    )]
     pub logical_symbol_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_id: Option<i64>,
@@ -87,9 +91,17 @@ pub struct RepoMemoryBinding {
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoMemoryCallPath {
     pub memory_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Content-derived 64-bit hashes > 2^53 — emit as strings so JSON clients don't round them
+    // (#130).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_big_id::big_id_opt::serialize"
+    )]
     pub start_logical_symbol_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_big_id::big_id_opt::serialize"
+    )]
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: String,
     pub path_summary: String,
@@ -117,6 +129,11 @@ pub struct RepoMemoryCreate {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RepoMemoryBindTarget {
+    // Content-derived 64-bit hash > 2^53 — accept it as a string (or number) so a >2^53 id isn't
+    // rounded by a JSON client before it reaches us (#130). `default` keeps the field optional now
+    // that a custom deserializer is attached (a plain `Option` no longer auto-defaults on
+    // absence).
+    #[serde(default, deserialize_with = "crate::serde_big_id::big_id_opt::deserialize")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub chunk_id: Option<i64>,
@@ -128,7 +145,9 @@ pub struct RepoMemoryBindTarget {
     pub github_owner: Option<String>,
     pub github_repo: Option<String>,
     pub github_number: Option<i64>,
+    #[serde(default, deserialize_with = "crate::serde_big_id::big_id_opt::deserialize")]
     pub start_logical_symbol_id: Option<i64>,
+    #[serde(default, deserialize_with = "crate::serde_big_id::big_id_opt::deserialize")]
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
     pub path_summary: Option<String>,

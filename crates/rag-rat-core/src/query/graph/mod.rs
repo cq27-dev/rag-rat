@@ -50,6 +50,8 @@ pub struct GraphTraversalReport {
 pub struct GraphTraversalQuery {
     pub tool: String,
     pub symbol_id: Option<i64>,
+    // Content-derived 64-bit hash > 2^53 — emit as a string so JSON clients don't round it (#130).
+    #[serde(serialize_with = "crate::serde_big_id::big_id_opt::serialize")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_path: String,
     pub resolution: String,
@@ -57,6 +59,7 @@ pub struct GraphTraversalQuery {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogicalSymbol {
+    #[serde(serialize_with = "crate::serde_big_id::big_id::serialize")]
     pub logical_symbol_id: i64,
     pub qualified_name: String,
     pub variant_count: u64,
@@ -174,6 +177,8 @@ pub struct CompareGraphTextReport {
 #[derive(Debug, Serialize)]
 pub struct CompareGraphTextQuery {
     pub symbol_id: Option<i64>,
+    // Content-derived 64-bit hash > 2^53 — emit as a string so JSON clients don't round it (#130).
+    #[serde(serialize_with = "crate::serde_big_id::big_id_opt::serialize")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_path: String,
     pub pattern: String,

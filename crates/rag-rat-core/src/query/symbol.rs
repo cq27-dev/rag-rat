@@ -6,7 +6,12 @@ use crate::language::Language;
 #[derive(Debug, Serialize)]
 pub struct SymbolHit {
     pub symbol_id: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // logical_symbol_id is a content-derived 64-bit hash > 2^53; emit as a string so JSON clients
+    // don't round it (#130). symbol_id/file_id are small rowids and stay numbers.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_big_id::big_id_opt::serialize"
+    )]
     pub logical_symbol_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logical_variant_count: Option<u64>,
@@ -34,6 +39,7 @@ pub struct SymbolLookup {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogicalSymbolHit {
+    #[serde(serialize_with = "crate::serde_big_id::big_id::serialize")]
     pub logical_symbol_id: i64,
     pub language: String,
     pub path: String,
