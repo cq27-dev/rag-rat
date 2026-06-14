@@ -54,6 +54,9 @@ pub struct ImpactSurfaceReport {
 
 #[derive(Debug, Serialize)]
 pub struct ImpactSurfaceQuery {
+    // Internal rowid — never serialized (reindex-churned, #149); `symbol_path` identifies the
+    // query.
+    #[serde(skip_serializing)]
     pub symbol_id: Option<i64>,
     pub symbol_path: Option<String>,
     pub query: Option<String>,

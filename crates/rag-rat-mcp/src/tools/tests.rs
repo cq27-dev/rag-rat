@@ -397,7 +397,7 @@ fn mcp_read_chunk_and_heal_index_do_not_return_stale_text() {
 }
 
 #[test]
-fn mcp_symbol_id_selection_disambiguates_graph_tools() {
+fn mcp_handle_selection_disambiguates_graph_tools() {
     let root = unique_temp_root();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub mod one;\npub mod two;\n").unwrap();
@@ -419,8 +419,12 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
     assert_eq!(lookup["disambiguation_required"], true);
     let candidates = lookup["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 2);
+    // #149: candidates carry the opaque `sym_<hex>` handle (not the ephemeral numeric symbol_id),
+    // plus the human-readable symbol_path.
     assert!(candidates.iter().all(|candidate| {
-        candidate["symbol_id"].is_i64() && candidate["symbol_path"].as_str().is_some()
+        candidate.get("symbol_id").is_none()
+            && candidate["logical_symbol_id"].as_str().is_some_and(|h| h.starts_with("sym_"))
+            && candidate["symbol_path"].as_str().is_some()
     }));
 
     let ambiguous =
@@ -436,14 +440,14 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
         &config.database,
         "find_callers",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
             "resolution": "exact",
             "edge_kinds": ["calls_name"]
         }),
     )
     .unwrap();
     assert_eq!(exact["query"]["tool"], "find_callers");
-    assert_eq!(exact["query"]["symbol_id"], one["symbol_id"]);
+    assert_eq!(exact["query"]["logical_symbol_id"], one["logical_symbol_id"]);
     assert_eq!(exact["query"]["resolution"], "exact");
     assert_eq!(exact["summary"]["returned_count"], 1);
     assert_eq!(exact["summary"]["total_matching_edges"], 1);
@@ -457,7 +461,7 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
         &config.database,
         "find_callers",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
             "resolution": "exact",
             "edge_kinds": ["calls_name"],
             "include_coverage": true
@@ -479,14 +483,14 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
         &config.database,
         "compare_graph_to_text",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
             "pattern": "    shared\\(",
             "resolution": "exact",
             "edge_kinds": ["calls_name"]
         }),
     )
     .unwrap();
-    assert_eq!(comparison["query"]["symbol_id"], one["symbol_id"]);
+    assert_eq!(comparison["query"]["logical_symbol_id"], one["logical_symbol_id"]);
     assert_eq!(comparison["summary"]["graph_edges"], 1);
     assert_eq!(comparison["summary"]["graph_hits"], 1);
     assert_eq!(comparison["summary"]["text_hits"], 3);
@@ -515,7 +519,7 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
         &config.database,
         "compare_graph_to_text",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
             "pattern": "shared",
             "resolution": "exact",
             "edge_kinds": ["calls_name"]
@@ -533,7 +537,7 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
         &config.database,
         "impact_surface",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
             "resolution": "exact",
             "include_tests": true,
             "include_docs": true,
@@ -559,7 +563,7 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
     let papertrail = call_tool(
         &config.database,
         "papertrail_for_symbol",
-        json!({"symbol_id": one["symbol_id"].as_i64().unwrap()}),
+        json!({"logical_symbol_id": one["logical_symbol_id"].as_str().unwrap()}),
     )
     .unwrap();
     assert!(papertrail["current_source"]["symbol"].as_str().unwrap().contains("shared"));
@@ -576,6 +580,11 @@ fn assert_schema_requires(tools: &[Value], name: &str, field: &str) {
 fn assert_schema_has_property(tools: &[Value], name: &str, field: &str) {
     let schema = tool_schema(tools, name);
     assert!(schema["properties"].get(field).is_some(), "{name} should define {field}");
+}
+
+fn assert_schema_lacks_property(tools: &[Value], name: &str, field: &str) {
+    let schema = tool_schema(tools, name);
+    assert!(schema["properties"].get(field).is_none(), "{name} must not define {field}");
 }
 
 fn assert_schema_nested_property(tools: &[Value], name: &str, parent: &str, field: &str) {
@@ -651,9 +660,12 @@ fn assert_enum_values(schema: &Value, expected: &[&str], label: &str) {
 }
 
 fn assert_symbol_selector_schema(tools: &[Value], name: &str) {
-    for field in ["symbol", "symbol_path", "symbol_id", "logical_symbol_id", "allow_ambiguous"] {
+    // #149: the wire selector is symbol/symbol_path/logical_symbol_id (the opaque handle); the
+    // ephemeral numeric symbol_id is no longer an accepted input.
+    for field in ["symbol", "symbol_path", "logical_symbol_id", "allow_ambiguous"] {
         assert_schema_has_property(tools, name, field);
     }
+    assert_schema_lacks_property(tools, name, "symbol_id");
 }
 
 #[test]

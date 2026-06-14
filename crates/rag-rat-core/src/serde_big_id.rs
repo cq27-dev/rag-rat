@@ -1,17 +1,18 @@
-//! Serde for `i64` ids that exceed JSON's 2^53 safe-integer range — content-derived
-//! `logical_symbol_id` hashes (~2.5e18, far above 2^53 = 9_007_199_254_740_992). A JSON *number*
-//! cannot carry such a value losslessly: a client that parses JSON numbers as f64 (every JS-based
-//! MCP client) silently rounds it (`2574604874062343519` → `2574604874062343700`), so the id is
-//! corrupted in transit before the server ever sees it (#130).
+//! Serde for the symbol handle (`logical_symbol_id` and its call-path `start_/end_` variants) — a
+//! content-derived `i64` far above JSON's 2^53 safe-integer range (~2.5e18 vs
+//! 9_007_199_254_740_992). A JSON *number* cannot carry such a value losslessly: a client that
+//! parses numbers as f64 (every JS-based MCP client) silently rounds it, corrupting the id in
+//! transit (#130).
 //!
-//! The fix: these ids cross EVERY serde boundary (CLI `--json`, MCP JSON, MCP TOON) as a STRING.
-//! - Serialize → always a string, so a reader copies an opaque string and round-trips it intact.
-//! - Deserialize → accept a string OR a number, so callers within the safe range (and older
-//!   clients) keep working; the string form is what makes a >2^53 id survive.
+//! The handle therefore crosses every serde boundary (CLI `--json`, MCP JSON, MCP TOON) as an
+//! opaque `sym_<hex>` token (#149). A decimal string would also be lossless, but it still *looks*
+//! like a number and tempts a client to `parseInt` it (and round); the `sym_` prefix + hex make it
+//! unmistakably a handle, never a number — copy it verbatim and round-trip it intact. Deserialize
+//! accepts ONLY the token, so a stale numeric rowid passed by habit fails loudly.
 //!
-//! Apply with `#[serde(with = "crate::serde_big_id::big_id")]` on an `i64` field or
-//! `#[serde(with = "crate::serde_big_id::big_id_opt")]` on an `Option<i64>` field. On an MCP arg
-//! struct that derives `JsonSchema`, also add `#[schemars(with = "String")]` (or
+//! Apply with `#[serde(with = "crate::serde_big_id::sym_handle")]` on an `i64` field or
+//! `#[serde(with = "crate::serde_big_id::sym_handle_opt")]` on an `Option<i64>` field. On an MCP
+//! arg struct that derives `JsonSchema`, also add `#[schemars(with = "String")]` (or
 //! `Option<String>`) so the advertised input schema asks clients for a string.
 
 use std::fmt;
@@ -19,92 +20,69 @@ use std::fmt;
 use serde::de::{self, Deserialize, Deserializer, Unexpected, Visitor};
 use serde::{Serialize, Serializer};
 
-/// JSON's largest exactly-representable integer, `2^53 - 1`. A number outside `±MAX_SAFE_INTEGER`
-/// can't survive a JSON-number parse that goes through an f64, so by the time such a value reaches
-/// us as a number it has almost certainly already been rounded — accepting it would silently look
-/// up the WRONG id. The numeric deserialize path is therefore bounded to the safe range; anything
-/// larger MUST arrive as a string (#130 review).
-const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+/// An `i64` symbol handle that crosses serde as an opaque `sym_<hex>` token. Hex is over the raw
+/// u64 bit pattern so any `i64` round-trips exactly. Private — the public surface is the
+/// `sym_handle` / `sym_handle_opt` serde modules.
+struct SymHandle(i64);
 
-/// An `i64` that serializes as a decimal string and deserializes from either a string or a number.
-/// Private — the public surface is the `big_id` / `big_id_opt` serde modules.
-struct BigId(i64);
+const SYM_HANDLE_PREFIX: &str = "sym_";
 
-impl Serialize for BigId {
+impl Serialize for SymHandle {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0.to_string())
+        serializer.serialize_str(&format!("{SYM_HANDLE_PREFIX}{:x}", self.0 as u64))
     }
 }
 
-impl<'de> Deserialize<'de> for BigId {
+impl<'de> Deserialize<'de> for SymHandle {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(BigIdVisitor)
+        deserializer.deserialize_str(SymHandleVisitor)
     }
 }
 
-/// The error for a numeric id outside the JSON safe-integer range — such a value can't be trusted
-/// (it may already be f64-rounded), so we reject it and point the caller at the string form.
-fn unsafe_number_message(value: impl fmt::Display) -> String {
-    format!(
-        "id {value} is outside JSON's safe-integer range (±2^53-1) and may have been rounded; \
-         pass it as a string"
-    )
-}
+struct SymHandleVisitor;
 
-struct BigIdVisitor;
-
-impl Visitor<'_> for BigIdVisitor {
-    type Value = BigId;
+impl Visitor<'_> for SymHandleVisitor {
+    type Value = SymHandle;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("an i64 as a decimal string, or a JSON number within ±(2^53-1)")
+        f.write_str("a symbol handle string of the form `sym_<hex>`")
     }
 
-    fn visit_i64<E: de::Error>(self, value: i64) -> Result<BigId, E> {
-        if !(-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value) {
-            return Err(E::custom(unsafe_number_message(value)));
-        }
-        Ok(BigId(value))
-    }
-
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<BigId, E> {
-        if value > MAX_SAFE_INTEGER as u64 {
-            return Err(E::custom(unsafe_number_message(value)));
-        }
-        Ok(BigId(value as i64))
-    }
-
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<BigId, E> {
-        value.parse::<i64>().map(BigId).map_err(|_| E::invalid_value(Unexpected::Str(value), &self))
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<SymHandle, E> {
+        let hex = value.strip_prefix(SYM_HANDLE_PREFIX).ok_or_else(|| {
+            E::custom(format!("symbol handle must start with `{SYM_HANDLE_PREFIX}`: `{value}`"))
+        })?;
+        u64::from_str_radix(hex, 16)
+            .map(|bits| SymHandle(bits as i64))
+            .map_err(|_| E::invalid_value(Unexpected::Str(value), &self))
     }
 }
 
-/// `#[serde(with = "...")]` module for a required `i64` big id (string out, string-or-number in).
-pub mod big_id {
-    use super::{BigId, Deserialize, Deserializer, Serialize, Serializer};
+/// `#[serde(with = "...")]` module for a required `i64` symbol handle (`sym_<hex>` out, token in).
+pub mod sym_handle {
+    use super::{Deserialize, Deserializer, Serialize, Serializer, SymHandle};
 
     pub fn serialize<S: Serializer>(value: &i64, serializer: S) -> Result<S::Ok, S::Error> {
-        BigId(*value).serialize(serializer)
+        SymHandle(*value).serialize(serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
-        BigId::deserialize(deserializer).map(|big| big.0)
+        SymHandle::deserialize(deserializer).map(|handle| handle.0)
     }
 }
 
-/// `#[serde(with = "...")]` module for an `Option<i64>` big id — `null`/absent stays `None`, a
-/// present value serializes as a string and deserializes from a string or a number.
-pub mod big_id_opt {
-    use super::{BigId, Deserialize, Deserializer, Serialize, Serializer};
+/// `#[serde(with = "...")]` module for an `Option<i64>` symbol handle — `null`/absent stays `None`.
+pub mod sym_handle_opt {
+    use super::{Deserialize, Deserializer, Serialize, Serializer, SymHandle};
 
     pub fn serialize<S: Serializer>(value: &Option<i64>, serializer: S) -> Result<S::Ok, S::Error> {
-        value.map(BigId).serialize(serializer)
+        value.map(SymHandle).serialize(serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<i64>, D::Error> {
-        Ok(Option::<BigId>::deserialize(deserializer)?.map(|big| big.0))
+        Ok(Option::<SymHandle>::deserialize(deserializer)?.map(|handle| handle.0))
     }
 }
 
@@ -113,79 +91,56 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     /// A content-derived logical_symbol_id beyond JS's 2^53 safe-integer ceiling — the value that
-    /// rounded to `...343700` as a JSON number in the field report.
+    /// rounded to `...343700` as a JSON number in the original field report (#130).
     const BIG: i64 = 2_574_604_874_062_343_519;
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
-    struct Req {
-        #[serde(with = "super::big_id")]
+    struct Handle {
+        #[serde(with = "super::sym_handle")]
         id: i64,
     }
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
-    struct Opt {
-        #[serde(with = "super::big_id_opt")]
+    struct HandleOpt {
+        #[serde(with = "super::sym_handle_opt")]
         id: Option<i64>,
     }
 
     #[test]
-    fn required_big_id_serializes_as_a_string() {
-        let json = serde_json::to_string(&Req { id: BIG }).unwrap();
-        assert_eq!(json, r#"{"id":"2574604874062343519"}"#, "must emit a string, not a number");
+    fn sym_handle_serializes_as_an_opaque_token() {
+        let json = serde_json::to_string(&Handle { id: BIG }).unwrap();
+        assert_eq!(json, r#"{"id":"sym_23bad57dfb79ad5f"}"#, "must emit sym_<hex>, not a number");
     }
 
     #[test]
-    fn required_big_id_round_trips_losslessly_through_json() {
-        let json = serde_json::to_string(&Req { id: BIG }).unwrap();
-        let back: Req = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.id, BIG);
+    fn sym_handle_round_trips_losslessly_including_negative_and_zero() {
+        for value in [BIG, 0_i64, 1, -1, i64::MAX, i64::MIN] {
+            let json = serde_json::to_string(&Handle { id: value }).unwrap();
+            let back: Handle = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.id, value, "round-trip failed for {value}");
+        }
     }
 
     #[test]
-    fn required_big_id_deserializes_from_a_string() {
-        let back: Req = serde_json::from_str(r#"{"id":"2574604874062343519"}"#).unwrap();
-        assert_eq!(back.id, BIG);
-    }
-
-    #[test]
-    fn required_big_id_still_accepts_a_safe_number_for_back_compat() {
-        // A small in-safe-range value sent as a JSON number must still deserialize.
-        let back: Req = serde_json::from_str(r#"{"id":1001}"#).unwrap();
-        assert_eq!(back.id, 1001);
-        // The boundary value 2^53-1 is still accepted as a number.
-        let edge: Req = serde_json::from_str(r#"{"id":9007199254740991}"#).unwrap();
-        assert_eq!(edge.id, 9_007_199_254_740_991);
-    }
-
-    #[test]
-    fn unsafe_number_is_rejected_so_a_rounded_id_never_silently_binds() {
-        // A value above 2^53 sent as a JSON NUMBER may already be f64-rounded; reject it rather
-        // than look up the wrong id. The same value as a STRING is exact and accepted (#130
-        // review).
-        let as_number = serde_json::from_str::<Req>(r#"{"id":2574604874062343519}"#);
-        assert!(as_number.is_err(), "an unsafe numeric id must be rejected, not silently accepted");
-        let as_string: Req = serde_json::from_str(r#"{"id":"2574604874062343519"}"#).unwrap();
-        assert_eq!(as_string.id, BIG);
-        // The optional variant rejects an unsafe number too.
-        assert!(serde_json::from_str::<Opt>(r#"{"id":2574604874062343519}"#).is_err());
-    }
-
-    #[test]
-    fn optional_big_id_serializes_string_or_null() {
-        assert_eq!(
-            serde_json::to_string(&Opt { id: Some(BIG) }).unwrap(),
-            r#"{"id":"2574604874062343519"}"#
+    fn sym_handle_rejects_a_bare_number_and_a_missing_prefix() {
+        // Clean break (#149): a numeric id (the old form) is no longer accepted, so a stale id
+        // passed by habit fails loudly instead of resolving to nothing.
+        assert!(serde_json::from_str::<Handle>(r#"{"id":2574604874062343519}"#).is_err());
+        assert!(
+            serde_json::from_str::<Handle>(r#"{"id":"23bad57dfb79ad5f"}"#).is_err(),
+            "needs prefix"
         );
-        assert_eq!(serde_json::to_string(&Opt { id: None }).unwrap(), r#"{"id":null}"#);
+        assert!(serde_json::from_str::<Handle>(r#"{"id":"sym_zzz"}"#).is_err(), "bad hex");
     }
 
     #[test]
-    fn optional_big_id_deserializes_string_number_and_null() {
-        let s: Opt = serde_json::from_str(r#"{"id":"2574604874062343519"}"#).unwrap();
-        assert_eq!(s.id, Some(BIG));
-        let n: Opt = serde_json::from_str(r#"{"id":1001}"#).unwrap();
-        assert_eq!(n.id, Some(1001));
-        let z: Opt = serde_json::from_str(r#"{"id":null}"#).unwrap();
-        assert_eq!(z.id, None);
+    fn sym_handle_opt_serializes_token_or_null() {
+        assert_eq!(
+            serde_json::to_string(&HandleOpt { id: Some(BIG) }).unwrap(),
+            r#"{"id":"sym_23bad57dfb79ad5f"}"#
+        );
+        assert_eq!(serde_json::to_string(&HandleOpt { id: None }).unwrap(), r#"{"id":null}"#);
+        let back: HandleOpt = serde_json::from_str(r#"{"id":"sym_23bad57dfb79ad5f"}"#).unwrap();
+        assert_eq!(back.id, Some(BIG));
     }
 }

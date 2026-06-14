@@ -1,2 +1,5 @@
 .rag-rat/
 target/
+
+# Plans/specs are kept on disk for review, never committed (see dont-commit-plans).
+docs/plans/

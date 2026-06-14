@@ -269,7 +269,16 @@ pub struct RankedImportance {
 /// A ranked load-bearing symbol.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SymbolImportance {
+    // Internal rowid — never serialized (reindex-churned, #149); the handle is logical_symbol_id.
+    #[serde(skip_serializing)]
     pub symbol_id: i64,
+    /// Opaque `sym_<hex>` handle for this symbol — the stable id to feed into symbol_lookup /
+    /// impact / find_callers. `None` only if the winner has no logical-symbol member row.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
+    )]
+    pub logical_symbol_id: Option<i64>,
     pub qualified_name: String,
     pub path: String,
     pub kind: String,
@@ -409,9 +418,10 @@ pub fn important_symbols(
         let symbol_id = symbol_ids[idx];
         let row = conn
             .query_row(
-                "SELECT s.qualified_name, s.kind, f.path
+                "SELECT s.qualified_name, s.kind, f.path, lsm.logical_symbol_id
                  FROM symbols s
                  JOIN files f ON f.id = s.file_id
+                 LEFT JOIN logical_symbol_members lsm ON lsm.symbol_id = s.id
                  WHERE s.id = ?1",
                 [symbol_id],
                 |row| {
@@ -419,12 +429,20 @@ pub fn important_symbols(
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
                     ))
                 },
             )
             .ok();
-        let Some((qualified_name, kind, path)) = row else { continue };
-        out.push(SymbolImportance { symbol_id, qualified_name, path, kind, score: scores[idx] });
+        let Some((qualified_name, kind, path, logical_symbol_id)) = row else { continue };
+        out.push(SymbolImportance {
+            symbol_id,
+            logical_symbol_id,
+            qualified_name,
+            path,
+            kind,
+            score: scores[idx],
+        });
     }
     Ok(RankedImportance { symbols: out, effective_seed_count })
 }

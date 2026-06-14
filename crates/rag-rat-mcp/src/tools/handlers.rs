@@ -312,7 +312,7 @@ pub(crate) fn graph_tool(
                 include_common_methods,
                 edge_kinds,
                 resolution_mode,
-                symbol_id: args.symbol_id,
+                symbol_id: None,
                 logical_symbol_id: args.logical_symbol_id,
             };
             let hops = if reverse {
@@ -352,7 +352,7 @@ pub(crate) fn compare_graph_to_text_tool(
 ) -> anyhow::Result<Value> {
     let selector = SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
-        symbol_id: args.symbol_id,
+        symbol_id: None,
         symbol_path: args.symbol_path,
         symbol: args.symbol,
         language: None,
@@ -521,14 +521,10 @@ pub(crate) fn impact_tool(
         include_text_fallback: args.include_text_fallback,
         include_memories: args.include_memories,
     };
-    if args.logical_symbol_id.is_some()
-        || args.symbol_id.is_some()
-        || args.symbol_path.is_some()
-        || args.symbol.is_some()
-    {
+    if args.logical_symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
         let selector = SymbolSelector {
             logical_symbol_id: args.logical_symbol_id,
-            symbol_id: args.symbol_id,
+            symbol_id: None,
             symbol_path: args.symbol_path,
             symbol: args.symbol,
             language: None,
@@ -561,7 +557,7 @@ pub(crate) fn memory_for_symbol_tool(
 ) -> anyhow::Result<Value> {
     let selector = SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
-        symbol_id: args.symbol_id,
+        symbol_id: None,
         symbol_path: args.symbol_path,
         symbol: args.symbol,
         language: None,
@@ -604,7 +600,7 @@ fn important_symbols_tool(
 pub(crate) fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
     Ok(SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
-        symbol_id: args.symbol_id,
+        symbol_id: None,
         symbol_path: args.symbol_path,
         symbol: args.symbol,
         language: optional_language(args.language)?,
@@ -626,7 +622,7 @@ pub(crate) fn graph_edge_kinds(edge_kinds: Option<&[McpGraphEdgeKind]>) -> Optio
 pub(crate) fn graph_symbol_selector(args: &SymbolGraphArgs) -> anyhow::Result<SymbolSelector> {
     Ok(SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
-        symbol_id: args.symbol_id,
+        symbol_id: None,
         symbol_path: args.symbol_path.clone(),
         symbol: args.symbol.clone(),
         language: None,

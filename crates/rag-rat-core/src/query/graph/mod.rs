@@ -49,9 +49,11 @@ pub struct GraphTraversalReport {
 #[derive(Debug, Serialize)]
 pub struct GraphTraversalQuery {
     pub tool: String,
+    // Internal rowid — never serialized (reindex-churned, #149); the handle is logical_symbol_id.
+    #[serde(skip_serializing)]
     pub symbol_id: Option<i64>,
-    // Content-derived 64-bit hash > 2^53 — emit as a string so JSON clients don't round it (#130).
-    #[serde(serialize_with = "crate::serde_big_id::big_id_opt::serialize")]
+    // Opaque `sym_<hex>` symbol handle (stable, JSON-safe — #130/#149).
+    #[serde(serialize_with = "crate::serde_big_id::sym_handle_opt::serialize")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_path: String,
     pub resolution: String,
@@ -59,7 +61,7 @@ pub struct GraphTraversalQuery {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogicalSymbol {
-    #[serde(serialize_with = "crate::serde_big_id::big_id::serialize")]
+    #[serde(serialize_with = "crate::serde_big_id::sym_handle::serialize")]
     pub logical_symbol_id: i64,
     pub qualified_name: String,
     pub variant_count: u64,
@@ -68,6 +70,8 @@ pub struct LogicalSymbol {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogicalSymbolVariant {
+    // Internal rowid only — a variant is identified on the wire by cfg/signature/lines (#149).
+    #[serde(skip_serializing)]
     pub symbol_id: i64,
     pub cfg_expr: Option<String>,
     pub signature_hash: Option<String>,
@@ -176,9 +180,11 @@ pub struct CompareGraphTextReport {
 
 #[derive(Debug, Serialize)]
 pub struct CompareGraphTextQuery {
+    // Internal rowid — never serialized (reindex-churned, #149); the handle is logical_symbol_id.
+    #[serde(skip_serializing)]
     pub symbol_id: Option<i64>,
-    // Content-derived 64-bit hash > 2^53 — emit as a string so JSON clients don't round it (#130).
-    #[serde(serialize_with = "crate::serde_big_id::big_id_opt::serialize")]
+    // Opaque `sym_<hex>` symbol handle (stable, JSON-safe — #130/#149).
+    #[serde(serialize_with = "crate::serde_big_id::sym_handle_opt::serialize")]
     pub logical_symbol_id: Option<i64>,
     pub symbol_path: String,
     pub pattern: String,
