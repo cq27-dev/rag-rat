@@ -11,6 +11,22 @@ pub struct StorageStatus {
     pub fts5_available: bool,
 }
 
+/// True when `err`'s chain contains a SQLite read-only violation (`SQLITE_READONLY`). The MCP read
+/// path opens read tools on a read-only connection (#143), but a few "read" tools still WRITE on a
+/// cold path — `semantic_search` heals stale FTS, `read_chunk` heals a stale/deleted file,
+/// `git_blame_chunk` fills the blame cache on a miss. That surfaces as this error; the dispatcher
+/// uses it to retry the call on a read-write connection (which also performs the heal). Walks the
+/// full `anyhow` cause chain because the rusqlite error is wrapped by the time it reaches the
+/// caller.
+pub fn is_readonly_violation(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ReadOnly
+        )
+    })
+}
+
 #[derive(Debug)]
 pub struct IndexConnection {
     conn: Connection,
@@ -34,12 +50,29 @@ impl IndexConnection {
     /// the file. WAL databases serve concurrent read-only opens; a DB that has never been
     /// opened for write errors here, which callers treat as "no context".
     pub fn open_read_only(path: &Path) -> anyhow::Result<Self> {
+        Self::open_read_only_with_busy_timeout(path, std::time::Duration::from_millis(100))
+    }
+
+    /// Read-only open that waits out a concurrent writer (the watcher mid-pass, a lazy heal)
+    /// instead of failing fast. Used by the MCP read tools: a `SQLITE_OPEN_READ_ONLY` connection
+    /// can never acquire the main write lock, so a served read is structurally immune to being
+    /// locked out by a writer — and the longer busy_timeout only matters for the brief WAL
+    /// checkpoint window. See [#143]. The 100ms `open_read_only` stays fast for the latency-
+    /// critical grep-augment hook, which prefers "no context" over blocking.
+    pub fn open_read_only_blocking(path: &Path) -> anyhow::Result<Self> {
+        Self::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))
+    }
+
+    fn open_read_only_with_busy_timeout(
+        path: &Path,
+        busy_timeout: std::time::Duration,
+    ) -> anyhow::Result<Self> {
         use rusqlite::OpenFlags;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(std::time::Duration::from_millis(100))?;
+        conn.busy_timeout(busy_timeout)?;
         Ok(Self { conn, database_path: path.to_path_buf(), source_root: None })
     }
 
@@ -127,5 +160,34 @@ mod tests {
     fn open_read_only_fails_cleanly_when_database_missing() {
         let missing = std::env::temp_dir().join("ragrat-ro-missing/never-created.db");
         assert!(IndexConnection::open_read_only(&missing).is_err());
+    }
+
+    #[test]
+    fn is_readonly_violation_flags_only_sqlite_readonly_errors() {
+        let dir = std::env::temp_dir().join(format!("ragrat-roviol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        {
+            let rw = IndexConnection::open(&db).unwrap();
+            crate::index::schema::apply(rw.connection()).unwrap();
+        }
+        let ro = IndexConnection::open_read_only(&db).unwrap();
+
+        // A write through a read-only connection → SQLITE_READONLY → flagged (the dispatcher's
+        // retry-on-read-write signal, #143 review).
+        let write_err: anyhow::Error = ro
+            .connection()
+            .execute("INSERT INTO index_meta(key, value) VALUES ('x', 'y')", [])
+            .unwrap_err()
+            .into();
+        assert!(is_readonly_violation(&write_err), "a write on a read-only conn must be flagged");
+
+        // A different failure (a syntax error) must NOT be mistaken for a read-only violation, or
+        // the dispatcher would mask real errors behind a needless read-write retry.
+        let syntax_err: anyhow::Error =
+            ro.connection().execute("THIS IS NOT SQL", []).unwrap_err().into();
+        assert!(!is_readonly_violation(&syntax_err), "a non-readonly error must not be flagged");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

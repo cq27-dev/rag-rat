@@ -7816,3 +7816,46 @@ pub fn qualified_caller_two() -> i32 { crate::helper::deep_helper() }
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn read_only_open_serves_current_index_and_declines_when_heal_is_owed() {
+    // #143: a pure-read MCP tool opens the index read-only, so a concurrent writer (watcher, heal,
+    // another client) can never lock it out. A current index is served read-only (Some) and its
+    // connection cannot write the main DB; when a heal write is still owed (here a stale
+    // graph_index_version), the read path declines (None) so the caller falls back to the
+    // read-write open that heals — after which reads are lock-free again.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn ro_anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    let ro = IndexDatabase::try_open_config_read_only(&config)
+        .unwrap()
+        .expect("a current index must be served read-only");
+    assert!(
+        !ro.symbols("ro_anchor", Some(Language::Rust), 10).unwrap().is_empty(),
+        "the read-only connection must answer queries"
+    );
+    assert!(
+        ro.storage
+            .connection()
+            .execute("INSERT INTO index_meta(key, value) VALUES ('ro_probe', 'x')", [])
+            .is_err(),
+        "a read-only tool connection must not be able to write the main DB"
+    );
+    drop(ro);
+
+    // Mark the graph index stale (a heal write is now owed). open() already ran and left it
+    // current, so set it afterward; the read-only path does not heal, so it must decline.
+    let db = IndexDatabase::open(&config.database).unwrap();
+    db.set_meta("graph_index_version", "0").unwrap();
+    drop(db);
+    assert!(
+        IndexDatabase::try_open_config_read_only(&config).unwrap().is_none(),
+        "a stale graph index owes a heal write → the read-only path must decline"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

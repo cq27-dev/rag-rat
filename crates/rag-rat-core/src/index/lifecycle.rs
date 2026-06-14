@@ -69,6 +69,51 @@ impl IndexDatabase {
         Ok(db)
     }
 
+    /// Open the index **read-only** for a pure-read tool, returning `None` when the index still
+    /// owes a write to be brought current. A `SQLITE_OPEN_READ_ONLY` connection can never acquire
+    /// the main write lock, so a read served through it is structurally immune to being locked out
+    /// by a concurrent writer (the watcher, a heal, another client) — the fix for the intermittent
+    /// "database is locked" under concurrent MCP clients (#143). Unlike `open_config` it performs
+    /// NO on-open heal writes (`ensure_model_manifest` / `ensure_graph_index_current`).
+    ///
+    /// Returns `Ok(None)` — caller falls back to the read-write `open_config`, which heals once and
+    /// after which reads are lock-free again — when any of these is true:
+    /// - the DB has never been opened for write (read-only open errors),
+    /// - the schema is not `Compatible` (a forward migrate is owed; that is a write),
+    /// - the graph index is stale (`ensure_graph_index_current` would rebuild — a write),
+    /// - the model manifest is not yet current (`ensure_model_manifest` would write).
+    ///
+    /// The temp-scope view (`set_context` → `install_scope_view`) is still installed: it writes
+    /// only the per-connection `temp.*` database, which is writable even on a read-only main DB.
+    pub fn try_open_config_read_only(config: &Config) -> anyhow::Result<Option<Self>> {
+        let mut storage = match IndexConnection::open_read_only_blocking(&config.database) {
+            Ok(storage) => storage,
+            // Never opened for write yet (no file / no WAL) — let the read-write path create it.
+            Err(_) => return Ok(None),
+        };
+        if schema::status(storage.connection())?.state != schema::SchemaState::Compatible {
+            return Ok(None);
+        }
+        if meta_for(storage.connection(), "graph_index_version")?.as_deref()
+            != Some(GRAPH_INDEX_VERSION)
+        {
+            return Ok(None);
+        }
+        if !ai::model_manifest_is_current(storage.connection())? {
+            return Ok(None);
+        }
+        storage.set_source_root(config.root.clone());
+        let (commit_sha, worktree_id) = resolve_git_context(&config.root);
+        let mut db = Self {
+            storage,
+            active_commit_sha: String::new(),
+            active_worktree_id: String::new(),
+            github: github::GitHubContext::from_gh(),
+        };
+        db.set_context(&commit_sha, &worktree_id)?;
+        Ok(Some(db))
+    }
+
     /// Set the GitHub repo context explicitly (tests / non-gh callers), so the library never
     /// shells out to `gh`.
     pub fn set_github_context(&mut self, default_repo: Option<&str>, gh_available: bool) {
