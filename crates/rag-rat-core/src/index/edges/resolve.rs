@@ -18,49 +18,113 @@ fn import_scope_from_row(
     })
 }
 
-/// Load the per-package local-crate sets + the file→package mapping for the ACTIVE CHECKOUT into
-/// `scope` (#61 per-package locality). `packages.local_roots_json` is a JSON string array of crate
-/// roots. Both reads are scoped through the per-connection `files`/`packages` rows of the active
-/// commit/worktree — a missing/empty `packages` table (non-Cargo corpus, pre-V022 index) leaves the
-/// scope's per-package maps empty so every file falls open to the global set. Shared by BOTH
-/// drivers so the per-package model is identical (#61 both-driver parity).
+/// Load the per-package local-crate sets and COMPUTE each active file's owning package into `scope`
+/// (#61 per-package locality). `packages.local_roots_json` is a JSON string array of crate roots.
+///
+/// The file→package mapping is computed AT LOAD time — not read from a persisted `files.package_id`
+/// — by longest-`manifest_dir`-prefix over the active scope's `packages` rows. A persisted pointer
+/// was the #106 multi-worktree leak: a clean file is a SHARED commit-scope row read by every
+/// worktree at that commit, while a package row is worktree-scoped, so one worktree's refresh
+/// stamped its package ids onto the shared rows a sibling then followed (and the DELETE + reinsert
+/// churned those ids each pass). Computing here against the active scope's OWN `packages` rows
+/// means worktree B never sees worktree A's package map.
+///
+/// The `packages` read is scoped to the active `(commit_sha, worktree_id)` via the per-connection
+/// `temp.connection_context` (the same context `install_scope_view` reads to build the `files`
+/// view); the file list comes from the `files` TEMP VIEW (overlay wins, dead/sibling scopes
+/// excluded), matching the symbol/edge resolution scope. A missing/empty `packages` table
+/// (non-Cargo corpus, pre-V022 index) leaves the per-package maps empty so every file falls open to
+/// the global set. Shared by BOTH drivers so the per-package model is identical (#61 both-driver
+/// parity).
 fn load_package_roots_into_scope(
     conn: &Connection,
     scope: &mut imports::ImportScope,
 ) -> anyhow::Result<()> {
-    // packages: id → local_roots (JSON array). Unscoped read of the whole table is fine — a
-    // package id is unique across scopes (its own PK), and files only reference ids in their scope.
-    {
-        let mut stmt = match conn.prepare("SELECT id, local_roots_json FROM packages") {
+    // The active checkout's (commit_sha, worktree_id), so the `packages` read is scoped exactly
+    // like the `files` view (which reads the same context table). A raw test connection without
+    // the context falls back to empty strings — the same scope `add_package`/`refresh_packages`
+    // write under for non-git fixtures, so the test path stays consistent.
+    let active_commit_sha = scope_context_value(conn, "commit_sha");
+    let active_worktree_id = scope_context_value(conn, "worktree_id");
+
+    // The active scope's packages, longest `manifest_dir` first so the first matching prefix is the
+    // most specific package. A synthetic per-load index keys `scope.package_roots` — the persisted
+    // `packages.id` is deliberately NOT consulted (it churns on every `refresh_packages` DELETE +
+    // reinsert and is meaningless across scopes).
+    let packages: Vec<(String, HashSet<String>)> = {
+        let mut stmt = match conn.prepare(
+            "SELECT manifest_dir, local_roots_json FROM packages WHERE commit_sha = ?1 AND \
+             worktree_id = ?2",
+        ) {
             Ok(stmt) => stmt,
             // No `packages` table (pre-V022 / non-Cargo): nothing to load, fall open.
             Err(_) => return Ok(()),
         };
+        let rows = stmt.query_map(params![active_commit_sha, active_worktree_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut packages: Vec<(String, HashSet<String>)> = rows
+            .map(|row| {
+                let (manifest_dir, roots_json) = row?;
+                let roots: HashSet<String> = serde_json::from_str(&roots_json).unwrap_or_default();
+                Ok::<_, anyhow::Error>((manifest_dir, roots))
+            })
+            .collect::<Result<_, _>>()?;
+        packages.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.len()));
+        packages
+    };
+    // No package rows for this scope (non-Cargo corpus, or a scope that never ran
+    // refresh_packages): leave the per-package maps empty so every file falls open to the
+    // global union.
+    if packages.is_empty() {
+        return Ok(());
+    }
+    for (synthetic_id, (_, roots)) in packages.iter().enumerate() {
+        scope.set_package_roots(synthetic_id as i64, roots.clone());
+    }
+
+    // Assign each active file its package by longest manifest-dir prefix — the SAME prefix rule the
+    // persisted assignment used: the empty-dir root manifest is the catch-all, else the path must
+    // equal the dir or continue with `/` after it. Built once on ingest, so `is_external_import`'s
+    // per-file lookup stays O(1). The `files` view scopes to the active checkout (#89). Any package
+    // row in this scope means the corpus is a Cargo project, so even a file matching no package
+    // (left unmapped → global fallback) still marks the scope as having manifests — a bin-only
+    // crate suppresses external imports rather than failing open (#4).
+    {
+        let mut stmt = conn.prepare("SELECT id, path FROM files")?;
         let rows =
             stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
         for row in rows {
-            let (package_id, roots_json) = row?;
-            let roots: HashSet<String> = serde_json::from_str(&roots_json).unwrap_or_default();
-            scope.set_package_roots(package_id, roots);
-        }
-    }
-    // files → package_id, scoped to the active checkout via the `files` TEMP VIEW (overlay wins,
-    // dead scopes excluded), matching the symbol/edge resolution scope. Any non-null package_id in
-    // the active scope means the corpus is a Cargo project — so a bin-only crate (empty root set)
-    // still suppresses external imports rather than failing open (#4). This is scope-correct: it
-    // reads the active checkout's files, not the unscoped `packages` table above.
-    {
-        let mut stmt = conn.prepare(
-            "SELECT files.id, files.package_id FROM files WHERE files.package_id IS NOT NULL",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
-        for row in rows {
-            let (file_id, package_id) = row?;
-            scope.set_file_package(file_id, package_id);
+            let (file_id, path) = row?;
             scope.mark_has_manifests();
+            let package = packages.iter().enumerate().find_map(|(synthetic_id, (dir, _))| {
+                let in_package = dir.is_empty()
+                    || path == *dir
+                    || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+                in_package.then_some(synthetic_id as i64)
+            });
+            if let Some(synthetic_id) = package {
+                scope.set_file_package(file_id, synthetic_id);
+            }
         }
     }
     Ok(())
+}
+
+/// Read a value from the per-connection `temp.connection_context` (the scope table
+/// `install_scope_view` populates). Empty string when absent — a raw test connection without the
+/// view, where `refresh_packages`/`add_package` also write the empty scope.
+fn scope_context_value(conn: &Connection, key: &str) -> String {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT value FROM temp.connection_context WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_default()
 }
 
 /// Re-resolve the ACTIVE CHECKOUT's edges against the ACTIVE CHECKOUT's symbols.
@@ -1133,32 +1197,48 @@ mod tests {
         assert_eq!(resolution, "unresolved");
     }
 
-    fn add_package(conn: &Connection, manifest_dir: &str, roots_json: &str) -> i64 {
+    /// Insert a `packages` row for the active test scope `(NEW, worktree_id)`.
+    fn add_package_in(conn: &Connection, manifest_dir: &str, worktree_id: &str, roots_json: &str) {
         conn.execute(
             "INSERT INTO packages(manifest_dir, commit_sha, worktree_id, local_roots_json) VALUES \
-             (?1, ?2, '', ?3)",
-            params![manifest_dir, NEW, roots_json],
+             (?1, ?2, ?3, ?4)",
+            params![manifest_dir, NEW, worktree_id, roots_json],
+        )
+        .unwrap();
+    }
+
+    fn add_package(conn: &Connection, manifest_dir: &str, roots_json: &str) {
+        add_package_in(conn, manifest_dir, "", roots_json);
+    }
+
+    /// Insert a file row in an explicit `(commit_sha, worktree_id)` scope (the default `add_file`
+    /// pins `worktree_id=''`). Used by the multi-worktree regression test, which needs two files
+    /// living in two different worktree scopes at the same commit.
+    fn add_file_in(conn: &Connection, path: &str, commit: &str, worktree_id: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id) VALUES (?1, 'rust', 'source', ?2, 0, 0, ?3, ?4)",
+            params![path, format!("sha-{commit}-{worktree_id}-{path}"), commit, worktree_id],
         )
         .unwrap();
         conn.last_insert_rowid()
     }
 
     /// #61 (#1 via the DB driver): a `path`-dep alias is local for the package that declares it and
-    /// EXTERNAL for a package that does not — `files.package_id` + `packages.local_roots_json` flow
-    /// through `resolve_all_edges`.
+    /// EXTERNAL for a package that does not. The file→package mapping is computed at LOAD time from
+    /// the `packages` rows (longest `manifest_dir` prefix) — there is no persisted
+    /// `files.package_id` — and `packages.local_roots_json` then flows through
+    /// `resolve_all_edges`.
     #[test]
     fn per_package_alias_suppression_through_db_driver() {
         let conn = seeded_conn();
         // Global fallback union has both crates; per-package sets differ.
         set_local_crate_roots(&conn, "myws\nlocal");
-        let pkg_a = add_package(&conn, "a", "[\"myws\",\"local\"]");
-        let pkg_b = add_package(&conn, "b", "[\"myws\"]");
+        add_package(&conn, "a", "[\"myws\",\"local\"]");
+        add_package(&conn, "b", "[\"myws\"]");
+        // Files live under their package dirs; the loader assigns each by longest-prefix match.
         let file_a = add_file(&conn, "a/src/lib.rs", NEW);
         let file_b = add_file(&conn, "b/src/lib.rs", NEW);
-        conn.execute("UPDATE main.files SET package_id = ?2 WHERE id = ?1", params![file_a, pkg_a])
-            .unwrap();
-        conn.execute("UPDATE main.files SET package_id = ?2 WHERE id = ?1", params![file_b, pkg_b])
-            .unwrap();
         // A local `Thing` definition both files' bare refs could bind to.
         let local = add_symbol(&conn, file_a, "Thing", "crate::a::Thing");
         add_import_edge_scoped(&conn, file_a, "Thing", "use local::Thing;", 0, 9999, MOD_FILE_ROOT);
@@ -1175,6 +1255,53 @@ mod tests {
         assert_eq!(
             to, None,
             "in package B, `local` is an EXTERNAL crate — the bare ref is suppressed"
+        );
+        assert_eq!(resolution, "unresolved");
+    }
+
+    /// #106 multi-worktree regression: two worktree scopes at the SAME commit whose `packages` carry
+    /// DIFFERENT path-dep aliases for the same key. Each scope must resolve `use alias::X` against
+    /// ITS OWN package roots — worktree B must NOT see worktree A's alias as local. This is the
+    /// leak the dropped persisted `files.package_id` caused: a clean file is a shared
+    /// commit-scope row, so stamping it with one worktree's package id let the sibling follow
+    /// the wrong map. Computing the mapping at load from the ACTIVE scope's own `packages` rows
+    /// makes the leak impossible.
+    #[test]
+    fn worktree_package_roots_do_not_leak_across_scopes() {
+        let conn = seeded_conn();
+        // Both worktrees share the commit `NEW`; their `packages` rows differ on whether `local` is
+        // a declared (local) alias. `wt_a` has it; `wt_b` does not.
+        let wt_a = "/wt-a";
+        let wt_b = "/wt-b";
+        set_local_crate_roots(&conn, "myws\nlocal");
+        add_package_in(&conn, "", wt_a, "[\"myws\",\"local\"]");
+        add_package_in(&conn, "", wt_b, "[\"myws\"]");
+        // Each worktree's own overlay row for the same file path (commit_sha empty, worktree set —
+        // the dirty-overlay shape `install_scope_view` selects on for the active worktree).
+        let file_a = add_file_in(&conn, "src/lib.rs", "", wt_a);
+        let file_b = add_file_in(&conn, "src/lib.rs", "", wt_b);
+        let local_a = add_symbol(&conn, file_a, "Thing", "crate::Thing");
+        // A same-named local symbol in B's scope, the temptation the suppression must resist.
+        let _local_b = add_symbol(&conn, file_b, "Thing", "crate::Thing");
+        add_import_edge_scoped(&conn, file_a, "Thing", "use local::Thing;", 0, 9999, MOD_FILE_ROOT);
+        add_import_edge_scoped(&conn, file_b, "Thing", "use local::Thing;", 0, 9999, MOD_FILE_ROOT);
+        let ref_a = add_edge_at_byte(&conn, file_a, "Thing", "", 100);
+        let ref_b = add_edge_at_byte(&conn, file_b, "Thing", "", 100);
+
+        // Resolve worktree A's scope: `local` is A's own alias → LOCAL, binds to A's `Thing`.
+        crate::index::install_scope_view(&conn, NEW, wt_a).unwrap();
+        resolve_all_edges(&conn).unwrap();
+        let (to, _, _) = edge_state(&conn, ref_a);
+        assert_eq!(to, Some(local_a), "worktree A declares `local` — its bare ref binds local");
+
+        // Resolve worktree B's scope: `local` is NOT B's alias → EXTERNAL, the bare ref is
+        // suppressed. If B were following A's package map (the #106 leak), this would bind local.
+        crate::index::install_scope_view(&conn, NEW, wt_b).unwrap();
+        resolve_all_edges(&conn).unwrap();
+        let (to, _, resolution) = edge_state(&conn, ref_b);
+        assert_eq!(
+            to, None,
+            "worktree B does NOT declare `local` — it must not see worktree A's alias as local"
         );
         assert_eq!(resolution, "unresolved");
     }

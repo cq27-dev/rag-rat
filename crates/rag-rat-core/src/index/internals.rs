@@ -663,12 +663,12 @@ impl IndexDatabase {
             self.storage.connection().execute("DELETE FROM edges_data", [])?;
             // Repopulate the per-package import scope BEFORE re-resolving (#61). A bare
             // version-bump re-resolve would re-derive `import_scope_*` on the new edges
-            // but read NULL `files.package_id` + an empty `packages` table (V022 only
-            // ADDED the columns; it did not backfill them), so every file would fall
-            // open to the global union and the new per-package behavior would never
-            // engage on a migrated index. `refresh_packages` writes `packages` +
-            // `files.package_id` + the global `local_crate_roots` union for the active
-            // scope so `resolve_edges` below sees the current package map.
+            // but read an empty `packages` table (V022 only ADDED the column; it did not
+            // backfill `packages`), so every file would fall open to the global union and
+            // the new per-package behavior would never engage on a migrated index.
+            // `refresh_packages` writes the active scope's `packages` rows + the global
+            // `local_crate_roots` union; `resolve_edges` below then computes each file's
+            // package at load time (`load_package_roots_into_scope`) from those rows.
             self.refresh_packages(&root)?;
             let files = self.graph_reindex_files()?;
             for file in files {
@@ -706,10 +706,10 @@ impl IndexDatabase {
         self.set_meta("graph_index_version", GRAPH_INDEX_VERSION)
     }
 
-    /// Rewrite the `packages` rows for the ACTIVE scope from the corpus's Cargo manifests and
-    /// assign `files.package_id`, then persist the GLOBAL local-crate-root union to
-    /// `index_meta.local_crate_roots` (#61 per-package import scope). Returns whether the package
-    /// map changed (so an incremental pass can trigger a re-resolve only when it must).
+    /// Rewrite the `packages` rows for the ACTIVE scope from the corpus's Cargo manifests, then
+    /// persist the GLOBAL local-crate-root union to `index_meta.local_crate_roots` (#61 per-package
+    /// import scope). Returns whether the package map changed (so an incremental pass can trigger a
+    /// re-resolve only when it must).
     ///
     /// "Changed" is reported when EITHER the global union changed OR any package's per-scope
     /// `(manifest_dir, local_roots_json)` set changed. Reporting only the global union missed a
@@ -719,11 +719,16 @@ impl IndexDatabase {
     /// results stale until an unrelated Rust edit or a full rebuild.
     ///
     /// Scoped by `(active_commit_sha, active_worktree_id)` like `files`: each pass owns its scope's
-    /// rows (DELETE + reinsert), and a sibling worktree's package rows are untouched. A file is
-    /// assigned the package whose RELATIVE `manifest_dir` is the longest prefix of the file's
-    /// stored path (the root manifest's empty dir is the catch-all). Resolution falls open to
-    /// the global set for any file left with NULL `package_id` (no manifest matched / non-Cargo
-    /// corpus).
+    /// rows (DELETE + reinsert), and a sibling worktree's package rows are untouched. The file→
+    /// package mapping is NOT persisted onto `files`: `load_package_roots_into_scope` (resolve.rs)
+    /// computes it at LOAD time by longest-`manifest_dir`-prefix over the active scope's `packages`
+    /// rows + the active files. Persisting a `files.package_id` pointer was the #106 multi-worktree
+    /// leak — a clean file is a SHARED commit-scope row (`commit_sha=HEAD, worktree_id=''`) read by
+    /// every worktree at that commit, while a package row is worktree-scoped, so one worktree's
+    /// refresh stamped its package ids onto the shared rows another worktree then followed (and the
+    /// DELETE-and-reinsert churns the AUTOINCREMENT ids each pass, invalidating any sibling's
+    /// pointer). Computing the mapping at load reads each scope's OWN `packages`, so no
+    /// cross-worktree pointer exists to leak.
     pub(super) fn refresh_packages(&self, root: &Path) -> anyhow::Result<bool> {
         let (global_roots, packages) = super::edges::scan_packages(root);
         let conn = self.storage.connection();
@@ -740,15 +745,13 @@ impl IndexDatabase {
                 })?;
             rows.collect::<Result<_, _>>()?
         };
-        // Replace this scope's package rows. The id is reassigned each rebuild, which is fine — it
-        // is referenced only by this scope's freshly-written files.package_id below.
+        // Replace this scope's package rows. The id is reassigned each rebuild, which is fine — the
+        // file→package mapping is computed at LOAD time from `manifest_dir`, not from a persisted
+        // id.
         conn.execute("DELETE FROM packages WHERE commit_sha = ?1 AND worktree_id = ?2", params![
             self.active_commit_sha,
             self.active_worktree_id
         ])?;
-        // (manifest_dir, package_id), kept for the longest-prefix file assignment. Sort longest dir
-        // first so the first matching prefix is the most specific package.
-        let mut package_ids: Vec<(String, i64)> = Vec::with_capacity(packages.len());
         // The freshly-written map, compared against `previous_package_map` below.
         let mut current_package_map: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
@@ -767,41 +770,8 @@ impl IndexDatabase {
                 ],
             )?;
             current_package_map.insert(package.manifest_dir.clone(), roots_json);
-            package_ids.push((package.manifest_dir.clone(), conn.last_insert_rowid()));
         }
         let package_map_changed = current_package_map != previous_package_map;
-        package_ids.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.len()));
-
-        // Assign package_id for every file in the active scope by longest manifest-dir prefix. A
-        // file at `crates/foo/src/x.rs` belongs to the package rooted at `crates/foo` (dir `crates/
-        // foo`), not the workspace root (dir ``) — so the path must continue with `/` after the
-        // prefix (or equal it), and the empty-dir root manifest matches anything as the fallback.
-        //
-        // Read through the `files` TEMP VIEW (#89), NOT `main.files` with a both-columns-equal
-        // predicate. The scope view is the UNION encoded by `install_scope_view`: clean rows are
-        // `(commit_sha=HEAD, worktree_id='')`, dirty overlays are `(commit_sha='',
-        // worktree_id=active)`, and the overlay shadows its committed twin. A both-equal
-        // `main.files` filter matched NEITHER case in a real checkout (clean rows have an empty
-        // worktree_id, overlays an empty commit_sha), leaving every file's package_id NULL so the
-        // resolver fell open to the global union — the per-package alias leak this change fixes.
-        // The view's `id` is `main.files.id`, so the UPDATE below targets the real row by its key.
-        let files: Vec<(i64, String)> = {
-            let mut stmt = conn.prepare("SELECT id, path FROM files")?;
-            let rows =
-                stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        for (file_id, path) in files {
-            let package_id = package_ids.iter().find_map(|(dir, id)| {
-                let in_package = dir.is_empty()
-                    || path == *dir
-                    || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
-                in_package.then_some(*id)
-            });
-            conn.execute("UPDATE main.files SET package_id = ?2 WHERE id = ?1", params![
-                file_id, package_id
-            ])?;
-        }
 
         let serialized = {
             let mut sorted: Vec<&str> = global_roots.iter().map(String::as_str).collect();

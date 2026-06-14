@@ -53,10 +53,10 @@ impl IndexDatabase {
             mem_trace("after clear_full_rebuild_tables (purge)");
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
-            // Per-package import scope (#61): the `packages` rows + `files.package_id` + the global
-            // `local_crate_roots` union are written by `refresh_packages`, called inside
-            // `index_targets_with_progress` AFTER files are inserted but BEFORE the in-memory
-            // resolve pass — package assignment reads `main.files`, which does not exist yet here.
+            // Per-package import scope (#61): the `packages` rows + the global `local_crate_roots`
+            // union are written by `refresh_packages`, called inside `index_targets_with_progress`
+            // AFTER files are inserted but BEFORE the in-memory resolve pass (which computes each
+            // file's package from those rows at load time) — the files do not exist yet here.
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
             mem_trace("after index_targets (edges resolved+inserted)");

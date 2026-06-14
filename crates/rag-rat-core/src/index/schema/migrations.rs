@@ -459,8 +459,12 @@ pub(crate) fn apply_symbol_scope_path(conn: &Connection) -> rusqlite::Result<()>
 /// `files`. `local_roots_json` is this package's own importable crate roots — the workspace crate
 /// names (global union) PLUS this manifest's in-corpus path-dependency alias keys — so a
 /// `use alias::…` resolves local for the package that declares the alias and external everywhere
-/// else (#1: per-package locality). `files.package_id` points each file at its owning package
-/// (NULL → fall open to the global `index_meta.local_crate_roots` set).
+/// else (#1: per-package locality). The file→package mapping is NOT persisted on `files`: the
+/// resolver computes it at LOAD time (`load_package_roots_into_scope`) by longest-`manifest_dir`-
+/// prefix over the active scope's `packages` rows. A persisted `files.package_id` pointer was the
+/// #106 multi-worktree leak — a clean file is a SHARED commit-scope row read by every worktree, but a
+/// package row is worktree-scoped, so one worktree's refresh stamped its ids onto a sibling's
+/// shared rows. Computing at load reads each scope's OWN `packages`, so no pointer can leak.
 ///
 /// Edge columns are DEDICATED (`import_scope_*`, `import_mod_id`), NOT a callee_* overload: the
 /// oracle's candidate filter is `callee_start_byte IS NOT NULL`, and overloading that column with a
@@ -483,18 +487,19 @@ pub(crate) fn apply_per_package_import_scope(conn: &Connection) -> rusqlite::Res
         CREATE INDEX IF NOT EXISTS idx_packages_scope ON packages(commit_sha, worktree_id);
         ",
     )?;
-    add_column_if_missing(conn, "files", "package_id", "INTEGER")?;
     // The dedicated import-scope columns on the REAL edge table (the `edges` symbol is a view
     // post-V020) are added + the compatibility view recreated by `ensure_edges_view`, which owns
     // the view↔table column contract and is idempotent. (It already ran at V020; rerun so a
     // forward-migrate from a pre-V022 index that somehow skipped the V020 rerun still converges.)
     ensure_edges_view(conn)?;
-    // This migration only adds the package/scope COLUMNS — it does not backfill `packages` /
-    // `files.package_id` or re-derive the `import_scope_*` edge columns on existing rows. That
-    // backfill rides the `GRAPH_INDEX_VERSION` bump (→ 7) instead: an upgraded index has a stale
-    // `graph_index_version`, so `ensure_graph_index_current` re-resolves on next open and (per the
-    // `refresh_packages` call added to that path) repopulates the scope. Without the version bump
-    // the new per-package behavior would never engage post-migration.
+    // This migration only adds the package table + edge COLUMNS — it does not backfill `packages`
+    // or re-derive the `import_scope_*` edge columns on existing rows. That backfill rides the
+    // `GRAPH_INDEX_VERSION` bump (→ 7) instead: an upgraded index has a stale
+    // `graph_index_version`, so `ensure_graph_index_current` re-resolves on next open and (per
+    // the `refresh_packages` call added to that path) repopulates `packages`. Without the
+    // version bump the new per-package behavior would never engage post-migration. The
+    // file→package mapping is computed at LOAD time from `packages`, so there is no
+    // `files.package_id` column to add.
     Ok(())
 }
 

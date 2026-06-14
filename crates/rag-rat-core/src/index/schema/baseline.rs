@@ -20,9 +20,6 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             indexed_revision TEXT NOT NULL DEFAULT '',
             commit_sha TEXT NOT NULL DEFAULT '',
             worktree_id TEXT NOT NULL DEFAULT '',
-            -- Owning Cargo package (#61, V022): the per-package local-crate-root set lives in
-            -- `packages`; NULL → fall open to the global `index_meta.local_crate_roots`.
-            package_id INTEGER,
             UNIQUE(path, commit_sha, worktree_id)
         );
 

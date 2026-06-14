@@ -101,13 +101,15 @@ impl IndexDatabase {
                 mutated = true;
             }
             // Per-package import scope (#61, salvaging #95's ordering): rewrite `packages` +
-            // reassign `files.package_id` + refresh the global `local_crate_roots` union BEFORE the
-            // resolve pass, so the resolver sees the current package map. Run it when a file was
-            // (re)indexed (a new/edited .rs needs its package_id) OR a Cargo.toml is in the change
-            // set (the crate set may have changed) — OUTSIDE the `indexed>0 || healed>0` gate, so a
-            // manifest-only change (no Rust file touched, indexed==0) still refreshes (#95 bug:
-            // the refresh was nested inside that gate and was skipped, leaving the crate set stale
-            // until the next full rebuild). `refresh_packages` returns whether the global union
+            // refresh the global `local_crate_roots` union BEFORE the resolve pass, so
+            // the resolver sees the current package map (the file→package mapping is
+            // then computed at resolve LOAD time from those rows — there is no
+            // persisted `files.package_id` to reassign). Run it when a Cargo.toml is in
+            // the change set (the crate set may have changed) OR a file was (re)indexed
+            // — OUTSIDE the `indexed>0 || healed>0` gate, so a manifest-only change (no
+            // Rust file touched, indexed==0) still refreshes (#95 bug: the refresh was nested
+            // inside that gate and was skipped, leaving the crate set stale until the
+            // next full rebuild). `refresh_packages` returns whether the package map
             // changed, which forces a re-resolve even when no file was indexed.
             let roots_changed = if indexed > 0 || healed > 0 || manifest_in_change_set {
                 db.refresh_packages(&config.root)?
@@ -204,10 +206,11 @@ impl IndexDatabase {
             }
             // `prepared` (this wave's chunk texts / symbols / edge candidates) drops here.
         }
-        // Per-package import scope (#61): write `packages` + `files.package_id` + the global
+        // Per-package import scope (#61): write the active scope's `packages` rows + the global
         // `local_crate_roots` union now — files are inserted, but the resolve below has not run, so
-        // it reads the fresh package assignment. (`set_context` installs the `files` scope view at
-        // open, so the scoped reads in the resolve see these rows.)
+        // it computes each file's package from these fresh rows at load time. (`set_context`
+        // installs the `files` scope view at open, so the scoped reads in the resolve see
+        // these rows.)
         self.refresh_packages(&config.root)?;
         edges::resolve_and_insert_edges(self.storage.connection(), graph)?;
 

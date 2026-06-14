@@ -6727,9 +6727,11 @@ fn conn_table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
 }
 
 /// V022 bootstrap (fresh-applies-all): a brand-new index applies every migration through V022 and
-/// ends with the `packages` table, `files.package_id`, and the three DEDICATED edge import-scope
-/// columns — and the `edges` compatibility view surfaces them. The oracle's `callee_*` columns are
-/// untouched (the columns are dedicated, not a callee overload).
+/// ends with the `packages` table and the three DEDICATED edge import-scope columns — and the
+/// `edges` compatibility view surfaces them. There is NO `files.package_id` column: the
+/// file→package mapping is computed at LOAD time from `packages` (the #106 fix dropped the
+/// persisted pointer). The oracle's `callee_*` columns are untouched (the columns are dedicated,
+/// not a callee overload).
 #[test]
 fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -6744,8 +6746,8 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
         assert!(package_cols.contains(&expected.to_string()), "packages missing {expected}");
     }
     assert!(
-        conn_table_columns(&conn, "files").contains(&"package_id".to_string()),
-        "files.package_id is added"
+        !conn_table_columns(&conn, "files").contains(&"package_id".to_string()),
+        "files.package_id is NOT added — the file→package mapping is computed at load (#106)"
     );
     // Dedicated columns on the real edge table — NOT a callee_* overload.
     let edges_data_cols = conn_table_columns(&conn, "edges_data");
@@ -6776,9 +6778,11 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
 }
 
 /// V022 forward-only migrate (older→latest): an index lacking the V022 artifacts (the `packages`
-/// table, `files.package_id`, the edge import-scope columns, and the V022 schema_version row) is
-/// re-`apply`ed and converges to V22 with all artifacts present — proving the migration is additive
-/// and idempotent on top of an older shape, the auto-migrate-forward path (#102).
+/// table, the edge import-scope columns, and the V022 schema_version row) is re-`apply`ed and
+/// converges to V22 with all artifacts present — proving the migration is additive and idempotent
+/// on top of an older shape, the auto-migrate-forward path (#102). V022 does NOT add a `files`
+/// column (the file→package mapping is computed at load, #106), so there is nothing to drop/re-add
+/// there.
 #[test]
 fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -6793,7 +6797,6 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DROP TRIGGER IF EXISTS edges_view_insert;
         DROP TRIGGER IF EXISTS edges_view_update;
         DROP TRIGGER IF EXISTS edges_view_delete;
-        ALTER TABLE files DROP COLUMN package_id;
         ALTER TABLE edges_data DROP COLUMN import_scope_start_byte;
         ALTER TABLE edges_data DROP COLUMN import_scope_end_byte;
         ALTER TABLE edges_data DROP COLUMN import_mod_id;
@@ -6808,7 +6811,10 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
     schema::apply(&conn).unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, 22);
     assert!(conn_table_exists(&conn, "packages"), "forward migrate creates packages");
-    assert!(conn_table_columns(&conn, "files").contains(&"package_id".to_string()));
+    assert!(
+        !conn_table_columns(&conn, "files").contains(&"package_id".to_string()),
+        "forward migrate does NOT add files.package_id (#106 computes the mapping at load)"
+    );
     let edges_data_cols = conn_table_columns(&conn, "edges_data");
     for expected in ["import_scope_start_byte", "import_scope_end_byte", "import_mod_id"] {
         assert!(edges_data_cols.contains(&expected.to_string()), "forward migrate adds {expected}");
@@ -6842,15 +6848,13 @@ fn full_rebuild_applies_per_package_import_scope() {
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
 
-    // The `packages` table was populated with myapp's root crate.
+    // The `packages` table was populated with myapp's root crate. The file→package mapping is NOT
+    // persisted (#106) — the resolver computes it at load from this row — so there is no
+    // `files.package_id` to assert; the behavioral assertions below prove the load-time computation
+    // engaged.
     let package_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0)).unwrap();
     assert!(package_count >= 1, "rebuild writes a packages row for the manifest");
-    // Every indexed file got a package_id (the single root package owns src/lib.rs).
-    let unassigned: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files WHERE package_id IS NULL", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(unassigned, 0, "the file is assigned to its owning package");
 
     // The `Display` reference (use'd from external std) must NOT bind to the local `Display`
     // struct.
@@ -7290,25 +7294,46 @@ fn full_rebuild_survives_stale_overlay_rows() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// #1: in a REAL git checkout the active context is `(commit_sha=HEAD, worktree_id=<root path>)`
-/// while a clean file row is `(commit_sha=HEAD, worktree_id='')`. `refresh_packages` once SELECTed
-/// files with BOTH columns equal to the active values, which matches NEITHER a clean row (empty
-/// worktree_id) nor an overlay (empty commit_sha) — so `files.package_id` stayed NULL and the
-/// resolver fell open to the global union, leaking per-package aliases. Reading through the `files`
-/// scope VIEW assigns package_id correctly. Prior tests missed this: they used non-git fixtures
-/// where `active_worktree_id` is empty, so the both-equal predicate accidentally matched.
+/// #1 / #106: in a REAL git checkout the active context is `(commit_sha=HEAD, worktree_id=<root
+/// path>)` while a clean file row is `(commit_sha=HEAD, worktree_id='')`. The file→package mapping
+/// is computed at LOAD time (`load_package_roots_into_scope`) by longest-`manifest_dir`-prefix over
+/// the active scope's `packages` rows — there is no persisted `files.package_id` (#106 dropped it
+/// to stop a worktree from stamping its package ids onto shared clean rows). This proves the
+/// load-time computation correctly maps a clean-checkout file to ITS package on a real git
+/// checkout: a path-dep alias declared only by crate `foo` resolves LOCAL inside `foo` and EXTERNAL
+/// inside crate `bar`.
 #[test]
-fn clean_checkout_file_gets_package_id_assigned() {
+fn clean_checkout_file_resolves_against_its_own_package_roots() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("crates/foo/src")).unwrap();
+    fs::create_dir_all(root.join("crates/bar/src")).unwrap();
+    fs::create_dir_all(root.join("crates/helper/src")).unwrap();
     run_git(&root, &["init"]);
     run_git(&root, &["config", "user.name", "Rag Rat"]);
     run_git(&root, &["config", "user.email", "rag@example.com"]);
-    // A two-crate Cargo workspace so the package map is non-trivial.
+    // A workspace where ONLY `foo` declares the RENAMED path-dep alias `shared` (pointing at the
+    // `helper` crate). The alias KEY `shared` is local ONLY to foo — it is not a workspace crate
+    // name (that is `helper`) and bar never declares it — so the same `use shared::Thing` is
+    // local in foo and external in bar. This is the per-package locality (#1) the load-time
+    // mapping must honor.
     fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[\"crates/*\"]\n").unwrap();
-    fs::write(root.join("crates/foo/Cargo.toml"), "[package]\nname=\"foo\"\n").unwrap();
-    fs::write(root.join("crates/foo/src/lib.rs"), "pub fn foo() -> i32 { 1 }\n").unwrap();
+    fs::write(
+        root.join("crates/foo/Cargo.toml"),
+        "[package]\nname=\"foo\"\n[dependencies]\nshared = { path = \"../helper\", package = \
+         \"helper\" }\n",
+    )
+    .unwrap();
+    // Both foo and bar reference a same-named `Thing` in TYPE position (a `references_type` edge —
+    // the bucket per-package suppression acts on).
+    fs::write(root.join("crates/foo/src/lib.rs"), "use shared::Thing;\npub fn foo(_t: Thing) {}\n")
+        .unwrap();
+    fs::write(root.join("crates/bar/Cargo.toml"), "[package]\nname=\"bar\"\n").unwrap();
+    fs::write(root.join("crates/bar/src/lib.rs"), "use shared::Thing;\npub fn bar(_t: Thing) {}\n")
+        .unwrap();
+    fs::write(root.join("crates/helper/Cargo.toml"), "[package]\nname=\"helper\"\n").unwrap();
+    // A local `Thing` symbol the bare references could bind to.
+    fs::write(root.join("crates/helper/src/lib.rs"), "pub struct Thing;\n").unwrap();
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-m", "init"]);
 
@@ -7330,20 +7355,39 @@ fn clean_checkout_file_gets_package_id_assigned() {
     let db = IndexDatabase::rebuild(&config).unwrap();
     assert!(!db.active_commit_sha.is_empty(), "fixture must be a real git checkout");
     assert!(!db.active_worktree_id.is_empty(), "a real checkout has a non-empty worktree id");
+    let conn = db.storage.connection();
 
-    let package_id: Option<i64> = db
-        .storage
-        .connection()
+    // In `foo`, `shared` is its declared path-dep alias → LOCAL → the bare `Thing` binds to the
+    // shared crate's `Thing`. In `bar`, `shared` is undeclared → EXTERNAL → the bare `Thing` is
+    // suppressed (stays unresolved). If the load-time mapping fell open to the global union (the
+    // #106 leak), bar's reference would wrongly bind too.
+    let foo_bound: i64 = conn
         .query_row(
-            "SELECT package_id FROM main.files WHERE path = 'crates/foo/src/lib.rs' AND kind != \
-             'deleted'",
+            "SELECT COUNT(*) FROM edges e JOIN files f ON f.id = e.source_file_id WHERE f.path = \
+             'crates/foo/src/lib.rs' AND e.to_name = 'Thing' AND e.edge_kind != 'imports' AND \
+             e.to_symbol_id IS NOT NULL",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert!(
-        package_id.is_some(),
-        "a normal clean-checkout file in a Cargo project must have package_id populated, not NULL"
+        foo_bound >= 1,
+        "in foo, `shared` is its own path-dep alias — the bare `Thing` resolves to the local \
+         symbol"
+    );
+    let bar_bound: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges e JOIN files f ON f.id = e.source_file_id WHERE f.path = \
+             'crates/bar/src/lib.rs' AND e.to_name = 'Thing' AND e.edge_kind != 'imports' AND \
+             e.to_symbol_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        bar_bound, 0,
+        "in bar, `shared` is an EXTERNAL crate — the bare `Thing` must NOT bind to the local \
+         symbol"
     );
 
     fs::remove_dir_all(root).unwrap();
