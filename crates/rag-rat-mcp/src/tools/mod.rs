@@ -637,6 +637,20 @@ pub fn call_tool_for_config(
     {
         obj.insert("version".to_string(), serde_json::json!(version));
     }
+    // Mirror the CLI's `apply_auto_run_ranking_hint`: when the background auto-fresh oracle is on,
+    // rewrite `important_symbols`' heuristic nudge so it doesn't tell the agent to run `oracle run`
+    // by hand — compiler ranking refreshes on its own. The core query is config-unaware, so the
+    // rewrite happens here where the config is available. (#142 review)
+    if name == "important_symbols"
+        && config.oracle.auto_run
+        && let Some(obj) = result.as_object_mut()
+        && obj.get("ranking_hint").and_then(Value::as_str).is_some()
+    {
+        obj.insert(
+            "ranking_hint".to_string(),
+            serde_json::json!(rag_rat_core::query::pagerank::RANKING_HINT_AUTO_RUN),
+        );
+    }
     Ok(result)
 }
 

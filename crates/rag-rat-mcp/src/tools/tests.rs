@@ -656,6 +656,34 @@ fn assert_symbol_selector_schema(tools: &[Value], name: &str) {
     }
 }
 
+#[test]
+fn mcp_rewrites_ranking_hint_when_auto_run_enabled() {
+    // #142 review: with `[oracle] auto_run` on and no oracle data yet, the important_symbols nudge
+    // must say compiler ranking refreshes in the background — not tell the agent to run `oracle
+    // run` by hand. The core query is config-unaware, so call_tool_for_config applies the
+    // rewrite.
+    let (root, mut config) = mixed_config();
+    IndexDatabase::rebuild(&config).unwrap();
+
+    config.oracle.auto_run = true;
+    let auto = call_tool_for_config(&config, "important_symbols", json!({"limit": 5})).unwrap();
+    assert_eq!(
+        auto["ranking_hint"].as_str(),
+        Some(rag_rat_core::query::pagerank::RANKING_HINT_AUTO_RUN),
+        "auto_run must rewrite the heuristic nudge: {auto:?}"
+    );
+
+    // With auto_run OFF the default manual-run nudge is preserved.
+    config.oracle.auto_run = false;
+    let manual = call_tool_for_config(&config, "important_symbols", json!({"limit": 5})).unwrap();
+    assert_eq!(
+        manual["ranking_hint"].as_str(),
+        Some(rag_rat_core::query::pagerank::RANKING_HINT_RUN_ORACLE),
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn tool_schema<'a>(tools: &'a [Value], name: &str) -> &'a Value {
     tools
         .iter()

@@ -298,24 +298,31 @@ pub fn important_symbols(
     conn: &Connection,
     options: ImportanceOptions<'_>,
 ) -> anyhow::Result<RankedImportance> {
-    // Resolved symbol→symbol edges in the active checkout: both endpoints non-null, source file in
-    // the scope view. `edge_strings` resolves the edge-kind and confidence ids to their names — the
-    // kind sets the base weight, the confidence scales it (a name-only guess flows less rank than a
+    // Symbol→symbol edges in the active checkout whose SOURCE resolved, source file in the scope
+    // view. `edge_strings` resolves the edge-kind and confidence ids to their names — the kind sets
+    // the base weight, the confidence scales it (a name-only guess flows less rank than a
     // structurally-resolved call). `d.id` keys the optional SCIP-oracle effect lookup.
+    //
+    // We intentionally KEEP edges with a NULL target so a SCIP-oracle UPGRADE can still supply one:
+    // the compiler routinely resolves a `NameOnly`/unresolved heuristic edge (`to_symbol_id` NULL)
+    // to an in-corpus symbol, and that recovered call must contribute PageRank — filtering NULL
+    // targets here dropped exactly the upgrade cases the SCIP-aware ranking exists to capture (#142
+    // review P1). A NULL-target edge with no Retarget verdict carries no usable callee and is
+    // skipped in the loop below.
     let mut stmt = conn.prepare(
         "SELECT d.id, d.from_symbol_id, d.to_symbol_id, ek.value, cf.value
          FROM edges_data d
          JOIN files ON files.id = d.source_file_id
          JOIN edge_strings ek ON ek.id = d.edge_kind_id
          JOIN edge_strings cf ON cf.id = d.confidence_id
-         WHERE d.from_symbol_id IS NOT NULL AND d.to_symbol_id IS NOT NULL",
+         WHERE d.from_symbol_id IS NOT NULL",
     )?;
     let rows = stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
             ))
@@ -338,13 +345,22 @@ pub fn important_symbols(
     for (edge_id, from, to, kind, confidence) in &rows {
         // Apply the SCIP verdict, if any: drop a contradicted/external edge entirely, retarget an
         // upgrade to the compiler's resolved symbol, and weight a confirmed/upgraded edge at the
-        // compiler tier. Absent a verdict, fall back to heuristic confidence weighting.
+        // compiler tier. Absent a verdict, fall back to heuristic confidence weighting. A Retarget
+        // supplies a target even when the heuristic edge had none (NULL `to`); Confirm and the
+        // heuristic path need an existing target, so a NULL-target edge without a Retarget is
+        // skipped (no usable callee).
         let (to_id, weight) = match options.oracle_effects.and_then(|m| m.get(edge_id)) {
             Some(EdgeOracleEffect::Drop) => continue,
             Some(EdgeOracleEffect::Retarget(resolved)) =>
                 (*resolved, edge_weight(kind) * COMPILER_FACTOR),
-            Some(EdgeOracleEffect::Confirm) => (*to, edge_weight(kind) * COMPILER_FACTOR),
-            None => (*to, edge_weight(kind) * confidence_factor(confidence)),
+            Some(EdgeOracleEffect::Confirm) => match to {
+                Some(to) => (*to, edge_weight(kind) * COMPILER_FACTOR),
+                None => continue,
+            },
+            None => match to {
+                Some(to) => (*to, edge_weight(kind) * confidence_factor(confidence)),
+                None => continue,
+            },
         };
         let from_idx = intern(*from, &mut index_of, &mut symbol_ids);
         let to_idx = intern(to_id, &mut index_of, &mut symbol_ids);
@@ -636,6 +652,56 @@ mod tests {
             .unwrap();
         }
         conn
+    }
+
+    #[test]
+    fn oracle_upgrade_ranks_a_recovered_null_target_edge() {
+        // #142 review P1: a NameOnly/unresolved heuristic edge has to_symbol_id NULL — only the
+        // SCIP verdict carries the resolved in-corpus target. The edge must still contribute
+        // PageRank via EdgeOracleEffect::Retarget, or compiler-recovered calls are dropped from the
+        // ranking (the very upgrade case SCIP-aware ranking exists to capture).
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES ('a.rs', 'rust', 'source', 'h', 0, 0)",
+            [],
+        )
+        .unwrap();
+        for i in 1..=2 {
+            conn.execute(
+                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                                     end_byte, signature, docs)
+                 VALUES (1, 'rust', ?1, ?2, 'function', 0, 10, NULL, NULL)",
+                params![format!("s{i}"), format!("a::s{i}")],
+            )
+            .unwrap();
+        }
+        // A NameOnly edge from s1 the heuristic could NOT resolve (to_symbol_id NULL), edge id 1.
+        conn.execute(
+            "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
+                               target_qualified_name, edge_kind, confidence)
+             VALUES (1, 1, NULL, 's2', 'a::s2', 'calls_name', 'NameOnly')",
+            [],
+        )
+        .unwrap();
+
+        // No verdict → the unresolved edge contributes no callee → empty graph (not an error).
+        assert!(important_symbols(&conn, opts(10, &[])).unwrap().symbols.is_empty());
+
+        // The compiler resolves the edge to s2 → s2 must now be ranked.
+        let effects = HashMap::from([(1_i64, EdgeOracleEffect::Retarget(2))]);
+        let out = important_symbols(&conn, ImportanceOptions {
+            limit: 10,
+            personalize_to: &[],
+            oracle_effects: Some(&effects),
+        })
+        .unwrap()
+        .symbols;
+        assert!(
+            out.iter().any(|s| s.qualified_name == "a::s2"),
+            "the oracle-recovered target must be ranked: {out:?}"
+        );
     }
 
     #[test]

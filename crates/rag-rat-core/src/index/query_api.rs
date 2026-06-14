@@ -1949,7 +1949,12 @@ impl IndexDatabase {
                 limit: PER_NAME_SEED_CAP,
                 ..by_path
             };
-            let candidates = self.symbol_candidates(&by_name)?.candidates;
+            // Use the UNENRICHED lookup: seed resolution only needs `symbol_id`, and the enriched
+            // `symbol_candidates` would fetch the oracle effect map + run a fan-in query per hit —
+            // a whole-graph oracle scan per seed name, repeated, all discarded here (#142 review).
+            let candidates =
+                crate::query::symbol::lookup_candidates(self.storage.connection(), &by_name)?
+                    .candidates;
             if candidates.is_empty() {
                 unresolved += 1;
             } else {
@@ -2184,8 +2189,10 @@ impl IndexDatabase {
     /// oracle fetch for the whole batch.
     fn enrich_search_hits_with_load_bearing(&self, hits: &mut [SearchHit]) -> anyhow::Result<()> {
         use crate::query::load_bearing::{self, OracleContext};
-        // Nothing to enrich → don't pay the oracle lookup. (#142 review)
-        if hits.is_empty() {
+        // Nothing enrichable → don't pay the (whole-graph) oracle lookup. A result made entirely of
+        // file/doc chunks with no `symbol_path` (common for Markdown/config) would otherwise scan
+        // every oracle verdict and then skip every hit. (#142 review)
+        if hits.iter().all(|hit| hit.symbol_path.is_none()) {
             return Ok(());
         }
         let effects = self.load_bearing_oracle_effects()?;
