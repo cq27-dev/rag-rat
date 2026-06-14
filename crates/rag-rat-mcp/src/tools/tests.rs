@@ -358,6 +358,20 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
     assert_eq!(impact["repo_memories"]["direct"].as_array().unwrap()[0]["memory_id"], memory_id);
     assert_eq!(impact["completeness_and_caveats"]["memory_status"]["active"], 1);
 
+    // symbol_lookup must still attach bound memories to each candidate. The enrichment resolves
+    // them from the in-memory hit's internal symbol_id, which no longer crosses the wire (#149/#153
+    // review) — reading it back off the serialized candidate would find nothing and drop them all.
+    let enriched = call_tool(
+        &config.database,
+        "symbol_lookup",
+        json!({"symbol": "cfg_helper", "allow_ambiguous": true}),
+    )
+    .unwrap();
+    let candidate_memories = enriched["candidates"].as_array().unwrap()[0]["memories"]
+        .as_array()
+        .expect("symbol_lookup candidate should carry its bound memory");
+    assert_eq!(candidate_memories[0]["memory_id"], memory_id);
+
     let validation = call_tool(&config.database, "memory_validate", json!({})).unwrap();
     assert_eq!(validation["current"], 1);
     let obsolete =

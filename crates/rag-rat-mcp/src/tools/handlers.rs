@@ -219,25 +219,11 @@ pub(crate) fn symbol_lookup_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow
     let Some(candidates) = value.get_mut("candidates").and_then(Value::as_array_mut) else {
         return Ok(value);
     };
-    let selector = SymbolSelector {
-        logical_symbol_id: None,
-        symbol_id: None,
-        symbol_path: None,
-        symbol: None,
-        language: None,
-        allow_ambiguous: true,
-        limit: 1,
-    };
-    for candidate in candidates {
-        let Some(symbol_id) = candidate.get("symbol_id").and_then(Value::as_i64) else {
-            continue;
-        };
-        let mut selector = selector.clone();
-        selector.symbol_id = Some(symbol_id);
-        let Ok(Ok(Some(symbol))) = db.select_symbol(&selector) else {
-            continue;
-        };
-        let memories = db.memory_for_symbol(&symbol, 10)?;
+    // Resolve memories from the in-memory hits, which still carry the internal `symbol_id`. The
+    // serialized candidates no longer expose it (#149), so the old read of `candidate["symbol_id"]`
+    // found nothing and dropped every memory — zip by position against the source hits instead.
+    for (candidate, hit) in candidates.iter_mut().zip(&lookup.candidates) {
+        let memories = db.memory_for_symbol(hit, 10)?;
         if !memories.is_empty() {
             candidate["memories"] = json!(memories);
         }

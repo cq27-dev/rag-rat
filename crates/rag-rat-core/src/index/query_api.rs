@@ -7,8 +7,8 @@ use crate::index::oracle::{
 use crate::query::pagerank::ImportantSymbolsResult;
 
 /// Inputs to [`IndexDatabase::important_symbols`]. The seed (`personalize`) takes names, paths, or
-/// numeric ids; `auto_seed_from_diff` is the MCP-only default (seed from the current git diff when
-/// no explicit seed is given) — the CLI passes `false` so it stays global-by-default. The
+/// `sym_<hex>` handles; `auto_seed_from_diff` is the MCP-only default (seed from the current git
+/// diff when no explicit seed is given) — the CLI passes `false` so it stays global-by-default. The
 /// intentional MCP/CLI divergence is acceptance-invariant #1.
 pub struct ImportantSymbolsRequest {
     pub limit: usize,
@@ -2074,8 +2074,33 @@ impl IndexDatabase {
             if entry.is_empty() {
                 continue;
             }
-            if let Ok(id) = entry.parse::<i64>() {
-                symbol_ids.push(id);
+            // An opaque `sym_<hex>` handle — what every symbol-returning tool now emits as the id
+            // to feed back here (#149). Resolve the logical symbol to its in-scope
+            // member rowids. A raw numeric id is deliberately NOT accepted: the wire
+            // dropped `symbol_id` (reindex-churned), so a bare number would be a stale
+            // rowid that silently seeds the wrong symbol.
+            if entry.starts_with("sym_") {
+                let Some(logical_symbol_id) = crate::serde_big_id::parse_sym_handle(entry) else {
+                    unresolved += 1;
+                    continue;
+                };
+                let by_handle = SymbolSelector {
+                    logical_symbol_id: Some(logical_symbol_id),
+                    symbol_id: None,
+                    symbol_path: None,
+                    symbol: None,
+                    language: None,
+                    allow_ambiguous: true,
+                    limit: PER_NAME_SEED_CAP,
+                };
+                let members =
+                    crate::query::symbol::lookup_candidates(self.storage.connection(), &by_handle)?
+                        .candidates;
+                if members.is_empty() {
+                    unresolved += 1;
+                } else {
+                    symbol_ids.extend(members.into_iter().map(|hit| hit.symbol_id));
+                }
                 continue;
             }
             // Try `symbol_path` (EXACT qualified name) FIRST: an unambiguous fully-qualified name
@@ -3448,20 +3473,27 @@ mod oracle_surfacing_tests {
         assert_eq!(seed.skipped.no_symbols, 1, "the bogus name is skipped, not fatal");
         assert!(result.reason.is_none());
 
-        // A raw numeric id is accepted verbatim (the `target` symbol id).
+        // A `sym_<hex>` handle — the id every symbol-returning tool now emits (#149) — resolves to
+        // its logical symbol's members and seeds them. A raw numeric rowid is deliberately NOT
+        // accepted: the wire dropped `symbol_id`, so a bare number is treated as a name/path.
         let target_id: i64 = db
             .storage
             .connection()
             .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
             .unwrap();
-        let by_id = db
+        let handle =
+            crate::query::symbol::logical_for_symbol_id(db.storage.connection(), target_id)
+                .unwrap()
+                .map(|logical| crate::serde_big_id::format_sym_handle(logical.logical_symbol_id))
+                .expect("the `target` symbol has a logical handle");
+        let by_handle = db
             .important_symbols(ImportantSymbolsRequest {
                 limit: 20,
-                personalize: vec![target_id.to_string()],
+                personalize: vec![handle],
                 auto_seed_from_diff: false,
             })
             .unwrap();
-        assert_eq!(by_id.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+        assert_eq!(by_handle.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
 
         // All-missing seed → global fall-through WITH a reason (never silent, never an error).
         let all_missing = db

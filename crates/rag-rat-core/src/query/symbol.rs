@@ -356,6 +356,18 @@ fn lookup_logical_members(
     for row in rows {
         hits.push(row?);
     }
+    // Stamp the logical handle onto every member: callers selecting by `logical_symbol_id` (impact,
+    // graph, memory) build their graph options from `SymbolHit.logical_symbol_id`, and a `None`
+    // here silently narrows the exact caller/callee set to the first concrete row instead of
+    // the whole logical group (#149 review). We already know the id, so set it without a
+    // per-member query.
+    if let Some(logical) = lookup_logical_by_id(conn, logical_symbol_id)? {
+        for hit in &mut hits {
+            hit.logical_symbol_id = Some(logical.logical_symbol_id);
+            hit.logical_variant_count = Some(logical.variant_count);
+            hit.logical_group_reason = Some(logical.group_reason.clone());
+        }
+    }
     Ok(hits)
 }
 

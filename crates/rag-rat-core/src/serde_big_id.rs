@@ -27,9 +27,23 @@ struct SymHandle(i64);
 
 const SYM_HANDLE_PREFIX: &str = "sym_";
 
+/// Format an `i64` symbol handle as its opaque `sym_<hex>` token (hex over the raw u64 bits, so any
+/// `i64` round-trips). The single source of truth for the on-the-wire handle shape — serde and any
+/// non-serde caller (e.g. seed-selector parsing) go through this and [`parse_sym_handle`].
+pub fn format_sym_handle(value: i64) -> String {
+    format!("{SYM_HANDLE_PREFIX}{:x}", value as u64)
+}
+
+/// Parse an opaque `sym_<hex>` handle back to its `i64`. `None` if the `sym_` prefix is missing or
+/// the remainder isn't valid hex — callers decide whether that's an error or a fall-through.
+pub fn parse_sym_handle(token: &str) -> Option<i64> {
+    let hex = token.strip_prefix(SYM_HANDLE_PREFIX)?;
+    u64::from_str_radix(hex, 16).ok().map(|bits| bits as i64)
+}
+
 impl Serialize for SymHandle {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&format!("{SYM_HANDLE_PREFIX}{:x}", self.0 as u64))
+        serializer.serialize_str(&format_sym_handle(self.0))
     }
 }
 
@@ -131,6 +145,18 @@ mod tests {
             "needs prefix"
         );
         assert!(serde_json::from_str::<Handle>(r#"{"id":"sym_zzz"}"#).is_err(), "bad hex");
+    }
+
+    #[test]
+    fn parse_and_format_sym_handle_round_trip() {
+        for value in [BIG, 0_i64, -1, i64::MAX, i64::MIN] {
+            let token = super::format_sym_handle(value);
+            assert!(token.starts_with("sym_"), "token must carry the prefix: {token}");
+            assert_eq!(super::parse_sym_handle(&token), Some(value), "round-trip via helpers");
+        }
+        assert_eq!(super::parse_sym_handle("23bad57dfb79ad5f"), None, "missing prefix → None");
+        assert_eq!(super::parse_sym_handle("sym_zzz"), None, "bad hex → None");
+        assert_eq!(super::parse_sym_handle("12345"), None, "bare number → None");
     }
 
     #[test]
