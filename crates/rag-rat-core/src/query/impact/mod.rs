@@ -18,6 +18,7 @@ use crate::query::symbol::SymbolHit;
 #[derive(Debug, Serialize)]
 pub struct ImpactItem {
     pub path: String,
+    #[serde(rename = "lang")]
     pub language: String,
     pub kind: String,
     pub symbol: Option<String>,
@@ -58,6 +59,7 @@ pub struct ImpactSurfaceQuery {
     // query.
     #[serde(skip_serializing)]
     pub symbol_id: Option<i64>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     pub query: Option<String>,
     pub resolution: String,

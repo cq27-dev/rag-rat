@@ -51,6 +51,7 @@ pub struct RepoMemoryBinding {
     pub end_line: Option<i64>,
     // Opaque `sym_<hex>` symbol handle (stable, JSON-safe — #130/#149).
     #[serde(
+        rename = "id",
         skip_serializing_if = "Option::is_none",
         serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
     )]
@@ -94,11 +95,13 @@ pub struct RepoMemoryCallPath {
     pub memory_id: String,
     // Opaque `sym_<hex>` symbol handles (stable, JSON-safe — #130/#149).
     #[serde(
+        rename = "start_id",
         skip_serializing_if = "Option::is_none",
         serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
     )]
     pub start_logical_symbol_id: Option<i64>,
     #[serde(
+        rename = "end_id",
         skip_serializing_if = "Option::is_none",
         serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
     )]
@@ -131,7 +134,11 @@ pub struct RepoMemoryCreate {
 pub struct RepoMemoryBindTarget {
     // Accept the opaque `sym_<hex>` handle (#149); `default` keeps it optional under the custom
     // deserializer.
-    #[serde(default, deserialize_with = "crate::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        deserialize_with = "crate::serde_big_id::sym_handle_opt::deserialize"
+    )]
     pub logical_symbol_id: Option<i64>,
     // Internal rowid — NOT accepted from the wire (reindex-churned, #149); bind by handle/path.
     // CLI sets it programmatically. `skip_deserializing` keeps it off the input schema.
@@ -146,9 +153,17 @@ pub struct RepoMemoryBindTarget {
     pub github_owner: Option<String>,
     pub github_repo: Option<String>,
     pub github_number: Option<i64>,
-    #[serde(default, deserialize_with = "crate::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "start_id",
+        default,
+        deserialize_with = "crate::serde_big_id::sym_handle_opt::deserialize"
+    )]
     pub start_logical_symbol_id: Option<i64>,
-    #[serde(default, deserialize_with = "crate::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "end_id",
+        default,
+        deserialize_with = "crate::serde_big_id::sym_handle_opt::deserialize"
+    )]
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
     pub path_summary: Option<String>,

@@ -107,7 +107,7 @@ fn mcp_stdio_smoke_lists_and_calls_core_tools() {
             "method": "tools/call",
             "params": {
                 "name": "papertrail_for_symbol",
-                "arguments": {"symbol": "open_database", "language": "rust", "limit": 1}
+                "arguments": {"symbol": "open_database", "lang": "rust", "limit": 1}
             }
         }),
     );

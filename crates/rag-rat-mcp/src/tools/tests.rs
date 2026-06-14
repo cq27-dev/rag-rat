@@ -119,7 +119,7 @@ fn list_tools_exposes_complete_typed_schemas() {
         "contains",
         "implements",
     ]);
-    assert_schema_has_property(tools, "find_callers", "logical_symbol_id");
+    assert_schema_has_property(tools, "find_callers", "id");
     assert_symbol_selector_schema(tools, "find_callers");
     assert_schema_has_property(tools, "trace_callees", "include_references");
     assert_schema_has_property(tools, "trace_callees", "include_unresolved");
@@ -129,7 +129,7 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_has_property(tools, "trace_callees", "include_memories");
     assert_schema_has_property(tools, "trace_callees", "edge_kinds");
     assert_schema_has_property(tools, "trace_callees", "resolution");
-    assert_schema_has_property(tools, "trace_callees", "logical_symbol_id");
+    assert_schema_has_property(tools, "trace_callees", "id");
     assert_symbol_selector_schema(tools, "trace_callees");
     assert_schema_requires(tools, "compare_graph_to_text", "pattern");
     assert_schema_has_property(tools, "compare_graph_to_text", "include_unresolved");
@@ -138,7 +138,7 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_has_property(tools, "compare_graph_to_text", "include_tests");
     assert_schema_has_property(tools, "compare_graph_to_text", "edge_kinds");
     assert_schema_has_property(tools, "compare_graph_to_text", "resolution");
-    assert_schema_has_property(tools, "compare_graph_to_text", "logical_symbol_id");
+    assert_schema_has_property(tools, "compare_graph_to_text", "id");
     assert_symbol_selector_schema(tools, "compare_graph_to_text");
     assert_schema_has_property(tools, "impact_surface", "resolution");
     assert_schema_has_property(tools, "impact_surface", "include_tests");
@@ -147,7 +147,7 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_has_property(tools, "impact_surface", "include_papertrail");
     assert_schema_has_property(tools, "impact_surface", "include_text_fallback");
     assert_schema_has_property(tools, "impact_surface", "include_memories");
-    assert_schema_has_property(tools, "impact_surface", "logical_symbol_id");
+    assert_schema_has_property(tools, "impact_surface", "id");
     assert_symbol_selector_schema(tools, "impact_surface");
     assert_schema_has_property(tools, "repo_brief", "mode");
     assert_schema_property_enum(tools, "repo_brief", "mode", &[
@@ -181,7 +181,7 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_nested_property(tools, "memory_create", "bind", "path_summary");
     assert_schema_requires(tools, "memory_update", "memory_id");
     assert_schema_requires(tools, "memory_search", "query");
-    assert_schema_has_property(tools, "memory_for_symbol", "logical_symbol_id");
+    assert_schema_has_property(tools, "memory_for_symbol", "id");
     assert_schema_requires(tools, "memory_for_path", "path");
     assert_schema_requires(tools, "memory_for_call_path", "edge_sequence_hash");
     assert_schema_requires(tools, "memory_mark_obsolete", "memory_id");
@@ -305,8 +305,7 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
     // logical_symbol_id crosses the MCP boundary as a STRING (#130: a 64-bit hash > 2^53 can't be a
     // JSON number without rounding). Read it as a string and pass it straight back to the other
     // tools — the round-trip the fix guarantees.
-    let logical_symbol_id =
-        lookup["candidates"].as_array().unwrap()[0]["logical_symbol_id"].as_str().unwrap();
+    let logical_symbol_id = lookup["candidates"].as_array().unwrap()[0]["id"].as_str().unwrap();
     let memory = call_tool(
             &config.database,
             "memory_create",
@@ -317,19 +316,15 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
                 "confidence": "high",
                 "created_by": "mcp-test",
                 "tags": ["cfg", "graph"],
-                "bind": {"logical_symbol_id": logical_symbol_id}
+                "bind": {"id": logical_symbol_id}
             }),
         )
         .unwrap();
     assert_eq!(memory["duplicate"], false);
     let memory_id = memory["memory"]["memory_id"].as_str().unwrap();
 
-    let for_symbol = call_tool(
-        &config.database,
-        "memory_for_symbol",
-        json!({"logical_symbol_id": logical_symbol_id}),
-    )
-    .unwrap();
+    let for_symbol =
+        call_tool(&config.database, "memory_for_symbol", json!({"id": logical_symbol_id})).unwrap();
     assert_eq!(for_symbol.as_array().unwrap()[0]["memory_id"], memory_id);
     let search =
         call_tool(&config.database, "memory_search", json!({"query": "logical helper"})).unwrap();
@@ -352,7 +347,7 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
     let impact = call_tool(
         &config.database,
         "impact_surface",
-        json!({"logical_symbol_id": logical_symbol_id, "include_memories": true}),
+        json!({"id": logical_symbol_id, "include_memories": true}),
     )
     .unwrap();
     assert_eq!(impact["repo_memories"]["direct"].as_array().unwrap()[0]["memory_id"], memory_id);
@@ -434,11 +429,11 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
     let candidates = lookup["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 2);
     // #149: candidates carry the opaque `sym_<hex>` handle (not the ephemeral numeric symbol_id),
-    // plus the human-readable symbol_path.
+    // plus the human-readable ref (symbol_path).
     assert!(candidates.iter().all(|candidate| {
         candidate.get("symbol_id").is_none()
-            && candidate["logical_symbol_id"].as_str().is_some_and(|h| h.starts_with("sym_"))
-            && candidate["symbol_path"].as_str().is_some()
+            && candidate["id"].as_str().is_some_and(|h| h.starts_with("sym_"))
+            && candidate["ref"].as_str().is_some()
     }));
 
     let ambiguous =
@@ -448,20 +443,20 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
 
     let one = candidates
         .iter()
-        .find(|candidate| candidate["symbol_path"].as_str().unwrap().contains("one.rs"))
+        .find(|candidate| candidate["ref"].as_str().unwrap().contains("one.rs"))
         .unwrap();
     let exact = call_tool(
         &config.database,
         "find_callers",
         json!({
-            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "resolution": "exact",
             "edge_kinds": ["calls_name"]
         }),
     )
     .unwrap();
     assert_eq!(exact["query"]["tool"], "find_callers");
-    assert_eq!(exact["query"]["logical_symbol_id"], one["logical_symbol_id"]);
+    assert_eq!(exact["query"]["id"], one["id"]);
     assert_eq!(exact["query"]["resolution"], "exact");
     assert_eq!(exact["summary"]["returned_count"], 1);
     assert_eq!(exact["summary"]["total_matching_edges"], 1);
@@ -475,7 +470,7 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
         &config.database,
         "find_callers",
         json!({
-            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "resolution": "exact",
             "edge_kinds": ["calls_name"],
             "include_coverage": true
@@ -497,14 +492,14 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
         &config.database,
         "compare_graph_to_text",
         json!({
-            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "pattern": "    shared\\(",
             "resolution": "exact",
             "edge_kinds": ["calls_name"]
         }),
     )
     .unwrap();
-    assert_eq!(comparison["query"]["logical_symbol_id"], one["logical_symbol_id"]);
+    assert_eq!(comparison["query"]["id"], one["id"]);
     assert_eq!(comparison["summary"]["graph_edges"], 1);
     assert_eq!(comparison["summary"]["graph_hits"], 1);
     assert_eq!(comparison["summary"]["text_hits"], 3);
@@ -533,7 +528,7 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
         &config.database,
         "compare_graph_to_text",
         json!({
-            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "pattern": "shared",
             "resolution": "exact",
             "edge_kinds": ["calls_name"]
@@ -551,7 +546,7 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
         &config.database,
         "impact_surface",
         json!({
-            "logical_symbol_id": one["logical_symbol_id"].as_str().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "resolution": "exact",
             "include_tests": true,
             "include_docs": true,
@@ -561,7 +556,7 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
         }),
     )
     .unwrap();
-    assert_eq!(impact["query"]["symbol_id"], one["symbol_id"]);
+    assert_eq!(impact["query"]["ref"], one["ref"]);
     assert_eq!(impact["query"]["resolution"], "exact");
     assert!(impact["direct_semantic_callers"].as_array().unwrap().len() == 1);
     assert!(impact["direct_semantic_callees"].as_array().unwrap().is_empty());
@@ -577,7 +572,7 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
     let papertrail = call_tool(
         &config.database,
         "papertrail_for_symbol",
-        json!({"logical_symbol_id": one["logical_symbol_id"].as_str().unwrap()}),
+        json!({"id": one["id"].as_str().unwrap()}),
     )
     .unwrap();
     assert!(papertrail["current_source"]["symbol"].as_str().unwrap().contains("shared"));
@@ -674,9 +669,9 @@ fn assert_enum_values(schema: &Value, expected: &[&str], label: &str) {
 }
 
 fn assert_symbol_selector_schema(tools: &[Value], name: &str) {
-    // #149: the wire selector is symbol/symbol_path/logical_symbol_id (the opaque handle); the
+    // #149: the wire selector is symbol/ref/id (the opaque handle); the
     // ephemeral numeric symbol_id is no longer an accepted input.
-    for field in ["symbol", "symbol_path", "logical_symbol_id", "allow_ambiguous"] {
+    for field in ["symbol", "ref", "id", "allow_ambiguous"] {
         assert_schema_has_property(tools, name, field);
     }
     assert_schema_lacks_property(tools, name, "symbol_id");

@@ -24,10 +24,12 @@ pub(crate) fn round_score(value: f64) -> f64 {
 pub struct ReadChunk {
     pub chunk_id: i64,
     pub path: String,
+    #[serde(rename = "lang")]
     pub language: String,
     pub kind: String,
     pub start_line: i64,
     pub end_line: i64,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]

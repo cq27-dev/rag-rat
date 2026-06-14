@@ -17,10 +17,12 @@ const GITHUB_WEIGHT: f64 = 0.02;
 pub struct SearchHit {
     pub chunk_id: i64,
     pub path: String,
+    #[serde(rename = "lang")]
     pub language: String,
     pub kind: String,
     pub start_line: i64,
     pub end_line: i64,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     pub score: f64,
     /// Which retrieval modes found this hit: "lexical" (BM25 only), "vector" (embedding cosine

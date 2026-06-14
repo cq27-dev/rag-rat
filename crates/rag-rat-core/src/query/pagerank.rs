@@ -275,6 +275,7 @@ pub struct SymbolImportance {
     /// Opaque `sym_<hex>` handle for this symbol — the stable id to feed into symbol_lookup /
     /// impact / find_callers. `None` only if the winner has no logical-symbol member row.
     #[serde(
+        rename = "id",
         skip_serializing_if = "Option::is_none",
         serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
     )]

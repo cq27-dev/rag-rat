@@ -13,6 +13,7 @@ pub struct SymbolHit {
     // The stable symbol handle: a content-derived id emitted as an opaque `sym_<hex>` token so a
     // JSON client can't round it (>2^53) or mistake it for a number to compute on (#130/#149).
     #[serde(
+        rename = "id",
         skip_serializing_if = "Option::is_none",
         serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
     )]
@@ -24,9 +25,11 @@ pub struct SymbolHit {
     pub file_id: i64,
     pub path: String,
     pub file_kind: String,
+    #[serde(rename = "lang")]
     pub language: String,
     pub name: String,
     pub qualified_name: String,
+    #[serde(rename = "ref")]
     pub symbol_path: String,
     pub kind: String,
     pub start_byte: i64,
@@ -54,8 +57,9 @@ pub struct SymbolLookup {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogicalSymbolHit {
-    #[serde(serialize_with = "crate::serde_big_id::sym_handle::serialize")]
+    #[serde(rename = "id", serialize_with = "crate::serde_big_id::sym_handle::serialize")]
     pub logical_symbol_id: i64,
+    #[serde(rename = "lang")]
     pub language: String,
     pub path: String,
     pub logical_name: String,

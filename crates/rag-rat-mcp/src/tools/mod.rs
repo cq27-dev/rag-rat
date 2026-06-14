@@ -233,10 +233,11 @@ pub struct ImportantSymbolsArgs {
     /// Max load-bearing symbols to return.
     #[serde(default = "default_repo_brief_limit")]
     pub limit: u32,
-    /// Symbols to bias importance toward (the symbols you're editing/querying) — names, symbol
-    /// paths, or numeric ids; the random surfer teleports back to these, lifting the spine *they*
-    /// depend on. A numeric value is a raw symbol id; otherwise it's resolved by symbol path then
-    /// name (ambiguous/missing entries are skipped, never fatal). LEAVE EMPTY to auto-seed from
+    /// Symbols to bias importance toward (the symbols you're editing/querying) — names, refs
+    /// (`path::name`), or `sym_<hex>` handles; the random surfer teleports back to these, lifting
+    /// the spine *they* depend on. A `sym_<hex>` handle resolves to its logical symbol's members;
+    /// otherwise the entry is resolved by ref then name (ambiguous/missing entries are skipped,
+    /// never fatal). LEAVE EMPTY to auto-seed from
     /// your current git diff (the default — "importance relative to your current changes").
     /// Pass a single `"global"` to force whole-repo PageRank instead.
     #[serde(default)]
@@ -246,11 +247,17 @@ pub struct ImportantSymbolsArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolArgs {
     pub symbol: Option<String>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "lang")]
     pub language: Option<String>,
     #[serde(default)]
     pub allow_ambiguous: bool,
@@ -264,9 +271,14 @@ pub struct SymbolArgs {
 pub struct SymbolGraphArgs {
     pub symbol: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default = "default_graph_limit")]
@@ -293,9 +305,14 @@ pub struct CompareGraphTextArgs {
     pub pattern: String,
     pub symbol: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default = "default_compare_limit")]
@@ -319,9 +336,14 @@ pub struct CompareGraphTextArgs {
 pub struct ImpactArgs {
     pub query: Option<String>,
     pub symbol: Option<String>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
     pub resolution: Option<McpGraphResolutionMode>,
@@ -458,7 +480,11 @@ impl McpMemorySource {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MemoryBindArgs {
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
     pub chunk_id: Option<i64>,
@@ -470,10 +496,18 @@ pub struct MemoryBindArgs {
     pub github_owner: Option<String>,
     pub github_repo: Option<String>,
     pub github_number: Option<i64>,
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "start_id",
+        default,
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub start_logical_symbol_id: Option<i64>,
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "end_id",
+        default,
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
@@ -527,9 +561,14 @@ pub struct MemorySearchArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MemoryForSymbolArgs {
     pub symbol: Option<String>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
     #[serde(default)]
@@ -749,8 +788,8 @@ pub fn description(name: &str) -> &'static str {
              without explain. Hits are validated against current source. Falls back to BM25-only \
              (every hit 'lexical') when no embedding model is present.",
         "symbol_lookup" =>
-            "Resolve a symbol name (or symbol_path/id) to its definition(s) in Rust, TypeScript, \
-             Kotlin, C, or C++ — exact or fuzzy. Returns candidates with signatures, locations, \
+            "Resolve a symbol name (or ref/id) to its definition(s) in Rust, TypeScript, Kotlin, \
+             C, or C++ — exact or fuzzy. Returns candidates with signatures, locations, \
              logical-symbol grouping (cfg variants), and any bound repo memories. Use to \
              disambiguate before a graph or read call.",
         "find_callers" =>
@@ -787,7 +826,7 @@ pub fn description(name: &str) -> &'static str {
              edge graph — what the rest of the code most depends on. Run before editing to see the \
              spine you shouldn't reinvent or break. By DEFAULT (no `personalize`) it auto-seeds \
              from your current git diff, returning importance relative to your current changes; \
-             pass `personalize` (names, symbol paths, or ids you're working on) to seed it \
+             pass `personalize` (names, refs, or `sym_<hex>` handles you're working on) to seed it \
              explicitly, or a single `\"global\"` to force whole-repo PageRank. The result is a \
              labeled object: `mode` (which scale), `seed_source` (seed provenance), and `symbols`.",
         "ffi_surface" =>

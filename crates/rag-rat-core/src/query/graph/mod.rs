@@ -53,15 +53,16 @@ pub struct GraphTraversalQuery {
     #[serde(skip_serializing)]
     pub symbol_id: Option<i64>,
     // Opaque `sym_<hex>` symbol handle (stable, JSON-safe — #130/#149).
-    #[serde(serialize_with = "crate::serde_big_id::sym_handle_opt::serialize")]
+    #[serde(rename = "id", serialize_with = "crate::serde_big_id::sym_handle_opt::serialize")]
     pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "ref")]
     pub symbol_path: String,
     pub resolution: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogicalSymbol {
-    #[serde(serialize_with = "crate::serde_big_id::sym_handle::serialize")]
+    #[serde(rename = "id", serialize_with = "crate::serde_big_id::sym_handle::serialize")]
     pub logical_symbol_id: i64,
     pub qualified_name: String,
     pub variant_count: u64,
@@ -105,6 +106,7 @@ pub struct GraphCoverage {
 #[derive(Debug, Serialize)]
 pub struct GraphPathCoverage {
     pub path: String,
+    #[serde(rename = "lang")]
     pub language: String,
     pub parser_status: String,
     pub graph_status: String,
@@ -184,8 +186,9 @@ pub struct CompareGraphTextQuery {
     #[serde(skip_serializing)]
     pub symbol_id: Option<i64>,
     // Opaque `sym_<hex>` symbol handle (stable, JSON-safe — #130/#149).
-    #[serde(serialize_with = "crate::serde_big_id::sym_handle_opt::serialize")]
+    #[serde(rename = "id", serialize_with = "crate::serde_big_id::sym_handle_opt::serialize")]
     pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "ref")]
     pub symbol_path: String,
     pub pattern: String,
     pub resolution: String,

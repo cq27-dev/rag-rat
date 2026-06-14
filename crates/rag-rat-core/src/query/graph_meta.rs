@@ -53,15 +53,21 @@ pub struct GraphEvidence {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphSymbol {
+    // Internal rowid — never serialized (reindex-churned, #149); the wire identity is `ref` /
+    // qualified_name. (Was leaking onto the wire as `id` before the #149 sweep covered this
+    // struct.)
+    #[serde(skip_serializing)]
     pub id: i64,
     pub name: String,
     pub qualified_name: String,
     pub kind: String,
+    #[serde(rename = "ref")]
     pub symbol_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CallerEvidence {
+    #[serde(rename = "ref")]
     pub symbol_path: String,
     pub path: String,
     pub line: i64,

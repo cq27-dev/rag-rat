@@ -92,6 +92,7 @@ pub struct RepoBriefMemoryCounts {
 #[derive(Debug, Serialize)]
 pub struct RepoBriefCandidate {
     pub path: String,
+    #[serde(rename = "lang")]
     pub language: String,
     pub kind: String,
     pub category: String,
