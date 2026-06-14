@@ -130,11 +130,12 @@ pub(crate) fn version_check(config: &Config) -> anyhow::Result<()> {
             "note": "version checking is disabled ([version_check] enabled = false in rag-rat.toml)",
         }));
     }
-    let _ = version_check::refresh(&config.database);
-    print_output(&version_check::build_status(
-        version_check::current_version(),
-        version_check::read_cache(&config.database).as_ref(),
-    ))
+    // Prefer the just-fetched result; only fall back to the cache when the network fetch itself
+    // failed — so a successful check still reports even if the cache write didn't land (read-only
+    // checkout, full disk).
+    let cached = version_check::refresh(&config.database)
+        .or_else(|| version_check::read_cache(&config.database));
+    print_output(&version_check::build_status(version_check::current_version(), cached.as_ref()))
 }
 pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
     let options = rag_rat_core::eval::EvalOptions {

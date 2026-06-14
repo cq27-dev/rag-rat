@@ -27,17 +27,16 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Agent/operator-facing version status. `latest_version`/`checked_at_ms` are `None` until a
-/// successful crates.io check has been cached; `update_available` is only ever true on a confirmed
-/// newer published version.
+/// Agent/operator-facing version status. `latest_version`/`checked_at_ms` are `null` until a
+/// successful crates.io check has been cached (serialized explicitly, not omitted, so the object
+/// shape is stable for consumers that test `latest_version == null`); `update_available` is only
+/// ever true on a confirmed newer published version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VersionStatus {
     pub current_version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_version: Option<String>,
     pub update_available: bool,
     pub update_command: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub checked_at_ms: Option<i64>,
 }
 
@@ -128,16 +127,15 @@ fn parse_latest_response(body: &str) -> Option<String> {
     json.get("crate")?.get("max_version")?.as_str().map(str::to_string)
 }
 
-/// Fetch crates.io and write the cache (network). Returns the latest version on success, `None`
-/// fail-open. Run out of band (a long-lived server's background, an explicit `version-check`
-/// command) — never on the session-start read path.
-pub fn refresh(database: &Path) -> Option<String> {
-    let latest = fetch_latest()?;
-    write_cache(database, &CachedVersion {
-        latest_version: latest.clone(),
-        checked_at_ms: now_ms(),
-    });
-    Some(latest)
+/// Fetch crates.io and write the cache (network). Returns the fresh [`CachedVersion`] on success,
+/// `None` fail-open. The caller gets the result directly so it can report the just-fetched latest
+/// even if the cache write fails (read-only checkout, full disk). Run out of band (a long-lived
+/// server's background, an explicit `version-check` command) — never on the session-start read
+/// path.
+pub fn refresh(database: &Path) -> Option<CachedVersion> {
+    let cached = CachedVersion { latest_version: fetch_latest()?, checked_at_ms: now_ms() };
+    write_cache(database, &cached);
+    Some(cached)
 }
 
 fn now_ms() -> i64 {
@@ -209,6 +207,18 @@ mod tests {
         assert_eq!(s.checked_at_ms, None);
         // The update command is always present so an agent can relay it once a latest is known.
         assert_eq!(s.update_command, "cargo install rag-rat --force");
+    }
+
+    #[test]
+    fn unknown_status_serializes_null_fields_not_omitted() {
+        // Stable object shape: latest_version/checked_at_ms are present as null when unknown, so
+        // consumers can test `latest_version == null` rather than a missing key.
+        let json = serde_json::to_value(build_status("0.5.0", None)).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(obj.contains_key("latest_version") && obj["latest_version"].is_null());
+        assert!(obj.contains_key("checked_at_ms") && obj["checked_at_ms"].is_null());
+        assert_eq!(obj["current_version"], "0.5.0");
+        assert_eq!(obj["update_available"], false);
     }
 
     #[test]

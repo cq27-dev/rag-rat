@@ -286,8 +286,12 @@ fn version_line(status: &rag_rat_core::version_check::VersionStatus) -> Option<S
             "\n⚠ rag-rat update available: {} → {} — run `{}`\n",
             status.current_version, latest, status.update_command
         ))
-    } else {
+    } else if latest == status.current_version {
         Some(format!("\nrag-rat {} (latest on crates.io)\n", status.current_version))
+    } else {
+        // Local build ahead of the published latest (dev / pre-release after a version bump) —
+        // don't call it the crates.io latest.
+        Some(format!("\nrag-rat {} (ahead of crates.io latest {latest})\n", status.current_version))
     }
 }
 
@@ -565,6 +569,15 @@ mod tests {
     #[test]
     fn version_line_is_none_when_latest_unknown() {
         assert_eq!(version_line(&status(None, false)), None, "no cached check → no line");
+    }
+
+    #[test]
+    fn version_line_marks_a_local_build_ahead_of_crates_io() {
+        // Running 0.5.0 while crates.io latest is 0.4.0 (dev/pre-release): not an update, but not
+        // "the crates.io latest" either.
+        let line = version_line(&status(Some("0.4.0"), false)).expect("ahead status renders");
+        assert!(line.contains("ahead of crates.io latest 0.4.0"), "got: {line}");
+        assert!(!line.contains("(latest on crates.io)"), "must not claim it's the latest: {line}");
     }
 
     // ─── HookInput parsing ────────────────────────────────────────────────────
