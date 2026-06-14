@@ -398,6 +398,25 @@ pub(crate) fn latest_run_tool_version(
     Ok(version)
 }
 
+/// Whether ANY oracle run exists in the active checkout, across all tools — one query to short out
+/// the per-tool [`latest_run_tool_version`] probes on the dominant "no oracle ever" path (where the
+/// table is empty, so this returns instantly). Scoped to `(commit_sha, worktree_id)`.
+pub(crate) fn any_run_in_scope(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM oracle_runs WHERE commit_sha = ?1 AND worktree_id = ?2 LIMIT 1",
+            params![commit_sha, worktree_id],
+            |_| Ok(()),
+        )
+        .ok()
+        .is_some();
+    Ok(exists)
+}
+
 /// The single canonical scope predicate every `edge_oracle` metric read joins through: restrict the
 /// counted verdicts to those whose edge belongs to the active `(commit_sha, worktree_id)` checkout,
 /// via `edge_oracle -> edges -> files`. This is the SAME join `edge_join_candidates` /
@@ -613,6 +632,46 @@ pub(crate) fn current_oracle_verdicts_for_edges(
                 tool_version: tool_version.to_string(),
             });
         }
+    }
+    Ok(out)
+}
+
+/// Fetch ALL current, in-scope oracle verdicts for `(tool, tool_version)` in this checkout, keyed
+/// by `edge_id` → `(kind, resolved_symbol_id)`. The single-scan sibling of
+/// [`current_oracle_verdicts_for_edges`] (which filters to a bounded id list): symbol-importance
+/// ranking ([`crate::query::pagerank`]) walks the WHOLE edge graph, so it needs the verdict set in
+/// one pass rather than a query per edge. Routes through the shared [`edge_oracle_scope_join`] +
+/// [`edge_oracle_current_predicate`] so the scope+currency gate can't be re-spelled — the only raw
+/// `FROM edge_oracle` lives here (#81). `resolved_symbol_id` is returned (not just its name)
+/// because the ranker needs the id to retarget an `Upgrade` edge.
+pub(crate) fn current_oracle_verdicts_all(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<std::collections::HashMap<i64, (OracleResolutionKind, Option<i64>)>> {
+    let sql = format!(
+        "SELECT edge_oracle.edge_id, edge_oracle.kind, \
+         edge_oracle.resolved_symbol_id{scope_join}{current}",
+        scope_join = edge_oracle_scope_join(),
+        current = edge_oracle_current_predicate(),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows =
+        stmt.query_map(params![tool.as_db_str(), tool_version, commit_sha, worktree_id], |row| {
+            let edge_id: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let resolved_symbol_id: Option<i64> = row.get(2)?;
+            Ok((edge_id, kind, resolved_symbol_id))
+        })?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (edge_id, kind, resolved_symbol_id) = row?;
+        let Some(kind) = OracleResolutionKind::from_db_str(&kind) else {
+            continue;
+        };
+        out.insert(edge_id, (kind, resolved_symbol_id));
     }
     Ok(out)
 }

@@ -1671,15 +1671,87 @@ impl IndexDatabase {
     /// Top load-bearing symbols by weighted PageRank over the active checkout's edge graph (#108).
     /// `personalize_to` biases importance toward those symbol ids (changed/query symbols); empty =
     /// global.
+    ///
+    /// When a SCIP oracle run exists for this checkout, ranking uses the compiler-verified graph
+    /// (contradicted edges dropped, upgrades retargeted, confirmed/upgraded edges weighted above
+    /// heuristic) — otherwise the heuristic graph with confidence weighting. The oracle lookup is
+    /// gated on a run existing, so absent oracle data it costs nothing (no scan).
     pub fn important_symbols(
         &self,
         limit: usize,
         personalize_to: &[i64],
     ) -> anyhow::Result<Vec<crate::query::pagerank::SymbolImportance>> {
+        let oracle_effects = self.symbol_importance_oracle_effects()?;
         crate::query::pagerank::important_symbols(
             self.storage.connection(),
-            crate::query::pagerank::ImportanceOptions { limit, personalize_to },
+            crate::query::pagerank::ImportanceOptions {
+                limit,
+                personalize_to,
+                oracle_effects: oracle_effects.as_ref(),
+            },
         )
+    }
+
+    /// Build the `edge_id -> EdgeOracleEffect` map that makes [`Self::important_symbols`]
+    /// SCIP-aware, merging current+in-scope verdicts across every oracle tool that has a run in
+    /// this checkout. Returns `None` when no run exists — the common case, where ranking pays zero
+    /// oracle cost (one existence probe short-circuits the per-tool version lookups + the
+    /// whole-graph verdict scan). Maps `OracleResolutionKind` to a ranking effect here so
+    /// `query::pagerank` stays free of oracle types:
+    /// - the compiler resolved an in-corpus target (`Upgrade` or `Contradict` with a resolved
+    ///   symbol) → **retarget** the edge there (the compiler's answer, whether it upgrades an
+    ///   unconfirmed edge or overrides a wrong heuristic one);
+    /// - `Confirm` → verify the heuristic target in place;
+    /// - `ResolvedExternal`, or a `Contradict` with no in-corpus target → **drop** the phantom edge
+    ///   (the real callee is out of corpus);
+    /// - an `Upgrade` with no resolved target → leave the edge heuristic (unconfirmed, not refuted
+    ///   — #82 finding 2).
+    fn symbol_importance_oracle_effects(
+        &self,
+    ) -> anyhow::Result<
+        Option<std::collections::HashMap<i64, crate::query::pagerank::EdgeOracleEffect>>,
+    > {
+        use crate::index::oracle::OracleResolutionKind as Kind;
+        use crate::query::pagerank::EdgeOracleEffect;
+        // CPU gate: one scoped existence query, so the dominant "no oracle ever" path skips the
+        // per-tool version lookups and the whole-graph verdict scan entirely.
+        if !oracle::any_run_in_scope(
+            self.storage.connection(),
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )? {
+            return Ok(None);
+        }
+        let mut effects: Option<std::collections::HashMap<i64, EdgeOracleEffect>> = None;
+        for &tool in oracle::OracleTool::ALL {
+            let Some(version) = self.latest_oracle_run_version(tool)? else {
+                continue;
+            };
+            let verdicts = oracle::current_oracle_verdicts_all(
+                self.storage.connection(),
+                tool,
+                &version,
+                &self.active_commit_sha,
+                &self.active_worktree_id,
+            )?;
+            let map = effects.get_or_insert_with(std::collections::HashMap::new);
+            for (edge_id, (kind, resolved_symbol_id)) in verdicts {
+                let effect = match (kind, resolved_symbol_id) {
+                    // Out-of-corpus callee: the in-repo target is a phantom either way.
+                    (Kind::ResolvedExternal, _) | (Kind::Contradict, None) =>
+                        EdgeOracleEffect::Drop,
+                    (Kind::Confirm, _) => EdgeOracleEffect::Confirm,
+                    // Compiler resolved an in-corpus target — trust it over the heuristic.
+                    (Kind::Upgrade | Kind::Contradict, Some(id)) => EdgeOracleEffect::Retarget(id),
+                    // Upgrade we can't name a target for: leave the edge heuristic.
+                    (Kind::Upgrade, None) => continue,
+                };
+                // An edge belongs to one file → one language → at most one tool's verdict, so this
+                // never overwrites a different tool's effect for the same edge.
+                map.insert(edge_id, effect);
+            }
+        }
+        Ok(effects)
     }
 
     pub fn memory_create(
@@ -2268,6 +2340,88 @@ mod oracle_surfacing_tests {
         assert_eq!(
             c.resolved_external, None,
             "an in-corpus contradiction must not be labeled resolved-external"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// End-to-end #108 SCIP-aware ranking: an in-corpus Contradict RETARGETS importance to the
+    /// compiler's true callee. The heuristic resolves `caller -> target`; the compiler contradicts
+    /// it, resolving the callee to the in-corpus `other`. Before the run, `target` carries the
+    /// call's rank and `other` none; after, the rank flows to `other` (the compiler's answer),
+    /// not the heuristic guess. Proves the wrapper gates on a run existing, maps in-corpus
+    /// Contradict to a retarget, and applies it through to the ranker.
+    #[test]
+    fn important_symbols_retargets_an_in_corpus_contradiction() {
+        let root = temp_root();
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn caller() { target(); } fn target() {} fn other() {}\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let conn = db.storage.connection();
+
+        let (edge_id, cs, ce, path) = call_edge(&db);
+        let name_of = |id: i64| -> String {
+            conn.query_row("SELECT qualified_name FROM symbols WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let target_sym: i64 = conn
+            .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let target_qn = name_of(target_sym);
+        // Force the heuristic edge to look exactly-resolved to `target`.
+        conn.execute(
+            "UPDATE edges SET confidence = 'Exact', resolution = 'exact', to_symbol_id = ?2 WHERE \
+             id = ?1",
+            params![edge_id, target_sym],
+        )
+        .unwrap();
+
+        let score_of = |out: &[crate::query::pagerank::SymbolImportance], qn: &str| {
+            out.iter().find(|s| s.qualified_name == qn).map_or(0.0, |s| s.score)
+        };
+
+        // The compiler contradicts the heuristic, resolving the callee to the other in-corpus def.
+        let (other_id, other_start, other_end): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT id, start_byte, end_byte FROM symbols WHERE name = 'other' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let other_qn = name_of(other_id);
+
+        // Heuristic ranking (no oracle run yet): `target` carries the call's rank, `other` none.
+        let before = db.important_symbols(20, &[]).unwrap();
+        assert!(
+            score_of(&before, &target_qn) > 0.0,
+            "heuristically `target` carries rank: {before:?}"
+        );
+        assert_eq!(
+            score_of(&before, &other_qn),
+            0.0,
+            "`other` is uncalled heuristically: {before:?}"
+        );
+
+        let symbol = "scip-rust crate held-mini `other`().";
+        let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((other_start, other_end)));
+        db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+
+        // SCIP-aware ranking: the edge is retargeted to the compiler's `other` — rank flows there,
+        // and the contradicted heuristic target `target` loses it.
+        let after = db.important_symbols(20, &[]).unwrap();
+        assert!(
+            score_of(&after, &other_qn) > score_of(&after, &target_qn),
+            "rank flows to the compiler's resolved callee, not the heuristic guess: {after:?}"
+        );
+        assert!(
+            score_of(&after, &other_qn) > score_of(&before, &other_qn),
+            "the retargeted callee gains rank it did not have heuristically: {after:?}"
         );
 
         let _ = fs::remove_dir_all(&root);

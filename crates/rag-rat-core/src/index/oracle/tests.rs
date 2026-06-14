@@ -2632,6 +2632,28 @@ fn drifted_file_verdict_is_not_surfaced() {
     assert!(verdicts.is_empty(), "a drifted file's verdict must not surface as Compiler");
 }
 
+/// The whole-graph scan ([`store::current_oracle_verdicts_all`], used by symbol-importance ranking)
+/// returns the same current+in-scope verdicts as the per-edge read — `(kind, resolved_symbol_id)`
+/// keyed by edge id — and applies the same currency gate (a drifted callsite drops out).
+#[test]
+fn current_oracle_verdicts_all_returns_scoped_current() {
+    let (h, edge, _sha, resolved) =
+        seed_verdict_full(OracleResolutionKind::Upgrade, "scip x `target`().", true);
+    let all = store::current_oracle_verdicts_all(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(
+        all.get(&edge),
+        Some(&(OracleResolutionKind::Upgrade, resolved)),
+        "the whole-graph scan returns the current verdict with its resolved symbol id"
+    );
+
+    // Drift the callsite file: the currency gate must drop the verdict from the whole-graph scan
+    // too, exactly as it does for the per-edge read.
+    h.conn.execute("UPDATE files SET sha256 = 'drifted-sha' WHERE path = 'a.rs'", []).unwrap();
+    let after =
+        store::current_oracle_verdicts_all(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert!(after.is_empty(), "a drifted file's verdict must not surface in the whole-graph scan");
+}
+
 /// Def-drift revert (#82 finding 3): an in-corpus verdict keeps its callsite file unchanged (so the
 /// `file_sha` gate still matches), but its resolved DEFINITION symbol is deleted/reinserted by
 /// incremental reindexing — the old `resolved_symbol_id` dangles. The surfacing read must drop the

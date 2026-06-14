@@ -335,6 +335,30 @@ pub(crate) fn current_oracle_verdicts_for_edges(
     )
 }
 
+/// Fetch ALL current, in-scope oracle verdicts for `(tool, tool_version)` in this checkout, keyed
+/// by `edge_id` → `(kind, resolved_symbol_id)`. The whole-graph sibling of
+/// [`current_oracle_verdicts_for_edges`], for symbol-importance ranking which walks every edge (one
+/// scan, not a query per edge). Same scope + currency gate via the store helper.
+pub(crate) fn current_oracle_verdicts_all(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<std::collections::HashMap<i64, (OracleResolutionKind, Option<i64>)>> {
+    store::current_oracle_verdicts_all(conn, tool, tool_version, commit_sha, worktree_id)
+}
+
+/// Whether ANY oracle run exists in the active checkout (across all tools) — the cheap existence
+/// probe that short-circuits the per-tool [`latest_run_tool_version`] calls when nothing ever ran.
+pub(crate) fn any_run_in_scope(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<bool> {
+    store::any_run_in_scope(conn, commit_sha, worktree_id)
+}
+
 /// Prune `oracle_runs` rows for dead `(commit_sha, worktree_id)` contexts — the gc companion to the
 /// `edge_oracle` FK cascade. See [`store::prune_oracle_runs_outside_scope`]. Returns rows deleted.
 pub fn prune_oracle_runs_outside_scope(

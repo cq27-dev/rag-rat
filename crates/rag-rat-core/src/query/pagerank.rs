@@ -36,6 +36,44 @@ fn edge_weight(kind: &str) -> f64 {
     }
 }
 
+/// Multiplier on [`edge_weight`] by the heuristic resolver's confidence in the edge
+/// (`EdgeConfidence` db strings). A name-only guess is a weak signal that a dependency exists, so
+/// it should flow less of the source's rank to that callee than a structurally-resolved call.
+/// Unknown values default to `1.0` (same defensive posture as [`edge_weight`]). A SCIP-verified
+/// edge bypasses this entirely and uses [`COMPILER_FACTOR`].
+fn confidence_factor(confidence: &str) -> f64 {
+    match confidence {
+        "Exact" => 1.0,
+        "Syntactic" => 0.85,
+        "NameOnly" => 0.4,
+        "Ambiguous" => 0.2,
+        _ => 1.0,
+    }
+}
+
+/// Confidence factor for an edge a SCIP oracle confirmed or resolved — above a heuristic `Exact`
+/// (`1.0`), so a compiler-verified dependency outranks a merely well-guessed one. Because PageRank
+/// normalizes each source node's out-weights, the bonus only changes the outcome at a *mixed*
+/// source (some edges compiler-verified, some heuristic), tilting that node's rank toward the
+/// verified callees; it is a no-op at a node whose edges are all the same tier.
+const COMPILER_FACTOR: f64 = 1.2;
+
+/// What a current, in-scope SCIP oracle verdict does to an edge during ranking, keyed by `edge_id`.
+/// Built by the query layer from `OracleResolutionKind` so this module stays free of oracle types.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EdgeOracleEffect {
+    /// The real callee is out of corpus — a `resolved-external`, or a `contradict` the compiler
+    /// couldn't resolve to an in-corpus symbol. Drop the phantom in-repo edge from the graph.
+    Drop,
+    /// The compiler confirmed the heuristic target — keep it, but weight at [`COMPILER_FACTOR`].
+    Confirm,
+    /// The compiler resolved the edge to an in-corpus symbol id — retarget the edge there and
+    /// weight at [`COMPILER_FACTOR`]. Covers both an `upgrade` (of an unconfirmed edge) and an
+    /// in-corpus `contradict` (overriding a wrong heuristic target): in both cases the id is
+    /// the compiler's answer.
+    Retarget(i64),
+}
+
 /// One node's outgoing edges as `(target_index, weight)`. Index space is `0..n`.
 pub type Adjacency = Vec<Vec<(usize, f64)>>;
 
@@ -115,6 +153,10 @@ pub struct ImportanceOptions<'a> {
     /// Optional personalization seed — symbol ids to bias importance toward (the agent's changed /
     /// query symbols). Empty/none = global importance.
     pub personalize_to: &'a [i64],
+    /// Optional SCIP-oracle effects keyed by `edge_id` (current + in-scope verdicts). `None` = no
+    /// oracle run for this checkout → rank the heuristic graph with confidence weighting only. The
+    /// caller builds this so absent oracle data costs zero (no scan); see the query-layer wrapper.
+    pub oracle_effects: Option<&'a HashMap<i64, EdgeOracleEffect>>,
 }
 
 /// Compute weighted PageRank over the active checkout's resolved symbol→symbol edges and return the
@@ -126,17 +168,26 @@ pub fn important_symbols(
     options: ImportanceOptions<'_>,
 ) -> anyhow::Result<Vec<SymbolImportance>> {
     // Resolved symbol→symbol edges in the active checkout: both endpoints non-null, source file in
-    // the scope view. `edge_strings` resolves the edge-kind id to its name for weighting.
+    // the scope view. `edge_strings` resolves the edge-kind and confidence ids to their names — the
+    // kind sets the base weight, the confidence scales it (a name-only guess flows less rank than a
+    // structurally-resolved call). `d.id` keys the optional SCIP-oracle effect lookup.
     let mut stmt = conn.prepare(
-        "SELECT d.from_symbol_id, d.to_symbol_id, ek.value
+        "SELECT d.id, d.from_symbol_id, d.to_symbol_id, ek.value, cf.value
          FROM edges_data d
          JOIN files ON files.id = d.source_file_id
          JOIN edge_strings ek ON ek.id = d.edge_kind_id
+         JOIN edge_strings cf ON cf.id = d.confidence_id
          WHERE d.from_symbol_id IS NOT NULL AND d.to_symbol_id IS NOT NULL",
     )?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     if rows.is_empty() {
@@ -153,13 +204,23 @@ pub fn important_symbols(
         })
     };
     let mut out_edges: Adjacency = Vec::new();
-    for (from, to, kind) in &rows {
+    for (edge_id, from, to, kind, confidence) in &rows {
+        // Apply the SCIP verdict, if any: drop a contradicted/external edge entirely, retarget an
+        // upgrade to the compiler's resolved symbol, and weight a confirmed/upgraded edge at the
+        // compiler tier. Absent a verdict, fall back to heuristic confidence weighting.
+        let (to_id, weight) = match options.oracle_effects.and_then(|m| m.get(edge_id)) {
+            Some(EdgeOracleEffect::Drop) => continue,
+            Some(EdgeOracleEffect::Retarget(resolved)) =>
+                (*resolved, edge_weight(kind) * COMPILER_FACTOR),
+            Some(EdgeOracleEffect::Confirm) => (*to, edge_weight(kind) * COMPILER_FACTOR),
+            None => (*to, edge_weight(kind) * confidence_factor(confidence)),
+        };
         let from_idx = intern(*from, &mut index_of, &mut symbol_ids);
-        let to_idx = intern(*to, &mut index_of, &mut symbol_ids);
+        let to_idx = intern(to_id, &mut index_of, &mut symbol_ids);
         if out_edges.len() < symbol_ids.len() {
             out_edges.resize_with(symbol_ids.len(), Vec::new);
         }
-        out_edges[from_idx].push((to_idx, edge_weight(kind)));
+        out_edges[from_idx].push((to_idx, weight));
     }
     out_edges.resize_with(symbol_ids.len(), Vec::new);
 
@@ -228,6 +289,17 @@ mod tests {
         let mut idx: Vec<usize> = (0..scores.len()).collect();
         idx.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
         idx
+    }
+
+    /// `ImportanceOptions` with no SCIP effects — the heuristic + confidence ranking path.
+    fn opts(limit: usize, personalize_to: &[i64]) -> ImportanceOptions<'_> {
+        ImportanceOptions { limit, personalize_to, oracle_effects: None }
+    }
+
+    /// Score of the symbol with `qualified_name` in a result set, or `0.0` when absent (a dropped /
+    /// never-interned node).
+    fn score_of(out: &[SymbolImportance], qualified_name: &str) -> f64 {
+        out.iter().find(|s| s.qualified_name == qualified_name).map_or(0.0, |s| s.score)
     }
 
     #[test]
@@ -327,8 +399,7 @@ mod tests {
             .unwrap();
         }
 
-        let out =
-            important_symbols(&conn, ImportanceOptions { limit: 10, personalize_to: &[] }).unwrap();
+        let out = important_symbols(&conn, opts(10, &[])).unwrap();
         assert!(!out.is_empty(), "graph has edges → results");
         assert_eq!(out[0].qualified_name, "a::hub", "the called hub ranks first: {out:?}");
         assert_eq!(out[0].path, "a.rs");
@@ -337,11 +408,7 @@ mod tests {
         // No resolved symbol→symbol edges → empty (not an error).
         let bare = Connection::open_in_memory().unwrap();
         schema::apply(&bare).unwrap();
-        assert!(
-            important_symbols(&bare, ImportanceOptions { limit: 10, personalize_to: &[] })
-                .unwrap()
-                .is_empty()
-        );
+        assert!(important_symbols(&bare, opts(10, &[])).unwrap().is_empty());
     }
 
     /// Insert `n` symbols (`s1..sn`, ids `1..=n`) plus `edges` as `(from_id, to_id)` calls, all in
@@ -380,16 +447,11 @@ mod tests {
     fn limit_truncates_and_a_huge_limit_is_safe() {
         let conn = graph_conn(3, &[(1, 3), (2, 3)]);
         // `limit` truncates to fewer than the node count.
-        let one =
-            important_symbols(&conn, ImportanceOptions { limit: 1, personalize_to: &[] }).unwrap();
+        let one = important_symbols(&conn, opts(1, &[])).unwrap();
         assert_eq!(one.len(), 1, "limit caps the result count");
         // An absurd limit clamps to the node count via MAX_RESULTS — no panic, no overflow, no
         // tens-of-thousands of point lookups.
-        let huge = important_symbols(&conn, ImportanceOptions {
-            limit: u32::MAX as usize,
-            personalize_to: &[],
-        })
-        .unwrap();
+        let huge = important_symbols(&conn, opts(u32::MAX as usize, &[])).unwrap();
         assert_eq!(huge.len(), 3, "bounded by the graph, never by the caller's limit");
     }
 
@@ -398,12 +460,141 @@ mod tests {
         // Two disjoint symmetric 2-cycles: {1↔2} and {3↔4}. Globally all four are balanced;
         // personalizing toward symbol 1 must lift its cluster (1,2) above the other (3,4).
         let conn = graph_conn(4, &[(1, 2), (2, 1), (3, 4), (4, 3)]);
-        let out =
-            important_symbols(&conn, ImportanceOptions { limit: 4, personalize_to: &[1] }).unwrap();
+        let out = important_symbols(&conn, opts(4, &[1])).unwrap();
         let top_two: Vec<&str> = out.iter().take(2).map(|s| s.qualified_name.as_str()).collect();
         assert!(
             top_two.iter().all(|q| *q == "a::s1" || *q == "a::s2"),
             "personalized cluster ranks first: {out:?}"
         );
+    }
+
+    /// Like [`graph_conn`] but each edge carries an explicit confidence (`EdgeConfidence::as_str`
+    /// casing, e.g. `"Exact"` / `"NameOnly"`); kind is always `calls_name`. Edge ids are `1..` in
+    /// insertion order, so a test can key an `oracle_effects` map by them.
+    fn conf_conn(n: usize, edges: &[(i64, i64, &str)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES ('a.rs', 'rust', 'source', 'h', 0, 0)",
+            [],
+        )
+        .unwrap();
+        for i in 1..=n {
+            conn.execute(
+                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                                     end_byte, signature, docs)
+                 VALUES (1, 'rust', ?1, ?2, 'function', 0, 10, NULL, NULL)",
+                params![format!("s{i}"), format!("a::s{i}")],
+            )
+            .unwrap();
+        }
+        for &(from, to, confidence) in edges {
+            conn.execute(
+                "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
+                                   target_qualified_name, edge_kind, confidence)
+                 VALUES (1, ?1, ?2, 'x', 'a::x', 'calls_name', ?3)",
+                params![from, to, confidence],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn confidence_factor_orders_by_certainty() {
+        assert!(confidence_factor("Exact") > confidence_factor("Syntactic"));
+        assert!(confidence_factor("Syntactic") > confidence_factor("NameOnly"));
+        assert!(confidence_factor("NameOnly") > confidence_factor("Ambiguous"));
+        assert_eq!(
+            confidence_factor("whatever"),
+            1.0,
+            "unknown confidence defaults to full weight"
+        );
+    }
+
+    #[test]
+    fn confidence_lifts_the_more_certain_dependency() {
+        // 1 calls 2 (Exact) and 3 (NameOnly), same kind → the exactly-resolved callee outranks the
+        // name-only guess purely on confidence.
+        let conn = conf_conn(3, &[(1, 2, "Exact"), (1, 3, "NameOnly")]);
+        let out = important_symbols(&conn, opts(10, &[])).unwrap();
+        assert!(
+            score_of(&out, "a::s2") > score_of(&out, "a::s3"),
+            "higher-confidence callee ranks higher: {out:?}"
+        );
+    }
+
+    #[test]
+    fn contradicted_edge_is_dropped_from_ranking() {
+        // 1 calls 2 (edge id 1) and 3 (edge id 2); the oracle contradicts 1→2. The phantom target
+        // gets no rank and falls out of the graph entirely; the real callee ranks first.
+        let conn = conf_conn(3, &[(1, 2, "Exact"), (1, 3, "Exact")]);
+        let effects = HashMap::from([(1_i64, EdgeOracleEffect::Drop)]);
+        let out = important_symbols(&conn, ImportanceOptions {
+            limit: 10,
+            personalize_to: &[],
+            oracle_effects: Some(&effects),
+        })
+        .unwrap();
+        assert_eq!(out[0].qualified_name, "a::s3", "the surviving callee ranks first: {out:?}");
+        assert!(
+            !out.iter().any(|s| s.qualified_name == "a::s2"),
+            "the contradicted-only target drops out of the graph: {out:?}"
+        );
+    }
+
+    #[test]
+    fn upgrade_retargets_rank_to_the_resolved_symbol() {
+        // 1 calls 2 heuristically (edge id 1), but the oracle upgrades the edge to resolve at 3.
+        // Rank flows to the compiler's target, not the heuristic guess.
+        let conn = conf_conn(3, &[(1, 2, "NameOnly")]);
+        let effects = HashMap::from([(1_i64, EdgeOracleEffect::Retarget(3))]);
+        let out = important_symbols(&conn, ImportanceOptions {
+            limit: 10,
+            personalize_to: &[],
+            oracle_effects: Some(&effects),
+        })
+        .unwrap();
+        assert_eq!(out[0].qualified_name, "a::s3", "rank flows to the retargeted symbol: {out:?}");
+        assert!(
+            !out.iter().any(|s| s.qualified_name == "a::s2"),
+            "the heuristic target gets no rank: {out:?}"
+        );
+    }
+
+    #[test]
+    fn confirm_overrides_low_heuristic_confidence() {
+        // 1 calls 2 (name_only, CONFIRMED, edge id 1) and 3 (name_only, no verdict, edge id 2).
+        // Confirm weights 1→2 at the compiler tier (above NameOnly), so 2 outranks 3.
+        let conn = conf_conn(3, &[(1, 2, "NameOnly"), (1, 3, "NameOnly")]);
+        let effects = HashMap::from([(1_i64, EdgeOracleEffect::Confirm)]);
+        let out = important_symbols(&conn, ImportanceOptions {
+            limit: 10,
+            personalize_to: &[],
+            oracle_effects: Some(&effects),
+        })
+        .unwrap();
+        assert!(
+            score_of(&out, "a::s2") > score_of(&out, "a::s3"),
+            "the confirmed edge outranks an equal-confidence unverified one: {out:?}"
+        );
+    }
+
+    #[test]
+    fn no_oracle_run_is_heuristic_confidence_only() {
+        // `None` effects and an empty effects map must rank identically — guards the CPU gate: an
+        // absent oracle introduces no behavioral dependency, it's just the confidence-weighted
+        // path.
+        let conn = conf_conn(3, &[(1, 2, "Exact"), (1, 3, "NameOnly")]);
+        let none = important_symbols(&conn, opts(10, &[])).unwrap();
+        let empty: HashMap<i64, EdgeOracleEffect> = HashMap::new();
+        let empty_map = important_symbols(&conn, ImportanceOptions {
+            limit: 10,
+            personalize_to: &[],
+            oracle_effects: Some(&empty),
+        })
+        .unwrap();
+        assert_eq!(none, empty_map, "None and an empty effects map rank identically");
     }
 }
