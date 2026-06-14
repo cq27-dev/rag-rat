@@ -19,6 +19,9 @@ const DAMPING: f64 = 0.85;
 const MAX_ITERS: usize = 100;
 /// L1-change convergence threshold: stop once the rank vector barely moves.
 const TOLERANCE: f64 = 1e-6;
+/// Hard cap on returned rows. Hydration is one point query per winner, so a hostile or careless
+/// `limit` (the MCP/CLI surface takes a `u32`) can't turn this into tens of thousands of lookups.
+const MAX_RESULTS: usize = 500;
 
 /// Per-edge-kind weight: structural dependencies (calls, impls) carry full importance; weaker
 /// associations (imports, containment) carry less. Unknown kinds default to `1.0`.
@@ -177,30 +180,38 @@ pub fn important_symbols(
 
     let scores = pagerank(symbol_ids.len(), &out_edges, personalize.as_deref());
 
-    // Top-`limit` indices by score.
+    // Top-`limit` indices by score. `sort_by` is stable, so equal scores keep insertion order →
+    // deterministic output for a fixed index. Clamp to `MAX_RESULTS` so the hydration loop below is
+    // bounded regardless of the caller's `limit`.
     let mut ranked: Vec<usize> = (0..symbol_ids.len()).collect();
     ranked.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(options.limit);
+    ranked.truncate(options.limit.min(MAX_RESULTS));
 
-    // Hydrate the winners with symbol metadata in one query.
+    // Hydrate the winners with symbol metadata. Joining `symbols` to the per-connection `files`
+    // scope view keeps hydration scope-consistent with the edge query: a winner whose file isn't in
+    // the active checkout drops out instead of emitting an empty path. Endpoints are active-scope
+    // by the edge re-resolution invariant, so this rarely fires — when it does, the result is
+    // shorter than `limit` rather than wrong.
     let mut out = Vec::with_capacity(ranked.len());
     for idx in ranked {
         let symbol_id = symbol_ids[idx];
-        let meta = conn
+        let row = conn
             .query_row(
-                "SELECT qualified_name, kind, file_id FROM symbols WHERE id = ?1",
+                "SELECT s.qualified_name, s.kind, f.path
+                 FROM symbols s
+                 JOIN files f ON f.id = s.file_id
+                 WHERE s.id = ?1",
                 [symbol_id],
                 |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 },
             )
             .ok();
-        let Some((qualified_name, kind, file_id)) = meta else { continue };
-        let path = conn
-            .query_row("SELECT path FROM files WHERE id = ?1", [file_id], |row| {
-                row.get::<_, String>(0)
-            })
-            .unwrap_or_default();
+        let Some((qualified_name, kind, path)) = row else { continue };
         out.push(SymbolImportance { symbol_id, qualified_name, path, kind, score: scores[idx] });
     }
     Ok(out)
@@ -330,6 +341,69 @@ mod tests {
             important_symbols(&bare, ImportanceOptions { limit: 10, personalize_to: &[] })
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Insert `n` symbols (`s1..sn`, ids `1..=n`) plus `edges` as `(from_id, to_id)` calls, all in
+    /// one file. Returns the connection ready for `important_symbols`.
+    fn graph_conn(n: usize, edges: &[(i64, i64)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES ('a.rs', 'rust', 'source', 'h', 0, 0)",
+            [],
+        )
+        .unwrap();
+        for i in 1..=n {
+            conn.execute(
+                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                                     end_byte, signature, docs)
+                 VALUES (1, 'rust', ?1, ?2, 'function', 0, 10, NULL, NULL)",
+                params![format!("s{i}"), format!("a::s{i}")],
+            )
+            .unwrap();
+        }
+        for &(from, to) in edges {
+            conn.execute(
+                "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
+                                   target_qualified_name, edge_kind, confidence)
+                 VALUES (1, ?1, ?2, 'x', 'a::x', 'calls_name', 'exact')",
+                params![from, to],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn limit_truncates_and_a_huge_limit_is_safe() {
+        let conn = graph_conn(3, &[(1, 3), (2, 3)]);
+        // `limit` truncates to fewer than the node count.
+        let one =
+            important_symbols(&conn, ImportanceOptions { limit: 1, personalize_to: &[] }).unwrap();
+        assert_eq!(one.len(), 1, "limit caps the result count");
+        // An absurd limit clamps to the node count via MAX_RESULTS — no panic, no overflow, no
+        // tens-of-thousands of point lookups.
+        let huge = important_symbols(&conn, ImportanceOptions {
+            limit: u32::MAX as usize,
+            personalize_to: &[],
+        })
+        .unwrap();
+        assert_eq!(huge.len(), 3, "bounded by the graph, never by the caller's limit");
+    }
+
+    #[test]
+    fn personalization_biases_the_db_ranking() {
+        // Two disjoint symmetric 2-cycles: {1↔2} and {3↔4}. Globally all four are balanced;
+        // personalizing toward symbol 1 must lift its cluster (1,2) above the other (3,4).
+        let conn = graph_conn(4, &[(1, 2), (2, 1), (3, 4), (4, 3)]);
+        let out =
+            important_symbols(&conn, ImportanceOptions { limit: 4, personalize_to: &[1] }).unwrap();
+        let top_two: Vec<&str> = out.iter().take(2).map(|s| s.qualified_name.as_str()).collect();
+        assert!(
+            top_two.iter().all(|q| *q == "a::s1" || *q == "a::s2"),
+            "personalized cluster ranks first: {out:?}"
         );
     }
 }

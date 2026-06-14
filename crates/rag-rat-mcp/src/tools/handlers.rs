@@ -78,7 +78,7 @@ pub(crate) fn call_tool_with_db(
         },
         "important_symbols" => {
             let args: ImportantSymbolsArgs = serde_json::from_value(arguments)?;
-            json!(db.important_symbols(args.limit as usize, &[])?)
+            json!(db.important_symbols(args.limit as usize, &args.personalize)?)
         },
         "ffi_surface" => {
             let args: LimitArgs = serde_json::from_value(arguments)?;

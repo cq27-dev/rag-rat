@@ -155,6 +155,10 @@ pub(crate) struct ImportantSymbolsArgs {
     /// Max load-bearing symbols to return.
     #[arg(long)]
     pub limit: Option<u32>,
+    /// Symbol ids to bias importance toward (the symbols you're working on) — comma-separated or
+    /// repeated. Empty = global importance.
+    #[arg(long, value_delimiter = ',')]
+    pub personalize: Vec<i64>,
 }
 
 #[derive(Debug, Args)]

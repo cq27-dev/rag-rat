@@ -93,7 +93,7 @@ pub(crate) fn important_symbols(
     args: &ImportantSymbolsArgs,
 ) -> anyhow::Result<()> {
     let db = open_index(config)?;
-    print_output(&db.important_symbols(args.limit.unwrap_or(20) as usize, &[])?)
+    print_output(&db.important_symbols(args.limit.unwrap_or(20) as usize, &args.personalize)?)
 }
 pub(crate) fn dump_config(config: &Config) -> anyhow::Result<()> {
     let targets = config
