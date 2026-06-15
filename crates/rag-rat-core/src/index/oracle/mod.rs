@@ -123,6 +123,29 @@ pub fn run_oracle_at(
     })
 }
 
+/// Roll back a just-completed oracle run for `(tool, tool_version)` in the active checkout: delete
+/// its `edge_oracle` verdicts, its `logical_symbol_monikers`, and its `oracle_runs` row, all in one
+/// transaction. Used when a corpus run FAILS its health gate (`oracle report`): the run's verdicts
+/// were already committed by [`run_oracle_at`], so without this it would become the authoritative
+/// latest run ([`store::latest_run_tool_version`]) and surface untrustworthy `Compiler`-tier
+/// verdicts in later status/query output — exactly the broken-environment case the gate exists to
+/// reject. Clearing the monikers is whole-tool (their PK is `(logical_symbol_id, tool)`, so the run
+/// already overwrote any prior version's at its start — there is nothing older to preserve).
+pub fn rollback_run(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    store::clear_edge_oracle_for_tool(conn, tool, tool_version, commit_sha, worktree_id)?;
+    store::clear_logical_symbol_monikers_for_tool(conn, tool)?;
+    store::delete_oracle_run(conn, tool, tool_version, commit_sha, worktree_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// The indexed `(path -> files.sha256)` map for the active checkout — the pre-spawn snapshot
 /// callers take BEFORE spawning the oracle tool (#83). Cheap (reads indexed shas; hashes
 /// nothing), and read-only, so the CLI takes it before acquiring the index write lock.

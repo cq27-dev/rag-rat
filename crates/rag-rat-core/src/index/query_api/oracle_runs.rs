@@ -130,6 +130,21 @@ impl IndexDatabase {
         )
     }
 
+    /// Roll back a just-completed run for `(tool, tool_version)` in this checkout — delete its
+    /// `edge_oracle` verdicts, monikers, and `oracle_runs` row. `oracle report` calls this when a
+    /// corpus FAILS its health gate, so a broken-environment run (the gate's whole purpose to
+    /// catch) can't linger as the authoritative latest verdict set for later status/query
+    /// surfaces.
+    pub fn rollback_oracle_run(&self, tool: OracleTool, tool_version: &str) -> anyhow::Result<()> {
+        oracle::rollback_run(
+            self.storage.connection(),
+            tool,
+            tool_version,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )
+    }
+
     /// Persisted oracle status (verdict counts + last run) for a tool/version, scoped to this
     /// database's active `(commit_sha, worktree_id)` checkout.
     pub fn oracle_status(
