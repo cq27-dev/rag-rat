@@ -11,11 +11,19 @@ pub mod schema;
 pub mod symbols;
 pub mod walker;
 
+mod file_index;
+mod file_lifecycle;
+mod fts;
+mod git_meta;
+mod graph_index;
 mod incremental;
-mod internals;
 mod lifecycle;
+mod meta;
+mod packages;
+mod parser_failures;
 mod query_api;
 mod rebuild;
+mod staleness;
 
 pub(crate) use lifecycle::install_scope_view;
 pub use query_api::ImportantSymbolsRequest;

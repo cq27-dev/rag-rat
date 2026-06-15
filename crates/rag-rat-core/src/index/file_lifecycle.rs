@@ -1,0 +1,143 @@
+//! File-row lifecycle: fetch the file row, mark/remove files in the active scope, and count indexed
+//! files.
+
+use super::*;
+
+impl IndexDatabase {
+    pub(super) fn mark_file_deleted(&self, path: &Path) -> anyhow::Result<()> {
+        let path = path_string(path);
+        self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
+        self.storage.connection().execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
+             indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+             VALUES (?1, 'unknown', 'deleted', '', 0, 0, ?2, '', '', ?3)
+             ON CONFLICT(path, commit_sha, worktree_id) DO UPDATE SET
+                kind = 'deleted',
+                sha256 = '',
+                modified_at_ms = 0,
+                indexed_at_ms = excluded.indexed_at_ms",
+            params![path, now_ms(), self.active_worktree_id],
+        )?;
+        self.mark_fts_dirty()?;
+        Ok(())
+    }
+
+    pub(super) fn remove_file_in_scope(
+        &self,
+        path: &Path,
+        commit_sha: &str,
+        worktree_id: &str,
+    ) -> anyhow::Result<()> {
+        let path = path_string(path);
+        // Direct edges_data writes (#79): these statements touch up to every in-edge of a file's
+        // symbols, so they must not pay the view triggers' per-row dictionary probes.
+        // 'NameOnly' is the EdgeConfidence demotion the resolver applies to a target-less edge.
+        let name_only_id = edges::intern_edge_string(self.storage.connection(), "NameOnly")?;
+        self.storage.connection().execute(
+            "UPDATE edges_data
+             SET to_symbol_id = NULL,
+                 confidence_id = ?4
+             WHERE to_symbol_id IN (
+                 SELECT symbols.id FROM symbols
+                 JOIN main.files ON main.files.id = symbols.file_id
+                 WHERE main.files.path = ?1
+                   AND main.files.commit_sha = ?2
+                   AND main.files.worktree_id = ?3
+             )",
+            params![path, commit_sha, worktree_id, name_only_id],
+        )?;
+        self.storage.connection().execute(
+            "DELETE FROM edges_data
+             WHERE source_file_id IN (
+                    SELECT id FROM main.files
+                    WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+                )
+                OR from_symbol_id IN (
+                    SELECT symbols.id FROM symbols
+                    JOIN main.files ON main.files.id = symbols.file_id
+                    WHERE main.files.path = ?1
+                      AND main.files.commit_sha = ?2
+                      AND main.files.worktree_id = ?3
+                )",
+            params![path, commit_sha, worktree_id],
+        )?;
+        self.storage
+            .connection()
+            .execute("DELETE FROM parser_failures WHERE path = ?1", [&path])?;
+        self.storage.connection().execute(
+            "DELETE FROM chunk_fts
+             WHERE rowid IN (
+                 SELECT chunks.id FROM chunks
+                 JOIN main.files ON main.files.id = chunks.file_id
+                 WHERE main.files.path = ?1
+                   AND main.files.commit_sha = ?2
+                   AND main.files.worktree_id = ?3
+             )",
+            params![path, commit_sha, worktree_id],
+        )?;
+        // Deleting the chunks cascades (ON DELETE CASCADE, foreign_keys=ON) to git_chunk_blame,
+        // chunk_embeddings, and chunk_summaries — so the gate skipping the full git-history wipe
+        // does NOT leak blame. (`docs` has no FK and is not cleaned here — a pre-existing gap,
+        // tracked separately.)
+        self.storage.connection().execute(
+            "DELETE FROM chunks
+             WHERE file_id IN (
+                SELECT id FROM main.files
+                WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+             )",
+            params![path, commit_sha, worktree_id],
+        )?;
+        self.storage.connection().execute(
+            "DELETE FROM symbols
+             WHERE file_id IN (
+                SELECT id FROM main.files
+                WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+             )",
+            params![path, commit_sha, worktree_id],
+        )?;
+        self.storage.connection().execute(
+            "DELETE FROM main.files WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3",
+            params![path, commit_sha, worktree_id],
+        )?;
+        self.mark_fts_dirty()?;
+        Ok(())
+    }
+
+    pub(super) fn file_row(&self, path: &Path) -> anyhow::Result<FileRow> {
+        self.storage
+            .connection()
+            .query_row(
+                "SELECT language, kind FROM files WHERE path = ?1",
+                [path_string(path)],
+                |row| {
+                    let language: String = row.get(0)?;
+                    let kind: String = row.get(1)?;
+                    Ok((language, kind))
+                },
+            )
+            .map_err(Into::into)
+            .and_then(|(language, kind)| {
+                Ok(FileRow { language: language.parse()?, kind: kind.parse()? })
+            })
+    }
+
+    pub(super) fn indexed_files(&self) -> anyhow::Result<Vec<IndexedFile>> {
+        let mut stmt =
+            self.storage.connection().prepare("SELECT path, sha256 FROM files ORDER BY path")?;
+        let rows =
+            stmt.query_map([], |row| Ok(IndexedFile { path: row.get(0)?, sha256: row.get(1)? }))?;
+        let mut files = Vec::new();
+        for row in rows {
+            files.push(row?);
+        }
+        Ok(files)
+    }
+
+    pub(super) fn indexed_file_count(&self) -> anyhow::Result<usize> {
+        let count =
+            self.storage
+                .connection()
+                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+}
