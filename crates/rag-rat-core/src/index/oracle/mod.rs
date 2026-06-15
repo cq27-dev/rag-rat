@@ -21,6 +21,7 @@
 mod auto_run;
 mod join;
 mod manifest;
+mod report;
 mod run;
 mod scip;
 mod status;
@@ -34,6 +35,10 @@ use std::path::Path;
 pub use auto_run::{AutoRunDecision, AutoRunInputs, auto_run_decision};
 pub(crate) use join::package_of;
 pub use manifest::{ToolAvailability, ToolManifest};
+pub use report::{
+    CorpusHealth, CorpusProfile, OracleResolutionReport, REPORT_SCHEMA_VERSION, ResolutionBefore,
+    ResolutionDelta, RunProvenance,
+};
 use run::OracleRunInput;
 pub use run::{OracleEvalMetrics, RecallCalls};
 use rusqlite::Connection;
