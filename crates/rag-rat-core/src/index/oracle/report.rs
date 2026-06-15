@@ -206,12 +206,16 @@ impl OracleResolutionReport {
         }
     }
 
-    /// Whether two reports are comparable for a Δ: same schema version AND same corpus profile
-    /// hash. A consumer that gets `false` must omit the delta (treat the baseline as
-    /// unavailable) rather than subtract incomparable numbers.
+    /// Whether two reports are comparable for a Δ: same schema version, same corpus profile hash,
+    /// AND same SCIP `tool_version`. The tool version is run-time provenance (not part of the
+    /// profile hash, which is static config), but a different indexer build changes the SCIP
+    /// output itself — so diffing across tool versions would attribute the *tool's* output
+    /// changes to rag-rat. A consumer that gets `false` must omit the delta (treat the baseline
+    /// as unavailable) rather than subtract incomparable numbers.
     pub fn comparable_to(&self, baseline: &OracleResolutionReport) -> bool {
         self.report_schema_version == baseline.report_schema_version
             && self.corpus_profile_hash == baseline.corpus_profile_hash
+            && self.tool_version == baseline.tool_version
     }
 }
 
@@ -400,11 +404,11 @@ mod tests {
     }
 
     #[test]
-    fn comparability_keys_on_version_and_profile_hash() {
+    fn comparability_keys_on_version_profile_hash_and_tool_version() {
         let before = ResolutionBefore { total_edges: 10, resolved_in_corpus: 5, unresolved: 5 };
         let a = report_for(before, OracleEvalMetrics::default(), 0);
         let b = report_for(before, OracleEvalMetrics::default(), 0);
-        assert!(a.comparable_to(&b), "same profile + version → comparable");
+        assert!(a.comparable_to(&b), "same profile + version + tool version → comparable");
 
         // A different profile hash → not comparable (Δ must be omitted).
         let mut incomparable = report_for(before, OracleEvalMetrics::default(), 0);
@@ -415,5 +419,12 @@ mod tests {
         let mut newer = report_for(before, OracleEvalMetrics::default(), 0);
         newer.report_schema_version = REPORT_SCHEMA_VERSION + 1;
         assert!(!a.comparable_to(&newer));
+
+        // A different SCIP tool version → not comparable. The indexer build changes the SCIP
+        // output, so a Δ would mis-attribute the tool's changes to rag-rat (Codex review on
+        // #166).
+        let mut other_tool = report_for(before, OracleEvalMetrics::default(), 0);
+        other_tool.tool_version = "scip-python 0.7.0".to_string();
+        assert!(!a.comparable_to(&other_tool));
     }
 }
