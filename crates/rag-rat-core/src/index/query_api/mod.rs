@@ -2,6 +2,7 @@ use rusqlite::OptionalExtension;
 
 use super::*;
 use crate::index::oracle;
+use crate::query::text_compare::*;
 
 mod graph;
 mod history;

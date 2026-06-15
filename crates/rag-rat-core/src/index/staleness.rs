@@ -2,6 +2,7 @@
 //! stale, regex/line reads over current source.
 
 use super::*;
+use crate::query::text_compare::*;
 
 impl IndexDatabase {
     pub(super) fn source_path_is_stale(&self, path: &str, indexed_sha256: &str) -> bool {

@@ -2,7 +2,11 @@
 //! text-only hits, parser-gap & false-positive detection, search doc-ranking and dedup. Support for
 //! query_api's compare_graph_to_text and search.
 
-use super::*;
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use crate::index::is_generated_path;
+use crate::search::lexical::SearchHit;
 
 pub(crate) fn rank_docs_for_symbol(
     symbol: &crate::query::symbol::SymbolHit,
@@ -215,4 +219,117 @@ pub(crate) fn is_test_like_path(path: &str) -> bool {
         || lower.ends_with(".test.tsx")
         || lower.ends_with(".spec.ts")
         || lower.ends_with(".spec.tsx")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn search_hit(chunk_id: i64) -> SearchHit {
+        SearchHit {
+            chunk_id,
+            path: String::new(),
+            language: String::new(),
+            kind: String::new(),
+            start_line: 0,
+            end_line: 0,
+            symbol_path: None,
+            score: 0.0,
+            retrieval_mode: String::new(),
+            summary: String::new(),
+            graph: None,
+            score_components: None,
+            importance: None,
+        }
+    }
+
+    #[test]
+    fn module_stem_lowercases_the_file_stem() {
+        assert_eq!(module_stem("crates/app/src/Runtime.rs"), "runtime");
+        assert_eq!(module_stem("nested/Mod.tsx"), "mod");
+        assert_eq!(module_stem(""), "");
+    }
+
+    #[test]
+    fn bounded_summary_collapses_whitespace_and_caps_length() {
+        assert_eq!(bounded_summary("  a\t b\n  c  "), "a b c");
+        let long = "x ".repeat(300); // 300 "x " tokens -> 300 chars after join+truncate
+        assert_eq!(bounded_summary(&long).chars().count(), 240);
+    }
+
+    #[test]
+    fn parser_gap_kinds() {
+        assert!(is_likely_parser_gap_kind("parser_call_extraction"));
+        assert!(is_likely_parser_gap_kind("parser_failure"));
+        assert!(!is_likely_parser_gap_kind("comment_text_mention"));
+    }
+
+    #[test]
+    fn text_shape_predicates() {
+        assert!(is_comment_like_text("// a comment"));
+        assert!(is_comment_like_text("/* block"));
+        assert!(is_comment_like_text("# python"));
+        assert!(!is_comment_like_text("let x = call();"));
+
+        assert!(is_import_or_declaration_text("import { a } from 'b'"));
+        assert!(is_import_or_declaration_text("interface Foo {"));
+        assert!(!is_import_or_declaration_text("foo()"));
+
+        assert!(is_test_scaffolding_text("  expect(foo()).toBe(1)"));
+        assert!(is_test_scaffolding_text("describe('x', () => {"));
+        assert!(!is_test_scaffolding_text("let y = bar();"));
+    }
+
+    #[test]
+    fn test_like_path_detection() {
+        assert!(is_test_like_path("crates/x/tests/foo.rs"));
+        assert!(is_test_like_path("src/widget_test.rs"));
+        assert!(is_test_like_path("app/Button.spec.tsx"));
+        assert!(is_test_like_path("web/__tests__/util.ts"));
+        assert!(!is_test_like_path("src/widget.rs"));
+    }
+
+    #[test]
+    fn classify_text_only_hit_walks_the_precedence() {
+        let failures = BTreeSet::from(["broken.rs".to_string()]);
+        assert_eq!(classify_text_only_hit("broken.rs", "spawn();", &failures), "parser_failure");
+        assert_eq!(
+            classify_text_only_hit("src/a.rs", "// spawn() in a comment", &failures),
+            "comment_text_mention"
+        );
+        assert_eq!(
+            classify_text_only_hit("src/a.ts", "import { spawn } from 'x'", &failures),
+            "declaration_text_mention"
+        );
+        assert_eq!(
+            classify_text_only_hit("src/a.test.ts", "expect(spawn()).toBe(1)", &failures),
+            "test_scaffolding_text_mention"
+        );
+        // A real call site in non-test, non-comment source is a likely parser gap.
+        assert_eq!(
+            classify_text_only_hit("src/a.rs", "spawn();", &failures),
+            "parser_call_extraction"
+        );
+    }
+
+    #[test]
+    fn pattern_match_mode_classification() {
+        assert_eq!(compare_pattern_match_mode(r"foo\(", "foo"), "identifier_or_call");
+        assert_eq!(compare_pattern_match_mode(r"\bfoo\b", "foo"), "identifier_or_call");
+        assert_eq!(compare_pattern_match_mode("foo", "foo"), "substring_identifier");
+        assert_eq!(compare_pattern_match_mode("something_else", "foo"), "regex");
+        assert_eq!(compare_pattern_match_mode("foo", ""), "regex");
+    }
+
+    #[test]
+    fn recommended_fallback_for_empty_inputs_is_none() {
+        assert_eq!(recommended_graph_text_fallback(&[], &[]), "none");
+    }
+
+    #[test]
+    fn dedupe_search_hits_keeps_first_per_chunk_id() {
+        let mut hits = vec![search_hit(1), search_hit(2), search_hit(1), search_hit(3)];
+        dedupe_search_hits(&mut hits);
+        assert_eq!(hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
 }

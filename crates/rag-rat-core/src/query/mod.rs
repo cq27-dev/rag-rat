@@ -9,6 +9,7 @@ pub mod orientation;
 pub mod pagerank;
 pub mod repo_brief;
 pub mod symbol;
+pub(crate) mod text_compare;
 pub mod tree;
 
 use rusqlite::{Connection, OptionalExtension};

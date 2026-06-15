@@ -27,7 +27,6 @@ mod prep;
 mod query_api;
 mod rebuild;
 mod staleness;
-mod text_compare;
 mod util;
 pub(crate) use discovery::*;
 pub use git_context::resolve_git_context;
@@ -35,7 +34,6 @@ pub(crate) use git_context::*;
 pub(crate) use lifecycle::install_scope_view;
 pub(crate) use prep::*;
 pub use query_api::ImportantSymbolsRequest;
-pub(crate) use text_compare::*;
 pub(crate) use util::*;
 
 #[cfg(test)]
