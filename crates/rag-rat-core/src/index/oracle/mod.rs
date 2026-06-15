@@ -146,6 +146,39 @@ pub fn oracle_eval_metrics(
     run::eval_metrics(conn, tool, tool_version, commit_sha, worktree_id, recall_calls)
 }
 
+/// Assemble the typed before/after [`OracleResolutionReport`] (C2) for a just-completed run: read
+/// the heuristic "before" resolution counts + the moniker tally from the index, compute the diffed
+/// eval metrics, and map everything onto the C0 schema. `run` is the run's [`OracleReport`] (its
+/// run-only counts — `skipped_drifted`, the recall call pair — aren't reconstructable from the side
+/// tables). The SCIP `tool_version` is read from `provenance` (the single source for both the
+/// report envelope and the metric scope key). Pure data: Markdown rendering is a glue concern, not
+/// here.
+pub fn resolution_report(
+    conn: &Connection,
+    profile: &report::CorpusProfile,
+    provenance: &report::RunProvenance,
+    tool: OracleTool,
+    commit_sha: &str,
+    worktree_id: &str,
+    run: &OracleReport,
+) -> anyhow::Result<report::OracleResolutionReport> {
+    let (total_edges, resolved_in_corpus, unresolved) =
+        store::resolution_before_counts(conn, commit_sha, worktree_id)?;
+    let before = report::ResolutionBefore { total_edges, resolved_in_corpus, unresolved };
+    let symbols_with_moniker = store::count_symbols_with_moniker(conn, tool)?;
+    let recall = RecallCalls { covered: run.covered_calls, oracle_only: run.oracle_only_calls };
+    let metrics =
+        run::eval_metrics(conn, tool, &provenance.tool_version, commit_sha, worktree_id, recall)?;
+    Ok(report::OracleResolutionReport::assemble(
+        profile,
+        provenance,
+        run,
+        &metrics,
+        before,
+        symbols_with_moniker,
+    ))
+}
+
 /// Persisted oracle status for a tool/version, scoped to the active `(commit_sha, worktree_id)`
 /// checkout (the verdict counts must cover only this checkout, like the eval metrics).
 pub fn oracle_status(

@@ -99,15 +99,16 @@ pub struct RunProvenance {
 }
 
 /// Heuristic "before" vs compiler "after" edge resolution. `resolved_before` is the heuristic's
-/// in-corpus resolutions (exact + same-file-name); `resolved_after` adds the oracle's recoveries
-/// (`upgraded` in-corpus + `resolved_external`). Denominator is `total_edges` (edge candidates
-/// carrying a callee range) for both rates — stated here so it is part of the contract, not an
-/// implementation detail.
+/// in-corpus resolutions — `Exact`/`Syntactic` confidence with a resolved in-corpus symbol, the
+/// same `heuristic_resolved_in_corpus` definition the join uses; `resolved_after` adds the oracle's
+/// recoveries (`upgraded` in-corpus + `resolved_external`). Denominator is `total_edges` (edge
+/// candidates carrying a callee range) for both rates — stated here so it is part of the contract,
+/// not an implementation detail.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ResolutionDelta {
     /// Edge candidates with a callee range — the denominator for both resolved rates.
     pub total_edges: u64,
-    /// Heuristic in-corpus resolutions before the oracle (exact + same-file-name).
+    /// Heuristic in-corpus resolutions before the oracle (Exact/Syntactic + resolved in-corpus).
     pub resolved_before: u64,
     /// `resolved_before` + oracle upgrades (in-corpus) + resolved-external.
     pub resolved_after: u64,

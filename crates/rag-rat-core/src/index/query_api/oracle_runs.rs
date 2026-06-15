@@ -107,6 +107,29 @@ impl IndexDatabase {
         )
     }
 
+    /// Assemble the typed before/after [`oracle::OracleResolutionReport`] (C2) for a just-completed
+    /// run over this checkout: the heuristic "before" resolution counts + moniker tally are read
+    /// from the index, the eval metrics are diffed from `edge_oracle`, and everything is stamped
+    /// onto the C0 schema with the caller's `profile` + `provenance`. `run` is the just-produced
+    /// [`OracleReport`] (its run-only counts can't be reconstructed from the side tables).
+    pub fn resolution_report(
+        &self,
+        profile: &oracle::CorpusProfile,
+        provenance: &oracle::RunProvenance,
+        tool: OracleTool,
+        run: &OracleReport,
+    ) -> anyhow::Result<oracle::OracleResolutionReport> {
+        oracle::resolution_report(
+            self.storage.connection(),
+            profile,
+            provenance,
+            tool,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+            run,
+        )
+    }
+
     /// Persisted oracle status (verdict counts + last run) for a tool/version, scoped to this
     /// database's active `(commit_sha, worktree_id)` checkout.
     pub fn oracle_status(
