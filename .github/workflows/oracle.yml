@@ -148,6 +148,75 @@ jobs:
           path: ${{ runner.temp }}/${{ matrix.corpus }}-report.json
           if-no-files-found: warn
 
+  report:
+    # Aggregate the small-tier corpus reports into one Markdown table: a job summary always, plus —
+    # on a PR — an artifact the fork-safe oracle-pr-comment.yml posts as a sticky comment. The Δ
+    # column diffs each corpus against `main`'s last reports, cached here (saved on a main push,
+    # restored on a PR). rag-rat emits JSON only; the Markdown is `tools/oracle-report-md.py` glue.
+    needs: [matrix, small]
+    # Run whenever the matrix ran, even if a corpus leg failed its health gate — a failing report is
+    # exactly what we want surfaced in the summary/comment.
+    if: always() && needs.matrix.outputs.tier == 'small' && needs.small.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all corpus reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: oracle-report-*
+          path: reports
+          merge-multiple: true
+
+      # main's last reports, for the Δ column. restore-keys prefix-matches the most recent main save;
+      # absent on the first run / a brand-new corpus → the script degrades to absolute-only.
+      - name: Restore the main baseline reports
+        uses: actions/cache/restore@v4
+        with:
+          path: baselines
+          key: oracle-baseline-${{ github.run_id }}
+          restore-keys: oracle-baseline-
+
+      - name: Render the Markdown report → job summary
+        # Report/baseline paths are space-free (kebab corpus ids under runner.temp), so unquoted
+        # word-splitting is safe and keeps this free of bash-version builtins.
+        run: |
+          set -euo pipefail
+          reports="$(find reports -name '*-report.json' | sort)"
+          [ -n "$reports" ] || { echo "no corpus reports found" >&2; exit 1; }
+          baselines=""
+          [ -d baselines ] && baselines="$(find baselines -name '*-report.json' | sort)" || true
+          # shellcheck disable=SC2086
+          python3 tools/oracle-report-md.py --reports $reports ${baselines:+--baselines $baselines} \
+            > oracle-report.md
+          cat oracle-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save the PR event (for the fork-safe comment step)
+        if: github.event_name == 'pull_request'
+        run: cp "$GITHUB_EVENT_PATH" event.json
+
+      - name: Upload the rendered report (consumed by oracle-pr-comment.yml)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-report-md
+          path: |
+            oracle-report.md
+            event.json
+
+      # On a main push these reports become the new baseline future PRs diff against. Immutable
+      # per-run key; the PR restore-keys prefix picks the most recent.
+      - name: Publish the new main baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          rm -rf baselines && mkdir baselines && cp reports/*-report.json baselines/
+      - name: Save the main baseline cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: baselines
+          key: oracle-baseline-${{ github.run_id }}
+
   heavy:
     needs: matrix
     if: needs.matrix.outputs.tier == 'heavy'

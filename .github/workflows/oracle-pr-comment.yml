@@ -1,0 +1,52 @@
+name: oracle-pr-comment
+
+# Fork-safe step 2 of the small-tier oracle report: post the rendered resolution table as a sticky
+# PR comment. Triggered by the `oracle` workflow completing; runs in BASE-repo context (so it has
+# `pull-requests: write`) but only ever consumes the Markdown artifact step 1 produced — never the
+# fork's code — so a fork PR can't reach the write token. Mirrors bench-pr-run / bench-pr-track.
+
+on:
+  workflow_run:
+    workflows: [oracle]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    # Only for PR-triggered oracle runs (skip push / release / dispatch). The artifact is uploaded
+    # only by the small tier's `report` job, so non-PR runs simply have nothing to post.
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the rendered report (from the oracle run)
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: oracle-report-md
+          run_id: ${{ github.event.workflow_run.id }}
+          if_no_artifact_found: ignore
+
+      - name: Upsert the sticky PR comment
+        if: hashFiles('oracle-report.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('oracle-report.md', 'utf8');
+            const event = JSON.parse(fs.readFileSync('event.json', 'utf8'));
+            const issue_number = event.number;
+            const { owner, repo } = context.repo;
+            // Find our previous comment by the stable marker oracle-report-md.py emits, and update
+            // it in place so a PR carries ONE rolling report rather than one per push.
+            const marker = '<!-- rag-rat-oracle-report -->';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

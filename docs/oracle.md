@@ -69,3 +69,19 @@ auto_run_min_interval_secs = 21600   # and at most once every 6 h
 It needs a SCIP tool (e.g. `rust-analyzer`) on `PATH`, runs only inside the MCP server, and produces
 the `.scip` outside the index write lock so the file watcher is never starved. See
 [`config.md`](config.md) for all knobs.
+
+## Resolution-quality CI (the corpus runner)
+
+`tools/oracle-corpora.toml` declares real-repo corpora (a small per-PR tier + a heavy
+release/Bencher tier); `tools/oracle-run.sh` runs one corpus end to end (clone @ rev → prepare →
+index → `rag-rat oracle report`, gated by per-corpus health thresholds). The `oracle.yml` workflow
+drives it:
+
+- **small tier** (PRs + `main`): a matrix over the small corpora. Each leg's report is rendered into
+  a Markdown table — `tools/oracle-report-md.py` (JSON in, Markdown out; the resolution rate,
+  precision/recall, and a **Δ-vs-`main`** column gated on `corpus_profile_hash` + `tool_version`
+  comparability) — and posted both as a job summary and a sticky PR comment (fork-safe two-workflow
+  split: `oracle.yml` → `oracle-pr-comment.yml`, mirroring the Bencher PR pattern). A failed health
+  gate fails the PR.
+- **heavy tier** (release / dispatch): the big corpora on the self-hosted box, converted to BMF
+  (`tools/oracle-report-bmf.py`) and pushed to Bencher as the headline resolution series.
