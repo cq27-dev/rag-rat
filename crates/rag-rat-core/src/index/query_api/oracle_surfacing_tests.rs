@@ -194,15 +194,23 @@ fn pre_spawn_snapshot_round_trips_through_run_oracle() {
 
     let symbol = "scip-rust crate held-mini `target`().";
     let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((29, 35)));
-    let report =
-        db.run_oracle(OracleTool::RustAnalyzer, "v-test", &scip, None, Some(&snapshot)).unwrap();
+    let report = db
+        .run_oracle(OracleTool::RustAnalyzer, "v-test", &scip, OracleShaSnapshots {
+            production: None,
+            pre_spawn: Some(&snapshot),
+        })
+        .unwrap();
     assert!(report.confirmed >= 1 || report.upgraded >= 1, "matching pin verdicts normally");
     assert_eq!(report.skipped_drifted, 0);
 
     let mut stale = snapshot.clone();
     stale.insert(path.clone(), "pre-spawn-old".to_string());
-    let report =
-        db.run_oracle(OracleTool::RustAnalyzer, "v-test2", &scip, None, Some(&stale)).unwrap();
+    let report = db
+        .run_oracle(OracleTool::RustAnalyzer, "v-test2", &scip, OracleShaSnapshots {
+            production: None,
+            pre_spawn: Some(&stale),
+        })
+        .unwrap();
     assert_eq!(report.rows_written, 0, "a mid-subprocess reindex must skip the candidate");
     assert!(report.skipped_drifted >= 1);
 

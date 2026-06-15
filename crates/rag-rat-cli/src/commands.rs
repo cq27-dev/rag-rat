@@ -339,8 +339,10 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
                     tool,
                     &version,
                     &bytes,
-                    Some(&production_sha),
-                    Some(&pre_spawn_sha),
+                    rag_rat_core::index::OracleShaSnapshots {
+                        production: Some(&production_sha),
+                        pre_spawn: Some(&pre_spawn_sha),
+                    },
                     started_at_ms,
                 )
             })?;

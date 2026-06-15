@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::index::ai;
 use crate::index::oracle::{OracleEvalMetrics, OracleTool, RecallCalls};
+use crate::index::{OracleShaSnapshots, ai};
 use crate::{Config, IndexDatabase};
 
 const TOP_K: usize = 10;
@@ -253,8 +253,12 @@ fn run_oracle_eval(
     })?;
     // Eval consumes a pre-built fixture `.scip` (no tool subprocess), so there is no production
     // snapshot — `None` leaves only the index-vs-disk content gate, as on the `--scip` CLI path.
-    let report =
-        db.run_oracle(OracleTool::RustAnalyzer, EVAL_ORACLE_TOOL_VERSION, &scip_bytes, None, None)?;
+    let report = db.run_oracle(
+        OracleTool::RustAnalyzer,
+        EVAL_ORACLE_TOOL_VERSION,
+        &scip_bytes,
+        OracleShaSnapshots::default(),
+    )?;
     // Both recall sides come from the run, occurrence-counted over the call population.
     let recall_calls =
         RecallCalls { covered: report.covered_calls, oracle_only: report.oracle_only_calls };

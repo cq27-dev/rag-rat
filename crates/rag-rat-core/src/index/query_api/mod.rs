@@ -17,6 +17,7 @@ mod search;
 
 pub use gc::GcReport;
 pub use importance::ImportantSymbolsRequest;
+pub use oracle_runs::OracleShaSnapshots;
 pub use search::SearchRequest;
 
 impl IndexDatabase {

@@ -37,7 +37,7 @@ pub(crate) use lifecycle::install_scope_view;
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub use parser_failures::ParserFailure;
 pub(crate) use prep::*;
-pub use query_api::{GcReport, ImportantSymbolsRequest, SearchRequest};
+pub use query_api::{GcReport, ImportantSymbolsRequest, OracleShaSnapshots, SearchRequest};
 pub(crate) use util::*;
 
 #[cfg(test)]
