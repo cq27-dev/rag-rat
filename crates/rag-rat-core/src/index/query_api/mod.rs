@@ -275,18 +275,36 @@ impl IndexDatabase {
             return Ok(false);
         }
         let files = self.assign_file_scopes(healable, &changes);
-        let indexed = self.apply_incremental_file_plan(
-            files,
-            std::collections::BTreeSet::new(),
-            &mut |_| {},
-        )?;
-        if indexed == 0 {
-            return Ok(false);
+        // Apply with the SAME write discipline as the incremental indexer
+        // (`index_incremental_with_progress`), not a corner-cut version (PR #158 review):
+        //  - one `BEGIN IMMEDIATE` txn so a concurrent reader never observes the index between the
+        //    logical-symbol DELETE-all and its rebuild (which would return empty logical handles);
+        //  - apply `changes.deleted` so a removed file's stale rows don't survive the re-resolve
+        //    and let the new file's edges bind to a deleted definition;
+        //  - `refresh_packages` BEFORE `resolve_edges`, since per-package import scope (#61) is
+        //    read at resolve time — a change set that adds/edits a Cargo.toml must resolve against
+        //    the fresh package map, not the stale one.
+        // On the read-only MCP connection the BEGIN trips SQLITE_READONLY and the dispatch retries
+        // read-write (like the #147 heal), so the txn always runs on a writable connection.
+        self.storage.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> anyhow::Result<()> {
+            self.apply_incremental_file_plan(files, changes.deleted.clone(), &mut |_| {})?;
+            self.refresh_packages(&config.root)?;
+            self.rebuild_logical_symbols()?;
+            self.resolve_edges()?;
+            self.sync_fts()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.storage.execute_batch("COMMIT")?;
+                Ok(true)
+            },
+            Err(error) => {
+                let _ = self.storage.execute_batch("ROLLBACK");
+                Err(error)
+            },
         }
-        // Re-derive so the new symbol carries a logical id and its edges resolve for enrichment.
-        self.rebuild_logical_symbols()?;
-        self.resolve_edges()?;
-        Ok(true)
     }
 
     pub fn select_symbol(
