@@ -867,20 +867,30 @@ mod tests {
             scip_path: None,
         })
         .unwrap();
-        // The hand-authored `must_include_*` baseline is the hard gate: every expectation must be
-        // met (no current-source-safety violations, every required symbol/path/graph target found).
-        let failures = report
-            .results
-            .iter()
-            .filter(|r| !r.passed)
-            .map(|r| {
-                (r.id.as_str(), &r.missing_symbols, &r.missing_paths, &r.missing_graph_targets)
-            })
-            .collect::<Vec<_>>();
-        assert!(report.pass, "eval baseline regressed: {failures:#?}");
+        // Safety + non-zero retrieval hold in every build shape.
         assert_eq!(report.metrics.stale_current_source_violations, 0);
         assert!(report.metrics.mrr_at_10 > 0.0);
         assert!(report.metrics.recall_at_10 > 0.0);
+
+        // The full hand-authored `must_include_*` baseline is the hard gate ONLY with an embedding
+        // backend. Some expectations (the const-arrow hook by name, the graph-neighbor query)
+        // require hybrid retrieval: their fixture chunks deliberately do NOT rank in top-K on
+        // lexical/BM25 alone — we don't lexically seed the fixture to fake semantic recall (#163,
+        // Codex review on #162). So under `--no-default-features` (hash, lexical-only) we
+        // smoke-check above; the hybrid CI pass (default features → MiniLM) enforces the
+        // full baseline here.
+        #[cfg(feature = "fastembed")]
+        {
+            let failures = report
+                .results
+                .iter()
+                .filter(|r| !r.passed)
+                .map(|r| {
+                    (r.id.as_str(), &r.missing_symbols, &r.missing_paths, &r.missing_graph_targets)
+                })
+                .collect::<Vec<_>>();
+            assert!(report.pass, "eval baseline regressed: {failures:#?}");
+        }
 
         // Best-effort cleanup; do not fail the test on cleanup error.
         let _ = std::fs::remove_dir_all(&db_dir);

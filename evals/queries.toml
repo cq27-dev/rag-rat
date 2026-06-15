@@ -69,10 +69,12 @@ must_include_paths = [
   "src/Main.kt",
 ]
 # `symbol_path` is `{file_path}::{name}` — the receiver/companion is NOT part of it (the qualified
-# name is file-path based, not semantic-scope based; scope_path carries the receiver separately). So
-# the companion factory's symbol_path is `src/Main.kt::create`; match on the bare name `create`.
+# name is file-path based, not semantic-scope based; scope_path carries the receiver separately). Use
+# the fully-qualified `src/Main.kt::create`, not bare `create`: symbol expectations match on
+# `== || ends_with`, so a bare name would also accept an unrelated `…recreate`/other-file `create`
+# as long as src/Main.kt happens to be a path hit. File-scoping keeps the gate on the actual factory.
 must_include_symbols = [
-  "create",
+  "src/Main.kt::create",
 ]
 
 [[query]]

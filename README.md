@@ -177,7 +177,7 @@ rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64
 rag-rat github sync --from-refs
 rag-rat hooks install              # git maintenance hooks
 rag-rat gc                         # prune rows for dead git contexts
-rag-rat eval [--json|--update-baseline]
+rag-rat eval [--json|--update-baseline]   # CI search-quality gate; requires a `--features eval` build (absent from the released binary)
 rag-rat mcp                        # start the STDIO server
 ```
 

@@ -1,6 +1,6 @@
 export function openDatabase(): void {
-  // Open the on-device database connection through the native bridge.
-  NativeHeldCore.openDatabase();
+  const handle = NativeHeldCore.openDatabase();
+  void handle;
 }
 
 export type BridgeState = "open" | "closed";
