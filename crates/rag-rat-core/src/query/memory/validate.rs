@@ -47,6 +47,26 @@ pub(crate) fn validate_logical_symbol_binding(
     if let Some(id) = binding.logical_symbol_id
         && crate::query::symbol::lookup_logical_by_id(conn, id)?.is_some()
     {
+        // The logical symbol is live. Its id is content-derived and STABLE across reindex, but
+        // chunk ids are reassigned on every re-chunk — so the stored `chunk_id` is stale whenever
+        // the symbol shifted lines (an edit ELSEWHERE in the same file leaves the symbol's
+        // name/qualified_name/kind/signature, hence its stable id, unchanged while its chunk
+        // moves). Re-derive the chunk from the live logical symbol before
+        // content-validating; trusting the churned `chunk_id` made `validate_bound_chunk`
+        // report `gone` for an unchanged symbol (#154 — the gone-on-every-reindex symptom
+        // was really gone-on-any-line-shift). Falls through to the stored-chunk check only
+        // when the logical symbol resolves to no chunk.
+        if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
+            binding.symbol_id = chunk.symbol_id;
+            binding.chunk_id = Some(chunk.chunk_id);
+            binding.path = Some(chunk.path);
+            binding.start_line = Some(chunk.start_line);
+            binding.end_line = Some(chunk.end_line);
+            return Ok(match source_hash_for_memory(conn, &binding.memory_id)? {
+                Some(expected) if expected != chunk.text_hash => "stale".to_string(),
+                _ => "current".to_string(),
+            });
+        }
         return validate_bound_chunk(conn, binding);
     }
     let relocated = conn

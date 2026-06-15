@@ -3119,6 +3119,75 @@ fn cross_version_moniker_match_requires_kind_corroboration() {
     }
 }
 
+/// #154: a `logical_symbol` binding must stay `current` across a reindex that merely SHIFTS the
+/// symbol's lines (an edit elsewhere in the file). The logical symbol's id is content-derived and
+/// stable, but chunk ids are reassigned on every re-chunk — so the stored `chunk_id` goes stale.
+/// Before the fix the stable-id arm called `validate_bound_chunk`, which found the churned chunk_id
+/// missing and returned `gone`; it must instead re-derive the chunk from the live logical symbol.
+#[test]
+fn logical_symbol_binding_survives_chunk_id_churn_on_reindex() {
+    let h = Harness::new();
+    let file = h.add_file("a.rs", "fn target() {}\n");
+    let sym = h.add_symbol_qualified(file, "target", "a.rs::target", "function", 0, 14);
+    h.add_chunk(file, "a.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "a.rs", "target", "a.rs::target", sym);
+
+    let created = create_memory(&h.conn, RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "target invariant".to_string(),
+        body: "target stays reentrant".to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget { logical_symbol_id: Some(1001), ..Default::default() },
+    })
+    .unwrap();
+    let memory_id = created.memory.memory_id;
+    let original_chunk_id = created
+        .memory
+        .bindings
+        .iter()
+        .find(|b| b.binding_kind == "logical_symbol")
+        .expect("logical_symbol binding")
+        .chunk_id
+        .expect("chunk_id bound");
+
+    // Re-chunk the file: chunk + symbol rows get NEW rowids (as a reindex reassigns them), but the
+    // logical symbol keeps its content-derived id 1001 (the symbol is unchanged, just shifted). The
+    // content is byte-identical, so the only thing that moved is the chunk_id.
+    h.conn.execute("DELETE FROM logical_symbol_members", []).unwrap();
+    h.conn.execute("DELETE FROM chunks", []).unwrap();
+    h.conn.execute("DELETE FROM symbols", []).unwrap();
+    let new_sym = h.add_symbol_qualified(file, "target", "a.rs::target", "function", 0, 14);
+    h.add_chunk(file, "a.rs::target", "fn target() {}\n");
+    h.conn
+        .execute(
+            "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, cfg_expr, \
+             signature_hash, start_line, end_line) VALUES (1001, ?1, NULL, NULL, 1, 1)",
+            params![new_sym],
+        )
+        .unwrap();
+
+    validate_memories(&h.conn, None).unwrap();
+
+    let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
+    let binding = memory
+        .bindings
+        .iter()
+        .find(|b| b.binding_kind == "logical_symbol")
+        .expect("logical_symbol binding");
+    assert_eq!(
+        binding.anchor_status, "current",
+        "a logical_symbol binding must survive chunk_id churn on reindex (#154)"
+    );
+    assert_ne!(
+        binding.chunk_id,
+        Some(original_chunk_id),
+        "the binding's chunk_id should be refreshed to the re-chunked symbol's new chunk"
+    );
+}
+
 /// Point the index `source_root` meta at the harness checkout so the off-index filesystem
 /// existence fallback (#98) has a root to resolve a binding path against.
 fn set_source_root(h: &Harness) {
