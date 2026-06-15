@@ -8,6 +8,10 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only: this job only checks out the repo and runs cargo. No write scopes (CodeQL hardening).
+permissions:
+  contents: read
+
 concurrency:
   group: eval-${{ github.ref }}
   cancel-in-progress: true

@@ -68,8 +68,11 @@ evidence_class = "symbol-name"
 must_include_paths = [
   "src/Main.kt",
 ]
+# `symbol_path` is `{file_path}::{name}` — the receiver/companion is NOT part of it (the qualified
+# name is file-path based, not semantic-scope based; scope_path carries the receiver separately). So
+# the companion factory's symbol_path is `src/Main.kt::create`; match on the bare name `create`.
 must_include_symbols = [
-  "MainBridge::create",
+  "create",
 ]
 
 [[query]]
