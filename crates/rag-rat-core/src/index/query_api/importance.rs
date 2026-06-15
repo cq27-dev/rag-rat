@@ -42,6 +42,29 @@ enum ChangedPathSymbols {
 }
 
 impl IndexDatabase {
+    /// Rank load-bearing symbols by weighted PageRank over the active checkout's edge graph
+    /// (#108), returning the labeled [`ImportantSymbolsResult`] (mode + seed provenance) per the
+    /// spec's "three scales". `personalize` biases importance toward the seed symbols; empty =
+    /// global.
+    ///
+    /// When a SCIP oracle run exists for this checkout, ranking uses the compiler-verified graph
+    /// (contradicted edges dropped, upgrades retargeted, confirmed/upgraded edges weighted above
+    /// heuristic) — otherwise the heuristic graph with confidence weighting. The oracle lookup is
+    /// gated on a run existing, so absent oracle data it costs nothing (no scan).
+    ///
+    /// Seed resolution happens HERE, at the query boundary, because it needs both the symbol index
+    /// (name/ref/handle → id) and git (the working-set diff); `query::pagerank` stays a pure
+    /// ranking primitive over raw ids. Seed precedence:
+    /// - explicit `request.personalize` (names / refs / `sym_<hex>` handles) →
+    ///   `SeedKind::Explicit`;
+    /// - else, if `request.auto_seed_from_diff` (the MCP default), the current git diff →
+    ///   `SeedKind::GitDiff`;
+    /// - else (the CLI default, or an explicit empty/`global` selector) → global, un-seeded.
+    ///
+    /// A seed intent that resolves to NO in-graph symbol (bad names only, or a diff with no indexed
+    /// symbols) does NOT hard-error: it falls through to global ranking but REPORTS the
+    /// fall-through (`mode = global …` + `reason` + the diff counts), so the caller sees WHY it
+    /// was un-seeded.
     pub fn important_symbols(
         &self,
         request: ImportantSymbolsRequest,
