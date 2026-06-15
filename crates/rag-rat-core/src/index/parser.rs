@@ -49,6 +49,7 @@ pub enum ParserKind {
     Kotlin,
     C,
     Cpp,
+    Python,
     Markdown,
 }
 
@@ -64,6 +65,7 @@ pub fn parser_kind(path: &Path, language: Language) -> ParserKind {
         Language::Kotlin => ParserKind::Kotlin,
         Language::C => ParserKind::C,
         Language::Cpp => ParserKind::Cpp,
+        Language::Python => ParserKind::Python,
         Language::Markdown => ParserKind::Markdown,
     }
 }
@@ -79,6 +81,7 @@ fn grammar_for(kind: ParserKind) -> Option<tree_sitter::Language> {
         ParserKind::Kotlin => tree_sitter_kotlin::LANGUAGE.into(),
         ParserKind::C => tree_sitter_c::LANGUAGE.into(),
         ParserKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        ParserKind::Python => tree_sitter_python::LANGUAGE.into(),
         ParserKind::Markdown => return None,
     })
 }
@@ -150,10 +153,14 @@ fn collect_symbols(
     if node.is_error() || node.is_missing() {
         return;
     }
-    if let Some((kind, name_node)) = symbol_node(language, node) {
+    if let Some((kind, name_node)) = symbol_node(language, node, text) {
         let name = node_text(name_node, text).unwrap_or_default();
         if !name.is_empty() {
-            out.push(make_symbol(path, language, text, node, kind, name));
+            // The span (chunk/embedding) is the matched `node`; the SIGNATURE is read from the
+            // declaration node, which differs for a decorated Python def (the span starts at the
+            // decorator, but the signature must be the `def`/`class` line).
+            let signature_node = signature_source_node(language, node);
+            out.push(make_symbol(path, language, text, node, signature_node, kind, name));
         }
     }
     let mut cursor = node.walk();
@@ -162,7 +169,11 @@ fn collect_symbols(
     }
 }
 
-fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node<'_>)> {
+fn symbol_node<'a>(
+    language: Language,
+    node: Node<'a>,
+    text: &str,
+) -> Option<(&'static str, Node<'a>)> {
     let kind = node.kind();
     match language {
         Language::Rust => match kind {
@@ -224,8 +235,71 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
             "preproc_function_def" => Some(("macro", child_name(node)?)),
             _ => None,
         },
+        Language::Python => match kind {
+            // A decorated def OWNS the symbol span (so `@app.get(...)` / `@dataclass` / `@property`
+            // decorator lines — which often define the API surface — are inside the chunk), using
+            // the inner def's name + kind. The inner `function_definition`/`class_definition` arms
+            // below are guarded so they don't ALSO emit a duplicate with the bare (decorator-less)
+            // span.
+            "decorated_definition" => {
+                let inner = node.child_by_field_name("definition")?;
+                let kind = match inner.kind() {
+                    "function_definition" => "function",
+                    "class_definition" => "class",
+                    _ => return None,
+                };
+                Some((kind, child_name(inner)?))
+            },
+            "function_definition" if !python_parent_is_decorated(node) =>
+                Some(("function", child_name(node)?)),
+            "class_definition" if !python_parent_is_decorated(node) =>
+                Some(("class", child_name(node)?)),
+            // PEP 695 type alias (`type UserId = int`) — index the alias like Rust/TS/C++ type
+            // aliases. `child_name` finds the first identifier (the alias name `UserId`).
+            "type_alias_statement" => Some(("type", child_name(node)?)),
+            // Constants are MODULE- or CLASS-level SCREAMING_SNAKE_CASE assignments only. Gating on
+            // scope keeps function-local uppercase temporaries (`TIMEOUT = compute()`) out of the
+            // symbol table, and the screaming-snake check keeps ordinary lowercase
+            // locals/attributes out.
+            "assignment" if python_assignment_is_const_scope(node) => {
+                let target = node.child_by_field_name("left")?;
+                let name = node_text(target, text)?;
+                (target.kind() == "identifier" && is_screaming_snake_case(&name))
+                    .then_some(("const", target))
+            },
+            _ => None,
+        },
         Language::Markdown => None,
     }
+}
+
+/// `true` for a Python constant name (SCREAMING_SNAKE_CASE): at least one ASCII uppercase letter
+/// and only uppercase / digits / underscore. Keeps `DEFAULT_NAME` but rejects `bridge_name` /
+/// `Api`.
+fn is_screaming_snake_case(name: &str) -> bool {
+    name.chars().any(|c| c.is_ascii_uppercase())
+        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Whether a Python def node's parent is a `decorated_definition` (so the parent arm owns its
+/// symbol span and the inner arm must not emit a duplicate).
+fn python_parent_is_decorated(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| parent.kind() == "decorated_definition")
+}
+
+/// Whether a Python `assignment` is at module or class scope (a constant), vs a function-local
+/// temporary. Walks ancestors to the first scope boundary: a `function_definition`/`lambda` means
+/// local (not a constant); a `class_definition`/`module` means module/class level (a constant).
+fn python_assignment_is_const_scope(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        match current.kind() {
+            "function_definition" | "lambda" => return false,
+            "class_definition" | "module" => return true,
+            _ => ancestor = current.parent(),
+        }
+    }
+    false
 }
 
 fn child_name(node: Node<'_>) -> Option<Node<'_>> {
@@ -294,6 +368,8 @@ fn scope_segment(language: Language, node: Node<'_>, text: &str) -> Option<Strin
         (Language::TypeScript, "internal_module" | "module" | "namespace_declaration") =>
             child_name(node)?,
         (Language::Kotlin, "class_declaration" | "object_declaration") => child_name(node)?,
+        // Python nests methods in classes and closures in functions — both bound `scope_path`.
+        (Language::Python, "class_definition" | "function_definition") => child_name(node)?,
         (Language::Cpp, "namespace_definition") => child_name(node)?,
         (
             Language::C | Language::Cpp,
@@ -372,6 +448,10 @@ fn make_symbol(
     language: Language,
     text: &str,
     node: Node<'_>,
+    // The declaration node the SIGNATURE is read from. Equals `node` except for a decorated Python
+    // def, where `node` is the `decorated_definition` (so the chunk span includes the decorators)
+    // but the signature must come from the inner `def`/`class` line.
+    signature_node: Node<'_>,
     kind: &str,
     name: String,
 ) -> ParsedSymbol {
@@ -391,10 +471,23 @@ fn make_symbol(
         end_byte,
         start_line,
         end_line,
-        signature: signature_for(text, start_byte, end_byte),
+        signature: signature_for(text, signature_node.start_byte(), signature_node.end_byte()),
         docs: docs_before(text, start_byte),
         facts: symbol_facts(language, text, node),
     }
+}
+
+/// The node a symbol's signature is read from. For a decorated Python def this is the inner
+/// `def`/`class` (so the signature is the declaration, not the `@decorator` line the span starts
+/// at); for everything else it's the matched node itself.
+fn signature_source_node<'a>(language: Language, node: Node<'a>) -> Node<'a> {
+    if language == Language::Python
+        && node.kind() == "decorated_definition"
+        && let Some(inner) = node.child_by_field_name("definition")
+    {
+        return inner;
+    }
+    node
 }
 
 fn symbol_facts(language: Language, text: &str, node: Node<'_>) -> Vec<ParsedSymbolFact> {

@@ -65,7 +65,7 @@ pub fn description(name: &str) -> &'static str {
              (every hit 'lexical') when no embedding model is present.",
         "symbol_lookup" =>
             "Resolve a symbol name (or ref/id) to its definition(s) in Rust, TypeScript, Kotlin, \
-             C, or C++ — exact or fuzzy. Returns candidates with signatures, locations, \
+             C, C++, or Python — exact or fuzzy. Returns candidates with signatures, locations, \
              logical-symbol grouping (cfg variants), and any bound repo memories. Use to \
              disambiguate before a graph or read call.",
         "find_callers" =>

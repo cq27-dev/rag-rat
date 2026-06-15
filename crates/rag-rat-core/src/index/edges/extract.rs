@@ -96,6 +96,7 @@ pub(crate) fn syntactic_edges(
         ParserKind::Kotlin => tree_sitter_kotlin::LANGUAGE.into(),
         ParserKind::C => tree_sitter_c::LANGUAGE.into(),
         ParserKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        ParserKind::Python => tree_sitter_python::LANGUAGE.into(),
         ParserKind::Markdown => return Ok(Vec::new()),
     };
     let mut parser = tree_sitter::Parser::new();
@@ -123,6 +124,7 @@ pub(crate) fn collect_edges(
         Language::TypeScript => typescript_edges(text, node, symbols, path, out),
         Language::Kotlin => kotlin_edges(text, node, symbols, path, out),
         Language::C | Language::Cpp => c_like_edges(text, node, symbols, path, out),
+        Language::Python => python_edges(text, node, symbols, path, out),
         Language::Markdown => {},
     }
 
@@ -600,6 +602,246 @@ pub(crate) fn c_like_edges(
         _ => {},
     }
 }
+pub(crate) fn python_edges(
+    text: &str,
+    node: Node<'_>,
+    symbols: &[IndexedSymbol],
+    path: &Path,
+    out: &mut Vec<EdgeCandidate>,
+) {
+    match node.kind() {
+        // `from <module> import <name|name as alias>, ...` — emit Imports edges to the MODULE and
+        // to each imported NAME, never the local alias. A relative import (`.sessions`)
+        // normalizes to its dotted tail (the leading dots aren't identifiers), so the
+        // module name is recorded separately from any `as` alias.
+        "import_from_statement" => {
+            let module = node.child_by_field_name("module_name");
+            if let Some(module) = module
+                && let Some(name) = last_identifier_text(module, text)
+            {
+                out.push(file_edge(
+                    path,
+                    module,
+                    text,
+                    name,
+                    EdgeKind::Imports,
+                    EdgeConfidence::NameOnly,
+                ));
+            }
+            let module_id = module.map(|m| m.id());
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if Some(child.id()) == module_id {
+                    continue;
+                }
+                python_import_target(child, text, path, out);
+            }
+        },
+        // `import <module>` / `import <module> as alias` — Imports edge to the module, not the
+        // alias.
+        "import_statement" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                python_import_target(child, text, path, out);
+            }
+        },
+        // Function / method / constructor call. Mirror the C handler: the callee is the LAST
+        // identifier under the `function` child (`f()` → `f`, `obj.method()` → `method`), the
+        // receiver is the first (recorded only as a NameOnly hint — never claimed as exact;
+        // resolving it is the oracle's job, not the heuristic's).
+        "call" => {
+            let function = node.child_by_field_name("function").unwrap_or(node);
+            let identifiers = identifiers_under(function, text);
+            let identifier_nodes = identifier_nodes_under(function);
+            // `handlers[key]()` — the callee is the subscript RESULT, not the index variable
+            // `last()` would pick. There's no clean callee identifier, so emit nothing (a wrong
+            // `calls_name key` is worse than a missing edge).
+            if function.kind() == "subscript" {
+                // fall through to recursion without emitting a call edge
+            } else if let Some(name) = identifiers.last().cloned() {
+                out.push(symbol_edge_with_context(
+                    symbols,
+                    node,
+                    text,
+                    name,
+                    EdgeKind::CallsName,
+                    EdgeConfidence::NameOnly,
+                    EdgeContext {
+                        target_qualified_name: dotted_qualified_name(&identifiers),
+                        receiver_hint: identifiers
+                            .first()
+                            .filter(|_| identifiers.len() > 1)
+                            .cloned(),
+                    },
+                    identifier_nodes.last().copied().map(CalleeRange::of_node),
+                ));
+            }
+        },
+        // `class Foo(Base, Generic[T], metaclass=Meta)` — each POSITIONAL base is an Implements +
+        // ReferencesType edge. Keyword (`metaclass=`) and splat (`*bases`/`**kw`) arguments are not
+        // superclasses, and a parameterized base resolves to its head (`Generic`, not `T`).
+        "class_definition" =>
+            if let Some(supers) = node.child_by_field_name("superclasses") {
+                let mut cursor = supers.walk();
+                for base in supers.named_children(&mut cursor) {
+                    if matches!(base.kind(), "keyword_argument" | "list_splat" | "dictionary_splat")
+                    {
+                        continue;
+                    }
+                    // Implements points at the base HEAD only (`Generic`, not `T`); ReferencesType
+                    // covers the head AND every type argument (`Mapping[str, Api]` → `Mapping`,
+                    // `str`, `Api`).
+                    let head = python_type_head(base);
+                    if let Some(name) = last_identifier_text(head, text) {
+                        out.push(symbol_edge(
+                            symbols,
+                            base,
+                            name,
+                            EdgeKind::Implements,
+                            EdgeConfidence::NameOnly,
+                            last_identifier_node(head)
+                                .map(final_segment_node)
+                                .map(CalleeRange::of_node),
+                        ));
+                    }
+                    emit_python_type_refs(base, symbols, text, out);
+                }
+            },
+        // Type annotations (`x: T`, `-> T`) wrap their type in a `type` node.
+        // `emit_python_type_refs` walks the whole type expression — generics (`Box[Item]`),
+        // qualified generics (`typing.Optional[Api]`), unions (`A | B`), nested
+        // (`Optional[list[Api]]`), `Callable` param lists — emitting a ReferencesType per
+        // referenced type. The alias NAME in a `type X = …` is skipped (it's a definition,
+        // not a reference). String forward refs (`-> "Api"`) carry no identifier → no edge.
+        "type" if !python_is_type_alias_name(node) => {
+            emit_python_type_refs(node, symbols, text, out);
+        },
+        // A bare decorator (`@requires_auth`, `@pytest.fixture`) is an identifier/attribute, not a
+        // `call` — applying it is a call-like dependency, so emit a NameOnly call edge. A
+        // parenthesized decorator (`@foo(...)`) is a `call` child, already handled by the call arm
+        // via recursion.
+        "decorator" => {
+            if let Some(inner) = node.named_child(0)
+                && matches!(inner.kind(), "identifier" | "attribute")
+                && let Some(name) = last_identifier_text(inner, text)
+            {
+                // Preserve the qualifier so a qualified decorator (`@pytest.fixture`) carries its
+                // `pytest` receiver + dotted path — same context the call arm records — so the
+                // resolver doesn't fall back to a bare local `fixture` of the same name.
+                let identifiers = identifiers_under(inner, text);
+                out.push(symbol_edge_with_context(
+                    symbols,
+                    node,
+                    text,
+                    name,
+                    EdgeKind::CallsName,
+                    EdgeConfidence::NameOnly,
+                    EdgeContext {
+                        target_qualified_name: dotted_qualified_name(&identifiers),
+                        receiver_hint: identifiers
+                            .first()
+                            .filter(|_| identifiers.len() > 1)
+                            .cloned(),
+                    },
+                    last_identifier_node(inner).map(final_segment_node).map(CalleeRange::of_node),
+                ));
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Emit `ReferencesType` edges for a subscript-form generic's type arguments, RECURSIVELY so nested
+/// generics (`typing.Optional[list[Api]]` → both `list` and `Api`) are all referenced. Each arg's
+/// head is emitted, then its own subscript args are walked; non-subscript args terminate.
+/// Emit a `ReferencesType` edge for every type referenced in a Python type expression, walking the
+/// whole shape: `type`/`generic_type`/`subscript`/`binary_operator` (PEP 604 `A |
+/// B`)/`list`/`tuple` (`Callable[[int, A], B]`)/`type_parameter` recurse into their children;
+/// `identifier`/`attribute`/ `dotted_name` are leaf references (the dotted tail is the referenced
+/// type). Anything else (string forward refs, `None`, literals) terminates with no edge. This
+/// single walker handles plain, generic, qualified, union, nested, and callable annotations
+/// uniformly.
+fn emit_python_type_refs(
+    node: Node<'_>,
+    symbols: &[IndexedSymbol],
+    text: &str,
+    out: &mut Vec<EdgeCandidate>,
+) {
+    match node.kind() {
+        "type" | "generic_type" | "subscript" | "binary_operator" | "list" | "tuple"
+        | "type_parameter" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                emit_python_type_refs(child, symbols, text, out);
+            }
+        },
+        "identifier" | "attribute" | "dotted_name" => {
+            if let Some(name) = last_identifier_text(node, text) {
+                out.push(symbol_edge(
+                    symbols,
+                    node,
+                    name,
+                    EdgeKind::ReferencesType,
+                    EdgeConfidence::NameOnly,
+                    last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
+                ));
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Whether `node` is the alias NAME being DEFINED in `type X = …` (the first child of a
+/// `type_alias_statement`) — a definition, not a reference, so it must not emit a `ReferencesType`
+/// self-edge. The value side (the second `type`) is referenced normally.
+fn python_is_type_alias_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "type_alias_statement"
+            && parent.named_child(0).map(|first| first.id()) == Some(node.id())
+    })
+}
+
+/// The "head" type node to anchor a Python type reference on, for a parameterized type. Unwraps the
+/// applicable wrappers to reach the base: a `type` wrapper, a `generic_type` (`Box[Item]` in an
+/// annotation → base `Box`), and a `subscript` (`Generic[T]` in a base-class list → value
+/// `Generic`). Plain identifiers/attributes pass through unchanged, so the type argument
+/// (`Item`/`T`) is never mistaken for the base. Bounded loop guards against a pathological tree.
+fn python_type_head(node: Node<'_>) -> Node<'_> {
+    let mut head = node;
+    for _ in 0..8 {
+        head = match head.kind() {
+            "type" | "generic_type" => head.named_child(0).unwrap_or(head),
+            "subscript" => head.child_by_field_name("value").unwrap_or(head),
+            _ => return head,
+        };
+    }
+    head
+}
+
+/// Emit an Imports edge for one import clause (`dotted_name` or `aliased_import`), targeting the
+/// imported name's dotted tail — NEVER the `as` alias (which is a local binding, not the import). A
+/// comma / parenthesized list (`from pkg import A, B`) nests its clauses under an `import_list`, so
+/// recurse into that.
+fn python_import_target(child: Node<'_>, text: &str, path: &Path, out: &mut Vec<EdgeCandidate>) {
+    if child.kind() == "import_list" {
+        let mut cursor = child.walk();
+        for clause in child.named_children(&mut cursor) {
+            python_import_target(clause, text, path, out);
+        }
+        return;
+    }
+    let target = match child.kind() {
+        "aliased_import" => child.child_by_field_name("name"),
+        "dotted_name" => Some(child),
+        _ => None,
+    };
+    if let Some(target) = target
+        && let Some(name) = last_identifier_text(target, text)
+    {
+        out.push(file_edge(path, target, text, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+    }
+}
+
 pub(crate) fn file_edge(
     path: &Path,
     node: Node<'_>,
@@ -747,5 +989,198 @@ pub(crate) fn symbol_edge_with_context(
         import_scope: None,
         edge_kind,
         confidence,
+    }
+}
+
+#[cfg(test)]
+mod python_edge_tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::language::Language;
+
+    fn edges(src: &str) -> Vec<EdgeCandidate> {
+        // No symbol table needed: the syntactic pass emits NameOnly candidates regardless of
+        // resolution, which is exactly the signal these assertions check.
+        syntactic_edges(Path::new("src/Main.py"), Language::Python, src, &[]).unwrap()
+    }
+
+    fn has(edges: &[EdgeCandidate], kind: EdgeKind, name: &str) -> bool {
+        edges.iter().any(|e| e.edge_kind == kind && e.to_name == name)
+    }
+
+    #[test]
+    fn relative_import_normalized_and_alias_not_treated_as_import() {
+        let e = edges("from .sessions import Session as ClientSession\n");
+        // The relative module `.sessions` normalizes to its dotted tail; the imported symbol is
+        // recorded separately.
+        assert!(has(&e, EdgeKind::Imports, "sessions"), "module import missing: {e:?}");
+        assert!(has(&e, EdgeKind::Imports, "Session"), "imported name missing: {e:?}");
+        // The local `as` alias is NOT an import target.
+        assert!(!has(&e, EdgeKind::Imports, "ClientSession"), "alias wrongly imported: {e:?}");
+    }
+
+    #[test]
+    fn plain_and_dotted_imports_use_module_not_alias() {
+        let e = edges("from requests.adapters import HTTPAdapter\nimport urllib3 as http\n");
+        assert!(has(&e, EdgeKind::Imports, "adapters"), "dotted module tail missing: {e:?}");
+        assert!(has(&e, EdgeKind::Imports, "HTTPAdapter"));
+        assert!(has(&e, EdgeKind::Imports, "urllib3"), "import module missing: {e:?}");
+        assert!(!has(&e, EdgeKind::Imports, "http"), "import alias wrongly recorded: {e:?}");
+    }
+
+    #[test]
+    fn method_call_records_receiver_hint_at_name_only_not_exact() {
+        let e = edges("def f():\n    http.disable_warnings()\n");
+        let call = e
+            .iter()
+            .find(|c| c.edge_kind == EdgeKind::CallsName && c.to_name == "disable_warnings")
+            .expect("method call edge");
+        assert_eq!(call.receiver_hint.as_deref(), Some("http"));
+        // The heuristic must NOT claim exact resolution for a member call — that's the oracle's
+        // job.
+        assert_eq!(call.confidence, EdgeConfidence::NameOnly);
+    }
+
+    #[test]
+    fn alias_call_emits_name_only_call_edge() {
+        // A call through an imported alias is a NameOnly call to the alias name (resolving the
+        // alias to its imported symbol is the resolver/oracle's job, not the syntactic
+        // pass).
+        let e = edges("def make():\n    return ClientSession()\n");
+        let call = e
+            .iter()
+            .find(|c| c.edge_kind == EdgeKind::CallsName && c.to_name == "ClientSession")
+            .expect("alias call edge");
+        assert_eq!(call.confidence, EdgeConfidence::NameOnly);
+    }
+
+    #[test]
+    fn base_class_emits_implements_and_references_type() {
+        let e = edges("class Api(Session):\n    pass\n");
+        assert!(has(&e, EdgeKind::Implements, "Session"), "base class Implements missing: {e:?}");
+        assert!(
+            has(&e, EdgeKind::ReferencesType, "Session"),
+            "base class ReferencesType missing: {e:?}"
+        );
+    }
+
+    #[test]
+    fn generic_base_resolves_to_base_not_type_arg() {
+        // `class Repo(Generic[T])` — the base is `Generic`, NOT the type argument `T`.
+        let e = edges("class Repo(Generic[T]):\n    pass\n");
+        assert!(has(&e, EdgeKind::Implements, "Generic"), "base should be Generic: {e:?}");
+        assert!(!has(&e, EdgeKind::Implements, "T"), "must not resolve to type arg T: {e:?}");
+    }
+
+    #[test]
+    fn metaclass_keyword_argument_is_not_a_base_class() {
+        // `class Model(Base, metaclass=Meta)` — `Base` is a base; `metaclass=Meta` is not.
+        let e = edges("class Model(Base, metaclass=Meta):\n    pass\n");
+        assert!(has(&e, EdgeKind::Implements, "Base"), "Base should be a base: {e:?}");
+        assert!(
+            !has(&e, EdgeKind::Implements, "Meta"),
+            "metaclass kwarg must not be a base: {e:?}"
+        );
+    }
+
+    #[test]
+    fn generic_annotation_anchors_the_head_type() {
+        // `x: Box[Item]` references `Box` (the head), which would otherwise be invisible.
+        let e = edges("def f(x: Box[Item]) -> None:\n    pass\n");
+        assert!(has(&e, EdgeKind::ReferencesType, "Box"), "annotation head Box missing: {e:?}");
+    }
+
+    #[test]
+    fn qualified_generic_annotation_emits_head_and_arg() {
+        // `x: typing.Optional[Api]` is a `subscript` — emit BOTH the head (`Optional`) and the type
+        // argument (`Api`); the latter is a plain expression the recursion otherwise misses.
+        let e = edges("def f(x: typing.Optional[Api]) -> None:\n    pass\n");
+        assert!(has(&e, EdgeKind::ReferencesType, "Optional"), "head Optional missing: {e:?}");
+        assert!(has(&e, EdgeKind::ReferencesType, "Api"), "type arg Api missing: {e:?}");
+    }
+
+    #[test]
+    fn union_annotation_emits_both_operands() {
+        // PEP 604 `A | B` — both operands are referenced types (was: only the last).
+        let e = edges("def f(x: A | B) -> None:\n    pass\n");
+        assert!(has(&e, EdgeKind::ReferencesType, "A"), "union operand A missing: {e:?}");
+        assert!(has(&e, EdgeKind::ReferencesType, "B"), "union operand B missing: {e:?}");
+    }
+
+    #[test]
+    fn subscript_callee_does_not_record_the_index() {
+        // `handlers[key]()` — `key` is the index, not the callee; emit no bogus call edge.
+        let e = edges("def f():\n    handlers[key]()\n");
+        assert!(
+            !has(&e, EdgeKind::CallsName, "key"),
+            "index var wrongly recorded as callee: {e:?}"
+        );
+    }
+
+    #[test]
+    fn generic_base_class_emits_type_args() {
+        // `class C(Mapping[str, Api])` — Implements the head `Mapping`, ReferencesType the arg
+        // `Api`.
+        let e = edges("class C(Mapping[str, Api]):\n    pass\n");
+        assert!(has(&e, EdgeKind::Implements, "Mapping"), "base head Implements missing: {e:?}");
+        assert!(has(&e, EdgeKind::ReferencesType, "Api"), "base type arg Api missing: {e:?}");
+        assert!(!has(&e, EdgeKind::Implements, "Api"), "type arg must not be Implements: {e:?}");
+    }
+
+    #[test]
+    fn type_alias_does_not_self_reference() {
+        // `type UserId = int` references `int`, NOT the alias name `UserId` being defined.
+        let e = edges("type UserId = int\n");
+        assert!(has(&e, EdgeKind::ReferencesType, "int"), "alias value int missing: {e:?}");
+        assert!(!has(&e, EdgeKind::ReferencesType, "UserId"), "alias name self-referenced: {e:?}");
+    }
+
+    #[test]
+    fn nested_qualified_generic_annotation_emits_all_heads() {
+        // `typing.Optional[list[Api]]` → Optional + list + the nested project type Api.
+        let e = edges("def f(x: typing.Optional[list[Api]]) -> None:\n    pass\n");
+        assert!(has(&e, EdgeKind::ReferencesType, "Optional"), "Optional missing: {e:?}");
+        assert!(has(&e, EdgeKind::ReferencesType, "list"), "list missing: {e:?}");
+        assert!(has(&e, EdgeKind::ReferencesType, "Api"), "nested Api missing: {e:?}");
+    }
+
+    #[test]
+    fn bare_decorator_emits_a_call_edge() {
+        // `@requires_auth` (no parens) is a dependency of the decorated symbol.
+        let e = edges("@requires_auth\ndef handler():\n    pass\n");
+        assert!(
+            has(&e, EdgeKind::CallsName, "requires_auth"),
+            "bare decorator edge missing: {e:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_bare_decorator_keeps_its_receiver() {
+        // `@pytest.fixture` records the `pytest` receiver so it can't fall back to a local
+        // `fixture`.
+        let e = edges("@pytest.fixture\ndef t():\n    pass\n");
+        let edge = e
+            .iter()
+            .find(|c| c.edge_kind == EdgeKind::CallsName && c.to_name == "fixture")
+            .expect("qualified decorator edge");
+        assert_eq!(edge.receiver_hint.as_deref(), Some("pytest"));
+    }
+
+    #[test]
+    fn multi_import_emits_each_imported_name() {
+        // `from pkg import A, B` nests the names under an `import_list`.
+        let e = edges("from pkg import A, B\n");
+        assert!(has(&e, EdgeKind::Imports, "A"), "import A missing: {e:?}");
+        assert!(has(&e, EdgeKind::Imports, "B"), "import B missing: {e:?}");
+    }
+
+    #[test]
+    fn annotation_emits_references_type() {
+        let e = edges("def f(url: str) -> None:\n    pass\n");
+        assert!(
+            has(&e, EdgeKind::ReferencesType, "str"),
+            "annotation ReferencesType missing: {e:?}"
+        );
     }
 }

@@ -55,8 +55,25 @@ use crate::index::git_history;
 /// never source; the rest are conventional build/dependency/output dirs that a non-git tree (no
 /// `.gitignore` to compile) still must not index. In a git tree these usually also appear in
 /// `.gitignore`, but the floor guarantees them even when they don't.
-const FLOOR_DIRS: &[&str] =
-    &[".git", ".rag-rat", ".omx", ".omc", "node_modules", "target", "dist", "build", "coverage"];
+const FLOOR_DIRS: &[&str] = &[
+    ".git",
+    ".rag-rat",
+    ".omx",
+    ".omc",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "coverage",
+    // Python virtualenv / dependency / cache trees: never project source. `site-packages` is the
+    // load-bearing one — installed deps live there regardless of the venv dir's name (`.venv`,
+    // `venv`, `env`, …), so flooring it stops a `python = ["."]` config from ingesting the whole
+    // dependency set even when the venv dir itself isn't named conventionally.
+    ".venv",
+    "venv",
+    "site-packages",
+    "__pycache__",
+];
 
 /// Whether a single path component matches a floor directory name (see [`FLOOR_DIRS`]).
 fn is_floor_dir(name: &str) -> bool {

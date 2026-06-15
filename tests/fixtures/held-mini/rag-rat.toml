@@ -6,4 +6,5 @@ database = ".rag-rat/index.sqlite"
 rust = ["src"]
 typescript = ["src"]
 kotlin = ["src"]
+python = ["src"]
 markdown = ["docs"]

@@ -96,8 +96,15 @@ pub(crate) fn candidate_dirs(scan: &RepoScan, language: Language) -> Vec<DirCand
             default: default_dir(scan, language, path),
         })
         .collect::<Vec<_>>();
+    // When nothing is a natural default, promote the largest candidate — but NEVER a Python
+    // dependency tree (`env/`, `site-packages`, …): in a repo whose only `.py` files live under a
+    // virtualenv, promoting it would write a binding into installed deps. If every candidate is a
+    // dependency dir, leave none defaulted (no binding beats the wrong binding).
     if !candidates.iter().any(|candidate| candidate.default)
-        && let Some(best) = candidates.iter_mut().max_by_key(|candidate| candidate.count)
+        && let Some(best) = candidates
+            .iter_mut()
+            .filter(|candidate| !fallback_excluded(language, &candidate.path))
+            .max_by_key(|candidate| candidate.count)
     {
         best.default = true;
     }
@@ -127,9 +134,44 @@ pub(crate) fn default_dir(scan: &RepoScan, language: Language, path: &Path) -> b
                 || text == "include"
                 || text.ends_with("/include")
                 || directly_contains_source(scan, language, path),
+        // Python packages typically sit at the repo root, under `src/`, or as a dir named after the
+        // package that directly contains `.py` files — but NEVER a virtualenv / dependency tree
+        // (`.venv/…/site-packages`), which would pollute the index with the whole dependency set.
+        Language::Python =>
+            !is_python_dependency_dir(&text)
+                && (text == "src"
+                    || text.ends_with("/src")
+                    || directly_contains_source(scan, language, path)),
         Language::Markdown => text == "docs" || text == ".",
     }
 }
+
+/// `true` for a path under a Python virtualenv / dependency tree — these hold installed third-party
+/// `.py` files (`site-packages`) that must never be indexed as project source.
+fn is_python_dependency_dir(text: &str) -> bool {
+    text.split('/').any(|component| {
+        matches!(
+            component,
+            ".venv"
+                | "venv"
+                | "env"
+                | ".env"
+                | "virtualenv"
+                | "site-packages"
+                | "__pycache__"
+                | ".tox"
+                | ".nox"
+                | "node_modules"
+        )
+    })
+}
+/// Whether the no-default fallback must NOT promote this candidate: a Python dependency/virtualenv
+/// tree (`env`/`.env`/`venv`/`site-packages`/…). `is_python_dependency_dir` covers the names
+/// `SKIPPED_DIRS` doesn't skip during the walk (e.g. `env`, which is too generic to skip globally).
+fn fallback_excluded(language: Language, path: &Path) -> bool {
+    language == Language::Python && is_python_dependency_dir(&display_rel(path))
+}
+
 pub(crate) fn directly_contains_source(scan: &RepoScan, language: Language, path: &Path) -> bool {
     path != Path::new(".")
         && scan
@@ -149,5 +191,35 @@ pub(crate) fn print_language_summary(scan: &RepoScan) {
         if count > 0 {
             println!("  {}: {count} files", language.as_str());
         }
+    }
+}
+
+#[cfg(test)]
+mod python_dir_tests {
+    use super::*;
+
+    #[test]
+    fn python_dependency_dir_detection() {
+        assert!(is_python_dependency_dir(".venv"));
+        assert!(is_python_dependency_dir("env"));
+        assert!(is_python_dependency_dir("project/.venv/lib/site-packages"));
+        assert!(!is_python_dependency_dir("src"));
+        assert!(!is_python_dependency_dir("app"));
+    }
+
+    #[test]
+    fn fallback_does_not_promote_a_venv_only_python_repo() {
+        // A repo whose only discovered .py files live under an `env/` virtualenv: the no-default
+        // fallback must NOT promote it (else `init -y` writes `python = ["env"]`).
+        let mut scan = RepoScan::default();
+        let dir = PathBuf::from("env");
+        scan.dir_counts.entry(Language::Python).or_default().insert(dir.clone(), 9);
+        scan.direct_dir_counts.entry(Language::Python).or_default().insert(dir, 9);
+
+        let candidates = candidate_dirs(&scan, Language::Python);
+        assert!(
+            candidates.iter().all(|candidate| !candidate.default),
+            "a virtualenv dir must never be selected as the default Python target: {candidates:?}"
+        );
     }
 }

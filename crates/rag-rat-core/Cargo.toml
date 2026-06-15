@@ -38,6 +38,7 @@ tree-sitter.workspace = true
 tree-sitter-c.workspace = true
 tree-sitter-cpp.workspace = true
 tree-sitter-kotlin.workspace = true
+tree-sitter-python.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 

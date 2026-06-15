@@ -12,12 +12,20 @@ pub enum Language {
     Kotlin,
     C,
     Cpp,
+    Python,
     Markdown,
 }
 
 impl Language {
-    pub const ALL: [Self; 6] =
-        [Self::Rust, Self::TypeScript, Self::Kotlin, Self::C, Self::Cpp, Self::Markdown];
+    pub const ALL: [Self; 7] = [
+        Self::Rust,
+        Self::TypeScript,
+        Self::Kotlin,
+        Self::C,
+        Self::Cpp,
+        Self::Python,
+        Self::Markdown,
+    ];
 
     pub fn all() -> &'static [Self] {
         &Self::ALL
@@ -30,6 +38,7 @@ impl Language {
             Self::Kotlin => "kotlin",
             Self::C => "c",
             Self::Cpp => "cpp",
+            Self::Python => "python",
             Self::Markdown => "markdown",
         }
     }
@@ -41,6 +50,7 @@ impl Language {
             Self::Kotlin => &["kt", "kts"],
             Self::C => &["c", "h"],
             Self::Cpp => &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++"],
+            Self::Python => &["py", "pyi"],
             Self::Markdown => &["md", "markdown"],
         }
     }
@@ -48,7 +58,13 @@ impl Language {
     pub fn supports_embeddings(self) -> bool {
         matches!(
             self,
-            Self::Rust | Self::TypeScript | Self::Kotlin | Self::C | Self::Cpp | Self::Markdown
+            Self::Rust
+                | Self::TypeScript
+                | Self::Kotlin
+                | Self::C
+                | Self::Cpp
+                | Self::Python
+                | Self::Markdown
         )
     }
 
@@ -74,6 +90,7 @@ impl FromStr for Language {
             "kotlin" | "kt" => Ok(Self::Kotlin),
             "c" => Ok(Self::C),
             "cpp" | "c++" | "cc" | "cxx" => Ok(Self::Cpp),
+            "python" | "py" => Ok(Self::Python),
             "markdown" | "md" => Ok(Self::Markdown),
             other => Err(LanguageError::Unknown(other.to_string())),
         }

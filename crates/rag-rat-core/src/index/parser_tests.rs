@@ -90,6 +90,52 @@ fn extracts_kotlin_symbols() {
 }
 
 #[test]
+fn extracts_python_symbols() {
+    let text = include_str!("../../../../tests/fixtures/held-mini/src/Main.py");
+    let symbols = parser::parse_symbols(Path::new("src/Main.py"), Language::Python, text).unwrap();
+    assert_eq!(parser::parser_kind(Path::new("src/Main.py"), Language::Python), ParserKind::Python);
+    assert_symbol(&symbols, "class", "Api");
+    // A decorator (`@classmethod` / `@property`) must NOT hide the inner method symbol.
+    assert_symbol(&symbols, "function", "from_url");
+    assert_symbol(&symbols, "function", "host");
+    assert_symbol(&symbols, "function", "make");
+    // SCREAMING_SNAKE_CASE module assignment is a constant…
+    assert_symbol(&symbols, "const", "DEFAULT_TIMEOUT");
+    // …but a lowercase assignment is NOT — we don't flood the symbol table with every local.
+    assert_no_symbol(&symbols, "const", "default_retries");
+    // `adapter` (a lowercase local inside `from_url`) is likewise not a symbol.
+    assert_no_symbol(&symbols, "const", "adapter");
+    // And `LOCAL_MAX` — SCREAMING_SNAKE but a FUNCTION-local — is not a constant either: the const
+    // rule is gated to module/class scope.
+    assert_no_symbol(&symbols, "const", "LOCAL_MAX");
+
+    // A decorated def's symbol span includes its decorator line (so `@classmethod` etc. — often the
+    // API surface — is in the chunk), not just the bare `def`.
+    let from_url = symbols.iter().find(|s| s.name == "from_url").unwrap();
+    let decorator_line = text.lines().position(|l| l.trim() == "@classmethod").unwrap() + 1;
+    assert_eq!(
+        from_url.start_line, decorator_line,
+        "decorated symbol span should start at the @classmethod line"
+    );
+    // …but the SIGNATURE is the `def` declaration, not the `@classmethod` decorator (it feeds
+    // logical-symbol member hashing + memory anchoring, which must key on the declaration).
+    assert_eq!(
+        from_url.signature.as_deref(),
+        Some("def from_url(cls, url: str) -> \"Api\":"),
+        "decorated signature must be the def line, not the decorator"
+    );
+}
+
+#[test]
+fn extracts_python_type_alias() {
+    // PEP 695 `type X = …` is indexed as a type symbol (like Rust/TS/C++ aliases).
+    let symbols =
+        parser::parse_symbols(Path::new("src/a.py"), Language::Python, "type UserId = int\n")
+            .unwrap();
+    assert_symbol(&symbols, "type", "UserId");
+}
+
+#[test]
 fn extracts_kotlin_kdoc_without_closing_delimiter_residue() {
     let text = r#"
 /**

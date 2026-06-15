@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn rejects_unknown_language() {
         let root = std::env::current_dir().unwrap();
-        let simple = BTreeMap::from([("python".to_string(), vec![".".to_string()])]);
+        let simple = BTreeMap::from([("cobol".to_string(), vec![".".to_string()])]);
 
         let err = resolve_targets(&root, simple, Vec::new()).unwrap_err();
 

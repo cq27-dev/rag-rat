@@ -29,6 +29,15 @@ const SKIPPED_DIRS: &[&str] = &[
     ".next",
     ".turbo",
     ".venv",
+    // Python virtualenv / dependency / cache trees — never project source. Skipping them at scan
+    // time means their `.py` files never become dir candidates, so the "no default → promote the
+    // largest" fallback can't select a `site-packages` tree (#167 review).
+    "venv",
+    "virtualenv",
+    "site-packages",
+    "__pycache__",
+    ".tox",
+    ".nox",
     "build",
     "dist",
     "node_modules",
