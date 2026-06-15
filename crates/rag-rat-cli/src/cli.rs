@@ -155,11 +155,12 @@ pub(crate) struct ImportantSymbolsArgs {
     /// Max load-bearing symbols to return.
     #[arg(long)]
     pub limit: Option<u32>,
-    /// Symbols to bias importance toward (the symbols you're working on) — names, symbol paths, or
-    /// numeric ids, comma-separated or repeated. A numeric value is a raw symbol id; otherwise
-    /// it's resolved by symbol path then name (ambiguous/missing entries are skipped). Empty =
-    /// global importance (the CLI is global-by-default — it never auto-seeds from the git
-    /// diff).
+    /// Symbols to bias importance toward (the symbols you're working on) — names, refs
+    /// (path::name), or sym_<hex> handles, comma-separated or repeated. A sym_<hex> handle
+    /// resolves to its logical symbol's members; otherwise the entry is resolved by ref then
+    /// name (ambiguous/missing entries are skipped). Raw numeric symbol ids are NOT accepted —
+    /// they are reindex-churned rowids (#149). Empty = global importance (the CLI is
+    /// global-by-default — it never auto-seeds from the git diff).
     #[arg(long, value_delimiter = ',')]
     pub personalize: Vec<String>,
 }
