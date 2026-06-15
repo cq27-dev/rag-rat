@@ -2228,6 +2228,63 @@ fn covered_side_ignores_references_type_confirmation() {
     assert_eq!(m.covered_calls, 1);
 }
 
+/// #176 (covered side): the covered side requires the matched SCIP symbol be CALLABLE (`).`) — the
+/// same filter `count_uncovered_calls` applies. A `calls_name` edge a verdict matched to a CLASS
+/// symbol (`…Thing#`, e.g. scip-python's `Thing()` constructor, which our extractor emits as
+/// `CallsName` but SCIP records as a reference to the class) must NOT inflate `covered_calls`.
+/// Otherwise the two sides measure different populations and a MISSED constructor — invisible to
+/// the callable-filtered uncovered side — would never offset a covered one, inflating recall.
+#[test]
+fn covered_side_requires_a_callable_scip_symbol() {
+    let h = Harness::new();
+    // `caller.rs`: a method call `target` at 14..20 and a constructor call `Thing` at 24..29.
+    let caller = h.add_file("caller.rs", "fn caller() { target(); Thing(); }\n");
+    let defs = h.add_file("defs.rs", "fn target() {}\nstruct Thing;\n");
+    let target_sym = h.add_symbol(defs, "target", 3, 9);
+    let thing_sym = h.add_symbol(defs, "Thing", 22, 27);
+    // BOTH are `calls_name` edges (a constructor call is a `CallsName` in our extractor).
+    let call_edge = h.add_edge(caller, "target", 14, 20, "Exact", Some(target_sym));
+    let ctor_edge = h.add_edge(caller, "Thing", 24, 29, "Exact", Some(thing_sym));
+
+    let call_sym = "scip-rust crate v1 `target`().";
+    // Class symbol — ends `#`, NOT `).`: not callable (how scip-python records a constructor ref).
+    let class_sym = "scip-rust crate v1 `Thing`#";
+    let mut index = Index {
+        documents: vec![Document {
+            relative_path: "caller.rs".to_string(),
+            occurrences: vec![
+                occurrence(0, 14, 20, call_sym, SymbolRole::UnspecifiedSymbolRole as i32),
+                occurrence(0, 24, 29, class_sym, SymbolRole::UnspecifiedSymbolRole as i32),
+            ],
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    index.documents.push(Document {
+        relative_path: "defs.rs".to_string(),
+        occurrences: vec![
+            occurrence(0, 3, 9, call_sym, SymbolRole::Definition as i32),
+            occurrence(1, 7, 12, class_sym, SymbolRole::Definition as i32),
+        ],
+        position_encoding: EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
+        ..Default::default()
+    });
+    let bytes = index.write_to_bytes().unwrap();
+
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    // Both edges still get verdicts (both join + resolve in-corpus)…
+    assert!(h.verdict(call_edge).is_some(), "call edge verdicted");
+    assert!(h.verdict(ctor_edge).is_some(), "constructor edge verdicted");
+    // …but only the callable-symbol call counts as covered; the class-symbol constructor does not,
+    // and the uncovered side excludes it too → no phantom recall gap.
+    assert_eq!(report.covered_calls, 1, "constructor (class symbol) must NOT inflate covered");
+    assert_eq!(report.oracle_only_calls, 0);
+}
+
 /// Finding 2: a candidate whose recorded `file_sha` no longer matches the disk bytes (content drift
 /// between the index build and the `.scip`) is SKIPPED — no verdict is emitted from mismatched
 /// content — and tallied in `skipped_drifted`. The same edge, with a matching `file_sha`, IS

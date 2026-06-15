@@ -277,12 +277,23 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         // join selected (reference-preferred, full containment), not a re-derived start-only match
         // — on overlapping occurrences the two could pick different occurrences. Every
         // verdict marks `matched_occurrences` (so it's never a recall gap); only a CALL
-        // (`calls_name`) edge also marks `covered_call_occurrences` (the recall numerator
-        // population — finding 1).
+        // (`calls_name`) edge whose matched SCIP symbol is itself callable also marks
+        // `covered_call_occurrences` (the recall numerator population — finding 1).
+        //
+        // The `symbol_is_callable` filter keeps the covered side over the SAME population as the
+        // uncovered side (`count_uncovered_calls`), which already requires it (#176 review):
+        // without it, a constructor call our extractor emits as `calls_name` but SCIP
+        // represents as a reference to the CLASS symbol (`…Foo#`, not `…).`) — e.g.
+        // scip-python's `Foo()` — counted as covered while a MISSED such call could never
+        // be counted as oracle-only, inflating recall. Requiring callability on both sides
+        // confines recall to method/function calls (the `).` kind) uniformly;
+        // constructor-via-class-symbol refs are out of the recall population because SCIP
+        // can't distinguish a constructor *call* from a type *annotation* of the same
+        // `Foo#` symbol.
         let (occ_start, occ_end) = verdict.matched_occurrence;
         let key = (candidate.source_path.clone(), occ_start, occ_end);
         matched_occurrences.insert(key.clone());
-        if candidate.edge_kind == CALL_EDGE_KIND {
+        if candidate.edge_kind == CALL_EDGE_KIND && scip::symbol_is_callable(&verdict.scip_symbol) {
             covered_call_occurrences.insert(key);
         }
 
