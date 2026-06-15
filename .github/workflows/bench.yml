@@ -9,6 +9,10 @@ name: bench
 on:
   push:
     branches: [main]
+  # Manual trigger to REAPPLY the Bencher thresholds (this job runs `bencher run --thresholds-reset`
+  # on `main`). Use it when the baseline drifts or thresholds get into a bad state without waiting
+  # for the next push to main — PR runs clone `main`'s thresholds via `--start-point-clone-thresholds`.
+  workflow_dispatch:
 
 permissions:
   contents: read
