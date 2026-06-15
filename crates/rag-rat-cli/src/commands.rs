@@ -551,12 +551,19 @@ fn finalize_corpus_report(
     Ok((report, violations))
 }
 
-/// Fail closed unless the active checkout's target bindings (language → directories) exactly match
-/// the corpus profile's `bindings`. The corpus runner generates the checkout's `rag-rat.toml` from
-/// these same bindings, so a match is the invariant; a mismatch means `oracle report --corpus X`
-/// was pointed at the wrong checkout, and its numbers would be stamped with X's
-/// `corpus_profile_hash` while measuring a different population. Compared as `language -> sorted
-/// dir set`, the same root-relative path strings both sides store.
+/// Fail closed unless the active checkout's targets are EXACTLY the corpus profile's `bindings`
+/// rendered through the plain `[target_bindings]` form — same languages, same directories, AND
+/// default include/exclude filters. The corpus runner generates the checkout's `rag-rat.toml` from
+/// these bindings (the simple form), so that's the invariant; any deviation means
+/// `oracle report --corpus X` would stamp X's `corpus_profile_hash` onto a different file
+/// population.
+///
+/// Two layers, both load-bearing:
+/// 1. language → directory set equality (catches a wrong repo / extra or missing bindings).
+/// 2. default filters per target: a `[[target]]` with the same language+dirs but custom
+///    `include`/`exclude` indexes a filtered subset/superset under the same hash (Codex on #175),
+///    so reject any target whose filters aren't the simple form's defaults (`include =
+///    ["**/*.<ext>", …]`, `exclude = []`).
 fn ensure_checkout_matches_corpus(
     config: &Config,
     profile: &rag_rat_core::index::oracle::CorpusProfile,
@@ -584,6 +591,26 @@ fn ensure_checkout_matches_corpus(
          claims",
         profile.corpus_id,
     );
+
+    // The dir set can match while a custom `include`/`exclude` quietly filters the indexed files.
+    // The corpus binding has no filter knobs, so a legitimate checkout carries exactly the simple
+    // form's defaults; anything else measures a different population under the same hash.
+    for target in &config.targets {
+        let default_include: BTreeSet<String> =
+            target.language.simple_extensions().iter().map(|ext| format!("**/*.{ext}")).collect();
+        let include: BTreeSet<String> = target.include.iter().cloned().collect();
+        anyhow::ensure!(
+            target.exclude.is_empty() && include == default_include,
+            "target `{}` ({}) has custom include/exclude filters (include {:?}, exclude {:?}) — \
+             `oracle report --corpus {}` requires the corpus's plain bindings (default filters) \
+             so the report's profile hash matches the file population it measured",
+            target.name,
+            target.language.as_str(),
+            target.include,
+            target.exclude,
+            profile.corpus_id,
+        );
+    }
     Ok(())
 }
 
@@ -1120,15 +1147,17 @@ mod tests {
 
         use rag_rat_core::index::oracle::{CorpusHealth, CorpusProfile};
 
-        let config = Config {
+        // A target carrying the SAME default filters the simple `[target_bindings]` form renders
+        // (`include = ["**/*.rs"]`, no exclude), so the bindings-match check accepts it.
+        let config_with = |include: Vec<String>, exclude: Vec<String>| Config {
             root: PathBuf::from("/x"),
             database: PathBuf::from("/x/db"),
             targets: vec![ResolvedTarget {
                 name: "rust".to_string(),
                 language: Language::Rust,
                 directories: vec![PathBuf::from("src")],
-                include: Vec::new(),
-                exclude: Vec::new(),
+                include,
+                exclude,
                 kind: TargetKind::Source,
             }],
             local_ai: Default::default(),
@@ -1136,6 +1165,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
         };
+        let config = config_with(vec!["**/*.rs".to_string()], Vec::new());
         let profile = |dirs: &[&str]| {
             let mut bindings = BTreeMap::new();
             bindings.insert("rust".to_string(), dirs.iter().map(|d| d.to_string()).collect());
@@ -1156,7 +1186,7 @@ mod tests {
                 },
             }
         };
-        // Exact language+dirs match → ok.
+        // Exact language+dirs match with default filters → ok.
         assert!(super::ensure_checkout_matches_corpus(&config, &profile(&["src"])).is_ok());
         // Same language, different directory → fail closed (a different population).
         assert!(super::ensure_checkout_matches_corpus(&config, &profile(&["lib"])).is_err());
@@ -1164,6 +1194,13 @@ mod tests {
         let mut two_langs = profile(&["src"]);
         two_langs.bindings.insert("python".to_string(), vec!["pkg".to_string()]);
         assert!(super::ensure_checkout_matches_corpus(&config, &two_langs).is_err());
+        // Same dirs but a custom `exclude` filters the population → fail closed (Codex #175).
+        let excluded =
+            config_with(vec!["**/*.rs".to_string()], vec!["**/generated/**".to_string()]);
+        assert!(super::ensure_checkout_matches_corpus(&excluded, &profile(&["src"])).is_err());
+        // Same dirs but a narrowed `include` → fail closed.
+        let narrowed = config_with(vec!["src/lib.rs".to_string()], Vec::new());
+        assert!(super::ensure_checkout_matches_corpus(&narrowed, &profile(&["src"])).is_err());
     }
 
     fn run_args() -> OracleArgs {
