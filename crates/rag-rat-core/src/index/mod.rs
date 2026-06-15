@@ -11,9 +11,11 @@ pub mod schema;
 pub mod symbols;
 pub mod walker;
 
+mod discovery;
 mod file_index;
 mod file_lifecycle;
 mod fts;
+mod git_context;
 mod git_meta;
 mod graph_index;
 mod incremental;
@@ -24,9 +26,13 @@ mod parser_failures;
 mod query_api;
 mod rebuild;
 mod staleness;
-
+mod util;
+pub(crate) use discovery::*;
+pub use git_context::resolve_git_context;
+pub(crate) use git_context::*;
 pub(crate) use lifecycle::install_scope_view;
 pub use query_api::ImportantSymbolsRequest;
+pub(crate) use util::*;
 
 #[cfg(test)]
 mod anchor_tests;
@@ -522,7 +528,7 @@ struct IndexedFile {
 }
 
 #[derive(Debug, Clone)]
-struct IndexFile {
+pub(crate) struct IndexFile {
     full_path: PathBuf,
     relative_path: PathBuf,
     language: Language,
@@ -611,22 +617,6 @@ struct PreparedIndexContent {
     // duplicate parse.
     edge_candidates: Vec<edges::EdgeCandidate>,
     parser_failure: Option<String>,
-}
-
-#[derive(Debug)]
-struct DiscoveryPlan {
-    files: Vec<IndexFile>,
-    deleted: BTreeSet<PathBuf>,
-    unindexed: Vec<IndexFile>,
-    changed: Vec<PathBuf>,
-    discovered_files: usize,
-    indexed_files: usize,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct GitChangedPaths {
-    pub(crate) changed: BTreeSet<PathBuf>,
-    pub(crate) deleted: BTreeSet<PathBuf>,
 }
 
 fn collect_index_files(config: &Config) -> anyhow::Result<Vec<IndexFile>> {
@@ -919,247 +909,6 @@ fn prepare_index_content(file: &IndexFile) -> anyhow::Result<PreparedIndexConten
         edge_candidates,
         parser_failure,
     })
-}
-
-fn discovery_plan(conn: &rusqlite::Connection, config: &Config) -> anyhow::Result<DiscoveryPlan> {
-    let discovered = collect_index_files(config)?;
-    let mut indexed = indexed_file_map(conn)?;
-    let mut current_paths = BTreeSet::new();
-    let mut files = Vec::new();
-    let mut unindexed = Vec::new();
-    let mut changed = Vec::new();
-    let discovered_files = discovered.len();
-    let hashed = discovered
-        .par_iter()
-        .map(|file| -> anyhow::Result<(IndexFile, String)> {
-            let text = fs::read(&file.full_path)?;
-            Ok((file.clone(), hex_sha256(&text)))
-        })
-        .collect::<Vec<_>>();
-
-    for hashed_file in hashed {
-        let (file, current_hash) = hashed_file?;
-        let relative = path_string(&file.relative_path);
-        current_paths.insert(file.relative_path.clone());
-        let Some(indexed_hash) = indexed.remove(&relative) else {
-            unindexed.push(file.clone());
-            files.push(file);
-            continue;
-        };
-        if current_hash != indexed_hash {
-            changed.push(file.relative_path.clone());
-            files.push(file);
-        }
-    }
-
-    let deleted = indexed
-        .into_keys()
-        .map(PathBuf::from)
-        .filter(|path| !current_paths.contains(path))
-        .collect::<BTreeSet<_>>();
-
-    Ok(DiscoveryPlan {
-        discovered_files,
-        indexed_files: current_paths
-            .len()
-            .saturating_add(deleted.len())
-            .saturating_sub(unindexed.len()),
-        files,
-        deleted,
-        unindexed,
-        changed,
-    })
-}
-
-fn indexed_file_map(conn: &rusqlite::Connection) -> anyhow::Result<BTreeMap<String, String>> {
-    let mut stmt = conn.prepare("SELECT path, sha256 FROM files ORDER BY path")?;
-    let rows =
-        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-    let mut files = BTreeMap::new();
-    for row in rows {
-        let (path, sha256) = row?;
-        files.insert(path, sha256);
-    }
-    Ok(files)
-}
-
-pub(crate) fn target_for_path(
-    config: &Config,
-    relative_path: &Path,
-) -> Option<(Language, TargetKind)> {
-    let relative = path_string(relative_path);
-    let language = Language::from_path(relative_path)?;
-    let mut targets = config.targets.iter().collect::<Vec<_>>();
-    targets.sort_by_key(|target| match target.kind {
-        TargetKind::Generated => 0,
-        TargetKind::Tests => 1,
-        TargetKind::Docs => 2,
-        TargetKind::Source => 3,
-    });
-    targets.into_iter().find_map(|target| {
-        if target.language != language {
-            return None;
-        }
-        if !target.directories.iter().any(|directory| {
-            directory.as_os_str().is_empty()
-                || directory == Path::new(".")
-                || relative_path.starts_with(directory)
-        }) {
-            return None;
-        }
-        if target.exclude.iter().any(|pattern| matches_simple_pattern(&relative, pattern)) {
-            return None;
-        }
-        if !target.include.iter().any(|pattern| matches_simple_pattern(&relative, pattern)) {
-            return None;
-        }
-        Some((target.language, target.kind))
-    })
-}
-
-pub(crate) fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> {
-    let repo = gix::discover(root)?;
-    let worktree_root = repo
-        .workdir()
-        .ok_or_else(|| anyhow::anyhow!("git repository has no worktree"))?
-        .to_path_buf();
-    let pathspec = config_root_pathspec(&worktree_root, root);
-    let mut paths = GitChangedPaths::default();
-
-    for item in repo
-        .status(gix::progress::Discard)?
-        .untracked_files(UntrackedFiles::Files)
-        .tree_index_track_renames(tree_index::TrackRenames::Disabled)
-        .into_iter([pathspec])?
-    {
-        let item = item?;
-        let Some(path) = repo_relative_path_to_config_path(&worktree_root, root, item.location())
-        else {
-            continue;
-        };
-        if root.join(&path).exists() {
-            if !paths.deleted.contains(&path) {
-                paths.changed.insert(path);
-            }
-        } else {
-            paths.changed.remove(&path);
-            paths.deleted.insert(path);
-        }
-    }
-
-    Ok(paths)
-}
-
-fn repo_relative_path_to_config_path(
-    worktree_root: &Path,
-    config_root: &Path,
-    repo_relative_path: &gix::bstr::BStr,
-) -> Option<PathBuf> {
-    let path = PathBuf::from(repo_relative_path.to_str_lossy().as_ref());
-    worktree_root.join(path).strip_prefix(config_root).ok().map(Path::to_path_buf)
-}
-
-fn config_root_pathspec(worktree_root: &Path, config_root: &Path) -> BString {
-    let relative = config_root.strip_prefix(worktree_root).unwrap_or_else(|_| Path::new(""));
-    let relative = path_string(relative);
-    if relative.is_empty() || relative == "." {
-        BString::from("*")
-    } else {
-        BString::from(format!("{relative}/**"))
-    }
-}
-
-fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
-    if let Some(extension) = pattern.strip_prefix("**/*.") {
-        return path.ends_with(&format!(".{extension}"));
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path.starts_with(prefix);
-    }
-    path == pattern || path.contains(pattern.trim_matches('*'))
-}
-
-fn meta_for(conn: &rusqlite::Connection, key: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
-        .optional()?)
-}
-
-fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).current_dir(root).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// The active-checkout `(commit_sha, worktree_id)` keys for `root`, as `open_config` derives them.
-/// `pub` so out-of-crate callers that open an index by path (benches mirroring the production
-/// `open_config` path, integration tests) can install the same active-checkout scope `search` uses.
-pub fn resolve_git_context(root: &Path) -> (String, String) {
-    let commit_sha =
-        git_output(root, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
-    let worktree_id = root.to_string_lossy().trim_end_matches('/').to_string();
-    (commit_sha, worktree_id)
-}
-
-/// The live (commit_sha, worktree_id) keys across every worktree that shares this repo, from
-/// `git worktree list --porcelain`. Each worktree contributes its HEAD commit (for clean rows)
-/// and its path (for dirty/overlay rows). Returns empty vecs outside a git worktree.
-fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) {
-    let mut commits = Vec::new();
-    let mut worktrees = Vec::new();
-    let Some(output) = git_output(root, &["worktree", "list", "--porcelain"]) else {
-        return (commits, worktrees);
-    };
-    for line in output.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            worktrees.push(path.trim().trim_end_matches('/').to_string());
-        } else if let Some(sha) = line.strip_prefix("HEAD ") {
-            commits.push(sha.trim().to_string());
-        }
-    }
-    (commits, worktrees)
-}
-
-fn table_row_count(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<u64> {
-    // `table` is always an internal string literal, never user input.
-    let count = conn
-        .query_row(&format!("SELECT COUNT(*) FROM main.{table}"), [], |row| row.get::<_, i64>(0))?;
-    Ok(u64::try_from(count).unwrap_or(0))
-}
-
-fn file_metadata_ms(path: &Path) -> anyhow::Result<i64> {
-    let modified = fs::metadata(path)?.modified()?;
-    Ok(duration_ms(modified.duration_since(UNIX_EPOCH)?))
-}
-
-fn now_ms() -> i64 {
-    duration_ms(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default())
-}
-
-fn duration_ms(duration: std::time::Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    let hash = Sha256::digest(bytes);
-    let mut out = String::with_capacity(hash.len() * 2);
-    for byte in hash {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-/// `path_string` for the read path: the importance auto-seed normalizes a `git_changed_paths` entry
-/// to the same `/`-separated form the `files` table stores, so the scoped-view lookup matches.
-pub(crate) fn path_string_for_seed(path: &Path) -> String {
-    path_string(path)
 }
 
 #[cfg(test)]
