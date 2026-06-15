@@ -329,6 +329,7 @@ pub struct SymbolArgs {
     #[serde(
         rename = "id",
         default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
         deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
@@ -351,6 +352,7 @@ pub struct SymbolGraphArgs {
     #[serde(
         rename = "id",
         default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
         deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
@@ -378,6 +380,7 @@ pub struct CompareGraphTextArgs {
     #[serde(
         rename = "id",
         default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
         deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
@@ -407,6 +410,7 @@ pub struct ImpactArgs {
     #[serde(
         rename = "id",
         default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
         deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
@@ -542,6 +546,7 @@ pub struct MemoryBindArgs {
     #[serde(
         rename = "id",
         default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
         deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
@@ -558,6 +563,7 @@ pub struct MemoryBindArgs {
     #[serde(
         rename = "start_id",
         default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
         deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
@@ -565,6 +571,7 @@ pub struct MemoryBindArgs {
     #[serde(
         rename = "end_id",
         default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
         deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]
@@ -626,6 +633,7 @@ pub struct MemoryForSymbolArgs {
     #[serde(
         rename = "id",
         default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
         deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
     )]
     #[schemars(with = "Option<String>")]

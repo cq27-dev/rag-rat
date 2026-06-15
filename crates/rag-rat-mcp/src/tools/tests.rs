@@ -39,6 +39,42 @@ fn degraded_coverage_escalates_low_completeness_risk() {
 }
 
 #[test]
+fn arg_struct_handles_survive_an_rmcp_style_serde_round_trip() {
+    // rmcp's `Parameters` extractor round-trips tool args through serialize -> deserialize, so any
+    // custom serde on an arg field MUST be symmetric. A `deserialize_with` (sym_handle) without a
+    // matching `serialize_with` re-emits a bare i64 on the round-trip, which the second deserialize
+    // then rejects ("invalid type: integer, expected a symbol handle string") — breaking handle
+    // input on the LIVE MCP server while unit tests that call `call_tool` directly (bypassing rmcp)
+    // pass. This guards every arg struct that carries a `sym_<hex>` handle (#153 review).
+    const HANDLE: &str = "sym_23bad57dfb79ad5f";
+
+    macro_rules! assert_handle_round_trips {
+        ($ty:ty, $field:literal, $value:expr) => {{
+            let first: $ty = serde_json::from_value($value).expect("initial deserialize");
+            let reserialized = serde_json::to_value(&first).expect("serialize");
+            assert_eq!(
+                reserialized[$field],
+                HANDLE,
+                "{} must re-serialize {} as the sym_<hex> token, not a bare integer",
+                stringify!($ty),
+                $field
+            );
+            // The round-trip (what rmcp does) must deserialize again without error.
+            serde_json::from_value::<$ty>(reserialized).expect("round-trip deserialize");
+        }};
+    }
+
+    assert_handle_round_trips!(SymbolArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(SymbolGraphArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(CompareGraphTextArgs, "id", json!({ "pattern": "x", "id": HANDLE }));
+    assert_handle_round_trips!(ImpactArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(MemoryForSymbolArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(MemoryBindArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(MemoryBindArgs, "start_id", json!({ "start_id": HANDLE }));
+    assert_handle_round_trips!(MemoryBindArgs, "end_id", json!({ "end_id": HANDLE }));
+}
+
+#[test]
 fn list_tools_exposes_complete_typed_schemas() {
     let tools = list_tools();
     let tools = tools.as_array().expect("tools/list shape");
