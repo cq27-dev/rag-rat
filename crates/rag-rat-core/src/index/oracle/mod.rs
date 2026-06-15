@@ -165,7 +165,8 @@ pub fn resolution_report(
     let (total_edges, resolved_in_corpus, unresolved) =
         store::resolution_before_counts(conn, commit_sha, worktree_id)?;
     let before = report::ResolutionBefore { total_edges, resolved_in_corpus, unresolved };
-    let symbols_with_moniker = store::count_symbols_with_moniker(conn, tool)?;
+    let symbols_with_moniker =
+        store::count_symbols_with_moniker(conn, tool, &provenance.tool_version)?;
     let recall = RecallCalls { covered: run.covered_calls, oracle_only: run.oracle_only_calls };
     let metrics =
         run::eval_metrics(conn, tool, &provenance.tool_version, commit_sha, worktree_id, recall)?;

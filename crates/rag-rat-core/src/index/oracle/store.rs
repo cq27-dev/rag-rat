@@ -58,6 +58,7 @@ pub(crate) fn resolution_before_counts(
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.callee_start_byte IS NOT NULL
+          AND edges.callee_end_byte IS NOT NULL
           AND {scope}
         ",
         ),
@@ -71,16 +72,20 @@ pub(crate) fn resolution_before_counts(
     ))
 }
 
-/// The number of logical symbols enriched with a SCIP moniker for `tool` — the "symbols enriched"
-/// signal (#70). `logical_symbol_monikers` is keyed `(logical_symbol_id, tool)` and is not
-/// checkout-scoped (logical symbols are repo-global), so this is a straight per-tool count.
+/// The number of logical symbols enriched with a SCIP moniker for `(tool, tool_version)` — the
+/// "symbols enriched" signal (#70). Scoped to `tool_version` (not just `tool`) so the count
+/// describes the SAME run as the report's `edge_oracle`-derived metrics: a later same-tool run with
+/// a different `tool_version` must not bleed its monikers into this report.
+/// `logical_symbol_monikers` is keyed `(logical_symbol_id, tool)` (repo-global, not
+/// checkout-scoped).
 pub(crate) fn count_symbols_with_moniker(
     conn: &Connection,
     tool: OracleTool,
+    tool_version: &str,
 ) -> anyhow::Result<u64> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM logical_symbol_monikers WHERE tool = ?1",
-        params![tool.as_db_str()],
+        "SELECT COUNT(*) FROM logical_symbol_monikers WHERE tool = ?1 AND tool_version = ?2",
+        params![tool.as_db_str(), tool_version],
         |row| row.get(0),
     )?;
     Ok(u64::try_from(count).unwrap_or(0))
