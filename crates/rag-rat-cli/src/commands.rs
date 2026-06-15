@@ -3,8 +3,10 @@ use std::sync::OnceLock;
 use rag_rat_core::OutputFormat;
 
 use super::*;
+#[cfg(feature = "eval")]
+use crate::cli::EvalArgs;
 use crate::cli::{
-    BriefArgs, ClustersArgs, EvalArgs, GithubArgs, GithubCommand, HookAction, HooksArgs,
+    BriefArgs, ClustersArgs, GithubArgs, GithubCommand, HookAction, HooksArgs,
     ImportantSymbolsArgs, IndexArgs, MaintenanceArgs, MemoryArgs, MemoryCommand, ModelsArgs,
     ModelsCommand, OracleArgs, OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs,
     ReconcileArgs,
@@ -166,6 +168,7 @@ pub(crate) fn version_check(config: &Config) -> anyhow::Result<()> {
         .or_else(|| version_check::read_cache(&config.database));
     print_output(&version_check::build_status(version_check::current_version(), cached.as_ref()))
 }
+#[cfg(feature = "eval")]
 pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
     let options = rag_rat_core::eval::EvalOptions {
         queries_path: args
@@ -199,6 +202,7 @@ pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
     }
     Ok(())
 }
+#[cfg(feature = "eval")]
 pub(crate) fn default_eval_path(config: &Config, file_name: &str) -> PathBuf {
     config.root.join("evals").join(file_name)
 }

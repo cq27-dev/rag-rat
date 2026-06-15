@@ -95,6 +95,7 @@ fn main() -> anyhow::Result<()> {
             let db = open_index(&config)?;
             print_output(&db.garbage_collect()?)?;
         },
+        #[cfg(feature = "eval")]
         Cmd::Eval(args) => eval(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,
         Cmd::DumpConfig => dump_config(&config)?,

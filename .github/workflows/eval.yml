@@ -1,0 +1,37 @@
+name: eval
+
+# Search-quality + SCIP-oracle eval gate. The eval harness is behind the `eval` cargo feature
+# (OFF in the shipped client), so it's compiled and run only here. Hash embedder
+# (`--no-default-features`) keeps it deterministic and network-free, like the rest of CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: eval-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  eval:
+    name: eval (search-quality)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `eval` feature code is skipped by the main CI (which builds --no-default-features), so
+      # lint it here or it bit-rots.
+      - name: clippy (eval feature)
+        run: cargo clippy -p rag-rat-core -p rag-rat --no-default-features --features eval --all-targets --locked -- -D warnings
+      # Runs the eval suite over the held-mini fixture corpus: asserts no current-source-safety
+      # violations and non-zero retrieval (mrr@10 / recall@10), plus the oracle precision/recall
+      # formatting. Deterministic (hash embedder, no model download).
+      - name: eval suite
+        run: cargo test -p rag-rat-core --no-default-features --features eval --locked eval_suite

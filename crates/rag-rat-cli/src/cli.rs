@@ -81,7 +81,8 @@ pub(crate) enum Command {
     /// Garbage-collect index rows for dead git contexts.
     Gc,
 
-    /// Run the search-quality eval suite.
+    /// Run the search-quality eval suite (CI gate; requires the `eval` build feature).
+    #[cfg(feature = "eval")]
     Eval(EvalArgs),
 
     /// SCIP-oracle pass: compiler-grade edge resolution from a language indexer.
@@ -228,6 +229,7 @@ pub(crate) struct ReconcileArgs {
     pub max_embedding_chars: Option<usize>,
 }
 
+#[cfg(feature = "eval")]
 #[derive(Debug, Args)]
 pub(crate) struct EvalArgs {
     /// Path to the queries TOML (defaults to <root>/evals/queries.toml).

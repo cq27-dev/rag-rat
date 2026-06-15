@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(feature = "eval")]
 pub(crate) fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
     println!(
         "eval: pass={} queries={} skipped={} mrr@10={:.3} recall@10={:.3} path_hit_rate={:.3} \
@@ -278,6 +279,7 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
 /// Format the one-line SCIP-oracle eval summary. Split out from `print_eval_summary` so the
 /// formatting is unit-testable without capturing stdout — the rates and raw counts must stay in the
 /// line so `eval` output is greppable.
+#[cfg(feature = "eval")]
 fn format_oracle_line(oracle: &rag_rat_core::index::oracle::OracleEvalMetrics) -> String {
     format!(
         "eval: oracle precision={:.3} recall={:.3} name_only_recovery={:.3} \
@@ -296,7 +298,7 @@ fn format_oracle_line(oracle: &rag_rat_core::index::oracle::OracleEvalMetrics) -
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "eval"))]
 mod tests {
     use rag_rat_core::index::oracle::OracleEvalMetrics;
 
