@@ -122,7 +122,7 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
     };
     db.reconcile_with_options_progress(options, |_| {})?;
     if run_gc {
-        let _ = db.gc();
+        let _ = db.garbage_collect();
     }
     let _ = db.memory_validate();
     Ok(())

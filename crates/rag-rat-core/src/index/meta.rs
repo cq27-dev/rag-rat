@@ -29,7 +29,7 @@ impl IndexDatabase {
     }
 
     pub(super) fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        meta_for(self.storage.connection(), key)
+        read_meta(self.storage.connection(), key)
     }
 
     pub(super) fn content_revision(&self) -> anyhow::Result<String> {

@@ -267,7 +267,7 @@ impl IndexDatabase {
             });
         }
         let (logical_symbol, variants) = self.graph_logical_symbol(options.logical_symbol_id)?;
-        let text_hits = self.regex_hits(pattern, &regex, include_tests)?;
+        let text_hits = self.find_regex_hits(pattern, &regex, include_tests)?;
         let text_by_location = text_hits
             .iter()
             .map(|hit| ((hit.path.clone(), hit.line), hit))
@@ -342,7 +342,7 @@ impl IndexDatabase {
             if text_by_location.contains_key(&(callsite.path.clone(), callsite.line)) {
                 continue;
             }
-            let current_line = self.current_line_text(&callsite.path, callsite.line)?;
+            let current_line = self.read_current_line_text(&callsite.path, callsite.line)?;
             let graph_only = crate::query::graph::GraphOnlyEdge {
                 path: callsite.path.clone(),
                 line: callsite.line,

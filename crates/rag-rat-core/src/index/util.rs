@@ -2,7 +2,7 @@
 
 use super::*;
 
-pub(crate) fn meta_for(conn: &rusqlite::Connection, key: &str) -> anyhow::Result<Option<String>> {
+pub(crate) fn read_meta(conn: &rusqlite::Connection, key: &str) -> anyhow::Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
         .optional()?)

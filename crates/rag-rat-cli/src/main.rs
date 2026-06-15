@@ -93,7 +93,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Reconcile(args) => reconcile(&config, &args)?,
         Cmd::Gc => {
             let db = open_index(&config)?;
-            print_output(&db.gc()?)?;
+            print_output(&db.garbage_collect()?)?;
         },
         Cmd::Eval(args) => eval(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,

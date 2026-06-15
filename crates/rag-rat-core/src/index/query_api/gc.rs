@@ -20,7 +20,7 @@ impl IndexDatabase {
     /// commit and overlay of every worktree reported by `git worktree list` (plus this
     /// connection's active context) and prunes file/chunk/embedding/symbol/edge rows for any
     /// other commit. Never prunes when no live context can be determined (non-git, git error).
-    pub fn gc(&self) -> anyhow::Result<GcReport> {
+    pub fn garbage_collect(&self) -> anyhow::Result<GcReport> {
         let mut live_commits = Vec::new();
         let mut live_worktrees = Vec::new();
         if let Some(root) = self.storage.source_root() {

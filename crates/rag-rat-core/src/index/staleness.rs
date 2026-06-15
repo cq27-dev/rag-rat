@@ -24,7 +24,7 @@ impl IndexDatabase {
         hex_sha256(&bytes) != indexed_sha256
     }
 
-    pub(super) fn regex_hits(
+    pub(super) fn find_regex_hits(
         &self,
         pattern: &str,
         regex: &Regex,
@@ -60,7 +60,7 @@ impl IndexDatabase {
         Ok(hits)
     }
 
-    pub(super) fn current_line_text(
+    pub(super) fn read_current_line_text(
         &self,
         path: &str,
         line: i64,
