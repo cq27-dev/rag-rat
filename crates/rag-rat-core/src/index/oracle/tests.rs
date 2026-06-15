@@ -2903,8 +2903,8 @@ fn prune_oracle_runs_drops_dead_contexts_only() {
 // ---------------------------------------------------------------------------
 
 use crate::query::memory::{
-    RepoMemoryBindTarget, RepoMemoryCreate, create_memory, memory_by_id, split_active_stale,
-    validate_memories,
+    RepoMemoryBindTarget, RepoMemoryCreate, create_memory, doctor_attention_count, memory_by_id,
+    split_active_stale, validate_memories,
 };
 
 /// Build a multi-document SCIP index, serialized.
@@ -3206,6 +3206,82 @@ fn memory_body_cap_is_8000_chars() {
     assert!(create_memory(&h.conn, make("x".repeat(8000))).is_ok(), "8000 chars is accepted");
     let err = create_memory(&h.conn, make("x".repeat(8001))).unwrap_err();
     assert!(err.to_string().contains("body exceeds 8000"), "8001 rejected with the cap: {err}");
+}
+
+/// `doctor_attention_count` (behind the MCP staleness nudge) counts active bindings whose anchor is
+/// gone/stale, excludes obsolete memories, and matches the population `memory_doctor` lists.
+#[test]
+fn doctor_attention_count_counts_active_gone_and_stale_bindings() {
+    let h = Harness::new();
+    let created = create_memory(&h.conn, RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "drift test".to_string(),
+        body: "x".to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget { path: Some("a.rs".to_string()), ..Default::default() },
+    })
+    .unwrap();
+    let id = created.memory.memory_id;
+    let set_status = |status: &str| {
+        h.conn
+            .execute(
+                "UPDATE repo_memory_bindings SET anchor_status = ?2 WHERE memory_id = ?1",
+                params![id, status],
+            )
+            .unwrap();
+    };
+
+    set_status("current");
+    assert_eq!(doctor_attention_count(&h.conn).unwrap(), 0, "current is not counted");
+    set_status("gone");
+    assert_eq!(doctor_attention_count(&h.conn).unwrap(), 1, "gone is counted");
+    set_status("stale");
+    assert_eq!(doctor_attention_count(&h.conn).unwrap(), 1, "stale is counted");
+    // An obsolete memory drops out even with a gone binding.
+    h.conn.execute("UPDATE repo_memories SET status = 'obsolete' WHERE id = ?1", [&id]).unwrap();
+    assert_eq!(doctor_attention_count(&h.conn).unwrap(), 0, "obsolete is excluded");
+}
+
+/// The public `memory_attention_count` (the MCP staleness nudge's source) reads from a file DB via
+/// a bare read-only open and fails open to 0 on a missing DB — it must never block a tool call.
+#[test]
+fn memory_attention_count_reads_file_db_and_fails_open() {
+    let dir = std::env::temp_dir().join(format!("ragrat-attn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("index.sqlite");
+
+    // Missing DB → 0 (fail-open).
+    assert_eq!(crate::memory_attention_count(&db_path), 0, "missing DB is 0, never an error");
+
+    // A real file DB with one gone binding → 1.
+    {
+        let rw = crate::storage::IndexConnection::open(&db_path).unwrap();
+        crate::index::schema::apply(rw.connection()).unwrap();
+        let created = create_memory(rw.connection(), RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "drift".to_string(),
+            body: "x".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            bind: RepoMemoryBindTarget { path: Some("a.rs".to_string()), ..Default::default() },
+        })
+        .unwrap();
+        rw.connection()
+            .execute(
+                "UPDATE repo_memory_bindings SET anchor_status = 'gone' WHERE memory_id = ?1",
+                [&created.memory.memory_id],
+            )
+            .unwrap();
+    }
+    assert_eq!(crate::memory_attention_count(&db_path), 1, "counts the gone binding from disk");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Point the index `source_root` meta at the harness checkout so the off-index filesystem

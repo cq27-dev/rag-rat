@@ -60,7 +60,29 @@ impl RagRatService {
         // a tool result is never lost. JSON is reachable by launching `rag-rat mcp --json`
         // (the format is chosen once at launch; MCP has no per-call flag).
         let text = rag_rat_core::render(&value, self.output_format);
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        let mut content = vec![Content::text(text)];
+        if let Some(nudge) = self.stale_memory_nudge() {
+            content.push(Content::text(nudge));
+        }
+        Ok(CallToolResult::success(content))
+    }
+
+    /// Surface drifted repo-memory anchors to the AGENT as a second tool-result content block.
+    /// Claude Code's agent is pull-based — MCP server notifications (`notifications/message`) reach
+    /// the UI/logs but NOT the model's context (anthropics/claude-code#3174) — so a tool result is
+    /// the one MCP-native channel that puts an actionable signal in front of the model. The nudge
+    /// self-limits: once the agent runs `memory_rebind`, the count drops to 0 and it stops showing.
+    /// Best-effort + lock-free (a bare read-only count), so it never slows or fails a tool call.
+    fn stale_memory_nudge(&self) -> Option<String> {
+        let n = rag_rat_core::memory_attention_count(&self.config.database);
+        (n > 0).then(|| {
+            let noun = if n == 1 { "memory" } else { "memories" };
+            format!(
+                "rag-rat: {n} active repo {noun} have stale/gone anchors. Call `memory_doctor` to \
+                 list them with suggested re-anchor targets, then `memory_rebind` to fix — so \
+                 source-anchored memory stays trustworthy for the next agent."
+            )
+        })
     }
 }
 

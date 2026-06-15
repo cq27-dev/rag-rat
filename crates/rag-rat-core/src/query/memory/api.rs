@@ -575,6 +575,26 @@ pub struct MemoryDoctorEntry {
 /// Read-only report: active memories with `gone | stale` bindings plus live rebind candidates.
 ///
 /// Invariant: this function is purely READ — it never writes to the database.
+/// Count of active memories whose anchor is `gone`/`stale` — the EXACT population `doctor_report`
+/// lists (same WHERE), so a "N need re-anchoring" nudge matches what `memory_doctor` then shows.
+/// `scip_moniker` bindings are excluded (self-heal on the next oracle run, never
+/// rebind-actionable).
+pub(crate) fn doctor_attention_count(conn: &Connection) -> anyhow::Result<u64> {
+    let count: i64 = conn.query_row(
+        "
+        SELECT COUNT(*)
+        FROM repo_memory_bindings AS b
+        JOIN repo_memories AS m ON m.id = b.memory_id
+        WHERE m.status = 'active'
+          AND b.anchor_status IN ('gone', 'stale')
+          AND b.binding_kind != 'scip_moniker'
+        ",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>> {
     // Query bindings whose anchor_status is non-current, restricted to active memories.
     // Mirrors the column list used by validate_memories / binding_row.
