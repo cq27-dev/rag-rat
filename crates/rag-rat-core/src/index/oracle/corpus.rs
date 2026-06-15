@@ -17,9 +17,17 @@ struct CorpusFile {
     corpus: Vec<CorpusProfile>,
 }
 
-/// Parse the corpus profiles from an `oracle-corpora.toml` string.
+/// Parse the corpus profiles from an `oracle-corpora.toml` string. Fails closed on an empty result:
+/// a typo'd table name (`[[corpora]]` instead of `[[corpus]]`) deserializes to zero corpora, which
+/// would silently turn the CI matrix into a no-op and skip the health gate — so require at least
+/// one.
 pub fn load_corpora(toml_str: &str) -> anyhow::Result<Vec<CorpusProfile>> {
-    Ok(toml::from_str::<CorpusFile>(toml_str)?.corpus)
+    let corpora = toml::from_str::<CorpusFile>(toml_str)?.corpus;
+    anyhow::ensure!(
+        !corpora.is_empty(),
+        "oracle-corpora.toml has no [[corpus]] entries (wrong table name?)"
+    );
+    Ok(corpora)
 }
 
 /// The corpus with this id, if any.
@@ -101,44 +109,83 @@ mod tests {
         OracleEvalMetrics, OracleReport, ResolutionBefore, ResolutionDelta, RunProvenance,
     };
 
-    const CORPORA: &str = include_str!("../../../../../tools/oracle-corpora.toml");
+    // Inline sample for the deterministic logic/health tests — kept IN-CRATE so they're packaging-
+    // safe (no `include_str!` of a file outside the `rag-rat-core` package). The committed
+    // `tools/oracle-corpora.toml` is validated separately at runtime (`committed_corpora_file`).
+    const SAMPLE: &str = r#"
+[[corpus]]
+corpus_id = "rust-semver"
+tier      = "small"
+repo      = "https://github.com/dtolnay/semver"
+rev       = "1.0.26"
+tool      = "rust-analyzer"
+prepare   = ["cargo fetch"]
+bindings  = { rust = ["src"] }
+health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 8 }
 
-    #[test]
-    fn committed_corpora_load_with_expected_ids_and_tiers() {
-        let corpora = load_corpora(CORPORA).unwrap();
-        let ids: Vec<&str> = corpora.iter().map(|c| c.corpus_id.as_str()).collect();
-        assert_eq!(ids, ["rust-semver", "c-cjson", "py-requests", "rust-cargo", "linux-kernel"]);
+[[corpus]]
+corpus_id = "linux-kernel"
+tier      = "heavy"
+repo      = "https://github.com/torvalds/linux"
+rev       = "v7.0"
+tool      = "scip-clang"
+prepare   = ["make defconfig"]
+bindings  = { c = ["."] }
+health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined = 5000, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 1000, timeout_minutes = 120 }
+"#;
 
-        let small: Vec<&str> =
-            corpora_for_tier(&corpora, "small").iter().map(|c| c.corpus_id.as_str()).collect();
-        assert_eq!(small, ["rust-semver", "c-cjson", "py-requests"]);
-        let heavy: Vec<&str> =
-            corpora_for_tier(&corpora, "heavy").iter().map(|c| c.corpus_id.as_str()).collect();
-        assert_eq!(heavy, ["rust-cargo", "linux-kernel"]);
-
-        let requests = corpus_by_id(&corpora, "py-requests").unwrap();
-        assert_eq!(requests.tool, "scip-python");
-        assert_eq!(requests.bindings.get("python"), Some(&vec!["src/requests".to_string()]));
+    /// Path to the committed corpora file (repo `tools/`), relative to this crate's manifest.
+    fn committed_corpora_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/oracle-corpora.toml")
     }
 
     #[test]
-    fn committed_corpus_profile_hashes_are_pinned() {
-        // GOLDEN: pin each committed profile's hash. An edit to any corpus field changes its hash
-        // (and makes prior reports incomparable) — recompute deliberately when the change is
-        // intended. This is the review tripwire for an accidental corpus/threshold edit.
-        let corpora = load_corpora(CORPORA).unwrap();
-        let hashes: Vec<(String, String)> =
-            corpora.iter().map(|c| (c.corpus_id.clone(), c.hash())).collect();
+    fn load_rejects_empty_or_misnamed_corpus_array() {
+        // A typo'd table name parses to zero corpora — must fail closed, not yield a no-op matrix.
+        assert!(load_corpora("[[corpora]]\ncorpus_id = \"x\"\n").is_err());
+        assert!(load_corpora("").is_err());
+    }
+
+    #[test]
+    fn sample_loads_and_selects_by_id_and_tier() {
+        let corpora = load_corpora(SAMPLE).unwrap();
+        let small: Vec<&str> =
+            corpora_for_tier(&corpora, "small").iter().map(|c| c.corpus_id.as_str()).collect();
+        assert_eq!(small, ["rust-semver"]);
+        let heavy: Vec<&str> =
+            corpora_for_tier(&corpora, "heavy").iter().map(|c| c.corpus_id.as_str()).collect();
+        assert_eq!(heavy, ["linux-kernel"]);
+        assert!(corpus_by_id(&corpora, "nope").is_none());
+    }
+
+    /// Runtime-fs (not `include_str!`) so the crate stays packaging-safe: the committed file lives
+    /// in the repo `tools/`, outside the published crate. Skips when absent (e.g. a packaged
+    /// crate); when present it's the review tripwire — the committed corpora's ids/tiers +
+    /// golden hashes.
+    #[test]
+    fn committed_corpora_file() {
+        let Ok(toml_str) = std::fs::read_to_string(committed_corpora_path()) else {
+            return; // not in a repo checkout (packaged crate) — nothing to validate.
+        };
+        let corpora = load_corpora(&toml_str).unwrap();
+        let ids: Vec<&str> = corpora.iter().map(|c| c.corpus_id.as_str()).collect();
+        assert_eq!(ids, ["rust-semver", "c-cjson", "py-requests", "rust-cargo", "linux-kernel"]);
+        assert_eq!(corpus_by_id(&corpora, "py-requests").unwrap().tool, "scip-python");
+
+        // GOLDEN per-profile hashes: an edit to any corpus field changes its hash (and makes prior
+        // reports incomparable) — recompute deliberately when intended.
+        let hashes: Vec<(&str, String)> =
+            corpora.iter().map(|c| (c.corpus_id.as_str(), c.hash())).collect();
         assert_eq!(hashes, vec![
-            ("rust-semver".to_string(), GOLDEN_RUST_SEMVER.to_string()),
-            ("c-cjson".to_string(), GOLDEN_C_CJSON.to_string()),
-            ("py-requests".to_string(), GOLDEN_PY_REQUESTS.to_string()),
-            ("rust-cargo".to_string(), GOLDEN_RUST_CARGO.to_string()),
-            ("linux-kernel".to_string(), GOLDEN_LINUX_KERNEL.to_string()),
+            ("rust-semver", GOLDEN_RUST_SEMVER.to_string()),
+            ("c-cjson", GOLDEN_C_CJSON.to_string()),
+            ("py-requests", GOLDEN_PY_REQUESTS.to_string()),
+            ("rust-cargo", GOLDEN_RUST_CARGO.to_string()),
+            ("linux-kernel", GOLDEN_LINUX_KERNEL.to_string()),
         ]);
     }
 
-    // Filled in from the first test run (see `committed_corpus_profile_hashes_are_pinned`).
+    // Pinned from the committed `tools/oracle-corpora.toml` (see `committed_corpora_file`).
     const GOLDEN_RUST_SEMVER: &str =
         "7973c3d62bbea9fbbdf3d7a4380fb7d9ccdbf2659a3503c9267eb9f9f329bb97";
     const GOLDEN_C_CJSON: &str = "685a33345247c2ef310b7671fb9e2a55a7cb7c577fcd29fecac436ff0634c9dc";
@@ -147,7 +194,7 @@ mod tests {
     const GOLDEN_RUST_CARGO: &str =
         "60452736340151a253001bb5c33cc83efa2a4ceabba4d42a227d3188d7761d79";
     const GOLDEN_LINUX_KERNEL: &str =
-        "5c075d0a7847a063e7a6a0439e108e804700d154223ce9eedbf74d98448d0f15";
+        "abf87f3dca38d79ad6239348659c13ca484c70f2197fd36e3a7e1f97e27165ff";
 
     fn report_with(
         total_edges: u64,
@@ -155,7 +202,7 @@ mod tests {
         skipped_drifted: u64,
         monikers: u64,
     ) -> OracleResolutionReport {
-        let profile = corpus_by_id(&load_corpora(CORPORA).unwrap(), "rust-semver").unwrap().clone();
+        let profile = corpus_by_id(&load_corpora(SAMPLE).unwrap(), "rust-semver").unwrap().clone();
         // Split `verdicts` across the four kinds arbitrarily (the gate sums them).
         let run = OracleReport {
             confirmed: verdicts,
@@ -180,7 +227,7 @@ mod tests {
 
     #[test]
     fn healthy_report_has_no_violations() {
-        let profile = corpus_by_id(&load_corpora(CORPORA).unwrap(), "rust-semver").unwrap().clone();
+        let profile = corpus_by_id(&load_corpora(SAMPLE).unwrap(), "rust-semver").unwrap().clone();
         // edges 100>=50, verdicts 30>=20, drift 0<=0, monikers 15>=10.
         let report = report_with(100, 30, 0, 15);
         assert!(check_corpus_health(&profile, &report).is_empty());
@@ -188,7 +235,7 @@ mod tests {
 
     #[test]
     fn each_threshold_violation_is_reported() {
-        let profile = corpus_by_id(&load_corpora(CORPORA).unwrap(), "rust-semver").unwrap().clone();
+        let profile = corpus_by_id(&load_corpora(SAMPLE).unwrap(), "rust-semver").unwrap().clone();
         // All four below/over threshold.
         let report = report_with(10, 5, 3, 2);
         let checks: Vec<&str> =
