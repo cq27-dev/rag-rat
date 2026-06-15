@@ -616,3 +616,109 @@ async fn run_stdio_unix(
     running.waiting().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use rag_rat_core::language::Language;
+    use rag_rat_core::{Config, IndexDatabase, OutputFormat, ResolvedTarget, TargetKind};
+    use serde_json::json;
+
+    use super::*;
+    use crate::tools::EmptyArgs;
+
+    static N: AtomicU64 = AtomicU64::new(0);
+
+    fn service_over_temp_repo() -> (PathBuf, RagRatService) {
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-server-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn open_database() {}\n").unwrap();
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+        (root, RagRatService::new(config, OutputFormat::Toon))
+    }
+
+    #[test]
+    fn get_info_advertises_tool_capability() {
+        let (root, svc) = service_over_temp_repo();
+        let info = svc.get_info();
+        assert!(info.capabilities.tools.is_some(), "server must advertise tools");
+        assert_eq!(info.server_info.name, "rag-rat");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn call_dispatches_every_read_tool_and_rejects_unknown() {
+        let (root, svc) = service_over_temp_repo();
+        // The chokepoint `call()` funnels every tool: success path (render to TOON text) across a
+        // representative read-tool set, plus the error mapping for an unknown tool.
+        let calls = [
+            ("semantic_search", json!({ "query": "open_database" })),
+            ("symbol_lookup", json!({ "symbol": "open_database" })),
+            ("find_callers", json!({ "symbol": "open_database" })),
+            ("trace_callees", json!({ "symbol": "open_database" })),
+            ("impact_surface", json!({ "symbol": "open_database" })),
+            ("docs_for_symbol", json!({ "symbol": "open_database" })),
+            ("git_history_for_symbol", json!({ "symbol": "open_database" })),
+            ("repo_brief", json!({})),
+            ("repo_clusters", json!({})),
+            ("important_symbols", json!({})),
+            ("ffi_surface", json!({})),
+            ("compare_graph_to_scip", json!({})),
+            ("index_status", json!({})),
+            ("local_ai_status", json!({})),
+            ("github_sync_status", json!({})),
+            ("memory_validate", json!({})),
+        ];
+        for (name, args) in calls {
+            let result = svc.call(name, args).unwrap_or_else(|e| panic!("{name} failed: {e:?}"));
+            assert!(!result.content.is_empty(), "{name} returned no content");
+        }
+        assert!(svc.call("definitely_not_a_tool", json!({})).is_err(), "unknown tool must error");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tool_wrappers_forward_to_call() {
+        // The #[tool] methods are thin forwarders to `call()`; exercise a representative set across
+        // the distinct arg shapes so the forwarding path is covered in-process (the stdio test runs
+        // the server out-of-process, where coverage isn't collected).
+        let (root, svc) = service_over_temp_repo();
+        // Each method takes a distinct Parameters<T>, so the args are built inline per call
+        // (a shared closure would monomorphize to a single T).
+        let sym = json!({ "symbol": "open_database" });
+        svc.semantic_search(Parameters(
+            serde_json::from_value(json!({ "query": "open_database" })).unwrap(),
+        ))
+        .unwrap();
+        svc.symbol_lookup(Parameters(serde_json::from_value(sym.clone()).unwrap())).unwrap();
+        svc.find_callers(Parameters(serde_json::from_value(sym.clone()).unwrap())).unwrap();
+        svc.impact_surface(Parameters(serde_json::from_value(sym.clone()).unwrap())).unwrap();
+        svc.repo_brief(Parameters(serde_json::from_value(json!({})).unwrap())).unwrap();
+        svc.important_symbols(Parameters(serde_json::from_value(json!({})).unwrap())).unwrap();
+        svc.index_status(Parameters(EmptyArgs {})).unwrap();
+        svc.local_ai_status(Parameters(EmptyArgs {})).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
