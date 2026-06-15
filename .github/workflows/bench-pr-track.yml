@@ -12,6 +12,10 @@ on:
 
 permissions:
   contents: read
+  # `bencher run --github-actions` posts BOTH a GitHub Check and a PR comment, so the tracker needs
+  # checks:write (specifying a permissions map sets omitted scopes to none) — Bencher's fork-PR
+  # example grants both. Without it the Check publish/update fails after the artifact download.
+  checks: write
   pull-requests: write
 
 env:
