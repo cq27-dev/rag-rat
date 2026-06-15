@@ -68,6 +68,15 @@ impl ToolManifest {
                                scripts/clang-tools/gen_compile_commands.py), or pass a pre-built \
                                index with `--scip <path>`.",
             },
+            OracleTool::ScipPython => ToolManifest {
+                tool,
+                program: "scip-python",
+                languages: &["python"],
+                install_hint: "scip-python not found on PATH. Install it (e.g. `npm install -g \
+                               @sourcegraph/scip-python`) AND install the project's dependencies \
+                               (e.g. into a virtualenv) so imports resolve, or pass a pre-built \
+                               index with `--scip <path>`.",
+            },
         }
     }
 
@@ -109,6 +118,13 @@ impl ToolManifest {
                 .output()
                 .is_ok_and(|output| output.status.success()),
             OracleTool::ScipClang => true,
+            // scip-python emits via an `index` subcommand; `index --help` exiting 0 is the analog
+            // of rust-analyzer's `scip --help` capability check.
+            OracleTool::ScipPython => Command::new(self.program)
+                .arg("index")
+                .arg("--help")
+                .output()
+                .is_ok_and(|output| output.status.success()),
         }
     }
 
@@ -119,7 +135,11 @@ impl ToolManifest {
     /// pre-built `--scip` path never reaches here.
     pub fn prerequisite_blocked(&self, root: &Path) -> Option<String> {
         match self.tool {
-            OracleTool::RustAnalyzer => None,
+            // scip-python's "deps must be installed" prerequisite has no single sentinel file to
+            // check (it's whatever the corpus `prepare` venv installs); a failed environment shows
+            // up as a near-zero moniker count the report health gate catches, so there's nothing to
+            // block on here.
+            OracleTool::RustAnalyzer | OracleTool::ScipPython => None,
             OracleTool::ScipClang => (!root.join("compile_commands.json").exists()).then(|| {
                 format!(
                     "scip-clang requires a compile_commands.json at {} — generate one (e.g. `bear \
@@ -152,6 +172,23 @@ impl ToolManifest {
                     .arg(format!("--index-output-path={}", output.display()));
                 cmd
             },
+            // scip-python indexes a working directory (not a source root arg) via its `index`
+            // subcommand. `--cwd <root>` is where it resolves the project + its installed deps;
+            // `--project-name` (the root's dir name) becomes the package component of in-corpus
+            // monikers, so a non-empty name is what lets `count_symbols_with_moniker` see them.
+            // `--output` is absolute, so it's unaffected by `--cwd`.
+            OracleTool::ScipPython => {
+                let project_name = root.file_name().and_then(|n| n.to_str()).unwrap_or("project");
+                let mut cmd = Command::new(self.program);
+                cmd.arg("index")
+                    .arg("--project-name")
+                    .arg(project_name)
+                    .arg("--cwd")
+                    .arg(root)
+                    .arg("--output")
+                    .arg(output);
+                cmd
+            },
         }
     }
 }
@@ -177,8 +214,8 @@ mod tests {
     #[test]
     fn every_tool_has_a_manifest_entry() {
         // Exhaustive over the OracleTool registry: each variant must resolve to a manifest with a
-        // non-empty program + hint, so `oracle run`/`status` can always describe it. (One variant
-        // today; the `match` is the exhaustiveness guard a new variant trips.)
+        // non-empty program + hint, so `oracle run`/`status` can always describe it. (The `match`
+        // in `for_tool` is the exhaustiveness guard a new variant trips.)
         for &tool in OracleTool::ALL {
             let manifest = ToolManifest::for_tool(tool);
             assert_eq!(manifest.tool, tool);
@@ -269,5 +306,28 @@ mod tests {
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(cmd.get_program().to_string_lossy(), "rust-analyzer");
         assert_eq!(args, vec!["scip", "/repo", "--output", "/tmp/out.scip"]);
+    }
+
+    #[test]
+    fn scip_python_indexes_a_cwd_with_a_project_name() {
+        // scip-python's invocation: `scip-python index --project-name <root-basename> --cwd <root>
+        // --output <abs>`. The project name (the root's dir name) is what gives in-corpus symbols
+        // a non-empty moniker package, and `--cwd` is where it resolves the installed deps. No
+        // compile_commands.json prerequisite (the venv install is the corpus `prepare` step's job).
+        let manifest = ToolManifest::for_tool(OracleTool::ScipPython);
+        assert_eq!(manifest.program, "scip-python");
+        assert_eq!(manifest.languages, &["python"]);
+        let cmd = manifest.scip_command(Path::new("/work/requests"), Path::new("/tmp/out.scip"));
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec![
+            "index",
+            "--project-name",
+            "requests",
+            "--cwd",
+            "/work/requests",
+            "--output",
+            "/tmp/out.scip",
+        ]);
+        assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_none());
     }
 }

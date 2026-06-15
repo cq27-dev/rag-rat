@@ -499,17 +499,22 @@ pub enum OracleTool {
     /// database rather than a source root, and is the SCIP emitter directly (no `scip`
     /// subcommand), so its probe + invocation differ from rust-analyzer's — see `ToolManifest`.
     ScipClang,
+    /// `scip-python index` — Python (#164 B6). Resolves imports against the project's INSTALLED
+    /// dependencies, so the corpus must install them (a venv) first; an unresolved environment
+    /// shows up as a near-zero moniker count the report's health gate catches.
+    ScipPython,
 }
 
 impl OracleTool {
     /// Every known oracle tool, for "report on all tools" surfaces (`oracle status` with no
     /// `--tool`). Later language backends (#72 Kotlin) extend this alongside the enum.
-    pub const ALL: &[OracleTool] = &[Self::RustAnalyzer, Self::ScipClang];
+    pub const ALL: &[OracleTool] = &[Self::RustAnalyzer, Self::ScipClang, Self::ScipPython];
 
     pub fn as_db_str(self) -> &'static str {
         match self {
             Self::RustAnalyzer => "rust-analyzer",
             Self::ScipClang => "scip-clang",
+            Self::ScipPython => "scip-python",
         }
     }
 
@@ -517,6 +522,7 @@ impl OracleTool {
         match value {
             "rust-analyzer" => Some(Self::RustAnalyzer),
             "scip-clang" => Some(Self::ScipClang),
+            "scip-python" => Some(Self::ScipPython),
             _ => None,
         }
     }

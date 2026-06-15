@@ -285,6 +285,8 @@ pub(crate) enum OracleToolArg {
     RustAnalyzer,
     #[value(name = "scip-clang")]
     ScipClang,
+    #[value(name = "scip-python")]
+    ScipPython,
 }
 
 impl OracleToolArg {
@@ -292,6 +294,7 @@ impl OracleToolArg {
         match self {
             OracleToolArg::RustAnalyzer => rag_rat_core::index::oracle::OracleTool::RustAnalyzer,
             OracleToolArg::ScipClang => rag_rat_core::index::oracle::OracleTool::ScipClang,
+            OracleToolArg::ScipPython => rag_rat_core::index::oracle::OracleTool::ScipPython,
         }
     }
 }
