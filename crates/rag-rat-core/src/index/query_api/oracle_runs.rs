@@ -130,18 +130,39 @@ impl IndexDatabase {
         )
     }
 
-    /// Roll back a just-completed run for `(tool, tool_version)` in this checkout — delete its
-    /// `edge_oracle` verdicts, monikers, and `oracle_runs` row. `oracle report` calls this when a
-    /// corpus FAILS its health gate, so a broken-environment run (the gate's whole purpose to
-    /// catch) can't linger as the authoritative latest verdict set for later status/query
-    /// surfaces.
-    pub fn rollback_oracle_run(&self, tool: OracleTool, tool_version: &str) -> anyhow::Result<()> {
-        oracle::rollback_run(
+    /// Run the oracle for a corpus report PROVISIONALLY and apply its health gate atomically: the
+    /// pass + report assembly + gate run in ONE transaction that commits only if healthy, so a
+    /// gate-failing run is rolled back whole — leaving the prior healthy verdicts/monikers/run row
+    /// intact (Codex on #175). `provenance.tool_version` is the run's content-addressed version.
+    /// Returns the report (always, for stdout) + the violations (empty = committed). The `shas` arm
+    /// the content-drift gates exactly as [`Self::run_oracle_at`].
+    pub fn run_oracle_report(
+        &self,
+        profile: &oracle::CorpusProfile,
+        provenance: &oracle::RunProvenance,
+        tool: OracleTool,
+        scip_bytes: &[u8],
+        shas: OracleShaSnapshots<'_>,
+        started_at_ms: i64,
+    ) -> anyhow::Result<(oracle::OracleResolutionReport, Vec<oracle::HealthViolation>)> {
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!(
+                "index has no source_root metadata; rebuild required for the oracle pass"
+            );
+        };
+        let root = root.to_path_buf();
+        oracle::run_oracle_report(
             self.storage.connection(),
+            profile,
+            provenance,
             tool,
-            tool_version,
             &self.active_commit_sha,
             &self.active_worktree_id,
+            scip_bytes,
+            &root,
+            shas.production,
+            shas.pre_spawn,
+            started_at_ms,
         )
     }
 

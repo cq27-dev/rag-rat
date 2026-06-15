@@ -437,11 +437,11 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
 
     let rag_rat_commit = rag_rat_commit_provenance();
 
-    // Run the oracle, then assemble the typed report + apply the health gate — all under the index
-    // write lock so a watcher reindex can't land between the join's verdict writes and the report's
-    // "before"/moniker reads, AND so an unhealthy run is rolled back atomically (it must not
-    // survive as the authoritative latest verdicts). Producing the `.scip` with the tool
-    // happens OUTSIDE the lock (#82 P3): the slow subprocess must not starve the watcher.
+    // Run the oracle + assemble the report + apply the health gate as ONE provisional transaction
+    // (`db.run_oracle_report` commits only if healthy, else rolls the whole run back), all under
+    // the index write lock so a watcher reindex can't interleave. Producing the `.scip` with
+    // the tool happens OUTSIDE the lock (#82 P3): the slow subprocess must not starve the
+    // watcher.
     let (report, violations) = if let Some(scip_path) = &args.scip {
         let scip_bytes = fs::read(scip_path).map_err(|err| {
             anyhow::anyhow!("failed to read SCIP index {}: {err}", scip_path.display())
@@ -451,16 +451,25 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
             scip_path.file_name().and_then(|n| n.to_str()).unwrap_or("index.scip"),
             oracle::scip_content_fingerprint(&scip_bytes),
         );
-        let production_sha = oracle::scip_content_fingerprint(&scip_bytes);
+        let provenance = oracle::RunProvenance {
+            tool_version,
+            rag_rat_commit: rag_rat_commit.clone(),
+            // worktree_id filled under the lock (it's the active checkout's, read from the db).
+            worktree_id: String::new(),
+            production_sha: oracle::scip_content_fingerprint(&scip_bytes),
+        };
         with_oracle_write_lock(config, |db| {
-            let run = db.run_oracle_from_scip(tool, &tool_version, &scip_bytes)?;
-            let provenance = oracle::RunProvenance {
-                tool_version: tool_version.clone(),
-                rag_rat_commit: rag_rat_commit.clone(),
-                worktree_id: db.active_worktree_id.clone(),
-                production_sha: production_sha.clone(),
-            };
-            finalize_corpus_report(db, &profile, &provenance, tool, &run)
+            let provenance =
+                oracle::RunProvenance { worktree_id: db.active_worktree_id.clone(), ..provenance };
+            // A pre-built `--scip` arms neither content-drift gate and has no spawn moment.
+            db.run_oracle_report(
+                &profile,
+                &provenance,
+                tool,
+                &scip_bytes,
+                rag_rat_core::index::OracleShaSnapshots::default(),
+                crate::now_epoch_ms(),
+            )
         })?
     } else {
         // No pre-built index: probe first so a missing tool fails before touching the index, then
@@ -485,32 +494,35 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
                 anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
             },
             oracle::ScipProduction::Produced { version, bytes, production_sha } => {
-                let fingerprint = oracle::scip_content_fingerprint(&bytes);
+                let provenance = oracle::RunProvenance {
+                    tool_version: version,
+                    rag_rat_commit: rag_rat_commit.clone(),
+                    worktree_id: String::new(),
+                    production_sha: oracle::scip_content_fingerprint(&bytes),
+                };
                 with_oracle_write_lock(config, |db| {
-                    let run = db.run_oracle_at(
+                    let provenance = oracle::RunProvenance {
+                        worktree_id: db.active_worktree_id.clone(),
+                        ..provenance
+                    };
+                    db.run_oracle_report(
+                        &profile,
+                        &provenance,
                         tool,
-                        &version,
                         &bytes,
                         rag_rat_core::index::OracleShaSnapshots {
                             production: Some(&production_sha),
                             pre_spawn: Some(&pre_spawn_sha),
                         },
                         started_at_ms,
-                    )?;
-                    let provenance = oracle::RunProvenance {
-                        tool_version: version.clone(),
-                        rag_rat_commit: rag_rat_commit.clone(),
-                        worktree_id: db.active_worktree_id.clone(),
-                        production_sha: fingerprint.clone(),
-                    };
-                    finalize_corpus_report(db, &profile, &provenance, tool, &run)
+                    )
                 })?
             },
         }
     };
 
-    // Emit the report unconditionally — the glue/Δ script consumes it even for a failing run (the
-    // run itself was already rolled back inside the lock when unhealthy).
+    // Emit the report unconditionally — the glue/Δ script consumes it even for a failing run (an
+    // unhealthy run was already rolled back whole inside the transaction).
     print_output(&report)?;
 
     // Health gate: a violated threshold means the run is untrustworthy, so exit non-zero even
@@ -526,29 +538,6 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
         );
     }
     Ok(())
-}
-
-/// Assemble the typed report, apply the corpus health gate, and — when the run is unhealthy — ROLL
-/// IT BACK before returning, so a broken-environment run can't survive as the authoritative latest
-/// verdict set for later status/query surfaces (Codex on #175). Runs entirely under the caller's
-/// `with_oracle_write_lock`, so the rollback is atomic with the run that wrote the verdicts.
-/// Returns the report (for stdout) plus the violations (for the caller's exit-code decision).
-fn finalize_corpus_report(
-    db: &IndexDatabase,
-    profile: &rag_rat_core::index::oracle::CorpusProfile,
-    provenance: &rag_rat_core::index::oracle::RunProvenance,
-    tool: rag_rat_core::index::oracle::OracleTool,
-    run: &rag_rat_core::index::oracle::OracleReport,
-) -> anyhow::Result<(
-    rag_rat_core::index::oracle::OracleResolutionReport,
-    Vec<rag_rat_core::index::oracle::HealthViolation>,
-)> {
-    let report = db.resolution_report(profile, provenance, tool, run)?;
-    let violations = rag_rat_core::index::oracle::check_corpus_health(profile, &report);
-    if !violations.is_empty() {
-        db.rollback_oracle_run(tool, &provenance.tool_version)?;
-    }
-    Ok((report, violations))
 }
 
 /// Fail closed unless the active checkout's targets are EXACTLY the corpus profile's `bindings`

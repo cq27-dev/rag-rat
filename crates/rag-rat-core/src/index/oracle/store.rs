@@ -463,26 +463,6 @@ pub(crate) fn record_oracle_run_at(
     Ok(conn.last_insert_rowid())
 }
 
-/// Delete the `oracle_runs` row for one `(tool, tool_version)` in the active checkout — the
-/// `oracle_runs` half of rolling back a run (the `edge_oracle` verdicts are cleared separately by
-/// [`clear_edge_oracle_for_tool`]; see [`super::rollback_run`]). Used when a corpus run fails its
-/// health gate: without removing the row, [`latest_run_tool_version`] would keep selecting the
-/// untrustworthy run, surfacing its verdicts in later status/query output despite the gate failure.
-pub(crate) fn delete_oracle_run(
-    conn: &Connection,
-    tool: OracleTool,
-    tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
-) -> anyhow::Result<()> {
-    conn.execute(
-        "DELETE FROM oracle_runs
-         WHERE tool = ?1 AND tool_version = ?2 AND commit_sha = ?3 AND worktree_id = ?4",
-        params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
-    )?;
-    Ok(())
-}
-
 /// The `tool_version` of the most recent run for `tool` **in the active checkout**, if any. This is
 /// the version the surfacing reads (the `Compiler` tier) key on: query output should show the
 /// verdicts the last `oracle run` for this checkout produced. Scoped to `(commit_sha, worktree_id)`

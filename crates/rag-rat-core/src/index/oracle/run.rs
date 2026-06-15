@@ -68,15 +68,30 @@ pub(crate) struct OracleRunInput<'a> {
 /// revisits), so `status`/eval would keep counting a verdict the current oracle doesn't stand
 /// behind.
 pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Result<OracleReport> {
+    // Authoritative-rerun clear + the per-edge writes + the run row are one atomic unit, so the
+    // table is never observed mid-clear and a failed run rolls back to the prior verdicts. The body
+    // ([`run_in_tx`]) does all the writes on `conn`; `tx` exists only to BEGIN/COMMIT around them.
+    // `oracle report` (C2) calls `run_in_tx` directly inside ITS OWN transaction so it can roll the
+    // whole run back when the corpus health gate fails — keeping a rejected run from destroying the
+    // prior healthy verdicts/monikers (the authoritative clear is part of the rolled-back unit).
+    let tx = conn.unchecked_transaction()?;
+    let report = run_in_tx(conn, input)?;
+    tx.commit()?;
+    Ok(report)
+}
+
+/// The oracle pass body — every read/write, no transaction management. Runs inside the caller's
+/// transaction: [`run`] wraps it in a commit-on-success transaction; the report path wraps it in
+/// one it rolls back on an unhealthy gate. NEVER call this outside a transaction (the authoritative
+/// clear would not be atomic with the writes).
+pub(crate) fn run_in_tx(
+    conn: &Connection,
+    input: &OracleRunInput<'_>,
+) -> anyhow::Result<OracleReport> {
     let mut report = OracleReport::default();
 
     let candidates = store::edge_join_candidates(conn, input.commit_sha, input.worktree_id)?;
 
-    // Authoritative-rerun clear + the per-edge writes + the run row are one atomic unit, so the
-    // table is never observed mid-clear and a failed run rolls back to the prior verdicts. All
-    // inner reads/writes run on `conn` (the same underlying connection `tx` guards), so they
-    // are part of this transaction; `tx` exists only to BEGIN/COMMIT around them.
-    let tx = conn.unchecked_transaction()?;
     store::clear_edge_oracle_for_tool(
         conn,
         input.tool,
@@ -388,7 +403,6 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
     )?;
 
-    tx.commit()?;
     Ok(report)
 }
 
