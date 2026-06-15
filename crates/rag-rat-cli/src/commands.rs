@@ -8,8 +8,8 @@ use crate::cli::EvalArgs;
 use crate::cli::{
     BriefArgs, ClustersArgs, GithubArgs, GithubCommand, HookAction, HooksArgs,
     ImportantSymbolsArgs, IndexArgs, MaintenanceArgs, MemoryArgs, MemoryCommand, ModelsArgs,
-    ModelsCommand, OracleArgs, OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs,
-    ReconcileArgs,
+    ModelsCommand, OracleArgs, OracleCommand, OracleReportArgs, OracleRunArgs, OracleStatusArgs,
+    QueryArgs, ReconcileArgs,
 };
 
 /// Process-wide output format, set once from the global `--json` flag in `main` before any command
@@ -214,6 +214,7 @@ pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
             let db = open_index(config)?;
             oracle_status(&db, status_args)
         },
+        OracleCommand::Report(report_args) => oracle_report(config, report_args),
     }
 }
 
@@ -386,6 +387,146 @@ fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<
     }
     print_output(&entries)
 }
+
+/// `rag-rat oracle report --corpus <id>` — run the oracle for a declared corpus and emit its typed
+/// C2 [`OracleResolutionReport`] (before/after edge resolution + verdicts + metrics, schema- and
+/// profile-stamped) as JSON/TOON. The report is ALWAYS printed (so a Δ glue script can consume it
+/// even on a failing run); then the per-corpus health gate runs and, on any violation, the command
+/// exits non-zero — catching "scip emitted almost nothing" / "venv didn't resolve deps" / a broken
+/// parse even when the underlying oracle command itself succeeded.
+///
+/// Unlike `oracle run`, a missing/unrunnable tool is a hard ERROR here, not the exit-0 `Blocked`
+/// UX: this is a measurement runner over a corpus whose tool CI is expected to have installed, so a
+/// silent skip would let a broken environment pass green.
+fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()> {
+    use rag_rat_core::index::oracle;
+
+    // Load the corpus profile (defaults to the committed `tools/oracle-corpora.toml`).
+    let corpora_path = args
+        .corpora
+        .clone()
+        .unwrap_or_else(|| config.root.join("tools").join("oracle-corpora.toml"));
+    let toml_str = fs::read_to_string(&corpora_path).map_err(|err| {
+        anyhow::anyhow!("failed to read corpora file {}: {err}", corpora_path.display())
+    })?;
+    let corpora = oracle::load_corpora(&toml_str)?;
+    let profile = oracle::corpus_by_id(&corpora, &args.corpus)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no corpus `{}` in {}", args.corpus, corpora_path.display())
+        })?
+        .clone();
+
+    // Map the corpus's declared tool id to an oracle backend.
+    let tool = oracle::OracleTool::from_db_str(&profile.tool).ok_or_else(|| {
+        anyhow::anyhow!(
+            "corpus `{}` names unknown oracle tool `{}`",
+            profile.corpus_id,
+            profile.tool
+        )
+    })?;
+    let rag_rat_commit = rag_rat_commit_provenance();
+
+    // Run the oracle, then assemble the typed report — both under the index write lock so a watcher
+    // reindex can't land between the join's verdict writes and the report's "before"/moniker reads.
+    // Producing the `.scip` with the tool happens OUTSIDE the lock (#82 P3): the slow subprocess
+    // must not starve the watcher.
+    let report = if let Some(scip_path) = &args.scip {
+        let scip_bytes = fs::read(scip_path).map_err(|err| {
+            anyhow::anyhow!("failed to read SCIP index {}: {err}", scip_path.display())
+        })?;
+        let tool_version = format!(
+            "scip-file:{}@{}",
+            scip_path.file_name().and_then(|n| n.to_str()).unwrap_or("index.scip"),
+            oracle::scip_content_fingerprint(&scip_bytes),
+        );
+        let production_sha = oracle::scip_content_fingerprint(&scip_bytes);
+        with_oracle_write_lock(config, |db| {
+            let run = db.run_oracle_from_scip(tool, &tool_version, &scip_bytes)?;
+            let provenance = oracle::RunProvenance {
+                tool_version: tool_version.clone(),
+                rag_rat_commit: rag_rat_commit.clone(),
+                worktree_id: db.active_worktree_id.clone(),
+                production_sha: production_sha.clone(),
+            };
+            db.resolution_report(&profile, &provenance, tool, &run)
+        })?
+    } else {
+        // No pre-built index: probe first so a missing tool fails before touching the index, then
+        // snapshot the pre-spawn shas (under the lock) and produce the `.scip` outside it
+        // (#82/#83).
+        if let oracle::ToolAvailability::Blocked { hint, .. } = oracle::probe_oracle_tool(tool) {
+            anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
+        }
+        let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
+            Ok((crate::now_epoch_ms(), db.oracle_pre_spawn_snapshot()?))
+        })?;
+        let scip_output = config
+            .database
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("rag-rat-oracle-report-{}.scip", std::process::id()));
+        let production = oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
+        let _ = fs::remove_file(&scip_output);
+        match production? {
+            oracle::ScipProduction::Blocked { hint, .. } => {
+                anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
+            },
+            oracle::ScipProduction::Produced { version, bytes, production_sha } => {
+                let fingerprint = oracle::scip_content_fingerprint(&bytes);
+                with_oracle_write_lock(config, |db| {
+                    let run = db.run_oracle_at(
+                        tool,
+                        &version,
+                        &bytes,
+                        rag_rat_core::index::OracleShaSnapshots {
+                            production: Some(&production_sha),
+                            pre_spawn: Some(&pre_spawn_sha),
+                        },
+                        started_at_ms,
+                    )?;
+                    let provenance = oracle::RunProvenance {
+                        tool_version: version.clone(),
+                        rag_rat_commit: rag_rat_commit.clone(),
+                        worktree_id: db.active_worktree_id.clone(),
+                        production_sha: fingerprint.clone(),
+                    };
+                    db.resolution_report(&profile, &provenance, tool, &run)
+                })?
+            },
+        }
+    };
+
+    // Emit the report unconditionally — the glue/Δ script consumes it even for a failing run.
+    print_output(&report)?;
+
+    // Health gate: a violated threshold means the run is untrustworthy, so exit non-zero even
+    // though the oracle command itself succeeded. Violations go to stderr (the report owns
+    // stdout).
+    let violations = oracle::check_corpus_health(&profile, &report);
+    if !violations.is_empty() {
+        for violation in &violations {
+            eprintln!("corpus health [{}]: {}", violation.check, violation.detail);
+        }
+        anyhow::bail!(
+            "corpus `{}` failed {} health threshold(s)",
+            profile.corpus_id,
+            violations.len()
+        );
+    }
+    Ok(())
+}
+
+/// The `rag_rat_commit` provenance stamp for a resolution report: CI exports `RAG_RAT_COMMIT`
+/// (the building checkout's git SHA) so a number traces to an exact engine build; off CI it falls
+/// back to the crate version, which is enough to disambiguate published builds.
+fn rag_rat_commit_provenance() -> String {
+    std::env::var("RAG_RAT_COMMIT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
 pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     match &args.command {

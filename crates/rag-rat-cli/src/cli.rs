@@ -259,6 +259,9 @@ pub(crate) enum OracleCommand {
     Run(OracleRunArgs),
     /// Report oracle verdict counts + whether the indexer tool is installed.
     Status(OracleStatusArgs),
+    /// Run the oracle for a declared corpus and emit its typed before/after resolution report
+    /// (C2). Applies the corpus health gate: exits non-zero if the run falls outside thresholds.
+    Report(OracleReportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -277,6 +280,20 @@ pub(crate) struct OracleStatusArgs {
     /// Report on one oracle tool only (default: every known tool).
     #[arg(long, value_enum)]
     pub tool: Option<OracleToolArg>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct OracleReportArgs {
+    /// The corpus id to report on (must match a `[[corpus]]` entry's `corpus_id`).
+    #[arg(long)]
+    pub corpus: String,
+    /// Path to the corpus profiles file. Defaults to `<root>/tools/oracle-corpora.toml`.
+    #[arg(long)]
+    pub corpora: Option<PathBuf>,
+    /// Consume a pre-built `.scip` instead of invoking the corpus's tool. Deterministic; the tool
+    /// need not be installed.
+    #[arg(long)]
+    pub scip: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -548,5 +565,34 @@ mod tests {
             cli.command,
             Command::Oracle(OracleArgs { command: OracleCommand::Status(_) })
         ));
+    }
+
+    #[test]
+    fn oracle_report_requires_corpus_and_takes_optional_paths() {
+        // `--corpus` is mandatory; a bare `oracle report` must not parse.
+        assert!(Cli::try_parse_from(["rag-rat", "oracle", "report"]).is_err());
+        let cli = Cli::try_parse_from([
+            "rag-rat",
+            "oracle",
+            "report",
+            "--corpus",
+            "py-requests",
+            "--corpora",
+            "/tmp/corpora.toml",
+            "--scip",
+            "/tmp/x.scip",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Oracle(OracleArgs { command: OracleCommand::Report(args) }) => {
+                assert_eq!(args.corpus, "py-requests");
+                assert_eq!(
+                    args.corpora.as_deref(),
+                    Some(std::path::Path::new("/tmp/corpora.toml"))
+                );
+                assert_eq!(args.scip.as_deref(), Some(std::path::Path::new("/tmp/x.scip")));
+            },
+            other => panic!("expected oracle report, got {other:?}"),
+        }
     }
 }
