@@ -92,6 +92,26 @@ fn include_accepts_a_json_string_encoded_array_from_buggy_clients() {
         serde_json::from_value::<ImpactArgs>(json!({ "include": "[]" })).unwrap().include,
         Some(vec![])
     );
+
+    // The other array params get the same tolerance: edge_kinds (Option<Vec>) and personalize
+    // (Vec).
+    let edges_arr: SymbolGraphArgs =
+        serde_json::from_value(json!({ "edge_kinds": ["calls_name"] })).unwrap();
+    let edges_str: SymbolGraphArgs =
+        serde_json::from_value(json!({ "edge_kinds": "[\"calls_name\"]" })).unwrap();
+    assert_eq!(edges_str.edge_kinds, Some(vec![McpGraphEdgeKind::CallsName]));
+    assert_eq!(edges_arr.edge_kinds, edges_str.edge_kinds);
+
+    let seeds_arr: ImportantSymbolsArgs =
+        serde_json::from_value(json!({ "personalize": ["a", "b"] })).unwrap();
+    let seeds_str: ImportantSymbolsArgs =
+        serde_json::from_value(json!({ "personalize": "[\"a\",\"b\"]" })).unwrap();
+    assert_eq!(seeds_str.personalize, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(seeds_arr.personalize, seeds_str.personalize);
+    // personalize is non-Option: absent collapses to an empty Vec (global ranking).
+    assert!(
+        serde_json::from_value::<ImportantSymbolsArgs>(json!({})).unwrap().personalize.is_empty()
+    );
 }
 
 #[test]

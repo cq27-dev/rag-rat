@@ -95,7 +95,7 @@ impl McpGraphResolutionMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpGraphEdgeKind {
     CallsName,
@@ -153,6 +153,17 @@ where
         Some(Value::String(raw)) => serde_json::from_str(&raw).map(Some).map_err(D::Error::custom),
         Some(other) => serde_json::from_value(other).map(Some).map_err(D::Error::custom),
     }
+}
+
+/// Non-`Option` sibling of [`de_seq_or_json_string`] for a plain `Vec<T>` field (e.g.
+/// `personalize`): same array-or-JSON-string tolerance, with `null`/absent collapsing to an empty
+/// `Vec`.
+fn de_vec_or_json_string<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(de_seq_or_json_string(deserializer)?.unwrap_or_default())
 }
 
 /// `semantic_search` `include` flags. `git`/`papertrail` are on by default (omit `include` to keep
@@ -337,7 +348,7 @@ pub struct ImportantSymbolsArgs {
     /// never fatal). LEAVE EMPTY to auto-seed from
     /// your current git diff (the default — "importance relative to your current changes").
     /// Pass a single `"global"` to force whole-repo PageRank instead.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_vec_or_json_string")]
     pub personalize: Vec<String>,
 }
 
@@ -390,6 +401,7 @@ pub struct SymbolGraphArgs {
     /// is the exact on-set (so listing `macros` alone also drops the default `memories`).
     #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<GraphInclude>>,
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
@@ -418,6 +430,7 @@ pub struct CompareGraphTextArgs {
     /// on-set.
     #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<CompareInclude>>,
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
