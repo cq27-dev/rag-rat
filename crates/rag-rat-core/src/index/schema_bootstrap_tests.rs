@@ -3081,8 +3081,8 @@ pub fn hub() {
         .expect("a capped flat result must carry a completeness sentinel (#150)");
     assert!(sentinel.reason.contains("capped"), "sentinel explains the cap: {sentinel:?}");
     assert!(
-        sentinel.evidence.iter().any(|evidence| evidence.contains("not shown")),
-        "sentinel carries the dropped count: {sentinel:?}"
+        sentinel.evidence.iter().any(|evidence| evidence.contains("beyond the limit")),
+        "sentinel signals more exist: {sentinel:?}"
     );
     let real_items = impact.iter().filter(|item| item.category != "completeness").count();
     assert_eq!(real_items, limit as usize, "exactly `limit` real items, plus the sentinel");
@@ -3093,6 +3093,39 @@ pub fn hub() {
         full.iter().all(|item| item.category != "completeness"),
         "an uncapped result must NOT carry a sentinel: {full:?}"
     );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn impact_surface_flat_signals_truncation_from_a_capped_textual_fallback() {
+    // #150 (Codex review): the per-section caps clamp `textual_fallback`/`historical_evidence` to
+    // exactly `limit`, so a free-text query with MORE matching files than `limit` used to fill the
+    // surface to exactly `limit` and skip the sentinel — silent truncation on the very path the fix
+    // targets. The probe-one-past-limit detection must catch it.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // The token `needle_token` appears only in COMMENTS across many files — no symbol is named it,
+    // so there are no exact targets / graph neighbors; everything comes from textual fallback.
+    for n in 0..6 {
+        fs::write(
+            root.join(format!("src/file_{n}.rs")),
+            format!("// needle_token marker {n}\npub fn unrelated_{n}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let limit = 2u32;
+    let impact = db.impact_surface("needle_token", limit).unwrap();
+    assert!(
+        impact.iter().any(|item| item.category == "completeness"),
+        "a capped textual-fallback result must still signal truncation (#150 Codex): {impact:?}"
+    );
+    let real_items = impact.iter().filter(|item| item.category != "completeness").count();
+    assert_eq!(real_items, limit as usize, "exactly `limit` real items, plus the sentinel");
 
     fs::remove_dir_all(root).unwrap();
 }
