@@ -87,6 +87,12 @@ pub struct IndexDatabase {
     /// `rebuild`/`open` leave it offline, and tests set it explicitly — so the library never
     /// shells out to `gh` during tests (#60).
     github: github::GitHubContext,
+    /// The config this index was opened against — present only on the config-bearing opens
+    /// (`open_config` / `try_open_config_read_only`), `None` for `rebuild`/`open`/tests. Lets a
+    /// read tool classify a working-tree change set against the indexed targets — the lazy
+    /// zero-hit heal (`symbol_candidates`, #152) needs it to index a just-added file the watcher
+    /// hasn't caught yet. Without it that heal is a graceful no-op.
+    config: Option<Config>,
 }
 
 #[derive(Debug, Clone)]

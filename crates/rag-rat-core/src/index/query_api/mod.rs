@@ -116,6 +116,15 @@ impl IndexDatabase {
     ) -> anyhow::Result<crate::query::symbol::SymbolLookup> {
         let mut lookup =
             crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
+        // #152: a name/symbol_path lookup that found NOTHING may be a just-added symbol the watcher
+        // hasn't indexed yet. Index the working-tree change set (bounded) and re-resolve once.
+        // Name-based selectors only — a miss on a churning id isn't "newly added".
+        if lookup.candidates.is_empty()
+            && selector_is_name_based(selector)
+            && self.heal_changed_for_zero_hit()?
+        {
+            lookup = crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
+        }
         // #147: symbol rows aren't anchor-relocated like chunks, so a file edited since indexing
         // returns stale line numbers. Heal the matched files inline (bounded, like
         // search_with_heal) and re-resolve so positions/ids are current; #148: report any
@@ -222,6 +231,62 @@ impl IndexDatabase {
         }
         self.sync_fts()?;
         Ok(())
+    }
+
+    /// #152: a name lookup that found NOTHING may be a symbol just added (or renamed into
+    /// existence) the watcher hasn't indexed yet. Index the working-tree change set — changed
+    /// source files that are dirty-vs-index OR not-yet-indexed — bounded by
+    /// `MAX_AUTO_HEAL_FILES_PER_CALL` (over the cap → do nothing; never raise `NeedsReindex`, since
+    /// the common zero-hit is a plain typo'd miss that must stay cheap), then re-derive logical
+    /// symbols + edges so the re-resolve sees the new symbol. Returns whether anything was indexed.
+    /// No-op without a stored `Config` (rebuild/open/tests) or a git root — a genuine miss on a
+    /// clean tree costs at most one `git status` and no write.
+    fn heal_changed_for_zero_hit(&self) -> anyhow::Result<bool> {
+        let Some(config) = self.config.as_ref() else {
+            return Ok(false);
+        };
+        let Ok(changes) = crate::index::git_changed_paths(&config.root) else {
+            return Ok(false);
+        };
+        if changes.changed.is_empty() {
+            return Ok(false);
+        }
+        // Classify changed paths against the indexed targets (include/exclude/language), keeping
+        // only those dirty-vs-index OR not-yet-indexed — a file already current adds nothing.
+        let mut healable = Vec::new();
+        for file in collect_changed_index_files(config, &changes)? {
+            let needs_index = match self.indexed_sha_for_path(&path_string(&file.relative_path))? {
+                None => true,
+                Some(indexed) => match fs::read(&file.full_path) {
+                    Ok(bytes) => hex_sha256(&bytes) != indexed,
+                    Err(_) => false,
+                },
+            };
+            if needs_index {
+                healable.push(file);
+            }
+            if healable.len() > MAX_AUTO_HEAL_FILES_PER_CALL {
+                // Too many newly-changed files to heal inline on a lookup miss — leave it to the
+                // watcher rather than turn a read into a large rebuild.
+                return Ok(false);
+            }
+        }
+        if healable.is_empty() {
+            return Ok(false);
+        }
+        let files = self.assign_file_scopes(healable, &changes);
+        let indexed = self.apply_incremental_file_plan(
+            files,
+            std::collections::BTreeSet::new(),
+            &mut |_| {},
+        )?;
+        if indexed == 0 {
+            return Ok(false);
+        }
+        // Re-derive so the new symbol carries a logical id and its edges resolve for enrichment.
+        self.rebuild_logical_symbols()?;
+        self.resolve_edges()?;
+        Ok(true)
     }
 
     pub fn select_symbol(
@@ -402,6 +467,16 @@ impl IndexDatabase {
     ) -> anyhow::Result<crate::query::clusters::RepoClustersReport> {
         crate::query::clusters::repo_clusters(self.storage.connection(), options)
     }
+}
+
+/// Whether a selector resolves by NAME (`symbol` / `symbol_path`) rather than by a reindex-churning
+/// id. Only name lookups get the #152 zero-hit heal: a miss on a `symbol_id`/`logical_symbol_id`
+/// isn't a "just added" symbol, just a stale or wrong id, so re-indexing the change set wouldn't
+/// recover it and would put a `git status` on every such miss.
+fn selector_is_name_based(selector: &crate::query::symbol::SymbolSelector) -> bool {
+    selector.symbol_id.is_none()
+        && selector.logical_symbol_id.is_none()
+        && (selector.symbol.is_some() || selector.symbol_path.is_some())
 }
 
 /// `resolved-external(<package>)` for a SCIP symbol that names a dependency outside the corpus, or

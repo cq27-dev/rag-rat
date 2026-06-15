@@ -7973,6 +7973,56 @@ fn symbol_lookup_heals_stale_line_numbers_after_an_edit() {
 }
 
 #[test]
+fn symbol_lookup_heals_a_just_added_symbol_without_waiting_for_the_watcher() {
+    // #152: a name lookup for a symbol just added (here, in a brand-new not-yet-indexed file)
+    // returns it via the lazy zero-hit heal, instead of nothing until the watcher catches up. The
+    // heal needs a stored Config (open_config) and a git working tree to derive the change set.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn existing() {}\n").unwrap();
+    run_git(&root, &["init", "-q"]);
+    run_git(&root, &["add", "-A"]);
+    run_git(&root, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+
+    let config = source_config(root.clone(), Language::Rust);
+    IndexDatabase::rebuild(&config).unwrap();
+    // Reopen via open_config so the zero-hit heal has the Config to classify the change set.
+    let db = IndexDatabase::open_config(&config).unwrap();
+
+    // A brand-new file with a brand-new symbol — never indexed, not yet committed.
+    fs::write(root.join("src/added.rs"), "pub fn brand_new_symbol() {}\n").unwrap();
+
+    let selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("brand_new_symbol".to_string()),
+        language: None,
+        allow_ambiguous: true,
+        limit: 10,
+    };
+    let found = db.symbol_candidates(&selector).unwrap();
+    assert!(
+        found.candidates.iter().any(|c| c.name == "brand_new_symbol"),
+        "a just-added symbol must be healed in without waiting for the watcher: {:?}",
+        found.candidates
+    );
+
+    // A genuine miss (a name that exists nowhere) returns empty — no heal resurrects it, no error.
+    let miss = crate::query::symbol::SymbolSelector {
+        symbol: Some("no_such_symbol_anywhere".to_string()),
+        ..selector.clone()
+    };
+    assert!(
+        db.symbol_candidates(&miss).unwrap().candidates.is_empty(),
+        "a genuine miss must stay empty"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn impact_completeness_flags_dirty_result_files() {
     // #148: a result file dirty vs the index is counted in completeness.stale_files. Resolve via
     // the non-healing `symbols()` so the edit isn't healed away before impact sees it.

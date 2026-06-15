@@ -264,7 +264,7 @@ impl IndexDatabase {
         Ok((count, manifest_in_change_set))
     }
 
-    fn assign_file_scopes(
+    pub(super) fn assign_file_scopes(
         &self,
         files: Vec<IndexFile>,
         changes: &GitChangedPaths,
@@ -355,7 +355,7 @@ impl IndexDatabase {
         Ok(healed)
     }
 
-    fn apply_incremental_file_plan<F>(
+    pub(super) fn apply_incremental_file_plan<F>(
         &self,
         files: Vec<IndexFile>,
         deleted: BTreeSet<PathBuf>,

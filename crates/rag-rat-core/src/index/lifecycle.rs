@@ -50,6 +50,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             github: github::GitHubContext::default(),
+            config: None,
         };
         if check_graph {
             db.ensure_graph_index_current()?;
@@ -65,6 +66,7 @@ impl IndexDatabase {
         // Real usage: resolve the GitHub repo context from the local `gh` CLI here, at the
         // boundary. rebuild/open (used by tests and the bare index command) leave it offline.
         db.github = github::GitHubContext::from_gh();
+        db.config = Some(config.clone());
         db.ensure_graph_index_current()?;
         Ok(db)
     }
@@ -109,6 +111,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             github: github::GitHubContext::from_gh(),
+            config: Some(config.clone()),
         };
         db.set_context(&commit_sha, &worktree_id)?;
         Ok(Some(db))
@@ -165,6 +168,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             github: github::GitHubContext::default(),
+            config: None,
         })
     }
 
