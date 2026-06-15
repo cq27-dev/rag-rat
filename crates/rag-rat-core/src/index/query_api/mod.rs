@@ -2,7 +2,9 @@ use rusqlite::OptionalExtension;
 
 use super::*;
 use crate::index::oracle;
+use crate::index::staleness::Heal;
 use crate::query::text_compare::*;
+use crate::search::lexical::SearchOptions;
 
 mod graph;
 mod history;
@@ -11,6 +13,36 @@ mod memory;
 mod oracle_runs;
 
 pub use importance::ImportantSymbolsRequest;
+
+/// A graph-enriched search request: the lexical query plus the graph-meta controls. Replaces the
+/// `search_*_with_graph_meta[_options]` method ladder — callers fill one value (using
+/// [`SearchRequest::new`] for the common defaults) instead of picking among four
+/// positional-argument variants and transposing the bools.
+pub struct SearchRequest<'a> {
+    pub query: &'a str,
+    pub limit: u32,
+    pub include_generated: bool,
+    pub explain: bool,
+    pub graph_mode: GraphMetaMode,
+    pub graph_limit: u32,
+    pub options: SearchOptions,
+}
+
+impl<'a> SearchRequest<'a> {
+    /// The conventional search defaults: no generated files, no explain, compact graph meta to
+    /// depth 3, git + papertrail boosts on. Override individual fields with struct-update syntax.
+    pub fn new(query: &'a str, limit: u32) -> Self {
+        Self {
+            query,
+            limit,
+            include_generated: false,
+            explain: false,
+            graph_mode: GraphMetaMode::Compact,
+            graph_limit: 3,
+            options: SearchOptions::default(),
+        }
+    }
+}
 
 impl IndexDatabase {
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
@@ -96,7 +128,10 @@ impl IndexDatabase {
         limit: u32,
         include_generated: bool,
     ) -> anyhow::Result<Vec<SearchHit>> {
-        self.search_with_graph_meta(query, limit, include_generated, GraphMetaMode::Compact, 3)
+        self.search_with_graph_meta(SearchRequest {
+            include_generated,
+            ..SearchRequest::new(query, limit)
+        })
     }
 
     pub fn search_explain(
@@ -105,90 +140,34 @@ impl IndexDatabase {
         limit: u32,
         include_generated: bool,
     ) -> anyhow::Result<Vec<SearchHit>> {
-        self.search_explain_with_graph_meta(
-            query,
-            limit,
+        self.search_with_graph_meta(SearchRequest {
             include_generated,
-            GraphMetaMode::Compact,
-            3,
-        )
+            explain: true,
+            ..SearchRequest::new(query, limit)
+        })
     }
 
+    /// Lexical+vector search with graph evidence and load-bearing enrichment attached. The single
+    /// entry point behind `search`/`search_explain`; callers that need non-default graph depth,
+    /// git/papertrail toggles, or explain mode build a [`SearchRequest`] directly.
     pub fn search_with_graph_meta(
         &self,
-        query: &str,
-        limit: u32,
-        include_generated: bool,
-        graph_mode: GraphMetaMode,
-        graph_limit: u32,
-    ) -> anyhow::Result<Vec<SearchHit>> {
-        self.search_with_graph_meta_options(
-            query,
-            limit,
-            include_generated,
-            graph_mode,
-            graph_limit,
-            SearchOptions::default(),
-        )
-    }
-
-    pub fn search_with_graph_meta_options(
-        &self,
-        query: &str,
-        limit: u32,
-        include_generated: bool,
-        graph_mode: GraphMetaMode,
-        graph_limit: u32,
-        options: SearchOptions,
+        request: SearchRequest<'_>,
     ) -> anyhow::Result<Vec<SearchHit>> {
         self.ensure_fts_fresh()?;
-        let mut hits =
-            self.search_with_heal(query, limit, include_generated, true, false, options)?;
+        let query = crate::search::lexical::LexicalQuery {
+            query: request.query,
+            limit: request.limit,
+            include_generated: request.include_generated,
+            explain: request.explain,
+            options: request.options,
+        };
+        let mut hits = self.search_with_heal(&query, Heal::Allow)?;
         graph_meta::attach_to_search_hits(
             self.storage.connection(),
             &mut hits,
-            graph_mode,
-            graph_limit,
-        )?;
-        self.enrich_search_hits_with_load_bearing(&mut hits)?;
-        Ok(hits)
-    }
-
-    pub fn search_explain_with_graph_meta(
-        &self,
-        query: &str,
-        limit: u32,
-        include_generated: bool,
-        graph_mode: GraphMetaMode,
-        graph_limit: u32,
-    ) -> anyhow::Result<Vec<SearchHit>> {
-        self.search_explain_with_graph_meta_options(
-            query,
-            limit,
-            include_generated,
-            graph_mode,
-            graph_limit,
-            SearchOptions::default(),
-        )
-    }
-
-    pub fn search_explain_with_graph_meta_options(
-        &self,
-        query: &str,
-        limit: u32,
-        include_generated: bool,
-        graph_mode: GraphMetaMode,
-        graph_limit: u32,
-        options: SearchOptions,
-    ) -> anyhow::Result<Vec<SearchHit>> {
-        self.ensure_fts_fresh()?;
-        let mut hits =
-            self.search_with_heal(query, limit, include_generated, true, true, options)?;
-        graph_meta::attach_to_search_hits(
-            self.storage.connection(),
-            &mut hits,
-            graph_mode,
-            graph_limit,
+            request.graph_mode,
+            request.graph_limit,
         )?;
         self.enrich_search_hits_with_load_bearing(&mut hits)?;
         Ok(hits)

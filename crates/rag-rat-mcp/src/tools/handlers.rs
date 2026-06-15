@@ -8,31 +8,18 @@ pub(crate) fn call_tool_with_db(
     let result = match name {
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
-            let graph_mode = GraphMetaMode::parse(args.include_graph.as_str())?;
-            let include_generated = included(&args.include, SearchInclude::Generated, false);
-            let options = SearchOptions {
-                include_git: included(&args.include, SearchInclude::Git, true),
-                include_papertrail: included(&args.include, SearchInclude::Papertrail, true),
-            };
-            if args.explain {
-                json!(db.search_explain_with_graph_meta_options(
-                    &args.query,
-                    args.limit,
-                    include_generated,
-                    graph_mode,
-                    args.graph_limit,
-                    options
-                )?)
-            } else {
-                json!(db.search_with_graph_meta_options(
-                    &args.query,
-                    args.limit,
-                    include_generated,
-                    graph_mode,
-                    args.graph_limit,
-                    options
-                )?)
-            }
+            json!(db.search_with_graph_meta(rag_rat_core::index::SearchRequest {
+                query: &args.query,
+                limit: args.limit,
+                include_generated: included(&args.include, SearchInclude::Generated, false),
+                explain: args.explain,
+                graph_mode: GraphMetaMode::parse(args.include_graph.as_str())?,
+                graph_limit: args.graph_limit,
+                options: SearchOptions {
+                    include_git: included(&args.include, SearchInclude::Git, true),
+                    include_papertrail: included(&args.include, SearchInclude::Papertrail, true),
+                },
+            })?)
         },
         "symbol_lookup" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;

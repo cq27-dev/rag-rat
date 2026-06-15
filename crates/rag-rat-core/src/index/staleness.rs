@@ -4,6 +4,15 @@
 use super::*;
 use crate::query::text_compare::*;
 
+/// Whether `search_with_heal` may lazily re-index files whose chunks have drifted from disk.
+/// `Allow` heals once and retries; `Skip` is the recursion's base case (and the explicit
+/// "don't touch the index" path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Heal {
+    Allow,
+    Skip,
+}
+
 impl IndexDatabase {
     pub(super) fn source_path_is_stale(&self, path: &str, indexed_sha256: &str) -> bool {
         let Some(root) = self.storage.source_root() else {
@@ -70,22 +79,11 @@ impl IndexDatabase {
 
     pub(super) fn search_with_heal(
         &self,
-        query: &str,
-        limit: u32,
-        include_generated: bool,
-        allow_heal: bool,
-        explain: bool,
-        options: SearchOptions,
+        request: &crate::search::lexical::LexicalQuery<'_>,
+        heal: Heal,
     ) -> anyhow::Result<Vec<SearchHit>> {
-        let hits = crate::search::lexical::search_with_options(
-            self.storage.connection(),
-            query,
-            limit,
-            include_generated,
-            explain,
-            options,
-        )?;
-        if !allow_heal {
+        let hits = crate::search::lexical::search_with_options(self.storage.connection(), request)?;
+        if heal == Heal::Skip {
             return Ok(hits);
         }
         let stale = self.stale_hit_paths(&hits)?;
@@ -102,7 +100,8 @@ impl IndexDatabase {
             self.heal_file(Path::new(&path))?;
         }
         self.sync_fts()?;
-        self.search_with_heal(query, limit, include_generated, false, explain, options)
+        // Retry once against the freshly healed index; Heal::Skip stops the recursion.
+        self.search_with_heal(request, Heal::Skip)
     }
 
     fn stale_hit_paths(&self, hits: &[SearchHit]) -> anyhow::Result<Vec<String>> {

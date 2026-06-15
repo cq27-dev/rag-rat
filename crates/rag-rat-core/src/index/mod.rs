@@ -33,7 +33,7 @@ pub use git_context::resolve_git_context;
 pub(crate) use git_context::*;
 pub(crate) use lifecycle::install_scope_view;
 pub(crate) use prep::*;
-pub use query_api::ImportantSymbolsRequest;
+pub use query_api::{ImportantSymbolsRequest, SearchRequest};
 pub(crate) use util::*;
 
 #[cfg(test)]
@@ -71,7 +71,7 @@ use crate::index::github::{GitHubEvidence, GitHubStatus, GitHubSyncReport, Paper
 use crate::index::symbols::Symbol;
 use crate::language::Language;
 use crate::query::graph_meta::{self, GraphMetaMode};
-use crate::search::lexical::{SearchHit, SearchOptions};
+use crate::search::lexical::SearchHit;
 use crate::storage::{IndexConnection, StorageStatus};
 
 #[derive(Debug)]

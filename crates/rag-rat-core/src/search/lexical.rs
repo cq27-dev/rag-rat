@@ -134,22 +134,29 @@ pub fn search_lexical_only(
     })
 }
 
+/// A lexical+vector search request: the query plus its controls. Replaces the positional
+/// `(query, limit, include_generated, explain, options)` argument train so call sites read
+/// themselves and can't transpose the two bools.
+pub struct LexicalQuery<'a> {
+    pub query: &'a str,
+    pub limit: u32,
+    pub include_generated: bool,
+    pub explain: bool,
+    pub options: SearchOptions,
+}
+
 pub fn search_with_options(
     conn: &Connection,
-    query: &str,
-    limit: u32,
-    include_generated: bool,
-    explain: bool,
-    options: SearchOptions,
+    request: &LexicalQuery<'_>,
 ) -> anyhow::Result<Vec<SearchHit>> {
     search_with_query_embedding(
         conn,
-        query,
-        limit,
-        include_generated,
-        ai::embed_query(conn, query)?,
-        explain,
-        options,
+        request.query,
+        request.limit,
+        request.include_generated,
+        ai::embed_query(conn, request.query)?,
+        request.explain,
+        request.options,
     )
 }
 
