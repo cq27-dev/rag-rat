@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.5.0...rag-rat-core-v0.6.0) - 2026-06-15
+
+### Added
+
+- *(mcp)* expose memory_doctor; raise memory body cap to 8000 + document caps ([#159](https://github.com/cq27-dev/rag-rat/pull/159))
+- opaque sym_<hex> symbol handle; drop ephemeral symbol_id from the wire ([#149](https://github.com/cq27-dev/rag-rat/pull/149)) ([#153](https://github.com/cq27-dev/rag-rat/pull/153))
+- lazy-heal symbol_lookup + flag dirty result files (#147, #148) ([#151](https://github.com/cq27-dev/rag-rat/pull/151))
+- confidence-aware + SCIP-aware symbol importance ranking ([#108](https://github.com/cq27-dev/rag-rat/pull/108)) ([#142](https://github.com/cq27-dev/rag-rat/pull/142))
+- crates.io version check surfaced to agents + operators (opt-out via rag-rat.toml) ([#136](https://github.com/cq27-dev/rag-rat/pull/136))
+
+### Fixed
+
+- *(impact)* signal truncation on the flat impact_surface shape ([#150](https://github.com/cq27-dev/rag-rat/pull/150)) ([#157](https://github.com/cq27-dev/rag-rat/pull/157))
+- *(index)* heal a just-added symbol on a zero-hit name lookup ([#152](https://github.com/cq27-dev/rag-rat/pull/152)) ([#158](https://github.com/cq27-dev/rag-rat/pull/158))
+- *(memory)* re-derive chunk for live logical-symbol bindings on validate ([#154](https://github.com/cq27-dev/rag-rat/pull/154)) ([#156](https://github.com/cq27-dev/rag-rat/pull/156))
+- oracle started_at = run start ([#145](https://github.com/cq27-dev/rag-rat/pull/145)); impact_surface flags truncated sections ([#49](https://github.com/cq27-dev/rag-rat/pull/49)) ([#146](https://github.com/cq27-dev/rag-rat/pull/146))
+- *(mcp)* read tools open read-only so a writer can't lock them out ([#143](https://github.com/cq27-dev/rag-rat/pull/143)) ([#144](https://github.com/cq27-dev/rag-rat/pull/144))
+- *(grep-augment)* skip pipe-incidental greps + dedup indexed hits (#138, #139) ([#140](https://github.com/cq27-dev/rag-rat/pull/140))
+
+### Other
+
+- de-spine the index + mcp crates — module splits, param structs, naming ([#155](https://github.com/cq27-dev/rag-rat/pull/155))
+- rewrite README, add oracle/grep-augmentation docs, fix MCP setup footgun
+- *(index)* regression for foreign leaked rows self-healing on full rebuild ([#59](https://github.com/cq27-dev/rag-rat/pull/59)) ([#133](https://github.com/cq27-dev/rag-rat/pull/133))
+
 ## [0.5.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.4.0...rag-rat-core-v0.5.0) - 2026-06-14
 
 ### Added
