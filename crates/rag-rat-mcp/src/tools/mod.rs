@@ -134,6 +134,27 @@ fn included<T: PartialEq>(include: &Option<Vec<T>>, flag: T, default: bool) -> b
     }
 }
 
+/// Deserialize an optional `Vec<T>` that may arrive EITHER as a real JSON array (the schema form)
+/// OR as a JSON-string-encoded array (`"[\"git\"]"`). Some MCP clients serialize non-string args as
+/// strings — Claude Code does this for array/object params (anthropics/claude-code#24599) — so the
+/// array `include` surface is unusable from them unless the server also accepts the stringified
+/// form. We keep advertising a real array (schema unchanged) and rescue the stringified case here;
+/// `null`/absent -> `None`, `[]` -> `Some(vec![])` (the explicit empty on-set). Serialize stays the
+/// default (a real array), which round-trips back through this deserializer fine — so no
+/// `serialize_with` is needed (contrast the scalar `sym_handle` fields, which DO need symmetry).
+fn de_seq_or_json_string<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error as _;
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => serde_json::from_str(&raw).map(Some).map_err(D::Error::custom),
+        Some(other) => serde_json::from_value(other).map(Some).map_err(D::Error::custom),
+    }
+}
+
 /// `semantic_search` `include` flags. `git`/`papertrail` are on by default (omit `include` to keep
 /// them); `generated`/`fallback` are off by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -254,7 +275,7 @@ pub struct SearchArgs {
     pub explain: bool,
     /// What to include: `git`, `papertrail` (both on by default), `generated`, `fallback` (off by
     /// default). Omit to keep defaults; an explicit list is the exact on-set.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<SearchInclude>>,
     #[serde(default = "default_search_graph_mode")]
     pub include_graph: McpGraphMode,
@@ -289,7 +310,7 @@ pub struct RepoBriefArgs {
     #[serde(default = "default_repo_brief_limit")]
     pub limit: u32,
     /// What to include: `memories` (on by default), `generated` (off). Omit to keep defaults.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<OrientationInclude>>,
 }
 
@@ -298,7 +319,7 @@ pub struct RepoClustersArgs {
     #[serde(default = "default_repo_brief_limit")]
     pub limit: u32,
     /// What to include: `memories` (on by default), `generated` (off). Omit to keep defaults.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<OrientationInclude>>,
     #[serde(default = "default_min_cluster_size")]
     pub min_cluster_size: u32,
@@ -341,7 +362,7 @@ pub struct SymbolArgs {
     #[serde(default = "default_symbol_limit")]
     pub limit: u32,
     /// What to include: `memories` (on by default). Pass `include: []` to suppress.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<MemoriesInclude>>,
 }
 
@@ -367,7 +388,7 @@ pub struct SymbolGraphArgs {
     /// What to include: `memories` (on by default); `references`, `unresolved`, `macros`,
     /// `common_methods`, `coverage` (all off by default). Omit to keep defaults; an explicit list
     /// is the exact on-set (so listing `macros` alone also drops the default `memories`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<GraphInclude>>,
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
@@ -395,7 +416,7 @@ pub struct CompareGraphTextArgs {
     /// What to include: `tests` (on by default); `references`, `unresolved`, `macros`,
     /// `common_methods` (off by default). Omit to keep defaults; an explicit list is the exact
     /// on-set.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<CompareInclude>>,
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
@@ -423,7 +444,7 @@ pub struct ImpactArgs {
     /// What to include — `tests`, `docs`, `git`, `papertrail`, `text_fallback`, `memories`, ALL on
     /// by default (impact's value is the bundled evidence). Omit to keep them; pass an explicit
     /// list to narrow, e.g. `["git"]` for git history only.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<ImpactInclude>>,
 }
 
@@ -441,7 +462,7 @@ pub struct ReadChunkArgs {
     #[serde(default = "default_read_chunk_graph_limit")]
     pub graph_limit: u32,
     /// What to include: `memories` (on by default). Pass `include: []` to suppress.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<MemoriesInclude>>,
 }
 
@@ -688,7 +709,7 @@ pub struct PapertrailCommitArgs {
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
     /// What to include: `fallback` (off by default).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<PapertrailCommitInclude>>,
 }
 

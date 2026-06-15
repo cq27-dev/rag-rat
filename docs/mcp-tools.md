@@ -84,7 +84,9 @@ tool's defaults** (e.g. `impact_surface` returns tests/docs/git/papertrail/text_
 graph tools return memories). A **present** list is the EXACT on-set — so it's also how you disable a
 default-on section: `impact_surface` with `"include": ["git"]` returns git history only, and any
 tool with `"include": []` returns the bare result. Each tool accepts only its own flags (see the
-signatures above).
+signatures above). The server also accepts a JSON-string-encoded array (`"[\"git\"]"`) as well as a
+real array, so the surface works even from clients that serialize array params as strings
+([anthropics/claude-code#24599](https://github.com/anthropics/claude-code/issues/24599)).
 
 `tools/list` is served by `rmcp` and exposes typed JSON schemas derived from the same request structs
 used by the handlers. Existing tool names and response fields are kept stable for current MCP clients.

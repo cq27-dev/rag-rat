@@ -75,6 +75,26 @@ fn arg_struct_handles_survive_an_rmcp_style_serde_round_trip() {
 }
 
 #[test]
+fn include_accepts_a_json_string_encoded_array_from_buggy_clients() {
+    // Some MCP clients serialize array args as JSON strings (Claude Code does this for array/object
+    // params — anthropics/claude-code#24599), so `include` arrives as `"[\"git\"]"` not `["git"]`.
+    // The server accepts both forms so the array surface stays usable; the schema still advertises
+    // a real array (#153 review).
+    let from_array: ImpactArgs = serde_json::from_value(json!({ "include": ["git"] })).unwrap();
+    let from_string: ImpactArgs =
+        serde_json::from_value(json!({ "include": "[\"git\"]" })).unwrap();
+    assert_eq!(from_string.include, Some(vec![ImpactInclude::Git]));
+    assert_eq!(from_array.include, from_string.include, "array and stringified array must agree");
+
+    // Omitted -> None (tool defaults apply); explicit empty (either form) -> Some(empty on-set).
+    assert_eq!(serde_json::from_value::<ImpactArgs>(json!({})).unwrap().include, None);
+    assert_eq!(
+        serde_json::from_value::<ImpactArgs>(json!({ "include": "[]" })).unwrap().include,
+        Some(vec![])
+    );
+}
+
+#[test]
 fn list_tools_exposes_complete_typed_schemas() {
     let tools = list_tools();
     let tools = tools.as_array().expect("tools/list shape");
