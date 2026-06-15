@@ -16,6 +16,11 @@ on:
   pull_request:
     paths:
       - 'crates/**'
+      # Root Cargo.toml/Cargo.lock change the built rag-rat binary (workspace deps / pinned
+      # versions) without touching crates/** — gate on them too so a dependency bump can't merge
+      # parser/oracle behaviour changes past the resolution health gate.
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'tools/oracle-corpora.toml'
       - 'tools/oracle-corpus.py'
       - 'tools/oracle-run.sh'
@@ -25,6 +30,8 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'tools/oracle-corpora.toml'
       - 'tools/oracle-corpus.py'
       - 'tools/oracle-run.sh'
@@ -48,11 +55,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pinned SCIP toolchain for the small tier, mirroring tools/bench.Containerfile so a PR number is
-  # produced by the same indexer build the heavy/Bencher tier uses.
+  # Pinned SCIP toolchain for the small tier so a PR number isn't perturbed by an unrelated indexer
+  # release. scip-clang/scip-python are pinned to explicit versions; rust-analyzer is installed as a
+  # rustup component (below), pinning it to the stable toolchain (a ~6-week cadence) instead of the
+  # weekly `releases/latest` — so a fresh RA build can't change `rust-semver`'s numbers mid-PR.
   SCIP_CLANG_VERSION: v0.4.0
   SCIP_PYTHON_VERSION: 0.6.6
-  RUST_ANALYZER_URL: https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-x86_64-unknown-linux-gnu.gz
 
 jobs:
   matrix:
@@ -89,6 +97,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        # rust-analyzer as a toolchain component pins the SCIP emitter to the stable release (not the
+        # weekly `releases/latest`), so the `rust-semver` leg's numbers don't shift under the PR.
+        with:
+          components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
 
       - name: Build rag-rat (release, hash embedder — no model download)
@@ -101,9 +113,10 @@ jobs:
           echo "installing $tool for ${{ matrix.corpus }}"
           case "$tool" in
             rust-analyzer)
-              curl --proto '=https' --tlsv1.2 -sSfL "$RUST_ANALYZER_URL" \
-                | gunzip > /usr/local/bin/rust-analyzer
-              chmod +x /usr/local/bin/rust-analyzer
+              # Already installed as a rustup component (toolchain step). Resolve the proxy to an
+              # absolute path on PATH so the oracle's `rust-analyzer scip` probe finds it.
+              ra="$(rustup which --toolchain stable rust-analyzer)"
+              install -m 0755 "$ra" /usr/local/bin/rust-analyzer
               rust-analyzer --version ;;
             scip-clang)
               curl --proto '=https' --tlsv1.2 -sSfL \

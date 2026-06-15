@@ -61,9 +61,9 @@ tier      = "heavy"
 repo      = "https://github.com/torvalds/linux"
 rev       = "v7.0"
 tool      = "scip-clang"
-# The compile_commands.json target reads per-object `.cmd` files, so the kernel must be BUILT first
-# (mirrors tools/kernel-c-oracle.sh). Without the build the compdb is empty and scip-clang sees
-# nothing.
-prepare   = ["make defconfig", "make -j", "make compile_commands.json"]
+# The compile_commands.json target reads per-object `.cmd` files, so the kernel must be BUILT first.
+# Without the build the compdb is empty and scip-clang sees nothing. `-j$(nproc)` bounds the build to
+# the core count — a bare `make -j` is UNLIMITED jobs and oversubscribes the box's CPU/RAM (#177).
+prepare   = ["make defconfig", "make -j$(nproc)", "make compile_commands.json"]
 bindings  = { c = ["."] }
 health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined = 5000, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 1000, timeout_minutes = 120 }

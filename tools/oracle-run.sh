@@ -50,7 +50,29 @@ TIMEOUT_MINUTES="$(field timeout_minutes)"
 CHECKOUT="$WORK/checkout"
 DB="$WORK/$CORPUS-index.sqlite"
 
-echo "oracle-run: corpus=$CORPUS tool=$TOOL repo=$REPO rev=$REV" >&2
+# Enforce the corpus's wall-clock budget over the WHOLE run — clone + prepare (cargo fetch / a kernel
+# build) + index + report — not just the report step (Codex on #177). Re-exec the script once under
+# `timeout` after resolving the budget; the guard env var stops a second wrap, and the resolved paths
+# are exported so the re-exec reuses the same work dir / binary rather than re-deriving them. `-k`
+# escalates to SIGKILL if a hung tool ignores SIGTERM. A timeout exits 124 (a failure like any gate
+# violation); the EXIT trap below still removes the checkout.
+if [ -z "${ORACLE_RUN_TIMED:-}" ]; then
+    export ORACLE_RUN_TIMED=1 ORACLE_WORK="$WORK" CORPORA RAG_RAT_BIN RAG_RAT_COMMIT REPORT_OUT
+    export CORPUS KEEP_CHECKOUT="${KEEP_CHECKOUT:-0}"
+    exec timeout -k 60s "${TIMEOUT_MINUTES}m" "$0"
+fi
+
+# Inside the timed re-exec. Remove the checkout + index DB on ANY exit (gate failure, timeout, error)
+# while leaving the report JSON; idempotent, so the trap firing on both a signal and the final exit
+# is harmless.
+cleanup_checkout() {
+    if [ "${KEEP_CHECKOUT:-0}" != "1" ]; then
+        rm -rf "$CHECKOUT" "$DB" "$DB"-wal "$DB"-shm
+    fi
+}
+trap cleanup_checkout EXIT
+
+echo "oracle-run: corpus=$CORPUS tool=$TOOL repo=$REPO rev=$REV (budget ${TIMEOUT_MINUTES}m)" >&2
 
 # Shallow-clone the pinned rev. A tag or branch name resolves via `fetch <ref>`; a full SHA fetches
 # directly. `--depth 1` keeps the corpus small — the oracle never needs history.
@@ -69,6 +91,16 @@ while IFS= read -r prepare_cmd; do
     ( cd "$CHECKOUT" && bash -c "$prepare_cmd" )
 done < <(field prepare)
 
+# Activate a virtualenv the prepare steps created, so the oracle's indexer subprocess resolves
+# against the project's installed deps rather than the global interpreter (Codex on #177). scip-python
+# (pyright) finds dependency monikers only when its `python` is the venv's — prepare runs in child
+# shells whose activation doesn't survive, so the runner re-establishes it for the index/report steps.
+if [ -d "$CHECKOUT/.venv/bin" ]; then
+    echo "oracle-run: activating $CHECKOUT/.venv" >&2
+    export VIRTUAL_ENV="$CHECKOUT/.venv"
+    export PATH="$CHECKOUT/.venv/bin:$PATH"
+fi
+
 # Render the corpus's rag-rat.toml: index the checkout into $DB with the declared per-language
 # bindings. The oracle report reads the SAME bindings from the corpora file for provenance; this
 # file is what `rag-rat index` walks.
@@ -84,21 +116,16 @@ done < <(field prepare)
 echo "oracle-run: rag-rat index --full" >&2
 ( cd "$CHECKOUT" && "$RAG_RAT_BIN" index --full >/dev/null )
 
-# `oracle report` runs the oracle + assembles the typed report + applies the health gate. Wrap it in
-# the corpus's wall-clock budget; a timeout (exit 124) is a failure like any health violation. Keep
-# its exit code so the caller (CI) sees the gate result, but always run cleanup + always leave the
-# report JSON behind (it's written before the gate fails).
-echo "oracle-run: oracle report --corpus $CORPUS (timeout ${TIMEOUT_MINUTES}m)" >&2
+# `oracle report` runs the oracle + assembles the typed report + applies the health gate. The whole
+# run is already inside the corpus wall-clock budget (the re-exec `timeout` above). Keep its exit
+# code so the caller (CI) sees the gate result; the report JSON is always written (it's emitted
+# before the gate fails), and the EXIT trap removes the checkout.
+echo "oracle-run: oracle report --corpus $CORPUS" >&2
 set +e
 ( cd "$CHECKOUT" && RAG_RAT_COMMIT="$RAG_RAT_COMMIT" \
-    timeout "${TIMEOUT_MINUTES}m" \
     "$RAG_RAT_BIN" --json oracle report --corpus "$CORPUS" --corpora "$CORPORA" ) > "$REPORT_OUT"
 rc=$?
 set -e
-
-if [ "${KEEP_CHECKOUT:-0}" != "1" ]; then
-    rm -rf "$CHECKOUT" "$DB" "$DB"-wal "$DB"-shm
-fi
 
 if [ "$rc" -eq 0 ]; then
     echo "oracle-run: done (healthy) — report: $REPORT_OUT" >&2

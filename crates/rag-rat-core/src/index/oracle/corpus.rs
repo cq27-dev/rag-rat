@@ -194,7 +194,7 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
     const GOLDEN_RUST_CARGO: &str =
         "60452736340151a253001bb5c33cc83efa2a4ceabba4d42a227d3188d7761d79";
     const GOLDEN_LINUX_KERNEL: &str =
-        "abf87f3dca38d79ad6239348659c13ca484c70f2197fd36e3a7e1f97e27165ff";
+        "9b64c26095bbf672884e8ca3c8d93bab44444f702904a0c8b35cd9feccd80fb6";
 
     fn report_with(
         total_edges: u64,

@@ -18,7 +18,13 @@ so a single Bencher upload can carry every heavy corpus from one run.
 from __future__ import annotations
 
 import json
+import re
 import sys
+
+
+def _slug(value: str) -> str:
+    """Make a tool-version string safe + compact for a benchmark name (drop spaces/punctuation)."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
 
 
 def benchmark(report: dict) -> tuple[str, dict]:
@@ -30,7 +36,15 @@ def benchmark(report: dict) -> tuple[str, dict]:
         # Mirror the engine's vacuous-1.0 convention for an empty denominator.
         return 100.0 if total == 0 else 100.0 * numerator / total
 
-    name = f"{report['corpus_id']}/oracle"
+    # Key the Bencher series by the FULL comparability identity, not just corpus_id (Codex on #177):
+    # a profile change (rev/bindings/prepare/threshold/tool) bumps `corpus_profile_hash`, and a SCIP
+    # indexer bump changes `tool_version` — both make reports incomparable (`comparable_to`), so each
+    # must start a FRESH series rather than silently append to the old one. Embedding the hash prefix
+    # + tool version in the benchmark name forces exactly that.
+    name = (
+        f"{report['corpus_id']}@{report['corpus_profile_hash'][:12]}"
+        f"+{_slug(report['tool_version'])}/oracle"
+    )
     body = {
         "total_edges": {"value": resolution["total_edges"]},
         "resolved_rate_before": {"value": rate(resolution["resolved_before"])},
