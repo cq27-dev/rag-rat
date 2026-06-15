@@ -1,0 +1,206 @@
+name: oracle
+
+# Unified, tier-driven SCIP-oracle resolution runner (#164, C3). One workflow over the declarative
+# corpus profiles in tools/oracle-corpora.toml, replacing the per-language oracle-rust.yml /
+# oracle-kernel.yml demos. tools/oracle-run.sh does the work for one corpus (clone @ rev → prepare →
+# index → `rag-rat oracle report`); this workflow just selects the tier and fans out.
+#
+#   small  — per-PR (and on main): fast corpora on GitHub-hosted runners. The health gate in
+#            `oracle report` makes a broken/regressed corpus FAIL the job. The Δ-vs-baseline PR
+#            comment is layered on later (tools/oracle-report-md.py, C5); here the report JSON is
+#            uploaded as an artifact.
+#   heavy  — release / manual dispatch only: the big corpora on the self-hosted big-memory box,
+#            pushed to Bencher as the headline resolution series. Never on PRs.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'tools/oracle-corpora.toml'
+      - 'tools/oracle-corpus.py'
+      - 'tools/oracle-run.sh'
+      - 'tools/oracle-report-bmf.py'
+      - '.github/workflows/oracle.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'tools/oracle-corpora.toml'
+      - 'tools/oracle-corpus.py'
+      - 'tools/oracle-run.sh'
+      - 'tools/oracle-report-bmf.py'
+      - '.github/workflows/oracle.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Corpus tier to run (small | heavy)'
+        required: false
+        default: 'small'
+
+# Least privilege: read the repo only. The heavy job's Bencher upload uses its own API token.
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned SCIP toolchain for the small tier, mirroring tools/bench.Containerfile so a PR number is
+  # produced by the same indexer build the heavy/Bencher tier uses.
+  SCIP_CLANG_VERSION: v0.4.0
+  SCIP_PYTHON_VERSION: 0.6.6
+  RUST_ANALYZER_URL: https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-x86_64-unknown-linux-gnu.gz
+
+jobs:
+  matrix:
+    # Resolve the tier and emit its corpus ids as a JSON array for the fan-out. release → heavy;
+    # dispatch → the chosen input; PR/push → small.
+    runs-on: ubuntu-latest
+    outputs:
+      tier: ${{ steps.select.outputs.tier }}
+      corpora: ${{ steps.select.outputs.corpora }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: select
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            release)           tier=heavy ;;
+            workflow_dispatch) tier="${{ github.event.inputs.tier }}" ;;
+            *)                 tier=small ;;
+          esac
+          echo "tier=$tier" >> "$GITHUB_OUTPUT"
+          corpora="$(python3 tools/oracle-corpus.py --list-tier "$tier" | jq -R . | jq -cs .)"
+          echo "corpora=$corpora" >> "$GITHUB_OUTPUT"
+          echo "tier=$tier corpora=$corpora"
+
+  small:
+    needs: matrix
+    if: needs.matrix.outputs.tier == 'small'
+    # 24.04: the pinned scip-clang prebuilt links against a recent GLIBC (see bench.Containerfile).
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        corpus: ${{ fromJSON(needs.matrix.outputs.corpora) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build rag-rat (release, hash embedder — no model download)
+        run: cargo build --release --no-default-features --bin rag-rat
+
+      - name: Install the corpus's SCIP tool
+        run: |
+          set -euo pipefail
+          tool="$(python3 tools/oracle-corpus.py --corpus '${{ matrix.corpus }}' --field tool)"
+          echo "installing $tool for ${{ matrix.corpus }}"
+          case "$tool" in
+            rust-analyzer)
+              curl --proto '=https' --tlsv1.2 -sSfL "$RUST_ANALYZER_URL" \
+                | gunzip > /usr/local/bin/rust-analyzer
+              chmod +x /usr/local/bin/rust-analyzer
+              rust-analyzer --version ;;
+            scip-clang)
+              curl --proto '=https' --tlsv1.2 -sSfL \
+                "https://github.com/sourcegraph/scip-clang/releases/download/${SCIP_CLANG_VERSION}/scip-clang-x86_64-linux" \
+                -o /usr/local/bin/scip-clang
+              chmod +x /usr/local/bin/scip-clang
+              scip-clang --version ;;
+            scip-python)
+              npm install -g "@sourcegraph/scip-python@${SCIP_PYTHON_VERSION}"
+              scip-python --version ;;
+            *)
+              echo "unknown tool '$tool'" >&2; exit 1 ;;
+          esac
+
+      - name: Run the oracle for ${{ matrix.corpus }}
+        env:
+          CORPUS: ${{ matrix.corpus }}
+          RAG_RAT_BIN: target/release/rag-rat
+          ORACLE_WORK: ${{ runner.temp }}/oracle-${{ matrix.corpus }}
+          REPORT_OUT: ${{ runner.temp }}/${{ matrix.corpus }}-report.json
+          RAG_RAT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash tools/oracle-run.sh
+
+      - name: Upload resolution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-report-${{ matrix.corpus }}
+          path: ${{ runner.temp }}/${{ matrix.corpus }}-report.json
+          if-no-files-found: warn
+
+  heavy:
+    needs: matrix
+    if: needs.matrix.outputs.tier == 'heavy'
+    # Self-hosted big-memory box (same as bench-release): the heavy corpora (whole cargo workspace,
+    # a kernel build + scip-clang) want the RAM + disk, and the SCIP tools live in the bench image.
+    # Heavy runs on release / dispatch only (never PRs), so a public-repo self-hosted runner is safe.
+    runs-on: [self-hosted, bigmem]
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      # Serial: both corpora would contend for the box's RAM if run at once.
+      max-parallel: 1
+      matrix:
+        corpus: ${{ fromJSON(needs.matrix.outputs.corpora) }}
+    env:
+      BENCHER_PROJECT: rag-rat
+      BENCHER_TESTBED: hetzner-bigmem
+      BENCHER_API_KEY: ${{ secrets.BENCHER_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned bench environment: rust-analyzer + scip-clang + kernel-build deps live in the image,
+      # so the SCIP indexer versions are reproducible (the content-addressed tool_version). Layer-
+      # cached on the runner.
+      - name: Build bench image
+        run: docker build -t rag-rat-bench -f tools/bench.Containerfile .
+
+      - name: Run the oracle for ${{ matrix.corpus }} and emit its report
+        run: |
+          docker run --rm \
+            -v "$PWD":/repo \
+            -v "${{ runner.temp }}":/work \
+            -v rag-rat-cargo-registry:/usr/local/cargo/registry \
+            -v rag-rat-target:/repo/target \
+            -e CORPUS='${{ matrix.corpus }}' \
+            -e ORACLE_WORK=/work/oracle-${{ matrix.corpus }} \
+            -e REPORT_OUT=/work/${{ matrix.corpus }}-report.json \
+            -e RAG_RAT_BIN=/repo/target/release/rag-rat \
+            -e RAG_RAT_COMMIT='${{ github.sha }}' \
+            rag-rat-bench \
+            bash -c 'cargo build --release --no-default-features --bin rag-rat && bash tools/oracle-run.sh'
+
+      - name: Convert the report to BMF
+        run: |
+          python3 tools/oracle-report-bmf.py \
+            "${{ runner.temp }}/${{ matrix.corpus }}-report.json" \
+            > "${{ runner.temp }}/${{ matrix.corpus }}-bmf.json"
+
+      - uses: bencherdev/bencher@main
+
+      # No --err: a headline resolution signal, not a gate. A regression shows in the Bencher plots.
+      - name: Track ${{ matrix.corpus }} edge resolution (Bencher)
+        run: |
+          bencher run \
+            --branch main \
+            --adapter json \
+            --file "${{ runner.temp }}/${{ matrix.corpus }}-bmf.json" \
+            --project "$BENCHER_PROJECT" \
+            --testbed "$BENCHER_TESTBED"
+
+      - name: Upload report + BMF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-heavy-${{ matrix.corpus }}
+          path: |
+            ${{ runner.temp }}/${{ matrix.corpus }}-report.json
+            ${{ runner.temp }}/${{ matrix.corpus }}-bmf.json
+          if-no-files-found: warn

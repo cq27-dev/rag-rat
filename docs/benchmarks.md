@@ -92,7 +92,7 @@ speedup, not a coverage regression.
 The headline resolves 58.7% of edges *syntactically* — by name, no compiler. The SCIP oracle (#61)
 measures how good that syntactic resolution actually is: it replays a real compilation through
 `scip-clang` (a clang-based SCIP indexer) and diffs its ground-truth bindings against the heuristic's.
-Numbers below are one `oracle-kernel.yml` run (`scip-clang 0.4.0`, kernel `defconfig`, containerized
+Numbers below are one heavy-tier `scip-clang` oracle run (`oracle.yml`, `scip-clang 0.4.0`, kernel `defconfig`, containerized
 bench image on the self-hosted bigmem box), so they cover the **compiled subset** — the translation
 units `defconfig` actually compiles — not the whole 62,903-file tree the headline indexes. Resolution
 *quality* and tree-wide *coverage* are different populations, reported side by side, not merged.
@@ -138,7 +138,7 @@ index spans the whole tree while the compilation database spans `defconfig`.)
 
 ## Rust edge resolution: heuristic vs compiler (rust-analyzer SCIP oracle)
 
-The Rust sibling, and the contrast that matters: one `oracle-rust.yml` run over **rust-lang/cargo**
+The Rust sibling, and the contrast that matters: one heavy-tier `rust-analyzer` oracle run over **rust-lang/cargo**
 (tag 0.97.1, the same pinned corpus as the iai/criterion benches), `rust-analyzer 0.3.2929`. Unlike
 scip-clang's compiled subset, rust-analyzer analyzes the **whole workspace**, so these cover every
 indexed `.rs` file (no subset caveat).
@@ -178,9 +178,11 @@ in-corpus call rate is not a weakness: cargo calls overwhelmingly into `std`/dep
 the oracle correctly bins **68k** of those as `resolved-external` rather than forcing a wrong
 in-corpus target.
 
-Run them yourself: `oracle-kernel.yml` / `tools/kernel-c-oracle.sh` (C) and `oracle-rust.yml` /
-`tools/rust-scip-oracle.sh` (Rust). Both pin the SCIP indexer via `tools/bench.Containerfile`, so the
-`tool_version` baked into every verdict is reproducible.
+Run them yourself via the unified runner: `CORPUS=linux-kernel bash tools/oracle-run.sh` (C) and
+`CORPUS=rust-cargo bash tools/oracle-run.sh` (Rust), or dispatch `oracle.yml` with `tier=heavy` to
+reproduce them on the Bencher box. The corpora are declared in `tools/oracle-corpora.toml`; the
+heavy tier pins the SCIP indexer via `tools/bench.Containerfile`, so the `tool_version` baked into
+every verdict is reproducible.
 
 ## Memory profile: where the peak lives
 
