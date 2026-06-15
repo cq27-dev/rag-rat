@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::OracleReport;
@@ -33,7 +33,7 @@ pub const REPORT_SCHEMA_VERSION: u32 = 2;
 /// even when the underlying command exits 0 — catching "scip emitted almost nothing" / "venv didn't
 /// resolve deps" / a silently-broken parse. Part of the profile, so it is covered by the profile
 /// hash (a threshold change is a profile change).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusHealth {
     /// Minimum heuristic edges the index must carry (catches a broken parse / empty index).
     pub expected_min_heuristic_edges: u64,
@@ -53,7 +53,7 @@ pub struct CorpusHealth {
 /// when their [`CorpusProfile::hash`] match; the hash covers every field here, so a changed repo /
 /// rev / tool / prepare step / binding / threshold yields a different hash and an *incomparable*
 /// verdict rather than a silently-wrong Δ.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusProfile {
     /// Stable corpus id (e.g. `"py-requests"`).
     pub corpus_id: String,

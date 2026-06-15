@@ -19,6 +19,7 @@
 //! - `store.rs` — `oracle_runs` / `edge_oracle` read + write helpers.
 
 mod auto_run;
+mod corpus;
 mod join;
 mod manifest;
 mod report;
@@ -33,6 +34,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use auto_run::{AutoRunDecision, AutoRunInputs, auto_run_decision};
+pub use corpus::{
+    HealthViolation, check_corpus_health, corpora_for_tier, corpus_by_id, load_corpora,
+};
 pub(crate) use join::package_of;
 pub use manifest::{ToolAvailability, ToolManifest};
 pub use report::{

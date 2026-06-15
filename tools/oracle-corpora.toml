@@ -1,0 +1,66 @@
+# SCIP-oracle corpus profiles (#164, C1). Declarative inputs for the resolution-quality runner:
+# each entry pins a real repo + revision + SCIP tool + per-language prepare steps + health gates.
+#
+# Two tiers:
+#   small — run per-PR (fast clone + build + index); the before/after delta comment gate.
+#   heavy — release/dispatch only; the Bencher headline resolution series. Never on PRs.
+#
+# Every field is part of the profile HASH (corpus_profile_hash), so changing a repo/rev/tool/prepare/
+# binding/threshold makes prior reports "incomparable" rather than silently mis-diffed. Pin `rev` to
+# an immutable ref; tags below are resolved to their commit at clone time by the runner.
+#
+# NOTE: `rev`s are release tags as a first cut — pin to the tag's commit SHA before trusting the
+# Bencher series (a moved tag would silently change the corpus). The golden hash test in
+# `oracle/corpus.rs` pins each profile's hash, so any edit here surfaces in review.
+
+[[corpus]]
+corpus_id = "rust-semver"
+tier      = "small"
+repo      = "https://github.com/dtolnay/semver"
+rev       = "1.0.26"
+tool      = "rust-analyzer"
+prepare   = ["cargo fetch"]
+bindings  = { rust = ["src"] }
+health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 8 }
+
+[[corpus]]
+corpus_id = "c-cjson"
+tier      = "small"
+repo      = "https://github.com/DaveGamble/cJSON"
+rev       = "v1.7.18"
+tool      = "scip-clang"
+prepare   = ["cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "cp build/compile_commands.json ."]
+bindings  = { c = ["."] }
+health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 8 }
+
+[[corpus]]
+corpus_id = "py-requests"
+tier      = "small"
+repo      = "https://github.com/psf/requests"
+rev       = "v2.32.3"
+tool      = "scip-python"
+prepare   = ["python -m venv .venv", ".venv/bin/pip install ."]
+bindings  = { python = ["src/requests"] }
+health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 12 }
+
+# --- heavy "headline" corpora: release/dispatch only, pushed to Bencher; excluded from the PR matrix.
+
+[[corpus]]
+corpus_id = "rust-cargo"
+tier      = "heavy"
+repo      = "https://github.com/rust-lang/cargo"
+rev       = "0.97.1"
+tool      = "rust-analyzer"
+prepare   = ["cargo fetch"]
+bindings  = { rust = ["src", "crates"] }
+health    = { expected_min_heuristic_edges = 5000, expected_min_oracle_examined = 1000, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 200, timeout_minutes = 45 }
+
+[[corpus]]
+corpus_id = "linux-kernel"
+tier      = "heavy"
+repo      = "https://github.com/torvalds/linux"
+rev       = "v7.0"
+tool      = "scip-clang"
+prepare   = ["make defconfig", "make compile_commands.json"]
+bindings  = { c = ["."] }
+health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined = 5000, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 1000, timeout_minutes = 120 }
