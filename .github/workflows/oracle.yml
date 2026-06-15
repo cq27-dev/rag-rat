@@ -25,6 +25,7 @@ on:
       - 'tools/oracle-corpus.py'
       - 'tools/oracle-run.sh'
       - 'tools/oracle-report-bmf.py'
+      - 'tools/oracle-report-md.py'
       - '.github/workflows/oracle.yml'
   push:
     branches: [main]
@@ -36,6 +37,7 @@ on:
       - 'tools/oracle-corpus.py'
       - 'tools/oracle-run.sh'
       - 'tools/oracle-report-bmf.py'
+      - 'tools/oracle-report-md.py'
       - '.github/workflows/oracle.yml'
   release:
     types: [published]

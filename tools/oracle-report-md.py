@@ -82,15 +82,21 @@ def row(report: dict, baseline: dict | None) -> str:
 
 
 def render(reports: dict[str, dict], baselines: dict[str, dict]) -> str:
+    # Explicit `+` joins on the multi-line literals (not adjacent-literal implicit concatenation,
+    # which CodeQL flags in a list as a likely missing comma).
     lines = [
         MARKER,
         "## SCIP oracle — resolution report",
         "",
-        "Heuristic→compiler edge resolution per corpus. **Δ** compares *resolved-after* to the "
-        "`main` baseline (only when the corpus profile + tool version match).",
+        (
+            "Heuristic→compiler edge resolution per corpus. **Δ** compares *resolved-after* to the "
+            + "`main` baseline (only when the corpus profile + tool version match)."
+        ),
         "",
-        "| corpus | tool | edges | resolved (heuristic → compiler) | precision | recall "
-        "| monikers | Δ vs main |",
+        (
+            "| corpus | tool | edges | resolved (heuristic → compiler) | precision | recall "
+            + "| monikers | Δ vs main |"
+        ),
         "|---|---|--:|---|--:|--:|--:|--:|",
     ]
     for corpus_id in sorted(reports):
@@ -98,7 +104,7 @@ def render(reports: dict[str, dict], baselines: dict[str, dict]) -> str:
     lines.append("")
     lines.append(
         "<sub>resolved = `Exact`/`Syntactic` + compiler upgrades + resolved-external, over edge "
-        "candidates with a callee range. precision/recall are the oracle eval metrics.</sub>"
+        + "candidates with a callee range. precision/recall are the oracle eval metrics.</sub>"
     )
     return "\n".join(lines) + "\n"
 
