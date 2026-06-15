@@ -6,6 +6,16 @@ use crate::index::oracle::{
 };
 
 impl IndexDatabase {
+    /// Run a SCIP-oracle pass from a pre-built `.scip` over the current (active commit/worktree)
+    /// edge candidates, writing `edge_oracle` verdicts. The heuristic resolution on the `edges`
+    /// row is never touched. Phase 1 (#68): eval-only, no CLI/MCP surface. Requires a `source_root`
+    /// (the checkout whose bytes back the SCIP document position-encoding conversion).
+    /// `production_sha` is the per-document disk-hash snapshot a tool-driven run captured the
+    /// instant its `.scip` was produced (`Some`), arming the scip-vs-disk content gate (#82
+    /// TOCTOU); a pre-built `--scip` has no production moment and passes `None`.
+    /// `pre_spawn_sha` is the indexed-sha snapshot taken before the tool subprocess was spawned
+    /// (see [`Self::oracle_pre_spawn_snapshot`]), arming the pre-spawn gate that covers the
+    /// subprocess interior (#83); a pre-built `--scip` has no spawn and passes `None`.
     pub fn run_oracle(
         &self,
         tool: OracleTool,
