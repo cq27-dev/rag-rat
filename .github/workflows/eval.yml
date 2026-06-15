@@ -29,7 +29,7 @@ jobs:
     name: eval (search-quality)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -37,7 +37,7 @@ jobs:
       # Cache the MiniLM model download (immutable → static key) so the semantic pass doesn't
       # re-fetch ~90 MB from Hugging Face every run; first run / cache-miss warms it.
       - name: cache embedding model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.rag-rat-models
           key: rag-rat-models-minilm-v1

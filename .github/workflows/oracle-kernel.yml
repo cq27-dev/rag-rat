@@ -14,6 +14,7 @@ on:
         default: 'defconfig'
 
 permissions:
+  contents: read
   checks: write
 
 env:
@@ -30,7 +31,7 @@ jobs:
     runs-on: [self-hosted, bigmem]
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Pinned bench environment (#71): scip-clang, rust-analyzer, the kernel-build deps (bc/…),
       # and the Rust toolchain all live in the image, so a missing host package (the `bc` failure)

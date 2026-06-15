@@ -10,6 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: read
   checks: write
 
 env:
@@ -26,7 +27,7 @@ jobs:
     runs-on: [self-hosted, bigmem]
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Pinned bench environment (#71): rust-analyzer + the Rust toolchain live in the image, so the
       # SCIP indexer version is reproducible (it's the content-addressed `tool_version` baked into

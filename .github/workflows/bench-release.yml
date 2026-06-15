@@ -34,6 +34,7 @@ on:
         default: ''
 
 permissions:
+  contents: read
   checks: write
 
 env:
@@ -56,7 +57,7 @@ jobs:
     # A whole-kernel index is long but bounded; cap it so a pathological run can't hang for hours.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Pinned bench environment (#71): the Rust toolchain + deps live in the image, so the kernel
       # index runs against a reproducible toolchain rather than the drifting host. Layer-cached.

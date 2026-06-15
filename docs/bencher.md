@@ -73,9 +73,9 @@ Four workflows under `.github/workflows/`:
 | Workflow | Trigger | Has the token? | Role |
 |---|---|---|---|
 | `bench.yml` | push to `main` | yes | Records both lightweight signals against the `main` branch; sets/refreshes the thresholds new PRs are compared against. |
-| `bench_pr_run.yml` | `pull_request` (incl. forks) | **no** | Runs the benches, uploads raw output + the PR event as an artifact. Never sees secrets, so a fork PR can't exfiltrate the token. |
-| `bench_pr_track.yml` | `workflow_run` of bench_pr_run | yes | Runs in the base-repo context: downloads the artifact, uploads results to Bencher, comments the comparison on the PR. |
-| `bench_release.yml` | `release: published` + manual `workflow_dispatch` | yes | The heavyweight Linux-kernel headline bench (below). Not a gate — tracks latency/throughput/memory over releases. |
+| `bench-pr-run.yml` | `pull_request` (incl. forks) | **no** | Runs the benches, uploads raw output + the PR event as an artifact. Never sees secrets, so a fork PR can't exfiltrate the token. |
+| `bench-pr-track.yml` | `workflow_run` of bench-pr-run | yes | Runs in the base-repo context: downloads the artifact, uploads results to Bencher, comments the comparison on the PR. |
+| `bench-release.yml` | `release: published` + manual `workflow_dispatch` | yes | The heavyweight Linux-kernel headline bench (below). Not a gate — tracks latency/throughput/memory over releases. |
 
 The `pull_request` → `workflow_run` split is Bencher's documented fork-safe pattern: untrusted fork
 code runs without secrets, and only the trusted base-repo workflow (which never executes fork code)
@@ -84,7 +84,7 @@ holds the API token. PR runs use `--start-point main --start-point-clone-thresho
 
 ## Release headline: indexing the Linux kernel
 
-`tools/bench-kernel.sh` (run by `bench_release.yml`) is the "indexes the Linux kernel in X seconds"
+`tools/bench-kernel.sh` (run by `bench-release.yml`) is the "indexes the Linux kernel in X seconds"
 benchmark. It shallow-clones a pinned kernel tag (`KERNEL_TAG`, default `v7.0`), indexes its C/H
 sources **once** with the release `rag-rat` binary (`index --full`, `--no-default-features` =
 hash embedder, no model download), and writes a Bencher Metric Format JSON file with eight measures:

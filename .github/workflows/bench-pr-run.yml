@@ -2,31 +2,35 @@ name: bench-pr-run
 
 # Fork-safe step 1 of 2: runs benchmarks on a PR (forks included) with NO secrets, then uploads the
 # raw results + PR event as an artifact. The upload to Bencher (which needs the token) happens in
-# bench_pr_track.yml, triggered by this workflow completing — so a fork PR can never read the token.
+# bench-pr-track.yml, triggered by this workflow completing — so a fork PR can never read the token.
 # Pattern mirrors Bencher's "Track Benchmarks with GitHub Actions" (fork PRs) docs.
 
 on:
   pull_request:
     types: [opened, reopened, edited, synchronize]
 
+# Fork-safe by construction: no secrets are used here, and the token is read-only.
+permissions:
+  contents: read
+
 jobs:
   benchmark:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install valgrind (iai-callgrind)
         run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: Cache iai-callgrind-runner
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/iai-callgrind-runner
           key: iai-runner-0.16.1
       - name: Install iai-callgrind-runner
         run: command -v iai-callgrind-runner || cargo install --locked iai-callgrind-runner@0.16.1
       - name: Cache bench corpus (cargo 0.97.1)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/bench-corpus
           key: bench-corpus-cargo-0.97.1

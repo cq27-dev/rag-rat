@@ -11,6 +11,7 @@ on:
     branches: [main]
 
 permissions:
+  contents: read
   checks: write
 
 concurrency:
@@ -30,20 +31,20 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install valgrind (iai-callgrind)
         run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: Cache iai-callgrind-runner
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/iai-callgrind-runner
           key: iai-runner-${{ env.IAI_RUNNER_VERSION }}
       - name: Install iai-callgrind-runner
         run: command -v iai-callgrind-runner || cargo install --locked iai-callgrind-runner@${{ env.IAI_RUNNER_VERSION }}
       - name: Cache bench corpus (cargo 0.97.1)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/bench-corpus
           key: bench-corpus-cargo-0.97.1
