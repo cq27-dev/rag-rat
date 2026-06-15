@@ -6,43 +6,18 @@ use crate::index::staleness::Heal;
 use crate::query::text_compare::*;
 use crate::search::lexical::SearchOptions;
 
+mod ai_lifecycle;
+mod gc;
 mod graph;
 mod history;
 mod importance;
 mod memory;
 mod oracle_runs;
+mod search;
 
+pub use gc::GcReport;
 pub use importance::ImportantSymbolsRequest;
-
-/// A graph-enriched search request: the lexical query plus the graph-meta controls. Replaces the
-/// `search_*_with_graph_meta[_options]` method ladder — callers fill one value (using
-/// [`SearchRequest::new`] for the common defaults) instead of picking among four
-/// positional-argument variants and transposing the bools.
-pub struct SearchRequest<'a> {
-    pub query: &'a str,
-    pub limit: u32,
-    pub include_generated: bool,
-    pub explain: bool,
-    pub graph_mode: GraphMetaMode,
-    pub graph_limit: u32,
-    pub options: SearchOptions,
-}
-
-impl<'a> SearchRequest<'a> {
-    /// The conventional search defaults: no generated files, no explain, compact graph meta to
-    /// depth 3, git + papertrail boosts on. Override individual fields with struct-update syntax.
-    pub fn new(query: &'a str, limit: u32) -> Self {
-        Self {
-            query,
-            limit,
-            include_generated: false,
-            explain: false,
-            graph_mode: GraphMetaMode::Compact,
-            graph_limit: 3,
-            options: SearchOptions::default(),
-        }
-    }
-}
+pub use search::SearchRequest;
 
 impl IndexDatabase {
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
@@ -120,57 +95,6 @@ impl IndexDatabase {
             unindexed_sample,
             warning,
         })
-    }
-
-    pub fn search(
-        &self,
-        query: &str,
-        limit: u32,
-        include_generated: bool,
-    ) -> anyhow::Result<Vec<SearchHit>> {
-        self.search_with_graph_meta(SearchRequest {
-            include_generated,
-            ..SearchRequest::new(query, limit)
-        })
-    }
-
-    pub fn search_explain(
-        &self,
-        query: &str,
-        limit: u32,
-        include_generated: bool,
-    ) -> anyhow::Result<Vec<SearchHit>> {
-        self.search_with_graph_meta(SearchRequest {
-            include_generated,
-            explain: true,
-            ..SearchRequest::new(query, limit)
-        })
-    }
-
-    /// Lexical+vector search with graph evidence and load-bearing enrichment attached. The single
-    /// entry point behind `search`/`search_explain`; callers that need non-default graph depth,
-    /// git/papertrail toggles, or explain mode build a [`SearchRequest`] directly.
-    pub fn search_with_graph_meta(
-        &self,
-        request: SearchRequest<'_>,
-    ) -> anyhow::Result<Vec<SearchHit>> {
-        self.ensure_fts_fresh()?;
-        let query = crate::search::lexical::LexicalQuery {
-            query: request.query,
-            limit: request.limit,
-            include_generated: request.include_generated,
-            explain: request.explain,
-            options: request.options,
-        };
-        let mut hits = self.search_with_heal(&query, Heal::Allow)?;
-        graph_meta::attach_to_search_hits(
-            self.storage.connection(),
-            &mut hits,
-            request.graph_mode,
-            request.graph_limit,
-        )?;
-        self.enrich_search_hits_with_load_bearing(&mut hits)?;
-        Ok(hits)
     }
 
     pub fn symbols(
@@ -407,207 +331,6 @@ impl IndexDatabase {
                 }
             },
         }
-    }
-
-    pub fn search_hash_baseline(
-        &self,
-        query: &str,
-        limit: u32,
-        include_generated: bool,
-    ) -> anyhow::Result<Vec<SearchHit>> {
-        self.ensure_fts_fresh()?;
-        crate::search::lexical::search_hash_baseline(
-            self.storage.connection(),
-            query,
-            limit,
-            include_generated,
-        )
-    }
-
-    pub fn docs_for_symbol(&self, symbol: &str, limit: u32) -> anyhow::Result<Vec<SearchHit>> {
-        self.search(symbol, limit, true)
-    }
-
-    pub fn docs_for_selected_symbol(
-        &self,
-        symbol: &crate::query::symbol::SymbolHit,
-        limit: u32,
-    ) -> anyhow::Result<Vec<SearchHit>> {
-        let mut hits = self.local_symbol_context_hits(symbol, limit)?;
-        hits.extend(self.search(&symbol.name, limit.saturating_mul(4).max(limit), true)?);
-        rank_docs_for_symbol(symbol, &mut hits);
-        dedupe_search_hits(&mut hits);
-        hits.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        Ok(hits)
-    }
-
-    pub fn local_ai_status(&self) -> anyhow::Result<LocalAiStatus> {
-        ai::status(self.storage.connection())
-    }
-
-    pub fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        ai::models(self.storage.connection())
-    }
-
-    pub fn install_model(&self, model_id: &str) -> anyhow::Result<ModelInfo> {
-        ai::install_model(self.storage.connection(), model_id)
-    }
-
-    pub fn reconcile(
-        &self,
-        limit: Option<u32>,
-        batch_size: Option<u32>,
-    ) -> anyhow::Result<ReconcileReport> {
-        ai::reconcile(self.storage.connection(), limit, batch_size)
-    }
-
-    pub fn reconcile_plan(&self) -> anyhow::Result<ReconcilePlan> {
-        ai::reconcile_plan(self.storage.connection())
-    }
-
-    pub fn reconcile_with_progress(
-        &self,
-        limit: Option<u32>,
-        batch_size: Option<u32>,
-        force: bool,
-        progress: impl FnMut(ai::ReconcileProgress),
-    ) -> anyhow::Result<ReconcileReport> {
-        ai::reconcile_with_progress(self.storage.connection(), limit, batch_size, force, progress)
-    }
-
-    pub fn reconcile_with_options_progress(
-        &self,
-        options: ai::ReconcileOptions,
-        progress: impl FnMut(ai::ReconcileProgress),
-    ) -> anyhow::Result<ReconcileReport> {
-        ai::reconcile_with_options_progress(self.storage.connection(), options, progress)
-    }
-
-    /// Garbage-collect index rows for git contexts that are no longer live. Keeps the active
-    /// commit and overlay of every worktree reported by `git worktree list` (plus this
-    /// connection's active context) and prunes file/chunk/embedding/symbol/edge rows for any
-    /// other commit. Never prunes when no live context can be determined (non-git, git error).
-    pub fn gc(&self) -> anyhow::Result<GcReport> {
-        let mut live_commits = Vec::new();
-        let mut live_worktrees = Vec::new();
-        if let Some(root) = self.storage.source_root() {
-            let (commits, worktrees) = live_worktree_contexts(root);
-            live_commits.extend(commits);
-            live_worktrees.extend(worktrees);
-        }
-        // Always keep this connection's active context, even if git enumeration missed it.
-        if !self.active_commit_sha.is_empty() {
-            live_commits.push(self.active_commit_sha.clone());
-        }
-        if !self.active_worktree_id.is_empty() {
-            live_worktrees.push(self.active_worktree_id.clone());
-        }
-        live_commits.sort();
-        live_commits.dedup();
-        live_worktrees.sort();
-        live_worktrees.dedup();
-        self.prune_to_live(&live_commits, &live_worktrees)
-    }
-
-    /// Prune file rows (and their derived rows) whose `commit_sha` and `worktree_id` are both
-    /// outside the live sets. Refuses to prune when both live sets are empty, so a missing
-    /// live set never wipes the index. `parser_failures` are keyed by path (shared across
-    /// commits) and are regenerated on the next index, so they are not preserved per-commit.
-    pub fn prune_to_live(
-        &self,
-        live_commits: &[String],
-        live_worktrees: &[String],
-    ) -> anyhow::Result<GcReport> {
-        let conn = self.storage.connection();
-        let files_before = table_row_count(conn, "files")?;
-        let chunks_before = table_row_count(conn, "chunks")?;
-        if live_commits.is_empty() && live_worktrees.is_empty() {
-            return Ok(GcReport {
-                files_pruned: 0,
-                chunks_pruned: 0,
-                files_remaining: files_before,
-                chunks_remaining: chunks_before,
-                skipped: true,
-            });
-        }
-        conn.execute_batch(
-            "
-            CREATE TEMP TABLE IF NOT EXISTS gc_live_commits(sha TEXT PRIMARY KEY);
-            DELETE FROM temp.gc_live_commits;
-            CREATE TEMP TABLE IF NOT EXISTS gc_live_worktrees(id TEXT PRIMARY KEY);
-            DELETE FROM temp.gc_live_worktrees;
-            CREATE TEMP TABLE IF NOT EXISTS staged_file_ids(id INTEGER PRIMARY KEY);
-            DELETE FROM temp.staged_file_ids;
-            ",
-        )?;
-        {
-            let mut stmt =
-                conn.prepare("INSERT OR IGNORE INTO temp.gc_live_commits(sha) VALUES (?1)")?;
-            for sha in live_commits {
-                stmt.execute([sha])?;
-            }
-        }
-        {
-            let mut stmt =
-                conn.prepare("INSERT OR IGNORE INTO temp.gc_live_worktrees(id) VALUES (?1)")?;
-            for id in live_worktrees {
-                stmt.execute([id])?;
-            }
-        }
-        // A file survives if its commit is live OR its worktree overlay is live. Empty-string
-        // keys never appear in the live sets, so unkeyed rows are pruned.
-        conn.execute(
-            "
-            INSERT OR IGNORE INTO temp.staged_file_ids(id)
-            SELECT id FROM main.files
-            WHERE commit_sha NOT IN (SELECT sha FROM temp.gc_live_commits)
-              AND worktree_id NOT IN (SELECT id FROM temp.gc_live_worktrees)
-            ",
-            [],
-        )?;
-        self.delete_staged_files_cascade()?;
-        conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
-        // `edge_oracle` verdicts cascade away with their edges via the FK ON DELETE CASCADE (fired
-        // by the cascade above, with `PRAGMA foreign_keys=ON`). `oracle_runs`, however, is keyed by
-        // `(commit_sha, worktree_id)` directly — nothing cascades it — so a dead checkout's run
-        // rows would survive the file pruning. Prune them with the SAME live sets, so a run and the
-        // edges it produced are dropped together.
-        oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
-        // Dictionary hygiene (#79): drop `edge_strings` values no edge references any more. The
-        // dictionary has NO FKs by design (see the schema comment), so orphans accumulate as
-        // edges are pruned; the vocabulary is small, but gc is the natural rate-limited home for
-        // the sweep. Every referencing column must appear here — a missed column would null its
-        // strings out from under live edges.
-        conn.execute(
-            "
-            DELETE FROM main.edge_strings
-            WHERE id NOT IN (
-                SELECT from_name_id FROM main.edges_data WHERE from_name_id IS NOT NULL
-                UNION SELECT to_name_id FROM main.edges_data
-                UNION SELECT target_qualified_name_id FROM main.edges_data
-                    WHERE target_qualified_name_id IS NOT NULL
-                UNION SELECT receiver_hint_id FROM main.edges_data
-                    WHERE receiver_hint_id IS NOT NULL
-                UNION SELECT resolution_id FROM main.edges_data
-                UNION SELECT edge_kind_id FROM main.edges_data
-                UNION SELECT confidence_id FROM main.edges_data
-            )
-            ",
-            [],
-        )?;
-        let files_remaining = table_row_count(conn, "files")?;
-        let chunks_remaining = table_row_count(conn, "chunks")?;
-        Ok(GcReport {
-            files_pruned: files_before.saturating_sub(files_remaining),
-            chunks_pruned: chunks_before.saturating_sub(chunks_remaining),
-            files_remaining,
-            chunks_remaining,
-            skipped: false,
-        })
-    }
-
-    pub fn current_embedding_count(&self, model_id: &str) -> anyhow::Result<u64> {
-        ai::current_embedding_count(self.storage.connection(), model_id)
     }
 
     pub fn heal_index(&self, limit: Option<u32>) -> anyhow::Result<HealIndexReport> {

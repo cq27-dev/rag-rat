@@ -33,7 +33,7 @@ pub use git_context::resolve_git_context;
 pub(crate) use git_context::*;
 pub(crate) use lifecycle::install_scope_view;
 pub(crate) use prep::*;
-pub use query_api::{ImportantSymbolsRequest, SearchRequest};
+pub use query_api::{GcReport, ImportantSymbolsRequest, SearchRequest};
 pub(crate) use util::*;
 
 #[cfg(test)]
@@ -177,16 +177,6 @@ pub struct HealIndexReport {
     pub skipped_files: u64,
     pub fts_fresh: bool,
     pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct GcReport {
-    pub files_pruned: u64,
-    pub chunks_pruned: u64,
-    pub files_remaining: u64,
-    pub chunks_remaining: u64,
-    /// True when no live context could be determined and pruning was skipped (nothing deleted).
-    pub skipped: bool,
 }
 
 #[derive(Debug, Serialize)]
