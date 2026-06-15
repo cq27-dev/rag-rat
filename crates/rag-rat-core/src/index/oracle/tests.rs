@@ -3188,6 +3188,26 @@ fn logical_symbol_binding_survives_chunk_id_churn_on_reindex() {
     );
 }
 
+/// The memory body cap is 8000 chars (raised from 4000 so detailed Invariant/Decision/BugPattern
+/// memories aren't forced to drop content). Boundary: 8000 accepted, 8001 rejected.
+#[test]
+fn memory_body_cap_is_8000_chars() {
+    let h = Harness::new();
+    let make = |body: String| RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "cap test".to_string(),
+        body,
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget { path: Some("a.rs".to_string()), ..Default::default() },
+    };
+    assert!(create_memory(&h.conn, make("x".repeat(8000))).is_ok(), "8000 chars is accepted");
+    let err = create_memory(&h.conn, make("x".repeat(8001))).unwrap_err();
+    assert!(err.to_string().contains("body exceeds 8000"), "8001 rejected with the cap: {err}");
+}
+
 /// Point the index `source_root` meta at the harness checkout so the off-index filesystem
 /// existence fallback (#98) has a root to resolve a binding path against.
 fn set_source_root(h: &Harness) {

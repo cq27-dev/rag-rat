@@ -188,6 +188,7 @@ pub(crate) fn call_tool_with_db(
             json!(db.memory_for_call_path_hash(&args.edge_sequence_hash, args.limit)?)
         },
         "memory_validate" => json!(db.memory_validate()?),
+        "memory_doctor" => json!(db.memory_doctor()?),
         "memory_mark_obsolete" => {
             let args: MemoryIdArgs = serde_json::from_value(arguments)?;
             json!(db.memory_mark_obsolete(&args.memory_id)?)

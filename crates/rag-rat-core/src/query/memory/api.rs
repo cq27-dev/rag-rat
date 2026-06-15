@@ -1,13 +1,20 @@
 use super::*;
 
+/// Max chars for a memory title (a one-line summary) and body. The body cap is generous on purpose:
+/// Invariant / Decision / BugPattern memories are meant to carry the *why* + *how to apply* in
+/// detail, and 4 000 forced real content out (the MCP `memory_create`/`memory_update` schemas
+/// document these). Enforced in Rust, not the schema, so raising them needs no migration.
+pub(crate) const MAX_MEMORY_TITLE_LEN: usize = 160;
+pub(crate) const MAX_MEMORY_BODY_LEN: usize = 8000;
+
 pub(crate) fn create_memory(
     conn: &Connection,
     request: RepoMemoryCreate,
 ) -> anyhow::Result<RepoMemoryCreateResult> {
     validate_kind(&request.kind)?;
     validate_confidence(&request.confidence)?;
-    validate_len("title", &request.title, 160)?;
-    validate_len("body", &request.body, 4000)?;
+    validate_len("title", &request.title, MAX_MEMORY_TITLE_LEN)?;
+    validate_len("body", &request.body, MAX_MEMORY_BODY_LEN)?;
     let source = request.source.clone().unwrap_or_else(|| "agent".to_string());
     validate_source(&source)?;
     let binding = resolve_binding(conn, &request.bind)?;
@@ -67,10 +74,10 @@ pub(crate) fn update_memory(
         validate_status(status)?;
     }
     if let Some(title) = update.title.as_deref() {
-        validate_len("title", title, 160)?;
+        validate_len("title", title, MAX_MEMORY_TITLE_LEN)?;
     }
     if let Some(body) = update.body.as_deref() {
-        validate_len("body", body, 4000)?;
+        validate_len("body", body, MAX_MEMORY_BODY_LEN)?;
     }
     let now = now_ms();
     conn.execute(

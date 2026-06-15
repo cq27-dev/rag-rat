@@ -461,6 +461,19 @@ impl RagRatService {
     }
 
     #[tool(
+        name = "memory_doctor",
+        description = "List repo memories with stale/gone anchors plus suggested re-anchor \
+                       targets — the actionable companion to memory_validate. Rebind them with \
+                       memory_rebind."
+    )]
+    fn memory_doctor(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_doctor", json!({}))
+    }
+
+    #[tool(
         name = "memory_mark_obsolete",
         description = "Mark a repo memory obsolete without deleting its audit trail."
     )]

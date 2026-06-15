@@ -560,7 +560,9 @@ pub struct MemoryBindArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MemoryCreateArgs {
     pub kind: McpMemoryKind,
+    /// One-line summary, max 160 characters.
     pub title: String,
+    /// The memory text (the *why* + *how to apply*), max 8000 characters.
     pub body: String,
     pub confidence: McpMemoryConfidence,
     pub created_by: Option<String>,
@@ -580,7 +582,9 @@ pub struct MemoryRebindArgs {
 pub struct MemoryUpdateArgs {
     pub memory_id: String,
     pub kind: Option<McpMemoryKind>,
+    /// One-line summary, max 160 characters.
     pub title: Option<String>,
+    /// The memory text (the *why* + *how to apply*), max 8000 characters.
     pub body: Option<String>,
     pub confidence: Option<McpMemoryConfidence>,
     pub status: Option<McpMemoryStatus>,

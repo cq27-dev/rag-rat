@@ -37,6 +37,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "memory_for_path",
     "memory_for_call_path",
     "memory_validate",
+    "memory_doctor",
     "memory_mark_obsolete",
 ];
 
@@ -176,6 +177,11 @@ pub fn description(name: &str) -> &'static str {
         "memory_validate" =>
             "Re-anchor every repo memory against current source and mark each current / relocated \
              / stale / gone. Runs automatically after indexing.",
+        "memory_doctor" =>
+            "List repo memories whose anchor is stale or gone, each with suggested re-anchor \
+             targets (qualified names) — the actionable companion to memory_validate. Read-only; \
+             reports the last-validated status, so run memory_validate first for a fresh check. \
+             Rebind the listed memories with memory_rebind.",
         "memory_mark_obsolete" =>
             "Mark a repo memory obsolete — kept for audit, hidden from active recall.",
         _ => "Unknown tool.",
@@ -213,8 +219,8 @@ pub fn schema(name: &str) -> Value {
         "memory_for_path" => schema_for::<MemoryForPathArgs>(),
         "memory_for_call_path" => schema_for::<MemoryForCallPathArgs>(),
         "memory_mark_obsolete" => schema_for::<MemoryIdArgs>(),
-        "local_ai_status" | "github_sync_status" | "index_status" | "memory_validate" =>
-            schema_for::<EmptyArgs>(),
+        "local_ai_status" | "github_sync_status" | "index_status" | "memory_validate"
+        | "memory_doctor" => schema_for::<EmptyArgs>(),
         _ => json!({"type": "object"}),
     }
 }
