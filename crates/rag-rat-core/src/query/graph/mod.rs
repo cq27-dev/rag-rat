@@ -192,7 +192,6 @@ pub struct CompareGraphTextQuery {
     pub symbol_path: String,
     pub pattern: String,
     pub resolution: String,
-    pub include_tests: bool,
 }
 
 #[derive(Debug, Default, Serialize)]

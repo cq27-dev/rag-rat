@@ -123,6 +123,88 @@ impl McpGraphEdgeKind {
     }
 }
 
+/// Resolve one optional include-flag against the array form. `None` (the `include` key omitted)
+/// keeps the tool's historical `default`; a present `include` list is the EXACT on-set, so a
+/// default-on flag (e.g. impact's `tests`/`git`) is disabled simply by leaving it out. Presence in
+/// the list = on. This is why the surface is an array, not per-key booleans (#149 follow-up).
+fn included<T: PartialEq>(include: &Option<Vec<T>>, flag: T, default: bool) -> bool {
+    match include {
+        None => default,
+        Some(flags) => flags.contains(&flag),
+    }
+}
+
+/// `semantic_search` `include` flags. `git`/`papertrail` are on by default (omit `include` to keep
+/// them); `generated`/`fallback` are off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchInclude {
+    Generated,
+    Git,
+    Papertrail,
+    Fallback,
+}
+
+/// `repo_brief` / `repo_clusters` `include` flags. `memories` on by default; `generated` off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrientationInclude {
+    Generated,
+    Memories,
+}
+
+/// `symbol_lookup` / `read_chunk` `include` flags. `memories` on by default (pass `include: []` to
+/// suppress).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoriesInclude {
+    Memories,
+}
+
+/// `find_callers` / `trace_callees` `include` flags. `memories` on by default; the rest off (they
+/// add unresolved/macro/common-method/reference noise or the coverage block on demand).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphInclude {
+    References,
+    Unresolved,
+    Macros,
+    CommonMethods,
+    Coverage,
+    Memories,
+}
+
+/// `compare_graph_to_text` `include` flags. `tests` on by default; the rest off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareInclude {
+    Tests,
+    References,
+    Unresolved,
+    Macros,
+    CommonMethods,
+}
+
+/// `impact_surface` `include` flags — ALL on by default (impact's value is the bundled evidence).
+/// Pass an explicit `include` to narrow it, e.g. `["git"]` for git history only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactInclude {
+    Tests,
+    Docs,
+    Git,
+    Papertrail,
+    TextFallback,
+    Memories,
+}
+
+/// `papertrail_for_commit` `include` flags. `fallback` off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PapertrailCommitInclude {
+    Fallback,
+}
+
 pub const TOOL_NAMES: &[&str] = &[
     "semantic_search",
     "symbol_lookup",
@@ -169,19 +251,15 @@ pub struct SearchArgs {
     #[serde(default = "default_search_limit")]
     pub limit: u32,
     #[serde(default)]
-    pub include_generated: bool,
-    #[serde(default)]
     pub explain: bool,
-    #[serde(default = "default_true")]
-    pub include_git: bool,
-    #[serde(default = "default_true")]
-    pub include_papertrail: bool,
+    /// What to include: `git`, `papertrail` (both on by default), `generated`, `fallback` (off by
+    /// default). Omit to keep defaults; an explicit list is the exact on-set.
+    #[serde(default)]
+    pub include: Option<Vec<SearchInclude>>,
     #[serde(default = "default_search_graph_mode")]
     pub include_graph: McpGraphMode,
     #[serde(default = "default_search_graph_limit")]
     pub graph_limit: u32,
-    #[serde(default)]
-    pub include_fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
@@ -210,20 +288,18 @@ pub struct RepoBriefArgs {
     pub mode: McpRepoBriefMode,
     #[serde(default = "default_repo_brief_limit")]
     pub limit: u32,
+    /// What to include: `memories` (on by default), `generated` (off). Omit to keep defaults.
     #[serde(default)]
-    pub include_generated: bool,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    pub include: Option<Vec<OrientationInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RepoClustersArgs {
     #[serde(default = "default_repo_brief_limit")]
     pub limit: u32,
+    /// What to include: `memories` (on by default), `generated` (off). Omit to keep defaults.
     #[serde(default)]
-    pub include_generated: bool,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    pub include: Option<Vec<OrientationInclude>>,
     #[serde(default = "default_min_cluster_size")]
     pub min_cluster_size: u32,
 }
@@ -263,8 +339,9 @@ pub struct SymbolArgs {
     pub allow_ambiguous: bool,
     #[serde(default = "default_symbol_limit")]
     pub limit: u32,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    /// What to include: `memories` (on by default). Pass `include: []` to suppress.
+    #[serde(default)]
+    pub include: Option<Vec<MemoriesInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -285,18 +362,11 @@ pub struct SymbolGraphArgs {
     pub limit: u32,
     #[serde(default)]
     pub allow_ambiguous: bool,
+    /// What to include: `memories` (on by default); `references`, `unresolved`, `macros`,
+    /// `common_methods`, `coverage` (all off by default). Omit to keep defaults; an explicit list
+    /// is the exact on-set (so listing `macros` alone also drops the default `memories`).
     #[serde(default)]
-    pub include_references: bool,
-    #[serde(default)]
-    pub include_unresolved: bool,
-    #[serde(default)]
-    pub include_macros: bool,
-    #[serde(default)]
-    pub include_common_methods: bool,
-    #[serde(default)]
-    pub include_coverage: bool,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    pub include: Option<Vec<GraphInclude>>,
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
@@ -317,18 +387,13 @@ pub struct CompareGraphTextArgs {
     pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default = "default_compare_limit")]
     pub limit: u32,
-    #[serde(default = "default_true")]
-    pub include_tests: bool,
     #[serde(default)]
     pub allow_ambiguous: bool,
+    /// What to include: `tests` (on by default); `references`, `unresolved`, `macros`,
+    /// `common_methods` (off by default). Omit to keep defaults; an explicit list is the exact
+    /// on-set.
     #[serde(default)]
-    pub include_references: bool,
-    #[serde(default)]
-    pub include_unresolved: bool,
-    #[serde(default)]
-    pub include_macros: bool,
-    #[serde(default)]
-    pub include_common_methods: bool,
+    pub include: Option<Vec<CompareInclude>>,
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
@@ -351,18 +416,11 @@ pub struct ImpactArgs {
     pub allow_ambiguous: bool,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
-    #[serde(default = "default_true")]
-    pub include_tests: bool,
-    #[serde(default = "default_true")]
-    pub include_docs: bool,
-    #[serde(default = "default_true")]
-    pub include_git: bool,
-    #[serde(default = "default_true")]
-    pub include_papertrail: bool,
-    #[serde(default = "default_true")]
-    pub include_text_fallback: bool,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    /// What to include — `tests`, `docs`, `git`, `papertrail`, `text_fallback`, `memories`, ALL on
+    /// by default (impact's value is the bundled evidence). Omit to keep them; pass an explicit
+    /// list to narrow, e.g. `["git"]` for git history only.
+    #[serde(default)]
+    pub include: Option<Vec<ImpactInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -378,8 +436,9 @@ pub struct ReadChunkArgs {
     pub include_graph: McpGraphMode,
     #[serde(default = "default_read_chunk_graph_limit")]
     pub graph_limit: u32,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    /// What to include: `memories` (on by default). Pass `include: []` to suppress.
+    #[serde(default)]
+    pub include: Option<Vec<MemoriesInclude>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
@@ -620,8 +679,9 @@ pub struct PapertrailCommitArgs {
     pub commit_hash: String,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
+    /// What to include: `fallback` (off by default).
     #[serde(default)]
-    pub include_fallback: bool,
+    pub include: Option<Vec<PapertrailCommitInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -799,8 +859,8 @@ pub fn description(name: &str) -> &'static str {
              symbol with symbol_lookup first when a name is ambiguous.",
         "trace_callees" =>
             "Find what a symbol calls (forward call graph). Same evidence shape as find_callers; \
-             unresolved std/common-method noise is filtered out by default (toggle with \
-             include_common_methods / include_unresolved).",
+             unresolved std/common-method noise is filtered out by default (add `common_methods` / \
+             `unresolved` to the `include` array to keep it).",
         "compare_graph_to_text" =>
             "Cross-check a symbol's graph caller edges against a regex text search of indexed \
              source — surfaces call sites the tree-sitter graph missed and flags likely false \

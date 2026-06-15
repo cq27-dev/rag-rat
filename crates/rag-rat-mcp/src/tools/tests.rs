@@ -91,17 +91,23 @@ fn list_tools_exposes_complete_typed_schemas() {
         "none", "compact", "full",
     ]);
     assert_schema_has_property(tools, "semantic_search", "graph_limit");
-    assert_schema_has_property(tools, "semantic_search", "include_git");
-    assert_schema_has_property(tools, "semantic_search", "include_papertrail");
-    assert_schema_has_property(tools, "semantic_search", "include_fallback");
+    assert_schema_array_item_enum(tools, "semantic_search", "include", &[
+        "generated",
+        "git",
+        "papertrail",
+        "fallback",
+    ]);
     assert_schema_has_property(tools, "semantic_search", "explain");
     assert_symbol_selector_schema(tools, "symbol_lookup");
-    assert_schema_has_property(tools, "find_callers", "include_references");
-    assert_schema_has_property(tools, "find_callers", "include_unresolved");
-    assert_schema_has_property(tools, "find_callers", "include_macros");
-    assert_schema_has_property(tools, "find_callers", "include_common_methods");
-    assert_schema_has_property(tools, "find_callers", "include_coverage");
-    assert_schema_has_property(tools, "find_callers", "include_memories");
+    assert_schema_array_item_enum(tools, "symbol_lookup", "include", &["memories"]);
+    assert_schema_array_item_enum(tools, "find_callers", "include", &[
+        "references",
+        "unresolved",
+        "macros",
+        "common_methods",
+        "coverage",
+        "memories",
+    ]);
     assert_schema_has_property(tools, "find_callers", "edge_kinds");
     assert_schema_has_property(tools, "find_callers", "resolution");
     assert_schema_property_enum(tools, "find_callers", "resolution", &[
@@ -121,32 +127,39 @@ fn list_tools_exposes_complete_typed_schemas() {
     ]);
     assert_schema_has_property(tools, "find_callers", "id");
     assert_symbol_selector_schema(tools, "find_callers");
-    assert_schema_has_property(tools, "trace_callees", "include_references");
-    assert_schema_has_property(tools, "trace_callees", "include_unresolved");
-    assert_schema_has_property(tools, "trace_callees", "include_macros");
-    assert_schema_has_property(tools, "trace_callees", "include_common_methods");
-    assert_schema_has_property(tools, "trace_callees", "include_coverage");
-    assert_schema_has_property(tools, "trace_callees", "include_memories");
+    assert_schema_array_item_enum(tools, "trace_callees", "include", &[
+        "references",
+        "unresolved",
+        "macros",
+        "common_methods",
+        "coverage",
+        "memories",
+    ]);
     assert_schema_has_property(tools, "trace_callees", "edge_kinds");
     assert_schema_has_property(tools, "trace_callees", "resolution");
     assert_schema_has_property(tools, "trace_callees", "id");
     assert_symbol_selector_schema(tools, "trace_callees");
     assert_schema_requires(tools, "compare_graph_to_text", "pattern");
-    assert_schema_has_property(tools, "compare_graph_to_text", "include_unresolved");
-    assert_schema_has_property(tools, "compare_graph_to_text", "include_macros");
-    assert_schema_has_property(tools, "compare_graph_to_text", "include_common_methods");
-    assert_schema_has_property(tools, "compare_graph_to_text", "include_tests");
+    assert_schema_array_item_enum(tools, "compare_graph_to_text", "include", &[
+        "tests",
+        "references",
+        "unresolved",
+        "macros",
+        "common_methods",
+    ]);
     assert_schema_has_property(tools, "compare_graph_to_text", "edge_kinds");
     assert_schema_has_property(tools, "compare_graph_to_text", "resolution");
     assert_schema_has_property(tools, "compare_graph_to_text", "id");
     assert_symbol_selector_schema(tools, "compare_graph_to_text");
     assert_schema_has_property(tools, "impact_surface", "resolution");
-    assert_schema_has_property(tools, "impact_surface", "include_tests");
-    assert_schema_has_property(tools, "impact_surface", "include_docs");
-    assert_schema_has_property(tools, "impact_surface", "include_git");
-    assert_schema_has_property(tools, "impact_surface", "include_papertrail");
-    assert_schema_has_property(tools, "impact_surface", "include_text_fallback");
-    assert_schema_has_property(tools, "impact_surface", "include_memories");
+    assert_schema_array_item_enum(tools, "impact_surface", "include", &[
+        "tests",
+        "docs",
+        "git",
+        "papertrail",
+        "text_fallback",
+        "memories",
+    ]);
     assert_schema_has_property(tools, "impact_surface", "id");
     assert_symbol_selector_schema(tools, "impact_surface");
     assert_schema_has_property(tools, "repo_brief", "mode");
@@ -157,9 +170,9 @@ fn list_tools_exposes_complete_typed_schemas() {
         "refactor_candidates",
     ]);
     assert_schema_has_property(tools, "repo_brief", "limit");
-    assert_schema_has_property(tools, "repo_brief", "include_memories");
+    assert_schema_array_item_enum(tools, "repo_brief", "include", &["generated", "memories"]);
     assert_schema_has_property(tools, "repo_clusters", "limit");
-    assert_schema_has_property(tools, "repo_clusters", "include_memories");
+    assert_schema_array_item_enum(tools, "repo_clusters", "include", &["generated", "memories"]);
     assert_schema_has_property(tools, "repo_clusters", "min_cluster_size");
     assert_symbol_selector_schema(tools, "docs_for_symbol");
     assert_symbol_selector_schema(tools, "git_history_for_symbol");
@@ -168,10 +181,15 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_has_property(tools, "read_chunk", "include_graph");
     assert_schema_property_enum(tools, "read_chunk", "include_graph", &["none", "compact", "full"]);
     assert_schema_has_property(tools, "read_chunk", "graph_limit");
-    assert_schema_has_property(tools, "read_chunk", "include_memories");
+    assert_schema_array_item_enum(tools, "read_chunk", "include", &["memories"]);
     assert_schema_requires(tools, "papertrail_for_commit", "commit_hash");
-    assert_schema_has_property(tools, "papertrail_for_commit", "include_fallback");
-    assert_schema_has_property(tools, "rationale_search", "include_fallback");
+    assert_schema_array_item_enum(tools, "papertrail_for_commit", "include", &["fallback"]);
+    assert_schema_array_item_enum(tools, "rationale_search", "include", &[
+        "generated",
+        "git",
+        "papertrail",
+        "fallback",
+    ]);
     assert_schema_has_property(tools, "heal_index", "limit");
     assert_schema_requires(tools, "memory_create", "kind");
     assert_schema_requires(tools, "memory_create", "bind");
@@ -339,7 +357,7 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
     let chunk = call_tool(
         &config.database,
         "read_chunk",
-        json!({"chunk_id": chunk_id, "include_memories": true}),
+        json!({"chunk_id": chunk_id, "include": ["memories"]}),
     )
     .unwrap();
     assert_eq!(chunk["memories"].as_array().unwrap()[0]["memory_id"], memory_id);
@@ -347,7 +365,7 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
     let impact = call_tool(
         &config.database,
         "impact_surface",
-        json!({"id": logical_symbol_id, "include_memories": true}),
+        json!({"id": logical_symbol_id, "include": ["memories"]}),
     )
     .unwrap();
     assert_eq!(impact["repo_memories"]["direct"].as_array().unwrap()[0]["memory_id"], memory_id);
@@ -473,7 +491,7 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
             "id": one["id"].as_str().unwrap(),
             "resolution": "exact",
             "edge_kinds": ["calls_name"],
-            "include_coverage": true
+            "include": ["coverage"]
         }),
     )
     .unwrap();
@@ -548,11 +566,7 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
         json!({
             "id": one["id"].as_str().unwrap(),
             "resolution": "exact",
-            "include_tests": true,
-            "include_docs": true,
-            "include_git": true,
-            "include_papertrail": true,
-            "include_text_fallback": true
+            "include": ["tests", "docs", "git", "papertrail", "text_fallback"]
         }),
     )
     .unwrap();

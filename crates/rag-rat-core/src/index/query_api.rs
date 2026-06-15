@@ -1516,7 +1516,6 @@ impl IndexDatabase {
                 symbol_path: symbol.qualified_name.clone(),
                 pattern: pattern.to_string(),
                 resolution: options.resolution_mode.as_str().to_string(),
-                include_tests,
             },
             logical_symbol,
             variants,
