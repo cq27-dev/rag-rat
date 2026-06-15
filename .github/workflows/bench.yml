@@ -34,6 +34,10 @@ env:
 jobs:
   bench:
     runs-on: ubuntu-latest
+    # The publish steps below hardcode `--branch main --thresholds-reset`, so this job must only run
+    # against main — a manual dispatch from a feature ref would otherwise reset main's baseline with
+    # non-main results. The push trigger is already main-only; this guards the workflow_dispatch ref.
+    if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
