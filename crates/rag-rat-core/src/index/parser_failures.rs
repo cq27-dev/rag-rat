@@ -2,6 +2,13 @@
 
 use super::*;
 
+#[derive(Debug, Serialize)]
+pub struct ParserFailure {
+    pub path: String,
+    pub language: String,
+    pub message: String,
+}
+
 impl IndexDatabase {
     pub(super) fn insert_parser_failure(
         &self,

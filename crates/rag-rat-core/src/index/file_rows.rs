@@ -1,5 +1,5 @@
-//! File-row lifecycle: fetch the file row, mark/remove files in the active scope, and count indexed
-//! files.
+//! File-row reads and scope mutations: fetch the file row, mark/remove files in the active scope,
+//! and count indexed files.
 
 use super::*;
 

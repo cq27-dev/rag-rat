@@ -2,6 +2,7 @@
 //! symbol, and logical-group rows; heal a stale file in place.
 
 use super::*;
+use crate::index::graph_index::{LogicalSymbolKey, LogicalSymbolMemberRow};
 
 /// Identity of the file whose chunks are being inserted — passed from the caller (which just
 /// inserted the file row) so `insert_chunks` doesn't re-`SELECT` it per file (#57).

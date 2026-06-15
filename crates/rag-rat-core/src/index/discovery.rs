@@ -3,6 +3,18 @@
 
 use super::*;
 
+#[derive(Debug, Serialize)]
+pub struct DiscoveryStatus {
+    pub discovered_files: usize,
+    pub indexed_files: usize,
+    pub unindexed_files: usize,
+    pub unindexed_source_files: usize,
+    pub changed_indexed_files: usize,
+    pub removed_indexed_files: usize,
+    pub unindexed_sample: Vec<String>,
+    pub warning: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct DiscoveryPlan {
     pub(crate) files: Vec<IndexFile>,

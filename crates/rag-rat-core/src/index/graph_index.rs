@@ -3,6 +3,67 @@
 
 use super::*;
 
+/// Grouping key that collapses cfg variants / overloads of one symbol into a single logical symbol.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct LogicalSymbolKey {
+    pub(super) language: String,
+    pub(super) path: String,
+    pub(super) name: String,
+    pub(super) qualified_name: String,
+    pub(super) kind: String,
+    // Signature is part of the identity so that two distinct same-named symbols in one file (e.g.
+    // `new` on two different impls — same `qualified_name`, different signatures) do NOT collapse
+    // into one logical symbol. Genuine cfg variants share a signature, so they still group.
+    pub(super) signature: Option<String>,
+}
+
+impl LogicalSymbolKey {
+    pub(super) fn from(row: &LogicalSymbolMemberRow) -> Self {
+        Self {
+            language: row.language.clone(),
+            path: row.path.clone(),
+            name: row.name.clone(),
+            qualified_name: row.qualified_name.clone(),
+            kind: row.kind.clone(),
+            signature: row.signature.clone(),
+        }
+    }
+
+    /// Deterministic logical-symbol id derived from the key, so it is **stable across reindex**
+    /// (the table is fully rebuilt each pass; an autoincrement rowid would churn the id every
+    /// time, breaking any cached id or logical-symbol-bound memory). A 63-bit truncation of the
+    /// key's SHA-256 — collisions are astronomically unlikely across a repo's symbols, and a
+    /// collision would surface as a loud primary-key error on rebuild rather than silent merging.
+    pub(super) fn stable_id(&self) -> i64 {
+        let canonical = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            self.language,
+            self.path,
+            self.name,
+            self.qualified_name,
+            self.kind,
+            self.signature.as_deref().unwrap_or(""),
+        );
+        let digest = Sha256::digest(canonical.as_bytes());
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        (u64::from_be_bytes(bytes) >> 1) as i64
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LogicalSymbolMemberRow {
+    pub(super) symbol_id: i64,
+    pub(super) path: String,
+    pub(super) language: String,
+    pub(super) name: String,
+    pub(super) qualified_name: String,
+    pub(super) kind: String,
+    pub(super) signature: Option<String>,
+    pub(super) start_line: i64,
+    pub(super) end_line: i64,
+}
+
 impl IndexDatabase {
     pub(super) fn resolve_edges(&self) -> anyhow::Result<()> {
         edges::resolve_all_edges(self.storage.connection())
