@@ -47,8 +47,9 @@ rag-rat oracle status
 ```
 
 `scip-python` resolves imports against the project's **installed** dependencies, so the checkout's
-deps must be importable (e.g. installed into a virtualenv) for cross-package edges to resolve; it
-also derives its project version from the git revision, so it expects a git checkout.
+deps must be importable (e.g. installed into a virtualenv) for cross-package edges to resolve. Its
+SCIP project version is pinned to a constant (not the git revision) so a symbol's moniker stays
+stable across commits — keeping moniker-anchored memory relocation working.
 
 A missing/unrunnable tool degrades to `Blocked` with an install hint and exit 0 — never an error.
 

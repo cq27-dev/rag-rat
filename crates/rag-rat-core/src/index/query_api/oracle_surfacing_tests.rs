@@ -329,6 +329,50 @@ fn compare_graph_to_scip_reports_contradiction() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// #176: surfacing must NOT be hardcoded to rust-analyzer. A verdict written under another backend
+/// (here scip-clang) must still be reported by `compare_graph_to_scip`, and the report's `tool`
+/// must name the contributing backend — proving the multi-tool `latest_runs_in_scope` seam, not the
+/// old single-`RustAnalyzer` query.
+#[test]
+fn compare_graph_to_scip_surfaces_non_rust_analyzer_tools() {
+    let root = temp_root();
+    fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+    let config = rust_config(root.clone());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (edge_id, cs, ce, path) = call_edge(&db);
+    let target_sym: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE edges SET confidence = 'Exact', resolution = 'exact', to_symbol_id = ?2 WHERE \
+             id = ?1",
+            params![edge_id, target_sym],
+        )
+        .unwrap();
+
+    let symbol = "scip-rust cargo other 1.0 `target`().";
+    let scip = scip_with(&path, cs, ce, symbol, None, None);
+    // Write the verdict under scip-clang, NOT rust-analyzer.
+    db.run_oracle_from_scip(OracleTool::ScipClang, "clang-vtest", &scip).unwrap();
+
+    let compare = db.compare_graph_to_scip().unwrap();
+    assert!(!compare.summary.no_oracle_data, "a scip-clang run exists: {compare:?}");
+    assert_eq!(compare.summary.contradictions, 1, "scip-clang verdict must surface: {compare:?}");
+    assert_eq!(compare.contradictions[0].edge_id, edge_id);
+    assert!(
+        compare.query.tool.contains("scip-clang"),
+        "the report must name the contributing backend, got `{}`",
+        compare.query.tool
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// #82 P0: when a run EXISTS but examined 0 in-scope verdicts, `compare_graph_to_scip` must WARN
 /// — that is "run-but-empty" (the silent symptom of the scope bug), not "compiler agrees". Here
 /// a run writes a verdict, then the callsite file drifts so the current-content gate

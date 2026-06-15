@@ -463,6 +463,27 @@ pub fn latest_run_tool_version(
     store::latest_run_tool_version(conn, tool, commit_sha, worktree_id)
 }
 
+/// Every oracle tool that has at least one run in this checkout, paired with its latest
+/// `tool_version`. The multi-language surfacing seam (#176): the graph read paths
+/// (`enrich_hops_with_oracle`, `compare_graph_to_scip`) iterate THIS rather than hardcoding
+/// `RustAnalyzer`, so a repo indexed in several languages surfaces each backend's verdicts on its
+/// own edges. An edge belongs to one language, so at most one tool ever has a verdict for it — the
+/// per-tool verdict sets are disjoint and merge cleanly. Tools with no run in scope are skipped.
+pub fn latest_runs_in_scope(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<Vec<(OracleTool, String)>> {
+    let mut runs = Vec::new();
+    for &tool in OracleTool::ALL {
+        if let Some(version) = store::latest_run_tool_version(conn, tool, commit_sha, worktree_id)?
+        {
+            runs.push((tool, version));
+        }
+    }
+    Ok(runs)
+}
+
 /// The `started_at` (Unix-epoch ms) of the most recent run for `tool` in the active checkout, or
 /// `None` when no run exists — the staleness clock the background auto-fresh oracle compares
 /// against the index's `indexed_at_ms`. See [`auto_run_decision`].

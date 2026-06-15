@@ -199,7 +199,20 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_core::Config) {
                 None => return Ok(()),
             }
         };
+        // The languages this checkout actually indexes. Gating background runs to these (#176)
+        // stops the auto-run loop from invoking a backend whose language isn't present —
+        // e.g. scip-python installed but no Python target: it would index nothing, fail,
+        // the error would be swallowed with no `oracle_runs` row recorded, and the loop
+        // would retry the doomed run every poll.
+        let configured_languages: std::collections::HashSet<&str> =
+            config.targets.iter().map(|target| target.language.as_str()).collect();
         for &tool in OracleTool::ALL {
+            // Skip a backend whose language this checkout doesn't index — never auto-run it here
+            // (the status registry stays broad; only background runs are gated).
+            let manifest = oracle::ToolManifest::for_tool(tool);
+            if !manifest.languages.iter().any(|lang| configured_languages.contains(lang)) {
+                continue;
+            }
             // Cheap probe before any decision: an uninstalled tool can never run, so don't even
             // read its run history.
             if matches!(oracle::probe_oracle_tool(tool), oracle::ToolAvailability::Blocked { .. }) {

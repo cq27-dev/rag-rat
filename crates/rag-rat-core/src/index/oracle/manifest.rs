@@ -176,13 +176,22 @@ impl ToolManifest {
             // subcommand. `--cwd <root>` is where it resolves the project + its installed deps;
             // `--project-name` (the root's dir name) becomes the package component of in-corpus
             // monikers, so a non-empty name is what lets `count_symbols_with_moniker` see them.
-            // `--output` is absolute, so it's unaffected by `--cwd`.
+            // `--project-version _` is PINNED (Codex on #176): scip-python otherwise defaults the
+            // version to the checkout's git revision, which is embedded in every SCIP symbol
+            // string, so every commit would churn all Python monikers — breaking
+            // moniker-anchored memory relocation (which resolves by exact moniker per
+            // tool). A constant version keeps a symbol's moniker stable across commits
+            // (and sidesteps scip-python's crash on a non-git checkout, where the
+            // git-rev default is undefined). `--output` is absolute, so it's unaffected
+            // by `--cwd`.
             OracleTool::ScipPython => {
                 let project_name = root.file_name().and_then(|n| n.to_str()).unwrap_or("project");
                 let mut cmd = Command::new(self.program);
                 cmd.arg("index")
                     .arg("--project-name")
                     .arg(project_name)
+                    .arg("--project-version")
+                    .arg("_")
                     .arg("--cwd")
                     .arg(root)
                     .arg("--output")
@@ -323,6 +332,9 @@ mod tests {
             "index",
             "--project-name",
             "requests",
+            // Pinned constant version (Codex #176): keeps monikers stable across commits.
+            "--project-version",
+            "_",
             "--cwd",
             "/work/requests",
             "--output",

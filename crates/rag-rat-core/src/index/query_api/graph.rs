@@ -64,26 +64,30 @@ impl IndexDatabase {
         if hops.is_empty() {
             return Ok(false);
         }
-        let tool = oracle::OracleTool::RustAnalyzer;
-        let Some(tool_version) = oracle::latest_run_tool_version(
-            self.storage.connection(),
-            tool,
-            &self.active_commit_sha,
-            &self.active_worktree_id,
-        )?
-        else {
+        // Merge verdicts from EVERY oracle backend that has a run in this checkout, not just
+        // rust-analyzer (#176): a mixed-language repo has rust-analyzer/scip-clang/scip-python
+        // runs, and a Python (or C) edge's `compiler` tier lives under that tool's verdicts. An
+        // edge belongs to one language, so the per-tool verdict sets are disjoint — merging can't
+        // collide.
+        let conn = self.storage.connection();
+        let runs =
+            oracle::latest_runs_in_scope(conn, &self.active_commit_sha, &self.active_worktree_id)?;
+        if runs.is_empty() {
             // No oracle run for this checkout — nothing to surface, all hops stay heuristic.
             return Ok(false);
-        };
+        }
         let edge_ids = hops.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
-        let verdicts = oracle::current_oracle_verdicts_for_edges(
-            self.storage.connection(),
-            tool,
-            &tool_version,
-            &self.active_commit_sha,
-            &self.active_worktree_id,
-            &edge_ids,
-        )?;
+        let mut verdicts = std::collections::HashMap::new();
+        for (tool, tool_version) in &runs {
+            verdicts.extend(oracle::current_oracle_verdicts_for_edges(
+                conn,
+                *tool,
+                tool_version,
+                &self.active_commit_sha,
+                &self.active_worktree_id,
+                &edge_ids,
+            )?);
+        }
         if verdicts.is_empty() {
             return Ok(false);
         }
@@ -428,17 +432,16 @@ impl IndexDatabase {
     pub fn compare_graph_to_scip(
         &self,
     ) -> anyhow::Result<crate::query::graph::CompareGraphScipReport> {
-        let tool = oracle::OracleTool::RustAnalyzer;
         let conn = self.storage.connection();
-        let tool_version = oracle::latest_run_tool_version(
-            conn,
-            tool,
-            &self.active_commit_sha,
-            &self.active_worktree_id,
-        )?;
+        // Compare against EVERY backend with a run in this checkout, not just rust-analyzer (#176):
+        // a mixed-language repo's contradictions span tools (a C edge under scip-clang, a Python
+        // edge under scip-python). Verdict sets are disjoint by edge language, so aggregating is a
+        // plain concatenation.
+        let runs =
+            oracle::latest_runs_in_scope(conn, &self.active_commit_sha, &self.active_worktree_id)?;
         let mut summary = crate::query::graph::CompareGraphScipSummary::default();
         let mut contradictions = Vec::new();
-        let Some(version) = tool_version.clone() else {
+        if runs.is_empty() {
             summary.no_oracle_data = true;
             summary.warnings.push(
                 "no oracle run for this checkout; run `rag-rat oracle run` to populate compiler \
@@ -447,7 +450,7 @@ impl IndexDatabase {
             );
             return Ok(crate::query::graph::CompareGraphScipReport {
                 query: crate::query::graph::CompareGraphScipQuery {
-                    tool: tool.as_db_str().to_string(),
+                    tool: String::new(),
                     tool_version: None,
                     commit_sha: self.active_commit_sha.clone(),
                     worktree_id: self.active_worktree_id.clone(),
@@ -455,15 +458,51 @@ impl IndexDatabase {
                 summary,
                 contradictions,
             });
-        };
-        let comparisons = oracle::current_oracle_comparisons(
-            conn,
-            tool,
-            &version,
-            &self.active_commit_sha,
-            &self.active_worktree_id,
-        )?;
-        summary.verdicts_examined = u64::try_from(comparisons.len()).unwrap_or(u64::MAX);
+        }
+        for (tool, version) in &runs {
+            let comparisons = oracle::current_oracle_comparisons(
+                conn,
+                *tool,
+                version,
+                &self.active_commit_sha,
+                &self.active_worktree_id,
+            )?;
+            summary.verdicts_examined += u64::try_from(comparisons.len()).unwrap_or(u64::MAX);
+            for comparison in comparisons {
+                if comparison.kind != oracle::OracleResolutionKind::Contradict {
+                    continue;
+                }
+                contradictions.push(crate::query::graph::GraphScipContradiction {
+                    edge_id: comparison.edge_id,
+                    edge_kind: comparison.edge_kind,
+                    heuristic_confidence: crate::query::graph::normalize_confidence(
+                        &comparison.heuristic_confidence,
+                    )
+                    .to_string(),
+                    heuristic_target: comparison.heuristic_target,
+                    callee_name: comparison.callee_name,
+                    // Label `resolved-external` ONLY for a contradiction the compiler resolved
+                    // OUTSIDE the corpus (`resolved_symbol_id IS NULL`). A Rust SCIP symbol carries
+                    // a crate/package component even for the LOCAL crate (`scip-rust crate
+                    // held-mini …`), so deriving the label from `scip_symbol`
+                    // alone would mislabel an IN-CORPUS contradiction (the
+                    // compiler resolved to a *different* in-corpus symbol) as
+                    // `resolved-external(<local-crate>)` (#82 finding 1). An in-corpus
+                    // contradiction is a same-corpus disagreement, not an external placement.
+                    resolved_external: comparison
+                        .resolved_symbol_id
+                        .is_none()
+                        .then(|| resolved_external_label(&comparison.scip_symbol))
+                        .flatten(),
+                    scip_symbol: comparison.scip_symbol,
+                    callsite: Some(crate::query::graph::Callsite {
+                        path: comparison.callsite_path,
+                        line: comparison.callsite_line,
+                        span: [comparison.callsite_line, comparison.callsite_line],
+                    }),
+                });
+            }
+        }
         // A run exists for this checkout but produced ZERO in-scope verdicts to compare. This is
         // NOT "the compiler agrees with the graph" — it is "the run found nothing in this
         // checkout's scope," which is exactly the silent-no-op symptom the #82 P0 scope bug
@@ -477,44 +516,15 @@ impl IndexDatabase {
                     .to_string(),
             );
         }
-        for comparison in comparisons {
-            if comparison.kind != oracle::OracleResolutionKind::Contradict {
-                continue;
-            }
-            contradictions.push(crate::query::graph::GraphScipContradiction {
-                edge_id: comparison.edge_id,
-                edge_kind: comparison.edge_kind,
-                heuristic_confidence: crate::query::graph::normalize_confidence(
-                    &comparison.heuristic_confidence,
-                )
-                .to_string(),
-                heuristic_target: comparison.heuristic_target,
-                callee_name: comparison.callee_name,
-                // Label `resolved-external` ONLY for a contradiction the compiler resolved OUTSIDE
-                // the corpus (`resolved_symbol_id IS NULL`). A Rust SCIP symbol carries a
-                // crate/package component even for the LOCAL crate (`scip-rust crate held-mini …`),
-                // so deriving the label from `scip_symbol` alone would mislabel an IN-CORPUS
-                // contradiction (the compiler resolved to a *different* in-corpus symbol) as
-                // `resolved-external(<local-crate>)` (#82 finding 1). An in-corpus contradiction is
-                // a same-corpus disagreement, not an external placement.
-                resolved_external: comparison
-                    .resolved_symbol_id
-                    .is_none()
-                    .then(|| resolved_external_label(&comparison.scip_symbol))
-                    .flatten(),
-                scip_symbol: comparison.scip_symbol,
-                callsite: Some(crate::query::graph::Callsite {
-                    path: comparison.callsite_path,
-                    line: comparison.callsite_line,
-                    span: [comparison.callsite_line, comparison.callsite_line],
-                }),
-            });
-        }
         summary.contradictions = u64::try_from(contradictions.len()).unwrap_or(u64::MAX);
         Ok(crate::query::graph::CompareGraphScipReport {
             query: crate::query::graph::CompareGraphScipQuery {
-                tool: tool.as_db_str().to_string(),
-                tool_version,
+                // The tools (and their versions) that contributed verdicts, joined — the report now
+                // spans every backend with a run, not a single hardcoded tool.
+                tool: runs.iter().map(|(tool, _)| tool.as_db_str()).collect::<Vec<_>>().join(","),
+                tool_version: Some(
+                    runs.iter().map(|(_, version)| version.clone()).collect::<Vec<_>>().join(","),
+                ),
                 commit_sha: self.active_commit_sha.clone(),
                 worktree_id: self.active_worktree_id.clone(),
             },
