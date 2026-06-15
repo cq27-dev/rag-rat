@@ -373,7 +373,36 @@ fn impact_surface_from_targets(
     let current_paths = surface.current_paths();
     historical_evidence(conn, &current_paths, query, &mut surface, max_items)?;
 
-    Ok(surface.into_items(max_items))
+    // #150: the flat shape capped at `limit` silently — a capped result read as complete. When the
+    // combined surface overflowed, append a visible completeness sentinel (the flat-shape analogue
+    // of the structured report's `truncated_sections`). Kept as a trailing `ImpactItem` so the
+    // compatibility `Vec<ImpactItem>` shape is unchanged; `category`/`kind` = `"completeness"` so a
+    // reader can detect it structurally.
+    let total = surface.len();
+    let mut items = surface.into_items(max_items);
+    if total > max_items {
+        items.push(impact_truncation_notice(max_items, total));
+    }
+    Ok(items)
+}
+
+/// Trailing sentinel flagging that a flat `impact_surface` result was capped at `limit` of `total`
+/// items (#150) — so a truncated flat result can't be mistaken for complete. Carries the dropped
+/// count in `evidence`; `category`/`kind` are `"completeness"` for structural detection.
+fn impact_truncation_notice(limit: usize, total: usize) -> ImpactItem {
+    ImpactItem {
+        path: String::new(),
+        language: String::new(),
+        kind: "completeness".to_string(),
+        symbol: None,
+        category: "completeness".to_string(),
+        reason: format!(
+            "result capped at {limit} of {total} impact items — more exist; raise `limit`, or use \
+             a symbol selector (symbol_path/symbol) for the structured report with per-section \
+             truncation"
+        ),
+        evidence: vec![format!("{} additional items not shown", total - limit)],
+    }
 }
 
 pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactItem>> {

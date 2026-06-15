@@ -3044,6 +3044,60 @@ pub fn caller() {
 }
 
 #[test]
+fn impact_surface_flat_signals_truncation_when_capped() {
+    // #150: the flat (free-text query) impact shape capped at `limit` SILENTLY — a capped result
+    // read as complete. A capped result must now carry a visible `completeness` sentinel (the
+    // flat-shape analogue of the structured report's `truncated_sections`).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn leaf_a() {}
+pub fn leaf_b() {}
+pub fn leaf_c() {}
+pub fn leaf_d() {}
+
+pub fn hub() {
+    leaf_a();
+    leaf_b();
+    leaf_c();
+    leaf_d();
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // A tiny limit forces truncation: `hub`'s own definition plus four callee neighbors overflow
+    // it.
+    let limit = 2u32;
+    let impact = db.impact_surface("hub", limit).unwrap();
+    let sentinel = impact
+        .iter()
+        .find(|item| item.category == "completeness")
+        .expect("a capped flat result must carry a completeness sentinel (#150)");
+    assert!(sentinel.reason.contains("capped"), "sentinel explains the cap: {sentinel:?}");
+    assert!(
+        sentinel.evidence.iter().any(|evidence| evidence.contains("not shown")),
+        "sentinel carries the dropped count: {sentinel:?}"
+    );
+    let real_items = impact.iter().filter(|item| item.category != "completeness").count();
+    assert_eq!(real_items, limit as usize, "exactly `limit` real items, plus the sentinel");
+
+    // A generous limit drops nothing, so no sentinel appears — it must not cry wolf.
+    let full = db.impact_surface("hub", 100).unwrap();
+    assert!(
+        full.iter().all(|item| item.category != "completeness"),
+        "an uncapped result must NOT carry a sentinel: {full:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn impact_surface_collapses_file_matches_to_one_row_per_file() {
     // Regression for #48: a file-granularity match (path/chunk text) used to fan out into one
     // row per symbol in the file. Each such section must now yield at most one row per file.
