@@ -73,7 +73,14 @@ impl RagRatService {
     /// the one MCP-native channel that puts an actionable signal in front of the model. The nudge
     /// self-limits: once the agent runs `memory_rebind`, the count drops to 0 and it stops showing.
     /// Best-effort + lock-free (a bare read-only count), so it never slows or fails a tool call.
+    ///
+    /// Suppressed in `--json` mode: that mode exists for clients that parse the tool text AS JSON
+    /// (or concatenate all text blocks), and a prose block would break them. The nudge is
+    /// agent-directed prose, meaningful only in the default TOON (LLM-facing) mode.
     fn stale_memory_nudge(&self) -> Option<String> {
+        if self.output_format == rag_rat_core::OutputFormat::Json {
+            return None;
+        }
         let n = rag_rat_core::memory_attention_count(&self.config.database);
         (n > 0).then(|| {
             let noun = if n == 1 { "memory" } else { "memories" };
@@ -666,7 +673,7 @@ mod tests {
 
     static N: AtomicU64 = AtomicU64::new(0);
 
-    fn service_over_temp_repo() -> (PathBuf, RagRatService) {
+    fn config_over_temp_repo() -> (PathBuf, Config) {
         let root = std::env::temp_dir().join(format!(
             "rag-rat-server-test-{}-{}",
             std::process::id(),
@@ -691,7 +698,45 @@ mod tests {
             oracle: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
+        (root, config)
+    }
+
+    fn service_over_temp_repo() -> (PathBuf, RagRatService) {
+        let (root, config) = config_over_temp_repo();
         (root, RagRatService::new(config, OutputFormat::Toon))
+    }
+
+    /// The staleness nudge (#160) rides a TOON tool result as a second content block, but is
+    /// SUPPRESSED in `--json` mode so JSON-parsing clients aren't broken (Codex #160 review).
+    #[test]
+    fn stale_memory_nudge_rides_toon_but_not_json() {
+        let (root, config) = config_over_temp_repo();
+        // A memory bound to an unindexed/absent path resolves `gone` → drift the nudge reports.
+        let toon = RagRatService::new(config.clone(), OutputFormat::Toon);
+        toon.call(
+            "memory_create",
+            json!({
+                "kind": "Invariant",
+                "title": "drift",
+                "body": "b",
+                "confidence": "high",
+                "bind": {"path": "does/not/exist.rs"}
+            }),
+        )
+        .unwrap();
+        // A path binding is created `current`; validation flips the absent path to `gone`.
+        toon.call("memory_validate", json!({})).unwrap();
+
+        // TOON (default, LLM-facing): nudge present as a second block.
+        let toon_result = toon.call("index_status", json!({})).unwrap();
+        assert_eq!(toon_result.content.len(), 2, "TOON result carries the nudge block");
+
+        // JSON mode: suppressed (single parseable block).
+        let json_svc = RagRatService::new(config, OutputFormat::Json);
+        let json_result = json_svc.call("index_status", json!({})).unwrap();
+        assert_eq!(json_result.content.len(), 1, "JSON result omits the prose nudge");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
