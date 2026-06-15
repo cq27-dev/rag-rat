@@ -32,9 +32,18 @@ pub(crate) fn git_commits_for_paths(
     conn: &Connection,
     paths: &[String],
     surface: &mut ImpactSurface,
-    limit: usize,
+    budget: usize,
 ) -> anyhow::Result<()> {
-    let mut remaining = limit;
+    // `budget` is the number of distinct history ITEMS this section may add. All commits for one
+    // path collapse to a single `(path, "git_commit_touched_file")` item, so we budget PER PATH
+    // (not per commit row) — otherwise one hot file's commits exhaust the budget and starve later
+    // paths' items, hiding flat-shape truncation (#150 review). Per-path evidence is bounded by
+    // `budget` rows. The structured caller (`git_commit_items`) always passes a single path, so its
+    // behaviour is unchanged.
+    if budget == 0 {
+        return Ok(());
+    }
+    let mut added = 0usize;
     let mut stmt = conn.prepare(
         "
         SELECT files.path, files.language, files.kind,
@@ -48,12 +57,13 @@ pub(crate) fn git_commits_for_paths(
         ",
     )?;
     for path in paths {
-        if remaining == 0 {
+        if added >= budget {
             break;
         }
+        let before = surface.len();
         let file = file_for_path(conn, path)?;
         let rows =
-            stmt.query_map(params![path, i64::try_from(remaining).unwrap_or(i64::MAX)], |row| {
+            stmt.query_map(params![path, i64::try_from(budget).unwrap_or(i64::MAX)], |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
@@ -77,10 +87,9 @@ pub(crate) fn git_commits_for_paths(
                 "git_commit_touched_file",
                 format!("{} touched {path} at {authored_at_s}: {subject}", short_hash(&hash)),
             );
-            remaining = remaining.saturating_sub(1);
-            if remaining == 0 {
-                break;
-            }
+        }
+        if surface.len() > before {
+            added += 1;
         }
     }
     Ok(())
@@ -90,9 +99,14 @@ pub(crate) fn github_refs_for_paths(
     conn: &Connection,
     paths: &[String],
     surface: &mut ImpactSurface,
-    limit: usize,
+    budget: usize,
 ) -> anyhow::Result<()> {
-    let mut remaining = limit;
+    // Budget per PATH (one `(path, "github_papertrail")` item per path), not per ref row — same
+    // item-vs-row reasoning as `git_commits_for_paths` (#150 review).
+    if budget == 0 {
+        return Ok(());
+    }
+    let mut added = 0usize;
     let mut stmt = conn.prepare(
         "
         SELECT owner, repo, number, ref_kind, source_kind, source_text
@@ -103,12 +117,13 @@ pub(crate) fn github_refs_for_paths(
         ",
     )?;
     for path in paths {
-        if remaining == 0 {
+        if added >= budget {
             break;
         }
+        let before = surface.len();
         let file = file_for_path(conn, path)?;
         let rows =
-            stmt.query_map(params![path, i64::try_from(remaining).unwrap_or(i64::MAX)], |row| {
+            stmt.query_map(params![path, i64::try_from(budget).unwrap_or(i64::MAX)], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -126,10 +141,9 @@ pub(crate) fn github_refs_for_paths(
                 "github_papertrail",
                 format!("{owner}/{repo}#{number} {ref_kind}/{source_kind}: {source_text}"),
             );
-            remaining = remaining.saturating_sub(1);
-            if remaining == 0 {
-                break;
-            }
+        }
+        if surface.len() > before {
+            added += 1;
         }
     }
     Ok(())
@@ -225,4 +239,61 @@ pub(crate) fn collect_rows<T>(
         out.push(row?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::schema;
+
+    fn commit(conn: &Connection, hash: &str, path: &str, ts: i64) {
+        conn.execute(
+            "INSERT OR IGNORE INTO git_commits(hash, author_name, author_email, authored_at_s, \
+             committed_at_s, subject, body) VALUES (?1, 'a', 'a@b', ?2, ?2, ?3, '')",
+            rusqlite::params![hash, ts, format!("touch {path}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO git_file_changes(commit_hash, path) VALUES (?1, ?2)",
+            rusqlite::params![hash, path],
+        )
+        .unwrap();
+    }
+
+    /// #150 review: `git_commits_for_paths` budgets by ITEM (one per path), not by commit row — so a
+    /// hot file with many commits can't exhaust the budget and starve a later path's history item.
+    #[test]
+    fn git_commits_budget_is_per_path_not_per_commit_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        // `hot.rs` has THREE commits; `cool.rs` has one. All of hot.rs's commits collapse to a
+        // single `(hot.rs, "git_commit_touched_file")` item.
+        commit(&conn, "c1", "hot.rs", 30);
+        commit(&conn, "c2", "hot.rs", 20);
+        commit(&conn, "c3", "hot.rs", 10);
+        commit(&conn, "c4", "cool.rs", 5);
+
+        let mut surface = ImpactSurface::default();
+        // Budget of 2 ITEMS. The old per-row budget would spend both slots on hot.rs's commits and
+        // never reach cool.rs; the per-path budget must surface BOTH files.
+        git_commits_for_paths(
+            &conn,
+            &["hot.rs".to_string(), "cool.rs".to_string()],
+            &mut surface,
+            2,
+        )
+        .unwrap();
+
+        let items = surface.into_items(10);
+        let paths: std::collections::BTreeSet<&str> =
+            items.iter().map(|item| item.path.as_str()).collect();
+        assert!(paths.contains("hot.rs"), "hot.rs item present: {items:?}");
+        assert!(
+            paths.contains("cool.rs"),
+            "cool.rs must not be starved by hot.rs's commits: {items:?}"
+        );
+        // hot.rs's three commits collapsed into one item carrying multiple evidence lines.
+        let hot = items.iter().find(|item| item.path == "hot.rs").unwrap();
+        assert!(hot.evidence.len() >= 2, "collapsed commits accumulate evidence: {hot:?}");
+    }
 }
