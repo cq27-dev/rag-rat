@@ -1,4 +1,5 @@
 export function openDatabase(): void {
+  // Open the on-device database connection through the native bridge.
   NativeHeldCore.openDatabase();
 }
 
@@ -14,7 +15,10 @@ export class BridgeClient {
   open(): void {}
 }
 
-export const useBridge = () => bridgeName;
+export const useBridge = (): string => {
+  const currentBridgeName = bridgeName;
+  return currentBridgeName;
+};
 
 export const BridgeBadge = function BridgeBadge() {
   return bridgeName;

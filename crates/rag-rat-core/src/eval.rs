@@ -845,6 +845,21 @@ mod tests {
         config.database = db_dir.join("index.sqlite");
 
         IndexDatabase::rebuild(&config).unwrap();
+
+        // When an embedding backend is compiled in (default features), install its model and
+        // reconcile so the eval exercises the real hybrid (lexical + semantic) retrieval path the
+        // product ships. Under `--no-default-features` (hash embedder, no model) this block is
+        // compiled out and the eval runs lexical-only — the baseline must pass either way. The
+        // model download is cached in CI via `RAG_RAT_MODEL_CACHE` (see eval.yml).
+        #[cfg(feature = "fastembed")]
+        {
+            let db = IndexDatabase::open_config(&config).unwrap();
+            if let Some(model_id) = config.local_ai.embedding.backend.model_id() {
+                db.install_model(model_id).expect("install embedding model");
+                db.reconcile(None, None).expect("reconcile embeddings");
+            }
+        }
+
         let report = run(&config, &EvalOptions {
             queries_path: workspace_root().join("evals/queries.toml"),
             expected_path: workspace_root().join("evals/expected_hits.toml"),
@@ -852,6 +867,17 @@ mod tests {
             scip_path: None,
         })
         .unwrap();
+        // The hand-authored `must_include_*` baseline is the hard gate: every expectation must be
+        // met (no current-source-safety violations, every required symbol/path/graph target found).
+        let failures = report
+            .results
+            .iter()
+            .filter(|r| !r.passed)
+            .map(|r| {
+                (r.id.as_str(), &r.missing_symbols, &r.missing_paths, &r.missing_graph_targets)
+            })
+            .collect::<Vec<_>>();
+        assert!(report.pass, "eval baseline regressed: {failures:#?}");
         assert_eq!(report.metrics.stale_current_source_violations, 0);
         assert!(report.metrics.mrr_at_10 > 0.0);
         assert!(report.metrics.recall_at_10 > 0.0);
