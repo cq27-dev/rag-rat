@@ -1,4 +1,5 @@
 mod api;
+mod hydrate;
 mod moniker;
 mod resolve;
 mod validate;
@@ -6,6 +7,7 @@ use std::collections::BTreeSet;
 
 pub use api::memory_evidence_for_symbol;
 pub(crate) use api::*;
+pub(crate) use hydrate::*;
 pub(crate) use moniker::*;
 pub(crate) use resolve::*;
 use rusqlite::{Connection, OptionalExtension, params};
