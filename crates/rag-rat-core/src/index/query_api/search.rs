@@ -109,7 +109,7 @@ impl IndexDatabase {
         symbol: &crate::query::symbol::SymbolHit,
         limit: u32,
     ) -> anyhow::Result<Vec<SearchHit>> {
-        let mut hits = self.local_symbol_context_hits(symbol, limit)?;
+        let mut hits = self.find_local_symbol_context_hits(symbol, limit)?;
         hits.extend(self.search(&symbol.name, limit.saturating_mul(4).max(limit), true)?);
         rank_docs_for_symbol(symbol, &mut hits);
         dedupe_search_hits(&mut hits);

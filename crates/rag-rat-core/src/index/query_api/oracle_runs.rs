@@ -1,3 +1,6 @@
+//! Oracle-run query surface on `IndexDatabase`: run the SCIP/compiler oracle (tool-driven or from a
+//! SCIP file), snapshot/probe tool availability, and read run status, versions, and eval metrics.
+
 use std::path::Path;
 
 use super::*;

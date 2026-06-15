@@ -1,3 +1,7 @@
+//! Symbol-importance query surface on `IndexDatabase`: PageRank-ranked `important_symbols` (with
+//! seed resolution for personalization) and the load-bearing-callee enrichment of search/symbol/
+//! neighbor hits.
+
 use rusqlite::OptionalExtension;
 
 use super::*;

@@ -1,3 +1,6 @@
+//! Git- and GitHub-history query surface on `IndexDatabase`: commit/rationale search, per-path and
+//! per-symbol history, blame, and GitHub ref/issue sync + lookup.
+
 use super::*;
 
 impl IndexDatabase {

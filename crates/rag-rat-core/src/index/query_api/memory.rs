@@ -1,3 +1,6 @@
+//! Repo-memory query surface on `IndexDatabase`: create/update/obsolete, search, anchor resolution
+//! (by symbol / path / call-path), rebind, and the validate/doctor anchor-health passes.
+
 use super::*;
 
 impl IndexDatabase {

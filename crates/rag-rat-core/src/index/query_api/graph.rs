@@ -1,3 +1,6 @@
+//! Graph-query surface on `IndexDatabase`: caller/callee traversal (find_callers / trace_callees),
+//! impact_surface / ffi_surface, and the graph-vs-text / graph-vs-scip completeness comparisons.
+
 use super::{annotate_completeness_with_externals, resolved_external_label, *};
 
 impl IndexDatabase {
@@ -212,7 +215,8 @@ impl IndexDatabase {
         // *level* string is unchanged; the clause just tells the caller how much of the gap is a
         // known external dependency rather than a resolver miss.
         annotate_completeness_with_externals(&mut summary, &results);
-        let (logical_symbol, variants) = self.graph_logical_symbol(options.logical_symbol_id)?;
+        let (logical_symbol, variants) =
+            self.read_graph_logical_symbol(options.logical_symbol_id)?;
         let mut paths = BTreeSet::new();
         paths.insert(symbol.path.clone());
         for result in &results {
@@ -266,7 +270,8 @@ impl IndexDatabase {
                 edge.callsite.as_ref().is_none_or(|callsite| !is_test_like_path(&callsite.path))
             });
         }
-        let (logical_symbol, variants) = self.graph_logical_symbol(options.logical_symbol_id)?;
+        let (logical_symbol, variants) =
+            self.read_graph_logical_symbol(options.logical_symbol_id)?;
         let text_hits = self.find_regex_hits(pattern, &regex, include_tests)?;
         let text_by_location = text_hits
             .iter()
@@ -518,7 +523,7 @@ impl IndexDatabase {
         })
     }
 
-    fn graph_logical_symbol(
+    fn read_graph_logical_symbol(
         &self,
         logical_symbol_id: Option<i64>,
     ) -> anyhow::Result<(
@@ -579,7 +584,7 @@ impl IndexDatabase {
         Ok(options)
     }
 
-    pub(super) fn local_symbol_context_hits(
+    pub(super) fn find_local_symbol_context_hits(
         &self,
         symbol: &crate::query::symbol::SymbolHit,
         limit: u32,
