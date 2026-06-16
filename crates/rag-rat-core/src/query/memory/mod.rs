@@ -210,6 +210,95 @@ pub struct RepoMemoryEvidence {
     pub stale: Vec<RepoMemory>,
 }
 
+impl RepoMemoryEvidence {
+    /// Project to the scannable compact view (#37): drops bodies, extra bindings, and call paths,
+    /// keeping the per-lane header an agent skims during preflight. Field names match the full
+    /// evidence so the wire shape is identical apart from per-memory detail.
+    pub fn compact(&self) -> CompactRepoMemoryEvidence {
+        let project =
+            |memories: &[RepoMemory]| memories.iter().map(CompactRepoMemory::from).collect();
+        CompactRepoMemoryEvidence {
+            direct: project(&self.direct),
+            path_crossed: project(&self.path_crossed),
+            call_path_crossed: project(&self.call_path_crossed),
+            stale: project(&self.stale),
+        }
+    }
+}
+
+/// Compact (default) view of `RepoMemoryEvidence` for `impact_surface` (#37) — same lane layout,
+/// each memory summarized to its high-signal header by [`CompactRepoMemory`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactRepoMemoryEvidence {
+    pub direct: Vec<CompactRepoMemory>,
+    pub path_crossed: Vec<CompactRepoMemory>,
+    #[serde(default)]
+    pub call_path_crossed: Vec<CompactRepoMemory>,
+    pub stale: Vec<CompactRepoMemory>,
+}
+
+/// A one-line-scannable projection of a [`RepoMemory`] for `impact_surface`'s default output (#37):
+/// what the memory says (kind/title/confidence/status) and where its *primary* binding
+/// (`bindings.first()`) is anchored — without the full body, the remaining bindings, or call paths.
+/// Full detail stays available via `memory_for_symbol` / `memory_for_path` /
+/// `memory_for_call_path`, or `impact_surface` full mode (`include` unaffected; `full_memories:
+/// true`).
+///
+/// Future direction: this header could carry a short LLM-generated `summary` of the full body,
+/// produced by an out-of-process local model (Ollama) rather than truncating the title — see the
+/// local-AI memory-maintenance spike (#122), which already commits to keeping Ollama out of the
+/// binary. Until that lands, the projection stays purely mechanical (no model dependency here).
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactRepoMemory {
+    pub memory_id: String,
+    pub kind: String,
+    pub title: String,
+    pub confidence: String,
+    pub status: String,
+    /// Anchor status of the primary binding (`current` / `stale` / …); `None` when unbound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// `[start_line, end_line]` of the primary binding when both are known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<[i64; 2]>,
+    // Opaque `sym_<hex>` handle of the primary binding when it's a symbol binding — the actionable
+    // key for a follow-up `memory_for_symbol` / `impact_surface` full lookup (#149).
+    #[serde(
+        rename = "id",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
+    )]
+    pub logical_symbol_id: Option<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl From<&RepoMemory> for CompactRepoMemory {
+    fn from(memory: &RepoMemory) -> Self {
+        let primary = memory.bindings.first();
+        Self {
+            memory_id: memory.memory_id.clone(),
+            kind: memory.kind.clone(),
+            title: memory.title.clone(),
+            confidence: memory.confidence.clone(),
+            status: memory.status.clone(),
+            anchor_status: primary.map(|binding| binding.anchor_status.clone()),
+            binding_kind: primary.map(|binding| binding.binding_kind.clone()),
+            path: primary.and_then(|binding| binding.path.clone()),
+            span: primary.and_then(|binding| match (binding.start_line, binding.end_line) {
+                (Some(start), Some(end)) => Some([start, end]),
+                _ => None,
+            }),
+            logical_symbol_id: primary.and_then(|binding| binding.logical_symbol_id),
+            tags: memory.tags.clone(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ResolvedBinding {
     binding_kind: String,

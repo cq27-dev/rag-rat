@@ -4134,9 +4134,183 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
             &crate::query::impact::ImpactSurfaceOptions::default(),
         )
         .unwrap();
-    assert_eq!(impact.repo_memories.direct.len(), 1);
+    assert_eq!(impact.repo_memories.compact().unwrap().direct.len(), 1);
     assert_eq!(impact.completeness_and_caveats.memory_status.active, 1);
     assert_eq!(impact.completeness_and_caveats.memory_status.stale, 0);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn compact_repo_memory_view_projects_primary_binding_then_full_mode_round_trips() {
+    // #37: the default `impact_surface` memory output is the scannable compact projection of each
+    // memory's primary binding; full bodies + bindings stay one explicit flag away.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchored() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("anchored".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("selected symbol");
+    let logical_symbol_id = symbol.logical_symbol_id.expect("logical symbol id");
+    let full_body = "Runtime shutdown must be idempotent; second call is a no-op.".to_string();
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Runtime shutdown must be idempotent".to_string(),
+            body: full_body.clone(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec!["runtime".to_string()],
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: Some(logical_symbol_id),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+    // Default mode is compact: a scannable header projected from the primary binding.
+    let compact_report = db
+        .impact_surface_report_for_selected_symbol(
+            &symbol,
+            10,
+            &crate::query::impact::ImpactSurfaceOptions::default(),
+        )
+        .unwrap();
+    let compact = compact_report.repo_memories.compact().expect("compact by default");
+    assert!(compact_report.repo_memories.full().is_none(), "default must not be full");
+    assert_eq!(compact.direct.len(), 1);
+    let entry = &compact.direct[0];
+    assert_eq!(entry.memory_id, created.memory.memory_id);
+    assert_eq!(entry.kind, "Invariant");
+    assert_eq!(entry.title, "Runtime shutdown must be idempotent");
+    assert_eq!(entry.confidence, "high");
+    assert_eq!(entry.status, "active");
+    assert_eq!(entry.anchor_status.as_deref(), Some("current"));
+    assert_eq!(entry.binding_kind.as_deref(), Some("logical_symbol"));
+    assert_eq!(entry.path.as_deref(), Some("src/lib.rs"));
+    assert!(entry.span.is_some(), "logical-symbol binding carries a line span");
+    assert_eq!(entry.logical_symbol_id, Some(logical_symbol_id));
+    assert_eq!(entry.tags, vec!["runtime".to_string()]);
+
+    // Explicit full mode restores the body + full bindings for deep inspection.
+    let full_report = db
+        .impact_surface_report_for_selected_symbol(
+            &symbol,
+            10,
+            &crate::query::impact::ImpactSurfaceOptions {
+                compact_memories: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let full = full_report.repo_memories.full().expect("full on request");
+    assert!(full_report.repo_memories.compact().is_none(), "full mode is not compact");
+    assert_eq!(full.direct.len(), 1);
+    assert_eq!(full.direct[0].body, full_body);
+    assert_eq!(full.direct[0].bindings[0].binding_kind, "logical_symbol");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn compact_repo_memory_view_separates_the_stale_lane() {
+    // #37: a memory whose anchor went stale lands in the compact `stale` lane (not `direct`), with
+    // its `anchor_status` carried through so an agent can see it needs re-anchoring.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn drifting() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("drifting".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("selected symbol");
+    let chunk_id = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                SELECT chunks.id
+                FROM chunks
+                JOIN files ON files.id = chunks.file_id
+                WHERE files.path = ?1 AND chunks.symbol_path = ?2
+                LIMIT 1
+                ",
+            params![symbol.path, symbol.qualified_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Risk".to_string(),
+            title: "Anchor drifts when the chunk hash changes".to_string(),
+            body: "Stale anchors belong in their own lane, away from current evidence.".to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                chunk_id: Some(chunk_id),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+    // Current anchor: the memory is in the active `direct` lane, stale lane empty.
+    let before = db
+        .impact_surface_report_for_selected_symbol(
+            &symbol,
+            10,
+            &crate::query::impact::ImpactSurfaceOptions::default(),
+        )
+        .unwrap();
+    let before = before.repo_memories.compact().unwrap();
+    assert_eq!(before.direct.len(), 1);
+    assert!(before.stale.is_empty());
+
+    // Drift the underlying chunk so validation marks the binding stale.
+    db.storage
+        .connection()
+        .execute("UPDATE chunks SET text_hash = 'changed' WHERE id = ?1", [chunk_id])
+        .unwrap();
+    assert_eq!(db.memory_validate().unwrap().stale, 1);
+
+    let after = db
+        .impact_surface_report_for_selected_symbol(
+            &symbol,
+            10,
+            &crate::query::impact::ImpactSurfaceOptions::default(),
+        )
+        .unwrap();
+    let after = after.repo_memories.compact().unwrap();
+    assert!(after.direct.is_empty(), "a stale memory leaves the direct lane");
+    assert_eq!(after.stale.len(), 1);
+    assert_eq!(after.stale[0].memory_id, created.memory.memory_id);
+    assert_eq!(after.stale[0].anchor_status.as_deref(), Some("stale"));
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -4385,9 +4559,10 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
             },
         )
         .unwrap();
-    assert!(impact.repo_memories.direct.is_empty());
-    assert_eq!(impact.repo_memories.path_crossed.len(), 1);
-    assert_eq!(impact.repo_memories.path_crossed[0].memory_id, edge_memory.memory.memory_id);
+    let compact = impact.repo_memories.compact().unwrap();
+    assert!(compact.direct.is_empty());
+    assert_eq!(compact.path_crossed.len(), 1);
+    assert_eq!(compact.path_crossed[0].memory_id, edge_memory.memory.memory_id);
     assert_eq!(impact.completeness_and_caveats.memory_status.active, 1);
 
     let call_path_memory = db
@@ -4626,14 +4801,14 @@ fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
     )
     .unwrap();
 
+    let compact = report.repo_memories.compact().unwrap();
     assert!(
-        report
-            .repo_memories
+        compact
             .call_path_crossed
             .iter()
             .any(|memory| memory.title == "a -> b -> c is the hot path"),
         "call-path memory should surface in impact_surface(b); got call_path_crossed = {:?}",
-        report.repo_memories.call_path_crossed.iter().map(|m| &m.title).collect::<Vec<_>>()
+        compact.call_path_crossed.iter().map(|m| &m.title).collect::<Vec<_>>()
     );
 
     fs::remove_dir_all(root).unwrap();

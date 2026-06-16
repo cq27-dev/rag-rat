@@ -58,7 +58,7 @@ To run from a checkout without installing, use a project-scoped server whose com
 - `find_callers`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("references" | "unresolved" | "macros" | "common_methods" | "coverage" | "memories")[], "edge_kinds"?: string[] }`
 - `trace_callees`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("references" | "unresolved" | "macros" | "common_methods" | "coverage" | "memories")[], "edge_kinds"?: string[] }`
 - `compare_graph_to_text`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "references" | "unresolved" | "macros" | "common_methods")[], "edge_kinds"?: string[] }`
-- `impact_surface`: `{ "query"?: string, "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "docs" | "git" | "papertrail" | "text_fallback" | "memories")[] }`
+- `impact_surface`: `{ "query"?: string, "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "docs" | "git" | "papertrail" | "text_fallback" | "memories")[], "full_memories"?: boolean }`
 - `ffi_surface`: `{ "limit"?: number }`
 - `docs_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include"?: ("memories")[] }`
@@ -87,6 +87,15 @@ tool with `"include": []` returns the bare result. Each tool accepts only its ow
 signatures above). The server also accepts a JSON-string-encoded array (`"[\"git\"]"`) as well as a
 real array, so the surface works even from clients that serialize array params as strings
 ([anthropics/claude-code#24599](https://github.com/anthropics/claude-code/issues/24599)).
+
+**Compact vs full memories.** `impact_surface`'s `repo_memories` payload is **compact by default**
+(#37): each memory is summarized to a scannable header — `memory_id`, `kind`, `title`, `confidence`,
+`status`, and its primary binding's `anchor_status` / `binding_kind` / `path` / `span` / `id` — so an
+agent skims the high-signal facts without scrolling full bodies. The lane shape is unchanged
+(`direct` / `path_crossed` / `call_path_crossed` / `stale`). Pass `"full_memories": true` for the
+full bodies + every binding + call paths, or fetch full detail per-anchor via
+`memory_for_symbol` / `memory_for_path` / `memory_for_call_path`. (`full_memories` is orthogonal to
+`include`: drop `"memories"` from `include` to omit the lane entirely.)
 
 `tools/list` is served by `rmcp` and exposes typed JSON schemas derived from the same request structs
 used by the handlers. Existing tool names and response fields are kept stable for current MCP clients.

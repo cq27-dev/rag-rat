@@ -114,7 +114,9 @@ The highest-leverage ones (full catalog + JSON schemas in [`docs/mcp-tools.md`](
 - **`find_callers` / `trace_callees`** — reverse/forward graph traversal (low-signal std/macro noise
   filtered by default).
 - **`impact_surface`** — the coding preflight: callers, callees, tests, git history, GitHub
-  papertrail, and repo memories for a symbol in one call.
+  papertrail, and repo memories for a symbol in one call. `repo_memories` defaults to a compact,
+  scannable per-memory header (kind, title, confidence, anchor status, and where it's bound); pass
+  `full_memories: true` (or use `memory_for_symbol|path|call_path`) for the full bodies + bindings.
 - **`important_symbols`** — load-bearing symbols by (SCIP-aware) PageRank; see
   [`docs/oracle.md`](docs/oracle.md).
 - **`repo_brief` / `repo_clusters`** — orientation: spine / churn / god-modules / ownership clusters.

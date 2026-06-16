@@ -500,6 +500,7 @@ pub(crate) fn impact_tool(
         include_papertrail: included(&args.include, ImpactInclude::Papertrail, true),
         include_text_fallback: included(&args.include, ImpactInclude::TextFallback, true),
         include_memories: included(&args.include, ImpactInclude::Memories, true),
+        compact_memories: !args.full_memories,
     };
     if args.logical_symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
         let selector = SymbolSelector {

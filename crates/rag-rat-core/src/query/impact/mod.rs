@@ -12,7 +12,7 @@ pub(crate) use select::*;
 use serde::Serialize;
 
 use crate::query::graph::{self, GraphHop, GraphResolutionMode, GraphTraversalOptions};
-use crate::query::memory::{self, RepoMemoryEvidence};
+use crate::query::memory::{self, CompactRepoMemoryEvidence, RepoMemoryEvidence};
 use crate::query::symbol::SymbolHit;
 
 #[derive(Debug, Serialize)]
@@ -36,6 +36,38 @@ pub struct ImpactSurfaceOptions {
     pub include_papertrail: bool,
     pub include_text_fallback: bool,
     pub include_memories: bool,
+    /// Emit `repo_memories` as the scannable compact view (default) rather than full bodies +
+    /// bindings + call paths (#37). The agent-facing MCP default is compact; full detail stays one
+    /// lookup away (`memory_for_symbol` / `memory_for_path` / `memory_for_call_path`).
+    pub compact_memories: bool,
+}
+
+/// `impact_surface`'s `repo_memories` payload — compact by default (#37), full on request. The two
+/// variants serialize with identical field names (`direct` / `path_crossed` / `call_path_crossed` /
+/// `stale`), so only the per-memory detail differs on the wire, not the lane shape.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum RepoMemoryEvidenceView {
+    Compact(CompactRepoMemoryEvidence),
+    Full(RepoMemoryEvidence),
+}
+
+impl RepoMemoryEvidenceView {
+    /// Borrow the full evidence; `None` when this view is compact.
+    pub fn full(&self) -> Option<&RepoMemoryEvidence> {
+        match self {
+            Self::Full(evidence) => Some(evidence),
+            Self::Compact(_) => None,
+        }
+    }
+
+    /// Borrow the compact evidence; `None` when this view is full.
+    pub fn compact(&self) -> Option<&CompactRepoMemoryEvidence> {
+        match self {
+            Self::Compact(evidence) => Some(evidence),
+            Self::Full(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -49,7 +81,7 @@ pub struct ImpactSurfaceReport {
     pub text_fallback_hits: Vec<ImpactItem>,
     pub recent_commits_touching_symbol_path: Vec<ImpactItem>,
     pub github_rationale_issues_prs: Vec<ImpactItem>,
-    pub repo_memories: RepoMemoryEvidence,
+    pub repo_memories: RepoMemoryEvidenceView,
     pub completeness_and_caveats: ImpactCompleteness,
 }
 
@@ -96,6 +128,7 @@ impl Default for ImpactSurfaceOptions {
             include_papertrail: true,
             include_text_fallback: true,
             include_memories: true,
+            compact_memories: true,
         }
     }
 }
@@ -261,6 +294,20 @@ pub fn impact_surface_report_for_symbol(
             truncated_sections.join(", ")
         ));
     }
+    // Completeness counts read the FULL evidence lanes, so compute them before the compact
+    // projection moves `repo_memories` into the view (#37).
+    let memory_active = u64::try_from(
+        repo_memories.direct.len()
+            + repo_memories.path_crossed.len()
+            + repo_memories.call_path_crossed.len(),
+    )
+    .unwrap_or(u64::MAX);
+    let memory_stale = u64::try_from(repo_memories.stale.len()).unwrap_or(u64::MAX);
+    let repo_memories = if options.compact_memories {
+        RepoMemoryEvidenceView::Compact(repo_memories.compact())
+    } else {
+        RepoMemoryEvidenceView::Full(repo_memories)
+    };
     Ok(ImpactSurfaceReport {
         query: ImpactSurfaceQuery {
             symbol_id: Some(symbol.symbol_id),
@@ -274,15 +321,7 @@ pub fn impact_surface_report_for_symbol(
             text_fallback_hits: u64::try_from(text_fallback_hits.len()).unwrap_or(u64::MAX),
             parser_failures: parser_failure_count(conn)?,
             stale_files: 0,
-            memory_status: ImpactMemoryStatus {
-                active: u64::try_from(
-                    repo_memories.direct.len()
-                        + repo_memories.path_crossed.len()
-                        + repo_memories.call_path_crossed.len(),
-                )
-                .unwrap_or(u64::MAX),
-                stale: u64::try_from(repo_memories.stale.len()).unwrap_or(u64::MAX),
-            },
+            memory_status: ImpactMemoryStatus { active: memory_active, stale: memory_stale },
             truncated_sections,
             caveats,
         },

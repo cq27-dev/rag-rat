@@ -395,6 +395,11 @@ pub struct ImpactArgs {
     /// list to narrow, e.g. `["git"]` for git history only.
     #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<ImpactInclude>>,
+    /// Return full memory bodies + every binding + call paths instead of the default compact,
+    /// scannable per-memory headers (#37). Full detail is also reachable via `memory_for_symbol` /
+    /// `memory_for_path` / `memory_for_call_path`.
+    #[serde(default)]
+    pub full_memories: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
