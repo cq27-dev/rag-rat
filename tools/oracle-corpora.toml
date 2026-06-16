@@ -13,49 +13,55 @@
 # Bencher series (a moved tag would silently change the corpus). The golden hash test in
 # `oracle/corpus.rs` pins each profile's hash, so any edit here surfaces in review.
 
+# The small-tier corpora are sized to a comparable scale (~8k–12k heuristic edges each) so the
+# report table's per-language rows are roughly equal and substantial — measured `total_edges`:
+# rust-time ~11.1k, c-libuv ~12.3k, py-rich ~8.4k, ts-rxjs ~7.9k, cpp-yaml ~9.2k. Each corpus's
+# health floors sit well below its measured numbers (catch a broken parse / unresolved deps), not as
+# exact regression gates. (cpp-yaml is the exception — its floors guard `.h` header resolution.)
+
 [[corpus]]
-corpus_id = "rust-semver"
+corpus_id = "rust-time"
 tier      = "small"
-repo      = "https://github.com/dtolnay/semver"
-rev       = "1.0.26"
+repo      = "https://github.com/time-rs/time"
+rev       = "v0.3.36"
 tool      = "rust-analyzer"
 prepare   = ["cargo fetch"]
-bindings  = { rust = ["src"] }
-health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 8 }
+bindings  = { rust = ["time/src"] }
+health    = { expected_min_heuristic_edges = 6000, expected_min_oracle_examined = 2000, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 250, timeout_minutes = 10 }
 
 [[corpus]]
-corpus_id = "c-cjson"
+corpus_id = "c-libuv"
 tier      = "small"
-repo      = "https://github.com/DaveGamble/cJSON"
-rev       = "v1.7.18"
+repo      = "https://github.com/libuv/libuv"
+rev       = "v1.48.0"
 tool      = "scip-clang"
 prepare   = ["cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "cp build/compile_commands.json ."]
-bindings  = { c = ["."] }
-health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 8 }
+bindings  = { c = ["src"] }
+health    = { expected_min_heuristic_edges = 7000, expected_min_oracle_examined = 1500, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 300, timeout_minutes = 10 }
 
 [[corpus]]
-corpus_id = "py-requests"
+corpus_id = "py-rich"
 tier      = "small"
-repo      = "https://github.com/psf/requests"
-rev       = "v2.32.3"
+repo      = "https://github.com/Textualize/rich"
+rev       = "v13.8.1"
 tool      = "scip-python"
 prepare   = ["python -m venv .venv", ".venv/bin/pip install ."]
-bindings  = { python = ["src/requests"] }
-health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 12 }
+bindings  = { python = ["rich"] }
+health    = { expected_min_heuristic_edges = 5000, expected_min_oracle_examined = 4000, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 500, timeout_minutes = 12 }
 
 [[corpus]]
-corpus_id = "ts-ky"
+corpus_id = "ts-rxjs"
 tier      = "small"
-repo      = "https://github.com/sindresorhus/ky"
-rev       = "v1.7.2"
+repo      = "https://github.com/ReactiveX/rxjs"
+rev       = "7.8.1"
 tool      = "scip-typescript"
-# scip-typescript resolves cross-package references against the project's installed `node_modules`
-# (the analog of scip-python's venv); `npm install` makes them present. It requires a root
-# `tsconfig.json` (ky ships one) — the backend deliberately does NOT pass `--infer-tsconfig`, which
-# would write a tsconfig into the checkout (read-only-on-source).
+# scip-typescript resolves cross-package references against the installed `node_modules` (the analog
+# of scip-python's venv); `npm install` makes them present. It requires a root `tsconfig.json` (rxjs
+# ships one) — the backend deliberately does NOT pass `--infer-tsconfig` (read-only-on-source). Bind
+# `src/internal` (the library implementation) rather than the whole `src` re-export surface.
 prepare   = ["npm install --no-audit --no-fund"]
-bindings  = { typescript = ["source"] }
-health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 12 }
+bindings  = { typescript = ["src/internal"] }
+health    = { expected_min_heuristic_edges = 5000, expected_min_oracle_examined = 3500, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 300, timeout_minutes = 15 }
 
 [[corpus]]
 corpus_id = "cpp-yaml"

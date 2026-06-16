@@ -170,16 +170,16 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
         let corpora = load_corpora(&toml_str).unwrap();
         let ids: Vec<&str> = corpora.iter().map(|c| c.corpus_id.as_str()).collect();
         assert_eq!(ids, [
-            "rust-semver",
-            "c-cjson",
-            "py-requests",
-            "ts-ky",
+            "rust-time",
+            "c-libuv",
+            "py-rich",
+            "ts-rxjs",
             "cpp-yaml",
             "rust-cargo",
             "linux-kernel"
         ]);
-        assert_eq!(corpus_by_id(&corpora, "py-requests").unwrap().tool, "scip-python");
-        assert_eq!(corpus_by_id(&corpora, "ts-ky").unwrap().tool, "scip-typescript");
+        assert_eq!(corpus_by_id(&corpora, "py-rich").unwrap().tool, "scip-python");
+        assert_eq!(corpus_by_id(&corpora, "ts-rxjs").unwrap().tool, "scip-typescript");
         assert_eq!(corpus_by_id(&corpora, "cpp-yaml").unwrap().tool, "scip-clang");
 
         // GOLDEN per-profile hashes: an edit to any corpus field changes its hash (and makes prior
@@ -187,10 +187,10 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
         let hashes: Vec<(&str, String)> =
             corpora.iter().map(|c| (c.corpus_id.as_str(), c.hash())).collect();
         assert_eq!(hashes, vec![
-            ("rust-semver", GOLDEN_RUST_SEMVER.to_string()),
-            ("c-cjson", GOLDEN_C_CJSON.to_string()),
-            ("py-requests", GOLDEN_PY_REQUESTS.to_string()),
-            ("ts-ky", GOLDEN_TS_KY.to_string()),
+            ("rust-time", GOLDEN_RUST_TIME.to_string()),
+            ("c-libuv", GOLDEN_C_LIBUV.to_string()),
+            ("py-rich", GOLDEN_PY_RICH.to_string()),
+            ("ts-rxjs", GOLDEN_TS_RXJS.to_string()),
             ("cpp-yaml", GOLDEN_CPP_YAML.to_string()),
             ("rust-cargo", GOLDEN_RUST_CARGO.to_string()),
             ("linux-kernel", GOLDEN_LINUX_KERNEL.to_string()),
@@ -198,12 +198,11 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
     }
 
     // Pinned from the committed `tools/oracle-corpora.toml` (see `committed_corpora_file`).
-    const GOLDEN_RUST_SEMVER: &str =
-        "7973c3d62bbea9fbbdf3d7a4380fb7d9ccdbf2659a3503c9267eb9f9f329bb97";
-    const GOLDEN_C_CJSON: &str = "685a33345247c2ef310b7671fb9e2a55a7cb7c577fcd29fecac436ff0634c9dc";
-    const GOLDEN_PY_REQUESTS: &str =
-        "76abdb4592d1e1997f133fb5cd185d85b57851e8a82e085268e45d4d16c2c832";
-    const GOLDEN_TS_KY: &str = "4565e3323659cc3de96eebfb033440a2a91622bcd14f7bec2b022d4e642f1bba";
+    const GOLDEN_RUST_TIME: &str =
+        "ba5a37328901f0b1964c51bc8cff3c729d07070a0ce0d61f9934ea7790ca6b64";
+    const GOLDEN_C_LIBUV: &str = "b34ef742c7d4b5efc02bdb95a8457719be9a0dd5621485e11c7d42d2e534d965";
+    const GOLDEN_PY_RICH: &str = "0a4a22be9817ff26b549119b098d23004e5a8b4d7817126e5084f9d730f1efda";
+    const GOLDEN_TS_RXJS: &str = "492436f3827cbf9afe206b5feb03227388521db68a5965c1c3e904f68f0e1109";
     const GOLDEN_CPP_YAML: &str =
         "2b6d2ec7f00b34e330116bf1b93fd51416926ac3d30e24dac766f0f8fb910f58";
     const GOLDEN_RUST_CARGO: &str =

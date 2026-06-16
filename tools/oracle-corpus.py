@@ -11,9 +11,9 @@ Pure stdlib (tomllib, 3.11+). No third-party deps so it runs on a bare CI runner
 
 Usage:
   oracle-corpus.py --list-tier small                 # corpus ids in a tier, one per line
-  oracle-corpus.py --corpus py-requests --field repo # a scalar field
-  oracle-corpus.py --corpus py-requests --field prepare        # one prepare command per line
-  oracle-corpus.py --corpus py-requests --field bindings_toml  # rag-rat.toml [target_bindings] body
+  oracle-corpus.py --corpus py-rich --field repo # a scalar field
+  oracle-corpus.py --corpus py-rich --field prepare        # one prepare command per line
+  oracle-corpus.py --corpus py-rich --field bindings_toml  # rag-rat.toml [target_bindings] body
 """
 
 from __future__ import annotations

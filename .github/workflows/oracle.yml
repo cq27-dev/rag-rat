@@ -60,7 +60,7 @@ env:
   # Pinned SCIP toolchain for the small tier so a PR number isn't perturbed by an unrelated indexer
   # release. scip-clang/scip-python/scip-typescript are pinned to explicit versions; rust-analyzer is installed as a
   # rustup component (below), pinning it to the stable toolchain (a ~6-week cadence) instead of the
-  # weekly `releases/latest` — so a fresh RA build can't change `rust-semver`'s numbers mid-PR.
+  # weekly `releases/latest` — so a fresh RA build can't change `rust-time`'s numbers mid-PR.
   SCIP_CLANG_VERSION: v0.4.0
   SCIP_PYTHON_VERSION: 0.6.6
   SCIP_TYPESCRIPT_VERSION: 0.4.0
@@ -101,7 +101,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         # rust-analyzer as a toolchain component pins the SCIP emitter to the stable release (not the
-        # weekly `releases/latest`), so the `rust-semver` leg's numbers don't shift under the PR.
+        # weekly `releases/latest`), so the `rust-time` leg's numbers don't shift under the PR.
         with:
           components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
