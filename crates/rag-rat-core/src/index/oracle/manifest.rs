@@ -87,15 +87,16 @@ impl ToolManifest {
                                or pass a pre-built index with `--scip <path>`.",
             },
             // scip-java is the SemanticDB-based JVM indexer; we drive it for KOTLIN (it indexes
-            // through the project's Gradle/Maven build via the semanticdb-kotlinc compiler plugin).
+            // through the project's Gradle build via the semanticdb-kotlinc compiler plugin —
+            // scip-java's auto-indexer supports Kotlin for Gradle only, not Maven).
             OracleTool::ScipJava => ToolManifest {
                 tool,
                 program: "scip-java",
                 languages: &["kotlin"],
                 install_hint: "scip-java not found on PATH. Install it (e.g. `cs install \
-                               --contrib scip-java`, needs a JVM) — it indexes through the \
-                               project's Gradle/Maven build, so the build must succeed; or pass a \
-                               pre-built index with `--scip <path>`.",
+                               --contrib scip-java`, needs a JVM) — it indexes Kotlin through the \
+                               project's Gradle build (Maven Kotlin is unsupported), so the build \
+                               must succeed; or pass a pre-built index with `--scip <path>`.",
             },
         }
     }
@@ -186,14 +187,20 @@ impl ToolManifest {
                     root.display()
                 )
             }),
-            // scip-java indexes THROUGH the build, so it needs a recognizable build at the root
-            // (Gradle or Maven). Without one it can't run; report Blocked rather than a confusing
-            // subprocess error (the JVM analog of scip-clang's compile_commands.json prerequisite).
-            OracleTool::ScipJava => (!has_jvm_build_file(root)).then(|| {
+            // scip-java indexes THROUGH the build, so it needs a recognizable build at the root.
+            // This backend advertises Kotlin only, and scip-java's automatic indexer supports
+            // Kotlin for GRADLE only — Maven Kotlin (`kotlin-maven-plugin`) is unsupported upstream
+            // (https://sourcegraph.github.io/scip-java/docs/getting-started.html#supported-build-tools).
+            // So a Maven-only (`pom.xml`) Kotlin checkout must report Blocked, not run scip-java
+            // and fail — accepting `pom.xml` would turn a clean block into a failed run
+            // + background retries (Codex on #193). The JVM analog of scip-clang's
+            // compile_commands.json gate.
+            OracleTool::ScipJava => (!has_gradle_build(root)).then(|| {
                 format!(
-                    "scip-java requires a Gradle or Maven build at {} (build.gradle[.kts], \
-                     settings.gradle[.kts], or pom.xml) — it indexes through the build; or pass a \
-                     pre-built index with `--scip <path>`.",
+                    "scip-java requires a Gradle build at {} (build.gradle[.kts] or \
+                     settings.gradle[.kts]) — it indexes Kotlin through the Gradle build (Maven \
+                     Kotlin is unsupported by scip-java's auto-indexer); or pass a pre-built \
+                     index with `--scip <path>`.",
                     root.display()
                 )
             }),
@@ -274,9 +281,11 @@ impl ToolManifest {
     }
 }
 
-/// Whether `root` has a recognizable JVM build (Gradle or Maven) that scip-java can index through.
-fn has_jvm_build_file(root: &Path) -> bool {
-    ["build.gradle.kts", "build.gradle", "settings.gradle.kts", "settings.gradle", "pom.xml"]
+/// Whether `root` has a Gradle build that scip-java can index Kotlin through. Maven is deliberately
+/// excluded: scip-java's automatic indexer supports Kotlin only for Gradle, and this backend
+/// advertises Kotlin only — a Maven (`pom.xml`) Kotlin checkout should report Blocked, not run.
+fn has_gradle_build(root: &Path) -> bool {
+    ["build.gradle.kts", "build.gradle", "settings.gradle.kts", "settings.gradle"]
         .iter()
         .any(|name| root.join(name).exists())
 }
@@ -466,15 +475,22 @@ mod tests {
     }
 
     #[test]
-    fn scip_java_requires_a_jvm_build_file() {
-        // scip-java indexes THROUGH the build; without a Gradle/Maven build at the root it's
-        // Blocked (the JVM analog of scip-clang's compile_commands.json prerequisite).
+    fn scip_java_requires_a_gradle_build() {
+        // scip-java indexes Kotlin THROUGH the Gradle build; without one it's Blocked (the JVM
+        // analog of scip-clang's compile_commands.json prerequisite). A Maven-only checkout is also
+        // Blocked: scip-java's auto-indexer supports Kotlin for Gradle only, so running it on a
+        // `pom.xml` Kotlin project would fail rather than index (Codex on #193).
         let manifest = ToolManifest::for_tool(OracleTool::ScipJava);
         assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_some());
         let dir = std::env::temp_dir().join("rag_rat_java_prereq_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(manifest.prerequisite_blocked(&dir).is_some(), "empty dir has no build → Blocked");
+        std::fs::write(dir.join("pom.xml"), "").unwrap();
+        assert!(
+            manifest.prerequisite_blocked(&dir).is_some(),
+            "Maven-only Kotlin is unsupported by scip-java → Blocked"
+        );
         std::fs::write(dir.join("build.gradle.kts"), "").unwrap();
         assert!(manifest.prerequisite_blocked(&dir).is_none(), "a Gradle build satisfies it");
         let _ = std::fs::remove_dir_all(&dir);
