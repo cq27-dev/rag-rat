@@ -65,13 +65,35 @@ impl ScipIndex {
     /// offsets can be converted in the document's encoding. A document whose source can't be read
     /// is skipped (its occurrences can't be byte-resolved); the join just finds no oracle data for
     /// those edges, which is the correct degradation.
+    ///
+    /// Test-only convenience for the unset-encoding default (`Unspecified`); the production path
+    /// calls [`Self::parse_with_default`] with the tool's known default.
+    #[cfg(test)]
     pub(crate) fn parse(
         bytes: &[u8],
+        read_document_source: impl FnMut(&str) -> Option<Vec<u8>>,
+    ) -> anyhow::Result<Self> {
+        Self::parse_with_default(
+            bytes,
+            PositionEncoding::UnspecifiedPositionEncoding,
+            read_document_source,
+        )
+    }
+
+    /// Like [`Self::parse`] but supplies the encoding to assume for documents that leave
+    /// `position_encoding` **unset** (the protobuf default `Unspecified`). Some indexers — notably
+    /// scip-typescript — emit ranges in UTF-16 code units but never set the field; reading those as
+    /// the historical UTF-32 fallback mis-converts any column past an astral character. The caller
+    /// passes the tool's known default (see `OracleTool::default_position_encoding`); a document
+    /// that DOES set the field always wins over this default.
+    pub(crate) fn parse_with_default(
+        bytes: &[u8],
+        default_encoding: PositionEncoding,
         mut read_document_source: impl FnMut(&str) -> Option<Vec<u8>>,
     ) -> anyhow::Result<Self> {
         let index = Index::parse_from_bytes(bytes)
             .map_err(|err| anyhow::anyhow!("failed to parse SCIP index: {err}"))?;
-        Self::from_index(&index, &mut read_document_source)
+        Self::from_index(&index, default_encoding, &mut read_document_source)
     }
 
     /// The relative paths of every document in a serialized `.scip`, WITHOUT reading any source or
@@ -90,6 +112,7 @@ impl ScipIndex {
     /// constructing an `Index` programmatically.
     pub(crate) fn from_index(
         index: &Index,
+        default_encoding: PositionEncoding,
         read_document_source: &mut impl FnMut(&str) -> Option<Vec<u8>>,
     ) -> anyhow::Result<Self> {
         let mut out = ScipIndex::default();
@@ -98,10 +121,17 @@ impl ScipIndex {
             let Some(source) = read_document_source(&path) else {
                 continue;
             };
-            let encoding = document
+            // A document that explicitly sets `position_encoding` wins; only fall back to the
+            // tool-supplied `default_encoding` when it's left unset (protobuf default
+            // `Unspecified`).
+            let encoding = match document
                 .position_encoding
                 .enum_value()
-                .unwrap_or(PositionEncoding::UnspecifiedPositionEncoding);
+                .unwrap_or(PositionEncoding::UnspecifiedPositionEncoding)
+            {
+                PositionEncoding::UnspecifiedPositionEncoding => default_encoding,
+                explicit => explicit,
+            };
             let mapper = LineColumnToByte::new(&source, encoding);
 
             let mut occurrences = Vec::with_capacity(document.occurrences.len());
@@ -166,8 +196,27 @@ fn has_import_role(symbol_roles: i32) -> bool {
 /// `…#`, a `Macro` `…!`, a `Meta` `…:`, a `Namespace`/`Package` `…/` — so they were already out. A
 /// symbol with no recognizable callable suffix is conservatively non-callable, so a malformed
 /// string can't inflate the recall denominator.
+///
+/// KNOWN SCOPE LIMIT (cross-language, most visible in TypeScript — tracked in #185): a
+/// **function-valued variable / arrow function** (`const f = () => …; f()`) is a `Term` (`…f.`),
+/// not a `Method`, so calls to it are excluded from BOTH sides of the recall ratio. SCIP carries no
+/// call role to tell a function-valued term from a plain value term, and admitting bare `.` would
+/// re-introduce the field/const over-count above — so TS recall measures method / function-
+/// declaration calls only (symmetric, but a narrower population than the heuristic emits). The
+/// verdict precision metrics are unaffected; only the recall denominator's scope is.
 pub(crate) fn symbol_is_callable(symbol: &str) -> bool {
     symbol.trim_end().ends_with(").")
+}
+
+/// Whether a SCIP symbol is a *namespace / module / package* descriptor — its final descriptor
+/// ends in `/` (the SCIP grammar's Namespace suffix, e.g. scip-typescript's per-file symbol
+/// `… src/`a.ts`/`). These are not code entities of their own in rag-rat's graph, so they must
+/// never become a logical symbol's moniker: scip-typescript emits a synthetic **zero-width** file
+/// definition at byte `0..0`, which the moniker pass's containment map would otherwise attach to
+/// the first real symbol — and being the shortest candidate, it would win selection and overwrite
+/// the symbol's own moniker, breaking moniker-based relocation.
+pub(crate) fn symbol_is_module(symbol: &str) -> bool {
+    symbol.trim_end().ends_with('/')
 }
 
 /// A SCIP `local …` symbol is function-local. SCIP's own `is_local_symbol` checks the `local`

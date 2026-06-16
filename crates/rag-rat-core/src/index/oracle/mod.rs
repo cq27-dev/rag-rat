@@ -601,6 +601,21 @@ impl OracleTool {
             _ => None,
         }
     }
+
+    /// The position encoding to assume for SCIP documents this tool emits **without** an explicit
+    /// `position_encoding` (the protobuf default `Unspecified`). scip-typescript reports ranges in
+    /// UTF-16 code units (TypeScript's internal string offsets) but never sets the field, so
+    /// reading it as the generic UTF-32 fallback mis-converts columns after any astral
+    /// character. The other backends either set the field or are unaffected, so they keep the
+    /// conservative `Unspecified` (UTF-32-equivalent) default.
+    pub(crate) fn default_position_encoding(self) -> ::scip::types::PositionEncoding {
+        use ::scip::types::PositionEncoding;
+        match self {
+            Self::ScipTypescript => PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
+            Self::RustAnalyzer | Self::ScipClang | Self::ScipPython =>
+                PositionEncoding::UnspecifiedPositionEncoding,
+        }
+    }
 }
 
 /// What the oracle concluded about one edge candidate. The names mirror the #61 design taxonomy.

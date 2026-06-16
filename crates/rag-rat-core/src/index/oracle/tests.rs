@@ -1441,6 +1441,48 @@ fn parse_document_with_no_occurrences_registers_empty_entry() {
     assert!(idx.definitions.is_empty());
 }
 
+/// scip-typescript leaves `position_encoding` UNSET (Unspecified) but emits UTF-16 column offsets.
+/// `parse_with_default(UTF16, …)` must read those columns as UTF-16 so an identifier after an
+/// astral character lands on the right bytes; the historical Unspecified→UTF-32 fallback misaligns
+/// it.
+#[test]
+fn unspecified_encoding_uses_the_supplied_default() {
+    // "😀foo\n": the emoji is 4 UTF-8 bytes = 2 UTF-16 units = 1 UTF-32 unit; "foo" is bytes 4..7.
+    let source = "😀foo\n".as_bytes().to_vec();
+    // UTF-16 columns [2,5] (past the 2-unit emoji).
+    let occ =
+        occurrence(0, 2, 5, "scip-typescript npm p 1 `a.ts`/foo().", SymbolRole::Definition as i32);
+    // Document with NO position_encoding set (serialized as the protobuf default = Unspecified).
+    let bytes = scip_bytes("a.ts", PositionEncoding::UnspecifiedPositionEncoding, vec![occ]);
+
+    let s = source.clone();
+    let idx = ScipIndex::parse_with_default(
+        &bytes,
+        PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
+        move |_| Some(s.clone()),
+    )
+    .unwrap();
+    let occ16 = &idx.occurrences_by_path.get("a.ts").unwrap()[0];
+    assert_eq!((occ16.start_byte, occ16.end_byte), (4, 7));
+    assert_eq!(&source[occ16.start_byte..occ16.end_byte], b"foo");
+
+    // The plain 2-arg parse (Unspecified → UTF-32 fallback) misaligns onto the wrong bytes.
+    let s = source.clone();
+    let idx32 = ScipIndex::parse(&bytes, move |_| Some(s.clone())).unwrap();
+    let occ32 = &idx32.occurrences_by_path.get("a.ts").unwrap()[0];
+    assert_ne!(&source[occ32.start_byte..occ32.end_byte], b"foo", "UTF-32 fallback misaligns");
+}
+
+/// `symbol_is_module` recognizes the SCIP namespace/module/package suffix (`/`) and nothing else.
+#[test]
+fn symbol_is_module_matches_only_namespace_suffix() {
+    use super::scip::symbol_is_module;
+    assert!(symbol_is_module("scip-typescript npm p 1 `a.ts`/"));
+    assert!(!symbol_is_module("scip-typescript npm p 1 `a.ts`/foo().")); // method
+    assert!(!symbol_is_module("scip-typescript npm p 1 `a.ts`/Bar#")); // type
+    assert!(!symbol_is_module("local 1"));
+}
+
 /// A multi-line occurrence range (`[start_line, start_char, end_line, end_char]`) parses to the
 /// byte span crossing the newline.
 #[test]
@@ -3667,6 +3709,33 @@ fn moniker_for_symbol_with_member_defs_is_the_symbols_own() {
     assert_eq!(report.monikers_written, 1, "one row per logical symbol, not per def");
     let (moniker, ..) = h.moniker(3003).expect("moniker row written");
     assert_eq!(moniker, struct_moniker, "the symbol's own (shortest) moniker wins");
+}
+
+/// A synthetic zero-width per-file definition (scip-typescript emits one ending in `/` at byte
+/// `0..0`) must NOT become a symbol's moniker: it containment-maps to the first symbol (whose span
+/// starts at 0) and, being shorter, would win shortest-moniker selection and clobber the real one.
+/// The namespace-suffix filter in the moniker pass drops it.
+#[test]
+fn synthetic_file_definition_does_not_overwrite_a_symbols_moniker() {
+    let h = Harness::new();
+    // `greet`'s span starts at byte 0, so a 0..0 file def would containment-map to it.
+    let defs = h.add_file("a.ts", "function greet() {}\n");
+    let sym = h.add_symbol_qualified(defs, "greet", "a.ts::greet", "function", 0, 19);
+    h.add_logical_symbol(4004, "a.ts", "greet", "a.ts::greet", sym);
+
+    let greet_moniker = "rust-analyzer cargo test_crate 0.1.0 greet().";
+    let file_moniker = "rust-analyzer cargo test_crate 0.1.0 `a.ts`/"; // shorter; ends in `/`
+    let bytes = scip_bytes_docs(vec![("a.ts", vec![
+        // File def first + at 0..0 so a naive containment+shortest winner would pick it.
+        occurrence(0, 0, 0, file_moniker, SymbolRole::Definition as i32),
+        occurrence(0, 9, 14, greet_moniker, SymbolRole::Definition as i32),
+    ])]);
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+
+    assert_eq!(report.monikers_written, 1, "the namespace symbol must not add a second row");
+    let (moniker, ..) = h.moniker(4004).expect("moniker row written");
+    assert_eq!(moniker, greet_moniker, "the symbol's own moniker wins, not the file's");
 }
 
 /// Moniker-STRING drift (Codex P2): rust-analyzer monikers embed the Cargo package version, so a

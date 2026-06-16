@@ -110,12 +110,16 @@ pub(crate) fn run_in_tx(
     // built against, the join is comparing incompatible coordinate spaces.
     let checkout_root = input.checkout_root.to_path_buf();
     let mut source_cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
-    let index = ScipIndex::parse(input.scip_bytes, |path| {
-        source_cache
-            .entry(path.to_string())
-            .or_insert_with(|| std::fs::read(checkout_root.join(path)).ok())
-            .clone()
-    })?;
+    let index = ScipIndex::parse_with_default(
+        input.scip_bytes,
+        input.tool.default_position_encoding(),
+        |path| {
+            source_cache
+                .entry(path.to_string())
+                .or_insert_with(|| std::fs::read(checkout_root.join(path)).ok())
+                .clone()
+        },
+    )?;
 
     // Per-document hash of the disk bytes actually read, for the content-integrity check. A
     // candidate whose `file_sha` (the `files.sha256` the edge was indexed against) differs from the
@@ -342,6 +346,13 @@ pub(crate) fn run_in_tx(
     // (`…Struct#field.` vs `…Struct#`), so shortest selects the symbol's own moniker.
     let mut best_monikers: HashMap<i64, &str> = HashMap::new();
     for (scip_symbol, def) in &index.definitions {
+        // A namespace/module/file symbol (ends in `/`) is never a code symbol's moniker. Skipping
+        // it here drops scip-typescript's synthetic zero-width (`0..0`) per-file
+        // definition, which would otherwise containment-map to the first real symbol and
+        // win shortest-moniker selection.
+        if scip::symbol_is_module(scip_symbol) {
+            continue;
+        }
         let disk = disk_sha.get(&def.path).map(String::as_str);
         if disk.is_none() || indexed_shas.get(&def.path).map(String::as_str) != disk {
             continue;
