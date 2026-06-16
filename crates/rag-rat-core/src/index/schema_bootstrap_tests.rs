@@ -1711,6 +1711,40 @@ fn index_discover_reporting_flags_content_changes() {
 }
 
 #[test]
+fn discover_relanguages_h_when_binding_changes_c_to_cpp() {
+    // A `.h` indexed under a `c` binding, then re-discovered under a `cpp` binding with IDENTICAL
+    // content, must be reindexed as C++ — discovery treats (language, kind) drift as a change, not
+    // just sha drift. Without this the `.h`→C++ upgrade would never take effect on an existing
+    // index (the sha is unchanged) until `--full`.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.h"), "class X { public: void f(); };\n").unwrap();
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::C)).unwrap();
+    let lang: String = db
+        .storage
+        .connection()
+        .query_row("SELECT language FROM files WHERE path = 'src/lib.h'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(lang, "c", "indexed as C under the c binding");
+    drop(db);
+
+    let (db, changed) =
+        IndexDatabase::index_discover_reporting(&source_config(root.clone(), Language::Cpp))
+            .unwrap();
+    assert!(changed, "re-languaging a .h with unchanged content must report a change");
+    let lang: String = db
+        .storage
+        .connection()
+        .query_row("SELECT language FROM files WHERE path = 'src/lib.h'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(lang, "cpp", "the .h must be reindexed as C++ after the binding change");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn indexes_rust_graph_edges_from_tree_sitter() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);

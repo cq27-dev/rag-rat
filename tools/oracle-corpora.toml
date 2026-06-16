@@ -57,6 +57,26 @@ prepare   = ["npm install --no-audit --no-fund"]
 bindings  = { typescript = ["source"] }
 health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 12 }
 
+[[corpus]]
+corpus_id = "cpp-yaml"
+tier      = "small"
+repo      = "https://github.com/jbeder/yaml-cpp"
+rev       = "0.8.0"
+tool      = "scip-clang"
+# C++ counterpart to the C `c-cjson` corpus — exercises classes / methods / overloads (the C++
+# resolution lever, logical_variant tiebreak) AND C++ header resolution: yaml-cpp's API is declared
+# in `include/yaml-cpp/*.h` and defined across ~31 `src/*.cpp` TUs. Binding BOTH dirs as `cpp` indexes
+# the `.h` headers as C++ too (a `cpp` binding claims `.h` — see Language::target_extensions), so
+# calls to header-declared methods resolve to their in-corpus definitions instead of going external.
+# Tests/tools off keeps the build to the library TUs; scip-clang indexes all 31 in a couple seconds.
+prepare   = ["cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DYAML_CPP_BUILD_TESTS=OFF -DYAML_CPP_BUILD_TOOLS=OFF", "cp build/compile_commands.json ."]
+bindings  = { cpp = ["src", "include"] }
+# Thresholds sit ABOVE the src-only baseline (no `.h` indexed: ~4600 edges, ~3400 examined, ~350
+# monikers) and below the src+include run (~9200 / ~5800 / ~1040), so this corpus actually GUARDS C++
+# header resolution: if `.h` indexing regresses, the run collapses to the src-only numbers and trips
+# the gate instead of passing green.
+health    = { expected_min_heuristic_edges = 7000, expected_min_oracle_examined = 4500, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 700, timeout_minutes = 12 }
+
 # --- heavy "headline" corpora: release/dispatch only, pushed to Bencher; excluded from the PR matrix.
 
 [[corpus]]

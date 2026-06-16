@@ -71,12 +71,7 @@ pub(crate) struct PreparedIndexContent {
 
 pub(crate) fn collect_index_files(config: &Config) -> anyhow::Result<Vec<IndexFile>> {
     let mut targets = config.targets.iter().collect::<Vec<_>>();
-    targets.sort_by_key(|target| match target.kind {
-        TargetKind::Generated => 0,
-        TargetKind::Tests => 1,
-        TargetKind::Docs => 2,
-        TargetKind::Source => 3,
-    });
+    targets.sort_by_key(|target| target.index_precedence());
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
 

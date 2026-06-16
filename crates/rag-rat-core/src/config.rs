@@ -176,6 +176,26 @@ pub struct ResolvedTarget {
     pub kind: TargetKind,
 }
 
+impl ResolvedTarget {
+    /// Indexing precedence when more than one target claims the same file (lower sorts first /
+    /// wins). Two levels: (1) kind — generated/tests/docs before source, the existing order;
+    /// (2) within a kind, a language that claims an ambiguous extension as an upgrade
+    /// ([`Language::upgrades_ambiguous_extension`]) wins it — so a `.h` covered by both a `c` and a
+    /// `cpp` binding indexes as C++ (the deliberate intent), not C (alphabetical accident). Both
+    /// the full-rebuild walk (first-claimer-wins) and the incremental per-path resolver use
+    /// this.
+    pub fn index_precedence(&self) -> (u8, u8) {
+        let kind_rank = match self.kind {
+            TargetKind::Generated => 0,
+            TargetKind::Tests => 1,
+            TargetKind::Docs => 2,
+            TargetKind::Source => 3,
+        };
+        let upgrade_rank = u8::from(!self.language.upgrades_ambiguous_extension());
+        (kind_rank, upgrade_rank)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
     Source,
@@ -269,7 +289,7 @@ fn resolve_targets(
             if language == Language::Markdown { TargetKind::Docs } else { TargetKind::Source };
         let name = language.as_str().to_string();
         push_target(root, &mut names, &mut targets, ResolvedTarget {
-            include: language.simple_extensions().iter().map(|ext| format!("**/*.{ext}")).collect(),
+            include: language.default_include_globs(),
             exclude: Vec::new(),
             name,
             language,
@@ -290,9 +310,7 @@ fn resolve_targets(
             name: target.name,
             language,
             directories: target.directories.into_iter().map(PathBuf::from).collect(),
-            include: target.include.unwrap_or_else(|| {
-                language.simple_extensions().iter().map(|ext| format!("**/*.{ext}")).collect()
-            }),
+            include: target.include.unwrap_or_else(|| language.default_include_globs()),
             exclude: target.exclude.unwrap_or_default(),
             kind,
         })?;
@@ -567,6 +585,35 @@ mod tests {
         assert_eq!(from_main.database, main.canonicalize().unwrap().join(".rag-rat/index.sqlite"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cpp_target_renders_h_in_its_default_globs_but_c_keeps_h_too() {
+        // The simple-binding glob render goes through `default_include_globs`, so a `cpp` binding
+        // includes `**/*.h` (the header-resolution fix) while `c` keeps it as well.
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ragrat-prec-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nc = [\".\"]\ncpp = [\".\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(root.join("rag-rat.toml")).unwrap();
+        let cpp = config.targets.iter().find(|t| t.language == Language::Cpp).unwrap();
+        assert!(cpp.include.contains(&"**/*.h".to_string()), "cpp globs: {:?}", cpp.include);
+        // cpp must sort ahead of c so it wins the ambiguous `.h` (index_precedence).
+        assert!(
+            cpp.index_precedence()
+                < config
+                    .targets
+                    .iter()
+                    .find(|t| t.language == Language::C)
+                    .unwrap()
+                    .index_precedence(),
+            "cpp must outrank c for the shared .h header"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

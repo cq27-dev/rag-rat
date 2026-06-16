@@ -174,11 +174,13 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
             "c-cjson",
             "py-requests",
             "ts-ky",
+            "cpp-yaml",
             "rust-cargo",
             "linux-kernel"
         ]);
         assert_eq!(corpus_by_id(&corpora, "py-requests").unwrap().tool, "scip-python");
         assert_eq!(corpus_by_id(&corpora, "ts-ky").unwrap().tool, "scip-typescript");
+        assert_eq!(corpus_by_id(&corpora, "cpp-yaml").unwrap().tool, "scip-clang");
 
         // GOLDEN per-profile hashes: an edit to any corpus field changes its hash (and makes prior
         // reports incomparable) — recompute deliberately when intended.
@@ -189,6 +191,7 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
             ("c-cjson", GOLDEN_C_CJSON.to_string()),
             ("py-requests", GOLDEN_PY_REQUESTS.to_string()),
             ("ts-ky", GOLDEN_TS_KY.to_string()),
+            ("cpp-yaml", GOLDEN_CPP_YAML.to_string()),
             ("rust-cargo", GOLDEN_RUST_CARGO.to_string()),
             ("linux-kernel", GOLDEN_LINUX_KERNEL.to_string()),
         ]);
@@ -201,6 +204,8 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
     const GOLDEN_PY_REQUESTS: &str =
         "76abdb4592d1e1997f133fb5cd185d85b57851e8a82e085268e45d4d16c2c832";
     const GOLDEN_TS_KY: &str = "4565e3323659cc3de96eebfb033440a2a91622bcd14f7bec2b022d4e642f1bba";
+    const GOLDEN_CPP_YAML: &str =
+        "2b6d2ec7f00b34e330116bf1b93fd51416926ac3d30e24dac766f0f8fb910f58";
     const GOLDEN_RUST_CARGO: &str =
         "60452736340151a253001bb5c33cc83efa2a4ceabba4d42a227d3188d7761d79";
     const GOLDEN_LINUX_KERNEL: &str =

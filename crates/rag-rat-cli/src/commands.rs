@@ -586,7 +586,7 @@ fn ensure_checkout_matches_corpus(
     // form's defaults; anything else measures a different population under the same hash.
     for target in &config.targets {
         let default_include: BTreeSet<String> =
-            target.language.simple_extensions().iter().map(|ext| format!("**/*.{ext}")).collect();
+            target.language.default_include_globs().into_iter().collect();
         let include: BTreeSet<String> = target.include.iter().cloned().collect();
         anyhow::ensure!(
             target.exclude.is_empty() && include == default_include,

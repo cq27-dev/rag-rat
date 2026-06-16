@@ -51,10 +51,10 @@ fn walk_dir(
 }
 
 fn is_target_file(root: &Path, path: &Path, target: &ResolvedTarget) -> bool {
-    let Some(language) = crate::language::Language::from_path(path) else {
-        return false;
-    };
-    if language != target.language {
+    // The target's language must CLAIM this extension (not bare `from_path` detection): that's what
+    // lets a `cpp` binding index its `.h` headers, which bare detection resolves to C. The file is
+    // then parsed as the target's language (see `discovery::target_for_path`).
+    if !target.language.claims_path(path) {
         return false;
     }
     let relative = path.strip_prefix(root).unwrap_or(path);
@@ -108,6 +108,41 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ragrat-walk-{}-{id}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn cpp_target() -> ResolvedTarget {
+        ResolvedTarget {
+            name: "cpp".to_string(),
+            language: Language::Cpp,
+            directories: vec![PathBuf::from(".")],
+            include: Language::Cpp.default_include_globs(),
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }
+    }
+
+    #[test]
+    fn cpp_target_indexes_h_headers_but_not_c_sources() {
+        let root = tempdir();
+        write(&root.join("include/lib.h"), "class C { void f(); };\n");
+        write(&root.join("src/lib.cpp"), "#include \"lib.h\"\nvoid C::f() {}\n");
+        write(&root.join("legacy.c"), "int g(void){return 0;}\n");
+
+        let target = cpp_target();
+        let ignore = IgnoreMatcher::compile(&root, &target.directories);
+        let rel: Vec<String> = walk_target(&root, &target, &ignore)
+            .unwrap()
+            .iter()
+            .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        // The `.h` header is claimed by the cpp binding (the header-resolution fix)...
+        assert!(rel.contains(&"include/lib.h".to_string()), "cpp must claim .h: {rel:?}");
+        assert!(rel.contains(&"src/lib.cpp".to_string()), "{rel:?}");
+        // ...but a plain `.c` file is NOT a C++ source.
+        assert!(!rel.contains(&"legacy.c".to_string()), "cpp must not claim .c: {rel:?}");
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
