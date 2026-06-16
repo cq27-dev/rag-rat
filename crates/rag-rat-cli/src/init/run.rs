@@ -11,6 +11,17 @@ pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Res
     } else {
         prompt_plan(root, root_value, &scan)?
     };
+    // A plan with no bindings would render an empty `[target_bindings]` and index nothing — a
+    // useless config. `init -y` can reach this when every detected language drops to a dependency
+    // tree (e.g. Python whose only `.py` live under a virtualenv); the interactive path already
+    // bails, so guard the non-interactive path the same way rather than write an unusable file
+    // (#181 review).
+    if plan.bindings.is_empty() {
+        anyhow::bail!(
+            "init found no indexable source to bind — every detected language resolved to a \
+             dependency tree (e.g. a virtualenv). Nothing to configure."
+        );
+    }
     let config_text = render_config(&plan);
 
     if options.dry_run {
@@ -100,9 +111,22 @@ pub(crate) fn prompt_plan(
         let dirs: Vec<_> =
             selected.into_iter().map(|index| candidates[index].path.clone()).collect();
         if dirs.is_empty() {
-            anyhow::bail!("init needs at least one selected root for {}", language.as_str());
+            // No roots selected — drop the language (don't bind it), matching the non-interactive
+            // plan which omits a language with no safe default (e.g. env-only Python, whose
+            // candidates are all dependency trees and so default to none). Bailing here would make
+            // accepting the offered defaults fail for exactly that case (#181 review).
+            continue;
         }
         bindings.insert(*language, dirs);
+    }
+    // Keep `languages` consistent with the bindings actually chosen (a dropped language must not
+    // linger and make `render_config` emit an empty list).
+    let languages = languages
+        .into_iter()
+        .filter(|language| bindings.contains_key(language))
+        .collect::<Vec<_>>();
+    if bindings.is_empty() {
+        anyhow::bail!("init needs at least one selected root to index");
     }
 
     let backend = prompt_backend(scan)?;
@@ -161,18 +185,34 @@ pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
         .filter(|language| scan.language_counts.get(language).copied().unwrap_or_default() > 0)
         .collect::<Vec<_>>();
     let languages = if languages.is_empty() { vec![Language::Rust] } else { languages };
-    let bindings = languages
+    let bindings: BTreeMap<Language, Vec<PathBuf>> = languages
         .iter()
-        .map(|language| {
-            let dirs = candidate_dirs(scan, *language)
-                .into_iter()
+        .filter_map(|language| {
+            let candidates = candidate_dirs(scan, *language);
+            let defaults = candidates
+                .iter()
                 .filter(|candidate| candidate.default)
-                .map(|candidate| candidate.path)
+                .map(|candidate| candidate.path.clone())
                 .collect::<Vec<_>>();
-            let dirs = if dirs.is_empty() { vec![PathBuf::from(".")] } else { dirs };
-            (*language, dirs)
+            if !defaults.is_empty() {
+                return Some((*language, defaults));
+            }
+            // No safe default. For Python this is an env-only repo (every `.py` under a dependency
+            // tree — `candidate_dirs` deliberately refuses to promote `.` over it, #173): OMIT the
+            // binding rather than fall back to `["."]`, which would index the installed deps (#181
+            // — the empty-default state must survive into the non-interactive plan, not
+            // get reconverted to `.` here). For other languages, `.` is the reasonable
+            // "index everything" default.
+            if *language == Language::Python && !candidates.is_empty() {
+                return None;
+            }
+            Some((*language, vec![PathBuf::from(".")]))
         })
         .collect();
+    // Keep `languages` consistent with the bindings actually emitted (a dropped env-only Python
+    // must not linger in the language list).
+    let languages =
+        languages.into_iter().filter(|language| bindings.contains_key(language)).collect();
     let backend = recommend_backend(estimated_chunks(scan.total_source_bytes));
     // Non-interactive default mirrors `OracleConfig`'s default: off until explicitly enabled.
     InitPlan { root_value, languages, bindings, backend, oracle_auto_run: false }
@@ -337,5 +377,90 @@ pub(crate) fn absolute_config_path(config: &Config, config_path: &Path) -> anyho
         Ok(config_path.to_path_buf())
     } else {
         Ok(config.root.join(config_path).canonicalize()?)
+    }
+}
+
+#[cfg(test)]
+mod default_plan_tests {
+    use std::path::Path;
+
+    use super::*;
+
+    /// #181: a repo whose only `.py` files live under a dependency tree must NOT get
+    /// `python = ["."]` — `default_plan` carries the no-safe-default state through by omitting the
+    /// Python binding entirely (rather than reconverting an empty default list to `.`).
+    #[test]
+    fn env_only_python_writes_no_binding_not_dot() {
+        let root = Path::new("/repo");
+        let mut scan = RepoScan::default();
+        for name in ["a.py", "b.py"] {
+            *scan.language_counts.entry(Language::Python).or_default() += 1;
+            add_file_to_dir_counts(
+                root,
+                &root.join("env/lib/site-packages/pkg").join(name),
+                Language::Python,
+                &mut scan,
+            )
+            .unwrap();
+        }
+        let plan = default_plan(".".to_string(), &scan);
+        assert!(
+            !plan.bindings.contains_key(&Language::Python),
+            "env-only Python must get NO binding, not `.`: {:?}",
+            plan.bindings
+        );
+        assert!(!plan.languages.contains(&Language::Python));
+    }
+
+    /// #173: a root entrypoint (`manage.py`) directly under the root binds `.` — preserved.
+    #[test]
+    fn root_entrypoint_binds_dot() {
+        let root = Path::new("/repo");
+        let mut scan = RepoScan::default();
+        *scan.language_counts.entry(Language::Python).or_default() += 1;
+        add_file_to_dir_counts(root, &root.join("manage.py"), Language::Python, &mut scan).unwrap();
+        let plan = default_plan(".".to_string(), &scan);
+        assert_eq!(plan.bindings.get(&Language::Python), Some(&vec![PathBuf::from(".")]));
+    }
+
+    /// #181 review: a root entrypoint ALONGSIDE a root UNFLOORED venv (`env`/`.env`/`virtualenv`) must
+    /// NOT bind `.` — the walk would ingest the venv (the indexer floor can't cover those names).
+    /// With only the root entrypoint and no package dir, Python is omitted rather than indexing
+    /// the venv. (A FLOORED venv like `.venv` does NOT set this flag, so it keeps binding `.` —
+    /// see `root_entrypoint_binds_dot` and
+    /// `only_unfloored_dependency_dirs_block_the_dot_default`.)
+    #[test]
+    fn root_entrypoint_with_root_venv_does_not_bind_dot() {
+        let root = Path::new("/repo");
+        let mut scan = RepoScan::default();
+        *scan.language_counts.entry(Language::Python).or_default() += 1;
+        add_file_to_dir_counts(root, &root.join("manage.py"), Language::Python, &mut scan).unwrap();
+        // An unfloored venv (`virtualenv`/`env`/`.env`) sits at the root — what `scan_dir` records.
+        scan.has_python_virtualenv = true;
+        let plan = default_plan(".".to_string(), &scan);
+        assert!(
+            !plan.bindings.contains_key(&Language::Python),
+            "a root venv must suppress the `.` default: {:?}",
+            plan.bindings
+        );
+    }
+
+    /// A normal Python package dir still binds (the env-only omission must not over-reach).
+    #[test]
+    fn python_package_dir_still_binds() {
+        let root = Path::new("/repo");
+        let mut scan = RepoScan::default();
+        for name in ["__init__.py", "views.py"] {
+            *scan.language_counts.entry(Language::Python).or_default() += 1;
+            add_file_to_dir_counts(
+                root,
+                &root.join("myapp").join(name),
+                Language::Python,
+                &mut scan,
+            )
+            .unwrap();
+        }
+        let plan = default_plan(".".to_string(), &scan);
+        assert_eq!(plan.bindings.get(&Language::Python), Some(&vec![PathBuf::from("myapp")]));
     }
 }

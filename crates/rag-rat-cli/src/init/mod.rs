@@ -11,6 +11,7 @@ use rag_rat_core::config::EmbeddingBackend;
 use rag_rat_core::index::ai::{
     FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID, ReconcileOptions,
 };
+use rag_rat_core::index::ignore_rules::{IgnoreMatcher, is_virtualenv_dir};
 use rag_rat_core::language::Language;
 use rag_rat_core::{Config, IndexDatabase};
 pub(crate) use render::*;
@@ -31,9 +32,10 @@ const SKIPPED_DIRS: &[&str] = &[
     ".venv",
     // Python virtualenv / dependency / cache trees — never project source. Skipping them at scan
     // time means their `.py` files never become dir candidates, so the "no default → promote the
-    // largest" fallback can't select a `site-packages` tree (#167 review).
+    // largest" fallback can't select a `site-packages` tree (#167 review). NB: `virtualenv` is NOT
+    // here — it's a real first-party package name; a virtualenv literally named `virtualenv/` is
+    // caught by content (`pyvenv.cfg`) in `scan_dir` instead (#181).
     "venv",
-    "virtualenv",
     "site-packages",
     "__pycache__",
     ".tox",
@@ -70,6 +72,14 @@ pub(crate) struct RepoScan {
     dir_counts: BTreeMap<Language, BTreeMap<PathBuf, usize>>,
     direct_dir_counts: BTreeMap<Language, BTreeMap<PathBuf, usize>>,
     total_source_bytes: u64,
+    /// The scan found a real Python virtualenv (a dir with a `pyvenv.cfg`) ANYWHERE the index
+    /// would walk — not gitignored, not floored. The indexer floor can't cover a venv under an
+    /// ambiguous name (`env`/`virtualenv`), so a `python = ["."]` walk WOULD index it; when
+    /// one is present we must not auto-bind `.`. Gitignored / conventionally-floored venvs
+    /// (`.venv`/`venv`) and first-party packages that merely share a venv-ish NAME (no
+    /// `pyvenv.cfg`) are NOT recorded here — content detection, not the name, decides (#181
+    /// review).
+    has_python_virtualenv: bool,
 }
 
 impl InitOptions {
@@ -284,6 +294,7 @@ mod tests {
             ]),
             direct_dir_counts: BTreeMap::new(),
             total_source_bytes: 0,
+            has_python_virtualenv: false,
         };
 
         let plan = default_plan(".".to_string(), &scan);
@@ -319,6 +330,7 @@ mod tests {
                 ]),
             )]),
             total_source_bytes: 0,
+            has_python_virtualenv: false,
         };
 
         let defaults = candidate_dirs(&scan, Language::C)

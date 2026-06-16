@@ -68,9 +68,18 @@ const FLOOR_DIRS: &[&str] = &[
     // Python virtualenv / dependency / cache trees: never project source. `site-packages` is the
     // load-bearing one — installed deps live there regardless of the venv dir's name (`.venv`,
     // `venv`, `env`, …), so flooring it stops a `python = ["."]` config from ingesting the whole
-    // dependency set even when the venv dir itself isn't named conventionally.
+    // dependency set even when the venv dir itself isn't named conventionally. Only names that can
+    // NEVER be a first-party import package are floored: `.venv`/`.tox`/`.nox` start with a dot (a
+    // Python package dir can't), and `site-packages`/`__pycache__` are reserved. `venv` is the one
+    // bare name kept (overwhelmingly a virtualenv). `virtualenv`/`env`/`.env` are deliberately NOT
+    // floored — `virtualenv` is itself a real package (`src/virtualenv/…` is first-party source,
+    // #181 review), and `env`/`.env` are too generic; their installed deps are still caught by
+    // `site-packages`, and the init scanner refuses to auto-bind `.` when any of them sit at the
+    // root.
     ".venv",
     "venv",
+    ".tox",
+    ".nox",
     "site-packages",
     "__pycache__",
 ];
@@ -78,6 +87,17 @@ const FLOOR_DIRS: &[&str] = &[
 /// Whether a single path component matches a floor directory name (see [`FLOOR_DIRS`]).
 fn is_floor_dir(name: &str) -> bool {
     FLOOR_DIRS.contains(&name)
+}
+
+/// Whether `dir` is a Python virtualenv — detected by CONTENT, not name: every venv created by
+/// `python -m venv` / `virtualenv` (Python 3.3+) writes a `pyvenv.cfg` at its root. This is the
+/// name-independent test that distinguishes an ambiguously-named venv (`env/`, `virtualenv/`) from
+/// a first-party package of the same name (the `virtualenv` PyPI package's `src/virtualenv/` has no
+/// `pyvenv.cfg`). Used to keep a venv out of init's binding candidates without flooring real
+/// package names (#181). `FLOOR_DIRS` still covers the conventional names (`.venv`/`venv`) as a
+/// fast path and for legacy venvs lacking the marker.
+pub fn is_virtualenv_dir(dir: &Path) -> bool {
+    dir.join("pyvenv.cfg").is_file()
 }
 
 /// One `.gitignore`, compiled by [`GitignoreBuilder`] with its own directory as the matching root
@@ -363,6 +383,25 @@ mod tests {
         assert!(m.is_ignored(&tmp.join(".rag-rat"), true));
         assert!(m.is_ignored(&tmp.join("node_modules/pkg/index.ts"), false));
         assert!(!m.is_ignored(&tmp.join("src/lib.rs"), false));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn python_venv_floor_dirs_ignored_but_generic_env_indexed() {
+        let tmp = tempdir();
+        let m = compile(&tmp);
+        // Dotted tooling trees can never be first-party import packages, so they're floored even
+        // with no .gitignore (#181).
+        assert!(m.is_ignored(&tmp.join(".tox/py311/lib/foo.py"), false));
+        assert!(m.is_ignored(&tmp.join(".nox/session/foo.py"), false));
+        // site-packages stays floored regardless of the enclosing venv dir's name.
+        assert!(m.is_ignored(&tmp.join("env/lib/python3.11/site-packages/dep.py"), false));
+        // …but bare names that CAN be a real import package are NOT floored globally: `virtualenv`
+        // is itself a PyPI package (`src/virtualenv/…` is first-party, #181 review), and
+        // `env`/`.env` are too generic. Their own non-site-packages files stay indexable.
+        assert!(!m.is_ignored(&tmp.join("src/virtualenv/__init__.py"), false));
+        assert!(!m.is_ignored(&tmp.join("env/settings.py"), false));
+        assert!(!m.is_ignored(&tmp.join(".env/config.py"), false));
         fs::remove_dir_all(&tmp).ok();
     }
 
