@@ -246,6 +246,49 @@ fn scope_exact_binds_a_unique_scope_path() {
     assert_eq!(resolution, "scope_exact");
 }
 
+/// Distinct same-(file, name, kind) items that differ only by `scope_path` (e.g. two `impl` blocks
+/// each defining `build`, or serde's many `impl Visitor { type Value }`) are NOT one logical
+/// symbol. `same_logical_symbol` must split them so the resolver falls through to unresolved
+/// instead of picking one arbitrarily at `Syntactic` (`logical_variant`) — that overconfidence made
+/// the SCIP oracle count the wrong pick as a contradiction, tanking Rust precision on trait-heavy
+/// crates.
+#[test]
+fn same_file_distinct_scopes_do_not_collapse_to_logical_variant() {
+    let conn = seeded_conn();
+    let defs = add_file(&conn, "a.rs", NEW);
+    let caller = add_file(&conn, "c.rs", NEW);
+    // Two distinct `build`s in ONE file (so same qualified_name a.rs::build), different impls.
+    add_symbol_scope(&conn, defs, "build", "a.rs::build", "A::build");
+    add_symbol_scope(&conn, defs, "build", "a.rs::build", "B::build");
+    let edge = add_edge(&conn, caller, "build", ""); // bare name — nothing disambiguates
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, None, "distinct same-file scopes must not collapse to an arbitrary pick");
+    assert_eq!(resolution, "unresolved");
+}
+
+/// Positive control: GENUINE variants — same file, name, kind AND scope_path (e.g. `#[cfg]`-gated
+/// copies) — still group, so the resolver binds the first at `Syntactic` via `logical_variant`.
+#[test]
+fn same_file_same_scope_variants_still_bind_via_logical_variant() {
+    let conn = seeded_conn();
+    let defs = add_file(&conn, "a.rs", NEW);
+    let caller = add_file(&conn, "c.rs", NEW);
+    let first = add_symbol_scope(&conn, defs, "build", "a.rs::build", "A::build");
+    add_symbol_scope(&conn, defs, "build", "a.rs::build", "A::build");
+    let edge = add_edge(&conn, caller, "build", "");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, Some(first), "true variants (shared scope_path) still bind the first");
+    assert_eq!(resolution, "logical_variant");
+}
+
 fn set_local_crate_roots(conn: &Connection, roots: &str) {
     conn.execute(
         "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('local_crate_roots', ?1)",

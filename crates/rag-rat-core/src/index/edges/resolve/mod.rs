@@ -801,6 +801,20 @@ pub(crate) fn resolve_symbol<'a>(
         [] => None,
     }
 }
+/// Whether a set of same-name candidate symbols are all the SAME logical symbol — so the resolver
+/// may pick `matches[0]` and label it `Syntactic` (`logical_variant`) instead of bailing on
+/// ambiguity. This must hold ONLY for genuine variants of one item (e.g. a forward declaration +
+/// its definition, or `#[cfg]`-gated copies that share a scope), never for distinct items that
+/// merely share a name.
+///
+/// `qualified_name` is `{file_path}::{name}` — NOT unique within a file: one file can declare many
+/// distinct same-named items (e.g. serde's `impl Visitor for A { type Value }` /
+/// `impl Visitor for B { type Value }`, 31 `Value` rows in one file across 10 impls). Grouping
+/// those by `qualified_name` alone made the resolver assert one arbitrary pick at `Syntactic`,
+/// which the SCIP oracle then counted as a `Contradict` ~93% of the time — tanking Rust precision
+/// on trait/generic-heavy crates. Requiring an equal `scope_path` (which carries the enclosing
+/// impl/trait/module chain, e.g. `Visitor<'de>::Value`) splits those distinct items apart while
+/// keeping true variants — which share a scope — grouped.
 pub(crate) fn same_logical_symbol(symbols: &[&IndexedSymbol]) -> bool {
     let Some(first) = symbols.first() else {
         return false;
@@ -809,6 +823,7 @@ pub(crate) fn same_logical_symbol(symbols: &[&IndexedSymbol]) -> bool {
         symbol.qualified_name == first.qualified_name
             && symbol.name == first.name
             && symbol.kind == first.kind
+            && symbol.scope_path == first.scope_path
     })
 }
 pub(crate) fn allow_unqualified_fallback(
