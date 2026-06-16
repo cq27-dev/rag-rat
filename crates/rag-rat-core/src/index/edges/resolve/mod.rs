@@ -664,6 +664,20 @@ pub(crate) fn resolve_symbol<'a>(
     if request.imported_external && !targets_local_qualified_path(request.target_qualified_name) {
         return None;
     }
+    // A Rust `references_type` to a GENERIC PARAMETER (`T`, `V`, `T1`) or an associated-type
+    // PROJECTION (`Self::Value`, `T::Output`, `V::Value`) has no in-corpus definition to point at —
+    // its concrete type is only known after type inference. Name-based resolution would bind it to
+    // whatever same-named concrete type happens to exist (serde has a `T` type and 50 `Value`s),
+    // asserting `Syntactic`; the SCIP oracle then counts that as a contradiction. Leave it
+    // unresolved (the edge is still recorded) instead of guessing. A real module-qualified type
+    // (`de::Deserializer`) has a lowercase path root and is NOT caught. Rust-only: TS/Kotlin/Python
+    // type parameters don't share this single-uppercase convention.
+    if request.source_language == Some(Language::Rust.as_str())
+        && request.edge_kind == EdgeKind::ReferencesType.as_str()
+        && rust_type_ref_is_unresolvable(request.name)
+    {
+        return None;
+    }
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
         // Semantic SCOPE-PATH match first (#61). An edge's `target_qualified_name` is a source-code
         // path (`Workspace::new`), which aligns with a symbol's `scope_path`
@@ -826,6 +840,27 @@ pub(crate) fn same_logical_symbol(symbols: &[&IndexedSymbol]) -> bool {
             && symbol.scope_path == first.scope_path
     })
 }
+/// Whether a Rust `references_type` target is a generic parameter or an associated-type projection
+/// — a reference name-based resolution can't (and shouldn't) bind to a concrete in-corpus type.
+/// True for a BARE generic-parameter name (`T`, `V`, `T1` — Rust's short-uppercase convention) or
+/// any PROJECTION whose root segment is `Self` or such a parameter (`Self::Value`, `T::Output`,
+/// `V::Value`). A module-qualified type (`de::Deserializer`, lowercase root) is NOT a projection.
+fn rust_type_ref_is_unresolvable(name: &str) -> bool {
+    match name.split_once("::") {
+        Some((root, _)) => root == "Self" || looks_like_type_parameter(root),
+        None => looks_like_type_parameter(name),
+    }
+}
+
+/// Rust generic-parameter NAME shape: one uppercase ASCII letter, then only digits (`T`, `K`, `V`,
+/// `T1`, `T2`). Deliberately narrow — a real two-letter type (`Id`, `IO`, `Ok`) or any longer name
+/// is NOT a parameter, so only the unambiguous single-letter convention is suppressed.
+fn looks_like_type_parameter(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|first| first.is_ascii_uppercase())
+        && chars.all(|rest| rest.is_ascii_digit())
+}
+
 pub(crate) fn allow_unqualified_fallback(
     edge_kind: &str,
     qualified: &str,

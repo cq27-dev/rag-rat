@@ -191,6 +191,38 @@ fn references_type_does_not_resolve_to_a_non_type_symbol() {
     assert_eq!(to, Some(gadget), "a type reference still resolves to a struct definition");
 }
 
+/// A Rust `references_type` to a generic parameter (`T`) or an associated-type projection
+/// (`Self::Value`, `V::Value`) must NOT bind to a same-named concrete type — name-based resolution
+/// can't know the concrete type, and an arbitrary confident bind is a pure oracle contradiction. A
+/// real type reference (`Gadget`) and a module-qualified path (lowercase root) still resolve.
+#[test]
+fn references_type_does_not_bind_generic_params_or_projections() {
+    let conn = seeded_conn();
+    let user = add_file(&conn, "a.rs", NEW);
+    let defs = add_file(&conn, "b.rs", NEW);
+    add_symbol(&conn, user, "user_fn", "crate::a::user_fn");
+    // Same-named concrete types exist in-corpus — the pre-fix resolver would bind to these.
+    add_symbol_kind(&conn, defs, "T", "crate::b::T", "struct");
+    add_symbol_kind(&conn, defs, "Value", "crate::b::Value", "struct");
+    let gadget = add_symbol_kind(&conn, defs, "Gadget", "crate::b::Gadget", "struct");
+
+    let generic = add_type_ref_edge(&conn, user, "T"); // generic parameter
+    let projection = add_type_ref_edge(&conn, user, "Self::Value"); // associated-type projection
+    let v_projection = add_type_ref_edge(&conn, user, "V::Value"); // type-param projection
+    let real = add_type_ref_edge(&conn, user, "Gadget"); // genuine type reference
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    for (edge, what) in [(generic, "T"), (projection, "Self::Value"), (v_projection, "V::Value")] {
+        let (to, _, resolution) = edge_state(&conn, edge);
+        assert_eq!(to, None, "{what} must stay unresolved, not bind a same-named concrete type");
+        assert_eq!(resolution, "unresolved", "{what}");
+    }
+    let (to, _, _) = edge_state(&conn, real);
+    assert_eq!(to, Some(gadget), "a genuine type reference still resolves");
+}
+
 fn add_symbol_scope(
     conn: &Connection,
     file_id: i64,
