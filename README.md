@@ -35,8 +35,8 @@ sequenceDiagram
 - **Repo memories.** Typed, source-anchored notes (`Invariant`, `Decision`, `Risk`, …) that survive
   refactors and surface automatically during future queries — the signal grep can't give you.
 - **A real code graph.** tree-sitter callers/callees/imports across Rust, TypeScript/TSX, Kotlin,
-  C/C++ — with an optional [compiler-grade SCIP oracle](docs/oracle.md) that upgrades edges to
-  `Compiler` confidence and ranks the load-bearing symbols.
+  C/C++, and Python — with an optional [compiler-grade SCIP oracle](docs/oracle.md) that upgrades
+  edges to `Compiler` confidence and ranks the load-bearing symbols.
 - **History as evidence.** Git history, lazy chunk blame, and cached GitHub issue/PR/review
   rationale, all queryable.
 - **Rides your existing grep.** A [PreToolUse hook](docs/grep-augmentation.md) injects the memories
