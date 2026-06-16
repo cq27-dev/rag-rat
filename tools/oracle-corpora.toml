@@ -59,9 +59,17 @@ tool      = "scip-typescript"
 # of scip-python's venv); `npm install` makes them present. It requires a root `tsconfig.json` (rxjs
 # ships one) — the backend deliberately does NOT pass `--infer-tsconfig` (read-only-on-source). Bind
 # `src/internal` (the library implementation) rather than the whole `src` re-export surface.
+#
+# `expected_min_resolved_external` (#185) is the dependency-resolution floor for this npm-style
+# backend: scip-typescript mints local package monikers from package.json REGARDLESS of whether
+# node_modules is installed, so `symbols_with_moniker` (~626 measured) stays high even on a
+# missing-deps run — only EXTERNAL resolution collapses. Measured `resolved_external` ~2534 with
+# node_modules present; the 1000 floor catches a missing-`npm install` run (external resolution drops
+# toward zero) while sitting well below the healthy number. The non-npm backends leave it unset
+# (external resolution isn't their dep signal; rust/c use cargo fetch / the compdb).
 prepare   = ["npm install --no-audit --no-fund"]
 bindings  = { typescript = ["src/internal"] }
-health    = { expected_min_heuristic_edges = 5000, expected_min_oracle_examined = 3500, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 300, timeout_minutes = 15 }
+health    = { expected_min_heuristic_edges = 5000, expected_min_oracle_examined = 3500, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 300, expected_min_resolved_external = 1000, timeout_minutes = 15 }
 
 [[corpus]]
 corpus_id = "cpp-yaml"

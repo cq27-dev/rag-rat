@@ -99,6 +99,19 @@ pub fn check_corpus_health(
         });
     }
 
+    // Opt-in external-resolution floor (#185): for npm-style backends `symbols_with_moniker` stays
+    // high even with `node_modules` absent (local monikers come from package.json), so only
+    // `resolved_external` reveals a missing-dependency run. Gated only when the profile sets a
+    // floor.
+    if let Some(min_resolved_external) = health.expected_min_resolved_external
+        && report.resolved_external < min_resolved_external
+    {
+        violations.push(HealthViolation {
+            check: "min_resolved_external",
+            detail: format!("{} < {min_resolved_external}", report.resolved_external),
+        });
+    }
+
     violations
 }
 
@@ -202,7 +215,7 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
         "ba5a37328901f0b1964c51bc8cff3c729d07070a0ce0d61f9934ea7790ca6b64";
     const GOLDEN_C_LIBUV: &str = "b34ef742c7d4b5efc02bdb95a8457719be9a0dd5621485e11c7d42d2e534d965";
     const GOLDEN_PY_RICH: &str = "0a4a22be9817ff26b549119b098d23004e5a8b4d7817126e5084f9d730f1efda";
-    const GOLDEN_TS_RXJS: &str = "492436f3827cbf9afe206b5feb03227388521db68a5965c1c3e904f68f0e1109";
+    const GOLDEN_TS_RXJS: &str = "da31c85864cdad38b7a4553774e46d241a602e3c4e9d11229bdd52c2f7411ee1";
     const GOLDEN_CPP_YAML: &str =
         "2b6d2ec7f00b34e330116bf1b93fd51416926ac3d30e24dac766f0f8fb910f58";
     const GOLDEN_RUST_CARGO: &str =
@@ -260,5 +273,41 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
             "max_skipped_drifted",
             "min_symbols_with_moniker",
         ]);
+    }
+
+    #[test]
+    fn external_resolution_floor_gates_only_when_set() {
+        // #185: the dep-resolution floor is opt-in. Unset (the SAMPLE default) → never gated, so a
+        // backend where external resolution isn't the signal isn't spuriously failed.
+        let mut profile =
+            corpus_by_id(&load_corpora(SAMPLE).unwrap(), "rust-semver").unwrap().clone();
+        assert!(profile.health.expected_min_resolved_external.is_none());
+        let mut report = report_with(100, 30, 0, 15); // resolved_external defaults to 0
+        assert_eq!(report.resolved_external, 0);
+        assert!(
+            check_corpus_health(&profile, &report)
+                .iter()
+                .all(|v| v.check != "min_resolved_external"),
+            "no floor set → external resolution is not gated even at 0"
+        );
+
+        // With a floor, a run whose external resolution falls below it violates (the npm-style
+        // missing-node_modules failure mode that `symbols_with_moniker` would miss).
+        profile.health.expected_min_resolved_external = Some(50);
+        let checks: Vec<&str> =
+            check_corpus_health(&profile, &report).iter().map(|v| v.check).collect();
+        assert!(
+            checks.contains(&"min_resolved_external"),
+            "below-floor external resolution must violate; got {checks:?}"
+        );
+
+        // A run clearing the floor passes the external check.
+        report.resolved_external = 80;
+        assert!(
+            check_corpus_health(&profile, &report)
+                .iter()
+                .all(|v| v.check != "min_resolved_external"),
+            "external resolution >= floor passes"
+        );
     }
 }

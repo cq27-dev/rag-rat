@@ -45,6 +45,17 @@ pub struct CorpusHealth {
     /// Minimum logical symbols that gained a moniker (catches "scip-python ran but resolved
     /// nothing", the venv-not-installed failure mode).
     pub expected_min_symbols_with_moniker: u64,
+    /// Minimum edges the oracle resolved to an EXTERNAL definition — an OPT-IN
+    /// dependency-resolution floor (#185). `symbols_with_moniker` is the canonical "did deps
+    /// resolve" signal for most backends, but it is unreliable for the npm-style ones:
+    /// scip-typescript mints local package monikers from `package.json` regardless of whether
+    /// `node_modules` is installed, so the moniker count stays high while only EXTERNAL
+    /// resolution collapses. Gating `resolved_external` directly catches a missing-dependency
+    /// run those backends would otherwise pass. `None` (omitted) = no gate — the default for
+    /// backends where external resolution isn't the dep signal (rust-analyzer/scip-clang) or
+    /// is already covered by the moniker floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_min_resolved_external: Option<u64>,
     /// Wall-clock budget for the whole corpus run; the runner wraps the run in this timeout.
     pub timeout_minutes: u64,
 }
@@ -272,6 +283,7 @@ mod tests {
                 expected_min_oracle_examined: 20,
                 expected_max_skipped_drifted: 0,
                 expected_min_symbols_with_moniker: 10,
+                expected_min_resolved_external: None,
                 timeout_minutes: 8,
             },
         }

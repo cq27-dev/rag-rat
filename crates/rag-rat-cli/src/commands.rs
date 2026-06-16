@@ -1171,6 +1171,7 @@ mod tests {
                     expected_min_oracle_examined: 1,
                     expected_max_skipped_drifted: 0,
                     expected_min_symbols_with_moniker: 1,
+                    expected_min_resolved_external: None,
                     timeout_minutes: 1,
                 },
             }
