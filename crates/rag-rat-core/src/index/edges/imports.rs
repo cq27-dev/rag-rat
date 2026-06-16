@@ -415,6 +415,27 @@ pub(crate) struct ImportScope {
     /// `Url`. Only a genuinely non-Cargo corpus (no manifest at all) fails open. Set true by
     /// [`Self::mark_has_manifests`] when any package row is loaded.
     has_manifests: bool,
+    /// Per-file Python import aliases: `alias name → its bindings` (#174). A `from m import T as
+    /// A` records `A → T` so a later reference to `A` resolves to the IMPORTED symbol `T`, not
+    /// an unrelated local `A`. Distinct from `by_file` (Rust external-import suppression):
+    /// this REBINDS an alias use to its in-corpus target name, rather than just flagging it
+    /// external.
+    python_aliases: HashMap<i64, HashMap<String, Vec<PythonAlias>>>,
+}
+
+/// One Python import alias binding: the imported target name the alias stands for, scoped to a byte
+/// range (whole-file today — Python imports are module-global). Mirrors [`ImportBinding`] but
+/// carries the TARGET name (for rebinding) rather than the crate root (for external detection).
+struct PythonAlias {
+    target: String,
+    scope_start: usize,
+    scope_end: usize,
+}
+
+impl PythonAlias {
+    fn covers(&self, ref_byte: usize) -> bool {
+        ref_byte >= self.scope_start && ref_byte < self.scope_end
+    }
 }
 
 impl ImportScope {
@@ -438,6 +459,56 @@ impl ImportScope {
     /// dep alias keys).
     pub(crate) fn set_package_roots(&mut self, package_id: i64, roots: HashSet<String>) {
         self.package_roots.insert(package_id, roots);
+    }
+
+    /// Record a Python `from <module> import <target> as <alias>` binding (#174): `alias → target`,
+    /// scoped to the import's byte range. The carrier is the aliased import's Imports edge — its
+    /// `to_name` is `target` and its `evidence` is `alias` (set by extraction's
+    /// `python_import_target`).
+    pub(crate) fn add_python_alias(
+        &mut self,
+        file_id: i64,
+        alias: String,
+        target: String,
+        scope: Option<ImportScopeRange>,
+    ) {
+        // A binding with no scope can't be range-tested; skip rather than bind file-wide blindly.
+        let Some(scope) = scope else { return };
+        self.python_aliases.entry(file_id).or_default().entry(alias).or_default().push(
+            PythonAlias { target, scope_start: scope.scope_start, scope_end: scope.scope_end },
+        );
+    }
+
+    /// The imported target name a Python alias `name` stands for at `ref_byte`, if any (#174). The
+    /// caller resolves the reference under this target name instead of the alias — so `Account()`
+    /// after `from models import User as Account` binds to `User`. `None` for non-Python files (the
+    /// map is empty) or a name that isn't an in-scope alias.
+    pub(crate) fn python_alias_target(
+        &self,
+        file_id: i64,
+        name: &str,
+        ref_byte: usize,
+    ) -> Option<&str> {
+        // The bindings covering `ref_byte` (#174 review). A sequential re-import
+        // (`from m1 import User as Account; from m2 import Customer as Account`) leaves exactly ONE
+        // covering binding at any byte — extraction's `python_next_module_binding` shrinks each
+        // earlier binding's `scope_end` to the next UNCONDITIONAL rebinding, so the ranges abut.
+        // The only way two cover the same byte is mutually-exclusive CONDITIONAL branches
+        // (`try: import … as A except: import … as A`), neither of which shrinks the other; when
+        // those name DIFFERENT targets the alias is genuinely AMBIGUOUS, so resolve nothing rather
+        // than pick one by byte order. All-same-target overlaps (try/except importing the same
+        // symbol from different modules) still resolve.
+        let mut covering = self
+            .python_aliases
+            .get(&file_id)?
+            .get(name)?
+            .iter()
+            .filter(|alias| alias.covers(ref_byte));
+        let first = covering.next()?;
+        if covering.any(|alias| alias.target != first.target) {
+            return None;
+        }
+        Some(first.target.as_str())
     }
 
     /// Record one Imports edge for `file_id`. An inline-`mod` edge (scope present, but `use_text`

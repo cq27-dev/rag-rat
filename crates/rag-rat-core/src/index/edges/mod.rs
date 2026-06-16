@@ -479,6 +479,16 @@ impl<'a> SymbolIndex<'a> {
         }
         Self { by_qualified, by_scope_path, by_name, by_qn_tail, file_language }
     }
+
+    /// Whether `file_id` itself defines a symbol named `name`. The Python alias rebind uses this to
+    /// DEFER when the imported target's bare name is ALSO defined locally (#174 review): a bare
+    /// rewrite of `Account` → `User` could grab a same-file `User` instead of the import, so leave
+    /// it to normal resolution. (The alias-shadow ordering — a same-module `class Account` /
+    /// `Account = …` after the import reassigning the name — is handled at extraction by bounding
+    /// the alias's `scope_end` at the next module-scope rebinding, not here.)
+    pub(crate) fn file_defines(&self, file_id: i64, name: &str) -> bool {
+        self.by_name.get(name).is_some_and(|symbols| symbols.iter().any(|s| s.file_id == file_id))
+    }
 }
 
 pub(crate) struct ResolveSymbolRequest<'a> {

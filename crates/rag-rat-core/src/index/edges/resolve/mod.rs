@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 
@@ -16,6 +16,92 @@ fn import_scope_from_row(
         scope_end: usize::try_from(scope_end.unwrap_or(0)).unwrap_or(0),
         mod_id: mod_id.unwrap_or(MOD_FILE_ROOT),
     })
+}
+
+/// How a Python from-import alias reference is rewritten before resolution (#174). Empty (all
+/// `None`) when nothing is an in-scope alias. The order/scope correctness lives in extraction:
+/// each alias binding's `scope_end` already stops at the next module-scope rebinding of the name,
+/// so `python_alias_target` only returns an alias that is genuinely in effect at `ref_byte`.
+#[derive(Default)]
+struct PythonAliasRebind {
+    /// Override the leaf name passed to `resolve_symbol` — a BARE alias reference (`Account()` →
+    /// resolve `User`).
+    name: Option<String>,
+    /// Override `target_qualified_name` — a QUALIFIED reference whose receiver root is an alias
+    /// (`Account.from_id` → `User.from_id`).
+    target_qualified_name: Option<String>,
+    /// Override `receiver_hint` — the rebound receiver (`Account` → `User`).
+    receiver_hint: Option<String>,
+}
+
+/// Resolve a Python from-import alias to its imported target name, or `None` (#174). Picks the
+/// alias in effect at `ref_byte` (extraction already bounded its scope at the next module-scope
+/// rebinding), then declines if the file ALSO defines the target's bare name locally — a bare
+/// rewrite could grab the local definition instead of the import, so leave it to normal resolution
+/// (no edge beats a wrong one).
+fn python_alias_target<'i>(
+    import_scope: &'i imports::ImportScope,
+    index: &SymbolIndex<'_>,
+    file_id: i64,
+    name: &str,
+    ref_byte: usize,
+) -> Option<&'i str> {
+    let target = import_scope.python_alias_target(file_id, name, ref_byte)?;
+    if index.file_defines(file_id, short_name(target)) {
+        return None;
+    }
+    Some(target)
+}
+
+/// Rewrite a Python from-import alias reference before resolution (#174). A BARE reference
+/// (`Account()`) rebinds the leaf; a QUALIFIED reference rebinds only the RECEIVER root
+/// (`Account.from_id()` → `User.from_id`), never the leaf — `pkg.Account` is `pkg`'s member, not
+/// the local alias `Account`, so the leaf of a qualified reference is never treated as an alias.
+///
+/// MODEL BOUNDARY: this is a MODULE-scope alias model (#174 review). The alias's scope is bounded
+/// at the next MODULE-scope rebinding of the name (extraction's `python_next_module_binding`). It
+/// does NOT model per-nested-scope lexical shadowing: a reference inside a `def`/`class` body that
+/// has its OWN local binding of the alias name is still rebound to the module import. That is rare
+/// (a nested local class/def reusing an imported alias's exact name) and resolving it would require
+/// full lexical-scope analysis at the reference site, beyond "module-scope binding statements".
+fn python_alias_rebind(
+    import_scope: &imports::ImportScope,
+    index: &SymbolIndex<'_>,
+    file_id: i64,
+    to_name: &str,
+    target_qualified_name: Option<&str>,
+    receiver_hint: Option<&str>,
+    ref_byte: usize,
+) -> PythonAliasRebind {
+    match receiver_hint {
+        Some(receiver) => {
+            let Some(target) =
+                python_alias_target(import_scope, index, file_id, receiver, ref_byte)
+            else {
+                return PythonAliasRebind::default();
+            };
+            PythonAliasRebind {
+                name: None,
+                target_qualified_name: target_qualified_name
+                    .map(|qualified| replace_qualified_root(qualified, target)),
+                receiver_hint: Some(target.to_string()),
+            }
+        },
+        None => {
+            let target =
+                python_alias_target(import_scope, index, file_id, short_name(to_name), ref_byte);
+            PythonAliasRebind { name: target.map(str::to_string), ..PythonAliasRebind::default() }
+        },
+    }
+}
+
+/// Replace the first `::`-separated segment (the receiver root) of a dotted qualified name with
+/// `root` — `replace_qualified_root("Account::from_id", "User") == "User::from_id"`.
+fn replace_qualified_root(qualified: &str, root: &str) -> String {
+    match qualified.split_once("::") {
+        Some((_, rest)) => format!("{root}::{rest}"),
+        None => root.to_string(),
+    }
 }
 
 /// Load the per-package local-crate sets and COMPUTE each active file's owning package into `scope`
@@ -158,17 +244,28 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
         // `evidence`. Building the per-file module interval set here is once-per-pass, not
         // per-edge.
         let mut stmt = conn.prepare(
-            "SELECT d.source_file_id, d.evidence, d.import_scope_start_byte, \
-             d.import_scope_end_byte, d.import_mod_id FROM edges_data d JOIN files ON files.id = \
-             d.source_file_id JOIN edge_strings ek ON ek.id = d.edge_kind_id WHERE ek.value = \
+            "SELECT d.source_file_id, files.language, tn.value, d.evidence, \
+             d.import_scope_start_byte, d.import_scope_end_byte, d.import_mod_id FROM edges_data \
+             d JOIN files ON files.id = d.source_file_id JOIN edge_strings ek ON ek.id = \
+             d.edge_kind_id LEFT JOIN edge_strings tn ON tn.id = d.to_name_id WHERE ek.value = \
              'imports'",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let file_id: i64 = row.get(0)?;
-            let evidence: Option<String> = row.get(1)?;
-            let scope = import_scope_from_row(row.get(2)?, row.get(3)?, row.get(4)?);
-            if let Some(evidence) = evidence {
+            let language: String = row.get(1)?;
+            let to_name: Option<String> = row.get(2)?;
+            let evidence: Option<String> = row.get(3)?;
+            let scope = import_scope_from_row(row.get(4)?, row.get(5)?, row.get(6)?);
+            if language == Language::Python.as_str() {
+                // A Python `from m import T as A` alias edge carries `evidence = A` (alias),
+                // `to_name = T` (target), and a whole-file scope (#174); non-aliased Python imports
+                // have no scope and `add_python_alias` skips them. Python imports never go through
+                // `add_use` (that parses Rust `use` text).
+                if let (Some(alias), Some(target)) = (evidence, to_name) {
+                    import_scope.add_python_alias(file_id, alias, target, scope);
+                }
+            } else if let Some(evidence) = evidence {
                 import_scope.add_use(file_id, &evidence, scope);
             }
         }
@@ -215,13 +312,34 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     {
         // The reference's byte position drives the module-aware covering test (#61).
         let ref_byte = usize::try_from(source_start_byte).unwrap_or(0);
+        // Python from-import alias rebind (#174): resolve a reference written under an alias using
+        // its imported TARGET — `Account()` after `from m import User as Account` binds to `User`,
+        // and `Account.from_id()` to `User.from_id`. Only reference edges — the Imports edge itself
+        // already names the real target. Non-Python files have no alias entries (cheap miss).
+        let rebind = if edge_kind == EdgeKind::Imports.as_str() {
+            PythonAliasRebind::default()
+        } else {
+            python_alias_rebind(
+                &import_scope,
+                &index,
+                source_file_id,
+                &to_name,
+                target_qualified_name.as_deref(),
+                receiver_hint.as_deref(),
+                ref_byte,
+            )
+        };
+        let resolve_name = rebind.name.as_deref().unwrap_or(to_name.as_str());
+        let resolve_qualified =
+            rebind.target_qualified_name.as_deref().or(target_qualified_name.as_deref());
+        let resolve_receiver = rebind.receiver_hint.as_deref().or(receiver_hint.as_deref());
         let resolution = resolve_symbol(
             ResolveSymbolRequest {
-                name: &to_name,
-                target_qualified_name: target_qualified_name.as_deref(),
+                name: resolve_name,
+                target_qualified_name: resolve_qualified,
                 edge_kind: &edge_kind,
                 evidence: evidence.as_deref(),
-                receiver_hint: receiver_hint.as_deref(),
+                receiver_hint: resolve_receiver,
                 source_file_id,
                 source_language: index.file_language.get(&source_file_id).copied(),
                 imported_external: import_scope.is_external_import(
@@ -332,10 +450,37 @@ pub(crate) fn resolve_and_insert_edges(
     // accumulator vs DB rows).
     let mut import_scope = imports::ImportScope::new(imports::load_local_roots(conn));
     load_package_roots_into_scope(conn, &mut import_scope)?;
+    // File languages from the DB, NOT `index.file_language` (built only from files that contributed
+    // a symbol). A Python entrypoint that ONLY does `from m import X as A; A()` has no symbol row
+    // for its own file, so `index.file_language` would miss it and the alias carrier would feed
+    // neither `add_python_alias` nor `add_use` under `index --full` (#174 review); the DB row
+    // is authoritative. The incremental driver already joins `files.language`, so this keeps
+    // the two drivers in lockstep.
+    let file_language: HashMap<i64, String> = {
+        let mut stmt = conn.prepare("SELECT id, language FROM files")?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
     for (file_id, candidate) in &edges {
         if candidate.edge_kind == EdgeKind::Imports {
             let evidence = arena.get_opt(candidate.evidence).unwrap_or("");
-            import_scope.add_use(*file_id, evidence, candidate.import_scope_range());
+            if file_language.get(file_id).map(String::as_str) == Some(Language::Python.as_str()) {
+                // Python from-import alias carrier (#174): evidence = alias, to_name = target,
+                // whole-file scope. Non-aliased Python imports have no scope → `add_python_alias`
+                // skips them; Python imports never feed `add_use` (Rust `use`-text parsing).
+                let target = arena.get(candidate.to_name).trim();
+                if !evidence.is_empty() && !target.is_empty() {
+                    import_scope.add_python_alias(
+                        *file_id,
+                        evidence.to_string(),
+                        target.to_string(),
+                        candidate.import_scope_range(),
+                    );
+                }
+            } else {
+                import_scope.add_use(*file_id, evidence, candidate.import_scope_range());
+            }
         }
     }
     import_scope.finalize();
@@ -374,13 +519,33 @@ pub(crate) fn resolve_and_insert_edges(
         // The reference's byte position drives the module-aware covering test (#61) — same input
         // the DB driver reads from `source_start_byte`.
         let ref_byte = candidate.source_span.start_byte as usize;
+        // Python from-import alias rebind (#174): mirror the DB driver — resolve a reference under
+        // its imported TARGET, so `Account()` binds to `User` and `Account.from_id()` to
+        // `User.from_id`. Imports edges keep their own target name; non-Python files have no alias
+        // entries.
+        let rebind = if candidate.edge_kind == EdgeKind::Imports {
+            PythonAliasRebind::default()
+        } else {
+            python_alias_rebind(
+                &import_scope,
+                &index,
+                *file_id,
+                to_name,
+                target_qualified_name,
+                receiver_hint,
+                ref_byte,
+            )
+        };
+        let resolve_name = rebind.name.as_deref().unwrap_or(to_name);
+        let resolve_qualified = rebind.target_qualified_name.as_deref().or(target_qualified_name);
+        let resolve_receiver = rebind.receiver_hint.as_deref().or(receiver_hint);
         let resolution = resolve_symbol(
             ResolveSymbolRequest {
-                name: to_name,
-                target_qualified_name,
+                name: resolve_name,
+                target_qualified_name: resolve_qualified,
                 edge_kind: candidate.edge_kind.as_str(),
                 evidence,
-                receiver_hint,
+                receiver_hint: resolve_receiver,
                 source_file_id: *file_id,
                 source_language: index.file_language.get(file_id).copied(),
                 imported_external: import_scope.is_external_import(

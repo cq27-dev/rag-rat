@@ -665,3 +665,365 @@ fn python_implements_ignores_a_foreign_language_class() {
     let (to, _confidence, _resolution) = edge_state(&conn, edge);
     assert_eq!(to, None, "a Python base must not bind to a foreign-language class");
 }
+/// #174: a Python `from <module> import <T> as <alias>` makes a later reference to `alias` resolve
+/// to the imported `T`, NOT an unrelated local symbol named `alias`. The aliased import's Imports
+/// edge carries `to_name = T` (target), `evidence = alias`, and a whole-file import scope; the
+/// resolver registers `alias → T` and rebinds the alias use before name resolution.
+#[test]
+fn python_from_import_alias_rebinds_to_the_imported_target() {
+    let conn = seeded_conn();
+    let app = add_py_file(&conn, "app.py");
+    let models = add_py_file(&conn, "models.py");
+    let other = add_py_file(&conn, "other.py");
+    // The import target, and a DECOY local symbol that shares the ALIAS name.
+    let user = add_py_symbol(&conn, models, "User", "models.py::User");
+    let decoy = add_py_symbol(&conn, other, "Account", "other.py::Account");
+    // `from models import User as Account` → alias carrier: target `User`, alias `Account`, whole-
+    // file scope [0, 200).
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence, \
+         source_start_byte, import_scope_start_byte, import_scope_end_byte, import_mod_id) VALUES \
+         (?1, 'User', 'imports', 'NameOnly', 'unresolved', 'Account', 0, 0, 200, -1)",
+        params![app],
+    )
+    .unwrap();
+    // `Account()` at byte 50 (inside the import scope).
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         source_start_byte) VALUES (?1, 'Account', 'calls_name', 'NameOnly', 'unresolved', 50)",
+        params![app],
+    )
+    .unwrap();
+    let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, confidence, _resolution) = edge_state(&conn, call);
+    assert_eq!(
+        to,
+        Some(user),
+        "alias `Account` must rebind to the imported `User`, not the local decoy {decoy}"
+    );
+    assert_ne!(confidence, "NameOnly", "the rebound alias reference resolves");
+}
+
+/// #174 review: the alias's `scope_end` bounds the rebind — a reference PAST it (where extraction
+/// found the name rebound at module scope) is not covered, so it falls through to normal resolution
+/// and binds the local `class Account`. The order/shadow computation itself lives in extraction
+/// (`python_next_module_binding`); here we check the resolver honors the resulting `scope_end`.
+#[test]
+fn python_alias_rebind_respects_the_scope_end_shadow() {
+    let conn = seeded_conn();
+    let app = add_py_file(&conn, "app.py");
+    let models = add_py_file(&conn, "models.py");
+    add_py_symbol(&conn, models, "User", "models.py::User");
+    // A LOCAL `class Account` at byte 30 — extraction would set the alias `scope_end` here.
+    let local_account = add_py_symbol_at(&conn, app, "Account", "app.py::Account", 30);
+    // Alias scope is [0, 30): the rebind applies before the redefinition, not after.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence, \
+         source_start_byte, import_scope_start_byte, import_scope_end_byte, import_mod_id) VALUES \
+         (?1, 'User', 'imports', 'NameOnly', 'unresolved', 'Account', 0, 0, 30, -1)",
+        params![app],
+    )
+    .unwrap();
+    // `Account()` at byte 50 — PAST the scope_end, so the alias no longer applies.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         source_start_byte) VALUES (?1, 'Account', 'calls_name', 'NameOnly', 'unresolved', 50)",
+        params![app],
+    )
+    .unwrap();
+    let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _confidence, _resolution) = edge_state(&conn, call);
+    assert_eq!(
+        to,
+        Some(local_account),
+        "a reference past scope_end must fall through to the local `class Account`, not the import"
+    );
+}
+
+/// #174 review: a QUALIFIED reference whose RECEIVER root is an alias is rebound at the receiver —
+/// `from models import User as Account; Account.from_id()` resolves the method on the imported
+/// `User`, not left unresolved. The alias rewrite rewrites the receiver + the qualified-name root.
+#[test]
+fn python_alias_rebind_rebinds_a_qualified_receiver() {
+    let conn = seeded_conn();
+    let app = add_py_file(&conn, "app.py");
+    let models = add_py_file(&conn, "models.py");
+    // The imported class `User` and its method `from_id` (scope_path `User::from_id`).
+    add_py_symbol(&conn, models, "User", "models.py::User");
+    let from_id =
+        add_py_symbol_scope(&conn, models, "from_id", "models.py::from_id", "User::from_id");
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence, \
+         source_start_byte, import_scope_start_byte, import_scope_end_byte, import_mod_id) VALUES \
+         (?1, 'User', 'imports', 'NameOnly', 'unresolved', 'Account', 0, 0, 200, -1)",
+        params![app],
+    )
+    .unwrap();
+    // `Account.from_id()` at byte 50: to_name=from_id, receiver=Account, qn=Account::from_id.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, confidence, \
+         resolution, receiver_hint, source_start_byte) VALUES (?1, 'from_id', 'Account::from_id', \
+         'calls_name', 'NameOnly', 'unresolved', 'Account', 50)",
+        params![app],
+    )
+    .unwrap();
+    let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _confidence, _resolution) = edge_state(&conn, call);
+    assert_eq!(
+        to,
+        Some(from_id),
+        "a qualified receiver alias must rebind so `Account.from_id` resolves to `User.from_id`"
+    );
+}
+
+/// #174 review: a sequential re-import reassigns the alias; the later binding wins. Real extraction
+/// shrinks the first binding's `scope_end` to the second's start, so the scopes ABUT (non-
+/// overlapping): `Account -> User` is [0, 20), `Account -> Customer` is [20, 200). `Account()` at
+/// byte 50 falls in the second, resolving to `Customer`.
+#[test]
+fn python_alias_rebind_picks_the_latest_reimport() {
+    let conn = seeded_conn();
+    let app = add_py_file(&conn, "app.py");
+    let models = add_py_file(&conn, "models.py");
+    let _user = add_py_symbol(&conn, models, "User", "models.py::User");
+    let customer = add_py_symbol(&conn, models, "Customer", "models.py::Customer");
+    // First binding `Account -> User` — scope ends where the second import rebinds the name (byte
+    // 20).
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence, \
+         source_start_byte, import_scope_start_byte, import_scope_end_byte, import_mod_id) VALUES \
+         (?1, 'User', 'imports', 'NameOnly', 'unresolved', 'Account', 0, 0, 20, -1)",
+        params![app],
+    )
+    .unwrap();
+    // Second binding `Account -> Customer` at byte 20 — reassigns the alias.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence, \
+         source_start_byte, import_scope_start_byte, import_scope_end_byte, import_mod_id) VALUES \
+         (?1, 'Customer', 'imports', 'NameOnly', 'unresolved', 'Account', 20, 20, 200, -1)",
+        params![app],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         source_start_byte) VALUES (?1, 'Account', 'calls_name', 'NameOnly', 'unresolved', 50)",
+        params![app],
+    )
+    .unwrap();
+    let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _confidence, _resolution) = edge_state(&conn, call);
+    assert_eq!(to, Some(customer), "the latest re-import of the alias must win");
+}
+
+/// #174 review: mutually-exclusive branch imports (`try: import … as DB except: import … as DB`)
+/// produce two OVERLAPPING alias bindings to DIFFERENT targets — neither shrinks the other's scope
+/// (extraction only shrinks at unconditional rebindings). The alias is genuinely ambiguous, so the
+/// reference must stay unresolved rather than picking one by byte order.
+#[test]
+fn python_alias_rebind_is_ambiguous_across_exclusive_branches() {
+    let conn = seeded_conn();
+    let app = add_py_file(&conn, "app.py");
+    let models = add_py_file(&conn, "models.py");
+    add_py_symbol(&conn, models, "Fast", "models.py::Fast");
+    add_py_symbol(&conn, models, "Slow", "models.py::Slow");
+    // Two covering bindings of `DB`, both spanning the file (the try/except branches don't shrink
+    // each other), to different targets.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence, \
+         source_start_byte, import_scope_start_byte, import_scope_end_byte, import_mod_id) VALUES \
+         (?1, 'Fast', 'imports', 'NameOnly', 'unresolved', 'DB', 0, 0, 200, -1)",
+        params![app],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence, \
+         source_start_byte, import_scope_start_byte, import_scope_end_byte, import_mod_id) VALUES \
+         (?1, 'Slow', 'imports', 'NameOnly', 'unresolved', 'DB', 20, 0, 200, -1)",
+        params![app],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         source_start_byte) VALUES (?1, 'DB', 'calls_name', 'NameOnly', 'unresolved', 50)",
+        params![app],
+    )
+    .unwrap();
+    let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, confidence, _resolution) = edge_state(&conn, call);
+    assert_eq!(to, None, "an alias bound to different targets in exclusive branches is ambiguous");
+    assert_eq!(confidence, "NameOnly");
+}
+
+/// #174 review: two branch imports of the SAME target (`try: from a import Engine as DB except: from
+/// a import Engine as DB`) overlap but agree, so the alias still resolves.
+#[test]
+fn python_alias_rebind_resolves_when_branches_agree() {
+    let conn = seeded_conn();
+    let app = add_py_file(&conn, "app.py");
+    let models = add_py_file(&conn, "models.py");
+    let engine = add_py_symbol(&conn, models, "Engine", "models.py::Engine");
+    for start in [0, 20] {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+             evidence, source_start_byte, import_scope_start_byte, import_scope_end_byte, \
+             import_mod_id) VALUES (?1, 'Engine', 'imports', 'NameOnly', 'unresolved', 'DB', ?2, \
+             0, 200, -1)",
+            params![app, start],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         source_start_byte) VALUES (?1, 'DB', 'calls_name', 'NameOnly', 'unresolved', 50)",
+        params![app],
+    )
+    .unwrap();
+    let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _confidence, _resolution) = edge_state(&conn, call);
+    assert_eq!(to, Some(engine), "agreeing branch imports still resolve");
+}
+
+/// #174 review: a QUALIFIED reference (`other.Account()`) is not the local alias `Account`, so it
+/// must NOT be rebound to the import. The receiver hint marks the reference qualified; the rebind
+/// bails on it. With no local `Account` symbol, a rebound reference would resolve to `User` — so a
+/// NameOnly (unresolved) outcome proves the rebind was correctly skipped.
+#[test]
+fn python_alias_rebind_skips_a_qualified_reference() {
+    let conn = seeded_conn();
+    let app = add_py_file(&conn, "app.py");
+    let models = add_py_file(&conn, "models.py");
+    add_py_symbol(&conn, models, "User", "models.py::User");
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence, \
+         source_start_byte, import_scope_start_byte, import_scope_end_byte, import_mod_id) VALUES \
+         (?1, 'User', 'imports', 'NameOnly', 'unresolved', 'Account', 0, 0, 200, -1)",
+        params![app],
+    )
+    .unwrap();
+    // `other.Account()` at byte 50 — a member access on `other`, recorded with a receiver hint.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         receiver_hint, source_start_byte) VALUES (?1, 'Account', 'calls_name', 'NameOnly', \
+         'unresolved', 'other', 50)",
+        params![app],
+    )
+    .unwrap();
+    let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, confidence, _resolution) = edge_state(&conn, call);
+    assert_eq!(to, None, "a qualified `other.Account` must not rebind to the imported `User`");
+    assert_eq!(confidence, "NameOnly", "the qualified reference stays unresolved");
+}
+
+/// #174 review: a reference BEFORE the import is outside the alias's scope, so it is not rebound.
+/// `Account()` (byte 5); `from m import User as Account` (byte 20) — the call precedes the binding,
+/// so it must stay unresolved rather than rebinding to `User`.
+#[test]
+fn python_alias_rebind_skips_a_use_before_the_import() {
+    let conn = seeded_conn();
+    let app = add_py_file(&conn, "app.py");
+    let models = add_py_file(&conn, "models.py");
+    add_py_symbol(&conn, models, "User", "models.py::User");
+    // The aliased import's scope starts at byte 20.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, evidence, \
+         source_start_byte, import_scope_start_byte, import_scope_end_byte, import_mod_id) VALUES \
+         (?1, 'User', 'imports', 'NameOnly', 'unresolved', 'Account', 20, 20, 200, -1)",
+        params![app],
+    )
+    .unwrap();
+    // `Account()` at byte 5 — BEFORE the import scope opens.
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         source_start_byte) VALUES (?1, 'Account', 'calls_name', 'NameOnly', 'unresolved', 5)",
+        params![app],
+    )
+    .unwrap();
+    let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, confidence, _resolution) = edge_state(&conn, call);
+    assert_eq!(to, None, "a use before the import is out of scope and must not rebind");
+    assert_eq!(confidence, "NameOnly", "the pre-import reference stays unresolved");
+}
+
+/// A Python symbol carrying a semantic `scope_path` (e.g. a method `User::from_id`), so the
+/// resolver's scope-suffix matching can bind a qualified reference.
+fn add_py_symbol_scope(
+    conn: &Connection,
+    file_id: i64,
+    name: &str,
+    qualified: &str,
+    scope_path: &str,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO symbols(file_id, language, name, qualified_name, scope_path, kind, \
+         start_byte, end_byte, start_line, end_line) VALUES (?1, 'python', ?2, ?3, ?4, \
+         'function', 0, 10, 1, 1)",
+        params![file_id, name, qualified, scope_path],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+fn add_py_file(conn: &Connection, path: &str) -> i64 {
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id) VALUES (?1, 'python', 'source', ?2, 0, 0, ?3, '')",
+        params![path, format!("sha-{path}"), NEW],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+fn add_py_symbol(conn: &Connection, file_id: i64, name: &str, qualified: &str) -> i64 {
+    add_py_symbol_at(conn, file_id, name, qualified, 0)
+}
+
+/// Like [`add_py_symbol`] but with an explicit `start_byte`, so a test can position a local
+/// definition before or after the alias import — the order-aware shadow check (#174 review) depends
+/// on which comes first.
+fn add_py_symbol_at(
+    conn: &Connection,
+    file_id: i64,
+    name: &str,
+    qualified: &str,
+    start_byte: i64,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, end_byte, \
+         start_line, end_line) VALUES (?1, 'python', ?2, ?3, 'class', ?4, ?4 + 10, 1, 1)",
+        params![file_id, name, qualified, start_byte],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
