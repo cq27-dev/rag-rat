@@ -255,6 +255,26 @@ fn references_type_multi_candidate_does_not_guess_in_rust() {
     assert_eq!(to, Some(only), "a uniquely-named type still resolves");
 }
 
+/// The multi-candidate `references_type` suppression must NOT drop a type defined AND used in its
+/// OWN file just because the name recurs elsewhere — `same_file_name` still resolves it locally.
+#[test]
+fn references_type_resolves_same_file_definition_despite_name_collision() {
+    let conn = seeded_conn();
+    let home = add_file(&conn, "a.rs", NEW);
+    let other = add_file(&conn, "b.rs", NEW);
+    // `Error` defined in BOTH files; a reference inside a.rs should bind to a.rs's own `Error`.
+    let local = add_symbol_kind(&conn, home, "Error", "a.rs::Error", "struct");
+    add_symbol_kind(&conn, other, "Error", "b.rs::Error", "struct");
+    let edge = add_type_ref_edge(&conn, home, "Error");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, Some(local), "a same-file type definition still resolves locally");
+    assert_eq!(resolution, "same_file_name");
+}
+
 fn add_symbol_scope(
     conn: &Connection,
     file_id: i64,

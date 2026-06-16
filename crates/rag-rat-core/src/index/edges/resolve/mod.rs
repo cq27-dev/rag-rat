@@ -808,12 +808,14 @@ pub(crate) fn resolve_symbol<'a>(
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
     match matches {
         [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "target_name_fallback")),
-        // Multiple same-name candidates. For a `references_type` this is the associated-type case —
-        // don't guess (see `multi_pick_ok`); leave it unresolved (NameOnly) for the oracle to
-        // upgrade.
-        [_, ..] if !multi_pick_ok => None,
         [_, ..] => {
-            if same_logical_symbol(matches) {
+            // `logical_variant` (an arbitrary pick among same-`scope_path` candidates) is gated by
+            // `multi_pick_ok`: for a Rust `references_type` the same-scope group is distinct
+            // associated types (serde's many `impl Trait { type Value }` share a trait scope), so
+            // picking one is a wrong guess. `same_file_name` is KEPT even for `references_type` — a
+            // type defined AND used in its own file resolves reliably to the local definition even
+            // when the name recurs in other files.
+            if multi_pick_ok && same_logical_symbol(matches) {
                 return Some((matches[0], EdgeConfidence::Syntactic, "logical_variant"));
             }
             let same_file = matches
@@ -823,7 +825,7 @@ pub(crate) fn resolve_symbol<'a>(
                 .collect::<Vec<_>>();
             match same_file.as_slice() {
                 [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "same_file_name")),
-                [_, ..] if same_logical_symbol(&same_file) =>
+                [_, ..] if multi_pick_ok && same_logical_symbol(&same_file) =>
                     Some((same_file[0], EdgeConfidence::Syntactic, "logical_variant")),
                 _ => None,
             }
