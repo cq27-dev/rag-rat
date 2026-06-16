@@ -2,6 +2,8 @@
 
 `rag-rat.toml` has an `[index]` table, optional simple `[target_bindings]`, and optional richer `[[target]]` blocks.
 
+`rag-rat init` writes a fully-commented `rag-rat.toml`: the lines reflecting your repo (bindings, embedding model) are active, and every other table below is emitted as commented defaults so the whole surface is discoverable in the file itself. For a C/C++ repo it detects C++ (any `.cpp`/`.cc`/… present) and binds the header directories as `cpp` so `.h` headers index as C++.
+
 ```toml
 [index]
 root = "."

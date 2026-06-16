@@ -80,6 +80,11 @@ pub(crate) struct RepoScan {
     /// `pyvenv.cfg`) are NOT recorded here — content detection, not the name, decides (#181
     /// review).
     has_python_virtualenv: bool,
+    /// Full paths of ambiguous `.h` headers, held aside during the walk and assigned to a language
+    /// only after the whole repo is seen: to **C++** if the repo has any C++ source
+    /// (`.cpp`/`.cc`/…), else to **C**. Bare `Language::from_path` calls every `.h` C, which would
+    /// bind a C++ library's header tree as `c` and parse it as C — see [`scan::assign_headers`].
+    deferred_headers: Vec<PathBuf>,
 }
 
 impl InitOptions {
@@ -273,6 +278,42 @@ mod tests {
     }
 
     #[test]
+    fn render_config_emits_full_commented_surface_that_round_trips() {
+        // The generated config documents the full surface (commented), still parses via
+        // Config::load, and the example [[target]] / [watch] / [version_check] tables stay
+        // COMMENTED — only the active bindings + model take effect.
+        let root = std::env::temp_dir().join(format!("ragrat-render-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("include")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let plan = InitPlan {
+            root_value: ".".to_string(),
+            languages: vec![Language::Cpp],
+            bindings: BTreeMap::from([(Language::Cpp, vec![
+                PathBuf::from("include"),
+                PathBuf::from("src"),
+            ])]),
+            backend: EmbeddingBackend::FastEmbed,
+            oracle_auto_run: false,
+        };
+        let text = render_config(&plan);
+        assert!(text.contains("# [[target]]"), "documents the expanded target form");
+        assert!(text.contains("# [watch]"));
+        assert!(text.contains("# [version_check]"));
+        assert!(text.contains("# [local_ai.embedding.runtime]"));
+        assert!(text.contains("`.h`"), "explains the cpp .h-header binding");
+
+        std::fs::write(root.join("rag-rat.toml"), &text).unwrap();
+        let config = Config::load(root.join("rag-rat.toml")).unwrap();
+        // Exactly the one active cpp target — the example [[target]] stayed commented.
+        assert_eq!(config.targets.len(), 1);
+        assert_eq!(config.targets[0].language, Language::Cpp);
+        // Commented [watch] falls back to its default (enabled).
+        assert!(config.watch.enabled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn recommend_backend_scales_with_repo_size() {
         assert_eq!(recommend_backend(estimated_chunks(500_000)), EmbeddingBackend::FastEmbed);
         assert_eq!(recommend_backend(estimated_chunks(50_000_000)), EmbeddingBackend::Model2Vec);
@@ -295,6 +336,7 @@ mod tests {
             direct_dir_counts: BTreeMap::new(),
             total_source_bytes: 0,
             has_python_virtualenv: false,
+            deferred_headers: Vec::new(),
         };
 
         let plan = default_plan(".".to_string(), &scan);
@@ -331,6 +373,7 @@ mod tests {
             )]),
             total_source_bytes: 0,
             has_python_virtualenv: false,
+            deferred_headers: Vec::new(),
         };
 
         let defaults = candidate_dirs(&scan, Language::C)

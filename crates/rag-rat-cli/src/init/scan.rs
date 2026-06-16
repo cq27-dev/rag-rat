@@ -31,7 +31,27 @@ pub(crate) fn scan_repo(root: &Path) -> anyhow::Result<RepoScan> {
     // review). Empty target dirs → the matcher governs the whole root.
     let ignore = IgnoreMatcher::compile(root, &[]);
     scan_dir(root, root, &ignore, &mut scan)?;
+    assign_headers(root, &mut scan)?;
     Ok(scan)
+}
+
+/// Resolve the ambiguous `.h` headers deferred during the walk. A `.h` is C or C++; bare extension
+/// detection picks C, but a repo with ANY C++ source (`.cpp`/`.cc`/…) almost certainly has C++
+/// headers, so bind them to C++ there and to C otherwise. This is what lets `init` generate a `cpp`
+/// binding that actually covers the header tree (so the indexer parses those `.h` as C++). A
+/// genuinely mixed C-and-C++ repo gets its headers under C++ (a clear default; C++ subsumes C-style
+/// headers) — the user can split them with an explicit `[[target]]` if needed.
+pub(crate) fn assign_headers(root: &Path, scan: &mut RepoScan) -> anyhow::Result<()> {
+    let header_lang = if scan.language_counts.get(&Language::Cpp).copied().unwrap_or(0) > 0 {
+        Language::Cpp
+    } else {
+        Language::C
+    };
+    for path in std::mem::take(&mut scan.deferred_headers) {
+        *scan.language_counts.entry(header_lang).or_default() += 1;
+        add_file_to_dir_counts(root, &path, header_lang, scan)?;
+    }
+    Ok(())
 }
 pub(crate) fn scan_dir(
     root: &Path,
@@ -70,9 +90,16 @@ pub(crate) fn scan_dir(
             && !ignore.is_ignored(&path, false)
             && let Some(language) = Language::from_path(&path)
         {
-            *scan.language_counts.entry(language).or_default() += 1;
-            add_file_to_dir_counts(root, &path, language, scan)?;
             scan.total_source_bytes += entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            // Defer the ambiguous bare `.h` header (bare detection calls it C): its language is
+            // decided in `assign_headers` once we know whether the repo is C++. All other files
+            // count immediately under their detected language.
+            if language == Language::C && path.extension().is_some_and(|ext| ext == "h") {
+                scan.deferred_headers.push(path);
+            } else {
+                *scan.language_counts.entry(language).or_default() += 1;
+                add_file_to_dir_counts(root, &path, language, scan)?;
+            }
         }
     }
     Ok(())
@@ -255,6 +282,66 @@ pub(crate) fn print_language_summary(scan: &RepoScan) {
         if count > 0 {
             println!("  {}: {count} files", language.as_str());
         }
+    }
+}
+
+#[cfg(test)]
+mod header_assignment_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::init::run::default_plan;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("ragrat-hdr-{tag}-{}-{id}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        root
+    }
+
+    #[test]
+    fn cpp_project_binds_h_headers_as_cpp() {
+        // include/*.h + src/*.cpp: the headers must count as C++ (not C) so init can bind a `cpp`
+        // target that covers the header tree.
+        let root = temp_root("cpp");
+        fs::create_dir_all(root.join("include/lib")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("include/lib/api.h"), "class Api { void run(); };\n").unwrap();
+        fs::write(root.join("src/api.cpp"), "#include \"lib/api.h\"\nvoid Api::run() {}\n")
+            .unwrap();
+
+        let scan = scan_repo(&root).unwrap();
+        assert_eq!(scan.language_counts.get(&Language::C).copied().unwrap_or(0), 0, "no C files");
+        assert_eq!(
+            scan.language_counts.get(&Language::Cpp).copied().unwrap_or(0),
+            2,
+            "header + src"
+        );
+        assert!(scan.dir_counts.get(&Language::Cpp).unwrap().contains_key(Path::new("include")));
+
+        let plan = default_plan(".".to_string(), &scan);
+        let cpp = &plan.bindings[&Language::Cpp];
+        assert!(cpp.contains(&PathBuf::from("include")), "cpp must bind the header dir: {cpp:?}");
+        assert!(!plan.bindings.contains_key(&Language::C), "no C binding for a C++-only repo");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pure_c_project_keeps_h_headers_as_c() {
+        // .c + .h with NO C++ source: headers stay C.
+        let root = temp_root("c");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.h"), "int f(void);\n").unwrap();
+        fs::write(root.join("src/lib.c"), "int f(void){return 0;}\n").unwrap();
+
+        let scan = scan_repo(&root).unwrap();
+        assert_eq!(scan.language_counts.get(&Language::C).copied().unwrap_or(0), 2, ".c + .h");
+        assert_eq!(scan.language_counts.get(&Language::Cpp).copied().unwrap_or(0), 0, "no C++");
+
+        fs::remove_dir_all(&root).ok();
     }
 }
 
