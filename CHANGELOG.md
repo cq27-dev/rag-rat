@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.6.0...rag-rat-core-v0.7.0) - 2026-06-16
+
+### Added
+
+- *(oracle)* C++ corpus (yaml-cpp) + resolve .h headers as C++ under a cpp binding ([#186](https://github.com/cq27-dev/rag-rat/pull/186))
+- *(oracle)* scip-typescript backend + ts-ky corpus ([#184](https://github.com/cq27-dev/rag-rat/pull/184))
+- *(python)* from-import alias resolution ([#174](https://github.com/cq27-dev/rag-rat/pull/174)) ([#179](https://github.com/cq27-dev/rag-rat/pull/179))
+- *(init)* Python root-entrypoint binding + content-aware dir selection ([#173](https://github.com/cq27-dev/rag-rat/pull/173)) ([#181](https://github.com/cq27-dev/rag-rat/pull/181))
+- *(python)* prefer a base class when resolving `implements` edges ([#172](https://github.com/cq27-dev/rag-rat/pull/172)) ([#180](https://github.com/cq27-dev/rag-rat/pull/180))
+- *(oracle)* unified tier-driven corpus runner + oracle.yml (C3) ([#177](https://github.com/cq27-dev/rag-rat/pull/177))
+- *(oracle)* scip-python backend — Python compiler-grade resolution (B6) ([#176](https://github.com/cq27-dev/rag-rat/pull/176))
+- *(oracle)* `oracle report --corpus <id>` — run a corpus + emit its C2 resolution report (C2-CLI) ([#175](https://github.com/cq27-dev/rag-rat/pull/175))
+- *(lang)* Python language support (symbols, graph edges, embeddings) + AST low-signal ([#167](https://github.com/cq27-dev/rag-rat/pull/167))
+- *(oracle)* corpus profiles + health-gate loader (C1) ([#171](https://github.com/cq27-dev/rag-rat/pull/171))
+- *(oracle)* live before/after resolution report computation (C2 core) ([#168](https://github.com/cq27-dev/rag-rat/pull/168))
+- *(oracle)* resolution-report + corpus-profile schema contract (C0) ([#166](https://github.com/cq27-dev/rag-rat/pull/166))
+- *(eval)* gate eval behind a non-default feature + add CI eval job ([#162](https://github.com/cq27-dev/rag-rat/pull/162))
+- *(mcp)* nudge the agent to re-anchor stale memories via tool-result content ([#160](https://github.com/cq27-dev/rag-rat/pull/160))
+
+### Fixed
+
+- *(resolve)* stop asserting high confidence on guessed Rust type references ([#192](https://github.com/cq27-dev/rag-rat/pull/192))
+
+### Other
+
+- *(oracle)* normalize small-tier corpora to a comparable ~8k-12k edge scale ([#190](https://github.com/cq27-dev/rag-rat/pull/190))
+- list Python in the README's code-graph languages ([#183](https://github.com/cq27-dev/rag-rat/pull/183))
+
 ## [0.6.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.5.0...rag-rat-core-v0.6.0) - 2026-06-15
 
 ### Added
