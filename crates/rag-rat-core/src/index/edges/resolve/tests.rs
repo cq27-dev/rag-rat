@@ -225,34 +225,55 @@ fn references_type_does_not_bind_generic_params_or_projections() {
 
 /// The PRODUCTION projection path: the Rust extractor emits `Self::Value` / `T::Output` as a
 /// `references_type` to the bare LAST segment (`Value` / `Output`), no `::`. When several
-/// same-named type definitions exist (serde declares `type Value` in dozens of trait impls),
-/// name-based resolution can't pick the right one — it must NOT guess one at `Syntactic` (the SCIP
-/// oracle counts that as a contradiction). A UNIQUE same-named type still resolves.
+/// distinct same-named type definitions exist in DIFFERENT files (different `qualified_name` and
+/// `scope_path`), they're not one logical symbol, so a bare reference from a third file stays
+/// unresolved rather than guessing. A UNIQUE same-named type still resolves.
 #[test]
-fn references_type_multi_candidate_does_not_guess_in_rust() {
+fn references_type_multi_candidate_across_files_does_not_guess() {
     let conn = seeded_conn();
     let user = add_file(&conn, "a.rs", NEW);
     let f1 = add_file(&conn, "b.rs", NEW);
     let f2 = add_file(&conn, "c.rs", NEW);
     add_symbol(&conn, user, "user_fn", "crate::a::user_fn");
-    // Two distinct `Value` associated types (different impls) — a bare `Value` ref can't
-    // disambiguate.
+    // Two distinct `Value` types in different files — a bare `Value` ref can't disambiguate.
     add_symbol_kind(&conn, f1, "Value", "b.rs::Value", "type");
     add_symbol_kind(&conn, f2, "Value", "c.rs::Value", "type");
     // A uniquely-named type (positive control).
     let only = add_symbol_kind(&conn, f1, "Config", "b.rs::Config", "struct");
 
-    let ambiguous = add_type_ref_edge(&conn, user, "Value"); // bare — the production projection shape
+    let ambiguous = add_type_ref_edge(&conn, user, "Value");
     let unique = add_type_ref_edge(&conn, user, "Config");
 
     crate::index::install_scope_view(&conn, NEW, "").unwrap();
     resolve_all_edges(&conn).unwrap();
 
-    let (to, _, resolution) = edge_state(&conn, ambiguous);
-    assert_eq!(to, None, "a bare multi-candidate type ref must not guess");
-    assert_eq!(resolution, "unresolved");
-    let (to, _, _) = edge_state(&conn, unique);
-    assert_eq!(to, Some(only), "a uniquely-named type still resolves");
+    assert_eq!(
+        edge_state(&conn, ambiguous).0,
+        None,
+        "ambiguous cross-file type ref stays unresolved"
+    );
+    assert_eq!(edge_state(&conn, unique).0, Some(only), "a uniquely-named type still resolves");
+}
+
+/// `#[cfg]`-split twin types (`#[cfg(unix)] struct Thing` / `#[cfg(windows)] struct Thing`) share
+/// `qualified_name` AND `scope_path` — they ARE one logical symbol. A `references_type` to `Thing`
+/// must still resolve via `logical_variant` (multi-candidate suppression must not block true
+/// logical variants).
+#[test]
+fn references_type_resolves_cfg_split_twin_types() {
+    let conn = seeded_conn();
+    let home = add_file(&conn, "a.rs", NEW);
+    // Two cfg-gated `Thing` structs in one file: same qualified_name, same (empty) scope_path.
+    let first = add_symbol_kind(&conn, home, "Thing", "a.rs::Thing", "struct");
+    add_symbol_kind(&conn, home, "Thing", "a.rs::Thing", "struct");
+    let edge = add_type_ref_edge(&conn, home, "Thing");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, Some(first), "cfg-twin type variants resolve via logical_variant");
+    assert_eq!(resolution, "logical_variant");
 }
 
 /// The multi-candidate `references_type` suppression must NOT drop a type defined AND used in its
