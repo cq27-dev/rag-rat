@@ -77,6 +77,15 @@ impl ToolManifest {
                                (e.g. into a virtualenv) so imports resolve, or pass a pre-built \
                                index with `--scip <path>`.",
             },
+            OracleTool::ScipTypescript => ToolManifest {
+                tool,
+                program: "scip-typescript",
+                languages: &["typescript"],
+                install_hint: "scip-typescript not found on PATH. Install it (e.g. `npm install \
+                               -g @sourcegraph/scip-typescript`) AND install the project's \
+                               dependencies (`npm install`) so cross-package references resolve, \
+                               or pass a pre-built index with `--scip <path>`.",
+            },
         }
     }
 
@@ -120,7 +129,7 @@ impl ToolManifest {
             OracleTool::ScipClang => true,
             // scip-python emits via an `index` subcommand; `index --help` exiting 0 is the analog
             // of rust-analyzer's `scip --help` capability check.
-            OracleTool::ScipPython => Command::new(self.program)
+            OracleTool::ScipPython | OracleTool::ScipTypescript => Command::new(self.program)
                 .arg("index")
                 .arg("--help")
                 .output()
@@ -139,7 +148,12 @@ impl ToolManifest {
             // check (it's whatever the corpus `prepare` venv installs); a failed environment shows
             // up as a near-zero moniker count the report health gate catches, so there's nothing to
             // block on here.
-            OracleTool::RustAnalyzer | OracleTool::ScipPython => None,
+            // scip-typescript, like scip-python, has no single prerequisite sentinel: it indexes
+            // the project's own files even without `node_modules` (cross-package
+            // monikers just stay unresolved), and infers a `tsconfig.json` when missing
+            // (`--infer-tsconfig`). A failed environment surfaces as a low moniker
+            // count the report health gate catches.
+            OracleTool::RustAnalyzer | OracleTool::ScipPython | OracleTool::ScipTypescript => None,
             OracleTool::ScipClang => (!root.join("compile_commands.json").exists()).then(|| {
                 format!(
                     "scip-clang requires a compile_commands.json at {} — generate one (e.g. `bear \
@@ -194,6 +208,23 @@ impl ToolManifest {
                     .arg("_")
                     .arg("--cwd")
                     .arg(root)
+                    .arg("--output")
+                    .arg(output);
+                cmd
+            },
+            // scip-typescript indexes the working dir via its `index` subcommand (like
+            // scip-python). `--infer-tsconfig` synthesizes a `tsconfig.json` from
+            // `package.json` when the project doesn't ship one (a no-op when it does),
+            // so a corpus needn't hand-author one; package name/version come from
+            // `package.json`, NOT the git rev, so monikers are already stable
+            // across commits and need no `--project-version` pin (unlike scip-python). `--output`
+            // is absolute, unaffected by `--cwd`.
+            OracleTool::ScipTypescript => {
+                let mut cmd = Command::new(self.program);
+                cmd.arg("index")
+                    .arg("--cwd")
+                    .arg(root)
+                    .arg("--infer-tsconfig")
                     .arg("--output")
                     .arg(output);
                 cmd
@@ -337,6 +368,28 @@ mod tests {
             "_",
             "--cwd",
             "/work/requests",
+            "--output",
+            "/tmp/out.scip",
+        ]);
+        assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_none());
+    }
+
+    #[test]
+    fn scip_typescript_indexes_a_cwd() {
+        // scip-typescript's invocation: `scip-typescript index --cwd <root> --infer-tsconfig
+        // --output <abs>`. No `--project-name` / `--project-version` (package.json supplies both,
+        // so monikers are already commit-stable) and no compile_commands.json prerequisite
+        // (the `npm install` is the corpus `prepare` step's job).
+        let manifest = ToolManifest::for_tool(OracleTool::ScipTypescript);
+        assert_eq!(manifest.program, "scip-typescript");
+        assert_eq!(manifest.languages, &["typescript"]);
+        let cmd = manifest.scip_command(Path::new("/work/ky"), Path::new("/tmp/out.scip"));
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec![
+            "index",
+            "--cwd",
+            "/work/ky",
+            "--infer-tsconfig",
             "--output",
             "/tmp/out.scip",
         ]);

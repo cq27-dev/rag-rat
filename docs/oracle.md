@@ -3,8 +3,9 @@
 The code graph is tree-sitter-derived, so edges are heuristic and confidence-labeled
 (`Exact` / `Syntactic` / `NameOnly` / `Ambiguous`). The **oracle** is an opt-in pass that consumes a
 pre-built [SCIP](https://docs.sourcegraph.com/code_navigation/explanations/scip) index from a real
-language tool (`rust-analyzer scip` for Rust, `scip-clang` for C/C++, `scip-python` for Python) and
-uses it as a *resolution oracle* to upgrade those edges to a `Compiler` confidence tier.
+language tool (`rust-analyzer scip` for Rust, `scip-clang` for C/C++, `scip-python` for Python,
+`scip-typescript` for TypeScript/TSX) and uses it as a *resolution oracle* to upgrade those edges to
+a `Compiler` confidence tier.
 
 It is opt-in, batch, content-addressed, and network-free — indexing stays fast and dependency-free
 without it.
@@ -42,6 +43,7 @@ rag-rat oracle run                 # uses rust-analyzer by default
 rag-rat oracle run --tool rust-analyzer        # Rust
 rag-rat oracle run --tool scip-clang           # C/C++ (needs a compile_commands.json)
 rag-rat oracle run --tool scip-python          # Python (resolves against installed deps)
+rag-rat oracle run --tool scip-typescript      # TypeScript/TSX (resolves against node_modules)
 rag-rat oracle run --scip path/to/index.scip   # consume a pre-built SCIP index directly
 rag-rat oracle status
 ```
@@ -50,6 +52,12 @@ rag-rat oracle status
 deps must be importable (e.g. installed into a virtualenv) for cross-package edges to resolve. Its
 SCIP project version is pinned to a constant (not the git revision) so a symbol's moniker stays
 stable across commits — keeping moniker-anchored memory relocation working.
+
+`scip-typescript` resolves cross-package references against the project's **installed**
+`node_modules` (the analog of scip-python's venv), so `npm install` must have run; it reads the
+project's `tsconfig.json` and synthesizes one from `package.json` when absent (`--infer-tsconfig`).
+Package name/version come from `package.json`, not the git revision, so monikers are already
+commit-stable and need no project-version pin.
 
 A missing/unrunnable tool degrades to `Blocked` with an install hint and exit 0 — never an error.
 

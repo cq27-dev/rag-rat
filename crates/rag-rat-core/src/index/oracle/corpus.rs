@@ -169,8 +169,16 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
         };
         let corpora = load_corpora(&toml_str).unwrap();
         let ids: Vec<&str> = corpora.iter().map(|c| c.corpus_id.as_str()).collect();
-        assert_eq!(ids, ["rust-semver", "c-cjson", "py-requests", "rust-cargo", "linux-kernel"]);
+        assert_eq!(ids, [
+            "rust-semver",
+            "c-cjson",
+            "py-requests",
+            "ts-ky",
+            "rust-cargo",
+            "linux-kernel"
+        ]);
         assert_eq!(corpus_by_id(&corpora, "py-requests").unwrap().tool, "scip-python");
+        assert_eq!(corpus_by_id(&corpora, "ts-ky").unwrap().tool, "scip-typescript");
 
         // GOLDEN per-profile hashes: an edit to any corpus field changes its hash (and makes prior
         // reports incomparable) — recompute deliberately when intended.
@@ -180,6 +188,7 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
             ("rust-semver", GOLDEN_RUST_SEMVER.to_string()),
             ("c-cjson", GOLDEN_C_CJSON.to_string()),
             ("py-requests", GOLDEN_PY_REQUESTS.to_string()),
+            ("ts-ky", GOLDEN_TS_KY.to_string()),
             ("rust-cargo", GOLDEN_RUST_CARGO.to_string()),
             ("linux-kernel", GOLDEN_LINUX_KERNEL.to_string()),
         ]);
@@ -191,6 +200,7 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
     const GOLDEN_C_CJSON: &str = "685a33345247c2ef310b7671fb9e2a55a7cb7c577fcd29fecac436ff0634c9dc";
     const GOLDEN_PY_REQUESTS: &str =
         "76abdb4592d1e1997f133fb5cd185d85b57851e8a82e085268e45d4d16c2c832";
+    const GOLDEN_TS_KY: &str = "4565e3323659cc3de96eebfb033440a2a91622bcd14f7bec2b022d4e642f1bba";
     const GOLDEN_RUST_CARGO: &str =
         "60452736340151a253001bb5c33cc83efa2a4ceabba4d42a227d3188d7761d79";
     const GOLDEN_LINUX_KERNEL: &str =

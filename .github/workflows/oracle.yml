@@ -58,11 +58,12 @@ concurrency:
 
 env:
   # Pinned SCIP toolchain for the small tier so a PR number isn't perturbed by an unrelated indexer
-  # release. scip-clang/scip-python are pinned to explicit versions; rust-analyzer is installed as a
+  # release. scip-clang/scip-python/scip-typescript are pinned to explicit versions; rust-analyzer is installed as a
   # rustup component (below), pinning it to the stable toolchain (a ~6-week cadence) instead of the
   # weekly `releases/latest` — so a fresh RA build can't change `rust-semver`'s numbers mid-PR.
   SCIP_CLANG_VERSION: v0.4.0
   SCIP_PYTHON_VERSION: 0.6.6
+  SCIP_TYPESCRIPT_VERSION: 0.4.0
 
 jobs:
   matrix:
@@ -129,6 +130,9 @@ jobs:
             scip-python)
               npm install -g "@sourcegraph/scip-python@${SCIP_PYTHON_VERSION}"
               scip-python --version ;;
+            scip-typescript)
+              npm install -g "@sourcegraph/scip-typescript@${SCIP_TYPESCRIPT_VERSION}"
+              scip-typescript --version ;;
             *)
               echo "unknown tool '$tool'" >&2; exit 1 ;;
           esac

@@ -1633,8 +1633,10 @@ fn map_definition_to_symbol_requires_real_containment_not_just_start() {
 /// reject an unknown string — the `rust-modern-style` closed-enum contract.
 #[test]
 fn persisted_enums_round_trip_through_db_strings() {
-    assert_eq!(OracleTool::from_db_str(OracleTool::RustAnalyzer.as_db_str()), Some(TOOL));
-    assert_eq!(OracleTool::from_db_str("scip-typescript"), None);
+    for &tool in OracleTool::ALL {
+        assert_eq!(OracleTool::from_db_str(tool.as_db_str()), Some(tool));
+    }
+    assert_eq!(OracleTool::from_db_str("no-such-tool"), None);
 
     for kind in [
         OracleResolutionKind::Upgrade,
