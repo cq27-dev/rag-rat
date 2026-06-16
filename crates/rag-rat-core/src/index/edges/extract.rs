@@ -688,20 +688,40 @@ pub(crate) fn python_edges(
                     {
                         continue;
                     }
-                    // Implements points at the base HEAD only (`Generic`, not `T`); ReferencesType
-                    // covers the head AND every type argument (`Mapping[str, Api]` → `Mapping`,
-                    // `str`, `Api`).
-                    let head = python_type_head(base);
-                    if let Some(name) = last_identifier_text(head, text) {
+                    // Emit Implements ONLY for a STATIC head — a plain identifier, or an attribute
+                    // whose receiver chain is all identifiers and not `self`/`cls` (`pkg.Base`),
+                    // after unwrapping generic/subscript/paren wrappers (#172 review). A DYNAMIC
+                    // base has no compile-time class — `factory()`,
+                    // `factory().Base`, `self.Base`, `Base if flag else Other`,
+                    // a lambda, … — so claiming an Implements edge would
+                    // let the Python class preference mis-bind it to a same-named local class. An
+                    // allowlist (vs blocklisting each dynamic form) is robust to new expression
+                    // kinds.
+                    //
+                    // Implements targets the base HEAD's LEAF name (`Base` for
+                    // `pkg.Base`/`Generic[T]` → `Generic`); ReferencesType
+                    // (below) covers the head and every type argument. The edge
+                    // is bare-name (no qualified context): a module-qualified base `pkg.Base`
+                    // is resolved by the leaf `Base` exactly like a bare base, because a top-level
+                    // Python class's `scope_path` is the bare name, not `pkg::Base`. The cost is
+                    // that an EXTERNAL `pkg.Base`/bare imported base can still
+                    // bind a same-named local class — the general "Python has
+                    // no external-import suppression" gap (#172/#174
+                    // review), which needs an in-corpus Python module model to close, not a
+                    // per-base special case.
+                    if let Some(head) = python_static_base_head(base, text)
+                        && let Some(name) = last_identifier_text(head, text)
+                    {
+                        let callee = last_identifier_node(head)
+                            .map(final_segment_node)
+                            .map(CalleeRange::of_node);
                         out.push(symbol_edge(
                             symbols,
                             base,
                             name,
                             EdgeKind::Implements,
                             EdgeConfidence::NameOnly,
-                            last_identifier_node(head)
-                                .map(final_segment_node)
-                                .map(CalleeRange::of_node),
+                            callee,
                         ));
                     }
                     emit_python_type_refs(base, symbols, text, out);
@@ -801,21 +821,53 @@ fn python_is_type_alias_name(node: Node<'_>) -> bool {
     })
 }
 
-/// The "head" type node to anchor a Python type reference on, for a parameterized type. Unwraps the
-/// applicable wrappers to reach the base: a `type` wrapper, a `generic_type` (`Box[Item]` in an
-/// annotation → base `Box`), and a `subscript` (`Generic[T]` in a base-class list → value
-/// `Generic`). Plain identifiers/attributes pass through unchanged, so the type argument
-/// (`Item`/`T`) is never mistaken for the base. Bounded loop guards against a pathological tree.
-fn python_type_head(node: Node<'_>) -> Node<'_> {
-    let mut head = node;
+/// The STATIC head node of a Python base-class expression — a plain `identifier`, or an
+/// `attribute`/ `dotted_name` whose receiver chain is all identifiers (`pkg.Base`) — after
+/// unwrapping the wrappers `python_type_head` strips (`type`/`generic_type`/`subscript`) plus
+/// parentheses. `None` for a DYNAMIC base whose runtime class isn't a compile-time name: a `call`
+/// (`factory()`), an attribute off a call (`factory().Base`), a `conditional_expression` (`Base if
+/// flag else Other`), a lambda, a binary operator, etc. (#172 review). Only a static head should
+/// claim an `Implements` edge — an allowlist, so a NEW dynamic expression form is excluded by
+/// default rather than mis-bound by the Python class preference. Bounded loop guards a pathological
+/// tree.
+fn python_static_base_head<'a>(base: Node<'a>, text: &str) -> Option<Node<'a>> {
+    let mut node = base;
     for _ in 0..8 {
-        head = match head.kind() {
-            "type" | "generic_type" => head.named_child(0).unwrap_or(head),
-            "subscript" => head.child_by_field_name("value").unwrap_or(head),
-            _ => return head,
+        node = match node.kind() {
+            "type" | "generic_type" | "parenthesized_expression" => node.named_child(0)?,
+            "subscript" => node.child_by_field_name("value")?,
+            "identifier" => return Some(node),
+            "attribute" | "dotted_name" =>
+                return python_attribute_is_static(node, text).then_some(node),
+            // call / conditional_expression / lambda / binary_operator / … → no static class.
+            _ => return None,
         };
     }
-    head
+    None
+}
+
+/// Whether an `attribute`/`dotted_name` chain is purely static (`pkg.Base`, `a.b.C`) — every
+/// receiver is an identifier or another attribute, never a `call`/`subscript` (`factory().Base` is
+/// dynamic). A `self`/`cls`-rooted chain (`self.Base`) is DYNAMIC: the base comes off the runtime
+/// instance, not a compile-time class (#172 review). Bounded loop guards a pathological tree.
+fn python_attribute_is_static(node: Node<'_>, text: &str) -> bool {
+    let mut current = node;
+    for _ in 0..16 {
+        match current.kind() {
+            "identifier" => return !matches!(node_text(current, text).as_str(), "self" | "cls"),
+            "dotted_name" =>
+                return !matches!(
+                    first_identifier_text(current, text).as_deref(),
+                    Some("self" | "cls")
+                ),
+            "attribute" => match current.child_by_field_name("object") {
+                Some(object) => current = object,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Emit an Imports edge for one import clause (`dotted_name` or `aliased_import`), targeting the
@@ -1071,6 +1123,127 @@ mod python_edge_tests {
         let e = edges("class Repo(Generic[T]):\n    pass\n");
         assert!(has(&e, EdgeKind::Implements, "Generic"), "base should be Generic: {e:?}");
         assert!(!has(&e, EdgeKind::Implements, "T"), "must not resolve to type arg T: {e:?}");
+    }
+
+    #[test]
+    fn call_shaped_base_emits_no_implements() {
+        // `class Sub(factory())` — a DYNAMIC base (the head is a callable, not the base class). No
+        // Implements edge (the resolver's class preference would mis-bind it), but the base call is
+        // still captured as a CallsName so the dependency on `factory` isn't lost (#172 review).
+        let e = edges("class Sub(factory()):\n    pass\n");
+        assert!(
+            !has(&e, EdgeKind::Implements, "factory"),
+            "a call-shaped base must NOT emit Implements: {e:?}"
+        );
+        assert!(
+            has(&e, EdgeKind::CallsName, "factory"),
+            "the base call is still captured as a CallsName: {e:?}"
+        );
+    }
+
+    #[test]
+    fn parenthesized_call_shaped_base_emits_no_implements() {
+        // `class Sub((factory()))` — tree-sitter nests the `call` under a
+        // `parenthesized_expression`, so the immediate-kind check missed it (#172 review round 2).
+        // Still a DYNAMIC base: no Implements, but the call dependency is captured.
+        let e = edges("class Sub((factory())):\n    pass\n");
+        assert!(
+            !has(&e, EdgeKind::Implements, "factory"),
+            "a parenthesized call-shaped base must NOT emit Implements: {e:?}"
+        );
+        assert!(
+            has(&e, EdgeKind::CallsName, "factory"),
+            "the base call is still captured as a CallsName: {e:?}"
+        );
+    }
+
+    #[test]
+    fn subscript_call_shaped_base_emits_no_implements() {
+        // `class Sub(factory()[T])` — tree-sitter exposes the base as a `subscript` whose value is
+        // the `call`; `python_type_head` unwraps the subscript to that call, so the dynamic-base
+        // check must unwrap it too (#172 review round 3). Still dynamic: no Implements.
+        let e = edges("class Sub(factory()[T]):\n    pass\n");
+        assert!(
+            !has(&e, EdgeKind::Implements, "factory"),
+            "a subscript-on-call base must NOT emit Implements: {e:?}"
+        );
+        assert!(
+            has(&e, EdgeKind::CallsName, "factory"),
+            "the base call is still captured as a CallsName: {e:?}"
+        );
+    }
+
+    #[test]
+    fn attribute_on_call_base_emits_no_implements() {
+        // `class Sub(factory().Base)` — the base is an `attribute` whose receiver is a `call`, so
+        // `Base` comes off the factory RESULT, not a static class (#172 review round 4). Dynamic:
+        // no Implements; subscripted `factory().Base[T]` is the same shape under a
+        // subscript.
+        let e = edges("class Sub(factory().Base):\n    pass\n");
+        assert!(
+            !has(&e, EdgeKind::Implements, "Base"),
+            "an attribute on a call result must NOT emit Implements: {e:?}"
+        );
+        let e = edges("class Sub(factory().Base[T]):\n    pass\n");
+        assert!(
+            !has(&e, EdgeKind::Implements, "Base"),
+            "a subscripted attribute on a call result must NOT emit Implements: {e:?}"
+        );
+    }
+
+    #[test]
+    fn static_attribute_base_emits_a_bare_implements() {
+        // `class Sub(pkg.Base)` — a static qualified base (receiver is a module, not a call) is a
+        // real superclass; the Implements edge targets the LEAF `Base` and is BARE (no qualified
+        // context) so it resolves like a bare base — a top-level Python class's `scope_path` is the
+        // bare name, not `pkg::Base` (#172 review).
+        let e = edges("class Sub(pkg.Base):\n    pass\n");
+        let imp = e
+            .iter()
+            .find(|c| c.edge_kind == EdgeKind::Implements && c.to_name == "Base")
+            .expect("qualified base Implements edge");
+        assert_eq!(imp.receiver_hint, None, "qualified base implements is bare-name");
+        assert_eq!(imp.target_qualified_name, None, "qualified base implements is bare-name");
+    }
+
+    #[test]
+    fn self_qualified_base_emits_no_implements() {
+        // `class Sub(self.Base)` (e.g. inside a method) — the base comes off the runtime instance,
+        // not a compile-time class, so it is DYNAMIC: no Implements (#172 review).
+        let e = edges(
+            "class Outer:\n    def make(self):\n        class Sub(self.Base):\n            pass\n",
+        );
+        assert!(
+            !has(&e, EdgeKind::Implements, "Base"),
+            "a `self.`-rooted base must NOT emit Implements: {e:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_expression_base_emits_no_implements() {
+        // `class Sub(Base if flag else Other)` — the runtime base is expression-dependent, so it is
+        // NOT a static class; emitting an Implements to the last identifier (`Other`) would let the
+        // class preference mis-bind it (#172 review). The allowlist excludes the whole expression.
+        let e = edges("class Sub(Base if flag else Other):\n    pass\n");
+        assert!(
+            !has(&e, EdgeKind::Implements, "Other"),
+            "a conditional-expression base must NOT emit Implements: {e:?}"
+        );
+        assert!(
+            !has(&e, EdgeKind::Implements, "Base"),
+            "a conditional-expression base must NOT emit Implements: {e:?}"
+        );
+    }
+
+    #[test]
+    fn parenthesized_class_base_still_emits_implements() {
+        // `class Sub((Base))` — a parenthesized but STATIC base is a real superclass, so the
+        // Implements edge must survive the dynamic-base guard.
+        let e = edges("class Sub((Base)):\n    pass\n");
+        assert!(
+            has(&e, EdgeKind::Implements, "Base"),
+            "a parenthesized class base must still emit Implements: {e:?}"
+        );
     }
 
     #[test]

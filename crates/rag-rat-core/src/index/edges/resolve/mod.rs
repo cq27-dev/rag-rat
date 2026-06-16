@@ -590,7 +590,7 @@ pub(crate) fn resolve_symbol<'a>(
         .copied()
         .filter(|symbol| kind_matches(symbol))
         .collect::<Vec<_>>();
-    let preferred = preferred_matches(request.edge_kind, &matches);
+    let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
     // In languages with separate type/value namespaces (Rust, C, C++), a `references_type`
     // reference must resolve to a type DEFINITION (struct/enum/trait/type/…). If none of the
     // same-named candidates is one, do NOT fall back to a non-type symbol (an `impl` block, a
@@ -602,6 +602,15 @@ pub(crate) fn resolve_symbol<'a>(
     if preferred.is_empty()
         && request.edge_kind == EdgeKind::ReferencesType.as_str()
         && matches!(request.source_language, Some("rust" | "c" | "cpp"))
+    {
+        return None;
+    }
+    // A Python `implements` (base class) that found no in-corpus PYTHON class must NOT fall back to
+    // the all-matches set: that would bind the base to a same-named non-class or a foreign-language
+    // class (#172 review). Leave it unresolved — the ReferencesType edge still records the base.
+    if preferred.is_empty()
+        && request.edge_kind == EdgeKind::Implements.as_str()
+        && request.source_language == Some(Language::Python.as_str())
     {
         return None;
     }
@@ -736,8 +745,25 @@ pub(crate) fn is_common_member_name(value: &str) -> bool {
 }
 pub(crate) fn preferred_matches<'a>(
     edge_kind: &str,
+    source_language: Option<&str>,
     matches: &[&'a IndexedSymbol],
 ) -> Vec<&'a IndexedSymbol> {
+    // Python base-class inheritance emits an `implements` edge to a CLASS — Python has no
+    // traits/interfaces — so prefer class-like kinds for Python (#172). This case ALSO filters by
+    // LANGUAGE: the name buckets are repo-wide, so without it a Python base would bind to a
+    // same-named TS/Kotlin/C++ class or Kotlin `object` in a mixed-language index (#172 review).
+    // Kept language-scoped so Kotlin/TS are otherwise UNCHANGED (`implements`/`: I` targets an
+    // interface, and a same-named class must not be preferred over it).
+    if edge_kind == "implements" && source_language == Some(Language::Python.as_str()) {
+        return matches
+            .iter()
+            .copied()
+            .filter(|symbol| {
+                matches!(symbol.kind.as_str(), "class" | "object")
+                    && symbol.language.as_str() == Language::Python.as_str()
+            })
+            .collect();
+    }
     let preferred_kinds: &[&str] = match edge_kind {
         "calls_name" => &["function", "method"],
         "constructs" => &["struct", "class", "object"],

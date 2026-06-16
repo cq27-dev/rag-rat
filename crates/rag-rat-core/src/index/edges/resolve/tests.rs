@@ -572,3 +572,96 @@ fn oracle_unaffected_by_import_scope_columns() {
          scope columns must not pull it in"
     );
 }
+
+/// #172: a Python `class Sub(Base)` emits an `implements` edge to `Base`, which is a CLASS (Python
+/// has no traits/interfaces). The resolver must prefer the base CLASS over a same-named non-class
+/// (e.g. a function) — language-scoped, so Kotlin/TS `implements` still prefers an interface.
+#[test]
+fn python_implements_prefers_a_base_class_over_a_non_class() {
+    let conn = seeded_conn();
+    let sub = py_source(&conn, "sub.py");
+    let base = py_source(&conn, "base.py");
+    let other = py_source(&conn, "other.py");
+    // A symbol in sub.py so the resolver knows the reference's source language is Python (a file's
+    // language is inferred from its symbols, and the language-scoped `implements` preference is
+    // what this exercises).
+    py_sym(&conn, sub, "Sub", "sub.py::Sub", "class");
+    // The real base class, and a DECOY same-named non-class (a module-level function `Base`).
+    let base_class = py_sym(&conn, base, "Base", "base.py::Base", "class");
+    let _decoy_fn = py_sym(&conn, other, "Base", "other.py::Base", "function");
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         source_start_byte) VALUES (?1, 'Base', 'implements', 'NameOnly', 'unresolved', 10)",
+        params![sub],
+    )
+    .unwrap();
+    let edge: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _confidence, _resolution) = edge_state(&conn, edge);
+    assert_eq!(
+        to,
+        Some(base_class),
+        "implements must prefer the base CLASS, not the decoy function"
+    );
+}
+
+fn py_source(conn: &Connection, path: &str) -> i64 {
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id) VALUES (?1, 'python', 'source', ?2, 0, 0, ?3, '')",
+        params![path, format!("sha-{path}"), NEW],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+fn py_sym(conn: &Connection, file_id: i64, name: &str, qualified: &str, kind: &str) -> i64 {
+    conn.execute(
+        "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, end_byte, \
+         start_line, end_line) VALUES (?1, 'python', ?2, ?3, ?4, 0, 10, 1, 1)",
+        params![file_id, name, qualified, kind],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+/// #172 review: a Python `implements` (base class) must NOT bind to a same-named class in another
+/// language. With only a TypeScript `class Base` in the index (the Python base is external), the
+/// edge stays unresolved rather than wrongly binding cross-language.
+#[test]
+fn python_implements_ignores_a_foreign_language_class() {
+    let conn = seeded_conn();
+    let sub = py_source(&conn, "sub.py");
+    py_sym(&conn, sub, "Sub", "sub.py::Sub", "class");
+    // The only same-named `Base` is a TYPESCRIPT class.
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id) VALUES ('w.ts', 'typescript', 'source', 'sha-w', 0, 0, ?1, '')",
+        params![NEW],
+    )
+    .unwrap();
+    let ts = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, end_byte, \
+         start_line, end_line) VALUES (?1, 'typescript', 'Base', 'w.ts::Base', 'class', 0, 10, 1, \
+         1)",
+        params![ts],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution, \
+         source_start_byte) VALUES (?1, 'Base', 'implements', 'NameOnly', 'unresolved', 10)",
+        params![sub],
+    )
+    .unwrap();
+    let edge: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _confidence, _resolution) = edge_state(&conn, edge);
+    assert_eq!(to, None, "a Python base must not bind to a foreign-language class");
+}
