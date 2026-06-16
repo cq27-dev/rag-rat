@@ -678,6 +678,18 @@ pub(crate) fn resolve_symbol<'a>(
     {
         return None;
     }
+    // Whether to accept a pick among MULTIPLE same-name candidates (the `logical_variant` /
+    // `same_file_name` arms). A RUST `references_type` with several same-named definitions is
+    // almost always an associated type the reference can't disambiguate by name (serde defines
+    // `type Value` in dozens of trait impls, which share a trait-scoped `scope_path`); guessing
+    // one and asserting `Syntactic` is a ~0.3-precision coin flip the SCIP oracle counts as a
+    // contradiction. A UNIQUE type match still binds (the high-precision single-match arms).
+    // Restricted to Rust: in C/C++ a same-named type across files is often the SAME type
+    // (header decl + use) and the same-file pick is usually right, so gating there only loses
+    // confirms. Calls / imports / implements keep multi-candidate resolution (genuine decl/def
+    // + cfg variants) in every language.
+    let multi_pick_ok = !(request.edge_kind == EdgeKind::ReferencesType.as_str()
+        && request.source_language == Some(Language::Rust.as_str()));
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
         // Semantic SCOPE-PATH match first (#61). An edge's `target_qualified_name` is a source-code
         // path (`Workspace::new`), which aligns with a symbol's `scope_path`
@@ -702,7 +714,7 @@ pub(crate) fn resolve_symbol<'a>(
             .collect::<Vec<_>>();
         match scope_exact.as_slice() {
             [symbol] => return Some((*symbol, EdgeConfidence::Exact, "scope_exact")),
-            [_, ..] if same_logical_symbol(&scope_exact) =>
+            [_, ..] if multi_pick_ok && same_logical_symbol(&scope_exact) =>
                 return Some((scope_exact[0], EdgeConfidence::Syntactic, "logical_variant")),
             _ => {},
         }
@@ -717,7 +729,7 @@ pub(crate) fn resolve_symbol<'a>(
             .collect::<Vec<_>>();
         match scope_matches.as_slice() {
             [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "scope_suffix")),
-            [_, ..] if same_logical_symbol(&scope_matches) =>
+            [_, ..] if multi_pick_ok && same_logical_symbol(&scope_matches) =>
                 return Some((scope_matches[0], EdgeConfidence::Syntactic, "logical_variant")),
             _ => {},
         }
@@ -743,7 +755,7 @@ pub(crate) fn resolve_symbol<'a>(
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "qualified_suffix")),
-            [_, ..] if same_logical_symbol(&matches) => {
+            [_, ..] if multi_pick_ok && same_logical_symbol(&matches) => {
                 return Some((matches[0], EdgeConfidence::Syntactic, "logical_variant"));
             },
             [_, ..] => return None,
@@ -796,6 +808,10 @@ pub(crate) fn resolve_symbol<'a>(
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
     match matches {
         [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "target_name_fallback")),
+        // Multiple same-name candidates. For a `references_type` this is the associated-type case —
+        // don't guess (see `multi_pick_ok`); leave it unresolved (NameOnly) for the oracle to
+        // upgrade.
+        [_, ..] if !multi_pick_ok => None,
         [_, ..] => {
             if same_logical_symbol(matches) {
                 return Some((matches[0], EdgeConfidence::Syntactic, "logical_variant"));

@@ -223,6 +223,38 @@ fn references_type_does_not_bind_generic_params_or_projections() {
     assert_eq!(to, Some(gadget), "a genuine type reference still resolves");
 }
 
+/// The PRODUCTION projection path: the Rust extractor emits `Self::Value` / `T::Output` as a
+/// `references_type` to the bare LAST segment (`Value` / `Output`), no `::`. When several
+/// same-named type definitions exist (serde declares `type Value` in dozens of trait impls),
+/// name-based resolution can't pick the right one — it must NOT guess one at `Syntactic` (the SCIP
+/// oracle counts that as a contradiction). A UNIQUE same-named type still resolves.
+#[test]
+fn references_type_multi_candidate_does_not_guess_in_rust() {
+    let conn = seeded_conn();
+    let user = add_file(&conn, "a.rs", NEW);
+    let f1 = add_file(&conn, "b.rs", NEW);
+    let f2 = add_file(&conn, "c.rs", NEW);
+    add_symbol(&conn, user, "user_fn", "crate::a::user_fn");
+    // Two distinct `Value` associated types (different impls) — a bare `Value` ref can't
+    // disambiguate.
+    add_symbol_kind(&conn, f1, "Value", "b.rs::Value", "type");
+    add_symbol_kind(&conn, f2, "Value", "c.rs::Value", "type");
+    // A uniquely-named type (positive control).
+    let only = add_symbol_kind(&conn, f1, "Config", "b.rs::Config", "struct");
+
+    let ambiguous = add_type_ref_edge(&conn, user, "Value"); // bare — the production projection shape
+    let unique = add_type_ref_edge(&conn, user, "Config");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, ambiguous);
+    assert_eq!(to, None, "a bare multi-candidate type ref must not guess");
+    assert_eq!(resolution, "unresolved");
+    let (to, _, _) = edge_state(&conn, unique);
+    assert_eq!(to, Some(only), "a uniquely-named type still resolves");
+}
+
 fn add_symbol_scope(
     conn: &Connection,
     file_id: i64,
