@@ -197,10 +197,10 @@ impl ToolManifest {
             // compile_commands.json gate.
             OracleTool::ScipJava => (!has_gradle_build(root)).then(|| {
                 format!(
-                    "scip-java requires a Gradle build at {} (build.gradle[.kts] or \
-                     settings.gradle[.kts]) — it indexes Kotlin through the Gradle build (Maven \
-                     Kotlin is unsupported by scip-java's auto-indexer); or pass a pre-built \
-                     index with `--scip <path>`.",
+                    "scip-java requires a Gradle build at {} (build.gradle, build.gradle.kts, \
+                     settings.gradle, or gradlew) — it indexes Kotlin through the Gradle build \
+                     (Maven Kotlin is unsupported by scip-java's auto-indexer); or pass a \
+                     pre-built index with `--scip <path>`.",
                     root.display()
                 )
             }),
@@ -291,11 +291,17 @@ impl ToolManifest {
     }
 }
 
-/// Whether `root` has a Gradle build that scip-java can index Kotlin through. Maven is deliberately
-/// excluded: scip-java's automatic indexer supports Kotlin only for Gradle, and this backend
-/// advertises Kotlin only — a Maven (`pom.xml`) Kotlin checkout should report Blocked, not run.
+/// Whether `root` has a Gradle build that scip-java can index Kotlin through. The sentinel set
+/// mirrors scip-java's own `GradleBuildTool.usedInCurrentDirectory` EXACTLY (v0.12.3:
+/// `settings.gradle`, `gradlew`, `build.gradle`, `build.gradle.kts`) so this gate agrees with what
+/// the tool will actually detect (Codex on #193): note scip-java does NOT recognize
+/// `settings.gradle.kts`, and DOES recognize the `gradlew` wrapper — accepting the former or
+/// omitting the latter would let a checkout pass the gate then fail with "no Gradle tool", or block
+/// a wrapper-only root scip-java could index. Maven is deliberately excluded: scip-java's automatic
+/// indexer supports Kotlin only for Gradle, and this backend advertises Kotlin only — a Maven
+/// (`pom.xml`) Kotlin checkout should report Blocked, not run.
 fn has_gradle_build(root: &Path) -> bool {
-    ["build.gradle.kts", "build.gradle", "settings.gradle.kts", "settings.gradle"]
+    ["settings.gradle", "gradlew", "build.gradle", "build.gradle.kts"]
         .iter()
         .any(|name| root.join(name).exists())
 }
@@ -502,8 +508,19 @@ mod tests {
             manifest.prerequisite_blocked(&dir).is_some(),
             "Maven-only Kotlin is unsupported by scip-java → Blocked"
         );
-        std::fs::write(dir.join("build.gradle.kts"), "").unwrap();
-        assert!(manifest.prerequisite_blocked(&dir).is_none(), "a Gradle build satisfies it");
+        // scip-java's GradleBuildTool does NOT recognize `settings.gradle.kts`, so neither do we —
+        // accepting it would pass the gate then fail with "no Gradle tool" (Codex on #193).
+        std::fs::write(dir.join("settings.gradle.kts"), "").unwrap();
+        assert!(
+            manifest.prerequisite_blocked(&dir).is_some(),
+            "settings.gradle.kts is not a scip-java Gradle sentinel → still Blocked"
+        );
+        // …but the `gradlew` wrapper IS one of scip-java's sentinels, so it satisfies the gate.
+        std::fs::write(dir.join("gradlew"), "").unwrap();
+        assert!(
+            manifest.prerequisite_blocked(&dir).is_none(),
+            "a gradlew wrapper is a scip-java Gradle sentinel → satisfied"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
