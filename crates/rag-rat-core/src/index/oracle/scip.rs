@@ -176,6 +176,41 @@ fn is_local_symbol(symbol: &str) -> bool {
     ::scip::symbol::is_local_symbol(symbol)
 }
 
+/// The constant version component pinned into in-corpus monikers so they stay stable across commits
+/// (matches scip-python's `--project-version _`). See [`stabilize_moniker_version`].
+pub(crate) const STABLE_MONIKER_VERSION: &str = "_";
+
+/// Normalize the **version** component of an in-corpus moniker to a constant so a stored moniker is
+/// invariant across releases — the prerequisite for moniker-anchored memory relocation.
+///
+/// scip-typescript bakes the project's `package.json` `version` into the package component of every
+/// local moniker (`scip-typescript npm <name> <version> <descriptor>`) and exposes no
+/// `--project-version` flag to override it (unlike scip-python, which we pin to `_` at the CLI). A
+/// routine version bump would otherwise churn every TS moniker and orphan every memory bound to
+/// one. Rewriting the version to [`STABLE_MONIKER_VERSION`] yields the same stable form scip-python
+/// already produces. Tools whose monikers are already version-stable (rust-analyzer, scip-clang,
+/// scip-python) pass through untouched, as do unparsable / package-less / local symbols.
+pub(crate) fn stabilize_moniker_version(
+    tool: super::OracleTool,
+    symbol: &str,
+) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if tool != super::OracleTool::ScipTypescript {
+        return Cow::Borrowed(symbol);
+    }
+    let Ok(mut parsed) = ::scip::symbol::parse_symbol(symbol) else {
+        return Cow::Borrowed(symbol);
+    };
+    let Some(package) = parsed.package.as_mut() else {
+        return Cow::Borrowed(symbol);
+    };
+    if package.name.trim().is_empty() || package.version == STABLE_MONIKER_VERSION {
+        return Cow::Borrowed(symbol);
+    }
+    package.version = STABLE_MONIKER_VERSION.to_string();
+    Cow::Owned(::scip::symbol::format_symbol(parsed))
+}
+
 /// Converts a SCIP `Occurrence.range` (`[start_line, start_char, end_char]` for single-line, or
 /// `[start_line, start_char, end_line, end_char]` for multi-line) — whose char columns are in a
 /// document's `position_encoding` — into an absolute **byte** range within the file.

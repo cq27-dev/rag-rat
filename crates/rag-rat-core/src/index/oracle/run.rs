@@ -376,12 +376,16 @@ pub(crate) fn run_in_tx(
             .or_insert(scip_symbol);
     }
     for (logical_symbol_id, moniker) in &best_monikers {
+        // Pin the version component to a constant so a release bump doesn't churn the moniker and
+        // orphan moniker-anchored memories (scip-typescript bakes package.json's version in and has
+        // no --project-version flag; a no-op for the already-stable tools).
+        let moniker = scip::stabilize_moniker_version(input.tool, moniker);
         store::write_logical_symbol_moniker(
             conn,
             input.tool,
             input.tool_version,
             *logical_symbol_id,
-            moniker,
+            &moniker,
         )?;
         report.monikers_written += 1;
     }

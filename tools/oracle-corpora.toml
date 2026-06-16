@@ -50,8 +50,9 @@ repo      = "https://github.com/sindresorhus/ky"
 rev       = "v1.7.2"
 tool      = "scip-typescript"
 # scip-typescript resolves cross-package references against the project's installed `node_modules`
-# (the analog of scip-python's venv); `npm install` makes them present. It reads the project's
-# `tsconfig.json` (ky ships one); the runner also passes `--infer-tsconfig` as a fallback.
+# (the analog of scip-python's venv); `npm install` makes them present. It requires a root
+# `tsconfig.json` (ky ships one) — the backend deliberately does NOT pass `--infer-tsconfig`, which
+# would write a tsconfig into the checkout (read-only-on-source).
 prepare   = ["npm install --no-audit --no-fund"]
 bindings  = { typescript = ["source"] }
 health    = { expected_min_heuristic_edges = 50, expected_min_oracle_examined = 20, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 10, timeout_minutes = 12 }

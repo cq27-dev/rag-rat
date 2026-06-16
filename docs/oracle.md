@@ -54,10 +54,13 @@ SCIP project version is pinned to a constant (not the git revision) so a symbol'
 stable across commits — keeping moniker-anchored memory relocation working.
 
 `scip-typescript` resolves cross-package references against the project's **installed**
-`node_modules` (the analog of scip-python's venv), so `npm install` must have run; it reads the
-project's `tsconfig.json` and synthesizes one from `package.json` when absent (`--infer-tsconfig`).
-Package name/version come from `package.json`, not the git revision, so monikers are already
-commit-stable and need no project-version pin.
+`node_modules` (the analog of scip-python's venv), so `npm install` must have run. It requires a
+`tsconfig.json` at the checkout root (a missing one is reported `Blocked` — we deliberately don't
+pass `--infer-tsconfig`, which would *write* a tsconfig into the source tree, breaking the
+read-only-on-source contract). It bakes the `package.json` **version** into every local symbol's
+moniker and offers no `--project-version` flag, so rag-rat normalizes that version to a constant at
+moniker-write time — keeping a symbol's moniker stable across releases, the same way scip-python's
+`--project-version _` pin does.
 
 A missing/unrunnable tool degrades to `Blocked` with an install hint and exit 0 — never an error.
 

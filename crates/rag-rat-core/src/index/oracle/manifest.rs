@@ -148,12 +148,23 @@ impl ToolManifest {
             // check (it's whatever the corpus `prepare` venv installs); a failed environment shows
             // up as a near-zero moniker count the report health gate catches, so there's nothing to
             // block on here.
-            // scip-typescript, like scip-python, has no single prerequisite sentinel: it indexes
-            // the project's own files even without `node_modules` (cross-package
-            // monikers just stay unresolved), and infers a `tsconfig.json` when missing
-            // (`--infer-tsconfig`). A failed environment surfaces as a low moniker
-            // count the report health gate catches.
-            OracleTool::RustAnalyzer | OracleTool::ScipPython | OracleTool::ScipTypescript => None,
+            OracleTool::RustAnalyzer | OracleTool::ScipPython => None,
+            // scip-typescript needs a `tsconfig.json` at the root: with `--infer-tsconfig` it would
+            // otherwise WRITE one into the checkout (confirmed against v0.4.0), violating the
+            // read-only-on-source contract — so we don't pass that flag and instead require a real
+            // tsconfig (the TS analog of scip-clang's compile_commands.json). Cross-package deps
+            // (`node_modules`) are the corpus `prepare` step's job; a missing one is NOT reliably
+            // caught by the moniker-count gate (scip-typescript mints local monikers from
+            // package.json regardless of node_modules) — only external resolution drops. A
+            // dedicated external-resolution health signal is tracked in #185.
+            OracleTool::ScipTypescript => (!root.join("tsconfig.json").exists()).then(|| {
+                format!(
+                    "scip-typescript requires a tsconfig.json at {} — add one to the project \
+                     (most TypeScript projects ship one), or pass a pre-built index with `--scip \
+                     <path>`.",
+                    root.display()
+                )
+            }),
             OracleTool::ScipClang => (!root.join("compile_commands.json").exists()).then(|| {
                 format!(
                     "scip-clang requires a compile_commands.json at {} — generate one (e.g. `bear \
@@ -213,20 +224,16 @@ impl ToolManifest {
                 cmd
             },
             // scip-typescript indexes the working dir via its `index` subcommand (like
-            // scip-python). `--infer-tsconfig` synthesizes a `tsconfig.json` from
-            // `package.json` when the project doesn't ship one (a no-op when it does),
-            // so a corpus needn't hand-author one; package name/version come from
-            // `package.json`, NOT the git rev, so monikers are already stable
-            // across commits and need no `--project-version` pin (unlike scip-python). `--output`
-            // is absolute, unaffected by `--cwd`.
+            // scip-python), reading the project's `tsconfig.json` (prerequisite-checked — we
+            // deliberately do NOT pass `--infer-tsconfig`, which WRITES a tsconfig into the source
+            // tree, breaking read-only-on-source). No `--project-name` / `--project-version`:
+            // package name + version come from `package.json`. That version is embedded in every
+            // local moniker and has no CLI override, so it's normalized downstream at
+            // moniker-write time (`scip::stabilize_moniker_version`), not here. `--output` is
+            // absolute, unaffected by `--cwd`.
             OracleTool::ScipTypescript => {
                 let mut cmd = Command::new(self.program);
-                cmd.arg("index")
-                    .arg("--cwd")
-                    .arg(root)
-                    .arg("--infer-tsconfig")
-                    .arg("--output")
-                    .arg(output);
+                cmd.arg("index").arg("--cwd").arg(root).arg("--output").arg(output);
                 cmd
             },
         }
@@ -376,23 +383,29 @@ mod tests {
 
     #[test]
     fn scip_typescript_indexes_a_cwd() {
-        // scip-typescript's invocation: `scip-typescript index --cwd <root> --infer-tsconfig
-        // --output <abs>`. No `--project-name` / `--project-version` (package.json supplies both,
-        // so monikers are already commit-stable) and no compile_commands.json prerequisite
-        // (the `npm install` is the corpus `prepare` step's job).
+        // scip-typescript's invocation: `scip-typescript index --cwd <root> --output <abs>`. No
+        // `--project-name` / `--project-version` (package.json supplies both; the version is
+        // normalized downstream at moniker-write time). NO `--infer-tsconfig` — that flag writes a
+        // tsconfig into the source tree, so a missing tsconfig is a prerequisite Block instead.
         let manifest = ToolManifest::for_tool(OracleTool::ScipTypescript);
         assert_eq!(manifest.program, "scip-typescript");
         assert_eq!(manifest.languages, &["typescript"]);
         let cmd = manifest.scip_command(Path::new("/work/ky"), Path::new("/tmp/out.scip"));
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, vec![
-            "index",
-            "--cwd",
-            "/work/ky",
-            "--infer-tsconfig",
-            "--output",
-            "/tmp/out.scip",
-        ]);
-        assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_none());
+        assert_eq!(args, vec!["index", "--cwd", "/work/ky", "--output", "/tmp/out.scip"]);
+        assert!(!args.iter().any(|a| a == "--infer-tsconfig"), "must not dirty the source tree");
+    }
+
+    #[test]
+    fn scip_typescript_requires_a_tsconfig() {
+        // A checkout without a tsconfig.json is Blocked (install-hint UX), not silently run with
+        // `--infer-tsconfig` writing one into the tree — the read-only-on-source contract.
+        let manifest = ToolManifest::for_tool(OracleTool::ScipTypescript);
+        assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_some());
+        let dir = std::env::temp_dir().join("rag_rat_ts_prereq_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
+        assert!(manifest.prerequisite_blocked(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
