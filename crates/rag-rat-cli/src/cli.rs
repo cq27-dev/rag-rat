@@ -306,6 +306,8 @@ pub(crate) enum OracleToolArg {
     ScipPython,
     #[value(name = "scip-typescript")]
     ScipTypescript,
+    #[value(name = "scip-java")]
+    ScipJava,
 }
 
 impl OracleToolArg {
@@ -316,6 +318,7 @@ impl OracleToolArg {
             OracleToolArg::ScipPython => rag_rat_core::index::oracle::OracleTool::ScipPython,
             OracleToolArg::ScipTypescript =>
                 rag_rat_core::index::oracle::OracleTool::ScipTypescript,
+            OracleToolArg::ScipJava => rag_rat_core::index::oracle::OracleTool::ScipJava,
         }
     }
 }

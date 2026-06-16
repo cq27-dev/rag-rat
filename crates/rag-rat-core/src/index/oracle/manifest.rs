@@ -86,6 +86,17 @@ impl ToolManifest {
                                dependencies (`npm install`) so cross-package references resolve, \
                                or pass a pre-built index with `--scip <path>`.",
             },
+            // scip-java is the SemanticDB-based JVM indexer; we drive it for KOTLIN (it indexes
+            // through the project's Gradle/Maven build via the semanticdb-kotlinc compiler plugin).
+            OracleTool::ScipJava => ToolManifest {
+                tool,
+                program: "scip-java",
+                languages: &["kotlin"],
+                install_hint: "scip-java not found on PATH. Install it (e.g. `cs install \
+                               --contrib scip-java`, needs a JVM) — it indexes through the \
+                               project's Gradle/Maven build, so the build must succeed; or pass a \
+                               pre-built index with `--scip <path>`.",
+            },
         }
     }
 
@@ -127,13 +138,14 @@ impl ToolManifest {
                 .output()
                 .is_ok_and(|output| output.status.success()),
             OracleTool::ScipClang => true,
-            // scip-python emits via an `index` subcommand; `index --help` exiting 0 is the analog
-            // of rust-analyzer's `scip --help` capability check.
-            OracleTool::ScipPython | OracleTool::ScipTypescript => Command::new(self.program)
-                .arg("index")
-                .arg("--help")
-                .output()
-                .is_ok_and(|output| output.status.success()),
+            // scip-python/typescript/java emit via an `index` subcommand; `index --help` exiting 0
+            // is the analog of rust-analyzer's `scip --help` capability check.
+            OracleTool::ScipPython | OracleTool::ScipTypescript | OracleTool::ScipJava =>
+                Command::new(self.program)
+                    .arg("index")
+                    .arg("--help")
+                    .output()
+                    .is_ok_and(|output| output.status.success()),
         }
     }
 
@@ -171,6 +183,17 @@ impl ToolManifest {
                      -- make`, CMake `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, or the kernel's \
                      scripts/clang-tools/gen_compile_commands.py), or pass a pre-built index with \
                      `--scip <path>`.",
+                    root.display()
+                )
+            }),
+            // scip-java indexes THROUGH the build, so it needs a recognizable build at the root
+            // (Gradle or Maven). Without one it can't run; report Blocked rather than a confusing
+            // subprocess error (the JVM analog of scip-clang's compile_commands.json prerequisite).
+            OracleTool::ScipJava => (!has_jvm_build_file(root)).then(|| {
+                format!(
+                    "scip-java requires a Gradle or Maven build at {} (build.gradle[.kts], \
+                     settings.gradle[.kts], or pom.xml) — it indexes through the build; or pass a \
+                     pre-built index with `--scip <path>`.",
                     root.display()
                 )
             }),
@@ -236,8 +259,26 @@ impl ToolManifest {
                 cmd.arg("index").arg("--cwd").arg(root).arg("--output").arg(output);
                 cmd
             },
+            // scip-java auto-detects the build tool in the working dir and indexes through it
+            // (running the build with the semanticdb-kotlinc plugin), so cwd = root. No
+            // `--project-version` need (unlike scip-python): scip-java emits `.` placeholders for
+            // the local project's package/version regardless of the build's
+            // `group`/`version`, so monikers are already commit-stable. `--output` is
+            // absolute.
+            OracleTool::ScipJava => {
+                let mut cmd = Command::new(self.program);
+                cmd.current_dir(root).arg("index").arg("--output").arg(output);
+                cmd
+            },
         }
     }
+}
+
+/// Whether `root` has a recognizable JVM build (Gradle or Maven) that scip-java can index through.
+fn has_jvm_build_file(root: &Path) -> bool {
+    ["build.gradle.kts", "build.gradle", "settings.gradle.kts", "settings.gradle", "pom.xml"]
+        .iter()
+        .any(|name| root.join(name).exists())
 }
 
 /// Run `<program> --version` and return the first non-empty trimmed stdout line, or `None` when the
@@ -406,6 +447,36 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
         assert!(manifest.prerequisite_blocked(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scip_java_indexes_through_the_build_in_cwd() {
+        // scip-java's invocation: `scip-java index --output <abs>`, run with cwd = root (it
+        // auto-detects the build tool there). No `--project-version` — scip-java emits `.`
+        // placeholders for the local project regardless of the build's group/version, so monikers
+        // are already commit-stable.
+        let manifest = ToolManifest::for_tool(OracleTool::ScipJava);
+        assert_eq!(manifest.program, "scip-java");
+        assert_eq!(manifest.languages, &["kotlin"]);
+        let cmd = manifest.scip_command(Path::new("/work/app"), Path::new("/tmp/out.scip"));
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec!["index", "--output", "/tmp/out.scip"]);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/work/app")), "runs in the project root");
+    }
+
+    #[test]
+    fn scip_java_requires_a_jvm_build_file() {
+        // scip-java indexes THROUGH the build; without a Gradle/Maven build at the root it's
+        // Blocked (the JVM analog of scip-clang's compile_commands.json prerequisite).
+        let manifest = ToolManifest::for_tool(OracleTool::ScipJava);
+        assert!(manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_some());
+        let dir = std::env::temp_dir().join("rag_rat_java_prereq_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(manifest.prerequisite_blocked(&dir).is_some(), "empty dir has no build → Blocked");
+        std::fs::write(dir.join("build.gradle.kts"), "").unwrap();
+        assert!(manifest.prerequisite_blocked(&dir).is_none(), "a Gradle build satisfies it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -575,13 +575,24 @@ pub enum OracleTool {
     /// references against the project's installed `node_modules`, so the corpus must `npm install`
     /// first; an unresolved environment shows up as a low moniker count the health gate catches.
     ScipTypescript,
+    /// `scip-java index` — Kotlin (#72). The SemanticDB-based JVM indexer; we drive it for Kotlin
+    /// (it indexes through the project's Gradle/Maven build via the semanticdb-kotlinc plugin), so
+    /// the build must succeed. Emits UTF-16 columns with `position_encoding` unset, like
+    /// scip-typescript; unlike scip-python/typescript it embeds no project version in local
+    /// monikers (always `.` placeholders), so monikers are already commit-stable.
+    ScipJava,
 }
 
 impl OracleTool {
     /// Every known oracle tool, for "report on all tools" surfaces (`oracle status` with no
-    /// `--tool`). Later language backends (#72 Kotlin) extend this alongside the enum.
-    pub const ALL: &[OracleTool] =
-        &[Self::RustAnalyzer, Self::ScipClang, Self::ScipPython, Self::ScipTypescript];
+    /// `--tool`). Later language backends extend this alongside the enum.
+    pub const ALL: &[OracleTool] = &[
+        Self::RustAnalyzer,
+        Self::ScipClang,
+        Self::ScipPython,
+        Self::ScipTypescript,
+        Self::ScipJava,
+    ];
 
     pub fn as_db_str(self) -> &'static str {
         match self {
@@ -589,6 +600,7 @@ impl OracleTool {
             Self::ScipClang => "scip-clang",
             Self::ScipPython => "scip-python",
             Self::ScipTypescript => "scip-typescript",
+            Self::ScipJava => "scip-java",
         }
     }
 
@@ -598,6 +610,7 @@ impl OracleTool {
             "scip-clang" => Some(Self::ScipClang),
             "scip-python" => Some(Self::ScipPython),
             "scip-typescript" => Some(Self::ScipTypescript),
+            "scip-java" => Some(Self::ScipJava),
             _ => None,
         }
     }
@@ -611,7 +624,11 @@ impl OracleTool {
     pub(crate) fn default_position_encoding(self) -> ::scip::types::PositionEncoding {
         use ::scip::types::PositionEncoding;
         match self {
-            Self::ScipTypescript => PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
+            // scip-typescript and scip-java (JVM/semanticdb) both emit UTF-16 columns with the
+            // field unset — empirically confirmed (a token after an astral char lands at the
+            // UTF-16 count). Reading them as the UTF-32 fallback mis-converts past astral chars.
+            Self::ScipTypescript | Self::ScipJava =>
+                PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
             Self::RustAnalyzer | Self::ScipClang | Self::ScipPython =>
                 PositionEncoding::UnspecifiedPositionEncoding,
         }

@@ -4361,3 +4361,18 @@ fn stabilize_moniker_version_pins_typescript_package_version() {
     let local = "local 42";
     assert_eq!(norm(OracleTool::ScipTypescript, local), local);
 }
+
+/// The per-tool default position encoding for SCIP documents that leave the field unset:
+/// scip-typescript and scip-java emit UTF-16 columns (confirmed empirically), the rest stay
+/// Unspecified.
+#[test]
+fn default_position_encoding_is_utf16_for_typescript_and_java() {
+    use ::scip::types::PositionEncoding::{
+        UTF16CodeUnitOffsetFromLineStart as U16, UnspecifiedPositionEncoding as UNSPEC,
+    };
+    assert_eq!(OracleTool::ScipTypescript.default_position_encoding(), U16);
+    assert_eq!(OracleTool::ScipJava.default_position_encoding(), U16);
+    assert_eq!(OracleTool::RustAnalyzer.default_position_encoding(), UNSPEC);
+    assert_eq!(OracleTool::ScipClang.default_position_encoding(), UNSPEC);
+    assert_eq!(OracleTool::ScipPython.default_position_encoding(), UNSPEC);
+}
