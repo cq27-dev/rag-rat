@@ -266,15 +266,25 @@ impl ToolManifest {
                 cmd.arg("index").arg("--cwd").arg(root).arg("--output").arg(output);
                 cmd
             },
-            // scip-java auto-detects the build tool in the working dir and indexes through it
-            // (running the build with the semanticdb-kotlinc plugin), so cwd = root. No
-            // `--project-version` need (unlike scip-python): scip-java emits `.` placeholders for
-            // the local project's package/version regardless of the build's
-            // `group`/`version`, so monikers are already commit-stable. `--output` is
-            // absolute.
+            // scip-java indexes through the build (running it with the semanticdb-kotlinc plugin),
+            // so cwd = root. `--build-tool Gradle` is PINNED: the prerequisite only proved Gradle
+            // is present, but a checkout that ALSO carries a `pom.xml` (Maven→Gradle
+            // migration, parent Maven descriptor) makes scip-java's auto-detection see
+            // multiple build tools and abort with "Multiple build tools detected"
+            // instead of indexing. Forcing Gradle (this backend's only supported Kotlin
+            // path) skips that ambiguity (Codex on #193); the value is matched
+            // case-insensitively upstream. No `--project-version` need (unlike
+            // scip-python): scip-java emits `.` placeholders for the local project's
+            // package/version regardless of the build's `group`/`version`, so monikers
+            // are already commit-stable. `--output` is absolute.
             OracleTool::ScipJava => {
                 let mut cmd = Command::new(self.program);
-                cmd.current_dir(root).arg("index").arg("--output").arg(output);
+                cmd.current_dir(root)
+                    .arg("index")
+                    .arg("--build-tool")
+                    .arg("Gradle")
+                    .arg("--output")
+                    .arg(output);
                 cmd
             },
         }
@@ -460,17 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn scip_java_indexes_through_the_build_in_cwd() {
-        // scip-java's invocation: `scip-java index --output <abs>`, run with cwd = root (it
-        // auto-detects the build tool there). No `--project-version` — scip-java emits `.`
-        // placeholders for the local project regardless of the build's group/version, so monikers
-        // are already commit-stable.
+    fn scip_java_indexes_through_the_gradle_build_in_cwd() {
+        // scip-java's invocation: `scip-java index --build-tool Gradle --output <abs>`, run with
+        // cwd = root. `--build-tool Gradle` is pinned so a checkout that also has a `pom.xml`
+        // doesn't trip scip-java's "Multiple build tools detected" abort. No `--project-version` —
+        // scip-java emits `.` placeholders for the local project regardless of the build's
+        // group/version, so monikers are already commit-stable.
         let manifest = ToolManifest::for_tool(OracleTool::ScipJava);
         assert_eq!(manifest.program, "scip-java");
         assert_eq!(manifest.languages, &["kotlin"]);
         let cmd = manifest.scip_command(Path::new("/work/app"), Path::new("/tmp/out.scip"));
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, vec!["index", "--output", "/tmp/out.scip"]);
+        assert_eq!(args, vec!["index", "--build-tool", "Gradle", "--output", "/tmp/out.scip"]);
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/work/app")), "runs in the project root");
     }
 
