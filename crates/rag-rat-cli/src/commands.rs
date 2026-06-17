@@ -495,7 +495,10 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
             },
             oracle::ScipProduction::Produced { version, bytes, production_sha } => {
                 let provenance = oracle::RunProvenance {
-                    tool_version: version,
+                    // Fold the pinned-toolchain fingerprint into the probed `--version` so a
+                    // lockfile bump that changes the indexer's output breaks Δ
+                    // comparability (#185/#197).
+                    tool_version: with_oracle_tool_version_suffix(version),
                     rag_rat_commit: rag_rat_commit.clone(),
                     worktree_id: String::new(),
                     production_sha: oracle::scip_content_fingerprint(&bytes),
@@ -611,6 +614,25 @@ fn rag_rat_commit_provenance() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Fold the oracle TOOL-ENVIRONMENT fingerprint into a probed `tool_version`. CI exports
+/// `RAG_RAT_ORACLE_TOOL_VERSION_SUFFIX` (the pinned npm toolchain lockfile hash) for the npm-based
+/// backends, whose `--version` alone is insufficient: scip-typescript's bundled `typescript`
+/// compiler can move under a lockfile bump while `scip-typescript --version` stays `0.4.0`. Folding
+/// the lockfile hash into `tool_version` makes that bump yield a DIFFERENT `tool_version`, so the
+/// Δ-vs-main report (which keys comparability on `tool_version`) refuses to compare rather than
+/// mis-attributing the toolchain-output change to rag-rat (#185 / Codex on #197). Unset (local
+/// runs, non-npm backends) leaves the version unchanged.
+fn with_oracle_tool_version_suffix(version: String) -> String {
+    join_tool_version_suffix(version, std::env::var("RAG_RAT_ORACLE_TOOL_VERSION_SUFFIX").ok())
+}
+
+fn join_tool_version_suffix(version: String, suffix: Option<String>) -> String {
+    match suffix.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        Some(suffix) => format!("{version}+{suffix}"),
+        None => version,
+    }
 }
 
 pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
@@ -1091,6 +1113,23 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn tool_version_suffix_folds_in_the_toolchain_fingerprint() {
+        // No suffix (local run / non-npm backend) → version unchanged.
+        assert_eq!(super::join_tool_version_suffix("0.4.0".into(), None), "0.4.0");
+        assert_eq!(super::join_tool_version_suffix("0.4.0".into(), Some("  ".into())), "0.4.0");
+        // A toolchain fingerprint makes a lockfile bump a DIFFERENT tool_version (breaks Δ
+        // comparability instead of mis-attributing the change), #185/#197.
+        assert_eq!(
+            super::join_tool_version_suffix("0.4.0".into(), Some("toolchain:abc123".into())),
+            "0.4.0+toolchain:abc123"
+        );
+        assert_ne!(
+            super::join_tool_version_suffix("0.4.0".into(), Some("toolchain:aaa".into())),
+            super::join_tool_version_suffix("0.4.0".into(), Some("toolchain:bbb".into())),
+        );
+    }
 
     use rag_rat_core::config::{ResolvedTarget, TargetKind};
     use rag_rat_core::language::Language;

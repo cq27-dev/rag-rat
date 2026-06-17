@@ -137,6 +137,13 @@ jobs:
               # oracle's probe. `npm ci` is reproducible; `npm install -g @pkg@ver` was not (#185 #2).
               npm ci --no-audit --no-fund --prefix tools/oracle-toolchain
               echo "$PWD/tools/oracle-toolchain/node_modules/.bin" >> "$GITHUB_PATH"
+              # Fold the toolchain lockfile hash into the oracle's tool_version (consumed by
+              # `oracle report` via RAG_RAT_ORACLE_TOOL_VERSION_SUFFIX). The npm indexers' --version
+              # alone doesn't move when only a transitive dep (e.g. the bundled `typescript`) bumps,
+              # so without this a lockfile-only change would stay "comparable" to main and the Δ
+              # would mis-attribute the toolchain-output change to rag-rat (#185/#197).
+              lock_sha="$(sha256sum tools/oracle-toolchain/package-lock.json | cut -c1-12)"
+              echo "RAG_RAT_ORACLE_TOOL_VERSION_SUFFIX=toolchain:$lock_sha" >> "$GITHUB_ENV"
               "$PWD/tools/oracle-toolchain/node_modules/.bin/$tool" --version ;;
             *)
               echo "unknown tool '$tool'" >&2; exit 1 ;;
