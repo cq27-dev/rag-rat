@@ -112,6 +112,16 @@ impl SymbolSelector {
         self.logical_symbol_id
             .or_else(|| self.symbol_path.as_deref().and_then(crate::serde_big_id::parse_sym_handle))
     }
+
+    /// Whether the `ref`/`symbol_path` slot holds a value SHAPED like a `sym_<hex>` handle — it
+    /// parses, OR it starts with `sym_` but is malformed (typo, bad hex, truncated copy). A
+    /// qualified name is `path::name` and never starts with `sym_`, so a `sym_`-prefixed value is
+    /// always a handle the client copied back, never a name. Callers treat it as id-based even when
+    /// it fails to parse, so a bad handle fails cheaply instead of tripping the #152 name-miss
+    /// heal/reindex (which can never recover a handle anyway) (#201 review).
+    pub fn ref_is_handle_shaped(&self) -> bool {
+        self.symbol_path.as_deref().is_some_and(|value| value.starts_with("sym_"))
+    }
 }
 
 #[derive(Debug, Serialize)]

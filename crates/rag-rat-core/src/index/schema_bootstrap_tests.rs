@@ -2469,15 +2469,18 @@ pub fn caller() {
     // 2-candidate count → a dead end.)
     let handle = crate::serde_big_id::format_sym_handle(logical_symbol_id);
     let by_ref_handle = db
-        .symbol_candidates(&crate::query::symbol::SymbolSelector {
-            logical_symbol_id: None,
-            symbol_id: None,
-            symbol_path: Some(handle),
-            symbol: None,
-            language: None,
-            allow_ambiguous: false,
-            limit: 10,
-        })
+        .symbol_candidates(
+            &crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: Some(handle),
+                symbol: None,
+                language: None,
+                allow_ambiguous: false,
+                limit: 10,
+            },
+            false,
+        )
         .unwrap();
     assert_eq!(by_ref_handle.candidates.len(), 2, "handle resolves the whole cfg group");
     assert!(
