@@ -214,8 +214,8 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
     const GOLDEN_RUST_TIME: &str =
         "ba5a37328901f0b1964c51bc8cff3c729d07070a0ce0d61f9934ea7790ca6b64";
     const GOLDEN_C_LIBUV: &str = "b34ef742c7d4b5efc02bdb95a8457719be9a0dd5621485e11c7d42d2e534d965";
-    const GOLDEN_PY_RICH: &str = "0a4a22be9817ff26b549119b098d23004e5a8b4d7817126e5084f9d730f1efda";
-    const GOLDEN_TS_RXJS: &str = "da31c85864cdad38b7a4553774e46d241a602e3c4e9d11229bdd52c2f7411ee1";
+    const GOLDEN_PY_RICH: &str = "8aaf6cd7453a3c2ada0a80bd02f570e7885104b029d664a6159c200b6dce25a0";
+    const GOLDEN_TS_RXJS: &str = "1cb0bed09d093533087c7c617afa9eb963bcf506d2c903e704cdc988b30493e7";
     const GOLDEN_CPP_YAML: &str =
         "2b6d2ec7f00b34e330116bf1b93fd51416926ac3d30e24dac766f0f8fb910f58";
     const GOLDEN_RUST_CARGO: &str =

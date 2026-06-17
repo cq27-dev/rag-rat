@@ -1,0 +1,10 @@
+{
+  "name": "rag-rat-oracle-toolchain",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned SCIP indexer toolchain for the oracle corpus runner (#185 item 2). npm ci against the committed package-lock.json pins each indexer's FULL transitive tree (notably scip-typescript's bundled `typescript` compiler), so a PR's resolution numbers can't shift under an unrelated upstream release while the indexer's --version is unchanged.",
+  "dependencies": {
+    "@sourcegraph/scip-typescript": "0.4.0",
+    "@sourcegraph/scip-python": "0.6.6"
+  }
+}

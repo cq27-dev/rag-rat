@@ -22,6 +22,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tools/oracle-corpora.toml'
+      - 'tools/oracle-toolchain/**'
       - 'tools/oracle-corpus.py'
       - 'tools/oracle-run.sh'
       - 'tools/oracle-report-bmf.py'
@@ -34,6 +35,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tools/oracle-corpora.toml'
+      - 'tools/oracle-toolchain/**'
       - 'tools/oracle-corpus.py'
       - 'tools/oracle-run.sh'
       - 'tools/oracle-report-bmf.py'
@@ -58,12 +60,14 @@ concurrency:
 
 env:
   # Pinned SCIP toolchain for the small tier so a PR number isn't perturbed by an unrelated indexer
-  # release. scip-clang/scip-python/scip-typescript are pinned to explicit versions; rust-analyzer is installed as a
-  # rustup component (below), pinning it to the stable toolchain (a ~6-week cadence) instead of the
-  # weekly `releases/latest` — so a fresh RA build can't change `rust-time`'s numbers mid-PR.
+  # release. scip-clang is pinned to an explicit prebuilt version (a single static binary, no
+  # transitive tree); rust-analyzer is installed as a rustup component (below), pinning it to the
+  # stable toolchain (a ~6-week cadence) instead of the weekly `releases/latest`. The npm-based
+  # indexers (scip-typescript, scip-python) are pinned by `tools/oracle-toolchain/package-lock.json`
+  # via `npm ci` — their FULL transitive tree (notably scip-typescript's bundled `typescript`
+  # compiler) is locked, so a transitive npm release can't shift a PR's numbers while the indexer's
+  # own `--version` is unchanged (#185 item 2).
   SCIP_CLANG_VERSION: v0.4.0
-  SCIP_PYTHON_VERSION: 0.6.6
-  SCIP_TYPESCRIPT_VERSION: 0.4.0
 
 jobs:
   matrix:
@@ -127,12 +131,13 @@ jobs:
                 -o /usr/local/bin/scip-clang
               chmod +x /usr/local/bin/scip-clang
               scip-clang --version ;;
-            scip-python)
-              npm install -g "@sourcegraph/scip-python@${SCIP_PYTHON_VERSION}"
-              scip-python --version ;;
-            scip-typescript)
-              npm install -g "@sourcegraph/scip-typescript@${SCIP_TYPESCRIPT_VERSION}"
-              scip-typescript --version ;;
+            scip-python|scip-typescript)
+              # Install the pinned npm toolchain from its committed lockfile (full transitive tree,
+              # incl. scip-typescript's bundled `typescript`) and put its bin dir on PATH for the
+              # oracle's probe. `npm ci` is reproducible; `npm install -g @pkg@ver` was not (#185 #2).
+              npm ci --no-audit --no-fund --prefix tools/oracle-toolchain
+              echo "$PWD/tools/oracle-toolchain/node_modules/.bin" >> "$GITHUB_PATH"
+              "$PWD/tools/oracle-toolchain/node_modules/.bin/$tool" --version ;;
             *)
               echo "unknown tool '$tool'" >&2; exit 1 ;;
           esac

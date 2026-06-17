@@ -45,7 +45,12 @@ tier      = "small"
 repo      = "https://github.com/Textualize/rich"
 rev       = "v13.8.1"
 tool      = "scip-python"
-prepare   = ["python -m venv .venv", ".venv/bin/pip install ."]
+# `pip install .` resolved rich's deps through ranges (pygments `^2.13`, markdown-it-py `>=2.2`), so
+# an upstream release could shift what scip-python sees while the profile hash — which records only
+# the command string — stayed "comparable" (#185 item 3). Pin rich v13.8.1's full resolved runtime
+# tree inline (these versions are now part of the hashed prepare command, so a bump is a deliberate,
+# reviewable profile change). `npm ci`'s pip analog.
+prepare   = ["python -m venv .venv", ".venv/bin/pip install . \"markdown-it-py==4.2.0\" \"mdurl==0.1.2\" \"pygments==2.20.0\""]
 bindings  = { python = ["rich"] }
 health    = { expected_min_heuristic_edges = 5000, expected_min_oracle_examined = 4000, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 500, timeout_minutes = 12 }
 
@@ -67,7 +72,11 @@ tool      = "scip-typescript"
 # node_modules present; the 1000 floor catches a missing-`npm install` run (external resolution drops
 # toward zero) while sitting well below the healthy number. The non-npm backends leave it unset
 # (external resolution isn't their dep signal; rust/c use cargo fetch / the compdb).
-prepare   = ["npm install --no-audit --no-fund"]
+# `npm ci` (not `npm install`) installs from rxjs's COMMITTED package-lock.json — a deterministic
+# dependency tree — so a transitive npm release can't shift the types/compiler inputs scip-typescript
+# sees while the profile hash stays "comparable" (#185 item 3). rxjs 7.8.1 ships a package-lock.json,
+# which `npm ci` requires.
+prepare   = ["npm ci --no-audit --no-fund"]
 bindings  = { typescript = ["src/internal"] }
 health    = { expected_min_heuristic_edges = 5000, expected_min_oracle_examined = 3500, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 300, expected_min_resolved_external = 1000, timeout_minutes = 15 }
 
