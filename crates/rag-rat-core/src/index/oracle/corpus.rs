@@ -188,12 +188,14 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
             "py-rich",
             "ts-rxjs",
             "cpp-yaml",
+            "py-django",
             "rust-cargo",
             "linux-kernel"
         ]);
         assert_eq!(corpus_by_id(&corpora, "py-rich").unwrap().tool, "scip-python");
         assert_eq!(corpus_by_id(&corpora, "ts-rxjs").unwrap().tool, "scip-typescript");
         assert_eq!(corpus_by_id(&corpora, "cpp-yaml").unwrap().tool, "scip-clang");
+        assert_eq!(corpus_by_id(&corpora, "py-django").unwrap().tool, "scip-python");
 
         // GOLDEN per-profile hashes: an edit to any corpus field changes its hash (and makes prior
         // reports incomparable) — recompute deliberately when intended.
@@ -205,6 +207,7 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
             ("py-rich", GOLDEN_PY_RICH.to_string()),
             ("ts-rxjs", GOLDEN_TS_RXJS.to_string()),
             ("cpp-yaml", GOLDEN_CPP_YAML.to_string()),
+            ("py-django", GOLDEN_PY_DJANGO.to_string()),
             ("rust-cargo", GOLDEN_RUST_CARGO.to_string()),
             ("linux-kernel", GOLDEN_LINUX_KERNEL.to_string()),
         ]);
@@ -218,6 +221,8 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
     const GOLDEN_TS_RXJS: &str = "1cb0bed09d093533087c7c617afa9eb963bcf506d2c903e704cdc988b30493e7";
     const GOLDEN_CPP_YAML: &str =
         "2b6d2ec7f00b34e330116bf1b93fd51416926ac3d30e24dac766f0f8fb910f58";
+    const GOLDEN_PY_DJANGO: &str =
+        "9d15317c4c5f8a767a539277ccf953cfa76eeade92dc323c7a35ac4e9081bf98";
     const GOLDEN_RUST_CARGO: &str =
         "60452736340151a253001bb5c33cc83efa2a4ceabba4d42a227d3188d7761d79";
     const GOLDEN_LINUX_KERNEL: &str =

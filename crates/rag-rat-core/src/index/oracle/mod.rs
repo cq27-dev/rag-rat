@@ -327,16 +327,39 @@ pub fn produce_scip_with_tool(
         .wait()
         .map_err(|err| anyhow::anyhow!("failed waiting for {}: {err}", manifest.program))?;
     let _ = forwarder.join();
-    if !status.success() {
-        anyhow::bail!("{} scip exited with status {status}", manifest.program);
-    }
-    let bytes = std::fs::read(scip_output).map_err(|err| {
-        anyhow::anyhow!(
-            "{} produced no readable index at {}: {err}",
+    // A SCIP indexer's exit CODE often reflects source DIAGNOSTICS, not indexing failure:
+    // scip-python (pyright) exits 1 whenever the analyzed project has type errors — true of most
+    // real-world Python projects (e.g. Django) — while still emitting a complete, valid index.
+    // So the contract "present tool that FAILS to produce SCIP → error" is keyed on whether a
+    // USABLE index was produced (non-empty + parses to ≥1 document), not on the exit code. A
+    // degenerate/partial index still trips the per-corpus health gate (min edges/examined/monikers)
+    // downstream, so accepting a parseable index here doesn't let a broken run masquerade as
+    // healthy. A non-zero exit with NO usable index remains a hard error.
+    let bytes = std::fs::read(scip_output).unwrap_or_default();
+    let usable_documents =
+        scip::ScipIndex::document_relative_paths(&bytes).map(|paths| paths.len()).unwrap_or(0);
+    if bytes.is_empty() || usable_documents == 0 {
+        if !status.success() {
+            anyhow::bail!(
+                "{} scip exited with status {status} and produced no usable index at {}",
+                manifest.program,
+                scip_output.display()
+            );
+        }
+        anyhow::bail!(
+            "{} produced no readable/parseable index at {}",
             manifest.program,
             scip_output.display()
-        )
-    })?;
+        );
+    }
+    if !status.success() {
+        eprintln!(
+            "note: {} exited with status {status} but produced a parseable index \
+             ({usable_documents} documents) — proceeding (a SCIP indexer's exit code reflects \
+             source diagnostics, not indexing failure); the health gate still guards the numbers",
+            manifest.program
+        );
+    }
     // Snapshot each document's disk hash NOW, the instant the subprocess finished — this is the
     // content the `.scip` describes. The join later pins its occurrence offsets to these hashes so
     // a file the watcher reindexes in the lock-free window before the join is skipped instead

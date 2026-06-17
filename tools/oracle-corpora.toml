@@ -100,6 +100,26 @@ bindings  = { cpp = ["src", "include"] }
 # the gate instead of passing green.
 health    = { expected_min_heuristic_edges = 7000, expected_min_oracle_examined = 4500, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 700, timeout_minutes = 12 }
 
+[[corpus]]
+corpus_id = "py-django"
+tier      = "small"
+repo      = "https://github.com/django/django"
+rev       = "5.1.2"
+tool      = "scip-python"
+# A heavier Python corpus than py-rich, chosen to exercise external-import / out-of-corpus resolution
+# (#182): binding the `django/db` SUB-package (deep ORM/field/backend class hierarchies) means many
+# refs target symbols OUTSIDE the bound set — `django.core`, `django.utils`, third-party deps — so it
+# stresses the "is this name local or external?" decision the per-module import model is about.
+# Measured: 12.9k heuristic edges, ~9.2k oracle-examined, ~4.4k resolved-external, ~3.0k monikers.
+# Deps pinned inline (asgiref/sqlparse) for reproducibility (#185 item 3); scip-python needs them
+# importable in the venv to resolve cross-module references.
+prepare   = ["python -m venv .venv", ".venv/bin/pip install . \"asgiref==3.11.1\" \"sqlparse==0.5.5\""]
+bindings  = { python = ["django/db"] }
+# Floors sit ~30% below the measured numbers (catch a broken parse / unresolved venv), not as exact
+# gates. `expected_min_resolved_external` (#185 item 1) is apt here: django/db is external-heavy, so a
+# dependency/venv failure shows up as collapsed external resolution, not just a low moniker count.
+health    = { expected_min_heuristic_edges = 9000, expected_min_oracle_examined = 6000, expected_max_skipped_drifted = 0, expected_min_symbols_with_moniker = 1800, expected_min_resolved_external = 2500, timeout_minutes = 20 }
+
 # --- heavy "headline" corpora: release/dispatch only, pushed to Bencher; excluded from the PR matrix.
 
 [[corpus]]
