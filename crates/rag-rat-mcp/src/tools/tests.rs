@@ -676,6 +676,42 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn find_callers_zero_callers_is_not_low_completeness() {
+    // #200: a symbol with no static callers can't be reported `low` completeness — a static graph
+    // can't see callers reached via message/enum dispatch, dynamic dispatch, trait objects, FFI, or
+    // reflection. find_callers on a call-less fn must escalate to >= medium and attach a note.
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    // `orphan` is never called; `caller` calls `callee` so the graph is otherwise healthy.
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn orphan() {}\npub fn callee() {}\npub fn caller() {\n    callee();\n}\n",
+    )
+    .unwrap();
+    let config = rust_config(root.clone());
+    IndexDatabase::rebuild(&config).unwrap();
+
+    let orphan = call_tool(&config.database, "find_callers", json!({"symbol": "orphan"})).unwrap();
+    assert_eq!(orphan["summary"]["returned_count"], 0);
+    assert_ne!(
+        orphan["summary"]["completeness_risk"], "low",
+        "0 callers must not read low: {orphan:?}"
+    );
+    assert!(
+        orphan["summary"]["completeness_note"].as_str().is_some_and(|n| n.contains("dispatch")),
+        "0 callers must carry a hidden-edge note: {orphan:?}"
+    );
+
+    // A symbol WITH a resolved caller keeps its honest low risk and no note.
+    let callee = call_tool(&config.database, "find_callers", json!({"symbol": "callee"})).unwrap();
+    assert_eq!(callee["summary"]["returned_count"], 1);
+    assert_eq!(callee["summary"]["completeness_risk"], "low");
+    assert!(callee["summary"]["completeness_note"].is_null());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn assert_schema_requires(tools: &[Value], name: &str, field: &str) {
     let schema = tool_schema(tools, name);
     let required = schema["required"].as_array().expect("required array");

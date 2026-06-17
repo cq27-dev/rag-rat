@@ -251,6 +251,7 @@ pub(crate) fn traversal_summary(
             unresolved: count_col(row, 5)?,
             false_positive_risk: String::new(),
             completeness_risk: String::new(),
+            completeness_note: None,
         })
     })?;
     let hidden_unresolved = hidden_unresolved_candidate_count(
@@ -266,6 +267,23 @@ pub(crate) fn traversal_summary(
     summary.truncated = summary.total_matching_edges > u64::from(limit);
     summary.false_positive_risk = false_positive_risk(&summary, mode).to_string();
     summary.completeness_risk = completeness_risk(&summary).to_string();
+    // #200: a `find_callers` (reverse) that found ZERO candidate edges must not read `low` — a
+    // static call graph cannot prove the ABSENCE of callers. Callers reached via message/enum
+    // dispatch (the actor-channel pattern), dynamic dispatch, trait objects, FFI, or reflection
+    // are invisible, as are external/entry-point callers. Escalate a `low` to `medium` and
+    // attach a note so "0 callers" isn't trusted as complete. (Forward `trace_callees` with 0
+    // callees is a genuine leaf — left alone.)
+    if reverse && summary.total_matching_edges == 0 {
+        if summary.completeness_risk == "low" {
+            summary.completeness_risk = "medium".to_string();
+        }
+        summary.completeness_note = Some(
+            "no static callers found; a static call graph can't see callers reached via \
+             message/enum dispatch, dynamic dispatch, trait objects, FFI, or reflection, nor \
+             external/entry-point callers — 0 may be incomplete"
+                .to_string(),
+        );
+    }
     Ok(summary)
 }
 pub(crate) fn count_col(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {

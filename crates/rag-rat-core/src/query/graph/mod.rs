@@ -92,6 +92,12 @@ pub struct GraphTraversalSummary {
     pub unresolved: u64,
     pub false_positive_risk: String,
     pub completeness_risk: String,
+    /// Why completeness may be worse than the counts suggest — set for a `find_callers` that found
+    /// ZERO callers (#200): a static call graph can't see callers reached via message/enum
+    /// dispatch, dynamic dispatch, trait objects, FFI, or reflection, nor entry points, so "0
+    /// callers" is not proof of none. `None` in the common case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completeness_note: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
