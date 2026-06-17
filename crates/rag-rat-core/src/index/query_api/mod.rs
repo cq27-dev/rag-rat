@@ -594,6 +594,10 @@ mod name_based_tests {
         assert!(!super::selector_is_name_based(&selector(None, Some("sym_zzzz"))));
         // A real qualified name in the same slot stays name-based (heal-eligible).
         assert!(super::selector_is_name_based(&selector(None, Some("crates/x/src/a.rs::foo"))));
+        // A qualified name that merely STARTS with `sym_` (path-qualified, or a `sym_…/` path) is a
+        // name, not a handle — it keeps the #152 heal (P3 review follow-up).
+        assert!(super::selector_is_name_based(&selector(None, Some("sym_helpers.rs::build"))));
+        assert!(super::selector_is_name_based(&selector(None, Some("sym_dir/mod.rs::build"))));
         // A bare name is name-based.
         assert!(super::selector_is_name_based(&selector(Some("foo"), None)));
     }

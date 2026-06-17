@@ -114,13 +114,16 @@ impl SymbolSelector {
     }
 
     /// Whether the `ref`/`symbol_path` slot holds a value SHAPED like a `sym_<hex>` handle — it
-    /// parses, OR it starts with `sym_` but is malformed (typo, bad hex, truncated copy). A
-    /// qualified name is `path::name` and never starts with `sym_`, so a `sym_`-prefixed value is
-    /// always a handle the client copied back, never a name. Callers treat it as id-based even when
-    /// it fails to parse, so a bad handle fails cheaply instead of tripping the #152 name-miss
-    /// heal/reindex (which can never recover a handle anyway) (#201 review).
+    /// parses, OR it starts with `sym_` but is malformed (typo, bad hex, truncated copy). A real
+    /// handle is `sym_` + hex with no separators, so we additionally require NO `::` and NO `/`:
+    /// that keeps a genuine qualified name that merely *starts* with `sym_` (e.g. a path-qualified
+    /// `sym_helpers.rs::build`, or a `sym_dir/…` path) classified as a name, so it stays eligible
+    /// for the #152 zero-hit heal. A bad-but-bare handle (`sym_zzzz`) stays id-based and fails
+    /// cheaply instead of tripping a heal/reindex that can never recover a handle (#201 review).
     pub fn ref_is_handle_shaped(&self) -> bool {
-        self.symbol_path.as_deref().is_some_and(|value| value.starts_with("sym_"))
+        self.symbol_path.as_deref().is_some_and(|value| {
+            value.starts_with("sym_") && !value.contains("::") && !value.contains('/')
+        })
     }
 }
 
