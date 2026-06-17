@@ -65,6 +65,7 @@ fn arg_struct_handles_survive_an_rmcp_style_serde_round_trip() {
     }
 
     assert_handle_round_trips!(SymbolArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(SymbolRefArgs, "id", json!({ "id": HANDLE }));
     assert_handle_round_trips!(SymbolGraphArgs, "id", json!({ "id": HANDLE }));
     assert_handle_round_trips!(CompareGraphTextArgs, "id", json!({ "pattern": "x", "id": HANDLE }));
     assert_handle_round_trips!(ImpactArgs, "id", json!({ "id": HANDLE }));
@@ -176,6 +177,11 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_has_property(tools, "semantic_search", "explain");
     assert_symbol_selector_schema(tools, "symbol_lookup");
     assert_schema_array_item_enum(tools, "symbol_lookup", "include", &["memories", "generated"]);
+    // #202 review: the `generated` opt-in is advertised ONLY where it's honored (symbol_lookup).
+    // git_history_for_symbol / papertrail_for_symbol resolve via select_symbol (always source-only)
+    // and carry no `include` at all — advertising a flag they'd silently ignore would be a lie.
+    assert_schema_lacks_property(tools, "git_history_for_symbol", "include");
+    assert_schema_lacks_property(tools, "papertrail_for_symbol", "include");
     assert_schema_array_item_enum(tools, "find_callers", "include", &[
         "references",
         "unresolved",

@@ -199,6 +199,15 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // `packages` (no persisted `files.package_id`), so the re-resolve only needs the `packages` rows.
 const GRAPH_INDEX_VERSION: &str = "7";
 
+// Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
+// on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —
+// a flag whose *meaning* changed (not its inputs) never refreshes otherwise, so a clean
+// `src/generated/...` file under a source target would keep `generated = 0` and stay in default
+// symbol/search results until a manual full reindex. 1: #202 — `generated` now also covers
+// `is_generated_path` codegen living under a source target.
+const GENERATED_FLAGS_VERSION: &str = "1";
+const GENERATED_FLAGS_VERSION_KEY: &str = "generated_flags_version";
+
 #[derive(Debug, Error)]
 pub enum IndexError {
     #[error("Gone: indexed chunk {chunk_id} no longer exists")]
@@ -231,10 +240,13 @@ struct GraphPathRow {
 }
 
 pub(crate) fn is_generated_path(path: &str) -> bool {
-    path.contains("/generated/")
-        || path.contains("/generated-web/")
-        || path.ends_with(".d.ts")
+    // Segment-based so a `generated` / `generated-web` directory is caught at ANY depth, INCLUDING
+    // the repo root (`generated/bindings.rs`) — `contains("/generated/")` needed a leading
+    // separator and silently missed root-level codegen dirs. Segment equality also avoids false
+    // positives like `pre-generated-data/` that a bare substring match would catch.
+    path.ends_with(".d.ts")
         || path.ends_with("_bg.wasm.d.ts")
+        || path.split('/').any(|segment| segment == "generated" || segment == "generated-web")
 }
 
 /// Whether a file should be flagged `files.generated = 1` — the single notion of "generated" the
@@ -283,3 +295,25 @@ impl FileScope {
 
 #[cfg(test)]
 mod schema_bootstrap_tests;
+
+#[cfg(test)]
+mod generated_path_tests {
+    use super::is_generated_path;
+
+    #[test]
+    fn generated_dirs_match_at_any_depth_including_root() {
+        // Nested and root-level codegen dirs both count (#202 review P2): the old
+        // `contains("/generated/")` needed a leading separator and missed the root case.
+        assert!(is_generated_path("packages/held-core/src/generated/foo.ts"));
+        assert!(is_generated_path("generated/bindings.rs"));
+        assert!(is_generated_path("generated-web/foo.ts"));
+        assert!(is_generated_path("apps/web/src/generated-web/bar.ts"));
+        // Declaration / wasm-bindgen output by suffix.
+        assert!(is_generated_path("types/index.d.ts"));
+        assert!(is_generated_path("pkg/app_bg.wasm.d.ts"));
+        // Hand-written source is not generated — and a substring near-miss must not false-positive.
+        assert!(!is_generated_path("src/lib.rs"));
+        assert!(!is_generated_path("src/pre-generated-data/seed.rs"));
+        assert!(!is_generated_path("src/generator.rs"));
+    }
+}

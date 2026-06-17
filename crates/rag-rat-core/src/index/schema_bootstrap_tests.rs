@@ -2117,6 +2117,59 @@ fn symbol_search_excludes_generated_bindings_unless_opted_in() {
 }
 
 #[test]
+fn stale_generated_flags_are_rederived_on_open() {
+    // #202 review (P2): incremental discovery rewrites a file row only on sha/language/kind change,
+    // so an index built BEFORE the flag's definition changed keeps the old `files.generated` and
+    // would still surface generated bindings. The version-gated re-derive must heal it on next
+    // open.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/generated")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn shared_symbol() {}\n").unwrap();
+    fs::write(root.join("src/generated/bindings.rs"), "pub fn shared_symbol() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Simulate a pre-#202 index: the generated-dir file was flagged 0, and the flags-version meta
+    // is absent/stale so the gate will fire.
+    db.storage
+        .connection()
+        .execute("UPDATE main.files SET generated = 0 WHERE path LIKE '%/generated/%'", [])
+        .unwrap();
+    db.storage
+        .connection()
+        .execute("DELETE FROM index_meta WHERE key = ?1", [GENERATED_FLAGS_VERSION_KEY])
+        .unwrap();
+    let by_name = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("shared_symbol".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: true,
+        limit: 10,
+    };
+    // Pre-heal: the mis-flagged generated copy leaks into the default (exclude-generated) search.
+    let before = db.symbol_candidates(&by_name, false).unwrap();
+    assert!(
+        before.candidates.iter().any(|c| c.path.contains("/generated/")),
+        "precondition: stale flag leaks the generated copy"
+    );
+
+    // The version-gated re-derive heals every mis-flagged row from the path heuristic.
+    db.ensure_generated_flags_current().unwrap();
+    let after = db.symbol_candidates(&by_name, false).unwrap();
+    assert!(!after.candidates.is_empty(), "source symbol still resolves");
+    assert!(
+        after.candidates.iter().all(|c| !c.path.contains("/generated/")),
+        "re-derive must re-exclude the generated copy: {:?}",
+        after.candidates.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn search_and_read_chunk_attach_bounded_graph_evidence() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);

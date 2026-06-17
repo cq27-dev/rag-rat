@@ -94,7 +94,7 @@ pub(crate) fn call_tool_with_db(
             json!(db.git_history_for_path(&args.path, args.limit)?)
         },
         "git_history_for_symbol" => {
-            let args: SymbolArgs = serde_json::from_value(arguments)?;
+            let args: SymbolRefArgs = serde_json::from_value(arguments)?;
             git_history_for_symbol_tool(db, args)?
         },
         "commits_touching_query" => {
@@ -110,7 +110,7 @@ pub(crate) fn call_tool_with_db(
             json!(db.papertrail_for_chunk(args.chunk_id, args.limit)?)
         },
         "papertrail_for_symbol" => {
-            let args: SymbolArgs = serde_json::from_value(arguments)?;
+            let args: SymbolRefArgs = serde_json::from_value(arguments)?;
             papertrail_for_symbol_tool(db, args)?
         },
         "papertrail_for_commit" => {
@@ -450,9 +450,9 @@ pub(crate) fn compact_graph_coverage(value: &mut Value, include_coverage: bool) 
 
 pub(crate) fn git_history_for_symbol_tool(
     db: &IndexDatabase,
-    args: SymbolArgs,
+    args: SymbolRefArgs,
 ) -> anyhow::Result<Value> {
-    let selector = symbol_selector(args)?;
+    let selector = symbol_ref_selector(args)?;
     match db.select_symbol(&selector)? {
         Ok(Some(symbol)) => Ok(json!(db.git_history_for_symbol(
             &symbol.qualified_name,
@@ -472,9 +472,9 @@ pub(crate) fn git_history_for_symbol_tool(
 
 pub(crate) fn papertrail_for_symbol_tool(
     db: &IndexDatabase,
-    args: SymbolArgs,
+    args: SymbolRefArgs,
 ) -> anyhow::Result<Value> {
-    let selector = symbol_selector(args)?;
+    let selector = symbol_ref_selector(args)?;
     match db.select_symbol(&selector)? {
         Ok(Some(symbol)) => Ok(json!(db.papertrail_for_selected_symbol(&symbol, selector.limit)?)),
         Ok(None) if selector.allow_ambiguous => {
@@ -580,6 +580,18 @@ fn important_symbols_tool(
 }
 
 pub(crate) fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
+    Ok(SymbolSelector {
+        logical_symbol_id: args.logical_symbol_id,
+        symbol_id: None,
+        symbol_path: args.symbol_path,
+        symbol: args.symbol,
+        language: optional_language(args.language)?,
+        allow_ambiguous: args.allow_ambiguous,
+        limit: args.limit,
+    })
+}
+
+pub(crate) fn symbol_ref_selector(args: SymbolRefArgs) -> anyhow::Result<SymbolSelector> {
     Ok(SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
         symbol_id: None,

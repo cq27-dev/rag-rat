@@ -54,6 +54,7 @@ impl IndexDatabase {
         };
         if check_graph {
             db.ensure_graph_index_current()?;
+            db.ensure_generated_flags_current()?;
         }
         Ok(db)
     }
@@ -68,6 +69,7 @@ impl IndexDatabase {
         db.github = github::GitHubContext::from_gh();
         db.config = Some(config.clone());
         db.ensure_graph_index_current()?;
+        db.ensure_generated_flags_current()?;
         Ok(db)
     }
 
@@ -98,6 +100,13 @@ impl IndexDatabase {
         }
         if read_meta(storage.connection(), "graph_index_version")?.as_deref()
             != Some(GRAPH_INDEX_VERSION)
+        {
+            return Ok(None);
+        }
+        // A stale generated-flags version owes a re-derive (a write); fall back to read-write so it
+        // heals once, after which reads are lock-free again (#202, same posture as the graph gate).
+        if read_meta(storage.connection(), GENERATED_FLAGS_VERSION_KEY)?.as_deref()
+            != Some(GENERATED_FLAGS_VERSION)
         {
             return Ok(None);
         }

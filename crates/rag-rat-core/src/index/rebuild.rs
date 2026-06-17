@@ -75,6 +75,9 @@ impl IndexDatabase {
             // phase.
             progress(IndexProgress::ResolvingGraph);
             db.mark_graph_index_current()?;
+            // Full rebuild writes correct `files.generated` via `file_is_generated`, so stamp the
+            // flags version current and skip a redundant re-derive on next open (#202).
+            db.mark_generated_flags_current()?;
             mem_trace("after mark_graph_index_current");
             progress(IndexProgress::RebuildingFts);
             db.rebuild_fts()?;

@@ -323,6 +323,32 @@ pub struct SymbolArgs {
     pub include: Option<Vec<SymbolInclude>>,
 }
 
+/// Pure symbol-selector args (symbol/ref/id/lang) with no `include` — for tools that resolve ONE
+/// symbol and never opt generated rows back in (`git_history_for_symbol`, `papertrail_for_symbol`).
+/// These go through `select_symbol`, which always excludes generated; advertising a `generated`
+/// include they silently ignore would be a lie, so they don't carry one (#202 review).
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SymbolRefArgs {
+    pub symbol: Option<String>,
+    #[serde(rename = "ref")]
+    pub symbol_path: Option<String>,
+    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
+    #[serde(
+        rename = "id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
+    #[schemars(with = "Option<String>")]
+    pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "lang")]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub allow_ambiguous: bool,
+    #[serde(default = "default_symbol_limit")]
+    pub limit: u32,
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolGraphArgs {
     pub symbol: Option<String>,

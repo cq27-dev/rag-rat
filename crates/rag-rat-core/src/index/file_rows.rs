@@ -133,6 +133,59 @@ impl IndexDatabase {
         Ok(files)
     }
 
+    /// Re-derive `files.generated` from the current [`is_generated_path`] heuristic (the single
+    /// source of truth) for every file whose stored flag disagrees, gated on
+    /// [`GENERATED_FLAGS_VERSION`] so it runs once per definition change. Needed because
+    /// incremental discovery rewrites a file row only on sha/language/kind change — when the
+    /// *meaning* of the flag changes (#202) the inputs are identical, so nothing would refresh
+    /// it. Idempotent. Runs only on a write-bearing open (read-only opens see the stale version
+    /// and fall back).
+    pub(super) fn ensure_generated_flags_current(&self) -> anyhow::Result<()> {
+        if self.meta(GENERATED_FLAGS_VERSION_KEY)?.as_deref() == Some(GENERATED_FLAGS_VERSION) {
+            return Ok(());
+        }
+        self.storage.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = self.rederive_generated_flags();
+        if result.is_err() {
+            let _ = self.storage.execute_batch("ROLLBACK");
+            result?;
+        }
+        self.set_meta(GENERATED_FLAGS_VERSION_KEY, GENERATED_FLAGS_VERSION)?;
+        self.storage.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Stamp the generated-flags version current. Called after a full rebuild / incremental pass,
+    /// which already write correct flags via `file_is_generated`, so the next open skips the
+    /// re-derive.
+    pub(super) fn mark_generated_flags_current(&self) -> anyhow::Result<()> {
+        self.set_meta(GENERATED_FLAGS_VERSION_KEY, GENERATED_FLAGS_VERSION)
+    }
+
+    fn rederive_generated_flags(&self) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        // The generated flag is a property of the file PATH (+ target kind), not the active scope,
+        // so re-derive over the base `main.files` for every row — NOT the per-connection `files`
+        // scope view (a non-updatable UNION; #89).
+        let rows: Vec<(i64, String, String)> = {
+            let mut stmt = conn.prepare("SELECT id, path, kind FROM main.files")?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?;
+            mapped.collect::<rusqlite::Result<_>>()?
+        };
+        // Mirror `file_is_generated` without parsing `kind` (skips the `deleted`/`unknown` markers
+        // cleanly): explicit generated target OR the path heuristic.
+        let mut update = conn.prepare_cached(
+            "UPDATE main.files SET generated = ?2 WHERE id = ?1 AND generated != ?2",
+        )?;
+        for (id, path, kind) in rows {
+            let generated = kind == TargetKind::Generated.as_str() || is_generated_path(&path);
+            update.execute(params![id, generated])?;
+        }
+        Ok(())
+    }
+
     pub(super) fn indexed_file_count(&self) -> anyhow::Result<usize> {
         let count =
             self.storage
