@@ -332,6 +332,44 @@ fn total_occurrences_counts_data_and_distinguishes_an_empty_shell() {
     assert!(ScipIndex::total_occurrences(b"not a scip index").is_err());
 }
 
+#[test]
+fn accept_produced_index_tolerates_diagnostic_exit_only_with_usable_data() {
+    use std::path::Path;
+
+    use super::accept_produced_index;
+    let p = Path::new("/tmp/out.scip");
+    let data =
+        scip_bytes("a.py", PositionEncoding::UTF8CodeUnitOffsetFromLineStart, vec![occurrence(
+            0,
+            0,
+            3,
+            "scip x `a`/foo().",
+            SymbolRole::Definition as i32,
+        )]);
+    let empty_shell = scip_bytes("a.py", PositionEncoding::UTF8CodeUnitOffsetFromLineStart, vec![]);
+
+    // Clean exit: needs only non-empty bytes (join + health gate validate the rest); an empty doc
+    // shell is fine here (a 0-occurrence run trips the health gate downstream, not this).
+    assert!(accept_produced_index(true, &data, "scip-python", p).unwrap().is_none());
+    assert!(accept_produced_index(true, &empty_shell, "scip-python", p).unwrap().is_none());
+    assert!(
+        accept_produced_index(true, b"", "scip-python", p).is_err(),
+        "clean exit, no bytes → bail"
+    );
+
+    // Non-zero (diagnostic) exit: tolerated ONLY with join-usable occurrences.
+    let note = accept_produced_index(false, &data, "scip-python", p).unwrap();
+    assert!(note.expect("tolerated note").contains("1 occurrences"));
+    assert!(
+        accept_produced_index(false, &empty_shell, "scip-python", p).is_err(),
+        "non-zero exit + empty doc shell (0 occurrences) → bail"
+    );
+    assert!(
+        accept_produced_index(false, b"", "scip-python", p).is_err(),
+        "non-zero exit + no index → bail"
+    );
+}
+
 /// Hex SHA-256 of bytes — the same hash `files.sha256` carries, so a test file's recorded sha
 /// matches the disk-byte hash the oracle's content-integrity gate computes (finding 2).
 fn sha256_hex(bytes: &[u8]) -> String {

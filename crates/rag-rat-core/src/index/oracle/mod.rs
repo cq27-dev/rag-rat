@@ -335,43 +335,10 @@ pub fn produce_scip_with_tool(
         .map_err(|err| anyhow::anyhow!("failed waiting for {}: {err}", manifest.program))?;
     let _ = forwarder.join();
     let bytes = std::fs::read(scip_output).unwrap_or_default();
-    if status.success() {
-        // Successful exit: require a readable index; the prior behavior (parse-validity is checked
-        // by the join + health gate downstream).
-        if bytes.is_empty() {
-            anyhow::bail!(
-                "{} produced no readable index at {}",
-                manifest.program,
-                scip_output.display()
-            );
-        }
-    } else {
-        // A SCIP indexer's exit CODE often reflects source DIAGNOSTICS, not indexing failure:
-        // scip-python (pyright) exits 1 whenever the analyzed project has type errors — true of
-        // most real-world Python projects (e.g. Django) — while still emitting a complete,
-        // valid index. So a non-zero exit is tolerated ONLY when the tool actually produced
-        // JOIN-USABLE data: a parseable index with ≥1 occurrence. This is stricter than "≥1
-        // document" on purpose — an indexer that bailed early can leave an empty doc shell,
-        // and on the non-health-gated paths (`oracle run`, auto-run) that would otherwise
-        // be recorded as a completed run with no compiler data, suppressing the "no oracle
-        // run" hint (#198 review). An empty/unparseable index on a non-zero exit stays a
-        // hard error.
-        let occurrences = scip::ScipIndex::total_occurrences(&bytes).unwrap_or(0);
-        if bytes.is_empty() || occurrences == 0 {
-            anyhow::bail!(
-                "{} scip exited with status {status} and produced no usable index at {} ({} \
-                 bytes, {occurrences} occurrences)",
-                manifest.program,
-                scip_output.display(),
-                bytes.len()
-            );
-        }
-        eprintln!(
-            "note: {} exited with status {status} but produced a usable index ({occurrences} \
-             occurrences) — proceeding (a SCIP indexer's exit code reflects source diagnostics, \
-             not indexing failure); the health gate still guards the numbers",
-            manifest.program
-        );
+    if let Some(note) =
+        accept_produced_index(status.success(), &bytes, manifest.program, scip_output)?
+    {
+        eprintln!("{note}");
     }
     // Snapshot each document's disk hash NOW, the instant the subprocess finished — this is the
     // content the `.scip` describes. The join later pins its occurrence offsets to these hashes so
@@ -381,6 +348,47 @@ pub fn produce_scip_with_tool(
     // omitted (its candidate then fails the gate and is skipped — the safe direction).
     let production_sha = snapshot_document_disk_hashes(&bytes, checkout_root);
     Ok(ScipProduction::Produced { version, bytes, production_sha })
+}
+
+/// Decide whether a finished tool run's output `bytes` is an acceptable SCIP index. `Err` → bail
+/// (no usable index); `Ok(None)` → accept silently (clean exit); `Ok(Some(note))` → accept but the
+/// caller should print `note` (a non-zero exit that was TOLERATED).
+///
+/// A SCIP indexer's exit CODE often reflects source DIAGNOSTICS, not indexing failure: scip-python
+/// (pyright) exits 1 whenever the analyzed project has type errors — true of most real-world Python
+/// (e.g. Django) — while still emitting a complete, valid index. So a non-zero exit is tolerated
+/// ONLY when the tool produced JOIN-USABLE data: a parseable index with ≥1 occurrence. That's
+/// stricter than "≥1 document" on purpose — an early-bailing indexer can leave an empty doc shell,
+/// and on the non-health-gated paths (`oracle run`, auto-run) that would otherwise be recorded as a
+/// completed run with no compiler data, suppressing the "no oracle run" hint (#198 review). A clean
+/// exit needs only non-empty bytes (downstream join + health gate validate the rest). Pulled out as
+/// a pure fn so the accept/bail branches are unit-testable without spawning a tool.
+fn accept_produced_index(
+    status_success: bool,
+    bytes: &[u8],
+    program: &str,
+    output: &Path,
+) -> anyhow::Result<Option<String>> {
+    if status_success {
+        if bytes.is_empty() {
+            anyhow::bail!("{program} produced no readable index at {}", output.display());
+        }
+        return Ok(None);
+    }
+    let occurrences = scip::ScipIndex::total_occurrences(bytes).unwrap_or(0);
+    if bytes.is_empty() || occurrences == 0 {
+        anyhow::bail!(
+            "{program} scip exited non-zero and produced no usable index at {} ({} bytes, \
+             {occurrences} occurrences)",
+            output.display(),
+            bytes.len()
+        );
+    }
+    Ok(Some(format!(
+        "note: {program} exited non-zero but produced a usable index ({occurrences} occurrences) \
+         — proceeding (a SCIP indexer's exit code reflects source diagnostics, not indexing \
+         failure); the health gate still guards the numbers"
+    )))
 }
 
 /// Hash each `.scip` document's CURRENT disk bytes under `checkout_root`, returning `relative_path
