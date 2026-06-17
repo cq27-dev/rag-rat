@@ -314,6 +314,24 @@ fn scip_bytes(path: &str, encoding: PositionEncoding, occurrences: Vec<Occurrenc
     index.write_to_bytes().unwrap()
 }
 
+#[test]
+fn total_occurrences_counts_data_and_distinguishes_an_empty_shell() {
+    use super::scip::ScipIndex;
+    // A real index with occurrences → the raw count; gates the diagnostic-exit tolerance in
+    // produce_scip_with_tool (#198 review) so an empty shell from an early-bailing tool isn't
+    // accepted on a non-zero exit.
+    let with_data = scip_bytes("a.py", PositionEncoding::UTF8CodeUnitOffsetFromLineStart, vec![
+        occurrence(0, 0, 3, "scip x `a`/foo().", SymbolRole::Definition as i32),
+        occurrence(1, 4, 7, "scip x `a`/foo().", 0),
+    ]);
+    assert_eq!(ScipIndex::total_occurrences(&with_data).unwrap(), 2);
+    // A parseable index with documents but ZERO occurrences — the empty shell the gate must reject.
+    let empty_shell = scip_bytes("a.py", PositionEncoding::UTF8CodeUnitOffsetFromLineStart, vec![]);
+    assert_eq!(ScipIndex::total_occurrences(&empty_shell).unwrap(), 0);
+    // Non-SCIP bytes don't parse → Err (the caller treats that as 0 / unusable).
+    assert!(ScipIndex::total_occurrences(b"not a scip index").is_err());
+}
+
 /// Hex SHA-256 of bytes — the same hash `files.sha256` carries, so a test file's recorded sha
 /// matches the disk-byte hash the oracle's content-integrity gate computes (finding 2).
 fn sha256_hex(bytes: &[u8]) -> String {

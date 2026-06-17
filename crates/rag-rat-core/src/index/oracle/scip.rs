@@ -108,6 +108,18 @@ impl ScipIndex {
         Ok(index.documents.iter().map(|document| document.relative_path.clone()).collect())
     }
 
+    /// Total raw occurrence count across all documents — a cheap "did the indexer actually emit
+    /// resolvable data?" signal (raw protobuf count, no per-document position conversion). A
+    /// parseable index with ZERO occurrences is an empty shell the join can't use; the diagnostic-
+    /// exit tolerance in `produce_scip_with_tool` requires this to be non-zero before accepting a
+    /// non-zero tool exit, so an indexer that bailed early (leaving only an empty doc list) isn't
+    /// recorded as a completed run on the non-health-gated paths (#198 review).
+    pub(crate) fn total_occurrences(bytes: &[u8]) -> anyhow::Result<usize> {
+        let index = Index::parse_from_bytes(bytes)
+            .map_err(|err| anyhow::anyhow!("failed to parse SCIP index: {err}"))?;
+        Ok(index.documents.iter().map(|document| document.occurrences.len()).sum())
+    }
+
     /// Build the maps from an already-deserialized [`Index`] — the entry point tests use after
     /// constructing an `Index` programmatically.
     pub(crate) fn from_index(

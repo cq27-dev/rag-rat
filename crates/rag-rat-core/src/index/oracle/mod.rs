@@ -313,6 +313,13 @@ pub fn produce_scip_with_tool(
     // `[N/M] Indexed …`) would otherwise corrupt that JSON. A piped child + a copy thread keeps
     // the progress live on stderr (where rust-analyzer's already goes) while stdout stays clean.
     command.stdout(std::process::Stdio::piped());
+    // Remove any pre-existing file at the output path BEFORE spawning, so the bytes we read after
+    // the run are provably THIS child's. Otherwise a stale `.scip` (a killed prior run left its
+    // PID-named file in the db dir, or an API caller reused the path) that the new indexer exits
+    // non-zero without overwriting would be read, parse fine, and — under the diagnostic-exit
+    // tolerance below — get its production hash captured against the CURRENT checkout and joined as
+    // if it were this run's output (#198 review).
+    let _ = std::fs::remove_file(scip_output);
     let mut child = command
         .spawn()
         .map_err(|err| anyhow::anyhow!("failed to invoke {}: {err}", manifest.program))?;
@@ -327,36 +334,42 @@ pub fn produce_scip_with_tool(
         .wait()
         .map_err(|err| anyhow::anyhow!("failed waiting for {}: {err}", manifest.program))?;
     let _ = forwarder.join();
-    // A SCIP indexer's exit CODE often reflects source DIAGNOSTICS, not indexing failure:
-    // scip-python (pyright) exits 1 whenever the analyzed project has type errors — true of most
-    // real-world Python projects (e.g. Django) — while still emitting a complete, valid index.
-    // So the contract "present tool that FAILS to produce SCIP → error" is keyed on whether a
-    // USABLE index was produced (non-empty + parses to ≥1 document), not on the exit code. A
-    // degenerate/partial index still trips the per-corpus health gate (min edges/examined/monikers)
-    // downstream, so accepting a parseable index here doesn't let a broken run masquerade as
-    // healthy. A non-zero exit with NO usable index remains a hard error.
     let bytes = std::fs::read(scip_output).unwrap_or_default();
-    let usable_documents =
-        scip::ScipIndex::document_relative_paths(&bytes).map(|paths| paths.len()).unwrap_or(0);
-    if bytes.is_empty() || usable_documents == 0 {
-        if !status.success() {
+    if status.success() {
+        // Successful exit: require a readable index; the prior behavior (parse-validity is checked
+        // by the join + health gate downstream).
+        if bytes.is_empty() {
             anyhow::bail!(
-                "{} scip exited with status {status} and produced no usable index at {}",
+                "{} produced no readable index at {}",
                 manifest.program,
                 scip_output.display()
             );
         }
-        anyhow::bail!(
-            "{} produced no readable/parseable index at {}",
-            manifest.program,
-            scip_output.display()
-        );
-    }
-    if !status.success() {
+    } else {
+        // A SCIP indexer's exit CODE often reflects source DIAGNOSTICS, not indexing failure:
+        // scip-python (pyright) exits 1 whenever the analyzed project has type errors — true of
+        // most real-world Python projects (e.g. Django) — while still emitting a complete,
+        // valid index. So a non-zero exit is tolerated ONLY when the tool actually produced
+        // JOIN-USABLE data: a parseable index with ≥1 occurrence. This is stricter than "≥1
+        // document" on purpose — an indexer that bailed early can leave an empty doc shell,
+        // and on the non-health-gated paths (`oracle run`, auto-run) that would otherwise
+        // be recorded as a completed run with no compiler data, suppressing the "no oracle
+        // run" hint (#198 review). An empty/unparseable index on a non-zero exit stays a
+        // hard error.
+        let occurrences = scip::ScipIndex::total_occurrences(&bytes).unwrap_or(0);
+        if bytes.is_empty() || occurrences == 0 {
+            anyhow::bail!(
+                "{} scip exited with status {status} and produced no usable index at {} ({} \
+                 bytes, {occurrences} occurrences)",
+                manifest.program,
+                scip_output.display(),
+                bytes.len()
+            );
+        }
         eprintln!(
-            "note: {} exited with status {status} but produced a parseable index \
-             ({usable_documents} documents) — proceeding (a SCIP indexer's exit code reflects \
-             source diagnostics, not indexing failure); the health gate still guards the numbers",
+            "note: {} exited with status {status} but produced a usable index ({occurrences} \
+             occurrences) — proceeding (a SCIP indexer's exit code reflects source diagnostics, \
+             not indexing failure); the health gate still guards the numbers",
             manifest.program
         );
     }
