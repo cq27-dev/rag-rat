@@ -245,9 +245,16 @@ impl IndexDatabase {
                     allow_ambiguous: true,
                     limit: PER_NAME_SEED_CAP,
                 };
-                let members =
-                    crate::query::symbol::lookup_candidates(self.storage.connection(), &by_handle)?
-                        .candidates;
+                // Importance seeding spans the whole graph; generated bindings are legitimate
+                // nodes here, so keep them (`include_generated: true`) — the #202 filter is for
+                // user-facing symbol search, not PageRank seeds. (A logical-id selector isn't
+                // filtered anyway, but pass it explicitly so the intent survives a refactor.)
+                let members = crate::query::symbol::lookup_candidates(
+                    self.storage.connection(),
+                    &by_handle,
+                    true,
+                )?
+                .candidates;
                 if members.is_empty() {
                     unresolved += 1;
                 } else {
@@ -286,9 +293,12 @@ impl IndexDatabase {
             // Use the UNENRICHED lookup: seed resolution only needs `symbol_id`, and the enriched
             // `symbol_candidates` would fetch the oracle effect map + run a fan-in query per hit —
             // a whole-graph oracle scan per seed name, repeated, all discarded here (#142 review).
-            let candidates =
-                crate::query::symbol::lookup_candidates(self.storage.connection(), &by_name)?
-                    .candidates;
+            let candidates = crate::query::symbol::lookup_candidates(
+                self.storage.connection(),
+                &by_name,
+                true, // whole-graph seeding keeps generated nodes (see by_handle note above)
+            )?
+            .candidates;
             if candidates.is_empty() {
                 unresolved += 1;
             } else {

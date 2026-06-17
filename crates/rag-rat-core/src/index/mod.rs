@@ -237,6 +237,18 @@ pub(crate) fn is_generated_path(path: &str) -> bool {
         || path.ends_with("_bg.wasm.d.ts")
 }
 
+/// Whether a file should be flagged `files.generated = 1` — the single notion of "generated" the
+/// query layer filters on (search, orientation, tree, clusters, and symbol search all default to
+/// `files.generated = 0`). A file is generated if its target is explicitly `kind = generated` OR
+/// its path matches the codegen heuristic ([`is_generated_path`] — `/generated/`, `.d.ts`, ubrn
+/// wasm-bindgen output). The path arm is what catches codegen that lives *under a source target*
+/// (e.g. ubrn FFI bindings in `packages/.../src/generated/`): those still get full symbols (symbol
+/// extraction is gated on `kind`, not this flag) so the graph keeps them, but they're filtered out
+/// of default search/lookup results instead of burying the hand-written source (#202).
+pub(crate) fn file_is_generated(kind: TargetKind, path: &str) -> bool {
+    matches!(kind, TargetKind::Generated) || is_generated_path(path)
+}
+
 #[derive(Debug)]
 struct IndexedFile {
     path: String,

@@ -113,9 +113,13 @@ impl IndexDatabase {
     pub fn symbol_candidates(
         &self,
         selector: &crate::query::symbol::SymbolSelector,
+        include_generated: bool,
     ) -> anyhow::Result<crate::query::symbol::SymbolLookup> {
-        let mut lookup =
-            crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
+        let mut lookup = crate::query::symbol::lookup_candidates(
+            self.storage.connection(),
+            selector,
+            include_generated,
+        )?;
         // #152: a name/symbol_path lookup that found NOTHING may be a just-added symbol the watcher
         // hasn't indexed yet. Index the working-tree change set (bounded) and re-resolve once.
         // Name-based selectors only — a miss on a churning id isn't "newly added".
@@ -123,7 +127,11 @@ impl IndexDatabase {
             && selector_is_name_based(selector)
             && self.heal_changed_for_zero_hit()?
         {
-            lookup = crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
+            lookup = crate::query::symbol::lookup_candidates(
+                self.storage.connection(),
+                selector,
+                include_generated,
+            )?;
         }
         // #147: symbol rows aren't anchor-relocated like chunks, so a file edited since indexing
         // returns stale line numbers. Heal the matched files inline (bounded, like
@@ -133,8 +141,11 @@ impl IndexDatabase {
         let stale = self.stale_source_paths(&paths)?;
         if !stale.is_empty() {
             self.heal_stale_paths(&stale)?; // NeedsReindex beyond the cap
-            let healed =
-                crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
+            let healed = crate::query::symbol::lookup_candidates(
+                self.storage.connection(),
+                selector,
+                include_generated,
+            )?;
             // A `symbol_id` selector can't survive a reindex (ids are reassigned per #149), so a
             // re-resolve by the OLD id finds nothing even though the symbol still exists — keep the
             // pre-heal candidates, flagged stale. For a name/symbol_path/logical selector an empty

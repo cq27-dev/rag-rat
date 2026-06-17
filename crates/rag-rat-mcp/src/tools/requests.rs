@@ -161,12 +161,21 @@ pub enum OrientationInclude {
     Memories,
 }
 
-/// `symbol_lookup` / `read_chunk` `include` flags. `memories` on by default (pass `include: []` to
-/// suppress).
+/// `read_chunk` `include` flags. `memories` on by default (pass `include: []` to suppress).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoriesInclude {
     Memories,
+}
+
+/// `symbol_lookup` `include` flags. `memories` on by default (pass `include: []` to suppress);
+/// `generated` opts generated bindings (ubrn FFI output, codegen) back into the results — they're
+/// excluded by default because they bury the source symbol a search is after (#202).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolInclude {
+    Memories,
+    Generated,
 }
 
 /// `find_callers` / `trace_callees` `include` flags. `memories` on by default; the rest off (they
@@ -308,9 +317,10 @@ pub struct SymbolArgs {
     pub allow_ambiguous: bool,
     #[serde(default = "default_symbol_limit")]
     pub limit: u32,
-    /// What to include: `memories` (on by default). Pass `include: []` to suppress.
+    /// What to include: `memories` (on by default) and/or `generated` (off by default — opts
+    /// generated bindings back into the results). Pass `include: []` to suppress memories.
     #[serde(default, deserialize_with = "de_seq_or_json_string")]
-    pub include: Option<Vec<MemoriesInclude>>,
+    pub include: Option<Vec<SymbolInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]

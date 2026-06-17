@@ -199,8 +199,9 @@ pub(crate) fn call_tool_with_db(
 }
 
 pub(crate) fn symbol_lookup_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow::Result<Value> {
-    let include_memories = included(&args.include, MemoriesInclude::Memories, true);
-    let lookup = db.symbol_candidates(&symbol_selector(args)?)?;
+    let include_memories = included(&args.include, SymbolInclude::Memories, true);
+    let include_generated = included(&args.include, SymbolInclude::Generated, false);
+    let lookup = db.symbol_candidates(&symbol_selector(args)?, include_generated)?;
     let mut value = json!(lookup);
     if !include_memories {
         return Ok(value);

@@ -2054,6 +2054,69 @@ fn find_callers_sees_calls_in_let_bindings() {
 }
 
 #[test]
+fn symbol_search_excludes_generated_bindings_unless_opted_in() {
+    // #202: a name/symbol_path search drowns in generated bindings (ubrn FFI output, codegen) that
+    // shadow the hand-written source symbol. The real-world case is codegen living UNDER a source
+    // target (e.g. `packages/.../src/generated/`): it keeps `kind = source` and gets full symbols,
+    // but `is_generated_path` flags `files.generated = 1`. Symbol search defaults to
+    // `files.generated = 0` (the same flag search/orientation use) and lets callers opt the
+    // generated rows back in; an explicit id selection is never filtered.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/generated")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn shared_symbol() {}\n").unwrap();
+    fs::write(root.join("src/generated/bindings.rs"), "pub fn shared_symbol() {}\n").unwrap();
+    // A single SOURCE target covers both files; the nested `generated/` dir is flagged by the path
+    // heuristic, not by target kind.
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let by_name = || crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("shared_symbol".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: true,
+        limit: 10,
+    };
+
+    // Default (include_generated = false): the generated copy is filtered out, source remains.
+    let default_hits = db.symbol_candidates(&by_name(), false).unwrap();
+    assert!(!default_hits.candidates.is_empty(), "source symbol must still resolve");
+    assert!(
+        default_hits.candidates.iter().all(|c| !c.path.contains("/generated/")),
+        "generated bindings must be excluded by default: {:?}",
+        default_hits.candidates.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+
+    // Opt-in (include_generated = true): both copies come back.
+    let all_hits = db.symbol_candidates(&by_name(), true).unwrap();
+    let generated = all_hits
+        .candidates
+        .iter()
+        .find(|c| c.path.contains("/generated/"))
+        .expect("opt-in must surface the generated copy");
+
+    // An explicit symbol_id pick of the generated symbol is honored regardless of the filter —
+    // the exclusion only governs name/path *search*, not a deliberate selection.
+    let by_id = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: Some(generated.symbol_id),
+        symbol_path: None,
+        symbol: None,
+        language: None,
+        allow_ambiguous: true,
+        limit: 10,
+    };
+    let id_hits = db.symbol_candidates(&by_id, false).unwrap();
+    assert_eq!(id_hits.candidates.len(), 1, "explicit id must resolve the generated symbol");
+    assert!(id_hits.candidates[0].path.contains("/generated/"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn search_and_read_chunk_attach_bounded_graph_evidence() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
@@ -2231,7 +2294,7 @@ impl B {
         allow_ambiguous: true,
         limit: 10,
     };
-    let lookup = db.symbol_candidates(&selector).unwrap();
+    let lookup = db.symbol_candidates(&selector, false).unwrap();
     let new_candidates: Vec<_> =
         lookup.candidates.iter().filter(|candidate| candidate.name == "new").collect();
     assert_eq!(new_candidates.len(), 2, "both constructors present: {new_candidates:?}");
@@ -2248,7 +2311,7 @@ impl B {
 
     // Reindex and confirm the logical ids are unchanged (content-derived, not churned).
     let db = IndexDatabase::rebuild(&config).unwrap();
-    let relookup = db.symbol_candidates(&selector).unwrap();
+    let relookup = db.symbol_candidates(&selector, false).unwrap();
     let reindexed_ids: std::collections::BTreeSet<i64> = relookup
         .candidates
         .iter()
@@ -2283,15 +2346,18 @@ pub fn caller() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let lookup = db
-        .symbol_candidates(&crate::query::symbol::SymbolSelector {
-            logical_symbol_id: None,
-            symbol_id: None,
-            symbol_path: None,
-            symbol: Some("spawn_blocking".to_string()),
-            language: Some(Language::Rust),
-            allow_ambiguous: true,
-            limit: 10,
-        })
+        .symbol_candidates(
+            &crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("spawn_blocking".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
         .unwrap();
     let logical_symbol_id = lookup.candidates[0].logical_symbol_id.expect("logical id");
     assert_eq!(lookup.candidates[0].logical_variant_count, Some(2));
@@ -5230,15 +5296,18 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
 
     // Bind to the a.rs instance specifically.
     let candidates = db
-        .symbol_candidates(&crate::query::symbol::SymbolSelector {
-            logical_symbol_id: None,
-            symbol_id: None,
-            symbol_path: None,
-            symbol: Some("target".to_string()),
-            language: Some(Language::Rust),
-            allow_ambiguous: true,
-            limit: 10,
-        })
+        .symbol_candidates(
+            &crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("target".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
         .unwrap();
     let a_symbol = candidates
         .candidates
@@ -5916,15 +5985,18 @@ fn memory_doctor_dedupes_cfg_split_candidates() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let original = db
-        .symbol_candidates(&crate::query::symbol::SymbolSelector {
-            logical_symbol_id: None,
-            symbol_id: None,
-            symbol_path: None,
-            symbol: Some("cfg_helper".to_string()),
-            language: Some(Language::Rust),
-            allow_ambiguous: true,
-            limit: 10,
-        })
+        .symbol_candidates(
+            &crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("cfg_helper".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
         .unwrap()
         .candidates[0]
         .symbol_id;
@@ -6021,29 +6093,35 @@ fn select_symbol_for_bind_collapses_cfg_split_group() {
     // Resolve by the fully-qualified name the doctor would suggest. select_symbol (no collapse)
     // must disambiguate; select_symbol_for_bind must collapse to one member of the logical group.
     let qualified = db
-        .symbol_candidates(&crate::query::symbol::SymbolSelector {
-            logical_symbol_id: None,
-            symbol_id: None,
-            symbol_path: None,
-            symbol: Some("spawn_blocking".to_string()),
-            language: Some(Language::Rust),
-            allow_ambiguous: true,
-            limit: 10,
-        })
+        .symbol_candidates(
+            &crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("spawn_blocking".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
         .unwrap()
         .candidates[0]
         .qualified_name
         .clone();
     let logical_id = db
-        .symbol_candidates(&crate::query::symbol::SymbolSelector {
-            logical_symbol_id: None,
-            symbol_id: None,
-            symbol_path: None,
-            symbol: Some("spawn_blocking".to_string()),
-            language: Some(Language::Rust),
-            allow_ambiguous: true,
-            limit: 10,
-        })
+        .symbol_candidates(
+            &crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("spawn_blocking".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
         .unwrap()
         .candidates[0]
         .logical_symbol_id
@@ -8250,14 +8328,14 @@ fn symbol_lookup_heals_stale_line_numbers_after_an_edit() {
         allow_ambiguous: true,
         limit: 10,
     };
-    let before = db.symbol_candidates(&selector).unwrap();
+    let before = db.symbol_candidates(&selector, false).unwrap();
     let before_byte = before.candidates[0].start_byte;
     assert!(before.stale_files.is_empty(), "clean index has no stale files");
 
     // Shift `target` down on disk WITHOUT reindexing — the index is now stale for this file.
     fs::write(root.join("src/lib.rs"), "// a\n// b\n// c\npub fn target() {}\n").unwrap();
 
-    let after = db.symbol_candidates(&selector).unwrap();
+    let after = db.symbol_candidates(&selector, false).unwrap();
     assert!(after.stale_files.is_empty(), "matched file was healed: {:?}", after.stale_files);
     assert!(
         after.candidates[0].start_byte > before_byte,
@@ -8298,7 +8376,7 @@ fn symbol_lookup_heals_a_just_added_symbol_without_waiting_for_the_watcher() {
         allow_ambiguous: true,
         limit: 10,
     };
-    let found = db.symbol_candidates(&selector).unwrap();
+    let found = db.symbol_candidates(&selector, false).unwrap();
     assert!(
         found.candidates.iter().any(|c| c.name == "brand_new_symbol"),
         "a just-added symbol must be healed in without waiting for the watcher: {:?}",
@@ -8311,7 +8389,7 @@ fn symbol_lookup_heals_a_just_added_symbol_without_waiting_for_the_watcher() {
         ..selector.clone()
     };
     assert!(
-        db.symbol_candidates(&miss).unwrap().candidates.is_empty(),
+        db.symbol_candidates(&miss, false).unwrap().candidates.is_empty(),
         "a genuine miss must stay empty"
     );
 
@@ -8369,12 +8447,15 @@ fn symbol_lookup_does_not_resurrect_a_deleted_symbol_after_heal() {
         allow_ambiguous: true,
         limit: 10,
     };
-    assert!(!db.symbol_candidates(&by_name).unwrap().candidates.is_empty(), "found before delete");
+    assert!(
+        !db.symbol_candidates(&by_name, false).unwrap().candidates.is_empty(),
+        "found before delete"
+    );
 
     // The edit removes `doomed` entirely.
     fs::write(root.join("src/lib.rs"), "pub fn something_else() {}\n").unwrap();
 
-    let after = db.symbol_candidates(&by_name).unwrap();
+    let after = db.symbol_candidates(&by_name, false).unwrap();
     assert!(
         after.candidates.is_empty(),
         "a deleted symbol must not be resurrected after heal: {:?}",
@@ -8408,7 +8489,7 @@ fn symbol_lookup_by_id_keeps_pre_heal_candidate_flagged_stale() {
         allow_ambiguous: true,
         limit: 10,
     };
-    let res = db.symbol_candidates(&by_id).unwrap();
+    let res = db.symbol_candidates(&by_id, false).unwrap();
     assert!(!res.candidates.is_empty(), "symbol_id selector keeps the pre-heal candidate");
     assert!(!res.stale_files.is_empty(), "and flags the file stale: {:?}", res.stale_files);
 

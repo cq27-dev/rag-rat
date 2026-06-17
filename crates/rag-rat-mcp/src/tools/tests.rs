@@ -175,7 +175,7 @@ fn list_tools_exposes_complete_typed_schemas() {
     ]);
     assert_schema_has_property(tools, "semantic_search", "explain");
     assert_symbol_selector_schema(tools, "symbol_lookup");
-    assert_schema_array_item_enum(tools, "symbol_lookup", "include", &["memories"]);
+    assert_schema_array_item_enum(tools, "symbol_lookup", "include", &["memories", "generated"]);
     assert_schema_array_item_enum(tools, "find_callers", "include", &[
         "references",
         "unresolved",

@@ -3,6 +3,15 @@ use serde::Serialize;
 
 use crate::language::Language;
 
+/// SQL fragment appended to a name/symbol_path search to drop generated-binding rows (ubrn FFI
+/// output, codegen) — navigation noise that buries the source symbol a search is after (#202).
+/// Filters on `files.generated`, the same flag search/orientation/tree/clusters default on (set by
+/// `crate::index::file_is_generated`: explicit `kind = generated` OR the codegen path heuristic, so
+/// it also catches generated code living under a *source* target). Only the *search* arms (name,
+/// symbol_path) apply it; an explicit `symbol_id` / `logical_symbol_id` selection is a deliberate
+/// pick and is never filtered.
+const GENERATED_EXCLUSION_CLAUSE: &str = " AND files.generated = 0";
+
 #[derive(Debug, Serialize)]
 pub struct SymbolHit {
     // The raw rowid is the internal handle + FK target, but it's reassigned on every reindex
@@ -104,7 +113,8 @@ pub fn lookup(
     language: Option<Language>,
     limit: u32,
 ) -> anyhow::Result<Vec<SymbolHit>> {
-    let mut hits = lookup_name(conn, name, language, limit)?;
+    // A bare name search excludes generated bindings by default (#202) — this path has no opt-in.
+    let mut hits = lookup_name(conn, name, language, limit, false)?;
     enrich_symbol_hits(conn, &mut hits)?;
     Ok(hits)
 }
@@ -112,8 +122,9 @@ pub fn lookup(
 pub fn lookup_candidates(
     conn: &Connection,
     selector: &SymbolSelector,
+    include_generated: bool,
 ) -> anyhow::Result<SymbolLookup> {
-    let candidates = candidates_for_selector(conn, selector)?;
+    let candidates = candidates_for_selector(conn, selector, include_generated)?;
     Ok(SymbolLookup {
         disambiguation_required: needs_disambiguation(&candidates, selector.allow_ambiguous),
         candidates,
@@ -125,7 +136,9 @@ pub fn select_one(
     conn: &Connection,
     selector: &SymbolSelector,
 ) -> anyhow::Result<Result<Option<SymbolHit>, SymbolDisambiguation>> {
-    let mut candidates = candidates_for_selector(conn, selector)?;
+    // Drill-down paths (impact, graph, memory) navigate source; generated bindings are never the
+    // target, so exclude them — and an explicit id selector bypasses the filter anyway (#202).
+    let mut candidates = candidates_for_selector(conn, selector, false)?;
     if candidates.is_empty() {
         return Ok(Ok(None));
     }
@@ -192,6 +205,7 @@ pub fn lookup_by_id(conn: &Connection, symbol_id: i64) -> anyhow::Result<Option<
 fn candidates_for_selector(
     conn: &Connection,
     selector: &SymbolSelector,
+    include_generated: bool,
 ) -> anyhow::Result<Vec<SymbolHit>> {
     if let Some(logical_symbol_id) = selector.logical_symbol_id {
         return lookup_logical_members(conn, logical_symbol_id, selector.limit);
@@ -200,14 +214,20 @@ fn candidates_for_selector(
         return Ok(lookup_by_id(conn, symbol_id)?.into_iter().collect());
     }
     if let Some(symbol_path) = selector.symbol_path.as_deref() {
-        let mut hits = lookup_symbol_path(conn, symbol_path, selector.language, selector.limit)?;
+        let mut hits = lookup_symbol_path(
+            conn,
+            symbol_path,
+            selector.language,
+            selector.limit,
+            include_generated,
+        )?;
         enrich_symbol_hits(conn, &mut hits)?;
         return Ok(hits);
     }
     let Some(symbol) = selector.symbol.as_deref() else {
         anyhow::bail!("one of symbol_id, symbol_path, or symbol is required");
     };
-    let mut hits = lookup_name(conn, symbol, selector.language, selector.limit)?;
+    let mut hits = lookup_name(conn, symbol, selector.language, selector.limit, include_generated)?;
     enrich_symbol_hits(conn, &mut hits)?;
     Ok(hits)
 }
@@ -217,6 +237,7 @@ fn lookup_name(
     name: &str,
     language: Option<Language>,
     limit: u32,
+    include_generated: bool,
 ) -> anyhow::Result<Vec<SymbolHit>> {
     let mut sql = "
         SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, \
@@ -227,6 +248,9 @@ fn lookup_name(
         WHERE (symbols.name = ?1 OR symbols.qualified_name LIKE ?2)
     "
     .to_string();
+    if !include_generated {
+        sql.push_str(GENERATED_EXCLUSION_CLAUSE);
+    }
     if language.is_some() {
         sql.push_str(" AND symbols.language = ?3");
     }
@@ -380,6 +404,7 @@ fn lookup_symbol_path(
     symbol_path: &str,
     language: Option<Language>,
     limit: u32,
+    include_generated: bool,
 ) -> anyhow::Result<Vec<SymbolHit>> {
     let mut sql = "
         SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, \
@@ -390,6 +415,9 @@ fn lookup_symbol_path(
         WHERE symbols.qualified_name = ?1
     "
     .to_string();
+    if !include_generated {
+        sql.push_str(GENERATED_EXCLUSION_CLAUSE);
+    }
     if language.is_some() {
         sql.push_str(" AND symbols.language = ?2");
     }
