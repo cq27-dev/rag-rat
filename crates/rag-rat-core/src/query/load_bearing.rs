@@ -221,7 +221,11 @@ pub fn scoped_weighted_fan_in(
          JOIN files ON files.id = d.source_file_id
          JOIN edge_strings ek ON ek.id = d.edge_kind_id
          JOIN edge_strings cf ON cf.id = d.confidence_id
-         WHERE d.to_symbol_id = ?1",
+         WHERE d.to_symbol_id = ?1
+           -- Internal dispatch FACT rows (#200) are synthesis inputs, not real in-edges — the
+           -- handle fact duplicates the dispatcher's existing calls_name, so counting it would
+           -- double-weight the handler. The synthesized `dispatches` edge IS counted.
+           AND ek.value NOT IN ('dispatch_construct', 'dispatch_handle')",
     )?;
     let rows = stmt
         .query_map([to_symbol_id], |row| {

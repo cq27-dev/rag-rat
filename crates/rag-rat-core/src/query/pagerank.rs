@@ -32,6 +32,12 @@ const MAX_RESULTS: usize = 500;
 pub(crate) fn edge_weight(kind: &str) -> f64 {
     match kind {
         "calls_name" | "implements" => 1.0,
+        // A synthesized dispatch hop (#200) is a real control-flow dependency, weighted just below
+        // a direct call (it is a level removed: construct → handler via the message enum).
+        "dispatches" => 0.8,
+        // Internal dispatch FACT kinds (#200) are synthesis inputs, never real edges — zero weight
+        // so they contribute nothing even if a query forgets to exclude them (defense in depth).
+        "dispatch_construct" | "dispatch_handle" => 0.0,
         "references_type" | "constructs" => 0.7,
         "uses_macro" => 0.5,
         "imports" | "exports" => 0.3,
@@ -325,7 +331,11 @@ pub fn important_symbols(
          JOIN files ON files.id = d.source_file_id
          JOIN edge_strings ek ON ek.id = d.edge_kind_id
          JOIN edge_strings cf ON cf.id = d.confidence_id
-         WHERE d.from_symbol_id IS NOT NULL",
+         WHERE d.from_symbol_id IS NOT NULL
+           -- Internal dispatch FACT rows (#200) are synthesis inputs, not real edges — they'd
+           -- double-count (the handle fact duplicates the dispatcher's existing calls_name) and
+           -- inflate rank. The synthesized `dispatches` edge IS counted (it's a real dependency).
+           AND ek.value NOT IN ('dispatch_construct', 'dispatch_handle')",
     )?;
     let rows = stmt
         .query_map([], |row| {

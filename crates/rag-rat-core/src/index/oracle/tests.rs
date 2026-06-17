@@ -746,7 +746,7 @@ fn migration_creates_oracle_side_tables() {
         assert!(columns.contains(&expected.to_string()), "edge_oracle missing {expected}");
     }
 
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 22);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 23);
 }
 
 /// The V019 moniker migration: the `logical_symbol_monikers` table (STRICT, NO foreign key — see

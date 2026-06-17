@@ -197,7 +197,10 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // (never backfilled), so without the bump a migrated index keeps empty package scopes and the
 // global-fallback behavior forever. The file→package mapping itself is computed at LOAD time from
 // `packages` (no persisted `files.package_id`), so the re-resolve only needs the `packages` rows.
-const GRAPH_INDEX_VERSION: &str = "7";
+// 8: #200 — the graph re-extract+resolve now emits the `dispatch_construct`/`dispatch_handle` FACT
+// rows and synthesizes `dispatches` edges; without the bump a migrated v7 index would carry NO
+// dispatch edges until a manual rebuild, since the re-resolve (which re-extracts edges) never runs.
+const GRAPH_INDEX_VERSION: &str = "8";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —

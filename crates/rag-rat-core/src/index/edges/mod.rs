@@ -31,6 +31,20 @@ pub enum EdgeKind {
     ReferencesType,
     Implements,
     Contains,
+    /// Synthesized at resolve time (#200): a `dispatches` edge from a function that CONSTRUCTS a
+    /// message/command enum variant to the handler that the matching arm calls — the actor-channel
+    /// dispatch hop a static call graph otherwise misses. NOT extracted directly; produced by
+    /// `synthesize_dispatch_edges` from the two fact kinds below.
+    Dispatches,
+    /// Internal dispatch FACT (#200), never user-visible: function `F` constructs `Enum::Variant`.
+    /// `to_name` is the 2-segment `Enum::Variant` key. Consumed by dispatch synthesis; excluded
+    /// from every user-facing edge-kind set, from PageRank, and from the oracle.
+    DispatchConstruct,
+    /// Internal dispatch FACT (#200), never user-visible: a `match`/`when` arm for `Enum::Variant`
+    /// (carried in `evidence`) whose body calls handler `to_name`. Resolution binds `to_name` to
+    /// the handler symbol; synthesis then joins it to the constructor on the variant key. Same
+    /// exclusions as `DispatchConstruct`.
+    DispatchHandle,
 }
 
 impl EdgeKind {
@@ -44,6 +58,9 @@ impl EdgeKind {
             Self::ReferencesType => "references_type",
             Self::Implements => "implements",
             Self::Contains => "contains",
+            Self::Dispatches => "dispatches",
+            Self::DispatchConstruct => "dispatch_construct",
+            Self::DispatchHandle => "dispatch_handle",
         }
     }
 }

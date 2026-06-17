@@ -2,6 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 
+mod dispatch;
+pub(crate) use dispatch::synthesize_dispatch_edges;
+
 /// Build an [`ImportScopeRange`] from the three dedicated edge columns, or `None` when the start
 /// byte is NULL (a non-import edge). The DB driver's twin of `CompactEdge::import_scope_range`
 /// (the full-rebuild path) — they must stay in lockstep (#61 both-driver parity).
@@ -310,6 +313,23 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
         source_start_byte,
     ) in rows
     {
+        // #200: a `dispatch_construct` fact's `to_name` is a synthetic `Enum::Variant` key, NOT a
+        // real call target — resolving it would bind a bogus `to_symbol_id` to any same-named
+        // symbol, and synthesis reads only the fact's `from_symbol_id`. Leave it
+        // unresolved. (`dispatch_handle` DOES resolve — synthesis reads its handler
+        // `to_symbol_id`.)
+        if edge_kind == EdgeKind::DispatchConstruct.as_str() {
+            let confidence_id = interner.get(conn, EdgeConfidence::NameOnly.as_str())?;
+            let resolution_id = interner.get(conn, "unresolved")?;
+            conn.prepare_cached(
+                "UPDATE edges_data
+                 SET to_symbol_id = NULL, target_start_line = NULL, target_end_line = NULL,
+                     confidence_id = ?2, resolution_id = ?3
+                 WHERE id = ?1",
+            )?
+            .execute(params![edge_id, confidence_id, resolution_id])?;
+            continue;
+        }
         // The reference's byte position drives the module-aware covering test (#61).
         let ref_byte = usize::try_from(source_start_byte).unwrap_or(0);
         // Python from-import alias rebind (#174): resolve a reference written under an alias using
@@ -396,6 +416,9 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
             resolution_id,
         ])?;
     }
+    // #200: now that the dispatch FACT rows are resolved (handlers bound to symbols), synthesize
+    // the construct→handler `dispatches` edges. Idempotent over the active scope.
+    synthesize_dispatch_edges(conn)?;
     Ok(())
 }
 /// Full-rebuild fast path: resolve every accumulated edge candidate against an in-memory symbol
@@ -539,27 +562,35 @@ pub(crate) fn resolve_and_insert_edges(
         let resolve_name = rebind.name.as_deref().unwrap_or(to_name);
         let resolve_qualified = rebind.target_qualified_name.as_deref().or(target_qualified_name);
         let resolve_receiver = rebind.receiver_hint.as_deref().or(receiver_hint);
-        let resolution = resolve_symbol(
-            ResolveSymbolRequest {
-                name: resolve_name,
-                target_qualified_name: resolve_qualified,
-                edge_kind: candidate.edge_kind.as_str(),
-                evidence,
-                receiver_hint: resolve_receiver,
-                source_file_id: *file_id,
-                source_language: index.file_language.get(file_id).copied(),
-                imported_external: import_scope.is_external_import(
-                    *file_id,
-                    short_name(to_name),
-                    ref_byte,
-                ) || import_scope.is_external_qualified_root(
-                    *file_id,
-                    target_qualified_name,
-                    ref_byte,
-                ),
-            },
-            &index,
-        );
+        // #200: a `dispatch_construct` fact's `to_name` is a synthetic `Enum::Variant` key, not a
+        // real target — never resolve it (synthesis reads only its `from_symbol_id`). Mirrors the
+        // incremental driver's skip; `dispatch_handle` DOES resolve (synthesis needs its handler
+        // id).
+        let resolution = if candidate.edge_kind == EdgeKind::DispatchConstruct {
+            None
+        } else {
+            resolve_symbol(
+                ResolveSymbolRequest {
+                    name: resolve_name,
+                    target_qualified_name: resolve_qualified,
+                    edge_kind: candidate.edge_kind.as_str(),
+                    evidence,
+                    receiver_hint: resolve_receiver,
+                    source_file_id: *file_id,
+                    source_language: index.file_language.get(file_id).copied(),
+                    imported_external: import_scope.is_external_import(
+                        *file_id,
+                        short_name(to_name),
+                        ref_byte,
+                    ) || import_scope.is_external_qualified_root(
+                        *file_id,
+                        target_qualified_name,
+                        ref_byte,
+                    ),
+                },
+                &index,
+            )
+        };
         let (to_symbol_id, confidence, target_start_line, target_end_line, reason) =
             match resolution {
                 Some((symbol, confidence, reason)) => (
@@ -640,6 +671,9 @@ pub(crate) fn resolve_and_insert_edges(
         conn.execute_batch(sql)?;
     }
     crate::index::mem_trace("edges: after index rebuild");
+    // #200: synthesize construct→handler `dispatches` edges from the resolved fact rows. Runs after
+    // the index rebuild — the few extra inserts maintain the (now rebuilt) indexes incrementally.
+    synthesize_dispatch_edges(conn)?;
     Ok(())
 }
 
@@ -980,7 +1014,10 @@ pub(crate) fn preferred_matches<'a>(
             .collect();
     }
     let preferred_kinds: &[&str] = match edge_kind {
-        "calls_name" => &["function", "method"],
+        // `dispatch_handle` (#200) is a call to the handler the match arm delegates to — resolve it
+        // with the SAME callable preference as a direct call, so a same-named type/const never wins
+        // over the handler function/method.
+        "calls_name" | "dispatch_handle" => &["function", "method"],
         "constructs" => &["struct", "class", "object"],
         "uses_macro" => &["macro"],
         "implements" => &["trait", "interface"],

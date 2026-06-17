@@ -72,8 +72,10 @@ pub fn description(name: &str) -> &'static str {
         "find_callers" =>
             "Find what calls a symbol (reverse call graph), instead of grepping for call sites. \
              Returns call sites with confidence + target verification, a completeness / \
-             false-positive risk summary, and repo memories crossing the call path. Resolve the \
-             symbol with symbol_lookup first when a name is ambiguous.",
+             false-positive risk summary, and repo memories crossing the call path. Includes \
+             synthesized `dispatches` edges for message/enum (actor-channel) dispatch — the sender \
+             that constructs the variant a handler's match arm handles. Resolve the symbol with \
+             symbol_lookup first when a name is ambiguous.",
         "trace_callees" =>
             "Find what a symbol calls (forward call graph). Same evidence shape as find_callers; \
              unresolved std/common-method noise is filtered out by default (add `common_methods` / \

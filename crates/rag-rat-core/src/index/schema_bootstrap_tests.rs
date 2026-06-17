@@ -2054,6 +2054,431 @@ fn find_callers_sees_calls_in_let_bindings() {
 }
 
 #[test]
+fn find_callers_sees_message_dispatch_via_synthetic_edge() {
+    // #200: a handler reached only through an enum-message dispatch (construct a variant in one fn,
+    // handle it in a `match` arm in another) has no static caller edge to the leaf. The synthesized
+    // `dispatches` edge connects the constructing fn to the handler the matching arm calls, so
+    // find_callers on the leaf surfaces the sender.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum MlReq {
+    UpsertJournalEmbedding { id: i64 },
+    Other,
+}
+
+pub fn enqueue() {
+    send(MlReq::UpsertJournalEmbedding { id: 1 });
+}
+
+fn send(_req: MlReq) {}
+
+pub fn handle(req: MlReq) {
+    match req {
+        MlReq::UpsertJournalEmbedding { id } => {
+            log_it();
+            upsert_journal_embedding(id)
+        },
+        MlReq::Other => {},
+    }
+}
+
+pub fn log_it() {}
+
+pub fn upsert_journal_embedding(_id: i64) {}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let callers = db.find_callers("upsert_journal_embedding", 50).unwrap();
+    // The direct (calls_name) caller is the dispatcher `handle`.
+    assert!(
+        callers.iter().any(|hop| {
+            hop.edge_kind == "calls_name"
+                && hop.from_symbol.as_deref().is_some_and(|s| s.ends_with("handle"))
+        }),
+        "missing direct handler caller: {callers:?}"
+    );
+    // The synthesized dispatch caller is the constructing fn `enqueue`, via the MlReq variant.
+    let dispatch = callers
+        .iter()
+        .find(|hop| hop.edge_kind == "dispatches")
+        .expect("missing synthetic dispatch edge");
+    assert!(
+        dispatch.from_symbol.as_deref().is_some_and(|s| s.ends_with("enqueue")),
+        "dispatch edge should come from the sender: {dispatch:?}"
+    );
+    assert_eq!(
+        dispatch.evidence.as_deref(),
+        Some("MlReq::UpsertJournalEmbedding"),
+        "dispatch edge should record the routing variant as evidence"
+    );
+
+    // A symbol not reached by any dispatch arm gets no synthetic edge.
+    let send_callers = db.find_callers("send", 50).unwrap();
+    assert!(
+        send_callers.iter().all(|hop| hop.edge_kind != "dispatches"),
+        "no dispatch edge expected for a non-handler: {send_callers:?}"
+    );
+
+    // #200 review (P2 #4): a side-effect call earlier in the arm body (`log_it()`) is NOT the
+    // routed handler — only the arm's tail delegate is. `log_it` must get no dispatch caller.
+    let log_callers = db.find_callers("log_it", 50).unwrap();
+    assert!(
+        log_callers.iter().all(|hop| hop.edge_kind != "dispatches"),
+        "an arm side-effect call must not become a dispatch target: {log_callers:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dispatch_fact_rows_are_hidden_from_the_edges_view() {
+    // #200 adversarial review: the internal `dispatch_construct`/`dispatch_handle` FACT rows live
+    // in `edges_data` (needed by `synthesize_dispatch_edges`) but are EXCLUDED from the `edges`
+    // compatibility view, so every query-layer reader (repo_brief, clusters, grep-augment,
+    // orientation, traversal, …) is structurally safe without each remembering an exclusion. The
+    // synthesized `dispatches` edge IS a real edge and stays visible.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum MlReq { Upsert { id: i64 } }
+pub fn enqueue() { send(MlReq::Upsert { id: 1 }); }
+fn send(_r: MlReq) {}
+pub fn handle(r: MlReq) {
+    match r {
+        MlReq::Upsert { id } => upsert(id),
+    }
+}
+pub fn upsert(_id: i64) {}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let view_count = |kind: &str| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM edges WHERE edge_kind = ?1", [kind], |r| r.get(0))
+            .unwrap()
+    };
+    let data_count = |kind: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM edges_data d JOIN edge_strings ek ON ek.id = d.edge_kind_id
+             WHERE ek.value = ?1",
+            [kind],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
+    // The FACT rows exist in the base table but are invisible through the view.
+    assert!(data_count("dispatch_construct") > 0, "construct fact persisted in edges_data");
+    assert!(data_count("dispatch_handle") > 0, "handle fact persisted in edges_data");
+    assert_eq!(view_count("dispatch_construct"), 0, "construct fact must be hidden from the view");
+    assert_eq!(view_count("dispatch_handle"), 0, "handle fact must be hidden from the view");
+    // The synthesized real edge is visible through the view.
+    assert!(view_count("dispatches") > 0, "the synthesized dispatches edge must stay visible");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dispatch_handles_or_patterns_guards_and_let_constructs() {
+    // #200 review: or-pattern arms emit a handle per variant; the delegate is the branch tail (a
+    // guard/scrutinee call is never a handler); a unit variant in a `let` value position is a
+    // construct.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Cmd { Start, Resume, Stop }
+
+pub fn enqueue_start() { send(Cmd::Start); }
+pub fn enqueue_resume() { send(Cmd::Resume); }
+pub fn enqueue_stop() {
+    let c = Cmd::Stop;
+    send(c);
+}
+fn send(_c: Cmd) {}
+
+pub fn handle(c: Cmd) {
+    match c {
+        Cmd::Start | Cmd::Resume => run_active(),
+        Cmd::Stop => if should_stop() { run_stop() } else { run_active() },
+    }
+}
+
+pub fn should_stop() -> bool { true }
+pub fn run_active() {}
+pub fn run_stop() {}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let dispatch_senders = |symbol: &str| -> Vec<String> {
+        db.find_callers(symbol, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|hop| hop.edge_kind == "dispatches")
+            .filter_map(|hop| hop.from_symbol)
+            .collect()
+    };
+    let ends_with = |names: &[String], suffix: &str| names.iter().any(|n| n.ends_with(suffix));
+
+    // Or-pattern: both `Cmd::Start` and `Cmd::Resume` senders dispatch to `run_active`. The
+    // `Cmd::Stop` else-branch also lands on `run_active` (`enqueue_stop` constructs via a `let`).
+    let active = dispatch_senders("run_active");
+    assert!(ends_with(&active, "enqueue_start"), "or-pattern Start sender missing: {active:?}");
+    assert!(ends_with(&active, "enqueue_resume"), "or-pattern Resume sender missing: {active:?}");
+    assert!(ends_with(&active, "enqueue_stop"), "guard else-branch sender missing: {active:?}");
+
+    // Guard if-branch: `Cmd::Stop` sender dispatches to `run_stop`.
+    let stop = dispatch_senders("run_stop");
+    assert!(ends_with(&stop, "enqueue_stop"), "guard if-branch sender missing: {stop:?}");
+
+    // The guard/scrutinee call `should_stop()` is NOT a dispatch handler.
+    assert!(
+        dispatch_senders("should_stop").is_empty(),
+        "a guard/predicate call must not become a dispatch handler"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dispatch_resolves_self_keyed_variants_per_impl() {
+    // #200 adversarial review (P1): `Self::Variant` is rewritten to the enclosing impl type, so two
+    // unrelated enums each writing `Self::Ripe` in construct + handle do NOT cross-link (the old
+    // bare `Self::Ripe` key collapsed them). A single impl's `Self::`-keyed dispatch still
+    // resolves.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Apple { Ripe }
+pub enum Banana { Ripe }
+
+fn sink<T>(_t: T) {}
+
+impl Apple {
+    pub fn enqueue_apple() { sink(Self::Ripe); }
+    pub fn run_apple(self) { match self { Self::Ripe => apple_handler() } }
+}
+
+impl Banana {
+    pub fn enqueue_banana() { sink(Self::Ripe); }
+    pub fn run_banana(self) { match self { Self::Ripe => banana_handler() } }
+}
+
+pub fn apple_handler() {}
+pub fn banana_handler() {}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let dispatch_senders = |symbol: &str| -> Vec<String> {
+        db.find_callers(symbol, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|hop| hop.edge_kind == "dispatches")
+            .filter_map(|hop| hop.from_symbol)
+            .collect()
+    };
+
+    // `Self::Ripe` in `impl Apple` keys as `Apple::Ripe` (recall preserved) and does NOT reach the
+    // Banana handler (no cross-enum collapse).
+    let apple = dispatch_senders("apple_handler");
+    assert!(
+        apple.iter().any(|s| s.ends_with("enqueue_apple")),
+        "self-keyed dispatch lost: {apple:?}"
+    );
+    let banana = dispatch_senders("banana_handler");
+    assert!(
+        banana.iter().any(|s| s.ends_with("enqueue_banana")),
+        "self-keyed dispatch lost: {banana:?}"
+    );
+    assert!(
+        apple.iter().all(|s| !s.ends_with("enqueue_banana"))
+            && banana.iter().all(|s| !s.ends_with("enqueue_apple")),
+        "Self::Variant must not cross-link distinct enums: apple={apple:?} banana={banana:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dispatch_handles_await_tails_and_external_enum_heads() {
+    // #200 review: an `.await` tail still resolves the handler; and an enum head with no LOCAL
+    // definition (an imported/aliased enum) is admitted, not skipped, since both sender and handler
+    // write the same head.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Job { Run }
+
+pub async fn enqueue() { dispatch(Job::Run); }
+async fn dispatch(_j: Job) {}
+pub async fn handle(j: Job) {
+    match j {
+        Job::Run => run_job().await,
+    }
+}
+pub async fn run_job() {}
+
+pub fn emit() { ship(Status::Ready); }
+fn ship(_s: Status) {}
+pub fn route(s: Status) {
+    match s {
+        Status::Ready => deliver(),
+    }
+}
+pub fn deliver() {}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let dispatch_from = |symbol: &str, sender: &str| {
+        db.find_callers(symbol, 50).unwrap().iter().any(|hop| {
+            hop.edge_kind == "dispatches"
+                && hop.from_symbol.as_deref().is_some_and(|s| s.ends_with(sender))
+        })
+    };
+
+    // `.await` tail: `Job::Run => run_job().await` still binds `run_job`.
+    assert!(dispatch_from("run_job", "enqueue"), "await tail handler missing a dispatch caller");
+    // External/aliased head (`Status` has no local enum definition) is admitted.
+    assert!(dispatch_from("deliver", "emit"), "external enum-head dispatch missing");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dispatch_ignores_nested_payload_variants() {
+    // #200 review: an arm pattern `Outer::Wrapped(Inner::Start) => run()` handles `Outer::Wrapped`,
+    // NOT the nested payload `Inner::Start`. A function that only constructs `Inner::Start` as data
+    // must not be reported as a dispatch caller of `run`.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Outer { Wrapped(Inner) }
+pub enum Inner { Start }
+
+pub fn enqueue_outer() { send(Outer::Wrapped(Inner::Start)); }
+pub fn enqueue_inner_only() { take(Inner::Start); }
+fn send(_o: Outer) {}
+fn take(_i: Inner) {}
+
+pub fn handle(o: Outer) {
+    match o {
+        Outer::Wrapped(Inner::Start) => run(),
+    }
+}
+pub fn run() {}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let senders: Vec<String> = db
+        .find_callers("run", 50)
+        .unwrap()
+        .into_iter()
+        .filter(|hop| hop.edge_kind == "dispatches")
+        .filter_map(|hop| hop.from_symbol)
+        .collect();
+    assert!(
+        senders.iter().any(|s| s.ends_with("enqueue_outer")),
+        "the outer-variant sender should dispatch: {senders:?}"
+    );
+    assert!(
+        senders.iter().all(|s| !s.ends_with("enqueue_inner_only")),
+        "a nested-payload variant must not be treated as the handled variant: {senders:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dispatch_join_is_scoped_to_a_unique_enum_definition() {
+    // #200 review (P2 #1): the variant key is module-stripped (`Msg::Start`), so two distinct enums
+    // both named `Msg` must NOT merge — a sender of one enum's variant must not appear as a caller
+    // of the other's handler. With the enum name ambiguous, the join is skipped entirely.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod a {
+    pub enum Msg { Start }
+    pub fn enqueue_a() { send_a(Msg::Start); }
+    fn send_a(_m: Msg) {}
+    pub fn handle_a(m: Msg) {
+        match m {
+            Msg::Start => run_a(),
+        }
+    }
+    pub fn run_a() {}
+}
+
+pub mod b {
+    pub enum Msg { Start }
+    pub fn enqueue_b() { send_b(Msg::Start); }
+    fn send_b(_m: Msg) {}
+    pub fn handle_b(m: Msg) {
+        match m {
+            Msg::Start => run_b(),
+        }
+    }
+    pub fn run_b() {}
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // `Msg` is ambiguous (two enums), so no dispatch edges are synthesized — crucially, NO
+    // cross-enum edge from `enqueue_a` to `run_b` (or vice versa).
+    for handler in ["run_a", "run_b"] {
+        let callers = db.find_callers(handler, 50).unwrap();
+        assert!(
+            callers.iter().all(|hop| hop.edge_kind != "dispatches"),
+            "ambiguous enum must not synthesize a (possibly cross-enum) dispatch into {handler}: \
+             {callers:?}"
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn symbol_search_excludes_generated_bindings_unless_opted_in() {
     // #202: a name/symbol_path search drowns in generated bindings (ubrn FFI output, codegen) that
     // shadow the hand-written source symbol. The real-world case is codegen living UNDER a source
@@ -7339,7 +7764,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 22);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 23);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -7402,15 +7827,18 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         ALTER TABLE edges_data DROP COLUMN import_scope_end_byte;
         ALTER TABLE edges_data DROP COLUMN import_mod_id;
         DELETE FROM schema_version WHERE id = '022_per_package_import_scope';
+        -- Also drop V023 (recreates the view) so `known_version` reads the contiguous V21 below;
+        -- leaving it would make the applied-set max 23 and skip the migrate.
+        DELETE FROM schema_version WHERE id = '023_dispatch_edge_facts_view_exclusion';
         ",
     )
     .unwrap();
     assert_eq!(schema::status(&conn).unwrap().current_version, 21, "now looks like a V21 index");
     assert!(!conn_table_exists(&conn, "packages"));
 
-    // Forward-migrate: re-running apply (the Older→apply path) converges to V22.
+    // Forward-migrate: re-running apply (the Older→apply path) converges to the latest version.
     schema::apply(&conn).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 22);
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     assert!(conn_table_exists(&conn, "packages"), "forward migrate creates packages");
     assert!(
         !conn_table_columns(&conn, "files").contains(&"package_id".to_string()),

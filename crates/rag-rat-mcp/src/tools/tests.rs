@@ -200,6 +200,7 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_array_item_enum(tools, "find_callers", "edge_kinds", &[
         "calls_name",
         "constructs",
+        "dispatches",
         "uses_macro",
         "references_type",
         "imports",

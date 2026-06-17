@@ -243,7 +243,62 @@ pub(crate) fn rust_edges(
                         .map(CalleeRange::of_node),
                 ));
             }
+            // #200 dispatch construct fact: a tuple enum-variant construction `Enum::Variant(..)`.
+            // Key off the FULL call path's last two PascalCase `::` segments, so
+            // `crate::m::Msg::Start(..)` still yields `Msg::Start` (the bare receiver would be
+            // `crate`). `Foo::new()` / `T::CONST` are excluded (tail not PascalCase).
+            if let Some(key) =
+                node.child_by_field_name("function").and_then(|f| enum_variant_key(f, text))
+            {
+                out.push(dispatch_fact(
+                    symbols,
+                    node,
+                    key,
+                    EdgeKind::DispatchConstruct,
+                    EdgeContext::default(),
+                    None,
+                ));
+            }
         },
+        "struct_expression" =>
+        // #200 dispatch construct fact: a struct enum-variant construction `Enum::Variant { .. }`.
+        {
+            if let Some(key) =
+                node.child_by_field_name("name").and_then(|n| enum_variant_key(n, text))
+            {
+                out.push(dispatch_fact(
+                    symbols,
+                    node,
+                    key,
+                    EdgeKind::DispatchConstruct,
+                    EdgeContext::default(),
+                    None,
+                ));
+            }
+        },
+        "scoped_identifier" =>
+        // #200 dispatch construct fact: a UNIT enum-variant `Enum::Stop` in a VALUE position — a
+        // call argument (`send(Msg::Stop)`), a `let` initializer (`let m = Msg::Stop;`), an
+        // assignment RHS, or a `return`/`break` value. Not a `call_expression`, so the arms above
+        // miss it. The value-position gate keeps an ordinary type/module/use path out;
+        // over-emitting for a non-enum `Foo::Bar` is harmless — synthesis only joins a
+        // variant whose head is a unique in-scope `enum`, so a non-enum head never yields a
+        // `dispatches` edge.
+        {
+            if scoped_identifier_in_value_position(node)
+                && let Some(key) = enum_variant_key(node, text)
+            {
+                out.push(dispatch_fact(
+                    symbols,
+                    node,
+                    key,
+                    EdgeKind::DispatchConstruct,
+                    EdgeContext::default(),
+                    None,
+                ));
+            }
+        },
+        "match_arm" => rust_dispatch_handle_facts(text, node, symbols, out),
         "macro_invocation" =>
             if let Some(name) = first_identifier_text(node, text) {
                 out.push(symbol_edge_with_context(
@@ -1299,6 +1354,266 @@ pub(crate) fn symbol_edge_with_context(
         import_scope: None,
         edge_kind,
         confidence,
+    }
+}
+
+/// PascalCase test for the enum/variant convention (#200): first char uppercase AND at least one
+/// lowercase — so `MlReq`/`Upsert` qualify but `new`, a SCREAMING `CONST`, and a bare `T` do not.
+fn is_pascal_case(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase) && name.chars().any(char::is_lowercase)
+}
+
+/// The `Enum::Variant` dispatch key from a scoped path node — its last two `::`-segments when BOTH
+/// are PascalCase, else `None`. Robust to longer paths (`crate::ml::MlReq::Upsert` →
+/// `MlReq::Upsert`) so a construction site and a handler arm produce the SAME key regardless of
+/// import depth (#200). Splits the node TEXT on `::` rather than counting identifier children —
+/// tree-sitter treats a `scoped_(type_)identifier` as a single identifier token, so
+/// `identifiers_under` returns the whole path as one element.
+///
+/// `Self::Variant` is rewritten to `<impl type>::Variant` using the enclosing `impl` block — `Self`
+/// is NOT a stable cross-file identity, so two unrelated enums each writing `Self::Ripe` would
+/// otherwise collapse to one key and cross-link (the actor pattern `impl MlReq { fn enqueue() {
+/// send(Self::Upsert) } }` is exactly this). With no enclosing impl type, a `Self`-headed key is
+/// dropped rather than admitted under the bare `Self` head.
+fn enum_variant_key(node: Node<'_>, text: &str) -> Option<String> {
+    let full = node.utf8_text(text.as_bytes()).ok()?;
+    let segments: Vec<&str> =
+        full.split("::").map(str::trim).filter(|segment| !segment.is_empty()).collect();
+    let n = segments.len();
+    if n < 2 || !is_pascal_case(segments[n - 1]) {
+        return None;
+    }
+    let variant = segments[n - 1];
+    let head = segments[n - 2];
+    let head = if head == "Self" {
+        enclosing_impl_type_name(node, text)?
+    } else if is_pascal_case(head) {
+        head.to_string()
+    } else {
+        return None;
+    };
+    Some(format!("{head}::{variant}"))
+}
+
+/// The base type name of the nearest enclosing `impl` block (`impl MlReq` / `impl Trait for MlReq`
+/// / `impl Foo<T>` → `MlReq` / `Foo`), or `None` when `node` is not inside an impl. Used to resolve
+/// a `Self`-headed dispatch key (#200 adversarial review). Strips generics and any module path.
+fn enclosing_impl_type_name(node: Node<'_>, text: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "impl_item" {
+            let type_node = ancestor.child_by_field_name("type")?;
+            let raw = type_node.utf8_text(text.as_bytes()).ok()?;
+            let base = raw.split('<').next().unwrap_or(raw).trim();
+            let last = base.rsplit("::").next().unwrap_or(base).trim();
+            return (!last.is_empty()).then(|| last.to_string());
+        }
+        current = ancestor.parent();
+    }
+    None
+}
+
+/// Every TOP-LEVEL `Enum::Variant` key carried by a `match` arm pattern (#200), paired with the
+/// scoped-path NODE it came from, deduped by key. Each OR-alternative contributes ONLY its outer
+/// constructor — `Msg::Start | Msg::Resume` yields both, but `Msg::Wrapped(Inner::Start)` yields
+/// only `Msg::Wrapped` (the nested payload `Inner::Start` is NOT a handled variant; including it
+/// would let an unrelated `Inner::Start` constructor be reported as a dispatch caller). The node is
+/// returned so each emitted handle fact anchors at its OWN variant span: the full-rebuild insert
+/// dedups on `(from, to_name, kind, span)` (NOT evidence), so two facts for the same delegate call
+/// would otherwise collapse to one. Empty for a non-enum pattern.
+fn pattern_enum_variant_keys<'a>(pattern: Node<'a>, text: &str) -> Vec<(String, Node<'a>)> {
+    // Unwrap `match_pattern` (which also wraps any `if`-guard) to the actual pattern / or_pattern.
+    let inner = if pattern.kind() == "match_pattern" {
+        let mut cursor = pattern.walk();
+        pattern.named_children(&mut cursor).next().unwrap_or(pattern)
+    } else {
+        pattern
+    };
+    let mut alternatives = Vec::new();
+    if inner.kind() == "or_pattern" {
+        let mut cursor = inner.walk();
+        alternatives.extend(inner.named_children(&mut cursor));
+    } else {
+        alternatives.push(inner);
+    }
+    let mut keys: Vec<(String, Node<'a>)> = Vec::new();
+    for alternative in alternatives {
+        if let Some((key, node)) = alternative_constructor_key(alternative, text)
+            && !keys.iter().any(|(existing, _)| existing == &key)
+        {
+            keys.push((key, node));
+        }
+    }
+    keys
+}
+
+/// The outer-constructor `Enum::Variant` key (+ its node) of ONE match-arm alternative — the type
+/// of a tuple/struct variant pattern, or a bare unit-variant path. `None` for a non-enum
+/// alternative (a wildcard, literal, or binding). Does NOT look inside the pattern, so a nested
+/// payload variant is not mistaken for the handled variant (#200 review).
+fn alternative_constructor_key<'a>(
+    alternative: Node<'a>,
+    text: &str,
+) -> Option<(String, Node<'a>)> {
+    let path = match alternative.kind() {
+        "tuple_struct_pattern" | "struct_pattern" => alternative.child_by_field_name("type")?,
+        "scoped_identifier" | "scoped_type_identifier" => alternative,
+        _ => return None,
+    };
+    enum_variant_key(path, text).map(|key| (key, path))
+}
+
+/// The DELEGATE call(s) a `match` arm routes to (#200): the tail call of the arm body, descending
+/// through control-flow shapes so a guard/scrutinee is never mistaken for the handler. A block →
+/// its tail expression; an `if` → both branch tails; a nested `match` → each arm's tail; `await`/
+/// `return`/`break`/parens/unsafe/try → their inner expression. A bare `call_expression` is the
+/// call itself. Anything else (a non-call tail, e.g. a literal) contributes nothing. Critically
+/// this does NOT descend into a call's arguments, so `handle(validate(x))` yields only `handle`,
+/// and `if ready() { a() } else { b() }` yields `a`/`b` — never `ready`.
+fn collect_tail_calls<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    match node.kind() {
+        "call_expression" => out.push(node),
+        "block" => {
+            let mut cursor = node.walk();
+            if let Some(tail) = node.named_children(&mut cursor).last() {
+                collect_tail_calls(tail, out);
+            }
+        },
+        "if_expression" => {
+            if let Some(consequence) = node.child_by_field_name("consequence") {
+                collect_tail_calls(consequence, out);
+            }
+            if let Some(alternative) = node.child_by_field_name("alternative") {
+                collect_tail_calls(alternative, out);
+            }
+        },
+        "else_clause"
+        | "expression_statement"
+        | "return_expression"
+        | "break_expression"
+        | "parenthesized_expression"
+        | "unsafe_block"
+        | "try_expression"
+        | "await_expression" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_tail_calls(child, out);
+            }
+        },
+        "match_expression" => {
+            let mut cursor = node.walk();
+            for descendant in node.named_children(&mut cursor) {
+                if descendant.kind() == "match_block" {
+                    let mut arm_cursor = descendant.walk();
+                    for arm in descendant.named_children(&mut arm_cursor) {
+                        if arm.kind() == "match_arm"
+                            && let Some(value) = arm.child_by_field_name("value")
+                        {
+                            collect_tail_calls(value, out);
+                        }
+                    }
+                }
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Whether a `scoped_identifier` sits in an expression VALUE position where a unit enum-variant is
+/// being produced (#200): a call argument, a `let` initializer, an assignment RHS, or a
+/// `return`/`break` value. Excludes type/pattern/use/path positions (a `use` leaf, a `let Pat = …`
+/// pattern, a `T::Assoc` type). Field-checked where the node could be on either side (let pattern
+/// vs value, assignment left vs right).
+fn scoped_identifier_in_value_position(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "arguments" | "return_expression" | "break_expression" => true,
+        "let_declaration" => parent.child_by_field_name("value") == Some(node),
+        "assignment_expression" => parent.child_by_field_name("right") == Some(node),
+        _ => false,
+    }
+}
+
+/// Build a dispatch FACT edge candidate (#200) whose `from_symbol` is the enclosing function. For a
+/// handle fact `evidence` carries the `Enum::Variant` key (safe: `resolve_symbol` never reads
+/// `evidence` for a non-import kind — only `synthesize_dispatch_edges` does), and `context` carries
+/// the same `target_qualified_name` / `receiver_hint` a normal call would, so the handler resolves
+/// identically to a `calls_name` (e.g. `self.handle(x)` / `Self::handle(x)` bind to the right
+/// method). `to_name` is the variant key (construct) or the handler name (handle). No callee range,
+/// so the SCIP oracle skips these rows.
+fn dispatch_fact(
+    symbols: &[IndexedSymbol],
+    node: Node<'_>,
+    to_name: String,
+    edge_kind: EdgeKind,
+    context: EdgeContext,
+    evidence: Option<String>,
+) -> EdgeCandidate {
+    let source = containing_symbol(symbols, node.start_byte());
+    EdgeCandidate {
+        from_symbol_id: source.map(|symbol| symbol.id),
+        from_name: source.map(|symbol| symbol.qualified_name.clone()),
+        to_name,
+        target_qualified_name: context.target_qualified_name,
+        evidence,
+        receiver_hint: context.receiver_hint,
+        source_span: span_for_node(node),
+        callee_span: None,
+        import_scope: None,
+        edge_kind,
+        confidence: EdgeConfidence::NameOnly,
+    }
+}
+
+/// Emit `DispatchHandle` facts for a `match_arm` whose pattern names one or more `Enum::Variant`s
+/// (#200): `evidence` = the variant key, `to_name` = the arm's DELEGATING call. Conservative on
+/// both ends — fires only when the pattern carries a 2-segment PascalCase enum path (an integer/`_`
+/// arm yields nothing), and binds only the tail/delegate call(s) (`collect_tail_calls`), so
+/// side-effect statements (`metrics::inc(); handle(x)`), nested argument calls
+/// (`handle(validate(x))`), and guard/scrutinee calls (`if ready() { a() }` → `a`, never `ready`)
+/// are not spurious targets. An OR-pattern arm (`A | B => handle()`) emits a fact for EACH variant.
+fn rust_dispatch_handle_facts(
+    text: &str,
+    node: Node<'_>,
+    symbols: &[IndexedSymbol],
+    out: &mut Vec<EdgeCandidate>,
+) {
+    let Some(pattern) = node.child_by_field_name("pattern") else {
+        return;
+    };
+    let keys = pattern_enum_variant_keys(pattern, text);
+    if keys.is_empty() {
+        return;
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    let mut tail_calls = Vec::new();
+    collect_tail_calls(value, &mut tail_calls);
+    for call in &tail_calls {
+        let Some(handler) = call_target_name(*call, text) else {
+            continue;
+        };
+        let context = EdgeContext {
+            target_qualified_name: target_qualified_name(*call, text),
+            receiver_hint: scoped_receiver_name(*call, text),
+        };
+        for (key, variant_node) in &keys {
+            // Anchor each fact at its OWN variant-pattern node (not the shared delegate call), so
+            // distinct variants of an OR-pattern arm survive the span-keyed full-rebuild dedup. The
+            // handler name + call context still come from the delegate call; from_symbol resolves
+            // to the same dispatcher fn either way.
+            out.push(dispatch_fact(
+                symbols,
+                *variant_node,
+                handler.clone(),
+                EdgeKind::DispatchHandle,
+                context.clone(),
+                Some(key.clone()),
+            ));
+        }
     }
 }
 

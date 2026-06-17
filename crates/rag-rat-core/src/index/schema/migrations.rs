@@ -656,6 +656,13 @@ pub(crate) fn ensure_edges_data_indexes(conn: &Connection) -> rusqlite::Result<(
 /// `last_insert_rowid()` REVERTS after an INSTEAD OF trigger ends — an insert through the view
 /// cannot read back the new edge id that way. The production insert paths write `edges_data`
 /// directly with interned ids for this reason (and for bulk speed).
+/// V023 (#200): recreate the `edges` compatibility view so its definition excludes the internal
+/// dispatch FACT rows. `ensure_edges_view` is idempotent (DROP + CREATE), so this simply rebuilds
+/// the view with the new body on an existing index; the underlying `edges_data` rows are untouched.
+pub(crate) fn apply_dispatch_edge_facts_view_exclusion(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_edges_view(conn)
+}
+
 pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     let legacy_table: Option<String> = conn
         .query_row(
@@ -733,7 +740,22 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
         LEFT JOIN edge_strings rh ON rh.id = d.receiver_hint_id
         LEFT JOIN edge_strings res ON res.id = d.resolution_id
         LEFT JOIN edge_strings ek ON ek.id = d.edge_kind_id
-        LEFT JOIN edge_strings conf ON conf.id = d.confidence_id;
+        LEFT JOIN edge_strings conf ON conf.id = d.confidence_id
+        -- #200: the internal dispatch FACT rows (`dispatch_construct`/`dispatch_handle`) are \
+         inputs
+        -- to `synthesize_dispatch_edges`, NOT real edges — the handle fact duplicates the
+        -- dispatcher's existing `calls_name`. Hide them at the compatibility view so EVERY \
+         query-layer
+        -- reader (graph traversal, repo_brief, clusters, grep-augment, orientation, …) is
+        -- structurally safe without each remembering an exclusion; the synthesized `dispatches` \
+         edge
+        -- (a real edge) stays visible. Resolution + synthesis read `edges_data` directly, so they
+        -- still see the facts. Filter on the raw `edge_kind_id` (a one-time constant subselect) \
+         so the
+        -- planner keeps the indexed-id predicates, not a value-join string compare.
+        WHERE d.edge_kind_id NOT IN (
+            SELECT id FROM edge_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
+        );
 
         -- Interning per column: `INSERT OR IGNORE` + `value NOT NULL` means a NULL string is
         -- silently skipped and its id subselect yields NULL — exactly the legacy nullability.
@@ -967,6 +989,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_020_ID => Some(20),
             MIGRATION_021_ID => Some(21),
             MIGRATION_022_ID => Some(22),
+            MIGRATION_023_ID => Some(23),
             _ => None,
         })
         .max()
@@ -998,6 +1021,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_020_ID
             | MIGRATION_021_ID
             | MIGRATION_022_ID
+            | MIGRATION_023_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1026,6 +1050,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_020_ID => migration.checksum != MIGRATION_020_CHECKSUM,
         MIGRATION_021_ID => migration.checksum != MIGRATION_021_CHECKSUM,
         MIGRATION_022_ID => migration.checksum != MIGRATION_022_CHECKSUM,
+        MIGRATION_023_ID => migration.checksum != MIGRATION_023_CHECKSUM,
         _ => false,
     }
 }
