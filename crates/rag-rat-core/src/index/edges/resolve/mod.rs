@@ -462,6 +462,18 @@ pub(crate) fn resolve_and_insert_edges(
             stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
         rows.collect::<Result<_, _>>()?
     };
+    // In-corpus Python module set for external-import classification (#182): repo-root-relative
+    // `.py` paths → dotted modules, so a plain absolute `from M import name` whose module is absent
+    // is external. Built once per pass from the active checkout's Python files (scoped `files`
+    // view).
+    let python_modules = {
+        let mut stmt =
+            conn.prepare("SELECT path FROM files WHERE language = ?1 AND kind = 'source'")?;
+        let rows = stmt
+            .query_map([Language::Python.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        imports::python_module_set(rows.iter().map(String::as_str))
+    };
     for (file_id, candidate) in &edges {
         if candidate.edge_kind == EdgeKind::Imports {
             let evidence = arena.get_opt(candidate.evidence).unwrap_or("");
@@ -477,6 +489,16 @@ pub(crate) fn resolve_and_insert_edges(
                         target.to_string(),
                         candidate.import_scope_range(),
                     );
+                }
+                // External-import classification (#182): a plain absolute `from M import name`
+                // carries its module in `import_source_module`; mark `name` external when `M` is
+                // out-of-corpus, so the existing `imported_external` path suppresses binding a bare
+                // `name` reference to a local same-named symbol.
+                if let Some(module) = arena.get_opt(candidate.import_source_module)
+                    && !target.is_empty()
+                    && imports::is_external_python_module(module, target, &python_modules)
+                {
+                    import_scope.add_python_external_import(*file_id, target.to_string());
                 }
             } else {
                 import_scope.add_use(*file_id, evidence, candidate.import_scope_range());

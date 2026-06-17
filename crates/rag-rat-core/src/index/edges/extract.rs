@@ -76,6 +76,7 @@ pub(crate) fn contains_edges(symbols: &[IndexedSymbol]) -> Vec<EdgeCandidate> {
                 source_span: child.span(),
                 callee_span: None,
                 import_scope: None,
+                import_source_module: None,
                 edge_kind: EdgeKind::Contains,
                 confidence: EdgeConfidence::Exact,
             });
@@ -302,6 +303,7 @@ pub(crate) fn rust_impl_edges(
             // located identifier node, so there is no clean callee range to record (#67).
             callee_span: None,
             import_scope: None,
+            import_source_module: None,
             edge_kind: EdgeKind::Implements,
             confidence: EdgeConfidence::NameOnly,
         });
@@ -650,6 +652,14 @@ pub(crate) fn python_edges(
             // rebinding of the alias name (#174 review) — see `python_import_target`.
             let module_root = record_alias.then(|| python_module_root(node)).flatten();
             let module_id = module.map(|m| m.id());
+            // The ABSOLUTE source module (`django.core`) for classifying imported names external
+            // (#182). A relative import (text starts with `.`) is in-corpus by construction →
+            // `None` (never suppressed, conservative). `None` too when there's no
+            // module node (`from . import x` parses the dots as the relative prefix).
+            let absolute_module = module
+                .and_then(|m| m.utf8_text(text.as_bytes()).ok())
+                .map(str::trim)
+                .filter(|m| !m.is_empty() && !m.starts_with('.'));
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 if Some(child.id()) == module_id {
@@ -662,16 +672,18 @@ pub(crate) fn python_edges(
                     record_alias,
                     import_start,
                     module_root,
+                    absolute_module,
                     out,
                 );
             }
         },
         // `import <module>` / `import <module> as alias` — Imports edge to the module, not the
-        // alias.
+        // alias. `import x` binds the qualified name `x` (you write `x.y`), not a bare name, and is
+        // left out of external classification (conservative, #182): `module_path = None`.
         "import_statement" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                python_import_target(child, text, path, false, node.start_byte(), None, out);
+                python_import_target(child, text, path, false, node.start_byte(), None, None, out);
             }
         },
         // Function / method / constructor call. Mirror the C handler: the callee is the LAST
@@ -1090,6 +1102,7 @@ fn python_import_binds_name(node: Node<'_>, name: &str, text: &str) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn python_import_target(
     child: Node<'_>,
     text: &str,
@@ -1097,12 +1110,26 @@ fn python_import_target(
     record_alias: bool,
     import_start: usize,
     module_root: Option<Node<'_>>,
+    // The ABSOLUTE source module of a `from <module> import <name>` (`django.core`), or `None` for
+    // a relative import / `import x` / when the module is unknown. Set on the plain name edge
+    // so resolution can classify `name` external (#182). Relative imports are in-corpus by
+    // construction, so they pass `None` and are never suppressed (conservative).
+    module_path: Option<&str>,
     out: &mut Vec<EdgeCandidate>,
 ) {
     if child.kind() == "import_list" {
         let mut cursor = child.walk();
         for clause in child.named_children(&mut cursor) {
-            python_import_target(clause, text, path, record_alias, import_start, module_root, out);
+            python_import_target(
+                clause,
+                text,
+                path,
+                record_alias,
+                import_start,
+                module_root,
+                module_path,
+                out,
+            );
         }
         return;
     }
@@ -1148,7 +1175,17 @@ fn python_import_target(
     if let Some(target) = target
         && let Some(name) = last_identifier_text(target, text)
     {
-        out.push(file_edge(path, target, text, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+        let mut edge =
+            file_edge(path, target, text, name, EdgeKind::Imports, EdgeConfidence::NameOnly);
+        // Carry the absolute source module so resolution can classify this imported name external
+        // (#182) — ONLY for a NON-aliased `from M import name` (`dotted_name`). An aliased import
+        // (`from urllib3.util import Timeout as TimeoutSauce`) binds the ALIAS, not the target, in
+        // the file; marking the target external would risk suppressing an unrelated LOCAL symbol of
+        // the target's name (the #174 regression). Relative imports / `import x` pass `None`.
+        if child.kind() != "aliased_import" {
+            edge.import_source_module = module_path.map(str::to_string);
+        }
+        out.push(edge);
     }
 }
 
@@ -1171,6 +1208,7 @@ pub(crate) fn file_edge(
         // File-level edges (imports / exports / mod) have no callee identifier to anchor (#67).
         callee_span: None,
         import_scope: None,
+        import_source_module: None,
         edge_kind,
         confidence,
     }
@@ -1200,6 +1238,7 @@ pub(crate) fn file_edge_scoped(
         source_span: span_for_node(node),
         callee_span: None,
         import_scope,
+        import_source_module: None,
         edge_kind,
         confidence,
     }
@@ -1297,6 +1336,7 @@ pub(crate) fn symbol_edge_with_context(
         source_span: span_for_node(node),
         callee_span,
         import_scope: None,
+        import_source_module: None,
         edge_kind,
         confidence,
     }

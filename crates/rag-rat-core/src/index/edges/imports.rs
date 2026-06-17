@@ -248,6 +248,37 @@ fn path_dependency_is_in_corpus(manifest_dir: &Path, path: &str, root: &Path) ->
     }
 }
 
+/// The set of in-corpus Python module dotted paths, from indexed `.py` file paths (#182). A regular
+/// file `a/b/c.py` → module `a.b.c`; a package init `a/b/__init__.py` → package `a.b`. Paths are
+/// repo-root-relative — the root from which ABSOLUTE imports resolve — so `from a.b import x` is
+/// in-corpus iff `a.b` (or `a.b.x` as a submodule) is in this set. ASSUMES root-layout (the import
+/// root is the indexed root); a `src/`-layout package would need package-root (`__init__.py`)
+/// detection — deferred (it would only ever cause MISSED suppression, never a wrong one).
+pub(crate) fn python_module_set<'a>(paths: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for path in paths {
+        let normalized = path.replace('\\', "/");
+        let Some(stripped) = normalized.strip_suffix(".py") else { continue };
+        let module_path = stripped.strip_suffix("/__init__").unwrap_or(stripped);
+        if !module_path.is_empty() {
+            set.insert(module_path.replace('/', "."));
+        }
+    }
+    set
+}
+
+/// Whether a plain absolute `from <module> import <name>` resolves OUTSIDE the in-corpus module set
+/// (#182): external iff NEITHER `module` NOR `module.name` (the name as a submodule) is in
+/// `in_corpus`. An external name must not bind to a local same-named symbol. Fails toward in-corpus
+/// (no suppression) — the conservative direction.
+pub(crate) fn is_external_python_module(
+    module: &str,
+    name: &str,
+    in_corpus: &HashSet<String>,
+) -> bool {
+    !in_corpus.contains(module) && !in_corpus.contains(&format!("{module}.{name}"))
+}
+
 /// Parse a Rust `use` statement into its crate root and the leaf NAMES it actually binds into
 /// scope — the only names a bare reference can resolve through. The imports edge stream enumerates
 /// every identifier under a `use` path (`use std::path::{Path, PathBuf}` emits `std::path`, `Path`,
@@ -421,6 +452,13 @@ pub(crate) struct ImportScope {
     /// this REBINDS an alias use to its in-corpus target name, rather than just flagging it
     /// external.
     python_aliases: HashMap<i64, HashMap<String, Vec<PythonAlias>>>,
+    /// Per-file Python names imported from an EXTERNAL (out-of-corpus) module: `file_id → {name}`
+    /// (#182). Populated at resolve time by classifying each plain absolute `from M import name`
+    /// against the in-corpus module set ([`python_module_set`] / [`is_external_python_module`]). A
+    /// name here makes [`Self::is_external_import`] true, so a bare reference to it is NOT bound
+    /// to a local same-named symbol — the Python mirror of the Rust crate-root suppression in
+    /// `by_file`.
+    python_external: HashMap<i64, HashSet<String>>,
 }
 
 /// One Python import alias binding: the imported target name the alias stands for, scoped to a byte
@@ -622,7 +660,20 @@ impl ImportScope {
     /// denotes that dependency's item and must NOT bind to a local same-named symbol. Fails
     /// OPEN: with no local-crate set (non-Cargo corpus / manifest scan found nothing), nothing
     /// is suppressed.
+    /// Record that `name` was imported from an external module in `file_id` (#182) — set by the
+    /// resolve-time classifier for a plain absolute `from M import name` whose `M` is
+    /// out-of-corpus.
+    pub(crate) fn add_python_external_import(&mut self, file_id: i64, name: String) {
+        self.python_external.entry(file_id).or_default().insert(name);
+    }
+
     pub(crate) fn is_external_import(&self, file_id: i64, name: &str, ref_byte: usize) -> bool {
+        // Python (#182): a name imported from an out-of-corpus module is external regardless of the
+        // Rust crate-root machinery below (which is empty for Python files). Mirrors the Rust
+        // path's role for the existing `imported_external` suppression in `resolve_symbol`.
+        if self.python_external.get(&file_id).is_some_and(|names| names.contains(name)) {
+            return true;
+        }
         let local_roots = self.roots_for_file(file_id);
         // Fail open ONLY for a non-Cargo corpus (no manifest scanned). A Cargo project with no
         // library crates (bin-only) has an empty root set but still suppresses external imports —
@@ -665,6 +716,51 @@ impl ImportScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_module_set_maps_paths_to_dotted_modules() {
+        let set = python_module_set([
+            "django/db/models/query.py",
+            "django/db/models/__init__.py",
+            "django/db/__init__.py",
+            "notpython.txt",
+        ]);
+        assert!(set.contains("django.db.models.query"));
+        assert!(set.contains("django.db.models")); // __init__.py → the package
+        assert!(set.contains("django.db"));
+        assert!(!set.contains("notpython")); // non-.py ignored
+    }
+
+    #[test]
+    fn is_external_python_module_classifies_against_the_in_corpus_set() {
+        // Only `django/db/*` is indexed (a sub-package binding).
+        let in_corpus = python_module_set([
+            "django/db/__init__.py",
+            "django/db/models/__init__.py",
+            "django/db/utils.py",
+        ]);
+        // `from django.core.exceptions import X` → module out-of-corpus → external (the #182 gap).
+        assert!(is_external_python_module("django.core.exceptions", "ValidationError", &in_corpus));
+        // `from django.db import models` → `django.db` in corpus → NOT external.
+        assert!(!is_external_python_module("django.db", "models", &in_corpus));
+        // `from django.db import connection` → name-as-submodule not needed; `django.db` in corpus.
+        assert!(!is_external_python_module("django.db", "connection", &in_corpus));
+        // `from django.db.models import Q` → `django.db.models` in corpus → NOT external.
+        assert!(!is_external_python_module("django.db.models", "Q", &in_corpus));
+        // A third-party import is external.
+        assert!(is_external_python_module("urllib3.util", "Timeout", &in_corpus));
+    }
+
+    #[test]
+    fn python_external_import_makes_is_external_import_true() {
+        let mut scope = ImportScope::new(HashSet::new());
+        scope.add_python_external_import(7, "ValidationError".to_string());
+        // The name is external in file 7 (ref_byte unused for the Python set).
+        assert!(scope.is_external_import(7, "ValidationError", 0));
+        // A different name / file is not.
+        assert!(!scope.is_external_import(7, "models", 0));
+        assert!(!scope.is_external_import(9, "ValidationError", 0));
+    }
 
     /// Helper: `(root, sorted leaves)` so the assertions don't depend on traversal order.
     fn parsed(use_text: &str) -> Option<(String, Vec<String>)> {

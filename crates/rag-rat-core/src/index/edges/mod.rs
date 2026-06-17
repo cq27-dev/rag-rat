@@ -121,6 +121,13 @@ pub(crate) struct EdgeCandidate {
     /// Module-aware import scope; see [`ImportScopeRange`]. `Some` only for Rust Imports edges (a
     /// `use`'s enclosing scope, or an inline `mod`'s body range); `None` for every other edge.
     import_scope: Option<ImportScopeRange>,
+    /// The ABSOLUTE source module of a Python `from <module> import <name>` (#182): set ONLY on
+    /// the per-NAME Imports edge of a plain (non-alias) absolute from-import — the dotted
+    /// module text (`django.core.exceptions`). `None` for everything else (relative imports,
+    /// module edges, aliases, non-Python). Resolution classifies `name` external when this
+    /// module resolves to no in-corpus module, so a bare `name` reference is not bound to a
+    /// local same-named symbol.
+    import_source_module: Option<String>,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
 }
@@ -271,6 +278,11 @@ struct CompactEdge {
     import_scope_start_byte: u32,
     import_scope_end_byte: u32,
     import_mod_id: i64,
+    /// Interned absolute Python from-import module (#182); `OptSym::NONE` for every
+    /// non-classifiable edge. In-memory only — the full-rebuild driver reads it to classify
+    /// external imports; not yet persisted to `edges_data` (incremental persistence is a
+    /// follow-up).
+    import_source_module: OptSym,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
 }
@@ -405,6 +417,7 @@ impl FullRebuildGraph {
             import_scope_start_byte,
             import_scope_end_byte,
             import_mod_id,
+            import_source_module: self.arena.intern_opt(candidate.import_source_module.as_deref()),
             edge_kind: candidate.edge_kind,
             confidence: candidate.confidence,
         };
