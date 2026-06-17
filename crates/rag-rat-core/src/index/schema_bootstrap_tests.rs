@@ -2462,6 +2462,33 @@ pub fn caller() {
         "logical exact callers: {exact_logical:?}"
     );
 
+    // #201 review (P2): feeding the candidate's `sym_<hex>` handle back through the
+    // `ref`/symbol_path slot must resolve to the logical group's members WITHOUT reporting
+    // disambiguation — every member shares that one handle, so the client has no more specific
+    // token to give. (Before the fix, `disambiguation_required` was computed from the raw
+    // 2-candidate count → a dead end.)
+    let handle = crate::serde_big_id::format_sym_handle(logical_symbol_id);
+    let by_ref_handle = db
+        .symbol_candidates(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: Some(handle),
+            symbol: None,
+            language: None,
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(by_ref_handle.candidates.len(), 2, "handle resolves the whole cfg group");
+    assert!(
+        by_ref_handle.candidates.iter().all(|c| c.logical_symbol_id == Some(logical_symbol_id)),
+        "every member shares the queried handle"
+    );
+    assert!(
+        !by_ref_handle.disambiguation_required,
+        "a handle in the ref slot is not ambiguous: {by_ref_handle:?}"
+    );
+
     fs::remove_dir_all(root).unwrap();
 }
 

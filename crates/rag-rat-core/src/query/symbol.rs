@@ -138,11 +138,13 @@ pub fn lookup_candidates(
     include_generated: bool,
 ) -> anyhow::Result<SymbolLookup> {
     let candidates = candidates_for_selector(conn, selector, include_generated)?;
-    Ok(SymbolLookup {
-        disambiguation_required: needs_disambiguation(&candidates, selector.allow_ambiguous),
-        candidates,
-        stale_files: Vec::new(),
-    })
+    // A handle — `id`, or a `sym_<hex>` in the ref/symbol_path slot (#201) — resolves to one
+    // logical symbol's members; binding to any member is binding to the same thing, so a
+    // cfg-split/overload group must NOT report disambiguation (the client has no more specific
+    // token to give). Mirrors `select_one`'s handle short-circuit.
+    let disambiguation_required = selector.effective_logical_symbol_id().is_none()
+        && needs_disambiguation(&candidates, selector.allow_ambiguous);
+    Ok(SymbolLookup { disambiguation_required, candidates, stale_files: Vec::new() })
 }
 
 pub fn select_one(
