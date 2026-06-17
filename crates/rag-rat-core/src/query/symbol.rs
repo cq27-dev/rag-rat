@@ -101,6 +101,19 @@ pub struct SymbolSelector {
     pub limit: u32,
 }
 
+impl SymbolSelector {
+    /// The logical-symbol handle to resolve by — `logical_symbol_id` if set, else a `sym_<hex>`
+    /// handle that arrived in the `ref`/`symbol_path` slot (#201). A `symbol_lookup` candidate is
+    /// emitted with its handle as `id`, so the obvious drill-down — feeding that token back as
+    /// `ref` — used to resolve `symbol_path = "sym_…"` against qualified names, match nothing, and
+    /// return null. Routing it here (a qualified name never looks like a `sym_` handle, so there's
+    /// no ambiguity) makes the handle work in EITHER slot across every symbol-shaped tool.
+    pub fn effective_logical_symbol_id(&self) -> Option<i64> {
+        self.logical_symbol_id
+            .or_else(|| self.symbol_path.as_deref().and_then(crate::serde_big_id::parse_sym_handle))
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SymbolDisambiguation {
     pub candidates: Vec<SymbolHit>,
@@ -142,7 +155,7 @@ pub fn select_one(
     if candidates.is_empty() {
         return Ok(Ok(None));
     }
-    if selector.logical_symbol_id.is_some() {
+    if selector.effective_logical_symbol_id().is_some() {
         return Ok(Ok(Some(candidates.remove(0))));
     }
     if needs_disambiguation(&candidates, selector.allow_ambiguous) {
@@ -207,7 +220,10 @@ fn candidates_for_selector(
     selector: &SymbolSelector,
     include_generated: bool,
 ) -> anyhow::Result<Vec<SymbolHit>> {
-    if let Some(logical_symbol_id) = selector.logical_symbol_id {
+    // `logical_symbol_id`, OR a `sym_<hex>` handle that arrived in the `symbol_path`/`ref` slot
+    // (#201) — resolve both as the logical symbol so a drilled-down candidate handle works in
+    // either slot.
+    if let Some(logical_symbol_id) = selector.effective_logical_symbol_id() {
         return lookup_logical_members(conn, logical_symbol_id, selector.limit);
     }
     if let Some(symbol_id) = selector.symbol_id {
@@ -492,4 +508,37 @@ fn enrich_symbol_hit(conn: &Connection, hit: &mut SymbolHit) -> anyhow::Result<(
         hit.logical_group_reason = Some(logical.group_reason);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selector(logical_symbol_id: Option<i64>, symbol_path: Option<&str>) -> SymbolSelector {
+        SymbolSelector {
+            logical_symbol_id,
+            symbol_id: None,
+            symbol_path: symbol_path.map(str::to_string),
+            symbol: None,
+            language: None,
+            allow_ambiguous: false,
+            limit: 10,
+        }
+    }
+
+    #[test]
+    fn effective_logical_symbol_id_accepts_a_handle_in_either_slot() {
+        let handle = 0x688b_7144_3793_b726_u64 as i64;
+        let token = crate::serde_big_id::format_sym_handle(handle);
+        // Explicit `id` wins.
+        assert_eq!(selector(Some(handle), None).effective_logical_symbol_id(), Some(handle));
+        // #201: a sym_<hex> handle fed into the `ref`/symbol_path slot resolves as the handle.
+        assert_eq!(selector(None, Some(&token)).effective_logical_symbol_id(), Some(handle));
+        // A real qualified name is NOT a handle → falls through to the symbol_path lookup.
+        assert_eq!(
+            selector(None, Some("crates/x/src/a.rs::foo")).effective_logical_symbol_id(),
+            None
+        );
+        assert_eq!(selector(None, None).effective_logical_symbol_id(), None);
+    }
 }
