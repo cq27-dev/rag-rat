@@ -1,8 +1,42 @@
 use super::*;
 
+/// Remove balanced `<...>` generic-argument regions from a call path — and the turbofish's leading
+/// `::` (`f::<a::B>` → `f`, `Vec::<u8>::new` → `Vec::new`) — so a generic argument's `::` /
+/// identifiers don't corrupt path-based call name / receiver / qualified-name extraction. `<`/`>`
+/// inside a `{...}` const-generic block (`Foo::<{ 1 << 2 }>`) are shift/comparison operators, not
+/// generic delimiters, so brace regions suppress angle counting.
+///
+/// A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default`), NOT a generic argument —
+/// stripping it would drop the type/receiver and mangle the qualified name (#208 review round 10),
+/// so a path that starts with `<` is returned unchanged.
+pub(crate) fn strip_generics(path: &str) -> String {
+    if path.trim_start().starts_with('<') {
+        return path.to_string();
+    }
+    let mut out = String::new();
+    let mut angle: u32 = 0;
+    let mut brace: u32 = 0;
+    for ch in path.chars() {
+        match ch {
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '<' if brace == 0 => {
+                if angle == 0 && out.ends_with("::") {
+                    out.truncate(out.len() - 2);
+                }
+                angle += 1;
+            },
+            '>' if brace == 0 => angle = angle.saturating_sub(1),
+            _ if angle == 0 => out.push(ch),
+            _ => {},
+        }
+    }
+    out
+}
+
 pub(crate) fn target_qualified_name(node: Node<'_>, text: &str) -> Option<String> {
     let function = node.child_by_field_name("function").unwrap_or(node);
-    let value = node_text(function, text);
+    let value = strip_generics(&node_text(function, text));
     (value.contains("::") || value.contains('.')).then(|| value.replace('.', "::"))
 }
 pub(crate) fn dotted_qualified_name(identifiers: &[String]) -> Option<String> {
@@ -31,8 +65,19 @@ pub(crate) fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Optio
         Some(first)
     }
 }
+/// A trailing turbofish (`f::<T>`) wraps the callee path in a `generic_function`; unwrap it so the
+/// type arguments' identifiers / byte ranges aren't mistaken for the callee.
+fn unwrap_generic_function(function: Node<'_>) -> Node<'_> {
+    if function.kind() == "generic_function" {
+        function.child_by_field_name("function").unwrap_or(function)
+    } else {
+        function
+    }
+}
+
 pub(crate) fn call_target_name(node: Node<'_>, text: &str) -> Option<String> {
     node.child_by_field_name("function")
+        .map(unwrap_generic_function)
         .and_then(|child| last_identifier_text(child, text))
         .map(|name| short_name(&name).to_string())
         .or_else(|| first_identifier_text(node, text))
@@ -44,13 +89,14 @@ pub(crate) fn call_target_name(node: Node<'_>, text: &str) -> Option<String> {
 /// node is available — never guess a wrong range.
 pub(crate) fn call_target_node(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("function")
+        .map(unwrap_generic_function)
         .and_then(last_identifier_node)
         .or_else(|| first_identifier_node(node))
         .map(final_segment_node)
 }
 pub(crate) fn scoped_receiver_name(node: Node<'_>, text: &str) -> Option<String> {
     let function = node.child_by_field_name("function").unwrap_or(node);
-    let value = node_text(function, text);
+    let value = strip_generics(&node_text(function, text));
     let separator = if value.contains("::") {
         "::"
     } else if value.contains('.') {

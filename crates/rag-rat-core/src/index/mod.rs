@@ -200,7 +200,15 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // 8: #200 — the graph re-extract+resolve now emits the `dispatch_construct`/`dispatch_handle` FACT
 // rows and synthesizes `dispatches` edges; without the bump a migrated v7 index would carry NO
 // dispatch edges until a manual rebuild, since the re-resolve (which re-extracts edges) never runs.
-const GRAPH_INDEX_VERSION: &str = "8";
+// 9: #207/#208 — the dispatch HANDLER detection changed (conservative closed recognizer), so the
+// `dispatch_handle` facts an existing v8 index extracted are stale (old tail-only handlers); the
+// bump re-extracts them so the corrected `dispatches` edges reach deployed indexes.
+// 10: #208 review rounds 9/10 — effect-only handler fallback (`h()?; Ok(unit)`), wrapper/delegate
+// reclassification (PascalCase tails, UFCS, Err), if-let payloads, `let mut`, field-store bails;
+// re-extract so the corrected `dispatch_handle` set reaches deployed indexes.
+// 11: #208 review round 11 — effect-only fallback records the direct call (no shadowing
+// misresolve); method calls on scoped receivers (`worker.run()`) are recorded again; re-extract.
+const GRAPH_INDEX_VERSION: &str = "11";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —

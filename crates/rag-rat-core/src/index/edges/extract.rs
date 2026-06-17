@@ -1463,31 +1463,317 @@ fn alternative_constructor_key<'a>(
     enum_variant_key(path, text).map(|key| (key, path))
 }
 
-/// The DELEGATE call(s) a `match` arm routes to (#200): the tail call of the arm body, descending
-/// through control-flow shapes so a guard/scrutinee is never mistaken for the handler. A block →
-/// its tail expression; an `if` → both branch tails; a nested `match` → each arm's tail; `await`/
-/// `return`/`break`/parens/unsafe/try → their inner expression. A bare `call_expression` is the
-/// call itself. Anything else (a non-call tail, e.g. a literal) contributes nothing. Critically
-/// this does NOT descend into a call's arguments, so `handle(validate(x))` yields only `handle`,
-/// and `if ready() { a() } else { b() }` yields `a`/`b` — never `ready`.
-fn collect_tail_calls<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+/// The DELEGATE handler call(s) a `match` arm routes to (#200/#207/#208). Traces the calls whose
+/// result becomes the arm's RESPONSE through a CLOSED set of value adapters (wrappers,
+/// constructors, containers, field/index/cast projections) and SIMPLE `let` bindings.
+///
+/// Deliberately CONSERVATIVE rather than a full dataflow analysis (#208 review, ~7 rounds): a
+/// precise answer needs Rust value-provenance + name-resolution + mutation tracking, which leaks at
+/// every un-modeled construct. Instead, anything not in the closed model emits NOTHING (a missed
+/// edge, never a false one):
+/// - if the arm REBINDS a local anywhere (`x = ..` / `(x, _) = ..`), bail entirely — a mutated
+///   binding's value can't be tracked path-sensitively, so no edge is synthesized for the arm;
+/// - only a plain `let x = value` maps `x` to its producer; any destructuring `let` invalidates its
+///   bindings (can't attribute which producer feeds which name);
+/// - `if`/`match` contribute only branch RESULTS (never a condition/scrutinee); a single match-arm
+///   payload binding inherits the scrutinee's producer; a side-effect statement / struct field
+///   LABEL / nested handler ARGUMENT is never a handler.
+fn collect_handler_calls<'a>(node: Node<'a>, text: &str, out: &mut Vec<Node<'a>>) {
+    if arm_rebinds_local(node) {
+        return;
+    }
+    result_handler_calls(node, text, &std::collections::HashMap::new(), out);
+}
+
+/// Whether the arm body MUTATES a local through any `=`/`op=` whose target subtree contains an
+/// identifier — anywhere under `node`. That covers an identifier (`resp = ..`), a destructuring
+/// tuple/array/struct/tuple-struct (`(resp,_) = ..`, `Out { resp } = ..`), a wrapped form
+/// (`(resp) = ..`, `*p = ..`), AND a field/index store on a local (`r.id = ..`, `buf[0] = ..` —
+/// which can stale a returned `r.id`/`buf[0]` projection, #208 review round 10). Any of these can
+/// make a `let` binding's stored producer stale in ways that need real control-flow / scope
+/// dataflow, so the whole arm BAILS rather than risk a stale/false handler edge. Conservative: a
+/// field store on a non-returned place (`self.metric = ..`) also bails — accepted recall.
+fn arm_rebinds_local(node: Node<'_>) -> bool {
+    if matches!(node.kind(), "assignment_expression" | "compound_assignment_expr")
+        && let Some(left) = node.child_by_field_name("left")
+        && subtree_has_identifier(left)
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).any(arm_rebinds_local)
+}
+
+/// Whether `node`'s subtree contains an `identifier` — used to decide if an assignment target can
+/// rebind/stale a local (see [`arm_rebinds_local`]).
+fn subtree_has_identifier(node: Node<'_>) -> bool {
+    if node.kind() == "identifier" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).any(subtree_has_identifier)
+}
+
+/// See [`collect_handler_calls`]. `scope` maps an in-scope binding name to the ALREADY-RESOLVED
+/// handler calls its current value contributes (built in declaration order; a later `let` or
+/// assignment of the same name replaces the entry). A binding read just contributes its stored
+/// handlers — there is no binding→binding recursion, hence no depth/cycle guard.
+fn result_handler_calls<'a>(
+    node: Node<'a>,
+    text: &str,
+    scope: &std::collections::HashMap<String, Vec<Node<'a>>>,
+    out: &mut Vec<Node<'a>>,
+) {
     match node.kind() {
-        "call_expression" => out.push(node),
+        "call_expression" => match classify_call(node, text) {
+            // The handler — recorded, args NOT descended. (A method call on a scoped binding —
+            // `v.into()`, `worker.run()` — is recorded too: a real handler-method like `worker.run`
+            // resolves and surfaces, while a pure adapter like `v.into`/`v.clone` is a std trait
+            // method that doesn't resolve to an in-corpus symbol, so it's dropped at resolution and
+            // creates no edge — #208 review round 11.)
+            CallRole::Delegate => out.push(node),
+            CallRole::Skip => {},
+            CallRole::Wrapper =>
+            // A transparent wrapper / variant constructor returns its SINGLE wrapped value, so the
+            // handler is whatever produced it. Descend only the lone payload arg — with MULTIPLE
+            // args we can't tell which is the response (`Resp::X(handler(), metric())`). Comments
+            // are NAMED children, so filter them before counting.
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    let mut cursor = args.walk();
+                    let arguments: Vec<Node<'a>> = args
+                        .named_children(&mut cursor)
+                        .filter(|arg| !matches!(arg.kind(), "line_comment" | "block_comment"))
+                        .collect();
+                    if let [only] = arguments.as_slice() {
+                        result_handler_calls(*only, text, scope, out);
+                    }
+                },
+        },
+        "identifier" => {
+            // A value-position read of a binding contributes its already-resolved handlers.
+            if let Ok(name) = node.utf8_text(text.as_bytes())
+                && let Some(handlers) = scope.get(name)
+            {
+                out.extend(handlers.iter().copied());
+            }
+        },
         "block" => {
+            // Skip comments: tree-sitter exposes `line_comment`/`block_comment` as NAMED children,
+            // so a trailing comment would otherwise masquerade as the block's tail expression.
             let mut cursor = node.walk();
-            if let Some(tail) = node.named_children(&mut cursor).last() {
-                collect_tail_calls(tail, out);
+            let children: Vec<Node<'a>> = node
+                .named_children(&mut cursor)
+                .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+                .collect();
+            let Some((tail, statements)) = children.split_last() else {
+                return;
+            };
+            // Resolve `let` bindings in declaration order. Only a PLAIN `let x = value` maps `x` to
+            // its producer; a destructuring `let` (`let (a, b) = ..`, `let Out { x } = ..`) can't
+            // attribute which producer feeds which binding, so it INVALIDATES its names. (The arm
+            // has already been checked free of reassignment by `arm_rebinds_local`, so
+            // a binding's mapped value is final.)
+            let mut local = scope.clone();
+            for statement in statements {
+                if statement.kind() != "let_declaration" {
+                    continue; // a bare side-effect statement is not a handler source
+                }
+                let Some(pattern) = statement.child_by_field_name("pattern") else {
+                    continue;
+                };
+                if let Some(name) = simple_binding_name(pattern, text) {
+                    let mut handlers = Vec::new();
+                    if let Some(value) = statement.child_by_field_name("value") {
+                        result_handler_calls(value, text, &local, &mut handlers);
+                    }
+                    local.insert(name, handlers);
+                } else {
+                    let mut names = Vec::new();
+                    pattern_binding_names(pattern, text, &mut names);
+                    for name in names {
+                        local.remove(&name);
+                    }
+                }
+            }
+            let before = out.len();
+            if tail.kind() != "let_declaration" {
+                result_handler_calls(*tail, text, &local, out);
+            }
+            // EFFECT-ONLY fallback (#208, held feedback): a command/ack handler does its work in a
+            // `?`-propagated side-effecting call and returns a FIXED value (`{ self.diarize(..)?;
+            // Ok(Resp::Done) }`), so the value-trace above found nothing. Record the LAST `?`-stmt
+            // whose payload is a DIRECT delegate call (`<call>.await?` / `<call>?`). Recording the
+            // call DIRECTLY — not via scope-traced `result_handler_calls` — avoids resolving a
+            // `let`-bound `?` (`task?`) against the final block scope, which a later shadowing
+            // `let` could redirect to the wrong producer (#208 review round 11). The
+            // `?` gate + direct-call requirement excludes fire-and-forget side effects
+            // (`metrics::inc();`).
+            if out.len() == before {
+                for statement in children.iter().rev() {
+                    if statement.kind() == "expression_statement"
+                        && let Some(try_expr) = statement.named_child(0)
+                        && try_expr.kind() == "try_expression"
+                        && let Some(call) = unwrap_to_call(try_expr)
+                        && matches!(classify_call(call, text), CallRole::Delegate)
+                    {
+                        out.push(call);
+                        break;
+                    }
+                }
             }
         },
         "if_expression" => {
+            // Branch RESULTS only — the `condition` field (a guard/scrutinee) is never a handler.
+            // EXCEPT an `if let Pat = value` condition: its payload bindings are projections of
+            // `value`, so the CONSEQUENCE inherits the value's handlers (like a match arm, #208).
+            let consequence_scope = match node.child_by_field_name("condition") {
+                Some(condition) if condition.kind() == "let_condition" => {
+                    let mut scrutinee_handlers = Vec::new();
+                    if let Some(value) = condition.child_by_field_name("value") {
+                        result_handler_calls(value, text, scope, &mut scrutinee_handlers);
+                    }
+                    let mut inner = scope.clone();
+                    if let Some(pattern) = condition.child_by_field_name("pattern") {
+                        let mut bound = Vec::new();
+                        pattern_binding_names(pattern, text, &mut bound);
+                        bound.sort();
+                        bound.dedup();
+                        match bound.as_slice() {
+                            [name] => {
+                                inner.insert(name.clone(), scrutinee_handlers);
+                            },
+                            _ =>
+                                for name in bound {
+                                    inner.remove(&name);
+                                },
+                        }
+                    }
+                    inner
+                },
+                _ => scope.clone(),
+            };
             if let Some(consequence) = node.child_by_field_name("consequence") {
-                collect_tail_calls(consequence, out);
+                result_handler_calls(consequence, text, &consequence_scope, out);
             }
             if let Some(alternative) = node.child_by_field_name("alternative") {
-                collect_tail_calls(alternative, out);
+                result_handler_calls(alternative, text, scope, out);
             }
         },
-        "else_clause"
+        "match_expression" => {
+            // Each arm's RESULT only — never the scrutinee directly. An arm's pattern bindings are
+            // projections of the SCRUTINEE, so they inherit the scrutinee's resolved handlers (a
+            // returned payload `match load()? { Some(v) => Ok(Wrap(v)) }` traces `v` back to
+            // `load`). This also overrides any outer `let` of the same name, so a
+            // payload `Some(value)` never resolves to an unrelated outer `let value`
+            // (#208 review).
+            let scrutinee_handlers = match node.child_by_field_name("value") {
+                Some(scrutinee) => {
+                    let mut handlers = Vec::new();
+                    result_handler_calls(scrutinee, text, scope, &mut handlers);
+                    handlers
+                },
+                None => Vec::new(),
+            };
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut arm_cursor = body.walk();
+                for arm in body.named_children(&mut arm_cursor) {
+                    if arm.kind() == "match_arm"
+                        && let Some(value) = arm.child_by_field_name("value")
+                    {
+                        let mut arm_scope = scope.clone();
+                        if let Some(pattern) = arm.child_by_field_name("pattern") {
+                            let mut bound = Vec::new();
+                            pattern_binding_names(pattern, text, &mut bound);
+                            // An or-pattern repeats the same binding per alternative
+                            // (`Ok(v) | Err(v)`); dedup so it counts as the single projected
+                            // payload.
+                            bound.sort();
+                            bound.dedup();
+                            match bound.as_slice() {
+                                // A single payload binding IS the projected scrutinee value —
+                                // inherit its handlers. Multiple
+                                // bindings can't each be the whole scrutinee
+                                // (`(resp, _span)` would credit every binding with every producer),
+                                // so mask them (#208 review).
+                                [name] => {
+                                    arm_scope.insert(name.clone(), scrutinee_handlers.clone());
+                                },
+                                _ =>
+                                    for name in bound {
+                                        arm_scope.remove(&name);
+                                    },
+                            }
+                        }
+                        result_handler_calls(value, text, &arm_scope, out);
+                    }
+                }
+            }
+        },
+        "struct_expression" => {
+            // Trace field VALUES and shorthand reads (`Resp { vector }`), never field LABELS
+            // (`Resp { status: .. }` must not match a `status` local). ONLY when there is exactly
+            // one field value — a multi-field struct can't attribute which field is the
+            // returned response (`Resp { ok: handler(), metric: m() }`), so emit
+            // nothing (no false edge, #208 review).
+            let mut cursor = node.walk();
+            let Some(fields) =
+                node.named_children(&mut cursor).find(|c| c.kind() == "field_initializer_list")
+            else {
+                return;
+            };
+            let mut field_cursor = fields.walk();
+            let values: Vec<Node<'a>> = fields
+                .named_children(&mut field_cursor)
+                .filter(|f| {
+                    matches!(
+                        f.kind(),
+                        "field_initializer"
+                            | "shorthand_field_initializer"
+                            | "base_field_initializer"
+                    )
+                })
+                .collect();
+            if let [field] = values.as_slice() {
+                match field.kind() {
+                    "field_initializer" =>
+                        if let Some(value) = field.child_by_field_name("value") {
+                            result_handler_calls(value, text, scope, out);
+                        },
+                    _ => {
+                        let mut inner_cursor = field.walk();
+                        for inner in field.named_children(&mut inner_cursor) {
+                            result_handler_calls(inner, text, scope, out);
+                        }
+                    },
+                }
+            }
+        },
+        "index_expression" => {
+            // A projection `r[i]` of a result — trace ONLY the indexed receiver (`r`), never the
+            // index expression (`choose_index()` selects, it doesn't produce the response).
+            let mut cursor = node.walk();
+            if let Some(receiver) = node.named_children(&mut cursor).next() {
+                result_handler_calls(receiver, text, scope, out);
+            }
+        },
+        "tuple_expression" | "array_expression" => {
+            // A SINGLE-element container is a transparent wrapper (`(x,)`, `[x]`); a multi-element
+            // one can't attribute which element is the returned response (`(handler(), metric())`),
+            // so emit nothing rather than credit a discarded sibling (#208 review).
+            let mut cursor = node.walk();
+            let elements: Vec<Node<'a>> = node.named_children(&mut cursor).collect();
+            if let [only] = elements.as_slice() {
+                result_handler_calls(*only, text, scope, out);
+            }
+        },
+        // Single-value projections/wrappers of a result (`&x`, `r.id`, `r as u32`, `*r`; the
+        // `field_identifier`/type is not an `identifier`, so it contributes nothing), plus
+        // control-flow and postfix wrappers — trace their children.
+        "reference_expression"
+        | "field_expression"
+        | "type_cast_expression"
+        | "unary_expression"
+        | "else_clause"
         | "expression_statement"
         | "return_expression"
         | "break_expression"
@@ -1497,25 +1783,153 @@ fn collect_tail_calls<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
         | "await_expression" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect_tail_calls(child, out);
-            }
-        },
-        "match_expression" => {
-            let mut cursor = node.walk();
-            for descendant in node.named_children(&mut cursor) {
-                if descendant.kind() == "match_block" {
-                    let mut arm_cursor = descendant.walk();
-                    for arm in descendant.named_children(&mut arm_cursor) {
-                        if arm.kind() == "match_arm"
-                            && let Some(value) = arm.child_by_field_name("value")
-                        {
-                            collect_tail_calls(value, out);
-                        }
-                    }
-                }
+                result_handler_calls(child, text, scope, out);
             }
         },
         _ => {},
+    }
+}
+
+/// The single identifier a PLAIN `let` pattern binds (`let x` / `let mut x`), or `None` for a
+/// destructuring pattern (which is invalidated, not mapped — see [`collect_handler_calls`]).
+fn simple_binding_name(pattern: Node<'_>, text: &str) -> Option<String> {
+    let identifier = match pattern.kind() {
+        "identifier" => pattern,
+        // `let mut x`: the `mut_pattern`'s first named child is the `mutable_specifier`, so find
+        // the identifier child rather than taking `named_child(0)` (#208 review round 10).
+        "mut_pattern" => {
+            let mut cursor = pattern.walk();
+            pattern.named_children(&mut cursor).find(|node| node.kind() == "identifier")?
+        },
+        _ => return None,
+    };
+    identifier.utf8_text(text.as_bytes()).ok().map(str::to_string)
+}
+
+/// Unwrap `?` / `.await` / parentheses to the underlying `call_expression`, for the effect-only
+/// fallback (`<call>.await?` / `<call>?`). `None` if the payload isn't a direct call (e.g. `task?`
+/// awaits a bound value — not a call — and must NOT be resolved against the block scope, #208
+/// review round 11).
+fn unwrap_to_call(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "call_expression" => Some(node),
+        "try_expression" | "await_expression" | "parenthesized_expression" =>
+            node.named_child(0).and_then(unwrap_to_call),
+        _ => None,
+    }
+}
+
+/// The local variable names a `let` / `match`-arm pattern BINDS — snake_case `identifier` leaves
+/// and struct-pattern shorthands — excluding field labels (`field_identifier`), type/variant paths
+/// (PascalCase identifiers, scoped paths), and literals. Used to map destructuring bindings to
+/// their producer and to mask match-arm payloads so they don't resolve to an outer `let` (#208
+/// review).
+fn pattern_binding_names(pattern: Node<'_>, text: &str, out: &mut Vec<String>) {
+    match pattern.kind() {
+        "shorthand_field_identifier" =>
+            if let Ok(name) = pattern.utf8_text(text.as_bytes()) {
+                out.push(name.to_string());
+            },
+        "identifier" =>
+        // A binding is snake_case / `_`-led; a PascalCase identifier pattern is a unit variant or
+        // const, which binds nothing.
+        {
+            if let Ok(name) = pattern.utf8_text(text.as_bytes())
+                && name.chars().next().is_some_and(|c| c == '_' || c.is_lowercase())
+            {
+                out.push(name.to_string());
+            }
+        },
+        "match_pattern" => {
+            // A guarded arm's `pattern` is `match_pattern` = the pattern + an `if <guard>` whose
+            // `condition` holds READS, not bindings — recurse the pattern, skip the guard (#208).
+            let guard = pattern.child_by_field_name("condition");
+            let mut cursor = pattern.walk();
+            for child in pattern.named_children(&mut cursor) {
+                if Some(child) != guard {
+                    pattern_binding_names(child, text, out);
+                }
+            }
+        },
+        "tuple_struct_pattern" | "struct_pattern" => {
+            // Skip the `type` path qualifier (`status::Ready(v)` / `Out { .. }`) — a lowercase
+            // module segment there is NOT a binding and must not mask an outer `let` of
+            // that name (#208).
+            let type_field = pattern.child_by_field_name("type");
+            let mut cursor = pattern.walk();
+            for child in pattern.named_children(&mut cursor) {
+                if Some(child) != type_field {
+                    pattern_binding_names(child, text, out);
+                }
+            }
+        },
+        // A bare `scoped_identifier` pattern is a UNIT-VARIANT / const path (`status::Ready`,
+        // `Mod::CONST`); its segments are a qualifier + variant, never bindings (#208 review).
+        "scoped_identifier" => {},
+        _ => {
+            let mut cursor = pattern.walk();
+            for child in pattern.named_children(&mut cursor) {
+                pattern_binding_names(child, text, out);
+            }
+        },
+    }
+}
+
+/// How `result_handler_calls` treats a `call_expression` (#200/#208 — one classifier so the
+/// delegate/wrapper decision can't disagree with itself, as it did across review rounds):
+/// - `Delegate`: RECORD it as the handler (a free fn `run`, a method `self.embed`, a module-pathed
+///   fn `crate::ml::embed::embed_text`).
+/// - `Wrapper`: a TRANSPARENT wrapper / variant constructor whose single argument IS the response —
+///   `Ok`/`Some` and ANY PascalCase-tail ctor (`MlResp::Embedded`, `dto::Wrapped`, bare `Wrapped`).
+///   Trace its lone payload argument.
+/// - `Skip`: emit nothing — `Err`/`None` (error/absence payload), a snake-tail `Type::assoc`
+///   constructor (`Vec::with_capacity`, `Resp::empty` — its arg configures, isn't the response), or
+///   a UFCS associated call (`<Resp as Default>::default()`).
+///
+/// Classification is by the path TAIL (constructor names are PascalCase; fns/methods are
+/// snake_case), which is receiver-agnostic — so `dto::Wrapped` and `Resp::Embedded` are both
+/// wrappers. Accepted recall: a bare PascalCase FFI fn (`CreateFileW`) reads as a wrapper (traced
+/// through, not recorded) — there is no extraction-time signal vs a tuple-struct ctor, and
+/// recording it risks crediting a constructor as a handler (a false edge), which the contract
+/// forbids.
+enum CallRole {
+    Delegate,
+    Wrapper,
+    Skip,
+}
+
+fn classify_call(call: Node<'_>, text: &str) -> CallRole {
+    let Some(function) = call.child_by_field_name("function") else {
+        return CallRole::Delegate;
+    };
+    let Ok(raw) = function.utf8_text(text.as_bytes()) else {
+        return CallRole::Delegate;
+    };
+    let raw = raw.trim();
+    // A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default()`), an
+    // associated/constructor call — never a handler, and its arg (if any) isn't the response.
+    if raw.starts_with('<') {
+        return CallRole::Skip;
+    }
+    let stripped = strip_generics(raw);
+    let segments: Vec<&str> =
+        stripped.split("::").map(str::trim).filter(|segment| !segment.is_empty()).collect();
+    let Some(tail) = segments.last() else {
+        return CallRole::Delegate;
+    };
+    if matches!(*tail, "Err" | "None") {
+        return CallRole::Skip;
+    }
+    if matches!(*tail, "Ok" | "Some") || is_pascal_case(tail) {
+        // A PascalCase tail is a variant / tuple-struct constructor (`Resp::Embedded`,
+        // `dto::Wrapped`, bare `Wrapped`) — a transparent wrapper of its payload.
+        return CallRole::Wrapper;
+    }
+    // snake_case tail: a `Type::assoc(..)` (PascalCase receiver) is a config-taking constructor;
+    // a bare fn / method / module-pathed fn is the handler.
+    match segments.as_slice() {
+        [.., receiver, _last] if is_pascal_case(receiver) => CallRole::Skip,
+        _ => CallRole::Delegate,
     }
 }
 
@@ -1590,9 +2004,9 @@ fn rust_dispatch_handle_facts(
     let Some(value) = node.child_by_field_name("value") else {
         return;
     };
-    let mut tail_calls = Vec::new();
-    collect_tail_calls(value, &mut tail_calls);
-    for call in &tail_calls {
+    let mut handler_calls = Vec::new();
+    collect_handler_calls(value, text, &mut handler_calls);
+    for call in &handler_calls {
         let Some(handler) = call_target_name(*call, text) else {
             continue;
         };
