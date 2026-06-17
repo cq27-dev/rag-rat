@@ -349,24 +349,34 @@ fn accept_produced_index_tolerates_diagnostic_exit_only_with_usable_data() {
     let empty_shell = scip_bytes("a.py", PositionEncoding::UTF8CodeUnitOffsetFromLineStart, vec![]);
 
     // Clean exit: needs only non-empty bytes (join + health gate validate the rest); an empty doc
-    // shell is fine here (a 0-occurrence run trips the health gate downstream, not this).
-    assert!(accept_produced_index(true, &data, "scip-python", p).unwrap().is_none());
-    assert!(accept_produced_index(true, &empty_shell, "scip-python", p).unwrap().is_none());
+    // shell is fine here (a 0-occurrence run trips the health gate downstream, not this). The
+    // `tolerate_diagnostic_exit` flag is irrelevant on a clean exit.
+    assert!(accept_produced_index(true, true, &data, "scip-python", p).unwrap().is_none());
     assert!(
-        accept_produced_index(true, b"", "scip-python", p).is_err(),
+        accept_produced_index(true, false, &empty_shell, "rust-analyzer", p).unwrap().is_none()
+    );
+    assert!(
+        accept_produced_index(true, true, b"", "scip-python", p).is_err(),
         "clean exit, no bytes → bail"
     );
 
-    // Non-zero (diagnostic) exit: tolerated ONLY with join-usable occurrences.
-    let note = accept_produced_index(false, &data, "scip-python", p).unwrap();
+    // Non-zero exit, DIAGNOSTIC-exit tool (scip-python): tolerated ONLY with usable occurrences.
+    let note = accept_produced_index(false, true, &data, "scip-python", p).unwrap();
     assert!(note.expect("tolerated note").contains("1 occurrences"));
     assert!(
-        accept_produced_index(false, &empty_shell, "scip-python", p).is_err(),
+        accept_produced_index(false, true, &empty_shell, "scip-python", p).is_err(),
         "non-zero exit + empty doc shell (0 occurrences) → bail"
     );
     assert!(
-        accept_produced_index(false, b"", "scip-python", p).is_err(),
+        accept_produced_index(false, true, b"", "scip-python", p).is_err(),
         "non-zero exit + no index → bail"
+    );
+
+    // Non-zero exit, NON-diagnostic tool (rust-analyzer/scip-clang): a real failure — bail even
+    // with a parseable, occurrence-bearing index (it could be a crashed run's partial output).
+    assert!(
+        accept_produced_index(false, false, &data, "rust-analyzer", p).is_err(),
+        "non-diagnostic backend's non-zero exit is a real failure → bail regardless of index"
     );
 }
 
