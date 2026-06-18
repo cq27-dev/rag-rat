@@ -101,14 +101,20 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
 }
 
 fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
-    let (db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
+    let (mut db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
+    // Keep every live linked worktree's branch overlay fresh (#219), so a `worktree`-scoped query
+    // sees that branch's changes without a manual `index --worktree`. Delta-only and idle-safe (the
+    // overlay pass writes nothing when a worktree is unchanged), so it can run every pass; a
+    // worktree change counts toward running the tail below even when config.root itself didn't
+    // change.
+    let overlays_changed = refresh_worktree_overlays(&mut db, config);
     // Idle backstop (issue #63, facet 2): when the sweep changed no content, skip the reconcile /
     // gc / memory-validate tail — an idle server should do no work past discovery. `run_gc` (every
     // GC_EVERY_PASSES) still forces a full tail, so the cases that DON'T flip content_changed are
     // still caught within that bound: a freshly-installed embedder, an embedding backlog left by a
     // time-capped reconcile (PASS_RECONCILE_MAX_SECONDS), and drifted memory anchors. Any real
     // content change runs the full tail immediately.
-    if !content_changed && !run_gc {
+    if !content_changed && !overlays_changed && !run_gc {
         return Ok(());
     }
     let runtime = &config.local_ai.embedding.runtime;
@@ -126,6 +132,33 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
     }
     let _ = db.memory_validate();
     Ok(())
+}
+
+/// Refresh the branch overlay of every live LINKED worktree of `config.root`'s repo (#219), so a
+/// `worktree`-scoped query stays current without a manual `index --worktree`. Returns whether any
+/// overlay actually changed. `index_worktree_overlay` is delta-only and idle-safe (a static
+/// worktree writes nothing), and the connection is restored to the base scope afterward so the rest
+/// of the pass (reconcile / gc / memory-validate) runs unscoped as before. Best-effort per worktree
+/// — a failure on one worktree is logged and doesn't abort the pass.
+fn refresh_worktree_overlays(db: &mut IndexDatabase, config: &Config) -> bool {
+    let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
+    let base_id = crate::index::worktree_id_of(&config.root);
+    let mut changed = false;
+    for worktree in worktrees {
+        if worktree == base_id {
+            continue; // the rooted checkout is the base scope, not an overlay
+        }
+        match db.index_worktree_overlay(config, Path::new(&worktree), &mut |_| {}) {
+            Ok(report) => {
+                changed |= report.indexed > 0 || report.tombstoned > 0 || report.pruned > 0;
+            },
+            Err(err) => eprintln!("watch: worktree overlay refresh failed for {worktree}: {err}"),
+        }
+    }
+    // Restore the base scope for the rest of the pass (index_worktree_overlay leaves the connection
+    // scoped to the last worktree it touched).
+    let _ = db.use_worktree_scope(&config.root, None);
+    changed
 }
 
 /// Whether an event KIND should ever fire a pass. Only content mutations do — `Create`, `Remove`,

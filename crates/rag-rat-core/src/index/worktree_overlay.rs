@@ -13,7 +13,7 @@
 //! ("what changed under config.root?") — it answers "what differs between the base scope and this
 //! sibling checkout?" — so it lives here, not in the incremental discovery path.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use super::*;
 
@@ -149,21 +149,32 @@ impl IndexDatabase {
             &scope,
             progress,
         )?;
+        // Write a tombstone only when one isn't already present, so a re-run on a static worktree
+        // writes nothing (idle-safety, like the readable sha-skip).
+        let mut tombstoned = 0;
         for path in &delta.tombstones {
-            self.write_tombstone_in_scope(path, &worktree_id)?;
+            let exists: bool = self.storage.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.files WHERE path = ?1 AND commit_sha = '' AND \
+                 worktree_id = ?2 AND kind = 'deleted')",
+                params![path_string(path), worktree_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                self.write_tombstone_in_scope(path, &worktree_id)?;
+                tombstoned += 1;
+            }
         }
         let pruned =
             self.prune_overlay_rows_not_in_delta(&worktree_id, &delta.shadowing_paths())?;
-        // The overlay inserted edges unresolved (apply_incremental_file_plan); resolve them in the
-        // now-active overlay scope so the linked symbols are graph-connected.
-        self.resolve_edges()?;
+        // Resolve the overlay's edges (inserted unresolved by apply_incremental_file_plan) in the
+        // now-active overlay scope — ONLY when something changed, so an unchanged worktree refresh
+        // is a true no-op (the watcher refreshes overlays every pass; this keeps idle
+        // passes write-free and clear of the self-sustaining re-index loop).
+        if indexed > 0 || tombstoned > 0 || pruned > 0 {
+            self.resolve_edges()?;
+        }
 
-        Ok(WorktreeOverlayReport {
-            worktree_id,
-            indexed,
-            tombstoned: delta.tombstones.len(),
-            pruned,
-        })
+        Ok(WorktreeOverlayReport { worktree_id, indexed, tombstoned, pruned })
     }
 
     /// Index an EXPLICIT set of repo-relative `paths`, reading bytes from `source_root` (which may
@@ -173,7 +184,6 @@ impl IndexDatabase {
     /// paths from this root into this scope", applying the same target include/exclude policy
     /// as discovery and reusing the per-file prepare/insert pipeline
     /// (`apply_incremental_file_plan`).
-    #[allow(dead_code)] // Reached via index_worktree_overlay (wired in #219 stages 3-5).
     pub(super) fn index_explicit_paths_from_root<F>(
         &self,
         config: &Config,
@@ -185,11 +195,19 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
+        // Existing rows in this scope (path → sha) so an UNCHANGED file is skipped: re-running the
+        // overlay on a static worktree then writes nothing, so the watcher can refresh overlays
+        // every maintenance pass without churn — preserving the idle backstop (#63) and not
+        // tripping the self-sustaining re-index loop.
+        let existing = self.scope_file_shas(&scope.commit_sha, &scope.worktree_id)?;
         let mut files = Vec::new();
         for rel in paths {
             let full_path = source_root.join(rel);
-            if !full_path.is_file() {
-                continue;
+            let Ok(bytes) = std::fs::read(&full_path) else {
+                continue; // not a readable regular file
+            };
+            if existing.get(path_string(rel).as_str()) == Some(&hex_sha256(&bytes)) {
+                continue; // unchanged since the last overlay index
             }
             let Some((language, kind)) = target_for_path(config, rel) else {
                 continue;
@@ -204,6 +222,22 @@ impl IndexDatabase {
             });
         }
         self.apply_incremental_file_plan(files, BTreeSet::new(), progress)
+    }
+
+    /// Existing file rows in a scope as `path → sha256` — for the idle-safe skip above.
+    fn scope_file_shas(
+        &self,
+        commit_sha: &str,
+        worktree_id: &str,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let conn = self.storage.connection();
+        let mut stmt = conn.prepare(
+            "SELECT path, sha256 FROM main.files WHERE commit_sha = ?1 AND worktree_id = ?2",
+        )?;
+        let rows = stmt.query_map(params![commit_sha, worktree_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
 
     /// Remove overlay rows of `worktree_id` whose path is no longer in the delta (the file matches

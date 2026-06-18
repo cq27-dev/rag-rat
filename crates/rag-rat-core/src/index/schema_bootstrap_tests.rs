@@ -8222,6 +8222,74 @@ fn worktree_overlay_rename_is_delete_old_plus_add_new() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+#[test]
+fn maintenance_pass_refreshes_a_linked_worktree_overlay() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    // A watcher maintenance pass auto-refreshes the overlay — no manual `index --worktree`.
+    crate::watch::maintenance_pass(&config, false).unwrap();
+
+    let mut db = IndexDatabase::open(&config.database).unwrap();
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/a.rs"),
+        vec!["linked_fn".to_string()],
+        "the maintenance pass populated the worktree overlay"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_reindex_is_idle_safe() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    let first = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(first.indexed >= 1, "the first overlay pass indexes the delta");
+    // A re-run on an UNCHANGED worktree must be a no-op (sha-skip + tombstone-exists + gated
+    // edge-resolve), so the watcher can refresh every pass without churn (#63 idle backstop).
+    let second = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        (second.indexed, second.tombstoned, second.pruned),
+        (0, 0, 0),
+        "an unchanged worktree re-index writes nothing"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),
