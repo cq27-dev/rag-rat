@@ -35,11 +35,11 @@ impl WorktreeOverlayDelta {
     }
 }
 
-// Fields are read by the #219 stage-2 acceptance tests and by callers wired in stages 3-5; the lib
-// build has no non-test reader yet.
+// Fields are read by the #219 acceptance tests and by callers wired in stage 5 (CLI / watcher); the
+// lib build has no non-test reader yet.
 #[allow(dead_code)]
 #[derive(Debug, Default)]
-pub(crate) struct WorktreeOverlayReport {
+pub struct WorktreeOverlayReport {
     /// The overlay scope's `worktree_id`; empty when `linked_path` was not a valid linked sibling
     /// (the pass was skipped).
     pub(crate) worktree_id: String,
@@ -124,8 +124,7 @@ impl IndexDatabase {
     /// scope, and tombstone the files it removed (#219 stage 2). No-op (empty `worktree_id` in the
     /// report) when `linked_path` is not a valid linked sibling of `config.root`'s repo. Leaves the
     /// connection scope set to the overlay; callers re-`set_context` if they need another scope.
-    #[allow(dead_code)] // Wired into the query/watcher paths in #219 stages 3-5.
-    pub(crate) fn index_worktree_overlay<F>(
+    pub fn index_worktree_overlay<F>(
         &mut self,
         config: &Config,
         linked_path: &Path,

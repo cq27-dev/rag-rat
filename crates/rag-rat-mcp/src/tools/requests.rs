@@ -239,6 +239,11 @@ pub struct SearchArgs {
     pub include_graph: McpGraphMode,
     #[serde(default = "default_search_graph_limit")]
     pub graph_limit: u32,
+    /// Absolute path to a linked git worktree you're working in. When set, results are served from
+    /// that worktree's branch overlay (its committed + uncommitted changes) on top of the indexed
+    /// checkout; omit to query the indexed checkout. An unrelated/invalid path falls back to it.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
@@ -323,6 +328,11 @@ pub struct SymbolArgs {
     /// generated bindings back into the results). Pass `include: []` to suppress memories.
     #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<SymbolInclude>>,
+    /// Absolute path to a linked git worktree you're working in; serves that worktree's branch
+    /// overlay over the indexed checkout. Omit (or pass an unrelated path) for the indexed
+    /// checkout.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 /// Pure symbol-selector args (symbol/ref/id/lang) with no `include` — for tools that resolve ONE
@@ -377,6 +387,11 @@ pub struct SymbolGraphArgs {
     pub include: Option<Vec<GraphInclude>>,
     #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
+    /// Absolute path to a linked git worktree you're working in; serves that worktree's branch
+    /// overlay over the indexed checkout. Omit (or pass an unrelated path) for the indexed
+    /// checkout.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -438,6 +453,11 @@ pub struct ImpactArgs {
     /// `memory_for_path` / `memory_for_call_path`.
     #[serde(default)]
     pub full_memories: bool,
+    /// Absolute path to a linked git worktree you're working in; serves that worktree's branch
+    /// overlay over the indexed checkout. Omit (or pass an unrelated path) for the indexed
+    /// checkout.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -456,6 +476,11 @@ pub struct ReadChunkArgs {
     /// What to include: `memories` (on by default). Pass `include: []` to suppress.
     #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<MemoriesInclude>>,
+    /// Absolute path to a linked git worktree you're working in; serves that worktree's branch
+    /// overlay over the indexed checkout. Omit (or pass an unrelated path) for the indexed
+    /// checkout.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]

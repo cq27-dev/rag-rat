@@ -61,6 +61,13 @@ pub fn call_tool_for_config(
     name: &str,
     arguments: Value,
 ) -> anyhow::Result<Value> {
+    // Optional caller `worktree`: scope the query to a linked worktree's branch overlay instead of
+    // the indexed checkout (#219). Extracted as a COMMON field from the request (serde ignores it
+    // per-tool — no `deny_unknown_fields`), so every tool routes without per-arg-struct plumbing.
+    // `use_worktree_scope` validates it server-side and falls back to the base scope for an absent
+    // / main / foreign / unreadable path — and only writes the per-connection `temp.*` scope
+    // view, so it is safe even on the read-only connection.
+    let worktree = worktree_arg(&arguments);
     // Read tools run on a lock-free read-only connection (#143). Two fall-backs to the read-write
     // open: (1) `try_open_config_read_only` returns `None` when the index still owes a heal/migrate
     // write; (2) a handful of read tools lazily WRITE on a cold path (`semantic_search` heals stale
@@ -68,8 +75,9 @@ pub fn call_tool_for_config(
     // fails on the read-only connection with `SQLITE_READONLY` — we detect that and retry the whole
     // call read-write (which performs the heal). The warm path never writes, so it stays lock-free.
     if is_read_only_tool(name)
-        && let Some(db) = IndexDatabase::try_open_config_read_only(config)?
+        && let Some(mut db) = IndexDatabase::try_open_config_read_only(config)?
     {
+        db.use_worktree_scope(&config.root, worktree.as_deref())?;
         match call_tool_with_db(&db, name, arguments.clone()) {
             Ok(result) => return finalize_tool_result(config, name, result),
             Err(err) if rag_rat_core::storage::is_readonly_violation(&err) => {
@@ -78,9 +86,21 @@ pub fn call_tool_for_config(
             Err(err) => return Err(err),
         }
     }
-    let db = IndexDatabase::open_config(config)?;
+    let mut db = IndexDatabase::open_config(config)?;
+    db.use_worktree_scope(&config.root, worktree.as_deref())?;
     let result = call_tool_with_db(&db, name, arguments)?;
     finalize_tool_result(config, name, result)
+}
+
+/// Extract the optional `worktree` request field (a linked-worktree checkout path) — common to
+/// every tool, read here rather than declared on each arg struct. Trimmed; empty/absent → `None`.
+fn worktree_arg(arguments: &Value) -> Option<std::path::PathBuf> {
+    arguments
+        .get("worktree")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// Post-process a tool result before returning it. Currently only `index_status`: surface the

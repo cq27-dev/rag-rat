@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rag_rat_core::language::Language;
@@ -924,6 +924,78 @@ fn rust_config(root: PathBuf) -> Config {
 fn unique_temp_root() -> PathBuf {
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("rag-rat-mcp-test-{}-{id}", std::process::id()))
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@e")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@e")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+fn candidate_count(value: &Value) -> usize {
+    value.get("candidates").and_then(Value::as_array).map_or(0, Vec::len)
+}
+
+#[test]
+fn worktree_param_routes_query_to_branch_overlay() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@e"]);
+    git(&root, &["config", "user.name", "t"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "base"]);
+    let config = rust_config(root.clone());
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    git(&root, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    git(&linked, &["add", "."]);
+    git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    drop(db);
+
+    let linked_str = linked.to_str().unwrap();
+    // With the `worktree` param the query resolves against that worktree's branch overlay.
+    let hit = call_tool_for_config(
+        &config,
+        "symbol_lookup",
+        json!({"symbol": "linked_fn", "worktree": linked_str}),
+    )
+    .unwrap();
+    assert!(candidate_count(&hit) > 0, "worktree-scoped lookup finds the branch symbol");
+
+    // Without it the base scope is queried — the branch symbol isn't there.
+    let base =
+        call_tool_for_config(&config, "symbol_lookup", json!({"symbol": "linked_fn"})).unwrap();
+    assert_eq!(candidate_count(&base), 0, "base scope does not see the branch symbol");
+
+    // And within the worktree scope the overlay shadows the base symbol.
+    let shadowed = call_tool_for_config(
+        &config,
+        "symbol_lookup",
+        json!({"symbol": "base_fn", "worktree": linked_str}),
+    )
+    .unwrap();
+    assert_eq!(
+        candidate_count(&shadowed),
+        0,
+        "the overlay shadows the base symbol in the worktree scope"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&linked);
 }
 
 #[test]
