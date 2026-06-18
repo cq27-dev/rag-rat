@@ -352,20 +352,8 @@ fn shared_db_base(root: &Path) -> PathBuf {
 /// a standard git repo (bare repo, custom `GIT_DIR`, git unavailable) so resolution falls back to
 /// `root` — never guess.
 fn main_worktree_root(root: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--git-common-dir"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let common_dir = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if common_dir.is_empty() {
-        return None;
-    }
-    let common_dir = root.join(common_dir).canonicalize().ok()?;
+    let repo = gix::discover(root).ok()?;
+    let common_dir = repo.common_dir().canonicalize().ok()?;
     // Only the standard `<main>/.git` layout maps cleanly to a main worktree root.
     if common_dir.file_name()?.to_str()? != ".git" {
         return None;

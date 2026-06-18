@@ -6,8 +6,8 @@ impl IndexDatabase {
     /// Refresh `git_commit` / `git_dirty` meta, writing only the keys that actually changed.
     /// Returns whether either was written (so the caller can tell a no-op pass from a real one).
     pub(super) fn write_git_meta(&self, root: &Path) -> anyhow::Result<bool> {
-        let commit = git_output(root, &["rev-parse", "HEAD"]).unwrap_or_default();
-        let dirty = !git_output(root, &["status", "--porcelain"]).unwrap_or_default().is_empty();
+        let commit = head_sha(root);
+        let dirty = is_worktree_dirty(root);
         let commit_changed = self.set_meta_if_changed("git_commit", &commit)?;
         let dirty_changed =
             self.set_meta_if_changed("git_dirty", if dirty { "true" } else { "false" })?;

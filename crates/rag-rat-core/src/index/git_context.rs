@@ -79,12 +79,38 @@ pub(crate) fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// HEAD commit sha for `root` via gix, or empty if unborn / not a repo (matching the old
+/// `rev-parse HEAD` failure behavior).
+pub(crate) fn head_sha(root: &Path) -> String {
+    gix::discover(root)
+        .ok()
+        .and_then(|repo| repo.head_id().ok().map(|id| id.to_hex().to_string()))
+        .unwrap_or_default()
+}
+
+/// Whether the worktree has any uncommitted change (tracked modifications + untracked files), the
+/// gix equivalent of a non-empty `git status --porcelain`. Lazy: stops at the first change.
+pub(crate) fn is_worktree_dirty(root: &Path) -> bool {
+    let Ok(repo) = gix::discover(root) else {
+        return false;
+    };
+    let Ok(platform) = repo.status(gix::progress::Discard) else {
+        return false;
+    };
+    // No pathspec → the whole worktree; lazy, so `.next()` stops at the first change.
+    let Ok(mut changes) =
+        platform.untracked_files(UntrackedFiles::Files).into_iter(None::<gix::bstr::BString>)
+    else {
+        return false;
+    };
+    changes.next().is_some()
+}
+
 /// The active-checkout `(commit_sha, worktree_id)` keys for `root`, as `open_config` derives them.
 /// `pub` so out-of-crate callers that open an index by path (benches mirroring the production
 /// `open_config` path, integration tests) can install the same active-checkout scope `search` uses.
 pub fn resolve_git_context(root: &Path) -> (String, String) {
-    let commit_sha =
-        git_output(root, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
+    let commit_sha = head_sha(root);
     let worktree_id = root.to_string_lossy().trim_end_matches('/').to_string();
     (commit_sha, worktree_id)
 }

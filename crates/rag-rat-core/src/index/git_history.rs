@@ -658,17 +658,18 @@ fn count_table(conn: &Connection, table: &str) -> anyhow::Result<u64> {
 /// git call (the ignore matcher anchors its `.gitignore` ancestor stack here — issue #62 finding 3:
 /// a `config.root` that is a subdirectory of a larger worktree must honor the worktree-root rules).
 pub(crate) fn worktree_root(root: &Path) -> Option<PathBuf> {
-    git_output(root, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+    gix::discover(root).ok()?.workdir().map(Path::to_path_buf)
 }
 
 fn git_repo(root: &Path) -> Option<GitRepo> {
-    let worktree_root = git_output(root, &["rev-parse", "--show-toplevel"])?;
-    let head = git_output(root, &["rev-parse", "HEAD"])?;
-    // `--is-shallow-repository` prints "true"/"false" (git 2.15+). Treat a probe failure as
-    // not-shallow: the worst case is one redundant full reload, never a skipped one.
-    let shallow =
-        git_output(root, &["rev-parse", "--is-shallow-repository"]).as_deref() == Some("true");
-    Some(GitRepo { worktree_root: PathBuf::from(worktree_root), head, shallow })
+    let repo = gix::discover(root).ok()?;
+    // `workdir()` is `None` for a bare repo — there is no worktree to index, so treat it as
+    // "no git" (the previous `--show-toplevel` failed there too).
+    let worktree_root = repo.workdir()?.to_path_buf();
+    // `head_id()` fails on an unborn HEAD (empty repo) — same as the old `rev-parse HEAD`.
+    let head = repo.head_id().ok()?.to_hex().to_string();
+    let shallow = repo.is_shallow();
+    Some(GitRepo { worktree_root, head, shallow })
 }
 
 /// Canonical serialization of the indexed root for the reload gate. The git-history row set is

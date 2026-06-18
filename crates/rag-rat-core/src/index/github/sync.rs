@@ -9,7 +9,11 @@ pub(crate) fn discover_and_store_refs(
     let mut refs = Vec::new();
     discover_commit_refs(conn, default_repo.as_deref(), &mut refs)?;
     discover_file_refs(conn, root, default_repo.as_deref(), &mut refs)?;
-    let branch = git_output(root, &["branch", "--show-current"]).unwrap_or_default();
+    let branch = gix::discover(root)
+        .ok()
+        .and_then(|repo| repo.head_name().ok().flatten())
+        .map(|name| name.shorten().to_string())
+        .unwrap_or_default();
     for parsed in parse_refs(&branch, default_repo.as_deref()) {
         refs.push(GitHubRef {
             owner: parsed.owner,

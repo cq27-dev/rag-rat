@@ -216,10 +216,6 @@ pub(crate) fn default_repo() -> Option<String> {
 pub(crate) fn gh_available() -> bool {
     Command::new("gh").arg("--version").output().is_ok_and(|output| output.status.success())
 }
-pub(crate) fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).current_dir(root).output().ok()?;
-    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
 pub(crate) fn string_value(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or_default().to_string()
 }
