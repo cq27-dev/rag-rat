@@ -71,14 +71,6 @@ pub(crate) fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
     path == pattern || path.contains(pattern.trim_matches('*'))
 }
 
-pub(crate) fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).current_dir(root).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 /// HEAD commit sha for `root` via gix, or empty if unborn / not a repo (matching the old
 /// `rev-parse HEAD` failure behavior).
 pub(crate) fn head_sha(root: &Path) -> String {
@@ -121,14 +113,30 @@ pub fn resolve_git_context(root: &Path) -> (String, String) {
 pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) {
     let mut commits = Vec::new();
     let mut worktrees = Vec::new();
-    let Some(output) = git_output(root, &["worktree", "list", "--porcelain"]) else {
+    let Ok(repo) = gix::discover(root) else {
         return (commits, worktrees);
     };
-    for line in output.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            worktrees.push(path.trim().trim_end_matches('/').to_string());
-        } else if let Some(sha) = line.strip_prefix("HEAD ") {
-            commits.push(sha.trim().to_string());
+    let push_path = |worktrees: &mut Vec<String>, path: &Path| {
+        worktrees.push(path.to_string_lossy().trim_end_matches('/').to_string());
+    };
+    // The main worktree (gix `worktrees()` lists only the LINKED ones).
+    if let Some(workdir) = repo.workdir() {
+        push_path(&mut worktrees, workdir);
+    }
+    if let Ok(id) = repo.head_id() {
+        commits.push(id.to_hex().to_string());
+    }
+    // Linked worktrees: path from the proxy, HEAD from opening each one.
+    if let Ok(proxies) = repo.worktrees() {
+        for proxy in proxies {
+            if let Ok(base) = proxy.base() {
+                push_path(&mut worktrees, &base);
+            }
+            if let Ok(linked) = proxy.into_repo()
+                && let Ok(id) = linked.head_id()
+            {
+                commits.push(id.to_hex().to_string());
+            }
         }
     }
     (commits, worktrees)
