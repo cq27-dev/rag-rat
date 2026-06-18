@@ -50,6 +50,36 @@ pub struct WorktreeOverlayReport {
     pub pruned: usize,
 }
 
+/// The `config.root` subdir prefix (relative to the repo's workdir) and the LINKED checkout's
+/// equivalent of `config.root`. The subdir is derived from the BASE workdir (both worktrees share
+/// the same layout); the linked root is the linked WORKDIR joined with that subdir — NOT the raw
+/// `linked_path`, which may be a subdir of the checkout (e.g. `--worktree .` from `/wt/src`) or the
+/// git dir (a hook). Falls back to the linked workdir / `linked_path` when the subdir can't be
+/// derived. Shared by the delta computation (path rebasing) and the read step (source root) so the
+/// two can't drift (#219 review).
+fn linked_config_subdir_and_root(
+    config: &Config,
+    base_repo: &gix::Repository,
+    linked_repo: &gix::Repository,
+    linked_path: &Path,
+) -> (PathBuf, PathBuf) {
+    let linked_workdir =
+        linked_repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| linked_path.to_path_buf());
+    // `config.root` is canonicalized (by `Config::load`'s `normalize_existing_dir`), but gix's
+    // `workdir()` may not be; canonicalize the base workdir so the subdir prefix strips cleanly.
+    let config_subdir = base_repo
+        .workdir()
+        .map(|base_workdir| {
+            base_workdir.canonicalize().unwrap_or_else(|_| base_workdir.to_path_buf())
+        })
+        .and_then(|base_workdir| {
+            config.root.strip_prefix(&base_workdir).ok().map(Path::to_path_buf)
+        })
+        .unwrap_or_default();
+    let linked_config_root = linked_workdir.join(&config_subdir);
+    (config_subdir, linked_config_root)
+}
+
 /// Compute the overlay delta of `linked_path` (a linked worktree of `config.root`'s repo) against
 /// the base scope. Candidate paths = the committed branch diff (base HEAD tree ↔ linked HEAD tree)
 /// UNION the linked worktree's working-tree status (dirty + untracked + deleted). Each candidate's
@@ -63,10 +93,13 @@ pub(crate) fn compute_linked_worktree_delta(
 ) -> anyhow::Result<WorktreeOverlayDelta> {
     let base_repo = git_context::discover_repo(&config.root)?;
     let linked_repo = git_context::discover_repo(linked_path)?;
-    // Read files from the linked repo's actual WORKDIR, not the raw `linked_path` (which may be the
-    // git dir or a subdir, e.g. from a hook). Falls back to `linked_path` for a missing workdir.
-    let linked_workdir =
-        linked_repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| linked_path.to_path_buf());
+    // `config.root` may be a SUBDIR of the repo. Tree-diff and status entries are repo-relative
+    // (e.g. `crate/src/lib.rs`), but `target_for_path` / the overlay path keys are config-root-
+    // relative (e.g. `src/lib.rs`), and the readable files are read from the LINKED checkout's
+    // equivalent of `config.root`. `config_subdir` is the prefix to strip; `linked_config_root` is
+    // the source root overlay bytes are read from (#219 review).
+    let (config_subdir, linked_config_root) =
+        linked_config_subdir_and_root(config, &base_repo, &linked_repo, linked_path);
 
     let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
 
@@ -109,10 +142,9 @@ pub(crate) fn compute_linked_worktree_delta(
         && let Ok(items) =
             platform.untracked_files(UntrackedFiles::Files).into_iter(None::<gix::bstr::BString>)
     {
-        for item in items.flatten() {
-            candidates.insert(PathBuf::from(item.location().to_str_lossy().as_ref()));
-        }
-        status_complete = true;
+        status_complete = fold_status_candidates(&mut candidates, items, |item| {
+            PathBuf::from(item.location().to_str_lossy().as_ref())
+        });
     }
 
     // Honor the worktree's `.gitignore` for files PRESENT in the worktree, so the overlay indexes
@@ -123,14 +155,21 @@ pub(crate) fn compute_linked_worktree_delta(
     // Tombstones are NOT ignore-filtered: a branch-deleted file must shadow its base row
     // regardless of ignore rules.
     let ignore =
-        ignore_rules::IgnoreMatcher::compile(&linked_workdir, &config.target_directories());
+        ignore_rules::IgnoreMatcher::compile(&linked_config_root, &config.target_directories());
     let mut delta = WorktreeOverlayDelta { status_complete, ..Default::default() };
-    for rel in candidates {
+    for repo_rel in candidates {
+        // Candidates are repo-relative; the overlay keys rows config-root-relative (matching the
+        // base rows + `target_for_path`). A candidate OUTSIDE the config subdir has no base row to
+        // shadow, so it can't strip the prefix → skip it.
+        let Ok(rel) = repo_rel.strip_prefix(&config_subdir) else {
+            continue;
+        };
+        let rel = rel.to_path_buf();
         // Only paths the base scope would index can be shadowed/overlaid.
         if target_for_path(config, &rel).is_none() {
             continue;
         }
-        let absolute = linked_workdir.join(&rel);
+        let absolute = linked_config_root.join(&rel);
         if absolute.is_file() {
             if ignore.is_ignored(&absolute, false) {
                 continue; // gitignored in the worktree — the base walker wouldn't index it either
@@ -138,13 +177,35 @@ pub(crate) fn compute_linked_worktree_delta(
             delta.readable.push(rel);
         } else if base_tree
             .as_ref()
-            .and_then(|t| t.lookup_entry_by_path(&rel).ok().flatten())
+            .and_then(|t| t.lookup_entry_by_path(&repo_rel).ok().flatten())
             .is_some()
         {
             delta.tombstones.push(rel);
         }
     }
     Ok(delta)
+}
+
+/// Fold a worktree-status iterator of `Result<Item, E>` into `candidates`, returning whether the
+/// read COMPLETED. A per-item error must NOT be flattened away: dropping a path while reporting
+/// "complete" yields a partial candidate set the prune then treats as authoritative, deleting valid
+/// overlay rows for the skipped paths. The first error stops the fold and returns `false`
+/// (incomplete) so the caller skips the prune; an empty stream is complete (#219 review). Generic +
+/// pure so the completeness decision is unit-testable without provoking a real gix status error.
+fn fold_status_candidates<T, E>(
+    candidates: &mut BTreeSet<PathBuf>,
+    items: impl IntoIterator<Item = Result<T, E>>,
+    locate: impl Fn(&T) -> PathBuf,
+) -> bool {
+    for item in items {
+        match item {
+            Ok(item) => {
+                candidates.insert(locate(&item));
+            },
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 fn change_location_path(change: &gix::object::tree::diff::Change<'_, '_, '_>) -> PathBuf {
@@ -183,10 +244,18 @@ impl IndexDatabase {
         self.set_context(&base_sha, &worktree_id)?;
 
         let delta = compute_linked_worktree_delta(config, linked_path)?;
+        // `delta.readable` is config-root-relative, so the bytes are read from the LINKED
+        // checkout's equivalent of `config.root` — not the raw `linked_path` (which may be
+        // a subdir of the checkout, e.g. `--worktree .` from `/wt/src`, or the git dir from
+        // a hook) (#219 review).
+        let base_repo = git_context::discover_repo(&config.root)?;
+        let linked_repo = git_context::discover_repo(linked_path)?;
+        let (_, source_root) =
+            linked_config_subdir_and_root(config, &base_repo, &linked_repo, linked_path);
         let scope = FileScope::worktree(worktree_id.clone());
         let indexed = self.index_explicit_paths_from_root(
             config,
-            linked_path,
+            &source_root,
             &delta.readable,
             &scope,
             progress,
@@ -320,5 +389,47 @@ impl IndexDatabase {
             }
         }
         Ok(pruned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fold_status_candidates_marks_complete_on_a_clean_read() {
+        let mut candidates = BTreeSet::new();
+        let items: Vec<Result<&str, ()>> = vec![Ok("src/a.rs"), Ok("src/b.rs")];
+        let complete = fold_status_candidates(&mut candidates, items, |s| PathBuf::from(s));
+        assert!(complete, "a clean status read is complete");
+        assert_eq!(
+            candidates,
+            BTreeSet::from([PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")]),
+        );
+    }
+
+    #[test]
+    fn fold_status_candidates_marks_incomplete_on_a_per_item_error() {
+        // The bug the #219 review caught: `flatten()` dropped the erroring item but left the read
+        // looking complete, so the prune treated a partial candidate set as authoritative and could
+        // delete valid overlay rows. A per-item error must mark the delta INCOMPLETE.
+        let mut candidates = BTreeSet::new();
+        let items: Vec<Result<&str, ()>> = vec![Ok("src/a.rs"), Err(()), Ok("src/c.rs")];
+        let complete = fold_status_candidates(&mut candidates, items, |s| PathBuf::from(s));
+        assert!(
+            !complete,
+            "a per-item status error makes the delta incomplete → caller skips prune"
+        );
+        // Stops at the error (the trailing path after it is not authoritative either way).
+        assert!(candidates.contains(Path::new("src/a.rs")));
+        assert!(!candidates.contains(Path::new("src/c.rs")));
+    }
+
+    #[test]
+    fn fold_status_candidates_empty_stream_is_complete() {
+        let mut candidates = BTreeSet::new();
+        let items: Vec<Result<&str, ()>> = vec![];
+        assert!(fold_status_candidates(&mut candidates, items, |s| PathBuf::from(s)));
+        assert!(candidates.is_empty());
     }
 }

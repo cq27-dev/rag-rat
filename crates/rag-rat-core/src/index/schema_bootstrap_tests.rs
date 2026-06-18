@@ -8605,6 +8605,83 @@ fn orientation_in_a_linked_worktree_reflects_the_overlay_on_base() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+/// #219 review: when `config.root` is a SUBDIR of the repo, the tree-diff / status candidates are
+/// repo-relative (`crate/src/lib.rs`) but the overlay keys + `target_for_path` are config-root-
+/// relative (`src/lib.rs`). The old code filtered every subdir edit out, so the overlay was empty
+/// and a worktree query kept serving the stale base. The fix rebases candidates to config-relative
+/// and reads bytes from the linked checkout's equivalent of `config.root`.
+#[test]
+fn worktree_overlay_serves_a_subdir_rooted_config() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("crate/src")).unwrap();
+    fs::write(main.join("crate/src/lib.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    // Config rooted at the SUBDIR `crate`, indexing `crate/src`.
+    let config = source_config(main.join("crate"), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Branch edits a file UNDER the config subdir.
+    fs::write(linked.join("crate/src/lib.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    // The caller passes the linked worktree root; `compute_linked_worktree_delta` derives the
+    // `crate` subdir and reads bytes from `<linked>/crate`.
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(report.indexed, 1, "the subdir edit must produce one overlay row");
+
+    db.use_worktree_scope(&config.root, Some(&linked)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/lib.rs"),
+        vec!["linked_fn".to_string()],
+        "the worktree query serves the branch version, keyed config-root-relative"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// #219 review: a caller can pass a path INSIDE the linked checkout (e.g. `--worktree .` run from
+/// `<linked>/src`) rather than its root. The overlay must still read the readable candidates from
+/// the resolved workdir, not from the raw `linked_path` (which would double the `src/` prefix and
+/// fail every read).
+#[test]
+fn worktree_overlay_accepts_a_path_inside_the_linked_checkout() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    // Pass a SUBDIR of the linked checkout, not its root. `gix` discovery resolves the workdir, so
+    // the readable file is read from `<linked>/src/a.rs`, not `<linked>/src/src/a.rs`.
+    let inside = linked.join("src");
+    let report = db.index_worktree_overlay(&config, &inside, &mut |_| {}).unwrap();
+    assert_eq!(report.indexed, 1, "the readable candidate must be read from the resolved workdir");
+
+    db.use_worktree_scope(&config.root, Some(&linked)).unwrap();
+    assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["linked_fn".to_string()]);
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),

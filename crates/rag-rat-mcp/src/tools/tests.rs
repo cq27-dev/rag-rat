@@ -1014,6 +1014,72 @@ fn worktree_param_routes_query_to_branch_overlay() {
 }
 
 #[test]
+fn heal_index_from_a_linked_worktree_does_not_corrupt_the_overlay() {
+    // #219 review: `heal_index` (a WRITE tool) reads file bytes from the stored `source_root` (the
+    // MAIN checkout). If the read-write connection were scoped to the linked worktree, the heal
+    // would reindex the overlay with MAIN's contents or — for a BRANCH-ONLY file, absent from main
+    // — tombstone it in the overlay scope. The fix keeps write tools in the BASE scope and
+    // makes the heal paths refuse to write under a linked overlay scope, so the overlay
+    // survives a `heal_index` invoked from the worktree cwd.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@e"]);
+    git(&root, &["config", "user.name", "t"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "base"]);
+    let config = rust_config(root.clone());
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    git(&root, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Branch modifies one file AND adds a branch-only file (the file absent from main is the strong
+    // corruption vector: a worktree-scoped heal can't read it from `source_root`, so it
+    // tombstones).
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    fs::write(linked.join("src/only.rs"), "pub fn branch_only_fn() {}\n").unwrap();
+    git(&linked, &["add", "."]);
+    git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    drop(db);
+
+    let linked_str = linked.to_str().unwrap();
+    // Run `heal_index` from the worktree cwd (the `worktree` param the dispatcher would honor).
+    call_tool_for_config(&config, "heal_index", json!({"worktree": linked_str})).unwrap();
+
+    // The overlay is intact: the worktree scope still serves the modified BRANCH version, not
+    // main's.
+    let modified = call_tool_for_config(
+        &config,
+        "symbol_lookup",
+        json!({"symbol": "linked_fn", "worktree": linked_str}),
+    )
+    .unwrap();
+    assert!(
+        candidate_count(&modified) > 0,
+        "heal_index from the worktree must NOT overwrite the modified branch overlay",
+    );
+    // The branch-only file is still served — NOT tombstoned by a heal that couldn't read it in
+    // main.
+    let only = call_tool_for_config(
+        &config,
+        "symbol_lookup",
+        json!({"symbol": "branch_only_fn", "worktree": linked_str}),
+    )
+    .unwrap();
+    assert!(
+        candidate_count(&only) > 0,
+        "heal_index must NOT tombstone the branch-only overlay file",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
 fn read_tool_lazy_write_retries_read_write_not_readonly_error() {
     // #143 review: read tools open read-only, but a few lazily WRITE on a cold path — here
     // `read_chunk` calls `mark_file_deleted` when its source file is gone on disk. That write fails

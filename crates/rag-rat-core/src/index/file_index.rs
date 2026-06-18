@@ -13,6 +13,12 @@ struct ChunkInsertFile<'a> {
 
 impl IndexDatabase {
     pub fn heal_file(&self, path: &Path) -> anyhow::Result<()> {
+        // A heal reads bytes from `source_root` (the MAIN checkout). Under a linked-worktree
+        // overlay scope that would shadow the branch's row with MAIN's content, so skip it
+        // — the overlay is maintained only by `index_worktree_overlay` (#219 review).
+        if self.active_scope_is_linked_overlay() {
+            return Ok(());
+        }
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("index has no source_root metadata; rebuild required");
         };

@@ -429,6 +429,22 @@ impl IndexDatabase {
     }
 
     pub fn heal_index(&self, limit: Option<u32>) -> anyhow::Result<HealIndexReport> {
+        // `heal_index` reads file bytes from `source_root` (the MAIN checkout) and would write into
+        // the active scope. Under a linked-worktree overlay scope that reindexes the overlay with
+        // MAIN's contents or tombstones branch-only files, so refuse — the overlay is owned by
+        // `index_worktree_overlay`. Callers scope writes to the base (#219 review).
+        if self.active_scope_is_linked_overlay() {
+            return Ok(HealIndexReport {
+                checked_files: 0,
+                healed_files: 0,
+                removed_files: 0,
+                skipped_files: 0,
+                fts_fresh: !self.fts_dirty()?,
+                message: Some(
+                    "skipped: heal does not run under a linked-worktree overlay scope".to_string(),
+                ),
+            });
+        }
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("heal_index requires source_root metadata; run `rag-rat index` first");
         };

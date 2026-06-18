@@ -1075,7 +1075,13 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         &rag_rat_core::locks::write_lock_path(&config.database),
     )?;
 
-    let db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
+    let mut db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
+    // Keep every live linked worktree's branch overlay fresh (#219). The git hooks run THIS command
+    // (not the foreground watcher), so without this a commit/checkout/merge in a linked worktree
+    // would index the base `config.root` but leave that worktree's overlay stale until a watcher
+    // pass or a manual `index --worktree`. Delta-only + idle-safe, like the watcher's pass; it
+    // restores the base scope afterward so reconcile/gc/memory-validate below run unscoped.
+    rag_rat_core::watch::refresh_worktree_overlays(&mut db, config);
     let elapsed = started.elapsed().as_secs();
     let remaining_seconds = max_seconds.saturating_sub(elapsed);
     let reconcile_report = if remaining_seconds > 0 {
@@ -1187,6 +1193,77 @@ mod tests {
             oracle: Default::default(),
         };
         (root, config)
+    }
+
+    #[test]
+    fn maintenance_command_refreshes_a_linked_worktree_overlay() {
+        // #219 review: the git hooks invoke `rag-rat maintenance` (NOT the foreground watcher), so
+        // this command — not just `watch::maintenance_pass` — must refresh every live linked
+        // worktree's branch overlay. Without it, a commit/checkout/merge in a linked worktree
+        // indexes the base `config.root` but leaves the worktree overlay stale.
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-maint-overlay-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "base"]);
+        let config = Config {
+            root: main.clone(),
+            database: main.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        let linked = root.join("wt");
+        git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+        std::fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+        git(&linked, &["add", "-A"]);
+        git(&linked, &["commit", "-qm", "branch"]);
+
+        // Run the actual CLI maintenance command (the hook entry point).
+        let args = super::MaintenanceArgs {
+            trigger: Some("post-merge".to_string()),
+            max_seconds: Some(0), // skip the embedding reconcile; we only assert the overlay
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+        super::maintenance(&config, &args).unwrap();
+
+        // The worktree-scoped query now sees the branch version, populated by the maintenance pass.
+        let mut db = IndexDatabase::open_config(&config).unwrap();
+        db.use_worktree_scope(&config.root, Some(&linked)).unwrap();
+        let names: Vec<String> =
+            db.symbols("linked_fn", None, 10).unwrap().into_iter().map(|h| h.name).collect();
+        assert!(
+            names.contains(&"linked_fn".to_string()),
+            "the maintenance command must populate the worktree overlay: {names:?}",
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

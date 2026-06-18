@@ -140,7 +140,12 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
 /// worktree writes nothing), and the connection is restored to the base scope afterward so the rest
 /// of the pass (reconcile / gc / memory-validate) runs unscoped as before. Best-effort per worktree
 /// — a failure on one worktree is logged and doesn't abort the pass.
-fn refresh_worktree_overlays(db: &mut IndexDatabase, config: &Config) -> bool {
+///
+/// `pub` so the hook-driven CLI `maintenance` command shares this exact path: the git hooks invoke
+/// `rag-rat maintenance` (not the foreground watcher), so without calling this a commit/checkout/
+/// merge in a linked worktree would index the base `config.root` but leave that worktree's overlay
+/// stale until a watcher pass or a manual `index --worktree` (#219 review).
+pub fn refresh_worktree_overlays(db: &mut IndexDatabase, config: &Config) -> bool {
     let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
     let base_id = crate::index::worktree_id_of(&config.root);
     let mut changed = false;

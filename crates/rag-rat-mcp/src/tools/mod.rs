@@ -86,8 +86,19 @@ pub fn call_tool_for_config(
             Err(err) => return Err(err),
         }
     }
+    // The read-WRITE open, reached by (a) a genuine write tool, or (b) a read tool whose lazy write
+    // tripped `SQLITE_READONLY` (or whose RO open was unavailable). A WRITE tool stays in the BASE
+    // scope: `heal_index` / the `memory_*` tools read file bytes from the stored `source_root` (the
+    // MAIN checkout) but would write into whatever scope the connection carries, so scoping the
+    // connection to a linked worktree would reindex the overlay with MAIN's contents or tombstone
+    // branch-only files — corrupting the overlay that only `index_worktree_overlay` may maintain. A
+    // READ tool keeps the worktree scope so its query still serves the overlay on this fallback;
+    // its lazy heal can't corrupt the overlay because the heal paths skip writes under a linked
+    // overlay scope (`IndexDatabase::active_scope_is_linked_overlay`) (#219 review).
     let mut db = IndexDatabase::open_config(config)?;
-    db.use_worktree_scope(&config.root, worktree.as_deref())?;
+    if is_read_only_tool(name) {
+        db.use_worktree_scope(&config.root, worktree.as_deref())?;
+    }
     let result = call_tool_with_db(&db, name, arguments)?;
     finalize_tool_result(config, name, result)
 }

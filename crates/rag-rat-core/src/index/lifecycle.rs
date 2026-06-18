@@ -188,6 +188,22 @@ impl IndexDatabase {
         Ok(())
     }
 
+    /// Whether this connection is scoped to a LINKED-worktree overlay (a non-empty
+    /// `active_worktree_id` that differs from the base checkout's own id, derived from
+    /// `source_root`). The lazy heal paths (`heal_file`, `heal_index`) read file bytes from
+    /// `source_root` (the MAIN checkout), so writing under a linked overlay scope would shadow the
+    /// branch's rows with MAIN's content; they SKIP the write in that case and leave the overlay to
+    /// `index_worktree_overlay`, the one writer allowed to maintain it (#219 review).
+    pub(crate) fn active_scope_is_linked_overlay(&self) -> bool {
+        if self.active_worktree_id.is_empty() {
+            return false;
+        }
+        match self.storage.source_root() {
+            Some(root) => self.active_worktree_id != worktree_id_of(root),
+            None => false,
+        }
+    }
+
     /// Re-scope this connection to a caller's `worktree` (a linked-worktree checkout), serving its
     /// overlay over the base. The base commit stays `root`'s indexed HEAD; only the `worktree_id`
     /// selects the overlay. A `None`, main, foreign, or unreadable `worktree` resolves to `root`'s
