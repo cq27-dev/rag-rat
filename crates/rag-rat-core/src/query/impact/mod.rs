@@ -15,6 +15,20 @@ use crate::query::graph::{self, GraphHop, GraphResolutionMode, GraphTraversalOpt
 use crate::query::memory::{self, CompactRepoMemoryEvidence, RepoMemoryEvidence};
 use crate::query::symbol::SymbolHit;
 
+/// An FTS5 phrase query for `needle` (a symbol name / qualified name / path), or `None` when it has
+/// no alphanumeric token. Used to find chunks that MENTION the needle through the `chunk_fts` index
+/// instead of a raw `chunks.text LIKE '%needle%'` full-table scan — same intent, but tokenized +
+/// indexed, and it never reads raw chunk text (so it stays fast and survives #77 text compression).
+/// Wrapped as a quoted FTS5 phrase (embedded `"` doubled) so `::`, `(`, `<`, etc. in a symbol name
+/// tokenize as separators rather than parse as FTS query syntax. Semantics shift substring→token —
+/// more precise for "mentions this symbol" than a substring match.
+pub(super) fn fts_phrase_query(needle: &str) -> Option<String> {
+    if !needle.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    Some(format!("\"{}\"", needle.replace('"', "\"\"")))
+}
+
 #[derive(Debug, Serialize)]
 pub struct ImpactItem {
     pub path: String,

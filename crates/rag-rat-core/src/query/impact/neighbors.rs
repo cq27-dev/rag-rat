@@ -225,27 +225,44 @@ pub(crate) fn textual_fallback(
         return Ok(());
     }
     let like = format!("%{query}%");
-    let mut stmt = conn.prepare(
+    // Chunk-text fallback goes through the `chunk_fts` index (MATCH), not a raw `chunks.text LIKE`
+    // full scan — tokenized + indexed, reads no raw text (#77). The FTS subquery yields chunk
+    // file_ids across all scopes; the outer `files` is the active-scope view, so `files.id IN
+    // (...)` keeps only in-scope files. `None` (no token) → omit the clause. No `LEFT JOIN
+    // chunks` needed.
+    let fts = fts_phrase_query(query);
+    let chunk_clause = if fts.is_some() {
+        "OR files.id IN (SELECT chunks.file_id FROM chunks JOIN chunk_fts ON chunk_fts.rowid = \
+         chunks.id WHERE chunk_fts MATCH ?3)"
+    } else {
+        ""
+    };
+    let sql = format!(
         "
         SELECT DISTINCT files.path, files.language, files.kind, symbols.qualified_name,
                CASE
                    WHEN files.path LIKE ?1 THEN 'path LIKE fallback'
                    WHEN symbols.name LIKE ?1 OR symbols.qualified_name LIKE ?1 THEN 'symbol LIKE \
          fallback'
-                   ELSE 'chunk text LIKE fallback'
+                   ELSE 'chunk text match fallback'
                END
         FROM files
         LEFT JOIN symbols ON symbols.file_id = files.id
-        LEFT JOIN chunks ON chunks.file_id = files.id
         WHERE files.path LIKE ?1
            OR symbols.name LIKE ?1
            OR symbols.qualified_name LIKE ?1
-           OR chunks.text LIKE ?1
+           {chunk_clause}
         ORDER BY files.kind, files.path, symbols.qualified_name
         LIMIT ?2
-        ",
-    )?;
-    let rows = stmt.query_map(params![like, i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+        "
+    );
+    let limit_param = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&like, &limit_param];
+    if let Some(fts) = &fts {
+        binds.push(fts);
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
         Ok((
             FileSymbol {
                 path: row.get(0)?,
