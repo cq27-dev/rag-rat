@@ -8384,6 +8384,51 @@ fn worktree_overlay_committed_added_file_symbol_resolves_cross_connection() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+#[test]
+fn worktree_overlay_serves_worktree_version_when_main_moved_ahead() {
+    // Symmetry: when MAIN advances a file the worktree branch didn't touch, the worktree scope must
+    // still serve the WORKTREE's (older) version — the overlay is the worktree's view, not "newest
+    // wins" (the base/worktree direction is irrelevant).
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/shared.rs"), "pub fn v1() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "v1"]);
+    let config = source_config(main.clone(), Language::Rust);
+
+    // Worktree branches at v1 (it does NOT touch shared.rs afterward).
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+
+    // Main moves AHEAD: shared.rs -> v2.
+    fs::write(main.join("src/shared.rs"), "pub fn v2() {}\n").unwrap();
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "v2"]);
+
+    let mut db = IndexDatabase::rebuild(&config).unwrap(); // base = main @ v2
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    // Worktree scope: the worktree's v1 (overlay shadows main's newer v2).
+    assert!(!db.symbols("v1", Some(Language::Rust), 10).unwrap().is_empty(), "worktree serves v1");
+    assert!(
+        db.symbols("v2", Some(Language::Rust), 10).unwrap().is_empty(),
+        "worktree scope does not show main's newer v2"
+    );
+    // Base scope: main's v2.
+    set_base_scope(&mut db, &main);
+    assert!(!db.symbols("v2", Some(Language::Rust), 10).unwrap().is_empty(), "base serves v2");
+    assert!(
+        db.symbols("v1", Some(Language::Rust), 10).unwrap().is_empty(),
+        "base does not show v1"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),
