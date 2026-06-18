@@ -352,7 +352,7 @@ fn shared_db_base(root: &Path) -> PathBuf {
 /// a standard git repo (bare repo, custom `GIT_DIR`, git unavailable) so resolution falls back to
 /// `root` — never guess.
 fn main_worktree_root(root: &Path) -> Option<PathBuf> {
-    let repo = gix::discover(root).ok()?;
+    let repo = crate::index::discover_repo(root).ok()?;
     let common_dir = repo.common_dir().canonicalize().ok()?;
     // Only the standard `<main>/.git` layout maps cleanly to a main worktree root.
     if common_dir.file_name()?.to_str()? != ".git" {

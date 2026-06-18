@@ -421,7 +421,7 @@ fn blame_lines_via_gix(
     start_line: i64,
     end_line: i64,
 ) -> anyhow::Result<Vec<BlameLine>> {
-    let repo = gix::discover(root)?;
+    let repo = crate::index::git_context::discover_repo(root)?;
     let head = repo.head_id()?.detach();
     // gix blames a path relative to the WORKTREE root; the caller's path is relative to the index
     // root, which may be a subdirectory of the worktree.
@@ -517,7 +517,7 @@ fn read_history_inner(
     commits: &mut Vec<CommitRecord>,
     changes: &mut Vec<FileChange>,
 ) -> anyhow::Result<()> {
-    let mut repo = gix::discover(root)?;
+    let mut repo = crate::index::git_context::discover_repo(root)?;
     // The by-commit-time walk + per-commit tree diffs look up each commit/tree more than once; an
     // object cache avoids repeated zlib inflation (gitoxide's own recommendation for these passes).
     repo.object_cache_size_if_unset(16 * 1024 * 1024);
@@ -578,9 +578,12 @@ fn read_history_inner(
                 push_file_change(&change, &hash, scope.as_deref(), &mut diff_cache, &mut commit_changes);
                 Ok::<_, std::convert::Infallible>(Action::Continue(()))
             })?;
-        // A subtree-scoped commit that didn't touch `root` is not part of this index's history (the
-        // old `git log -- <subtree>` would not have listed it).
-        if scope.is_some() && commit_changes.is_empty() {
+        // A commit with no file changes in scope is not part of this index's history: the old
+        // `git log <head> -- .` pathspec applied history simplification and listed NEITHER empty
+        // commits (even at the repo root) NOR subtree-scoped commits that didn't touch `root` (#213
+        // review). (A root/shallow-boundary commit diffs against the empty tree, so it has changes
+        // and is kept; a mode-only change also counts.)
+        if commit_changes.is_empty() {
             continue;
         }
         commits.push(record);
@@ -589,9 +592,10 @@ fn read_history_inner(
     Ok(())
 }
 
-/// Record one tree-diff change as a `FileChange` — file blobs only (trees/submodules are skipped) —
-/// with exact additions/deletions from a blob line-diff. A binary/uncountable diff yields `None`
-/// counts (the numstat `-` case).
+/// Record one tree-diff change as a `FileChange` — files only (regular blobs AND symlinks; trees
+/// and submodule gitlinks are skipped) — with exact additions/deletions from a blob line-diff. A
+/// binary/uncountable diff yields `None` counts (the numstat `-` case). Symlinks are included
+/// because `git log --numstat` records them as changed paths (#213 review).
 fn push_file_change(
     change: &Change<'_, '_, '_>,
     hash: &str,
@@ -599,16 +603,17 @@ fn push_file_change(
     diff_cache: &mut gix::diff::blob::Platform,
     out: &mut Vec<FileChange>,
 ) {
-    let (change_kind, location, is_blob) = match change {
-        Change::Addition { location, entry_mode, .. } => ("added", *location, entry_mode.is_blob()),
+    let (change_kind, location, is_file) = match change {
+        Change::Addition { location, entry_mode, .. } =>
+            ("added", *location, entry_mode.is_blob_or_symlink()),
         Change::Deletion { location, entry_mode, .. } =>
-            ("deleted", *location, entry_mode.is_blob()),
+            ("deleted", *location, entry_mode.is_blob_or_symlink()),
         Change::Modification { location, entry_mode, .. } =>
-            ("modified", *location, entry_mode.is_blob()),
+            ("modified", *location, entry_mode.is_blob_or_symlink()),
         // Rewrites are disabled above; ignore defensively if config ever forces them on.
         Change::Rewrite { .. } => return,
     };
-    if !is_blob {
+    if !is_file {
         return;
     }
     // `location` is worktree-root-relative. At the worktree root keep it as-is; under a subtree
@@ -709,11 +714,11 @@ fn count_table(conn: &Connection, table: &str) -> anyhow::Result<u64> {
 /// git call (the ignore matcher anchors its `.gitignore` ancestor stack here — issue #62 finding 3:
 /// a `config.root` that is a subdirectory of a larger worktree must honor the worktree-root rules).
 pub(crate) fn worktree_root(root: &Path) -> Option<PathBuf> {
-    gix::discover(root).ok()?.workdir().map(Path::to_path_buf)
+    crate::index::git_context::discover_repo(root).ok()?.workdir().map(Path::to_path_buf)
 }
 
 fn git_repo(root: &Path) -> Option<GitRepo> {
-    let repo = gix::discover(root).ok()?;
+    let repo = crate::index::git_context::discover_repo(root).ok()?;
     // `workdir()` is `None` for a bare repo — there is no worktree to index, so treat it as
     // "no git" (the previous `--show-toplevel` failed there too).
     let worktree_root = repo.workdir()?.to_path_buf();

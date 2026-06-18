@@ -9,7 +9,7 @@ pub(crate) fn discover_and_store_refs(
     let mut refs = Vec::new();
     discover_commit_refs(conn, default_repo.as_deref(), &mut refs)?;
     discover_file_refs(conn, root, default_repo.as_deref(), &mut refs)?;
-    let branch = gix::discover(root)
+    let branch = crate::index::git_context::discover_repo(root)
         .ok()
         .and_then(|repo| repo.head_name().ok().flatten())
         .map(|name| name.shorten().to_string())

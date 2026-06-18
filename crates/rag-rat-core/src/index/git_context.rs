@@ -9,8 +9,20 @@ pub(crate) struct GitChangedPaths {
     pub(crate) deleted: BTreeSet<PathBuf>,
 }
 
+/// Open the git repository for `root` via gix, honoring `GIT_DIR` / `GIT_WORK_TREE` — a bare git
+/// dir plus an external worktree (e.g. in CI) is configured purely through those env vars, and
+/// plain `gix::discover` only searches upward from `root`, so it would miss such a repo and leave
+/// git history "unavailable" (clearing the historical tables). All gix discovery goes through here
+/// (#213 review).
+pub(crate) fn discover_repo(root: &Path) -> Result<gix::Repository, Box<gix::discover::Error>> {
+    // Box the error: gix's `discover::Error` is a large enum, and an unboxed large `Err` bloats every
+    // `Result` this returns (clippy::result_large_err). Callers use `.ok()` or `?` (anyhow), both of
+    // which handle the box transparently.
+    gix::discover_with_environment_overrides(root).map_err(Box::new)
+}
+
 pub(crate) fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> {
-    let repo = gix::discover(root)?;
+    let repo = discover_repo(root)?;
     let worktree_root = repo
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("git repository has no worktree"))?
@@ -74,7 +86,7 @@ pub(crate) fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
 /// HEAD commit sha for `root` via gix, or empty if unborn / not a repo (matching the old
 /// `rev-parse HEAD` failure behavior).
 pub(crate) fn head_sha(root: &Path) -> String {
-    gix::discover(root)
+    discover_repo(root)
         .ok()
         .and_then(|repo| repo.head_id().ok().map(|id| id.to_hex().to_string()))
         .unwrap_or_default()
@@ -83,7 +95,7 @@ pub(crate) fn head_sha(root: &Path) -> String {
 /// Whether the worktree has any uncommitted change (tracked modifications + untracked files), the
 /// gix equivalent of a non-empty `git status --porcelain`. Lazy: stops at the first change.
 pub(crate) fn is_worktree_dirty(root: &Path) -> bool {
-    let Ok(repo) = gix::discover(root) else {
+    let Ok(repo) = discover_repo(root) else {
         return false;
     };
     let Ok(platform) = repo.status(gix::progress::Discard) else {
@@ -130,7 +142,7 @@ pub fn resolve_git_context(root: &Path) -> (String, String) {
 pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) {
     let mut commits = Vec::new();
     let mut worktrees = Vec::new();
-    let Ok(repo) = gix::discover(root) else {
+    let Ok(repo) = discover_repo(root) else {
         return (commits, worktrees);
     };
     let add_repo =
@@ -153,13 +165,16 @@ pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) 
         add_repo(&mut worktrees, &mut commits, &main);
     }
     // Linked worktrees: path from the proxy (robust even if the checkout is gone), HEAD from
-    // opening.
+    // opening the worktree's git dir. Use the inaccessible-tolerant open so a
+    // temporarily-missing checkout STILL contributes its registered HEAD — otherwise a clean
+    // row keyed by that commit could be GC-pruned even though the worktree is still registered
+    // and may return (#213 review).
     if let Ok(proxies) = repo.worktrees() {
         for proxy in proxies {
             if let Ok(base) = proxy.base() {
                 worktrees.push(base.to_string_lossy().trim_end_matches('/').to_string());
             }
-            if let Ok(linked) = proxy.into_repo()
+            if let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree()
                 && let Ok(id) = linked.head_id()
             {
                 commits.push(id.to_hex().to_string());
