@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use gix::object::tree::diff::{Action, Change};
 use gix::revision::walk::Sorting;
@@ -411,12 +410,49 @@ pub fn store_blame(conn: &Connection, summary: &ChunkBlameSummary) -> anyhow::Re
 }
 
 pub fn blame_lines(root: &Path, path: &str, start_line: i64, end_line: i64) -> Vec<BlameLine> {
-    let range = format!("{start_line},{end_line}");
-    let Some(output) = git_output(root, &["blame", "--line-porcelain", "-L", &range, "--", path])
-    else {
-        return Vec::new();
+    blame_lines_via_gix(root, path, start_line, end_line).unwrap_or_default()
+}
+
+/// Blame `start_line..=end_line` (1-based) of `path` via gix, one `BlameLine` per source line in
+/// order, attributing each to the commit gix's blame found and that commit's author time (#212).
+fn blame_lines_via_gix(
+    root: &Path,
+    path: &str,
+    start_line: i64,
+    end_line: i64,
+) -> anyhow::Result<Vec<BlameLine>> {
+    let repo = gix::discover(root)?;
+    let head = repo.head_id()?.detach();
+    // gix blames a path relative to the WORKTREE root; the caller's path is relative to the index
+    // root, which may be a subdirectory of the worktree.
+    let worktree_root = repo.workdir().unwrap_or(root);
+    let absolute = root.join(path);
+    let relative = absolute.strip_prefix(worktree_root).unwrap_or_else(|_| Path::new(path));
+    let file_path = gix::path::into_bstr(relative);
+    let start = u32::try_from(start_line.max(1)).unwrap_or(1);
+    let end = u32::try_from(end_line.max(start_line)).unwrap_or(start);
+    let options = gix::repository::blame_file::Options {
+        ranges: gix::blame::BlameRanges::from_one_based_inclusive_range(start..=end)?,
+        ..Default::default()
     };
-    parse_blame(&output)
+    let outcome = repo.blame_file(file_path.as_ref(), head, options)?;
+    let mut entries = outcome.entries;
+    entries.sort_by_key(|entry| entry.start_in_blamed_file);
+    let mut author_time: std::collections::HashMap<gix::ObjectId, Option<i64>> =
+        std::collections::HashMap::new();
+    let mut lines = Vec::new();
+    for entry in entries {
+        let commit = entry.commit_id.to_hex().to_string();
+        let time = *author_time.entry(entry.commit_id).or_insert_with(|| {
+            repo.find_commit(entry.commit_id)
+                .ok()
+                .and_then(|c| c.author().ok().map(|a| a.seconds()))
+        });
+        for _ in 0..entry.len.get() {
+            lines.push(BlameLine { commit: commit.clone(), author_time_s: time });
+        }
+    }
+    Ok(lines)
 }
 
 #[derive(Debug, Clone)]
@@ -575,32 +611,6 @@ fn normalize_git_path(root: &Path, worktree_root: &Path, path: &str) -> Option<S
     None
 }
 
-fn parse_blame(output: &str) -> Vec<BlameLine> {
-    let mut lines = Vec::new();
-    let mut current_commit = None::<String>;
-    let mut current_time = None::<i64>;
-    for line in output.lines() {
-        if let Some((hash, _rest)) = line.split_once(' ')
-            && hash.len() == 40
-            && hash.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            current_commit = Some(hash.to_string());
-            current_time = None;
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("author-time ") {
-            current_time = value.parse().ok();
-            continue;
-        }
-        if line.starts_with('\t')
-            && let Some(commit) = current_commit.clone()
-        {
-            lines.push(BlameLine { commit, author_time_s: current_time });
-        }
-    }
-    lines
-}
-
 fn path_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PathHistoryItem> {
     Ok(PathHistoryItem {
         hash: row.get(0)?,
@@ -709,14 +719,6 @@ pub(crate) fn is_history_current(conn: &Connection, root: &Path) -> bool {
         Ok(head_matches && root_matches && prior_was_full && has_rows)
     };
     probe().unwrap_or(false)
-}
-
-fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).current_dir(root).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn fts_query(query: &str) -> String {
