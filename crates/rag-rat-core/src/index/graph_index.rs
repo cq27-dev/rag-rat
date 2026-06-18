@@ -69,6 +69,15 @@ impl IndexDatabase {
         edges::resolve_all_edges(self.storage.connection())
     }
 
+    /// Resolve edges for a LINKED-WORKTREE OVERLAY pass (#219 P1): re-resolve / re-synthesize ONLY
+    /// the worktree's own overlay source files, never the SHARED committed (base) rows that are
+    /// merely visible in the overlay scope view. Resolution targets still span the full overlay
+    /// view, so an overlay edge into a base symbol resolves correctly. The plain `resolve_edges`
+    /// (base/incremental/full-rebuild) owns its scope and rewrites everything in view.
+    pub(super) fn resolve_overlay_edges(&self, worktree_id: &str) -> anyhow::Result<()> {
+        edges::resolve_overlay_edges(self.storage.connection(), worktree_id)
+    }
+
     pub(super) fn rebuild_logical_symbols(&self) -> anyhow::Result<()> {
         // The insert below re-derives the COMPLETE logical-symbol table from all current symbols,
         // so clear it entirely first. A member-join "rebuild set" misses logical_symbols whose

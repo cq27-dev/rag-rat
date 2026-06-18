@@ -378,6 +378,17 @@ impl IndexDatabase {
         let Some(mut chunk) = crate::query::read_chunk(self.storage.connection(), chunk_id)? else {
             return Ok(None);
         };
+        // Under a LINKED-WORKTREE OVERLAY scope, `source_root` is the MAIN checkout — NOT the
+        // branch the chunk came from. Live-revalidating against main would slice the chunk
+        // text out of main's copy of the file (returning BASE text for a branch chunk
+        // whenever the anchor still matches), or call the overlay-guarded `heal_file`
+        // no-op. The overlay rows are maintained by `index_worktree_overlay` (read from the
+        // linked checkout), so the STORED text is already the branch's — return it as-is
+        // and skip live revalidation (#219 review). The base/main scope keeps full live
+        // revalidation below.
+        if self.active_scope_is_linked_overlay() {
+            return Ok(Some(chunk));
+        }
         let Some(root) = self.storage.source_root() else {
             return Ok(Some(chunk));
         };

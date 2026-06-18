@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use rusqlite::{Connection, params};
 
+use super::EdgeWriteScope;
 use crate::index::edges::{EdgeConfidence, EdgeKind, EdgeStringInterner};
 
 /// Cap on constructors × handlers materialized for one variant key. A catch-all message enum used
@@ -49,20 +50,30 @@ pub(crate) struct DispatchSynthesis {
     pub skipped_variants: usize,
 }
 
-pub(crate) fn synthesize_dispatch_edges(conn: &Connection) -> anyhow::Result<DispatchSynthesis> {
+pub(crate) fn synthesize_dispatch_edges(
+    conn: &Connection,
+    write: EdgeWriteScope<'_>,
+) -> anyhow::Result<DispatchSynthesis> {
     let mut interner = EdgeStringInterner::default();
     let dispatches_kind_id = interner.get(conn, EdgeKind::Dispatches.as_str())?;
 
-    // Idempotent re-run: drop any prior synthesized dispatches in the ACTIVE scope before
-    // rebuilding them. `files` is the per-connection scope view (#89), so other checkouts are
-    // untouched.
+    // Idempotent re-run: drop any prior synthesized dispatches in the WRITE scope before rebuilding
+    // them. `files` is the per-connection scope view (#89), so other checkouts are untouched; the
+    // extra write predicate keeps a LINKED-OVERLAY pass from deleting a SHARED committed (base)
+    // sender's `dispatches` row (#219 P1) — a base row visible in the overlay view but not owned by
+    // it.
     conn.execute(
-        "DELETE FROM edges_data
-         WHERE edge_kind_id = ?1 AND source_file_id IN (SELECT id FROM files)",
+        &format!(
+            "DELETE FROM edges_data
+             WHERE edge_kind_id = ?1 AND source_file_id IN (
+                 SELECT files.id FROM files WHERE 1 = 1{}
+             )",
+            write.files_write_predicate(),
+        ),
         params![dispatches_kind_id],
     )?;
 
-    let constructors = collect_constructors(conn)?;
+    let constructors = collect_constructors(conn, write)?;
     let handlers = collect_handlers(conn)?;
     if constructors.is_empty() || handlers.is_empty() {
         return Ok(DispatchSynthesis::default());
@@ -145,16 +156,22 @@ pub(crate) fn synthesize_dispatch_edges(conn: &Connection) -> anyhow::Result<Dis
 /// view.
 fn collect_constructors(
     conn: &Connection,
+    write: EdgeWriteScope<'_>,
 ) -> anyhow::Result<HashMap<String, HashMap<i64, Constructor>>> {
-    let mut stmt = conn.prepare(
+    // Constructors are the SOURCE rows we emit `dispatches` for, so restrict them to the write
+    // scope (#219 P1): a linked-overlay pass must not synthesize dispatches OUT of a shared
+    // committed sender. Handlers (the resolve TARGETS, below) stay full-scope so an overlay
+    // sender into a base handler still binds.
+    let mut stmt = conn.prepare(&format!(
         "SELECT tn.value, d.from_symbol_id, d.source_file_id, d.source_start_line, \
          d.source_end_line
          FROM edges_data d
          JOIN files ON files.id = d.source_file_id
          JOIN edge_strings ek ON ek.id = d.edge_kind_id
          JOIN edge_strings tn ON tn.id = d.to_name_id
-         WHERE ek.value = 'dispatch_construct' AND d.from_symbol_id IS NOT NULL",
-    )?;
+         WHERE ek.value = 'dispatch_construct' AND d.from_symbol_id IS NOT NULL{}",
+        write.files_write_predicate(),
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, Constructor {
             symbol_id: row.get(1)?,

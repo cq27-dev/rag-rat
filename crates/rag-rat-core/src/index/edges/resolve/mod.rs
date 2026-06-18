@@ -216,6 +216,39 @@ fn scope_context_value(conn: &Connection, key: &str) -> String {
     .unwrap_or_default()
 }
 
+/// Which edges a resolve pass may WRITE (re-resolve / re-synthesize).
+///
+/// READS always span the full active-checkout `files` scope view (so a target in a shadowed/base
+/// file still resolves); this only narrows the SET of source files whose `edges_data` rows the pass
+/// mutates. A LINKED-WORKTREE OVERLAY pass must NOT rewrite a SHARED committed (base-scoped) caller
+/// file's edges: the base row's `files.id` is the same row the base scope reads, so re-resolving it
+/// against the overlay's (shadowed) symbol set would corrupt base `find_callers`/impact until a
+/// base pass resolved it back — graph results flipping by whichever worktree refreshed last (#219
+/// P1).
+#[derive(Clone, Copy)]
+pub(crate) enum EdgeWriteScope<'a> {
+    /// Every in-view source file (the base/incremental/full-rebuild path: the active scope OWNS its
+    /// committed rows, so rewriting them is correct).
+    ActiveScope,
+    /// Only the linked worktree's OVERLAY rows (`files.worktree_id = id`). Shared committed rows in
+    /// the view are read for resolution targets but never written.
+    OverlayOnly(&'a str),
+}
+
+impl EdgeWriteScope<'_> {
+    /// `AND`-able predicate (with a leading space) restricting `files` to the writable source rows,
+    /// or empty for `ActiveScope`. Inlined (not bound) because it is appended to several different
+    /// SELECTs; the embedded value is a git-derived worktree id, single-quote-escaped defensively.
+    fn files_write_predicate(&self) -> String {
+        match self {
+            EdgeWriteScope::ActiveScope => String::new(),
+            EdgeWriteScope::OverlayOnly(worktree_id) => {
+                format!(" AND files.worktree_id = '{}'", worktree_id.replace('\'', "''"))
+            },
+        }
+    }
+}
+
 /// Re-resolve the ACTIVE CHECKOUT's edges against the ACTIVE CHECKOUT's symbols.
 ///
 /// SCOPE (load-bearing, #89): both SELECTs join `files` — the per-connection scoped TEMP VIEW
@@ -234,6 +267,21 @@ fn scope_context_value(conn: &Connection, key: &str) -> String {
 /// scope's edges stay self-consistent until gc prunes them or their own worktree's pass rewrites
 /// them.
 pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
+    resolve_edges_with_scope(conn, EdgeWriteScope::ActiveScope)
+}
+
+/// Re-resolve ONLY a linked worktree's OVERLAY edges (#219 P1). Resolution targets still span the
+/// full active scope (so an overlay edge into a base symbol resolves), but the WRITE set is the
+/// worktree's own overlay rows — a SHARED committed caller's `edges_data` is never rewritten by an
+/// overlay pass, so the base scope's graph is left intact. Accepted recall trade-off: a BASE
+/// caller's edge into an OVERLAY-modified symbol is not re-pointed in the overlay scope (the base
+/// row is read-only here); the overlay still serves its own files' edges, and the base resolves its
+/// own on its next pass.
+pub(crate) fn resolve_overlay_edges(conn: &Connection, worktree_id: &str) -> anyhow::Result<()> {
+    resolve_edges_with_scope(conn, EdgeWriteScope::OverlayOnly(worktree_id))
+}
+
+fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> anyhow::Result<()> {
     let symbols = all_symbols(conn)?;
     let index = SymbolIndex::build(&symbols);
     // Per-package + module-aware import scope (#61): the active checkout's Imports edges → per-file
@@ -279,14 +327,18 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     // write pre-interned ids instead of paying the view triggers' per-row probes. The `files`
     // join is the active-checkout scope (#89) and is unaffected by the interning.
     let mut interner = EdgeStringInterner::default();
-    let mut stmt = conn.prepare(
+    // The WRITE filter (#219 P1): in an overlay pass this restricts the re-resolved (UPDATEd) rows
+    // to the worktree's OVERLAY source files, so a shared committed caller's edges are never
+    // rewritten; empty for the base/incremental/full-rebuild path.
+    let mut stmt = conn.prepare(&format!(
         "SELECT d.id, d.source_file_id, tn.value, tqn.value, ek.value, conf.value, d.evidence, \
          rh.value, d.source_start_byte FROM edges_data d JOIN files ON files.id = \
          d.source_file_id LEFT JOIN edge_strings tn ON tn.id = d.to_name_id LEFT JOIN \
          edge_strings tqn ON tqn.id = d.target_qualified_name_id LEFT JOIN edge_strings ek ON \
          ek.id = d.edge_kind_id LEFT JOIN edge_strings conf ON conf.id = d.confidence_id LEFT \
-         JOIN edge_strings rh ON rh.id = d.receiver_hint_id ORDER BY d.id",
-    )?;
+         JOIN edge_strings rh ON rh.id = d.receiver_hint_id WHERE 1 = 1{} ORDER BY d.id",
+        write.files_write_predicate(),
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -417,8 +469,9 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
         ])?;
     }
     // #200: now that the dispatch FACT rows are resolved (handlers bound to symbols), synthesize
-    // the construct→handler `dispatches` edges. Idempotent over the active scope.
-    synthesize_dispatch_edges(conn)?;
+    // the construct→handler `dispatches` edges. Idempotent over the write scope (#219 P1: an
+    // overlay pass synthesizes/clears dispatches ONLY for its own overlay source files).
+    synthesize_dispatch_edges(conn, write)?;
     Ok(())
 }
 /// Full-rebuild fast path: resolve every accumulated edge candidate against an in-memory symbol
@@ -673,7 +726,8 @@ pub(crate) fn resolve_and_insert_edges(
     crate::index::mem_trace("edges: after index rebuild");
     // #200: synthesize construct→handler `dispatches` edges from the resolved fact rows. Runs after
     // the index rebuild — the few extra inserts maintain the (now rebuilt) indexes incrementally.
-    synthesize_dispatch_edges(conn)?;
+    // A full rebuild owns its whole scope, so it synthesizes over the active scope.
+    synthesize_dispatch_edges(conn, EdgeWriteScope::ActiveScope)?;
     Ok(())
 }
 

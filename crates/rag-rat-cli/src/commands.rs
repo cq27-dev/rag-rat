@@ -1076,16 +1076,12 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     )?;
 
     let mut db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
-    // Keep every live linked worktree's branch overlay fresh (#219). The git hooks run THIS command
-    // (not the foreground watcher), so without this a commit/checkout/merge in a linked worktree
-    // would index the base `config.root` but leave that worktree's overlay stale until a watcher
-    // pass or a manual `index --worktree`. Delta-only + idle-safe, like the watcher's pass; it
-    // restores the base scope afterward so reconcile/gc/memory-validate below run unscoped.
-    rag_rat_core::watch::refresh_worktree_overlays(&mut db, config);
     let elapsed = started.elapsed().as_secs();
     let remaining_seconds = max_seconds.saturating_sub(elapsed);
-    let reconcile_report = if remaining_seconds > 0 {
-        let options = rag_rat_core::index::ai::ReconcileOptions {
+    // Reconcile options shared by the overlay pass and the base reconcile below. `None` (no time
+    // budget left) skips both, so neither the overlay nor the base embeds when out of time.
+    let reconcile_options =
+        (remaining_seconds > 0).then(|| rag_rat_core::index::ai::ReconcileOptions {
             limit: None,
             batch_size: Some(config.local_ai.embedding.runtime.batch_size),
             force: false,
@@ -1094,10 +1090,19 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
             max_seconds: Some(remaining_seconds),
             max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
             intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
-        };
-        Some(db.reconcile_with_options_progress(options, render_reconcile_progress)?)
-    } else {
-        None
+        });
+    // Keep every live linked worktree's branch overlay fresh (#219). The git hooks run THIS command
+    // (not the foreground watcher), so without this a commit/checkout/merge in a linked worktree
+    // would index the base `config.root` but leave that worktree's overlay stale until a watcher
+    // pass or a manual `index --worktree`. Delta-only + idle-safe, like the watcher's pass; a
+    // CHANGED overlay's embeddings are reconciled INLINE (while scoped to it) so worktree queries
+    // aren't BM25-only for branch content. It restores the base scope afterward so the base
+    // reconcile/gc/memory-validate below run unscoped.
+    rag_rat_core::watch::refresh_worktree_overlays(&mut db, config, reconcile_options.as_ref());
+    let reconcile_report = match reconcile_options {
+        Some(options) =>
+            Some(db.reconcile_with_options_progress(options, render_reconcile_progress)?),
+        None => None,
     };
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.

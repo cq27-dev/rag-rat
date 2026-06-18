@@ -292,11 +292,30 @@ impl IndexDatabase {
         //   so a NEWLY-ADDED overlay file's symbols are invisible until regrouped (a modified
         //   file's unchanged symbols resolve via the base's logical rows — which is why only added
         //   files were missing). This is the field-reported bug.
-        // - resolve_edges: the overlay inserted edges unresolved.
+        // - resolve_overlay_edges: the overlay inserted edges unresolved. Uses the OVERLAY-SCOPED
+        //   resolver (NOT the base `resolve_edges`): resolution targets span the full overlay view,
+        //   but only the worktree's OWN overlay source rows are re-resolved — a shared committed
+        //   (base) caller's `edges_data`, visible in the overlay view but owned by the base scope,
+        //   must not be rewritten or base `find_callers`/impact would corrupt until a base pass
+        //   resolved it back, flipping by whichever worktree refreshed last (#219 P1).
+        // - refresh_packages: write the overlay scope's `packages` rows from the LINKED checkout's
+        //   manifests BEFORE resolving, so the per-package import scope (#61) is correct for the
+        //   branch. The resolver's `load_package_roots_into_scope` reads `packages` at the active
+        //   `(base_sha, linked_worktree_id)` scope — the base rows live at `(base_sha, '')` and are
+        //   invisible to it — so without this the overlay resolves imports against an empty package
+        //   map (every file falls open to the global union → external-dep suppression downgraded /
+        //   wrong for a branch with a new or changed Cargo.toml or path-dep alias) (#219 review).
+        // - resolve_overlay_edges: the overlay inserted edges unresolved. Uses the OVERLAY-SCOPED
+        //   resolver (NOT the base `resolve_edges`): resolution targets span the full overlay view,
+        //   but only the worktree's OWN overlay source rows are re-resolved — a shared committed
+        //   (base) caller's `edges_data`, visible in the overlay view but owned by the base scope,
+        //   must not be rewritten or base `find_callers`/impact would corrupt until a base pass
+        //   resolved it back, flipping by whichever worktree refreshed last (#219 P1).
         // - sync_fts: so semantic_search (BM25) sees the overlay's chunks.
         if indexed > 0 || tombstoned > 0 || pruned > 0 {
             self.rebuild_logical_symbols()?;
-            self.resolve_edges()?;
+            self.refresh_packages(&source_root)?;
+            self.resolve_overlay_edges(&worktree_id)?;
             self.sync_fts()?;
         }
 

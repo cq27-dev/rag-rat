@@ -75,9 +75,15 @@ impl IndexDatabase {
                 )",
             params![path, commit_sha, worktree_id],
         )?;
-        self.storage
-            .connection()
-            .execute("DELETE FROM parser_failures WHERE path = ?1", [&path])?;
+        // `parser_failures` is keyed by `path` only (no scope). A LINKED-WORKTREE OVERLAY pass must
+        // NOT delete by bare path: that would clear a REAL parse failure recorded for the same path
+        // by the base (or a sibling) scope. The overlay never WRITES this table either (see
+        // `insert_parser_failure`), so it has nothing of its own to remove (#219 review).
+        if !self.active_scope_is_linked_overlay() {
+            self.storage
+                .connection()
+                .execute("DELETE FROM parser_failures WHERE path = ?1", [&path])?;
+        }
         self.storage.connection().execute(
             "DELETE FROM chunk_fts
              WHERE rowid IN (

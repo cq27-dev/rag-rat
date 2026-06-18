@@ -15,7 +15,18 @@ pub fn walk_target(
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = BTreeSet::new();
     for directory in &target.directories {
-        walk_dir(root, &root.join(directory), target, ignore, &mut files)?;
+        let dir = root.join(directory);
+        // A configured target directory may be ABSENT under `root` — most importantly when the
+        // config came from a linked worktree that added a BRANCH-ONLY target dir, but `Config.root`
+        // is anchored to the MAIN checkout (so the shared index has one base commit) (#219 review).
+        // Base discovery over main must SKIP the missing dir, not hard-error: there is nothing to
+        // index there on main, and the linked worktree's overlay pass picks up the branch-only
+        // files separately. Without this, a hook/maintenance launched from such a branch
+        // aborted before `refresh_worktree_overlays` could run.
+        if !dir.is_dir() {
+            continue;
+        }
+        walk_dir(root, &dir, target, ignore, &mut files)?;
     }
     Ok(files.into_iter().collect())
 }
@@ -173,6 +184,33 @@ mod tests {
         assert!(!rel.contains(&"crates/app/skip.rs".to_string()), "nested gitignore: {rel:?}");
         assert!(!rel.contains(&"generated/out.rs".to_string()), "root gitignore: {rel:?}");
         assert!(!rel.iter().any(|p| p.starts_with("target/")), "floor dir: {rel:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn walk_skips_a_missing_target_directory() {
+        // #219 review: a config carrying a BRANCH-ONLY target dir is anchored to the MAIN root, so
+        // base discovery over main must SKIP the absent dir, not hard-error on `read_dir` — else a
+        // hook/maintenance launched from such a branch aborts before the overlay pass can run.
+        let root = tempdir();
+        write(&root.join("present/lib.rs"), "fn a() {}\n");
+        let target = ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("present"), PathBuf::from("branch_only")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        };
+        let ignore = IgnoreMatcher::compile(&root, &target.directories);
+
+        let found = walk_target(&root, &target, &ignore).expect("missing dir must not error");
+        let rel: Vec<String> = found
+            .iter()
+            .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(rel, vec!["present/lib.rs".to_string()], "present dir indexed, missing skipped");
 
         fs::remove_dir_all(&root).ok();
     }

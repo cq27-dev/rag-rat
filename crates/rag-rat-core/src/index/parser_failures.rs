@@ -16,6 +16,17 @@ impl IndexDatabase {
         language: Language,
         message: &str,
     ) -> anyhow::Result<()> {
+        // `parser_failures` is keyed by `path` ONLY (no scope) and every reader counts it globally
+        // (coverage, repo_brief, the orientation digest). A LINKED-WORKTREE OVERLAY pass routes its
+        // files through this same write path, so a branch-only syntax error would be reported in
+        // the BASE and sibling scopes — and `remove_file_in_scope`'s bare-path delete would
+        // clear a real failure from another scope. The overlay is not the table's owner;
+        // skip the write under an overlay scope and leave the global table to the base pass
+        // (accepted recall: a branch-only parse failure is not surfaced in that branch's
+        // coverage) (#219 review).
+        if self.active_scope_is_linked_overlay() {
+            return Ok(());
+        }
         self.storage.connection().execute(
             "INSERT INTO parser_failures(path, language, message) VALUES (?1, ?2, ?3)",
             params![path_string(path), language.as_str(), message],

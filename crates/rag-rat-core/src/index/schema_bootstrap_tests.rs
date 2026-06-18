@@ -7979,6 +7979,257 @@ fn worktree_overlay_committed_modification_shadows_base() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+/// The resolved target symbol id of the single `calls_name` edge whose source file is `path` — or
+/// `None` when it is unresolved. Reads `edges_data` directly (the edge rows are shared across
+/// scopes; `source_file_id` keys them by the scope's file row), so it can prove a shared committed
+/// caller's edge is left intact by an overlay pass (#219 P1).
+fn calls_edge_target(db: &IndexDatabase, path: &str) -> Option<i64> {
+    db.storage
+        .connection()
+        .query_row(
+            "SELECT d.to_symbol_id FROM edges_data d
+             JOIN files f ON f.id = d.source_file_id
+             JOIN edge_strings ek ON ek.id = d.edge_kind_id
+             WHERE f.path = ?1 AND ek.value = 'calls_name'",
+            [path],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn worktree_overlay_resolution_does_not_corrupt_base_edges() {
+    // #219 P1: an UNCHANGED committed caller's edge into a symbol the overlay renames must NOT be
+    // rewritten by the overlay pass — the caller file's row is SHARED with the base scope, so an
+    // overlay-scoped re-resolve against the (shadowed) overlay symbol set would corrupt the base
+    // graph. The fix re-resolves ONLY the worktree's own overlay source rows.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    // `caller.rs` calls `target_fn` (defined in `target.rs`). The caller is never touched on the
+    // branch, so its committed row is shared between base and overlay scopes.
+    fs::write(main.join("src/caller.rs"), "pub fn use_it() { target_fn(); }\n").unwrap();
+    fs::write(main.join("src/target.rs"), "pub fn target_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // The base edge resolves to a concrete target symbol; capture it.
+    let base_target = calls_edge_target(&db, "src/caller.rs");
+    assert!(base_target.is_some(), "base caller edge resolves to target_fn");
+
+    // The branch RENAMES target_fn → renamed_fn (so target_fn no longer exists in the overlay's
+    // symbol set), but leaves caller.rs untouched.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/target.rs"), "pub fn renamed_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "rename target"]);
+
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.indexed >= 1, "target.rs indexed as an overlay row");
+
+    // Back in the base scope: the unchanged caller's edge must still resolve to the SAME base
+    // target. Before the fix the overlay pass re-resolved the shared caller row against its own
+    // symbol set (where target_fn is gone) and NULLed/retargeted it, corrupting the base graph.
+    set_base_scope(&mut db, &main);
+    assert_eq!(
+        calls_edge_target(&db, "src/caller.rs"),
+        base_target,
+        "the overlay pass must not rewrite the shared base caller's resolved edge"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// Global `parser_failures` row count (the table is unscoped — keyed by `path` only).
+fn parser_failure_total(db: &IndexDatabase) -> i64 {
+    db.storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM parser_failures", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn worktree_overlay_does_not_pollute_or_clear_global_parser_failures() {
+    // #219 review: `parser_failures` is keyed by `path` only and every reader counts it globally.
+    // An overlay pass routes its files through the same write path, so (1) a BRANCH-ONLY syntax
+    // error must not be recorded into the global table (it would show in base/sibling coverage),
+    // and (2) an overlay pass over a path that is BROKEN in the base must not DELETE the base's
+    // failure by bare path.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/clean.rs"), "pub fn clean_fn() {}\n").unwrap();
+    fs::write(main.join("src/base_broken.rs"), "pub fn base_broken(").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // The base has exactly one failure (base_broken.rs).
+    assert_eq!(parser_failure_total(&db), 1, "base records its one parse failure");
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // The branch BREAKS the previously-clean file AND fixes the base-broken one.
+    fs::write(linked.join("src/clean.rs"), "pub fn clean_fn(").unwrap();
+    fs::write(linked.join("src/base_broken.rs"), "pub fn now_ok() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch edits"]);
+
+    let mut db = db;
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.indexed >= 1, "the branch's two changed files are indexed as overlay rows");
+
+    // The global table is UNCHANGED by the overlay pass: the branch-only `clean.rs` failure was not
+    // recorded, and the base `base_broken.rs` failure was not cleared by the overlay's same-path
+    // re-index.
+    assert_eq!(
+        parser_failure_total(&db),
+        1,
+        "overlay neither pollutes nor clears the global parser_failures table"
+    );
+    set_base_scope(&mut db, &main);
+    let base_failures = db.parser_failure_paths().unwrap();
+    assert_eq!(base_failures.len(), 1);
+    assert_eq!(
+        base_failures[0].path, "src/base_broken.rs",
+        "the base scope still reports its own parse failure, untouched by the overlay"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// The lowest chunk id whose file row has `path` in the active scope (overlay row wins).
+fn scoped_chunk_id(db: &IndexDatabase, path: &str) -> i64 {
+    db.storage
+        .connection()
+        .query_row(
+            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE f.path = ?1 ORDER BY c.id LIMIT 1",
+            [path],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn worktree_overlay_read_chunk_returns_branch_text_not_main() {
+    // #219 review: `read_chunk_current` revalidates a scoped chunk against `source_root` (the MAIN
+    // checkout). When a branch differs from main but the chunk's anchor still validates against
+    // main, the EXACT path re-sliced the chunk text out of MAIN's file — returning base text for a
+    // branch chunk. The anchor hash is whitespace-NORMALIZED (lines trimmed, blanks dropped), so a
+    // branch that differs from main ONLY in indentation anchors EXACT against main, then slices
+    // main's de-indented bytes. The fix skips live revalidation under an overlay scope, returning
+    // the stored branch-indexed text verbatim.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    // Main: no indentation.
+    let main_src = "pub fn marker() -> i32 {\nlet branch_witness = 1;\nbranch_witness\n}\n";
+    fs::write(main.join("src/a.rs"), main_src).unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Branch: SAME normalized content (so the anchor matches EXACT against main), but distinctively
+    // indented — the indentation is what proves whether the stored branch text or main's bytes win.
+    let branch_src =
+        "pub fn marker() -> i32 {\n        let branch_witness = 1;\n        branch_witness\n}\n";
+    fs::write(linked.join("src/a.rs"), branch_src).unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    // index_worktree_overlay leaves the connection in the overlay scope.
+    let overlay_chunk_id = scoped_chunk_id(&db, "src/a.rs");
+    let chunk = db.read_chunk(overlay_chunk_id).unwrap().expect("overlay chunk readable");
+    assert!(
+        chunk.text.contains("        let branch_witness"),
+        "read_chunk returns the BRANCH's indented text in the overlay scope (not main's \
+         de-indented bytes via an EXACT anchor match), got: {:?}",
+        chunk.text
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn refresh_worktree_overlays_reconciles_overlay_scope_embeddings() {
+    // #219 review: `refresh_worktree_overlays` restored the base scope BEFORE the pass's reconcile,
+    // so a NEW/CHANGED overlay chunk never got an embedding (worktree `semantic_search` stayed
+    // BM25-only for branch content). The fix reconciles each CHANGED overlay inline, while scoped
+    // to it. Uses the deterministic in-process HASH model (no download).
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(
+        main.join("src/a.rs"),
+        "pub fn base_entry() {\n    // base content with enough detail to satisfy the embedding \
+         policy minimum\n}\n",
+    )
+    .unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.reconcile(None, Some(8)).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // A NEW branch-only file with enough text to be embedding-eligible.
+    fs::write(
+        linked.join("src/branch_new.rs"),
+        "pub fn branch_entry() {\n    // branch-only content with enough detail to satisfy the \
+         embedding policy minimum\n}\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "add branch file"]);
+
+    let options = ai::ReconcileOptions { batch_size: Some(8), ..Default::default() };
+    // The pass refreshes the overlay AND reconciles its embeddings inline.
+    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, Some(&options));
+    assert!(changed, "the overlay changed (a new branch file was indexed)");
+
+    // In the overlay scope, the new branch file's chunk must carry a Current embedding — not be
+    // left BM25-only. `refresh_worktree_overlays` restored the base scope, so re-enter the
+    // overlay.
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    let embedded: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM chunk_embeddings ce
+             JOIN chunks c ON c.id = ce.chunk_id
+             JOIN files f ON f.id = c.file_id
+             WHERE f.path = 'src/branch_new.rs' AND ce.status = 'Current'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(embedded >= 1, "the overlay's new chunk was reconciled into an embedding");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 #[test]
 fn worktree_overlay_branch_deleted_file_is_hidden_by_tombstone() {
     let main = unique_temp_root();
