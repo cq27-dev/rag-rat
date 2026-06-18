@@ -1,28 +1,25 @@
 use super::*;
 
 pub(crate) fn git_paths(root: &Path) -> anyhow::Result<GitPaths> {
-    let worktree_root = git_rev_parse(root, "--show-toplevel")?;
-    let git_dir = git_rev_parse(root, "--git-dir")?;
-    let git_common_dir = git_rev_parse(root, "--git-common-dir")?;
-    let hooks_dir = git_rev_parse(root, "--git-path hooks")?;
+    let repo = gix::discover(root)?;
+    let worktree_root =
+        repo.workdir().ok_or_else(|| anyhow::anyhow!("not inside a git worktree"))?.to_path_buf();
+    // gix may report the git dir relative to the discovery root; mirror the old `rev-parse`
+    // absolutize (relative -> `root.join`).
+    let absolutize = |path: &Path| {
+        if path.is_absolute() { path.to_path_buf() } else { root.join(path) }
+    };
+    let git_dir = absolutize(repo.git_dir());
+    let git_common_dir = absolutize(repo.common_dir());
+    // `core.hooksPath` overrides the default `<git-dir>/hooks` (git resolves a relative value
+    // against the worktree); fall back to the standard location otherwise.
+    let hooks_dir = repo
+        .config_snapshot()
+        .trusted_path("core.hooksPath")
+        .and_then(Result::ok)
+        .map(|path| if path.is_absolute() { path.into_owned() } else { worktree_root.join(path) })
+        .unwrap_or_else(|| git_dir.join("hooks"));
     Ok(GitPaths { worktree_root, git_dir, git_common_dir, hooks_dir })
-}
-pub(crate) fn git_rev_parse(root: &Path, arg: &str) -> anyhow::Result<PathBuf> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(root).arg("rev-parse");
-    for part in arg.split_whitespace() {
-        command.arg(part);
-    }
-    let output = command.output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git rev-parse {arg} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let value = String::from_utf8(output.stdout)?.trim().to_string();
-    let path = PathBuf::from(value);
-    Ok(if path.is_absolute() { path } else { root.join(path) })
 }
 pub(crate) fn install_hook(hooks_dir: &Path, hook: &str) -> anyhow::Result<()> {
     let path = hooks_dir.join(hook);

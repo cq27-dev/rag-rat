@@ -4,7 +4,6 @@ mod fs_atomic;
 mod hooks_support;
 mod render;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 use std::{env, fs};
 

@@ -3147,6 +3147,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dialoguer",
+ "gix",
  "libc",
  "rag-rat-core",
  "rag-rat-mcp",
