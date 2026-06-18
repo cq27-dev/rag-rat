@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 24;
+pub const LATEST_SCHEMA_VERSION: u32 = 25;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -105,6 +105,10 @@ const MIGRATION_024_CHECKSUM: &str = "sha256:rag-rat-files-has-test-code-v24";
 const MIGRATION_024_DESCRIPTION: &str = "Add files.has_test_code flag (precomputed test-marker \
                                          detection) so impact_surface avoids a chunks.text scan \
                                          (#77)";
+const MIGRATION_025_ID: &str = "025_chunk_text_compression_tables";
+const MIGRATION_025_CHECKSUM: &str = "sha256:rag-rat-chunk-text-compression-tables-v25";
+const MIGRATION_025_DESCRIPTION: &str = "Add chunk_text (zstd blob) + chunk_text_dict (shared \
+                                         dictionary) tables for compressed chunk text (#77)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -326,6 +330,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_024_CHECKSUM,
         description: MIGRATION_024_DESCRIPTION,
         apply: apply_files_has_test_code,
+    },
+    Migration {
+        id: MIGRATION_025_ID,
+        checksum: MIGRATION_025_CHECKSUM,
+        description: MIGRATION_025_DESCRIPTION,
+        apply: apply_chunk_text_compression_tables,
     },
 ];
 

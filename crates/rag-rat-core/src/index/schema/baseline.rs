@@ -68,6 +68,26 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
         );
 
+        -- Compressed chunk text (#77 Phase 2). The heavy chunks.text payload moves here as a
+        -- dictionary-trained zstd blob (one shared dict in chunk_text_dict), decompressed on read,
+        -- so the chunks row stays small. raw_len is the decompressed byte length = decompress
+        -- capacity. One blob per chunk preserves random-access reads.
+        CREATE TABLE IF NOT EXISTS chunk_text(
+            chunk_id INTEGER PRIMARY KEY,
+            blob BLOB NOT NULL,
+            raw_len INTEGER NOT NULL,
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        ) STRICT;
+
+        -- The single shared zstd dictionary for chunk_text (#77). Stored IN the DB so a copied /
+        -- P2P-streamed index is self-contained: decompress anywhere with no extension. Row id is
+        -- always 1; dict_version bumps force a retrain + recompress.
+        CREATE TABLE IF NOT EXISTS chunk_text_dict(
+            id INTEGER PRIMARY KEY,
+            dict BLOB NOT NULL,
+            dict_version INTEGER NOT NULL DEFAULT 1
+        ) STRICT;
+
         CREATE TABLE IF NOT EXISTS symbols(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL,

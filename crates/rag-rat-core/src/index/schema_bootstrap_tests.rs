@@ -10164,12 +10164,37 @@ fn conn_table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
 /// persisted pointer). The oracle's `callee_*` columns are untouched (the columns are dedicated,
 /// not a callee overload).
 #[test]
+fn v025_creates_chunk_text_compression_tables() {
+    // #77 Phase 2: the chunk_text (zstd blob) + chunk_text_dict (shared dictionary) tables exist
+    // after a fresh apply (baseline) AND a forward-migrate (V025).
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    for t in ["chunk_text", "chunk_text_dict"] {
+        assert!(conn_table_exists(&conn, t), "{t} created on fresh apply");
+    }
+    let cols = conn_table_columns(&conn, "chunk_text");
+    for expected in ["chunk_id", "blob", "raw_len"] {
+        assert!(cols.contains(&expected.to_string()), "chunk_text missing {expected}");
+    }
+    // Forward-migrate path: drop the tables + the V025 ledger row, re-apply → recreated.
+    conn.execute_batch(
+        "DROP TABLE chunk_text; DROP TABLE chunk_text_dict;
+         DELETE FROM schema_version WHERE id = '025_chunk_text_compression_tables';",
+    )
+    .unwrap();
+    schema::apply(&conn).unwrap();
+    assert!(conn_table_exists(&conn, "chunk_text"), "V025 recreates chunk_text on forward migrate");
+    assert!(conn_table_exists(&conn, "chunk_text_dict"));
+}
+
+#[test]
 fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 24);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 25);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10239,6 +10264,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         -- the parts already present.)
         DELETE FROM schema_version WHERE id = '023_dispatch_edge_facts_view_exclusion';
         DELETE FROM schema_version WHERE id = '024_files_has_test_code';
+        DELETE FROM schema_version WHERE id = '025_chunk_text_compression_tables';
         ",
     )
     .unwrap();

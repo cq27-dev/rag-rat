@@ -684,6 +684,29 @@ pub(crate) fn apply_files_has_test_code(conn: &Connection) -> rusqlite::Result<(
     )
 }
 
+/// V025 (#77): create the chunk_text (zstd blob) + chunk_text_dict (shared dictionary) tables for
+/// compressed chunk text. Additive + idempotent (CREATE TABLE IF NOT EXISTS); a fresh DB already
+/// has them from the baseline. NO backfill here — populating chunk_text + retiring chunks.text is
+/// driven by the index pipeline (compress at write) once the read paths decompress from chunk_text,
+/// so the data move isn't an irreversible one-shot in the migration.
+pub(crate) fn apply_chunk_text_compression_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS chunk_text(
+            chunk_id INTEGER PRIMARY KEY,
+            blob BLOB NOT NULL,
+            raw_len INTEGER NOT NULL,
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS chunk_text_dict(
+            id INTEGER PRIMARY KEY,
+            dict BLOB NOT NULL,
+            dict_version INTEGER NOT NULL DEFAULT 1
+        ) STRICT;
+        ",
+    )
+}
+
 pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     let legacy_table: Option<String> = conn
         .query_row(
@@ -1012,6 +1035,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_022_ID => Some(22),
             MIGRATION_023_ID => Some(23),
             MIGRATION_024_ID => Some(24),
+            MIGRATION_025_ID => Some(25),
             _ => None,
         })
         .max()
@@ -1045,6 +1069,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_022_ID
             | MIGRATION_023_ID
             | MIGRATION_024_ID
+            | MIGRATION_025_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1075,6 +1100,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_022_ID => migration.checksum != MIGRATION_022_CHECKSUM,
         MIGRATION_023_ID => migration.checksum != MIGRATION_023_CHECKSUM,
         MIGRATION_024_ID => migration.checksum != MIGRATION_024_CHECKSUM,
+        MIGRATION_025_ID => migration.checksum != MIGRATION_025_CHECKSUM,
         _ => false,
     }
 }
