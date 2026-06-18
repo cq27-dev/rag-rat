@@ -48,10 +48,18 @@ pub struct Orientation {
 ///
 /// Invariant: purely READ — all writes go to TEMP objects (the scope view) which are
 /// discarded when the connection closes.
-pub fn orientation(conn: &Connection, root: &std::path::Path) -> anyhow::Result<Orientation> {
-    // Step 1: install the scoping view for this connection.
-    let (commit_sha, worktree_id) = crate::index::resolve_git_context(root);
-    crate::index::install_scope_view(conn, &commit_sha, &worktree_id)?;
+pub fn orientation(
+    conn: &Connection,
+    config_root: &std::path::Path,
+    cwd: &std::path::Path,
+) -> anyhow::Result<Orientation> {
+    // Step 1: install the WORKTREE-AWARE scoping view. `config_root` (the main worktree, where the
+    // shared base index lives) anchors the base commit; `cwd` is the session's working dir — when
+    // it is a linked worktree, orientation reflects that branch's overlay on the base,
+    // otherwise the base scope (#219). Using the worktree's own HEAD as the base (the old
+    // `resolve_git_context(cwd)`) was wrong: the index has no committed scope at a linked
+    // worktree's HEAD, so orientation saw only the bare overlay delta.
+    crate::index::install_worktree_scope_view(conn, config_root, cwd)?;
 
     // Step 2: directory tree (reads scoped `files` view).
     let tree = crate::query::tree::dir_tree(conn, &Default::default())?;
@@ -69,7 +77,9 @@ pub fn orientation(conn: &Connection, root: &std::path::Path) -> anyhow::Result<
     let active_memory_total = active_non_dir_memory_count(conn)?;
 
     // Step 6: git-history index status (live HEAD + indexed HEAD).
-    let git_status = crate::index::git_history::status(conn, root)?;
+    // The git working-tree status reflects the SESSION's checkout (the worktree's own dirty state),
+    // so read it from `cwd`, not the base `config_root`.
+    let git_status = crate::index::git_history::status(conn, cwd)?;
     let head = git_status.head.unwrap_or_default();
     let indexed_head = git_status.indexed_head.unwrap_or_default();
 

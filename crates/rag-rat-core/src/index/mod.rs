@@ -34,7 +34,12 @@ pub use discovery::DiscoveryStatus;
 pub(crate) use discovery::*;
 pub use git_context::resolve_git_context;
 pub(crate) use git_context::*;
+// Only tests reach `install_scope_view` directly now (non-test code goes through
+// `install_worktree_scope_view`, which calls it within `lifecycle`); gate the re-export so the
+// non-test build doesn't warn it unused.
+#[cfg(test)]
 pub(crate) use lifecycle::install_scope_view;
+pub use lifecycle::install_worktree_scope_view;
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub use parser_failures::ParserFailure;
 pub(crate) use prep::*;

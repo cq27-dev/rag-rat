@@ -287,8 +287,16 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
     // (`let _ = run_inner()`) — so the hook stays silent and never blocks session start. Do NOT
     // add error prints here: this branch's stdout is injected as model context.
     let conn = IndexConnection::open_read_only(&config.database)?;
-    let root = Path::new(&input.cwd);
-    let o = rag_rat_core::query::orientation::orientation(conn.connection(), root)?;
+    // Scope orientation to the session's worktree: `config.root` (anchored to the main worktree) is
+    // the base index, `input.cwd` is where the session is — a linked worktree gets its branch
+    // overlay (#219). find_config already anchored config.root to the main worktree, so the two
+    // together resolve the right overlay even when the session is launched from a linked
+    // checkout.
+    let o = rag_rat_core::query::orientation::orientation(
+        conn.connection(),
+        &config.root,
+        Path::new(&input.cwd),
+    )?;
     let (live, enabled) = watcher_state(&config);
     print!("{}", format_digest(&o, live, enabled));
     if let Some(line) = version_check_line(&config) {
@@ -331,8 +339,11 @@ fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
     let Some(search) = extract_search(input) else { return Ok(()) };
     let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
 
-    let context = ask_listener(&config, &input.session_id, &search)
-        .unwrap_or_else(|| fallback_compose(&config, &search));
+    // Pass the session cwd through both paths so the grep-augmentation is scoped to the worktree
+    // the session is in (a linked worktree gets its branch overlay), not just the base index
+    // (#219).
+    let context = ask_listener(&config, &input.session_id, &input.cwd, &search)
+        .unwrap_or_else(|| fallback_compose(&config, &input.cwd, &search));
     if let Some(context) = context {
         // PreToolUse contract: allow + additionalContext; plain stdout is debug-only.
         println!(
@@ -504,7 +515,12 @@ fn find_config(start: &Path) -> Option<Config> {
 
 /// Outer Option: did the listener answer at all (None ⇒ fall back). Inner Option: did it
 /// have anything new to say.
-fn ask_listener(config: &Config, session_id: &str, search: &Search) -> Option<Option<String>> {
+fn ask_listener(
+    config: &Config,
+    session_id: &str,
+    cwd: &str,
+    search: &Search,
+) -> Option<Option<String>> {
     #[cfg(unix)]
     {
         use std::io::{BufRead, BufReader, Write as _};
@@ -516,8 +532,11 @@ fn ask_listener(config: &Config, session_id: &str, search: &Search) -> Option<Op
         let stream = UnixStream::connect(&socket).ok()?;
         stream.set_read_timeout(Some(SOCKET_BUDGET)).ok()?;
         stream.set_write_timeout(Some(SOCKET_BUDGET)).ok()?;
+        // `cwd` lets the listener scope the augmentation to the session's worktree overlay (#219);
+        // an older listener without the field just ignores it (lenient deserialize) → base scope.
         let request = serde_json::json!({
             "v": 1, "kind": "grep_augment", "session_id": session_id,
+            "cwd": cwd,
             "pattern": search.pattern, "search_path": search.search_path,
             "source": search.source,
         });
@@ -533,7 +552,7 @@ fn ask_listener(config: &Config, session_id: &str, search: &Search) -> Option<Op
     }
     #[cfg(not(unix))]
     {
-        let _ = (config, session_id, search);
+        let _ = (config, session_id, cwd, search);
         None
     }
 }
@@ -545,8 +564,17 @@ fn socket_path(config: &Config) -> PathBuf {
 }
 
 /// Stateless direct read (no dedupe — spec: fallback path). Any error ⇒ silence.
-fn fallback_compose(config: &Config, search: &Search) -> Option<String> {
+fn fallback_compose(config: &Config, cwd: &str, search: &Search) -> Option<String> {
     let conn = IndexConnection::open_read_only(&config.database).ok()?;
+    // Scope to the session's worktree overlay before composing — `compose` queries the `files`
+    // view, so without this it would read raw (unscoped) rows. config.root is the anchored main
+    // worktree; cwd is the session dir (a linked worktree → its overlay, else base) (#219).
+    rag_rat_core::index::install_worktree_scope_view(
+        conn.connection(),
+        &config.root,
+        Path::new(cwd),
+    )
+    .ok()?;
     grep_augment::compose(
         conn.connection(),
         &search.pattern,

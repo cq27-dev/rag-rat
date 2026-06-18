@@ -206,6 +206,24 @@ impl IndexDatabase {
     }
 }
 
+/// Install the per-connection scope view for a worktree-aware query on a RAW connection — the
+/// Claude Code hooks (SessionStart orientation, PreToolUse grep-augmentation) and the MCP hook
+/// listener open an `IndexConnection` directly, not `IndexDatabase`, so they can't use
+/// `use_worktree_scope`. Resolves the OVERLAY scope from `config_root` (the main worktree, where
+/// the base index lives) and `cwd` (the session's working dir): when `cwd` is a linked worktree of
+/// `config_root`'s repo, the view serves that branch's overlay on the base; otherwise (main /
+/// foreign / unreadable) it is the base scope. `pub` so the CLI hook + the MCP listener (other
+/// crates) can scope their context to the worktree the session is actually in (#219).
+pub fn install_worktree_scope_view(
+    conn: &rusqlite::Connection,
+    config_root: &Path,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    let (commit_sha, worktree_id) = resolve_worktree_scope(config_root, Some(cwd));
+    install_scope_view(conn, &commit_sha, &worktree_id)?;
+    Ok(())
+}
+
 /// Installs the per-connection commit/worktree scoping view; callers query `files` afterward and
 /// see only the active context.
 pub(crate) fn install_scope_view(

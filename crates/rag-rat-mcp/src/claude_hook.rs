@@ -19,6 +19,10 @@ pub struct HookRequest {
     pub search_path: Option<String>,
     #[serde(default)]
     pub source: String,
+    /// The session's working directory, so the listener scopes the augmentation to that worktree's
+    /// branch overlay (#219). Absent (older client) → base scope.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,11 +155,22 @@ mod listener {
                     state.filter.clone()
                 };
                 let database = config.database.clone();
+                let config_root = config.root.clone();
+                // Scope to the session's worktree overlay (#219). Absent cwd (older client) → the
+                // config root, which resolves to the base scope. This also fixes the listener's
+                // prior lack of ANY scope install: compose queries the `files` view, so without
+                // this it read raw, unscoped rows.
+                let cwd = req.cwd.clone().map(PathBuf::from).unwrap_or_else(|| config_root.clone());
                 let pattern = req.pattern.clone();
                 let search_path = req.search_path.clone();
                 // rusqlite is sync; one short read off the runtime threads.
                 let composed = tokio::task::spawn_blocking(move || {
                     let conn = IndexConnection::open_read_only(&database)?;
+                    rag_rat_core::index::install_worktree_scope_view(
+                        conn.connection(),
+                        &config_root,
+                        &cwd,
+                    )?;
                     grep_augment::compose(
                         conn.connection(),
                         &pattern,
@@ -214,10 +229,18 @@ mod listener_tests {
 
         let rw = IndexConnection::open(&config.database).unwrap();
         schema::apply(rw.connection()).unwrap();
+        // Seed at the scope a NON-git index uses (commit_sha '', worktree_id = the root), so the
+        // listener's worktree-scoped read (#219) surfaces the file — the listener now installs the
+        // scope view (resolve_worktree_scope → an absent request cwd resolves to config.root → base
+        // scope), where the overlay branch keys on `worktree_id`.
         rw.connection()
             .execute(
-                "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
-                 VALUES ('src/lib.rs', 'rust', 'source', 'abc', 0, 0)",
+                &format!(
+                    "INSERT INTO files(path, language, kind, sha256, modified_at_ms, \
+                     indexed_at_ms, worktree_id)
+                     VALUES ('src/lib.rs', 'rust', 'source', 'abc', 0, 0, '{}')",
+                    config.root.to_string_lossy()
+                ),
                 [],
             )
             .unwrap();

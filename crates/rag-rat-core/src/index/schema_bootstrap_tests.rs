@@ -8562,6 +8562,49 @@ fn worktree_overlay_resolves_through_a_symlinked_path() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+#[test]
+fn orientation_in_a_linked_worktree_reflects_the_overlay_on_base() {
+    // #219: SessionStart orientation must scope to the session's WORKTREE (the overlay on the
+    // base), not the worktree's own HEAD — the index has no committed scope at a linked
+    // worktree's HEAD, so the old resolve_git_context(cwd) saw only the bare overlay delta,
+    // missing the base files.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base_fn() {}\n").unwrap();
+    fs::write(main.join("src/keep.rs"), "pub fn keep_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let db_path = db.database_path().to_path_buf();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/added.rs"), "pub fn added_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    drop(db);
+
+    let conn = IndexConnection::open_read_only(&db_path).unwrap();
+    // Worktree cwd: overlay ON base = base.rs + keep.rs + the overlay's added.rs = 3.
+    let o_wt = crate::query::orientation::orientation(conn.connection(), &main, &linked).unwrap();
+    assert_eq!(
+        o_wt.total_files, 3,
+        "worktree orientation must show base files + the overlay's added file"
+    );
+
+    // Main cwd: base scope only = 2.
+    let o_main = crate::query::orientation::orientation(conn.connection(), &main, &main).unwrap();
+    assert_eq!(o_main.total_files, 2, "main orientation shows the base scope");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),
@@ -9829,7 +9872,7 @@ fn orientation_composes_read_only() {
 
     // orientation installs its own scope view — pass the raw connection.
     let conn = db.storage.connection();
-    let o1 = crate::query::orientation::orientation(conn, &root).unwrap();
+    let o1 = crate::query::orientation::orientation(conn, &root, &root).unwrap();
 
     // tree: root memory must be set; nodes must be non-empty.
     assert_eq!(
@@ -9878,7 +9921,7 @@ fn orientation_composes_read_only() {
     let _ = o1.parser_failures;
 
     // Idempotency: run orientation a second time — must succeed with same key results.
-    let o2 = crate::query::orientation::orientation(conn, &root).unwrap();
+    let o2 = crate::query::orientation::orientation(conn, &root, &root).unwrap();
     assert_eq!(
         o2.tree.root_memory_title.as_deref(),
         Some("root purpose"),
@@ -9918,7 +9961,7 @@ fn orientation_composes_through_read_only_connection() {
 
     // Open the SAME on-disk DB read-only, exactly as session_start does.
     let conn = IndexConnection::open_read_only(&db_path).unwrap();
-    let o = crate::query::orientation::orientation(conn.connection(), &root)
+    let o = crate::query::orientation::orientation(conn.connection(), &root, &root)
         .expect("orientation must compose through a read-only main-DB connection");
 
     // The scope view (TEMP table/view) was created and queried — non-empty tree + 6 files.
