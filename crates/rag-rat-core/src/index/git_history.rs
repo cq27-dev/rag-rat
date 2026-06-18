@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rayon::prelude::*;
+use gix::object::tree::diff::{Action, Change};
+use gix::revision::walk::Sorting;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -127,12 +128,12 @@ pub(crate) fn prepare(root: &Path) -> anyhow::Result<PreparedGitHistory> {
     let Some(repo) = git_repo(root) else {
         return Ok(PreparedGitHistory { repo: None, commits: Vec::new(), changes: Vec::new() });
     };
-    // Pin both logs to the sha captured above, not the implicit HEAD: HEAD can move between
-    // `git_repo` and these two separate `git log` invocations, which would record the meta head
-    // while the tables hold a newer commit's history. Pinning makes `prepare` atomic w.r.t. a
-    // concurrent commit and keeps the stored `git_history_indexed_head` honest for the gate.
-    let commits = read_commits(root, &repo.head)?;
-    let changes = read_file_changes(root, &repo.worktree_root, &repo.head)?;
+    // One streaming gix revwalk pinned to the captured HEAD produces both the commit records and
+    // their file changes — no `git log` subprocess and no full-history stdout buffer, so memory
+    // stays bounded on deep-history repos (#212). Pinning to the captured sha (not implicit HEAD)
+    // keeps `prepare` atomic w.r.t. a concurrent commit, so the stored `git_history_indexed_head`
+    // stays honest for the reload gate.
+    let (commits, changes) = read_history(root, &repo.worktree_root, &repo.head);
     Ok(PreparedGitHistory { repo: Some(repo), commits, changes })
 }
 
@@ -443,93 +444,127 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_commits(root: &Path, head: &str) -> anyhow::Result<Vec<CommitRecord>> {
-    let Some(output) = git_output(root, &[
-        "log",
-        head,
-        "--format=format:%H%x1f%an%x1f%ae%x1f%at%x1f%ct%x1f%s%x1f%B%x1e",
-        "--",
-        ".",
-    ]) else {
-        return Ok(Vec::new());
-    };
-    Ok(output
-        .split('\x1e')
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .filter_map(parse_commit_record)
-        .collect())
-}
-
-fn read_file_changes(
+/// Walk the commit history reachable from `head` with gix (gitoxide), producing the commit records
+/// and their per-file changes in a SINGLE streaming pass — no `git log` subprocess and no
+/// full-history stdout buffer, so memory stays bounded on deep-history repos (#212). Best-effort: a
+/// repo gix can't open, or a commit it can't read, yields fewer rows rather than failing the whole
+/// index (matching the previous subprocess path's graceful degradation).
+fn read_history(
     root: &Path,
     worktree_root: &Path,
     head: &str,
-) -> anyhow::Result<Vec<FileChange>> {
-    let Some(output) =
-        git_output(root, &["log", head, "--numstat", "--format=format:%x1e%H", "--", "."])
-    else {
-        return Ok(Vec::new());
-    };
-    Ok(output
-        .split('\x1e')
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .flat_map(|record| parse_file_change_record(root, worktree_root, record))
-        .collect())
-}
-
-fn parse_commit_record(record: &str) -> Option<CommitRecord> {
-    let record = record.trim();
-    if record.is_empty() {
-        return None;
-    }
-    let mut parts = record.splitn(7, '\x1f');
-    let hash = parts.next()?;
-    let author_name = parts.next()?;
-    let author_email = parts.next()?;
-    let authored_at_s = parts.next()?;
-    let committed_at_s = parts.next()?;
-    let subject = parts.next()?;
-    let body = parts.next().unwrap_or_default().trim().to_string();
-    Some(CommitRecord {
-        hash: hash.to_string(),
-        author_name: author_name.to_string(),
-        author_email: author_email.to_string(),
-        authored_at_s: authored_at_s.parse().unwrap_or(0),
-        committed_at_s: committed_at_s.parse().unwrap_or(0),
-        subject: subject.to_string(),
-        body,
-    })
-}
-
-fn parse_file_change_record(root: &Path, worktree_root: &Path, record: &str) -> Vec<FileChange> {
-    let mut lines = record.lines().filter(|line| !line.trim().is_empty());
-    let Some(hash) = lines.next().map(str::trim).filter(|line| !line.is_empty()) else {
-        return Vec::new();
-    };
+) -> (Vec<CommitRecord>, Vec<FileChange>) {
+    let mut commits = Vec::new();
     let mut changes = Vec::new();
-    for line in lines {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() < 3 {
-            continue;
-        }
-        let Some(path) = normalize_git_path(root, worktree_root, fields[2]) else {
-            continue;
-        };
-        changes.push(FileChange {
-            commit_hash: hash.to_string(),
-            path,
-            additions: parse_numstat_count(fields[0]),
-            deletions: parse_numstat_count(fields[1]),
-            change_kind: "modified".to_string(),
-        });
-    }
-    changes
+    let _ = read_history_inner(root, worktree_root, head, &mut commits, &mut changes);
+    (commits, changes)
 }
 
+fn read_history_inner(
+    root: &Path,
+    worktree_root: &Path,
+    head: &str,
+    commits: &mut Vec<CommitRecord>,
+    changes: &mut Vec<FileChange>,
+) -> anyhow::Result<()> {
+    let mut repo = gix::discover(root)?;
+    // The by-commit-time walk + per-commit tree diffs look up each commit/tree more than once; an
+    // object cache avoids repeated zlib inflation (gitoxide's own recommendation for these passes).
+    repo.object_cache_size_if_unset(16 * 1024 * 1024);
+    let head_id = gix::ObjectId::from_hex(head.as_bytes())?;
+    // A blob-diff resource cache for per-file line counts (`change.diff`), reused across commits
+    // and cleared each commit to bound its growth.
+    let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
+    let walk = repo
+        .rev_walk([head_id])
+        // Newest-first, matching `git log`'s default reverse-chronological order.
+        .sorting(Sorting::ByCommitTime(gix::traverse::commit::simple::CommitTimeOrder::NewestFirst))
+        .all()?;
+    for info in walk {
+        let id = info?.id;
+        let commit = repo.find_commit(id)?;
+        let author = commit.author()?;
+        let committer = commit.committer()?;
+        let body = commit.message_raw_sloppy().to_string();
+        commits.push(CommitRecord {
+            hash: id.to_hex().to_string(),
+            author_name: author.name.to_string(),
+            author_email: author.email.to_string(),
+            authored_at_s: author.seconds(),
+            committed_at_s: committer.seconds(),
+            subject: commit.message()?.summary().to_string(),
+            // The full raw message (git `%B`), so commit FTS covers the body, not just the subject.
+            body: body.trim().to_string(),
+        });
+
+        let hash = id.to_hex().to_string();
+        let new_tree = commit.tree()?;
+        let parent_tree = match commit.parent_ids().next() {
+            Some(parent) => repo.find_commit(parent.detach())?.tree()?,
+            None => repo.empty_tree(),
+        };
+        diff_cache.clear_resource_cache();
+        parent_tree
+            .changes()?
+            // Full paths for each change; NO rename detection — a rename shows as a deletion +
+            // addition, matching `git log --numstat` without `-M` (and avoiding the Rewrite variant).
+            .options(|opts| {
+                opts.track_path().track_rewrites(None);
+            })
+            .for_each_to_obtain_tree(&new_tree, |change| {
+                push_file_change(&change, &hash, root, worktree_root, &mut diff_cache, changes);
+                Ok::<_, std::convert::Infallible>(Action::Continue(()))
+            })?;
+    }
+    Ok(())
+}
+
+/// Record one tree-diff change as a `FileChange` — file blobs only (trees/submodules are skipped) —
+/// with exact additions/deletions from a blob line-diff. A binary/uncountable diff yields `None`
+/// counts (the numstat `-` case).
+fn push_file_change(
+    change: &Change<'_, '_, '_>,
+    hash: &str,
+    root: &Path,
+    worktree_root: &Path,
+    diff_cache: &mut gix::diff::blob::Platform,
+    out: &mut Vec<FileChange>,
+) {
+    let (change_kind, location, is_blob) = match change {
+        Change::Addition { location, entry_mode, .. } => ("added", *location, entry_mode.is_blob()),
+        Change::Deletion { location, entry_mode, .. } =>
+            ("deleted", *location, entry_mode.is_blob()),
+        Change::Modification { location, entry_mode, .. } =>
+            ("modified", *location, entry_mode.is_blob()),
+        // Rewrites are disabled above; ignore defensively if config ever forces them on.
+        Change::Rewrite { .. } => return,
+    };
+    if !is_blob {
+        return;
+    }
+    let Some(path) = normalize_git_path(root, worktree_root, &location.to_string()) else {
+        return;
+    };
+    let (additions, deletions) = change
+        .diff(diff_cache)
+        .ok()
+        .and_then(|mut platform| platform.line_counts().ok().flatten())
+        .map_or((None, None), |stats| {
+            (Some(i64::from(stats.insertions)), Some(i64::from(stats.removals)))
+        });
+    out.push(FileChange {
+        commit_hash: hash.to_string(),
+        path,
+        additions,
+        deletions,
+        change_kind: change_kind.to_string(),
+    });
+}
+
+/// Map a gix change `location` (repo-root-relative) to the index-root-relative path the rest of the
+/// index uses. Handles the subdirectory-repo case where the index `root` is a child of the git
+/// worktree root.
 fn normalize_git_path(root: &Path, worktree_root: &Path, path: &str) -> Option<String> {
-    let path = normalize_rename_path(path);
     let path = Path::new(path);
     if let Ok(relative) = worktree_root.join(path).strip_prefix(root) {
         return Some(path_string(relative));
@@ -538,14 +573,6 @@ fn normalize_git_path(root: &Path, worktree_root: &Path, path: &str) -> Option<S
         return Some(path_string(path));
     }
     None
-}
-
-fn normalize_rename_path(path: &str) -> &str {
-    path.rsplit(" => ").next().unwrap_or(path).trim_matches('{').trim_matches('}')
-}
-
-fn parse_numstat_count(value: &str) -> Option<i64> {
-    (value != "-").then(|| value.parse::<i64>().ok()).flatten()
 }
 
 fn parse_blame(output: &str) -> Vec<BlameLine> {

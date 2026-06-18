@@ -29,7 +29,7 @@ rag-rat-core = { version = "0.7.0", path = "crates/rag-rat-core", default-featur
 rag-rat-mcp = { version = "0.7.0", path = "crates/rag-rat-mcp", default-features = false }
 anyhow = "1.0"
 fastembed = { version = "5.1.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
-gix = { version = "0.84.0", default-features = false, features = ["status", "parallel", "sha1"] }
+gix = { version = "0.84.0", default-features = false, features = ["status", "parallel", "sha1", "revision", "blob-diff"] }
 libc = "0.2"
 rmcp = { version = "1.7.0", features = ["transport-io"] }
 rusqlite = "0.40"
