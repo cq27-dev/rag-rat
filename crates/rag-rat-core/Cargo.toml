@@ -34,6 +34,9 @@ thiserror.workspace = true
 toml.workspace = true
 toon-format.workspace = true
 ureq.workspace = true
+# Dictionary-trained zstd compression of stored chunk text (#77 Phase 2). One shared dictionary
+# trained on a corpus sample (zdict_builder) + bulk one-shot compress/decompress per chunk blob.
+zstd = "0.13"
 tree-sitter.workspace = true
 tree-sitter-c.workspace = true
 tree-sitter-cpp.workspace = true

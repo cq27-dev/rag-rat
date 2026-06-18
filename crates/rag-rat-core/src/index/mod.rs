@@ -28,6 +28,10 @@ mod prep;
 mod query_api;
 mod rebuild;
 mod staleness;
+// Landed first as a tested, self-contained foundation; wired into the index (compress at index
+// time, decompress on the read paths) in the next #77 Phase 2 increment.
+#[allow(dead_code)]
+mod text_compression;
 mod util;
 mod worktree_overlay;
 pub use discovery::DiscoveryStatus;
