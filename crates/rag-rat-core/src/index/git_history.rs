@@ -428,6 +428,27 @@ fn blame_lines_via_gix(
     let worktree_root = repo.workdir().unwrap_or(root);
     let absolute = root.join(path);
     let relative = absolute.strip_prefix(worktree_root).unwrap_or_else(|_| Path::new(path));
+
+    // Blame attributes lines in HEAD's version of the file. If the working tree differs from HEAD
+    // (a dirty file, or one not in HEAD at all), its line numbers don't align with HEAD, so a HEAD
+    // blame would shift/mis-attribute the chunk's lines — and `git_blame_chunk` would cache that
+    // wrong result under the dirty content hash (#213 review). Only blame a file that is byte-for-
+    // byte identical to HEAD; otherwise return no attribution. (`git blame` with no revision blamed
+    // the worktree directly, marking uncommitted lines `0000000`; gix blames committed objects
+    // only, so a clean-file guard is the faithful, safe equivalent.)
+    let head_blob = repo
+        .find_commit(head)
+        .ok()
+        .and_then(|commit| commit.tree().ok())
+        .and_then(|tree| tree.lookup_entry_by_path(relative).ok().flatten())
+        .and_then(|entry| entry.object().ok())
+        .map(|object| object.data.clone());
+    match (head_blob, std::fs::read(&absolute)) {
+        (Some(head_bytes), Ok(worktree_bytes)) if head_bytes == worktree_bytes => {},
+        // Dirty / new / unreadable: skip rather than cache misaligned attribution.
+        _ => return Ok(Vec::new()),
+    }
+
     let file_path = gix::path::into_bstr(relative);
     let start = u32::try_from(start_line.max(1)).unwrap_or(1);
     let end = u32::try_from(end_line.max(start_line)).unwrap_or(start);

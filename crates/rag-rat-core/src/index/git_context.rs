@@ -107,30 +107,40 @@ pub fn resolve_git_context(root: &Path) -> (String, String) {
     (commit_sha, worktree_id)
 }
 
-/// The live (commit_sha, worktree_id) keys across every worktree that shares this repo, from
-/// `git worktree list --porcelain`. Each worktree contributes its HEAD commit (for clean rows)
-/// and its path (for dirty/overlay rows). Returns empty vecs outside a git worktree.
+/// The live (commit_sha, worktree_id) keys across every worktree that shares this repo (the gix
+/// equivalent of `git worktree list --porcelain`). Each worktree contributes its HEAD commit (for
+/// clean rows) and its path (for dirty/overlay rows). Returns empty vecs outside a git worktree.
 pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) {
     let mut commits = Vec::new();
     let mut worktrees = Vec::new();
     let Ok(repo) = gix::discover(root) else {
         return (commits, worktrees);
     };
-    let push_path = |worktrees: &mut Vec<String>, path: &Path| {
-        worktrees.push(path.to_string_lossy().trim_end_matches('/').to_string());
-    };
-    // The main worktree (gix `worktrees()` lists only the LINKED ones).
-    if let Some(workdir) = repo.workdir() {
-        push_path(&mut worktrees, workdir);
+    let add_repo =
+        |worktrees: &mut Vec<String>, commits: &mut Vec<String>, repo: &gix::Repository| {
+            if let Some(workdir) = repo.workdir() {
+                worktrees.push(workdir.to_string_lossy().trim_end_matches('/').to_string());
+            }
+            if let Ok(id) = repo.head_id() {
+                commits.push(id.to_hex().to_string());
+            }
+        };
+    // The current worktree (may itself be the main one or a linked one).
+    add_repo(&mut worktrees, &mut commits, &repo);
+    // The MAIN worktree, ALWAYS — `worktrees()` enumerates only LINKED worktrees and
+    // `repo.workdir()` is whichever checkout we were launched from, so when that's a linked
+    // worktree the main one would otherwise be missing. A GC reading this set must keep the
+    // main worktree's path/HEAD live or it could prune the main checkout's indexed rows (#213
+    // review). The common dir IS the main repo's git dir.
+    if let Ok(main) = gix::open(repo.common_dir()) {
+        add_repo(&mut worktrees, &mut commits, &main);
     }
-    if let Ok(id) = repo.head_id() {
-        commits.push(id.to_hex().to_string());
-    }
-    // Linked worktrees: path from the proxy, HEAD from opening each one.
+    // Linked worktrees: path from the proxy (robust even if the checkout is gone), HEAD from
+    // opening.
     if let Ok(proxies) = repo.worktrees() {
         for proxy in proxies {
             if let Ok(base) = proxy.base() {
-                push_path(&mut worktrees, &base);
+                worktrees.push(base.to_string_lossy().trim_end_matches('/').to_string());
             }
             if let Ok(linked) = proxy.into_repo()
                 && let Ok(id) = linked.head_id()
@@ -139,5 +149,11 @@ pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) 
             }
         }
     }
+    // The current/main/linked sets overlap (e.g. launched from the main worktree); dedup so each
+    // live worktree path + HEAD appears once.
+    worktrees.sort();
+    worktrees.dedup();
+    commits.sort();
+    commits.dedup();
     (commits, worktrees)
 }

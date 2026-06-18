@@ -11,14 +11,17 @@ pub(crate) fn git_paths(root: &Path) -> anyhow::Result<GitPaths> {
     };
     let git_dir = absolutize(repo.git_dir());
     let git_common_dir = absolutize(repo.common_dir());
-    // `core.hooksPath` overrides the default `<git-dir>/hooks` (git resolves a relative value
-    // against the worktree); fall back to the standard location otherwise.
+    // `core.hooksPath` overrides the default (git resolves a relative value against the worktree);
+    // otherwise the default is the COMMON hooks dir — a linked worktree shares `<main>/.git/hooks`,
+    // NOT its private `<git-dir>/worktrees/<name>/hooks`, so installing there would write hooks git
+    // never runs (#213 review). For the main worktree git_dir == common_dir, so this is correct
+    // there too.
     let hooks_dir = repo
         .config_snapshot()
         .trusted_path("core.hooksPath")
         .and_then(Result::ok)
         .map(|path| if path.is_absolute() { path.into_owned() } else { worktree_root.join(path) })
-        .unwrap_or_else(|| git_dir.join("hooks"));
+        .unwrap_or_else(|| git_common_dir.join("hooks"));
     Ok(GitPaths { worktree_root, git_dir, git_common_dir, hooks_dir })
 }
 pub(crate) fn install_hook(hooks_dir: &Path, hook: &str) -> anyhow::Result<()> {
