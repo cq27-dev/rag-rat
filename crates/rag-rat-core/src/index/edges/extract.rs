@@ -99,9 +99,14 @@ pub(crate) fn syntactic_edges(
         ParserKind::Python => tree_sitter_python::LANGUAGE.into(),
         ParserKind::Markdown => return Ok(Vec::new()),
     };
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&grammar)?;
-    let Some(tree) = parser.parse(text, None) else {
+    // Cancel/abandon a pathological parse (a grammar-ambiguity blowup, e.g. some Kotlin files)
+    // rather than hang the indexer forever — a timed-out file yields no edges, same as a parse
+    // failure (#210).
+    let Some(tree) = crate::index::parser::parse_within_budget(
+        grammar,
+        text,
+        crate::index::parser::PARSE_BUDGET,
+    ) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();

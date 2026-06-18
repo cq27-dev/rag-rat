@@ -1,8 +1,73 @@
+use std::ops::ControlFlow;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use tree_sitter::Node;
+use tree_sitter::{Node, ParseOptions, ParseState, Parser, Tree};
 
 use crate::language::Language;
+
+/// Wall-clock budget for a single file's tree-sitter parse. A normal file parses in well under this
+/// (tens of ms even for thousands of lines); a pathological input that drives tree-sitter into
+/// super-linear parsing — a grammar-ambiguity blowup, e.g. some Kotlin files (#210) — would
+/// otherwise pin a core at 100% CPU FOREVER, hanging `index` and the background watcher with no
+/// recovery. Past the budget the parse is treated as a parser failure (the file is recorded +
+/// skipped), keeping the indexer responsive. Generous on purpose: the cost of a false timeout
+/// (silently dropping a huge but legitimate file) is worse than a few wasted seconds on a genuinely
+/// pathological one.
+pub(crate) const PARSE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Extra wall-clock the caller waits beyond [`PARSE_BUDGET`] before ABANDONING the parse worker.
+/// tree-sitter's progress callback only fires in the lex/advance path, so a same-position reduce
+/// blowup (the H2.kt class, #210) never invokes it and the soft budget can't stop it — only giving
+/// up on the worker thread does. Small margin so that when the soft cancel DOES work the worker
+/// returns first (clean, no leaked thread); the leaked-worker path is the fallback for the
+/// uncancellable case.
+const PARSE_ABANDON_GRACE: Duration = Duration::from_secs(2);
+
+/// Parse `text` under a hard wall-clock bound, returning `None` on a genuine parse failure OR a
+/// timeout — both of which the callers already treat as a parser failure (#210).
+///
+/// Two layers, because tree-sitter cannot be cancelled mid-reduce (#210): the parse runs on a
+/// worker thread with a SOFT progress-callback budget (cleanly cancels the cancellable cases —
+/// runaway lexing, huge-but-progressing files — so the worker exits and nothing leaks); the calling
+/// thread also waits only `budget + PARSE_ABANDON_GRACE` and, if the worker blows past that (an
+/// uncancellable reduce explosion), ABANDONS it and reports a parse failure. The abandoned worker
+/// keeps running until it finishes or the process exits — accepted: bounding the indexer's
+/// wall-clock matters more than one leaked thread on a genuinely pathological file.
+pub(crate) fn parse_within_budget(
+    grammar: tree_sitter::Language,
+    text: &str,
+    budget: Duration,
+) -> Option<Tree> {
+    let text = text.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut parser = Parser::new();
+        if parser.set_language(&grammar).is_err() {
+            let _ = tx.send(None);
+            return;
+        }
+        let deadline = Instant::now() + budget;
+        let mut over_budget = |_state: &ParseState| {
+            if Instant::now() >= deadline {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let options = ParseOptions::new().progress_callback(&mut over_budget);
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let tree = parser.parse_with_options(
+            &mut |i, _| if i < len { &bytes[i..] } else { &bytes[..0] },
+            None,
+            Some(options),
+        );
+        // The receiver may already have given up (abandoned worker) — ignore the send error.
+        let _ = tx.send(tree);
+    });
+    rx.recv_timeout(budget + PARSE_ABANDON_GRACE).ok().flatten()
+}
 
 #[derive(Debug, Clone)]
 pub struct ParsedSymbol {
@@ -111,9 +176,7 @@ impl ParsedFile {
 /// grammar (markdown) or if the parse fails outright.
 pub fn parse_file(path: &Path, language: Language, text: &str) -> Option<ParsedFile> {
     let grammar = grammar_for(parser_kind(path, language))?;
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&grammar).ok()?;
-    let tree = parser.parse(text, None)?;
+    let tree = parse_within_budget(grammar, text, PARSE_BUDGET)?;
     let mut symbols = Vec::new();
     collect_symbols(path, language, text, tree.root_node(), &mut symbols);
     symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
@@ -576,4 +639,30 @@ fn clean_doc_comment_line(trimmed: &str) -> Option<String> {
     .trim();
 
     (!line.is_empty()).then(|| line.to_string())
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn parse_within_budget_parses_normal_input_within_budget() {
+        // The budgeted/worker-thread path must produce a tree for an ordinary file — no false
+        // timeout, same result as a plain parse (#210).
+        let grammar = grammar_for(ParserKind::Rust).expect("rust grammar");
+        let tree = parse_within_budget(grammar, "fn main() { let x = 1 + 2; }", PARSE_BUDGET);
+        assert!(tree.is_some(), "a normal file must parse within budget");
+        assert!(!tree.unwrap().root_node().has_error(), "valid input parses cleanly");
+    }
+
+    #[test]
+    fn parse_within_budget_zero_budget_does_not_hang() {
+        // A near-zero budget must return promptly (the worker is cancelled or abandoned), never
+        // hang — the whole point of the guard (#210). A large input ensures the parse can't finish
+        // before the deadline check.
+        let grammar = grammar_for(ParserKind::Rust).expect("rust grammar");
+        let big = "fn f() { let x = vec![1, 2, 3]; }\n".repeat(20_000);
+        // Returns (None on cancel/abandon, or a partial tree) — the assertion is that it RETURNS.
+        let _ = parse_within_budget(grammar, &big, std::time::Duration::ZERO);
+    }
 }
