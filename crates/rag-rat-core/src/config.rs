@@ -263,12 +263,16 @@ impl Config {
         // write CONFLICTING overlay rows to the shared DB — a file present on one branch
         // races between readable and tombstone (#218/#219). The main worktree (and non-git
         // dirs) resolve to themselves, so single-worktree users see no change.
-        let root = main_worktree_or_self(&root);
-        // One database per repo: a relative path resolves against `root` (now the main worktree),
-        // so all linked worktrees share one index. An absolute path is honored as-is.
+        let root = anchor_root_to_main_worktree(&root);
+        // One database per repo, shared across worktrees: a relative path resolves against the MAIN
+        // worktree TOP — NOT `root`, which may be a subdirectory — so every worktree of a repo AND
+        // any `root="<subdir>"` config land on the SAME index. An absolute path is honored as-is.
         let database = match raw.index.database {
             Some(db) if Path::new(&db).is_absolute() => PathBuf::from(db),
-            other => root.join(other.unwrap_or_else(|| ".rag-rat/index.sqlite".to_string())),
+            other => {
+                let relative = other.unwrap_or_else(|| ".rag-rat/index.sqlite".to_string());
+                main_worktree_root(&root).unwrap_or_else(|| root.clone()).join(relative)
+            },
         };
         let targets = resolve_targets(&root, raw.target_bindings, raw.target)?;
         let local_ai = LocalAiConfig::try_from(raw.local_ai)?;
@@ -343,13 +347,30 @@ fn push_target(
     Ok(())
 }
 
-/// The **main** worktree root for a **linked** git worktree (so every worktree of a repo resolves
-/// to one `root` + one shared index DB); for the main worktree or a non-git dir, `root` unchanged —
-/// single-worktree setups are unaffected.
-fn main_worktree_or_self(root: &Path) -> PathBuf {
-    match main_worktree_root(root) {
-        Some(main_root) if main_root != root => main_root,
-        _ => root.to_path_buf(),
+/// Re-anchor a **linked** worktree's `root` to the equivalent path under the **main** worktree, so
+/// every worktree of a repo resolves to one root + one shared index — while PRESERVING any
+/// subdirectory the config root points at (a `root="<subdir>"` rebases to `<main>/<subdir>`, not
+/// the repo top). The main worktree (and non-git dirs) resolve to themselves. Collapsing a subdir
+/// root to the repo top changed the indexed file set and could fail config load when a target dir
+/// exists only under the subdir (#219 review).
+fn anchor_root_to_main_worktree(root: &Path) -> PathBuf {
+    let Ok(repo) = crate::index::discover_repo(root) else {
+        return root.to_path_buf();
+    };
+    let (Some(workdir), Some(main_root)) = (repo.workdir(), main_worktree_root(root)) else {
+        return root.to_path_buf();
+    };
+    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    if main_root == workdir {
+        return root.to_path_buf(); // already the main worktree — keep the configured (sub)root
+    }
+    // Linked worktree: rebase root's in-worktree subpath under the main worktree top. `root` is
+    // canonicalized by `normalize_existing_dir`, so it strips cleanly against the canonical
+    // workdir; `root == workdir` (a `root="."` config) yields an empty suffix → the main
+    // worktree top.
+    match root.strip_prefix(&workdir) {
+        Ok(rel) => main_root.join(rel),
+        Err(_) => main_root,
     }
 }
 
@@ -620,14 +641,14 @@ mod tests {
     }
 
     #[test]
-    fn main_worktree_or_self_shares_one_db_across_worktrees() {
+    fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
         let git = |dir: &Path, args: &[&str]| {
             std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
         };
         let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!("ragrat-cfg-{}-{id}", std::process::id()));
         let main = tmp.join("main");
-        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(main.join("src")).unwrap();
         git(&main, &["init", "-q"]);
         git(&main, &["config", "user.email", "t@example.com"]);
         git(&main, &["config", "user.name", "t"]);
@@ -636,20 +657,26 @@ mod tests {
         git(&main, &["commit", "-qm", "seed"]);
         let linked = tmp.join("wt");
         git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+        std::fs::create_dir_all(linked.join("src")).unwrap();
 
         let main_c = main.canonicalize().unwrap();
         let linked_c = linked.canonicalize().unwrap();
 
-        // Main worktree resolves to itself (no redirect → existing DB location preserved).
-        assert_eq!(main_worktree_or_self(&main_c), main_c);
-        // Linked worktree redirects to the main worktree → one shared DB.
-        assert_eq!(main_worktree_or_self(&linked_c), main_c);
+        // Main worktree (any root) resolves to itself.
+        assert_eq!(anchor_root_to_main_worktree(&main_c), main_c);
+        // A SUBDIR root on the main worktree is PRESERVED (not collapsed to the repo top) — the
+        // #219-review regression: collapsing changed the indexed file set + failed config load.
+        assert_eq!(anchor_root_to_main_worktree(&main_c.join("src")), main_c.join("src"));
+        // Linked worktree, root=".", redirects to the main worktree → one shared base.
+        assert_eq!(anchor_root_to_main_worktree(&linked_c), main_c);
+        // Linked worktree SUBDIR root rebases under the main worktree, subdir preserved.
+        assert_eq!(anchor_root_to_main_worktree(&linked_c.join("src")), main_c.join("src"));
 
         // A non-git directory falls back to itself.
         let plain = tmp.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         let plain_c = plain.canonicalize().unwrap();
-        assert_eq!(main_worktree_or_self(&plain_c), plain_c);
+        assert_eq!(anchor_root_to_main_worktree(&plain_c), plain_c);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

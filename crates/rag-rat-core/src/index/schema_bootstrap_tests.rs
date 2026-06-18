@@ -8472,6 +8472,96 @@ fn worktree_overlay_stable_when_main_removed_a_file_a_nested_branch_keeps() {
     let _ = fs::remove_dir_all(&main);
 }
 
+#[test]
+fn worktree_overlay_keeps_base_scope_logical_grouping() {
+    // #219 regression: the overlay pass's rebuild_logical_symbols must NOT de-group the
+    // base (shadowed) scope. A linked worktree that MODIFIES a base file shadows the base committed
+    // row; that base symbol must keep its logical handle (sym_<hex>), or graph-nav-by-id silently
+    // breaks for base symbols. Before the fix the overlay rebuild ran against the worktree scope
+    // view and wiped every other scope's grouping.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/shared.rs"), "pub fn shared_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Modify the base file in the worktree → the overlay shadows the base committed row.
+    fs::write(linked.join("src/shared.rs"), "pub fn shared_fn() {\n    let _x = 1;\n}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    // The BASE committed shared_fn symbol (commit_sha != '', worktree_id = '') must still be
+    // grouped.
+    let base_grouped: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            // Query RAW main.files, not the `files` scope view: after the overlay pass the
+            // connection is worktree-scoped, which SHADOWS the base committed shared.rs row.
+            "SELECT COUNT(*) FROM logical_symbol_members m
+             JOIN main.symbols s ON s.id = m.symbol_id
+             JOIN main.files f ON f.id = s.file_id
+             WHERE s.name = 'shared_fn' AND f.commit_sha != '' AND f.worktree_id = ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(base_grouped >= 1, "overlay pass de-grouped the base scope (graph-nav-by-id breaks)");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_overlay_resolves_through_a_symlinked_path() {
+    // #219 regression: a worktree referenced via a SYMLINK must resolve to the same
+    // worktree_id as the canonical path (worktree_id_of canonicalizes), so indexing via one
+    // spelling and querying via another agree. Before the fix the keys diverged → silent
+    // overlay miss + GC pruning the live overlay.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/added.rs"), "pub fn added_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    // Index via the CANONICAL path; query via a SYMLINK to the same checkout.
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    let symlinked = unique_temp_root();
+    let _ = fs::remove_dir_all(&symlinked);
+    std::os::unix::fs::symlink(&linked, &symlinked).unwrap();
+
+    db.use_worktree_scope(&main, Some(&symlinked)).unwrap();
+    assert!(
+        !db.symbols("added_fn", Some(Language::Rust), 10).unwrap().is_empty(),
+        "a symlinked worktree path must resolve to the same overlay as the canonical path"
+    );
+
+    let _ = fs::remove_file(&symlinked);
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),

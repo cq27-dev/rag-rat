@@ -22,6 +22,14 @@ pub(crate) struct GitChangedPaths {
 /// configured purely through `GIT_DIR`/`GIT_WORK_TREE`, e.g. CI — #213) do we fall back to the
 /// environment-override discovery, so that legitimate env-configured layout still resolves instead
 /// of leaving git history "unavailable".
+///
+/// LIMITATION (accepted, #219 review): the env fallback fires only when plain discovery ERRORS. If
+/// `config.root` has no `.git` of its own but sits INSIDE an enclosing repo (a monorepo above, a
+/// `$HOME` dotfiles repo), plain discovery succeeds on that enclosing repo and the `GIT_DIR`-
+/// configured external worktree is silently ignored. We do NOT re-prefer `GIT_DIR` here: that is
+/// exactly the env-hijack this fix removed (a worktree shell / git hook exports `GIT_DIR` and would
+/// re-capture resolution). The contract is: the index's repo is the one discoverable from
+/// `config.root` — don't nest a `GIT_DIR`-only external worktree inside another repo.
 pub(crate) fn discover_repo(root: &Path) -> Result<gix::Repository, Box<gix::discover::Error>> {
     // Box the error: gix's `discover::Error` is a large enum, and an unboxed large `Err` bloats
     // every `Result` this returns (clippy::result_large_err). Callers use `.ok()` or `?`
@@ -146,11 +154,20 @@ pub fn resolve_git_context(root: &Path) -> (String, String) {
     (commit_sha, worktree_id_of(root))
 }
 
-/// Format a worktree checkout path into the `worktree_id` string scope rows are keyed by (trailing
-/// slash trimmed) — shared by `resolve_git_context`, `resolve_worktree_scope`, and (for liveness)
-/// `live_worktree_contexts`, so the overlay key, the active scope, and the GC live set can't drift.
+/// Format a worktree checkout path into the `worktree_id` string scope rows are keyed by — shared
+/// by `resolve_git_context`, `resolve_worktree_scope`, and (for liveness) `live_worktree_contexts`,
+/// so the overlay WRITE key, the query scope, and the GC live set can't drift.
+///
+/// CANONICALIZES the path so the SAME physical worktree yields the SAME id no matter how it's
+/// spelled — a symlinked or relative reference, or a trailing slash. Without this, indexing via one
+/// spelling (CLI `--worktree`, the watcher's `proxy.base()`) and querying via another (the MCP
+/// `worktree` param / cwd fallback) produced DIFFERENT ids: the query silently missed the overlay,
+/// and GC — whose live set is canonical — pruned the live overlay as dead on every maintenance pass
+/// (#219 review). Falls back to the literal path when it can't be resolved (a removed
+/// worktree mid-GC), trailing slash trimmed either way.
 pub(crate) fn worktree_id_of(path: &Path) -> String {
-    path.to_string_lossy().trim_end_matches('/').to_string()
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    resolved.to_string_lossy().trim_end_matches('/').to_string()
 }
 
 /// Resolve the active scope `(commit_sha, worktree_id)` for a query, honoring an optional caller
@@ -204,7 +221,7 @@ pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) 
     let add_repo =
         |worktrees: &mut Vec<String>, commits: &mut Vec<String>, repo: &gix::Repository| {
             if let Some(workdir) = repo.workdir() {
-                worktrees.push(workdir.to_string_lossy().trim_end_matches('/').to_string());
+                worktrees.push(worktree_id_of(workdir));
             }
             if let Ok(id) = repo.head_id() {
                 commits.push(id.to_hex().to_string());
@@ -228,7 +245,7 @@ pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) 
     if let Ok(proxies) = repo.worktrees() {
         for proxy in proxies {
             if let Ok(base) = proxy.base() {
-                worktrees.push(base.to_string_lossy().trim_end_matches('/').to_string());
+                worktrees.push(worktree_id_of(&base));
             }
             if let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree()
                 && let Ok(id) = linked.head_id()

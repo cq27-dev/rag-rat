@@ -25,6 +25,11 @@ use super::*;
 pub(crate) struct WorktreeOverlayDelta {
     pub(crate) readable: Vec<PathBuf>,
     pub(crate) tombstones: Vec<PathBuf>,
+    /// Whether the linked working-tree status was read in full. When `false` (a status read error
+    /// silently dropped the working-tree portion), the delta is PARTIAL and the caller must NOT
+    /// prune — pruning against a partial `shadowing_paths` would delete valid overlay rows (#219
+    /// review). The committed-diff portion is always complete (it errors hard).
+    pub(crate) status_complete: bool,
 }
 
 impl WorktreeOverlayDelta {
@@ -58,29 +63,48 @@ pub(crate) fn compute_linked_worktree_delta(
 ) -> anyhow::Result<WorktreeOverlayDelta> {
     let base_repo = git_context::discover_repo(&config.root)?;
     let linked_repo = git_context::discover_repo(linked_path)?;
-
-    // Resolve BOTH trees through `base_repo` so the cross-tree diff shares one object store — the
-    // worktrees share the same `.git`, so the linked HEAD's tree is reachable from base_repo by
-    // oid.
-    let base_tree = base_repo.head_id()?.object()?.peel_to_tree()?;
-    let linked_head = linked_repo.head_id()?.detach();
-    let linked_tree = base_repo.find_object(linked_head)?.peel_to_tree()?;
+    // Read files from the linked repo's actual WORKDIR, not the raw `linked_path` (which may be the
+    // git dir or a subdir, e.g. from a hook). Falls back to `linked_path` for a missing workdir.
+    let linked_workdir =
+        linked_repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| linked_path.to_path_buf());
 
     let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
 
-    // Committed branch diff. Rename detection OFF: a rename becomes delete(old)+add(new), which the
-    // on-disk categorization below resolves to tombstone(old) + readable(new).
-    base_tree
-        .changes()?
-        .options(|opts| {
-            opts.track_path().track_rewrites(None);
-        })
-        .for_each_to_obtain_tree(&linked_tree, |change| {
-            candidates.insert(change_location_path(&change));
-            Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
-        })?;
+    // Resolve BOTH trees through `base_repo` so the cross-tree diff shares one object store (the
+    // worktrees share the same `.git`). Each is OPTIONAL: an unborn HEAD (a fresh `git worktree add
+    // --orphan`, zero commits) has no tree. Without tolerating that, `head_id()?` errored the whole
+    // pass, so the watcher logged a failure for an orphan worktree every pass (#219 review). The
+    // committed branch diff is computed only when both trees exist; the working-tree status below
+    // still captures an orphan worktree's files.
+    let base_tree = base_repo
+        .head_id()
+        .ok()
+        .and_then(|id| id.object().ok())
+        .and_then(|o| o.peel_to_tree().ok());
+    let linked_tree = linked_repo
+        .head_id()
+        .ok()
+        .and_then(|id| base_repo.find_object(id.detach()).ok())
+        .and_then(|o| o.peel_to_tree().ok());
+    if let (Some(base_tree), Some(linked_tree)) = (base_tree.as_ref(), linked_tree.as_ref()) {
+        // Rename detection OFF: a rename becomes delete(old)+add(new), which the on-disk
+        // categorization below resolves to tombstone(old) + readable(new).
+        base_tree
+            .changes()?
+            .options(|opts| {
+                opts.track_path().track_rewrites(None);
+            })
+            .for_each_to_obtain_tree(linked_tree, |change| {
+                candidates.insert(change_location_path(&change));
+                Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
+            })?;
+    }
 
-    // Linked working-tree status (vs the linked HEAD): dirty edits, untracked files, deletes.
+    // Linked working-tree status (vs the linked HEAD): dirty edits, untracked files, deletes. Track
+    // whether it was read in FULL — a silently-dropped status read yields a PARTIAL delta (missing
+    // untracked / working-tree-deleted paths), and the caller must skip the prune on a partial
+    // delta or it would delete valid overlay rows (#219 review).
+    let mut status_complete = false;
     if let Ok(platform) = linked_repo.status(gix::progress::Discard)
         && let Ok(items) =
             platform.untracked_files(UntrackedFiles::Files).into_iter(None::<gix::bstr::BString>)
@@ -88,6 +112,7 @@ pub(crate) fn compute_linked_worktree_delta(
         for item in items.flatten() {
             candidates.insert(PathBuf::from(item.location().to_str_lossy().as_ref()));
         }
+        status_complete = true;
     }
 
     // Honor the worktree's `.gitignore` for files PRESENT in the worktree, so the overlay indexes
@@ -97,20 +122,25 @@ pub(crate) fn compute_linked_worktree_delta(
     // call, so a worktree `.gitignore` edit (which fires a pass) takes effect immediately.
     // Tombstones are NOT ignore-filtered: a branch-deleted file must shadow its base row
     // regardless of ignore rules.
-    let ignore = ignore_rules::IgnoreMatcher::compile(linked_path, &config.target_directories());
-    let mut delta = WorktreeOverlayDelta::default();
+    let ignore =
+        ignore_rules::IgnoreMatcher::compile(&linked_workdir, &config.target_directories());
+    let mut delta = WorktreeOverlayDelta { status_complete, ..Default::default() };
     for rel in candidates {
         // Only paths the base scope would index can be shadowed/overlaid.
         if target_for_path(config, &rel).is_none() {
             continue;
         }
-        let absolute = linked_path.join(&rel);
+        let absolute = linked_workdir.join(&rel);
         if absolute.is_file() {
             if ignore.is_ignored(&absolute, false) {
                 continue; // gitignored in the worktree — the base walker wouldn't index it either
             }
             delta.readable.push(rel);
-        } else if base_tree.lookup_entry_by_path(&rel).ok().flatten().is_some() {
+        } else if base_tree
+            .as_ref()
+            .and_then(|t| t.lookup_entry_by_path(&rel).ok().flatten())
+            .is_some()
+        {
             delta.tombstones.push(rel);
         }
     }
@@ -176,8 +206,16 @@ impl IndexDatabase {
                 tombstoned += 1;
             }
         }
-        let pruned =
-            self.prune_overlay_rows_not_in_delta(&worktree_id, &delta.shadowing_paths())?;
+        // Prune overlay rows that no longer differ from the base — but ONLY when the delta is
+        // complete. A partial delta (the working-tree status read failed → `status_complete` false)
+        // is missing untracked / working-tree-deleted paths, so pruning against its
+        // `shadowing_paths` would delete valid overlay rows; skip the prune and let the
+        // next complete pass reconcile (mirrors gc's empty-live-set guard) (#219 review).
+        let pruned = if delta.status_complete {
+            self.prune_overlay_rows_not_in_delta(&worktree_id, &delta.shadowing_paths())?
+        } else {
+            0
+        };
         // Finalize like the incremental pass does — ONLY when something changed, so an unchanged
         // worktree refresh is a true no-op (the watcher refreshes overlays every pass; this keeps
         // idle passes write-free and clear of the self-sustaining re-index loop):
