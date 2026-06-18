@@ -120,6 +120,11 @@ pub(crate) struct IndexArgs {
     /// Index only changed files (the default).
     #[arg(long)]
     pub changed: bool,
+    /// Index a LINKED git worktree's branch overlay on top of the existing base index, so queries
+    /// scoped to it (`--worktree` / the MCP `worktree` arg) see that branch's changes. Indexes
+    /// only the delta vs the base; does not rebuild the base.
+    #[arg(long, value_name = "PATH")]
+    pub worktree: Option<std::path::PathBuf>,
     /// Run the background file watcher in the foreground until interrupted.
     #[arg(long)]
     pub watch: bool,

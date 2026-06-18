@@ -38,6 +38,26 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
         &rag_rat_core::locks::write_lock_path(&config.database),
     )?;
+    // `--worktree`: index a linked worktree's branch overlay on top of the existing base index
+    // (#219). A distinct mode — the delta vs the base, not a base (re)build — so handle it before
+    // the full/discover/changed branches.
+    if let Some(worktree) = &args.worktree {
+        let mut db = open_index(config)?;
+        let mut progress = render_index_progress;
+        let report = db.index_worktree_overlay(config, worktree, &mut progress)?;
+        if report.worktree_id.is_empty() {
+            anyhow::bail!(
+                "{} is not a linked worktree of {} — nothing indexed",
+                worktree.display(),
+                config.root.display()
+            );
+        }
+        eprintln!(
+            "worktree overlay [{}]: {} indexed, {} tombstoned, {} pruned",
+            report.worktree_id, report.indexed, report.tombstoned, report.pruned
+        );
+        return Ok(());
+    }
     let db = if args.full {
         IndexDatabase::rebuild_with_progress(config, render_index_progress)?
     } else if args.discover {

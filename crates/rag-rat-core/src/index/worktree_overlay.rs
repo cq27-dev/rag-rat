@@ -35,17 +35,14 @@ impl WorktreeOverlayDelta {
     }
 }
 
-// Fields are read by the #219 acceptance tests and by callers wired in stage 5 (CLI / watcher); the
-// lib build has no non-test reader yet.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct WorktreeOverlayReport {
     /// The overlay scope's `worktree_id`; empty when `linked_path` was not a valid linked sibling
     /// (the pass was skipped).
-    pub(crate) worktree_id: String,
-    pub(crate) indexed: usize,
-    pub(crate) tombstoned: usize,
-    pub(crate) pruned: usize,
+    pub worktree_id: String,
+    pub indexed: usize,
+    pub tombstoned: usize,
+    pub pruned: usize,
 }
 
 /// Compute the overlay delta of `linked_path` (a linked worktree of `config.root`'s repo) against
