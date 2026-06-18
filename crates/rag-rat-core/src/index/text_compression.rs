@@ -32,15 +32,46 @@ pub(crate) fn train_dict(samples: &[Vec<u8>], max_size: usize) -> Result<Vec<u8>
     Ok(zstd::dict::from_samples(&refs, max_size)?)
 }
 
-/// Compress one chunk's text with the shared dictionary.
+/// Compress one chunk's text. An EMPTY `dict` means "no dictionary" (plain zstd) — the fallback for
+/// corpora too small to train a dict on (`from_samples` hard-errors under ~7 samples); the read
+/// side recognizes the same empty-dict sentinel, so write and read stay consistent.
 pub(crate) fn compress(text: &[u8], dict: &[u8]) -> Result<Vec<u8>> {
+    if dict.is_empty() {
+        return Ok(zstd::bulk::compress(text, COMPRESSION_LEVEL)?);
+    }
     let mut compressor = zstd::bulk::Compressor::with_dictionary(COMPRESSION_LEVEL, dict)?;
     Ok(compressor.compress(text)?)
 }
 
+/// A compressor bound to the shared dictionary once, reused across many chunks. The per-call
+/// [`compress`] re-prepares the dictionary every invocation (~costly over a full corpus), so the
+/// index-time build path uses this instead. An empty dict means no-dictionary (plain zstd).
+pub(crate) struct ChunkCompressor<'a>(Option<zstd::bulk::Compressor<'a>>);
+
+impl<'a> ChunkCompressor<'a> {
+    pub(crate) fn new(dict: &'a [u8]) -> Result<Self> {
+        Ok(Self(if dict.is_empty() {
+            None
+        } else {
+            Some(zstd::bulk::Compressor::with_dictionary(COMPRESSION_LEVEL, dict)?)
+        }))
+    }
+
+    pub(crate) fn compress(&mut self, text: &[u8]) -> Result<Vec<u8>> {
+        match &mut self.0 {
+            Some(compressor) => Ok(compressor.compress(text)?),
+            None => Ok(zstd::bulk::compress(text, COMPRESSION_LEVEL)?),
+        }
+    }
+}
+
 /// Decompress one chunk blob. `capacity` is an upper bound on the decompressed size — store the
-/// original byte length per row and pass it; a too-small value errors rather than truncating.
+/// original byte length per row and pass it; a too-small value errors rather than truncating. An
+/// empty `dict` means the blob was written without a dictionary (see [`compress`]).
 pub(crate) fn decompress(blob: &[u8], dict: &[u8], capacity: usize) -> Result<Vec<u8>> {
+    if dict.is_empty() {
+        return Ok(zstd::bulk::decompress(blob, capacity)?);
+    }
     let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict)?;
     Ok(decompressor.decompress(blob, capacity)?)
 }
@@ -90,5 +121,14 @@ mod tests {
         let dict = train_dict(&sample(), 16 * 1024).unwrap();
         let blob = compress(b"", &dict).unwrap();
         assert_eq!(decompress(&blob, &dict, 16).unwrap(), b"");
+    }
+
+    #[test]
+    fn empty_dict_is_the_no_dict_fallback() {
+        // A corpus too small to train on stores an empty dict; compress/decompress must round-trip
+        // with no dictionary (plain zstd), so the tiny-repo fallback is transparent to callers.
+        let text = b"fn tiny() -> u8 { 7 }\n";
+        let blob = compress(text, &[]).unwrap();
+        assert_eq!(decompress(&blob, &[], text.len() + 16).unwrap(), text);
     }
 }

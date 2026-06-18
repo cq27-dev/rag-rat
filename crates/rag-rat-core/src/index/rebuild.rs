@@ -79,6 +79,10 @@ impl IndexDatabase {
             // flags version current and skip a redundant re-derive on next open (#202).
             db.mark_generated_flags_current()?;
             mem_trace("after mark_graph_index_current");
+            // Derive the compressed chunk_text store (#77 Phase 2) from chunks.text inside the same
+            // transaction, so the dict row + the blobs that use it are committed atomically.
+            db.build_chunk_text_store()?;
+            mem_trace("after build_chunk_text_store");
             progress(IndexProgress::RebuildingFts);
             db.rebuild_fts()?;
             mem_trace("after rebuild_fts");
