@@ -8111,6 +8111,117 @@ fn worktree_overlay_query_routing_selects_scope() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+/// Raw count of overlay file rows (`worktree_id != ''`), bypassing the scope view — to assert GC
+/// keeps/prunes overlay rows directly.
+fn overlay_row_count(db: &IndexDatabase) -> i64 {
+    db.storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM main.files WHERE worktree_id != ''", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn worktree_overlay_gc_keeps_a_live_worktrees_overlay() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    // Reset to the BASE scope so the overlay is kept only via `live_worktree_contexts` (the active-
+    // context fallback in garbage_collect would otherwise mask a worktree_id mismatch).
+    set_base_scope(&mut db, &main);
+    let before = overlay_row_count(&db);
+    assert!(before > 0, "overlay rows exist before GC");
+
+    db.garbage_collect().unwrap();
+    assert_eq!(
+        overlay_row_count(&db),
+        before,
+        "GC keeps a live worktree's overlay (the overlay worktree_id matches the GC live set)"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_gc_prunes_a_removed_worktrees_overlay() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    set_base_scope(&mut db, &main);
+    assert!(overlay_row_count(&db) > 0);
+
+    // Remove the worktree → it leaves the `live_worktree_contexts` set → GC prunes its overlay.
+    run_git(&main, &["worktree", "remove", "--force", linked.to_str().unwrap()]);
+    db.garbage_collect().unwrap();
+    assert_eq!(overlay_row_count(&db), 0, "GC prunes a removed worktree's overlay");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_rename_is_delete_old_plus_add_new() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/old.rs"), "pub fn moved_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    run_git(&linked, &["mv", "src/old.rs", "src/new.rs"]);
+    run_git(&linked, &["commit", "-q", "-m", "rename"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    // Linked scope: the old path is tombstoned (hidden), the new path carries the moved symbol.
+    assert!(!path_in_scope(&db, "src/old.rs"), "renamed-from path is hidden in the worktree scope");
+    assert!(path_in_scope(&db, "src/new.rs"));
+    assert_eq!(names_in_scope(&db, "src/new.rs"), vec!["moved_fn".to_string()]);
+
+    // Base scope is unchanged: old exists, new does not.
+    set_base_scope(&mut db, &main);
+    assert!(path_in_scope(&db, "src/old.rs"));
+    assert!(!path_in_scope(&db, "src/new.rs"));
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),
