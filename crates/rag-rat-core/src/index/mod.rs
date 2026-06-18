@@ -29,6 +29,7 @@ mod query_api;
 mod rebuild;
 mod staleness;
 mod util;
+mod worktree_overlay;
 pub use discovery::DiscoveryStatus;
 pub(crate) use discovery::*;
 pub use git_context::resolve_git_context;

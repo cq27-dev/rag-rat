@@ -5,8 +5,22 @@ use super::*;
 
 impl IndexDatabase {
     pub(super) fn mark_file_deleted(&self, path: &Path) -> anyhow::Result<()> {
+        self.write_tombstone_in_scope(path, &self.active_worktree_id)
+    }
+
+    /// Write a `kind='deleted'` overlay tombstone for `path` in an EXPLICIT `worktree_id` scope
+    /// (not necessarily the active one). The scope view excludes such a row from the overlay
+    /// branch AND (because the committed branch's `path NOT IN (overlay paths)` subquery still
+    /// counts it) suppresses the base committed row — so the path is HIDDEN rather than falling
+    /// through to the base. That is exactly what a linked worktree's branch-deleted file needs
+    /// (#219); `mark_file_deleted` is the active-scope special case.
+    pub(super) fn write_tombstone_in_scope(
+        &self,
+        path: &Path,
+        worktree_id: &str,
+    ) -> anyhow::Result<()> {
         let path = path_string(path);
-        self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
+        self.remove_file_in_scope(Path::new(&path), "", worktree_id)?;
         self.storage.connection().execute(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
              indexed_at_ms, indexed_revision, commit_sha, worktree_id)
@@ -16,7 +30,7 @@ impl IndexDatabase {
                 sha256 = '',
                 modified_at_ms = 0,
                 indexed_at_ms = excluded.indexed_at_ms",
-            params![path, now_ms(), self.active_worktree_id],
+            params![path, now_ms(), worktree_id],
         )?;
         self.mark_fts_dirty()?;
         Ok(())

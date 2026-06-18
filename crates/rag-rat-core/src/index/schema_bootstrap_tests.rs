@@ -7901,6 +7901,177 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
 fn test_gh_ctx() -> github::GitHubContext {
     github::GitHubContext::new(Some("cq27-dev/rag-rat"), false)
 }
+// ---- #219 stage 2: linked-worktree overlay indexing ----
+
+fn init_git_repo(root: &Path) {
+    run_git(root, &["init", "-q", "-b", "main"]);
+    run_git(root, &["config", "user.email", "t@e"]);
+    run_git(root, &["config", "user.name", "t"]);
+}
+
+/// Symbol names visible in the ACTIVE scope for `path` — queried through the `temp.files` scope
+/// view (set by `set_context`), so overlay shadowing and tombstones are reflected exactly as a real
+/// query would see them.
+fn names_in_scope(db: &IndexDatabase, path: &str) -> Vec<String> {
+    let conn = db.storage.connection();
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.name FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path = ?1 \
+             ORDER BY s.name",
+        )
+        .unwrap();
+    let names = stmt.query_map([path], |row| row.get::<_, String>(0)).unwrap();
+    names.filter_map(Result::ok).collect()
+}
+
+/// Whether `path` is visible at all in the active scope view (a tombstone makes this false even
+/// when the base committed row exists).
+fn path_in_scope(db: &IndexDatabase, path: &str) -> bool {
+    db.storage
+        .connection()
+        .query_row("SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)", [path], |row| row.get(0))
+        .unwrap()
+}
+
+fn set_base_scope(db: &mut IndexDatabase, root: &Path) {
+    let (sha, _) = resolve_git_context(root);
+    db.set_context(&sha, &worktree_id_of(root)).unwrap();
+}
+
+#[test]
+fn worktree_overlay_committed_modification_shadows_base() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["base_fn".to_string()]);
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(!report.worktree_id.is_empty(), "linked worktree recognized");
+    assert!(report.indexed >= 1, "a.rs indexed as an overlay row");
+
+    // index_worktree_overlay leaves the connection in the linked overlay scope.
+    assert_eq!(
+        names_in_scope(&db, "src/a.rs"),
+        vec!["linked_fn".to_string()],
+        "linked scope sees the branch content, and the overlay shadows the base"
+    );
+    set_base_scope(&mut db, &main);
+    assert_eq!(
+        names_in_scope(&db, "src/a.rs"),
+        vec!["base_fn".to_string()],
+        "the base scope is unchanged by the overlay"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_branch_deleted_file_is_hidden_by_tombstone() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/keep.rs"), "pub fn keep_fn() {}\n").unwrap();
+    fs::write(main.join("src/gone.rs"), "pub fn gone_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    assert!(path_in_scope(&db, "src/gone.rs"));
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::remove_file(linked.join("src/gone.rs")).unwrap();
+    run_git(&linked, &["add", "-A"]);
+    run_git(&linked, &["commit", "-q", "-m", "drop gone"]);
+
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.tombstoned >= 1, "gone.rs written as a tombstone");
+
+    // Tombstone hides the branch-deleted file; the untouched file falls through to the base.
+    assert!(!path_in_scope(&db, "src/gone.rs"), "linked scope hides the branch-deleted file");
+    assert!(path_in_scope(&db, "src/keep.rs"), "non-delta file falls through to the base");
+    assert_eq!(names_in_scope(&db, "src/keep.rs"), vec!["keep_fn".to_string()]);
+
+    set_base_scope(&mut db, &main);
+    assert!(path_in_scope(&db, "src/gone.rs"), "the base scope still has the file");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_untracked_linked_file_appears() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+    // Untracked new file in the linked checkout (no branch commit).
+    fs::write(linked.join("src/new.rs"), "pub fn new_fn() {}\n").unwrap();
+
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(names_in_scope(&db, "src/new.rs"), vec!["new_fn".to_string()]);
+
+    set_base_scope(&mut db, &main);
+    assert!(!path_in_scope(&db, "src/new.rs"), "the untracked file is not in the base scope");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_reads_uncommitted_linked_edit_not_head() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+    // Linked HEAD == base; only a DIRTY (uncommitted) edit in the linked working tree.
+    fs::write(linked.join("src/a.rs"), "pub fn dirty_fn() {}\n").unwrap();
+
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/a.rs"),
+        vec!["dirty_fn".to_string()],
+        "overlay reads the linked WORKING tree, not the linked HEAD tree"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),
