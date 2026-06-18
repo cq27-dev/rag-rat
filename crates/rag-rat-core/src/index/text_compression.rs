@@ -6,16 +6,19 @@
 //! reads (one blob per row) instead of a single big stream.
 //!
 //! Why hand-rolled (not sqlite-zstd): the dictionary lives in the DB (self-contained); no extension
-//! to load on every connection; works under ATTACH / streaming; full control. The #77 spike on real
-//! chunk text measured ~3.9x (rust) / ~2.9x (ts) at the per-row level WITH a shared dict, vs only
-//! ~2.3x / ~1.8x without — the dictionary is what makes small chunks (~730 B avg) compress, and one
-//! global dict was within ~3% of per-language, so we keep a single dict (no per-language keying).
+//! to load on every connection; works under ATTACH / streaming; full control. The dictionary is
+//! essential — small chunks (~730 B avg) barely compress alone (~2x) but ~4x WITH a shared dict;
+//! one global dict measured within ~3% of per-language, so we keep a single dict (no per-language
+//! keying).
 
 use anyhow::Result;
 
-/// zstd level for stored chunk blobs. 19 is near-max ratio; chunks are small and compressed ONCE at
-/// index time (amortized), while decompress on the read path stays ~GB/s.
-pub(crate) const COMPRESSION_LEVEL: i32 = 19;
+/// zstd level for stored chunk blobs. Compression runs at INDEX time on the write path, so the
+/// level is chosen for write speed, NOT max ratio: measured on the real kernel corpus, level 3 =
+/// 212 MB/s (~4.2x) vs level 19 = 4.1 MB/s (~4.9x) — 52x faster for ~80% of the ratio (levels
+/// 15->22 buy almost nothing). Level 3 keeps a full reindex's added compression cost negligible
+/// (the hard no-indexing-delay constraint); decompression throughput is level-independent.
+pub(crate) const COMPRESSION_LEVEL: i32 = 3;
 
 /// Default trained-dictionary size — zstd's own default; the #77 spike measured its ratios at this
 /// size. Stored once in the DB, so its cost is negligible against the per-row savings.

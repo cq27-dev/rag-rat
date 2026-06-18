@@ -75,15 +75,22 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS chunk_text(
             chunk_id INTEGER PRIMARY KEY,
             blob BLOB NOT NULL,
-            raw_len INTEGER NOT NULL,
+            -- raw_len is the decompress capacity; CHECK(>= 0) so a bad write can't become a huge
+            -- usize at the read-side cast and blow up Vec::with_capacity.
+            raw_len INTEGER NOT NULL CHECK(raw_len >= 0),
             FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
         ) STRICT;
 
         -- The single shared zstd dictionary for chunk_text (#77). Stored IN the DB so a copied /
-        -- P2P-streamed index is self-contained: decompress anywhere with no extension. Row id is
-        -- always 1; dict_version bumps force a retrain + recompress.
+        -- P2P-streamed index is self-contained: decompress anywhere with no extension. CHECK(id = \
+         1)
+        -- enforces the single-row invariant (two dict rows -> undefined which one wins -> every \
+         blob
+        -- fails to decompress); a dict_version bump retrains + recompresses ALL rows atomically \
+         (no
+        -- per-row version, so the recompress must be one transaction).
         CREATE TABLE IF NOT EXISTS chunk_text_dict(
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY CHECK(id = 1),
             dict BLOB NOT NULL,
             dict_version INTEGER NOT NULL DEFAULT 1
         ) STRICT;

@@ -695,11 +695,11 @@ pub(crate) fn apply_chunk_text_compression_tables(conn: &Connection) -> rusqlite
         CREATE TABLE IF NOT EXISTS chunk_text(
             chunk_id INTEGER PRIMARY KEY,
             blob BLOB NOT NULL,
-            raw_len INTEGER NOT NULL,
+            raw_len INTEGER NOT NULL CHECK(raw_len >= 0),
             FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
         ) STRICT;
         CREATE TABLE IF NOT EXISTS chunk_text_dict(
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY CHECK(id = 1),
             dict BLOB NOT NULL,
             dict_version INTEGER NOT NULL DEFAULT 1
         ) STRICT;

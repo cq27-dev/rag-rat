@@ -10186,6 +10186,23 @@ fn v025_creates_chunk_text_compression_tables() {
     schema::apply(&conn).unwrap();
     assert!(conn_table_exists(&conn, "chunk_text"), "V025 recreates chunk_text on forward migrate");
     assert!(conn_table_exists(&conn, "chunk_text_dict"));
+
+    // CHECK constraints (adversary-found). chunk_text_dict is single-row (id = 1); a second dict
+    // row would make "which dict wins" undefined → every blob throws Dictionary mismatch.
+    conn.execute("INSERT INTO chunk_text_dict(id, dict, dict_version) VALUES (1, x'00', 1)", [])
+        .unwrap();
+    assert!(
+        conn.execute("INSERT INTO chunk_text_dict(id, dict, dict_version) VALUES (2, x'00', 1)", [
+        ])
+        .is_err(),
+        "chunk_text_dict rejects id != 1"
+    );
+    // raw_len is the decompress capacity; a negative value would cast to a huge usize.
+    assert!(
+        conn.execute("INSERT INTO chunk_text(chunk_id, blob, raw_len) VALUES (1, x'00', -1)", [])
+            .is_err(),
+        "chunk_text rejects negative raw_len"
+    );
 }
 
 #[test]
