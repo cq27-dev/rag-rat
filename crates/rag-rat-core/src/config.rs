@@ -254,16 +254,21 @@ impl Config {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let root = config_dir.join(raw.index.root.unwrap_or_else(|| ".".to_string()));
         let root = normalize_existing_dir(&root)?;
-        // One database per repo: resolve a relative database path against the *main* worktree so
-        // all linked worktrees of a repo share one index (the commit/worktree overlay is built for
-        // exactly this). An absolute path is honored as-is. The main worktree resolves against its
-        // own root (unchanged), so single-worktree users see no change.
+        // Anchor `root` to the MAIN worktree root, so EVERY invocation resolves to the same root
+        // and thus the same base commit for the one shared index — whether launched from
+        // the main checkout, a linked worktree, or any cwd (`root="."` resolves against the
+        // launch dir, and a linked worktree has its OWN checked-out config). Per-worktree
+        // results come from the `worktree` QUERY scope, never a per-worktree config root:
+        // otherwise two processes rooted at different worktrees (different base commits)
+        // write CONFLICTING overlay rows to the shared DB — a file present on one branch
+        // races between readable and tombstone (#218/#219). The main worktree (and non-git
+        // dirs) resolve to themselves, so single-worktree users see no change.
+        let root = main_worktree_or_self(&root);
+        // One database per repo: a relative path resolves against `root` (now the main worktree),
+        // so all linked worktrees share one index. An absolute path is honored as-is.
         let database = match raw.index.database {
             Some(db) if Path::new(&db).is_absolute() => PathBuf::from(db),
-            other => {
-                let relative = other.unwrap_or_else(|| ".rag-rat/index.sqlite".to_string());
-                shared_db_base(&root).join(relative)
-            },
+            other => root.join(other.unwrap_or_else(|| ".rag-rat/index.sqlite".to_string())),
         };
         let targets = resolve_targets(&root, raw.target_bindings, raw.target)?;
         let local_ai = LocalAiConfig::try_from(raw.local_ai)?;
@@ -338,10 +343,10 @@ fn push_target(
     Ok(())
 }
 
-/// Base directory a relative `database` path resolves against. For a **linked** git worktree this
-/// is the **main** worktree root (so all worktrees share one index DB); for the main worktree or a
-/// non-git dir it is `root` unchanged — single-worktree setups keep their existing DB location.
-fn shared_db_base(root: &Path) -> PathBuf {
+/// The **main** worktree root for a **linked** git worktree (so every worktree of a repo resolves
+/// to one `root` + one shared index DB); for the main worktree or a non-git dir, `root` unchanged —
+/// single-worktree setups are unaffected.
+fn main_worktree_or_self(root: &Path) -> PathBuf {
     match main_worktree_root(root) {
         Some(main_root) if main_root != root => main_root,
         _ => root.to_path_buf(),
@@ -571,6 +576,16 @@ mod tests {
             "main and linked worktrees must share one index database",
         );
         assert_eq!(from_main.database, main.canonicalize().unwrap().join(".rag-rat/index.sqlite"));
+        // AND the `root` anchors to the main worktree from either launch point — so every process
+        // uses the same base commit for the shared index, instead of a worktree-launched one
+        // rooting at the worktree (a different base → conflicting overlay writes /
+        // readable-vs-tombstone races) (#218/#219).
+        assert_eq!(from_main.root, from_linked.root, "main and linked configs resolve to one root");
+        assert_eq!(
+            from_linked.root,
+            main.canonicalize().unwrap(),
+            "a linked worktree's config root anchors to the main worktree",
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -605,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_db_base_shares_one_db_across_worktrees() {
+    fn main_worktree_or_self_shares_one_db_across_worktrees() {
         let git = |dir: &Path, args: &[&str]| {
             std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
         };
@@ -626,15 +641,15 @@ mod tests {
         let linked_c = linked.canonicalize().unwrap();
 
         // Main worktree resolves to itself (no redirect → existing DB location preserved).
-        assert_eq!(shared_db_base(&main_c), main_c);
+        assert_eq!(main_worktree_or_self(&main_c), main_c);
         // Linked worktree redirects to the main worktree → one shared DB.
-        assert_eq!(shared_db_base(&linked_c), main_c);
+        assert_eq!(main_worktree_or_self(&linked_c), main_c);
 
         // A non-git directory falls back to itself.
         let plain = tmp.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         let plain_c = plain.canonicalize().unwrap();
-        assert_eq!(shared_db_base(&plain_c), plain_c);
+        assert_eq!(main_worktree_or_self(&plain_c), plain_c);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
