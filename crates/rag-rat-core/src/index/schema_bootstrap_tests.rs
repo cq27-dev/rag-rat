@@ -8072,6 +8072,45 @@ fn worktree_overlay_reads_uncommitted_linked_edit_not_head() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+#[test]
+fn worktree_overlay_query_routing_selects_scope() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    // The routing entry the MCP/query path uses: None -> base, a valid linked sibling -> its
+    // overlay, an unreadable/foreign path -> base (never the wrong repo).
+    db.use_worktree_scope(&main, None).unwrap();
+    assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["base_fn".to_string()]);
+
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["linked_fn".to_string()]);
+
+    db.use_worktree_scope(&main, Some(Path::new("/"))).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/a.rs"),
+        vec!["base_fn".to_string()],
+        "an unreadable worktree path falls back to the base scope"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),

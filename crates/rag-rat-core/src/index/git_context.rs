@@ -156,9 +156,6 @@ pub(crate) fn worktree_id_of(path: &Path) -> String {
 /// `worktree` names a valid linked sibling of `root`'s repo, the `worktree_id` selects that
 /// worktree's overlay; otherwise (absent / main / foreign / unreadable) it falls back to `root`'s
 /// own scope — never the wrong repo.
-// Wired into the query open path (`open_config` / `set_context`) in #219 stage 3 (scope routing);
-// unused until then.
-#[allow(dead_code)]
 pub(crate) fn resolve_worktree_scope(root: &Path, worktree: Option<&Path>) -> (String, String) {
     let (base_sha, base_id) = resolve_git_context(root);
     match worktree.and_then(|candidate| validated_sibling_worktree(root, candidate)) {
@@ -174,7 +171,6 @@ pub(crate) fn resolve_worktree_scope(root: &Path, worktree: Option<&Path>) -> (S
 /// the wrong repo (#219). The comparison canonicalizes git/common dirs; the returned checkout path
 /// is gix's raw `workdir()` so its `worktree_id` matches the GC live set from
 /// `live_worktree_contexts`.
-#[allow(dead_code)] // Reached only via resolve_worktree_scope (wired in #219 stage 3).
 fn validated_sibling_worktree(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let repo = discover_repo(candidate).ok()?;
     let git_dir = repo.git_dir().canonicalize().ok()?;

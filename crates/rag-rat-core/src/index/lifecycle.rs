@@ -187,6 +187,23 @@ impl IndexDatabase {
         install_scope_view(self.storage.connection(), commit_sha, worktree_id)?;
         Ok(())
     }
+
+    /// Re-scope this connection to a caller's `worktree` (a linked-worktree checkout), serving its
+    /// overlay over the base. The base commit stays `root`'s indexed HEAD; only the `worktree_id`
+    /// selects the overlay. A `None`, main, foreign, or unreadable `worktree` resolves to `root`'s
+    /// own scope — never the wrong repo (the validation lives in `resolve_worktree_scope`). The
+    /// query open path calls this after opening so a `worktree`-scoped request serves the
+    /// overlay (#219 stage 3); the overlay rows themselves are maintained by
+    /// `index_worktree_overlay` (#219 stages 2/5). `root` is passed explicitly (not read from
+    /// `self.config`) so it works on every open.
+    pub fn use_worktree_scope(
+        &mut self,
+        root: &Path,
+        worktree: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        let (commit_sha, worktree_id) = resolve_worktree_scope(root, worktree);
+        self.set_context(&commit_sha, &worktree_id)
+    }
 }
 
 /// Installs the per-connection commit/worktree scoping view; callers query `files` afterward and
