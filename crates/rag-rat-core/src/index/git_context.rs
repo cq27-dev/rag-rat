@@ -9,23 +9,27 @@ pub(crate) struct GitChangedPaths {
     pub(crate) deleted: BTreeSet<PathBuf>,
 }
 
-/// Open the git repository for `root` via gix, honoring `GIT_DIR` / `GIT_WORK_TREE` — a bare git
-/// dir plus an external worktree (e.g. in CI) is configured purely through those env vars, and
-/// plain `gix::discover` only searches upward from `root`, so it would miss such a repo and leave
-/// git history "unavailable" (clearing the historical tables). All gix discovery goes through here
-/// (#213 review).
+/// Open the git repository for `root` via gix. Resolves from `root` (the configured PATH) FIRST,
+/// searching upward for a `.git`, and IGNORING `GIT_DIR` / `GIT_WORK_TREE` on that path. The
+/// index's git context is defined by `config.root`, so an inherited `GIT_DIR`/`GIT_WORK_TREE` from
+/// the launching shell (e.g. a tool operating in a linked worktree — Claude Code, an IDE) must NOT
+/// hijack resolution. With the env honored unconditionally, `discover_repo(config.root)` and
+/// `discover_repo(linked_path)` BOTH returned the single env-specified repo, regardless of their
+/// path argument — collapsing the base↔linked overlay delta to empty and PRUNING/tombstoning every
+/// overlay row (the field-reported worktree flip-flop, #219). All gix discovery goes through here.
 ///
-/// Known limitation (#218): gix resolves a RELATIVE `GIT_DIR`/`GIT_WORK_TREE` against the process
-/// cwd, not against `root` (the old `git -C root` resolved them against `root`). Absolute env
-/// values, and relative ones when cwd == `root`, work; relative values from a foreign cwd don't.
-/// gix exposes no way to open with an explicit (git-dir, worktree) pair from outside the crate, so
-/// re-rooting cleanly isn't possible without process-global cwd/env mutation (racy under the
-/// parallel indexer).
+/// Only when no repository is found upward from `root` (a bare git dir + external worktree
+/// configured purely through `GIT_DIR`/`GIT_WORK_TREE`, e.g. CI — #213) do we fall back to the
+/// environment-override discovery, so that legitimate env-configured layout still resolves instead
+/// of leaving git history "unavailable".
 pub(crate) fn discover_repo(root: &Path) -> Result<gix::Repository, Box<gix::discover::Error>> {
     // Box the error: gix's `discover::Error` is a large enum, and an unboxed large `Err` bloats
     // every `Result` this returns (clippy::result_large_err). Callers use `.ok()` or `?`
     // (anyhow), both of which handle the box transparently.
-    gix::discover_with_environment_overrides(root).map_err(Box::new)
+    match gix::discover(root) {
+        Ok(repo) => Ok(repo),
+        Err(_) => gix::discover_with_environment_overrides(root).map_err(Box::new),
+    }
 }
 
 pub(crate) fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> {

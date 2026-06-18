@@ -8429,6 +8429,49 @@ fn worktree_overlay_serves_worktree_version_when_main_moved_ahead() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+#[test]
+fn worktree_overlay_stable_when_main_removed_a_file_a_nested_branch_keeps() {
+    // Field repro of the perverse held layout: a linked worktree NESTED inside config.root and
+    // gitignored there; MAIN removed a file the branch still HAS; the index retains the dead old
+    // commit scope that had the file. Across repeated WATCHER maintenance passes the overlay must
+    // serve that file READABLE in the worktree scope — never flip-flop to a tombstone.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/keep.rs"), "pub fn keep_fn() {}\n").unwrap();
+    fs::write(main.join("src/reinf.rs"), "pub fn classify_seg() {}\n").unwrap();
+    fs::write(main.join(".gitignore"), "/wt/\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "C1 has reinf"]);
+    let config = source_config(main.clone(), Language::Rust);
+
+    // Index at C1 → leaves a committed scope that HAS reinf.rs (the lingering dead scope).
+    IndexDatabase::rebuild(&config).unwrap();
+
+    // Linked worktree forked at C1, NESTED under main at the gitignored path.
+    let linked = main.join("wt");
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+
+    // Main REMOVES reinf.rs at C2; the branch keeps it on disk + in its HEAD.
+    fs::remove_file(main.join("src/reinf.rs")).unwrap();
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "C2 removed reinf"]);
+
+    for pass in 0..3 {
+        crate::watch::maintenance_pass(&config, pass == 2).unwrap(); // gc on the last pass
+        let mut db = IndexDatabase::open(&config.database).unwrap();
+        db.use_worktree_scope(&main, Some(&linked)).unwrap();
+        assert_eq!(
+            names_in_scope(&db, "src/reinf.rs"),
+            vec!["classify_seg".to_string()],
+            "pass {pass}: worktree overlay serves the branch file (readable, not tombstoned)"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&main);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),
