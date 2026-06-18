@@ -429,24 +429,17 @@ fn blame_lines_via_gix(
     let absolute = root.join(path);
     let relative = absolute.strip_prefix(worktree_root).unwrap_or_else(|_| Path::new(path));
 
-    // Blame attributes lines in HEAD's version of the file. If the working tree differs from HEAD
-    // (a dirty file, or one not in HEAD at all), its line numbers don't align with HEAD, so a HEAD
-    // blame would shift/mis-attribute the chunk's lines — and `git_blame_chunk` would cache that
-    // wrong result under the dirty content hash (#213 review). Only blame a file that is byte-for-
-    // byte identical to HEAD; otherwise return no attribution. (`git blame` with no revision blamed
-    // the worktree directly, marking uncommitted lines `0000000`; gix blames committed objects
-    // only, so a clean-file guard is the faithful, safe equivalent.)
-    let head_blob = repo
-        .find_commit(head)
-        .ok()
-        .and_then(|commit| commit.tree().ok())
-        .and_then(|tree| tree.lookup_entry_by_path(relative).ok().flatten())
-        .and_then(|entry| entry.object().ok())
-        .map(|object| object.data.clone());
-    match (head_blob, std::fs::read(&absolute)) {
-        (Some(head_bytes), Ok(worktree_bytes)) if head_bytes == worktree_bytes => {},
-        // Dirty / new / unreadable: skip rather than cache misaligned attribution.
-        _ => return Ok(Vec::new()),
+    // Blame attributes lines in HEAD's version of the file. If the file is modified in the
+    // worktree, its line numbers don't align with HEAD, so a HEAD blame would
+    // shift/mis-attribute the chunk's lines — and `git_blame_chunk` would cache that wrong
+    // result under the dirty content hash (#213 review). Skip blame for a modified file. Use
+    // gix status (filter-aware: a clean file that merely differs from its blob via
+    // .gitattributes / autocrlf / LFS normalization is NOT flagged) rather than a raw byte
+    // compare, which would wrongly treat such clean files as dirty (#213 review). (`git blame`
+    // with no revision blamed the worktree directly, marking uncommitted lines `0000000`; gix
+    // blames committed objects only, so a clean-file guard is the faithful, safe equivalent.)
+    if crate::index::git_context::path_is_dirty(&repo, relative) {
+        return Ok(Vec::new());
     }
 
     let file_path = gix::path::into_bstr(relative);
@@ -532,19 +525,25 @@ fn read_history_inner(
     // A blob-diff resource cache for per-file line counts (`change.diff`), reused across commits
     // and cleared each commit to bound its growth.
     let mut diff_cache = repo.diff_resource_cache_for_tree_diff()?;
+    // When `root` is a SUBDIRECTORY of the worktree, scope history to commits/paths under that
+    // subtree — what the old `git log <head> -- .` (run from `root`) covered. `None` at the
+    // worktree root keeps everything (#213 review).
+    let scope = scope_prefix(root, worktree_root);
     let walk = repo
         .rev_walk([head_id])
         // Newest-first, matching `git log`'s default reverse-chronological order.
         .sorting(Sorting::ByCommitTime(gix::traverse::commit::simple::CommitTimeOrder::NewestFirst))
         .all()?;
     for info in walk {
-        let id = info?.id;
-        let commit = repo.find_commit(id)?;
+        // A walk error (e.g. traversing past a shallow clone's boundary into absent objects) ends
+        // the walk with what we have, rather than discarding the whole history (#213 review).
+        let Ok(info) = info else { break };
+        let Ok(commit) = repo.find_commit(info.id) else { break };
         let author = commit.author()?;
         let committer = commit.committer()?;
         let body = commit.message_raw_sloppy().to_string();
-        commits.push(CommitRecord {
-            hash: id.to_hex().to_string(),
+        let record = CommitRecord {
+            hash: info.id.to_hex().to_string(),
             author_name: author.name.to_string(),
             author_email: author.email.to_string(),
             authored_at_s: author.seconds(),
@@ -552,15 +551,22 @@ fn read_history_inner(
             subject: commit.message()?.summary().to_string(),
             // The full raw message (git `%B`), so commit FTS covers the body, not just the subject.
             body: body.trim().to_string(),
-        });
-
-        let hash = id.to_hex().to_string();
+        };
+        let hash = record.hash.clone();
         let new_tree = commit.tree()?;
+        // A shallow clone's boundary commit lists a parent whose object is ABSENT; treat it like a
+        // root commit (diff against the empty tree) instead of aborting, so its changed paths are
+        // still recorded — matching `git log --numstat` on a shallow clone (#213 review).
         let parent_tree = match commit.parent_ids().next() {
-            Some(parent) => repo.find_commit(parent.detach())?.tree()?,
+            Some(parent) => repo
+                .find_commit(parent.detach())
+                .ok()
+                .and_then(|parent| parent.tree().ok())
+                .unwrap_or_else(|| repo.empty_tree()),
             None => repo.empty_tree(),
         };
         diff_cache.clear_resource_cache();
+        let mut commit_changes = Vec::new();
         parent_tree
             .changes()?
             // Full paths for each change; NO rename detection — a rename shows as a deletion +
@@ -569,9 +575,16 @@ fn read_history_inner(
                 opts.track_path().track_rewrites(None);
             })
             .for_each_to_obtain_tree(&new_tree, |change| {
-                push_file_change(&change, &hash, root, worktree_root, &mut diff_cache, changes);
+                push_file_change(&change, &hash, scope.as_deref(), &mut diff_cache, &mut commit_changes);
                 Ok::<_, std::convert::Infallible>(Action::Continue(()))
             })?;
+        // A subtree-scoped commit that didn't touch `root` is not part of this index's history (the
+        // old `git log -- <subtree>` would not have listed it).
+        if scope.is_some() && commit_changes.is_empty() {
+            continue;
+        }
+        commits.push(record);
+        changes.append(&mut commit_changes);
     }
     Ok(())
 }
@@ -582,8 +595,7 @@ fn read_history_inner(
 fn push_file_change(
     change: &Change<'_, '_, '_>,
     hash: &str,
-    root: &Path,
-    worktree_root: &Path,
+    scope: Option<&str>,
     diff_cache: &mut gix::diff::blob::Platform,
     out: &mut Vec<FileChange>,
 ) {
@@ -599,8 +611,18 @@ fn push_file_change(
     if !is_blob {
         return;
     }
-    let Some(path) = normalize_git_path(root, worktree_root, &location.to_string()) else {
-        return;
+    // `location` is worktree-root-relative. At the worktree root keep it as-is; under a subtree
+    // index keep ONLY paths inside the subtree and make them root-relative — paths outside
+    // `root` are dropped so a subdirectory index doesn't record the wider worktree's changes
+    // (#213 review).
+    let location = location.to_string();
+    let path = match scope {
+        None => location,
+        Some(prefix) => match location.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('/'))
+        {
+            Some(under_root) => under_root.to_string(),
+            None => return,
+        },
     };
     let (additions, deletions) = change
         .diff(diff_cache)
@@ -618,18 +640,16 @@ fn push_file_change(
     });
 }
 
-/// Map a gix change `location` (repo-root-relative) to the index-root-relative path the rest of the
-/// index uses. Handles the subdirectory-repo case where the index `root` is a child of the git
-/// worktree root.
-fn normalize_git_path(root: &Path, worktree_root: &Path, path: &str) -> Option<String> {
-    let path = Path::new(path);
-    if let Ok(relative) = worktree_root.join(path).strip_prefix(root) {
-        return Some(path_string(relative));
-    }
-    if root.join(path).exists() || !path.is_absolute() {
-        return Some(path_string(path));
-    }
-    None
+/// The index `root`'s path WITHIN the worktree (e.g. `Some("tools/rag-rat")`), or `None` when
+/// `root` IS the worktree root (or the two can't be related). Used to scope history to the subtree
+/// the old `git log -- .` (run from `root`) covered. Canonicalizes both sides so a symlink / path-
+/// representation mismatch doesn't spuriously scope (or fail to scope).
+fn scope_prefix(root: &Path, worktree_root: &Path) -> Option<String> {
+    let root = root.canonicalize().ok()?;
+    let worktree_root = worktree_root.canonicalize().ok()?;
+    let relative = root.strip_prefix(&worktree_root).ok()?;
+    let prefix = path_string(relative);
+    (!prefix.is_empty()).then_some(prefix)
 }
 
 fn path_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PathHistoryItem> {

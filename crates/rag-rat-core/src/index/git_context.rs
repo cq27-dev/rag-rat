@@ -98,6 +98,23 @@ pub(crate) fn is_worktree_dirty(root: &Path) -> bool {
     changes.next().is_some()
 }
 
+/// Whether `relative` (a worktree-root-relative path) is modified in the worktree — the per-path,
+/// filter-aware analog of [`is_worktree_dirty`]. gix status respects `.gitattributes` / autocrlf /
+/// LFS normalization, so a clean-but-normalized file is NOT flagged (unlike a raw byte compare).
+/// Conservative: a status error reports "not dirty" so callers (blame) don't lose results on a
+/// transient status hiccup.
+pub(crate) fn path_is_dirty(repo: &gix::Repository, relative: &Path) -> bool {
+    let Ok(platform) = repo.status(gix::progress::Discard) else {
+        return false;
+    };
+    let pathspec = gix::path::into_bstr(relative).into_owned();
+    let Ok(mut changes) = platform.untracked_files(UntrackedFiles::Files).into_iter([pathspec])
+    else {
+        return false;
+    };
+    changes.next().is_some()
+}
+
 /// The active-checkout `(commit_sha, worktree_id)` keys for `root`, as `open_config` derives them.
 /// `pub` so out-of-crate callers that open an index by path (benches mirroring the production
 /// `open_config` path, integration tests) can install the same active-checkout scope `search` uses.
