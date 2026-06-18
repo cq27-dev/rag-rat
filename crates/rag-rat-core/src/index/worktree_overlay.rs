@@ -90,13 +90,25 @@ pub(crate) fn compute_linked_worktree_delta(
         }
     }
 
+    // Honor the worktree's `.gitignore` for files PRESENT in the worktree, so the overlay indexes
+    // the same set the base walker would. Reuse the base's IgnoreMatcher (the `ignore` crate)
+    // compiled for the linked checkout — using THIS, not a separate gitignore engine,
+    // guarantees the overlay and base classify a path identically (no drift). Recompiled each
+    // call, so a worktree `.gitignore` edit (which fires a pass) takes effect immediately.
+    // Tombstones are NOT ignore-filtered: a branch-deleted file must shadow its base row
+    // regardless of ignore rules.
+    let ignore = ignore_rules::IgnoreMatcher::compile(linked_path, &config.target_directories());
     let mut delta = WorktreeOverlayDelta::default();
     for rel in candidates {
         // Only paths the base scope would index can be shadowed/overlaid.
         if target_for_path(config, &rel).is_none() {
             continue;
         }
-        if linked_path.join(&rel).is_file() {
+        let absolute = linked_path.join(&rel);
+        if absolute.is_file() {
+            if ignore.is_ignored(&absolute, false) {
+                continue; // gitignored in the worktree — the base walker wouldn't index it either
+            }
             delta.readable.push(rel);
         } else if base_tree.lookup_entry_by_path(&rel).ok().flatten().is_some() {
             delta.tombstones.push(rel);

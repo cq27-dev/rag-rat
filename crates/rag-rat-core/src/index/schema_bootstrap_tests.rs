@@ -8290,6 +8290,50 @@ fn worktree_overlay_reindex_is_idle_safe() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+#[test]
+fn worktree_overlay_honors_gitignore_and_refreshes_on_change() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // A tracked-but-gitignored file on the branch (force-added past the ignore rule), so it appears
+    // in the committed tree-diff yet must be excluded by the worktree's `.gitignore` — parity with
+    // the base walker, which the gix status path alone wouldn't enforce for a tracked file.
+    fs::write(linked.join(".gitignore"), "/src/ignored.rs\n").unwrap();
+    fs::write(linked.join("src/ignored.rs"), "pub fn ignored_fn() {}\n").unwrap();
+    run_git(&linked, &["add", ".gitignore"]);
+    run_git(&linked, &["add", "-f", "src/ignored.rs"]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(
+        !path_in_scope(&db, "src/ignored.rs"),
+        "a gitignored worktree file is not overlaid (parity with the base walker)"
+    );
+
+    // Remove the ignore rule on disk and re-index → the overlay now picks it up (a `.gitignore`
+    // change is honored because the matcher is recompiled each pass).
+    fs::write(linked.join(".gitignore"), "").unwrap();
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/ignored.rs"),
+        vec!["ignored_fn".to_string()],
+        "removing the ignore rule refreshes the overlay to include the file"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),
