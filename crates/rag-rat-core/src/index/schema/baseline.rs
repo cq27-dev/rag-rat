@@ -20,6 +20,11 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             indexed_revision TEXT NOT NULL DEFAULT '',
             commit_sha TEXT NOT NULL DEFAULT '',
             worktree_id TEXT NOT NULL DEFAULT '',
+            -- 1 when the file text contains a test marker (cfg(test) / describe( / it( / test();
+            -- precomputed at index time so impact_surface test detection filters on an indexed \
+         flag
+            -- instead of a full chunks.text LIKE scan (#77).
+            has_test_code INTEGER NOT NULL DEFAULT 0,
             UNIQUE(path, commit_sha, worktree_id)
         );
 

@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 23;
+pub const LATEST_SCHEMA_VERSION: u32 = 24;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -100,6 +100,11 @@ const MIGRATION_023_ID: &str = "023_dispatch_edge_facts_view_exclusion";
 const MIGRATION_023_CHECKSUM: &str = "sha256:rag-rat-dispatch-edge-facts-view-exclusion-v23";
 const MIGRATION_023_DESCRIPTION: &str = "Recreate the edges compatibility view to exclude \
                                          internal dispatch FACT rows from query-layer reads (#200)";
+const MIGRATION_024_ID: &str = "024_files_has_test_code";
+const MIGRATION_024_CHECKSUM: &str = "sha256:rag-rat-files-has-test-code-v24";
+const MIGRATION_024_DESCRIPTION: &str = "Add files.has_test_code flag (precomputed test-marker \
+                                         detection) so impact_surface avoids a chunks.text scan \
+                                         (#77)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -315,6 +320,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_023_CHECKSUM,
         description: MIGRATION_023_DESCRIPTION,
         apply: apply_dispatch_edge_facts_view_exclusion,
+    },
+    Migration {
+        id: MIGRATION_024_ID,
+        checksum: MIGRATION_024_CHECKSUM,
+        description: MIGRATION_024_DESCRIPTION,
+        apply: apply_files_has_test_code,
     },
 ];
 

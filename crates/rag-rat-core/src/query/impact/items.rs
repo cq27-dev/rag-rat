@@ -48,15 +48,15 @@ pub(crate) fn test_items(
             &name,
             "Tests touching this symbol/path",
             "test_mentions_symbol_or_path",
+            // Test detection reads the precomputed `files.has_test_code` flag (#77) instead of
+            // scanning `chunks.text` for the markers — same marker set (see
+            // `index::text_has_test_marker`), now an indexed column, no raw-text scan.
             "
             files.kind = 'source'
             AND (
                 files.path LIKE '%test%'
                 OR files.path LIKE '%spec%'
-                OR chunks.text LIKE '%#[cfg(test)]%'
-                OR chunks.text LIKE '%describe(%'
-                OR chunks.text LIKE '%it(%'
-                OR chunks.text LIKE '%test(%'
+                OR files.has_test_code = 1
             )
             ",
             limit,
@@ -135,9 +135,7 @@ pub(crate) fn section_like_items(
     // `chunks.text LIKE` full scan — tokenized + indexed, reads no raw text (#77). The FTS subquery
     // yields chunk file_ids across all scopes; the outer `files` is the active-scope view, so
     // `files.id IN (...)` keeps only in-scope files. `None` (needle has no token) → omit the
-    // clause. (`LEFT JOIN chunks` stays for now: `test_items`'s filter still references
-    // `chunks.text` for the test-marker detection — replaced by a precomputed
-    // `files.has_test_code` flag in the next step.)
+    // clause.
     let fts = fts_phrase_query(needle);
     let chunk_clause = if fts.is_some() {
         "OR files.id IN (SELECT chunks.file_id FROM chunks JOIN chunk_fts ON chunk_fts.rowid = \
@@ -158,7 +156,6 @@ pub(crate) fn section_like_items(
                MAX(CASE WHEN files.path LIKE ?1 THEN 1 ELSE 0 END) AS path_match
         FROM files
         LEFT JOIN symbols ON symbols.file_id = files.id
-        LEFT JOIN chunks ON chunks.file_id = files.id
         WHERE ({filter})
           AND (
               files.path LIKE ?1
