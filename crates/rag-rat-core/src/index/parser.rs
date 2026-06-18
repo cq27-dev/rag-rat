@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use tree_sitter::{Node, ParseOptions, ParseState, Parser, Tree};
@@ -38,17 +38,17 @@ const PARSE_ABANDON_GRACE: Duration = Duration::from_secs(2);
 static TIMED_OUT_PARSES: LazyLock<Mutex<HashSet<u64>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Live parse-worker threads (normal + abandoned). An abandoned worker keeps spinning until its
-/// uncancellable parse finishes, so a long-lived watcher seeing a stream of DISTINCT pathological
-/// edits could otherwise accumulate CPU-bound threads without bound (#211 review). Past the cap a
-/// parse bails to a parser failure instead of spawning another worker — protecting the machine.
-static LIVE_PARSE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// Count of ABANDONED parse workers still running — uncancellable parses the caller gave up on but
+/// that keep pegging a core until they finish (or forever, for a truly non-terminating blowup).
+/// ONLY abandoned workers are counted, NOT normal in-flight parses, so normal/healthy parsing is
+/// never throttled by this cap (#211 review). A healthy file is refused only when this many leaked
+/// workers are already saturating the machine.
+static ABANDONED_PARSE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Cap for [`LIVE_PARSE_WORKERS`]. Generous vs. the indexer's rayon width (4× the CPU count) so
-/// normal concurrent parsing is never throttled — only runaway abandoned workers hit it.
-static MAX_LIVE_PARSE_WORKERS: LazyLock<usize> = LazyLock::new(|| {
-    std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_mul(4).max(16)
-});
+/// Cap for [`ABANDONED_PARSE_WORKERS`]: at most ~one leaked worker per core before new parses bail
+/// (each abandoned worker pegs a core, so beyond this the machine is already saturated).
+static MAX_ABANDONED_PARSE_WORKERS: LazyLock<usize> =
+    LazyLock::new(|| std::thread::available_parallelism().map_or(4, |n| n.get()).max(4));
 
 fn content_key(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -57,27 +57,25 @@ fn content_key(text: &str) -> u64 {
     hasher.finish()
 }
 
-/// Decrements [`LIVE_PARSE_WORKERS`] when a parse-worker thread ends — whether it completed or was
-/// abandoned after the timeout (an abandoned worker still occupies a thread until its parse finally
-/// finishes, so it must stay counted until then).
-struct WorkerGuard;
-impl Drop for WorkerGuard {
-    fn drop(&mut self) {
-        LIVE_PARSE_WORKERS.fetch_sub(1, Ordering::Relaxed);
+fn memoize_timed_out(key: u64) {
+    if let Ok(mut set) = TIMED_OUT_PARSES.lock() {
+        set.insert(key);
     }
 }
 
 /// Parse `text` under a hard wall-clock bound, returning `None` on a genuine parse failure OR a
 /// timeout — both of which the callers already treat as a parser failure (#210).
 ///
-/// Three layers, because tree-sitter cannot be cancelled mid-reduce (#210):
-/// 1. a content-keyed memo ([`TIMED_OUT_PARSES`]) short-circuits content known to be pathological,
-///    so it is never parsed more than once;
+/// Because tree-sitter cannot be cancelled mid-reduce (#210):
+/// 1. a content-keyed memo ([`TIMED_OUT_PARSES`]) short-circuits content already known to time out
+///    — soft-cancelled OR hard-abandoned — so it is never parsed more than once (a file is parsed
+///    by symbols, edges, AND the chunk fallback, so this avoids paying the budget 2-3× per pass);
 /// 2. the parse runs on a worker thread with a SOFT progress-callback budget that cleanly cancels
-///    the cancellable cases (runaway lexing, huge-but-progressing files) so nothing leaks;
+///    the cancellable cases (runaway lexing, huge-but-progressing files);
 /// 3. the calling thread waits only `budget + PARSE_ABANDON_GRACE` and, on an uncancellable reduce
-///    explosion, ABANDONS the worker, memoizes the content, and reports a parse failure. A global
-///    cap ([`LIVE_PARSE_WORKERS`]) bounds how many such abandoned workers can pile up.
+///    explosion, ABANDONS the worker. Only abandoned-and-still-running workers count toward
+///    [`ABANDONED_PARSE_WORKERS`] (via a race-free claim), so normal parsing is never throttled and
+///    leaked workers still can't accumulate without bound.
 pub(crate) fn parse_within_budget(
     grammar: tree_sitter::Language,
     text: &str,
@@ -88,47 +86,73 @@ pub(crate) fn parse_within_budget(
     if TIMED_OUT_PARSES.lock().is_ok_and(|set| set.contains(&key)) {
         return None;
     }
-    // Bound concurrent workers so abandoned (uncancellable) ones can't accumulate unboundedly.
-    if LIVE_PARSE_WORKERS.fetch_add(1, Ordering::Relaxed) >= *MAX_LIVE_PARSE_WORKERS {
-        LIVE_PARSE_WORKERS.fetch_sub(1, Ordering::Relaxed);
+    // Refuse only when leaked (abandoned) workers already saturate the machine — normal parsing
+    // never increments this, so healthy files aren't dropped just because earlier files were
+    // pathological (#211 review).
+    if ABANDONED_PARSE_WORKERS.load(Ordering::Relaxed) >= *MAX_ABANDONED_PARSE_WORKERS {
         return None;
     }
+
+    // Whoever flips this `false -> true` first OWNS the outcome — the worker if it finishes in
+    // time, the caller if it times out first. This lets the caller count a worker as abandoned
+    // exactly once and the worker un-count itself when it eventually finishes, with no race.
+    let claimed = Arc::new(AtomicBool::new(false));
+    let worker_claimed = Arc::clone(&claimed);
     let text = text.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // Decrements the live-worker count when this thread ends (completed or abandoned).
-        let _guard = WorkerGuard;
+    let spawned = std::thread::Builder::new().spawn(move || {
         let mut parser = Parser::new();
-        if parser.set_language(&grammar).is_err() {
-            let _ = tx.send(None);
-            return;
-        }
-        let deadline = Instant::now() + budget;
-        let mut over_budget = |_state: &ParseState| {
-            if Instant::now() >= deadline {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
+        let (tree, budget_cancelled) = if parser.set_language(&grammar).is_ok() {
+            let deadline = Instant::now() + budget;
+            let mut over_budget = |_state: &ParseState| {
+                if Instant::now() >= deadline {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            };
+            let options = ParseOptions::new().progress_callback(&mut over_budget);
+            let bytes = text.as_bytes();
+            let len = bytes.len();
+            let tree = parser.parse_with_options(
+                &mut |i, _| if i < len { &bytes[i..] } else { &bytes[..0] },
+                None,
+                Some(options),
+            );
+            // tree-sitter returns `None` when the progress callback cancels an over-budget parse;
+            // flag it so the caller memoizes the content (#211 review).
+            let cancelled = tree.is_none() && Instant::now() >= deadline;
+            (tree, cancelled)
+        } else {
+            (None, false)
         };
-        let options = ParseOptions::new().progress_callback(&mut over_budget);
-        let bytes = text.as_bytes();
-        let len = bytes.len();
-        let tree = parser.parse_with_options(
-            &mut |i, _| if i < len { &bytes[i..] } else { &bytes[..0] },
-            None,
-            Some(options),
-        );
         // The receiver may already have given up (abandoned worker) — ignore the send error.
-        let _ = tx.send(tree);
+        let _ = tx.send((tree, budget_cancelled));
+        // If the caller already abandoned us (it won the claim), we were counted — un-count now
+        // that this thread is finally done.
+        if worker_claimed.swap(true, Ordering::Relaxed) {
+            ABANDONED_PARSE_WORKERS.fetch_sub(1, Ordering::Relaxed);
+        }
     });
+    // Thread creation can fail in a constrained environment; degrade to a parser failure rather
+    // than panic (#211 review).
+    if spawned.is_err() {
+        return None;
+    }
+
     match rx.recv_timeout(budget + PARSE_ABANDON_GRACE) {
-        Ok(tree) => tree,
-        // Uncancellable blowup: memoize the content so it is never parsed again, and abandon the
-        // worker (its guard decrements the live count when it eventually finishes).
+        Ok((tree, budget_cancelled)) => {
+            if budget_cancelled {
+                memoize_timed_out(key);
+            }
+            tree
+        },
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            if let Ok(mut set) = TIMED_OUT_PARSES.lock() {
-                set.insert(key);
+            memoize_timed_out(key);
+            // Abandon: count this worker (until it finishes and un-counts itself) UNLESS it
+            // actually completed first and we lost the claim race.
+            if !claimed.swap(true, Ordering::Relaxed) {
+                ABANDONED_PARSE_WORKERS.fetch_add(1, Ordering::Relaxed);
             }
             None
         },
