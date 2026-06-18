@@ -447,6 +447,10 @@ fn blame_lines_via_gix(
     let end = u32::try_from(end_line.max(start_line)).unwrap_or(start);
     let options = gix::repository::blame_file::Options {
         ranges: gix::blame::BlameRanges::from_one_based_inclusive_range(start..=end)?,
+        // Follow whole-file renames, like `git blame` does by default — otherwise every unchanged
+        // line in a renamed file is attributed to the rename commit instead of its original author,
+        // skewing the chunk's dominant/newest/oldest commit (#213 review).
+        rewrites: Some(gix::diff::Rewrites::default()),
         ..Default::default()
     };
     let outcome = repo.blame_file(file_path.as_ref(), head, options)?;
@@ -592,10 +596,11 @@ fn read_history_inner(
     Ok(())
 }
 
-/// Record one tree-diff change as a `FileChange` — files only (regular blobs AND symlinks; trees
-/// and submodule gitlinks are skipped) — with exact additions/deletions from a blob line-diff. A
-/// binary/uncountable diff yields `None` counts (the numstat `-` case). Symlinks are included
-/// because `git log --numstat` records them as changed paths (#213 review).
+/// Record one tree-diff change as a `FileChange` — any leaf path change (regular blob, symlink, OR
+/// submodule gitlink), skipping only directory (tree) entries — with additions/deletions from a
+/// blob line-diff. A binary/uncountable diff (and gitlinks, whose "content" is a commit id) yields
+/// `None` counts (the numstat `-` case). Symlinks and gitlinks are included because `git log
+/// --numstat` records them as changed paths (#213 review).
 fn push_file_change(
     change: &Change<'_, '_, '_>,
     hash: &str,
@@ -603,17 +608,20 @@ fn push_file_change(
     diff_cache: &mut gix::diff::blob::Platform,
     out: &mut Vec<FileChange>,
 ) {
-    let (change_kind, location, is_file) = match change {
+    // Keep blob / symlink / gitlink changes; drop only TREE entries (directory nodes the diff may
+    // emit alongside their leaf changes) — matching `git log --numstat`, which lists submodule
+    // pointer changes too (#213 review).
+    let (change_kind, location, is_path_change) = match change {
         Change::Addition { location, entry_mode, .. } =>
-            ("added", *location, entry_mode.is_blob_or_symlink()),
+            ("added", *location, !entry_mode.is_tree()),
         Change::Deletion { location, entry_mode, .. } =>
-            ("deleted", *location, entry_mode.is_blob_or_symlink()),
+            ("deleted", *location, !entry_mode.is_tree()),
         Change::Modification { location, entry_mode, .. } =>
-            ("modified", *location, entry_mode.is_blob_or_symlink()),
+            ("modified", *location, !entry_mode.is_tree()),
         // Rewrites are disabled above; ignore defensively if config ever forces them on.
         Change::Rewrite { .. } => return,
     };
-    if !is_file {
+    if !is_path_change {
         return;
     }
     // `location` is worktree-root-relative. At the worktree root keep it as-is; under a subtree

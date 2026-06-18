@@ -1,7 +1,10 @@
 use super::*;
 
 pub(crate) fn git_paths(root: &Path) -> anyhow::Result<GitPaths> {
-    let repo = gix::discover(root)?;
+    // Env-aware discovery (honors GIT_DIR / GIT_WORK_TREE) so `hooks install/status/uninstall`
+    // works in a bare-dir + external-worktree checkout, matching the old `git -C root
+    // rev-parse` (#213 review).
+    let repo = gix::discover_with_environment_overrides(root)?;
     let worktree_root =
         repo.workdir().ok_or_else(|| anyhow::anyhow!("not inside a git worktree"))?.to_path_buf();
     // gix may report the git dir relative to the discovery root; mirror the old `rev-parse`
