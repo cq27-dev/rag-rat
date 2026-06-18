@@ -1,5 +1,8 @@
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use tree_sitter::{Node, ParseOptions, ParseState, Parser, Tree};
@@ -24,24 +27,77 @@ pub(crate) const PARSE_BUDGET: Duration = Duration::from_secs(5);
 /// uncancellable case.
 const PARSE_ABANDON_GRACE: Duration = Duration::from_secs(2);
 
+/// Content hashes of inputs whose parse already exceeded the budget. A pathological parse is
+/// UNCANCELLABLE (#210), so re-parsing the same content just spawns another doomed worker — and the
+/// same file is parsed by several callers (symbols, edges, AND the chunk fallback in
+/// `prepare_index_content`), so without a memo a single pathological file pays the timeout 2-3× per
+/// pass (#211 review). A hit returns `None` immediately, never spawning a worker — so identical
+/// content times out at most ONCE process-wide (this also covers the watcher re-reading an
+/// unchanged pathological file across passes). Keyed by content, so a genuinely changed file is
+/// re-tried.
+static TIMED_OUT_PARSES: LazyLock<Mutex<HashSet<u64>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Live parse-worker threads (normal + abandoned). An abandoned worker keeps spinning until its
+/// uncancellable parse finishes, so a long-lived watcher seeing a stream of DISTINCT pathological
+/// edits could otherwise accumulate CPU-bound threads without bound (#211 review). Past the cap a
+/// parse bails to a parser failure instead of spawning another worker — protecting the machine.
+static LIVE_PARSE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Cap for [`LIVE_PARSE_WORKERS`]. Generous vs. the indexer's rayon width (4× the CPU count) so
+/// normal concurrent parsing is never throttled — only runaway abandoned workers hit it.
+static MAX_LIVE_PARSE_WORKERS: LazyLock<usize> = LazyLock::new(|| {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_mul(4).max(16)
+});
+
+fn content_key(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Decrements [`LIVE_PARSE_WORKERS`] when a parse-worker thread ends — whether it completed or was
+/// abandoned after the timeout (an abandoned worker still occupies a thread until its parse finally
+/// finishes, so it must stay counted until then).
+struct WorkerGuard;
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        LIVE_PARSE_WORKERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Parse `text` under a hard wall-clock bound, returning `None` on a genuine parse failure OR a
 /// timeout — both of which the callers already treat as a parser failure (#210).
 ///
-/// Two layers, because tree-sitter cannot be cancelled mid-reduce (#210): the parse runs on a
-/// worker thread with a SOFT progress-callback budget (cleanly cancels the cancellable cases —
-/// runaway lexing, huge-but-progressing files — so the worker exits and nothing leaks); the calling
-/// thread also waits only `budget + PARSE_ABANDON_GRACE` and, if the worker blows past that (an
-/// uncancellable reduce explosion), ABANDONS it and reports a parse failure. The abandoned worker
-/// keeps running until it finishes or the process exits — accepted: bounding the indexer's
-/// wall-clock matters more than one leaked thread on a genuinely pathological file.
+/// Three layers, because tree-sitter cannot be cancelled mid-reduce (#210):
+/// 1. a content-keyed memo ([`TIMED_OUT_PARSES`]) short-circuits content known to be pathological,
+///    so it is never parsed more than once;
+/// 2. the parse runs on a worker thread with a SOFT progress-callback budget that cleanly cancels
+///    the cancellable cases (runaway lexing, huge-but-progressing files) so nothing leaks;
+/// 3. the calling thread waits only `budget + PARSE_ABANDON_GRACE` and, on an uncancellable reduce
+///    explosion, ABANDONS the worker, memoizes the content, and reports a parse failure. A global
+///    cap ([`LIVE_PARSE_WORKERS`]) bounds how many such abandoned workers can pile up.
 pub(crate) fn parse_within_budget(
     grammar: tree_sitter::Language,
     text: &str,
     budget: Duration,
 ) -> Option<Tree> {
+    let key = content_key(text);
+    // Known-pathological content: don't spawn another doomed worker (#211 review).
+    if TIMED_OUT_PARSES.lock().is_ok_and(|set| set.contains(&key)) {
+        return None;
+    }
+    // Bound concurrent workers so abandoned (uncancellable) ones can't accumulate unboundedly.
+    if LIVE_PARSE_WORKERS.fetch_add(1, Ordering::Relaxed) >= *MAX_LIVE_PARSE_WORKERS {
+        LIVE_PARSE_WORKERS.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
     let text = text.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        // Decrements the live-worker count when this thread ends (completed or abandoned).
+        let _guard = WorkerGuard;
         let mut parser = Parser::new();
         if parser.set_language(&grammar).is_err() {
             let _ = tx.send(None);
@@ -66,7 +122,18 @@ pub(crate) fn parse_within_budget(
         // The receiver may already have given up (abandoned worker) — ignore the send error.
         let _ = tx.send(tree);
     });
-    rx.recv_timeout(budget + PARSE_ABANDON_GRACE).ok().flatten()
+    match rx.recv_timeout(budget + PARSE_ABANDON_GRACE) {
+        Ok(tree) => tree,
+        // Uncancellable blowup: memoize the content so it is never parsed again, and abandon the
+        // worker (its guard decrements the live count when it eventually finishes).
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            if let Ok(mut set) = TIMED_OUT_PARSES.lock() {
+                set.insert(key);
+            }
+            None
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -664,5 +731,20 @@ mod budget_tests {
         let big = "fn f() { let x = vec![1, 2, 3]; }\n".repeat(20_000);
         // Returns (None on cancel/abandon, or a partial tree) — the assertion is that it RETURNS.
         let _ = parse_within_budget(grammar, &big, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn parse_within_budget_skips_content_memoized_as_timed_out() {
+        // Content already recorded as pathological is short-circuited to a parser failure WITHOUT
+        // spawning another doomed worker — so a single bad file is never parsed twice within a pass
+        // (symbols/edges/chunk-fallback) nor re-parsed across watcher passes (#211 review). Use a
+        // unique string so the process-global memo can't collide with another test.
+        let src = "fn memoized_timeout_marker_8f3a() {}";
+        TIMED_OUT_PARSES.lock().expect("poison-set lock").insert(content_key(src));
+        let grammar = grammar_for(ParserKind::Rust).expect("rust grammar");
+        assert!(
+            parse_within_budget(grammar, src, PARSE_BUDGET).is_none(),
+            "memoized-as-timed-out content must short-circuit to a parser failure"
+        );
     }
 }
