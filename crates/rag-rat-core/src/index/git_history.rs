@@ -558,26 +558,25 @@ fn read_history_inner(
         };
         let hash = record.hash.clone();
         let parent_ids: Vec<_> = commit.parent_ids().collect();
-        // MERGE commit: `git log --numstat -- .` does NOT pass `--diff-merges`, so a merge shows no
-        // per-file diff. Diffing it against its first parent would wrongly attribute the merged
-        // branch's paths to the merge and inflate `changed_file_count` (#213 review). Record the
-        // commit (it's part of history / FTS) with no file changes.
-        if parent_ids.len() > 1 {
-            commits.push(record);
-            continue;
-        }
         let new_tree = commit.tree()?;
-        // A shallow clone's boundary commit lists a parent whose object is ABSENT; treat it like a
-        // root commit (diff against the empty tree) instead of aborting, so its changed paths are
-        // still recorded — matching `git log --numstat` on a shallow clone (#213 review).
-        let parent_tree = match parent_ids.first() {
-            Some(parent) => repo
-                .find_commit(parent.detach())
-                .ok()
-                .and_then(|parent| parent.tree().ok())
-                .unwrap_or_else(|| repo.empty_tree()),
-            None => repo.empty_tree(),
+        // First parent's tree + whether its object is PRESENT. A missing object (shallow-clone
+        // boundary) → empty tree, treated as a ROOT: it records the full diff vs the empty tree
+        // (matching `git log --numstat` on a shallow clone), so even a shallow MERGE tip records
+        // its files instead of looking like a zero-change merge (#213 review).
+        let (parent_tree, parent_present) = match parent_ids.first() {
+            Some(parent) =>
+                match repo.find_commit(parent.detach()).ok().and_then(|p| p.tree().ok()) {
+                    Some(tree) => (tree, true),
+                    None => (repo.empty_tree(), false),
+                },
+            None => (repo.empty_tree(), false),
         };
+        // A real MERGE (>1 parent, first parent present) records NO per-file changes — `git log
+        // --numstat` has no `--diff-merges` — but its first-parent diff still decides whether the
+        // commit is IN SCOPE (a merge that didn't touch `root` is omitted, like `git log -- .` /
+        // `-- <subtree>`). A shallow boundary (parent absent) is a root, so it DOES record its
+        // diff.
+        let is_merge_with_parent = parent_ids.len() > 1 && parent_present;
         diff_cache.clear_resource_cache();
         let mut commit_changes = Vec::new();
         parent_tree
@@ -592,16 +591,21 @@ fn read_history_inner(
                 push_file_change(&change, &hash, scope.as_deref(), &mut diff_cache, &mut commit_changes);
                 Ok::<_, std::convert::Infallible>(Action::Continue(()))
             })?;
-        // A commit with no file changes in scope is not part of this index's history: the old
-        // `git log <head> -- .` pathspec applied history simplification and listed NEITHER empty
-        // commits (even at the repo root) NOR subtree-scoped commits that didn't touch `root` (#213
-        // review). (A root/shallow-boundary commit diffs against the empty tree, so it has changes
-        // and is kept; a mode-only change also counts.)
+        // No in-scope changes vs the first parent → not part of this index's history: `git log --
+        // .` / `-- <subtree>` history simplification lists NEITHER empty commits (even at
+        // the repo root) NOR merges/commits that didn't touch the scope (#213 review). (A
+        // root/shallow-boundary commit diffs against the empty tree, so it has changes and
+        // is kept; a mode-only change also counts.)
         if commit_changes.is_empty() {
             continue;
         }
         commits.push(record);
-        changes.append(&mut commit_changes);
+        // A real merge's first-parent diff was used ONLY for the scope decision above — do NOT
+        // record it (numstat has no merge diff). Non-merges and shallow-boundary roots
+        // record their changes.
+        if !is_merge_with_parent {
+            changes.append(&mut commit_changes);
+        }
     }
     Ok(())
 }
@@ -621,39 +625,50 @@ fn push_file_change(
     // alongside their leaves). A rename/copy is recorded once at the DESTINATION (the old
     // numstat parser normalized `old => new` to the destination), with counts from the
     // rewrite's content diff (`None` for a pure 100%-similar rename) (#213 review).
-    let (change_kind, location, additions, deletions) = match change {
+    // Each arm yields (change_kind, ROOT-RELATIVE path, counts) or returns. `scope_relative` maps a
+    // worktree-root-relative location to the index-root-relative path (or `None` = outside `root`).
+    let (change_kind, path, additions, deletions) = match change {
         Change::Addition { location, entry_mode, .. } if !entry_mode.is_tree() => {
+            let Some(path) = scope_relative(scope, &location.to_string()) else { return };
             let (additions, deletions) = blob_line_counts(change, diff_cache);
-            ("added", location.to_string(), additions, deletions)
+            ("added", path, additions, deletions)
         },
         Change::Deletion { location, entry_mode, .. } if !entry_mode.is_tree() => {
+            let Some(path) = scope_relative(scope, &location.to_string()) else { return };
             let (additions, deletions) = blob_line_counts(change, diff_cache);
-            ("deleted", location.to_string(), additions, deletions)
+            ("deleted", path, additions, deletions)
         },
         Change::Modification { location, entry_mode, .. } if !entry_mode.is_tree() => {
+            let Some(path) = scope_relative(scope, &location.to_string()) else { return };
             let (additions, deletions) = blob_line_counts(change, diff_cache);
-            ("modified", location.to_string(), additions, deletions)
+            ("modified", path, additions, deletions)
         },
-        Change::Rewrite { location, entry_mode, diff, copy, .. } if !entry_mode.is_tree() => {
+        Change::Rewrite { location, source_location, entry_mode, diff, copy, .. }
+            if !entry_mode.is_tree() =>
+        {
+            // A rename/copy can cross the index-root boundary in a subtree index, so filter EACH
+            // side by scope: both inside → one entry at the destination (a rename
+            // within the subtree); source-only inside → the file LEFT the subtree,
+            // recorded as a deletion; dest-only inside → it ENTERED the subtree,
+            // recorded as an addition. Matches what `git log --numstat -- <subtree>`
+            // reported for a boundary-crossing move (#213 review).
+            let source = scope_relative(scope, &source_location.to_string());
+            let destination = scope_relative(scope, &location.to_string());
             let (additions, deletions) = diff.as_ref().map_or((None, None), |stats| {
                 (Some(i64::from(stats.insertions)), Some(i64::from(stats.removals)))
             });
-            (if *copy { "copied" } else { "renamed" }, location.to_string(), additions, deletions)
+            match (source, destination) {
+                (Some(_), Some(path)) =>
+                    (if *copy { "copied" } else { "renamed" }, path, additions, deletions),
+                // Crossing the boundary: counts are unknown (the rewrite diff is the content delta,
+                // not the full add/delete) — the path + kind are what path history needs.
+                (None, Some(path)) => ("added", path, None, None),
+                (Some(path), None) => ("deleted", path, None, None),
+                (None, None) => return,
+            }
         },
         // A tree entry, or any future variant: not a leaf path change.
         _ => return,
-    };
-    // `location` is worktree-root-relative. At the worktree root keep it as-is; under a subtree
-    // index keep ONLY paths inside the subtree and make them root-relative — paths outside
-    // `root` are dropped so a subdirectory index doesn't record the wider worktree's changes
-    // (#213 review).
-    let path = match scope {
-        None => location,
-        Some(prefix) => match location.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('/'))
-        {
-            Some(under_root) => under_root.to_string(),
-            None => return,
-        },
     };
     out.push(FileChange {
         commit_hash: hash.to_string(),
@@ -662,6 +677,19 @@ fn push_file_change(
         deletions,
         change_kind: change_kind.to_string(),
     });
+}
+
+/// Map a worktree-root-relative `location` to the index-root-relative path, or `None` if it falls
+/// outside the index `root`. At the worktree root (`scope` is `None`) it's the location unchanged;
+/// under a subtree index the location must start with the subtree prefix (#213 review).
+fn scope_relative(scope: Option<&str>, location: &str) -> Option<String> {
+    match scope {
+        None => Some(location.to_string()),
+        Some(prefix) => location
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(str::to_string),
+    }
 }
 
 /// Line counts for a blob/symlink change via gix's blob diff. `(None, None)` for a
