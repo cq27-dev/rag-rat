@@ -8916,6 +8916,38 @@ fn files_has_test_code_flag_is_computed_at_index_time() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[test]
+fn files_has_test_code_flag_survives_the_heal_path() {
+    // #77 / PR #223 review: the lazy heal path (heal_file -> index_file) is a SECOND files-insert
+    // site. Without computing the flag there, a marker-only test file healed (e.g. on a lexical
+    // search miss) would drop to has_test_code = 0 and be misclassified as a non-test. Heal must
+    // recompute it from the same chunk markers as the full/incremental path.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // PATH has no 'test'/'spec' — only the flag can classify it.
+    fs::write(root.join("src/markers.rs"), "#[cfg(test)]\nmod inner {\n    pub fn check() {}\n}\n")
+        .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let flag = || -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT has_test_code FROM main.files WHERE path = 'src/markers.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(flag(), 1, "full index sets has_test_code");
+    db.heal_file(std::path::Path::new("src/markers.rs")).unwrap();
+    assert_eq!(flag(), 1, "heal_file re-indexes through index_file and keeps has_test_code = 1");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// End-to-end through the FULL-REBUILD driver (`resolve_and_insert_edges`): a real `rebuild` of a
 /// tiny Cargo workspace must apply per-package + module-aware import scope. A bare reference to a
 /// name `use`d from an EXTERNAL crate stays unresolved; a same-named LOCAL workspace symbol still

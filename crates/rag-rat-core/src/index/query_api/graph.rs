@@ -660,6 +660,9 @@ impl IndexDatabase {
         query: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
+        // impact's chunk-mention evidence runs `chunk_fts MATCH` (#77 Phase 1), so the FTS index
+        // must be fresh first — same precondition search enforces before its MATCH queries.
+        self.ensure_fts_fresh()?;
         crate::query::impact::impact_surface(self.storage.connection(), query, limit)
     }
 
@@ -669,6 +672,7 @@ impl IndexDatabase {
         limit: u32,
         resolution_mode: crate::query::graph::GraphResolutionMode,
     ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
+        self.ensure_fts_fresh()?;
         crate::query::impact::impact_surface_with_options(
             self.storage.connection(),
             query,
@@ -683,6 +687,7 @@ impl IndexDatabase {
         limit: u32,
         resolution_mode: crate::query::graph::GraphResolutionMode,
     ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
+        self.ensure_fts_fresh()?;
         crate::query::impact::impact_surface_for_symbol(
             self.storage.connection(),
             symbol,
@@ -697,6 +702,7 @@ impl IndexDatabase {
         limit: u32,
         options: &crate::query::impact::ImpactSurfaceOptions,
     ) -> anyhow::Result<crate::query::impact::ImpactSurfaceReport> {
+        self.ensure_fts_fresh()?;
         // Surface the `Compiler` tier on impact's direct graph neighbors too (same read-side JOIN
         // as trace_callees/find_callers). The enrichment is now injected INTO the builder so it
         // runs over the OVERFETCHED candidate set before the re-rank + limit truncation (#82
