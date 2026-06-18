@@ -178,12 +178,19 @@ impl IndexDatabase {
         }
         let pruned =
             self.prune_overlay_rows_not_in_delta(&worktree_id, &delta.shadowing_paths())?;
-        // Resolve the overlay's edges (inserted unresolved by apply_incremental_file_plan) in the
-        // now-active overlay scope — ONLY when something changed, so an unchanged worktree refresh
-        // is a true no-op (the watcher refreshes overlays every pass; this keeps idle
-        // passes write-free and clear of the self-sustaining re-index loop).
+        // Finalize like the incremental pass does — ONLY when something changed, so an unchanged
+        // worktree refresh is a true no-op (the watcher refreshes overlays every pass; this keeps
+        // idle passes write-free and clear of the self-sustaining re-index loop):
+        // - rebuild_logical_symbols: symbol_lookup / graph nav resolve through `logical_symbols`,
+        //   so a NEWLY-ADDED overlay file's symbols are invisible until regrouped (a modified
+        //   file's unchanged symbols resolve via the base's logical rows — which is why only added
+        //   files were missing). This is the field-reported bug.
+        // - resolve_edges: the overlay inserted edges unresolved.
+        // - sync_fts: so semantic_search (BM25) sees the overlay's chunks.
         if indexed > 0 || tombstoned > 0 || pruned > 0 {
+            self.rebuild_logical_symbols()?;
             self.resolve_edges()?;
+            self.sync_fts()?;
         }
 
         Ok(WorktreeOverlayReport { worktree_id, indexed, tombstoned, pruned })

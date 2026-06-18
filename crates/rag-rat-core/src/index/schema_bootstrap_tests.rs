@@ -8334,6 +8334,56 @@ fn worktree_overlay_honors_gitignore_and_refreshes_on_change() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+#[test]
+fn worktree_overlay_committed_added_file_symbol_resolves_cross_connection() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    {
+        // The CLI `index --worktree` writer: build the base, then overlay-index a worktree that
+        // COMMITTED a brand-new file, then drop the connection.
+        let mut db = IndexDatabase::rebuild(&config).unwrap();
+        run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+        fs::write(linked.join("src/added.rs"), "pub fn added_fn() {}\n").unwrap();
+        run_git(&linked, &["add", "."]);
+        run_git(&linked, &["commit", "-q", "-m", "add file"]);
+        let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+        assert!(report.indexed >= 1, "the added file is indexed into the overlay");
+    }
+
+    // A FRESH connection (the MCP server querying after the CLI wrote the overlay).
+    let mut db = IndexDatabase::open(&config.database).unwrap();
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert!(
+        !db.symbols("added_fn", Some(Language::Rust), 10).unwrap().is_empty(),
+        "a committed added file's symbol resolves via symbol lookup in the worktree scope \
+         (cross-connection)"
+    );
+    // ...and is grouped into logical_symbols, so GRAPH NAV (find_callers/trace_callees resolve
+    // through logical_symbols) sees it too — the overlay pass must run rebuild_logical_symbols.
+    let grouped: bool = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM logical_symbols WHERE logical_name = 'added_fn')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(grouped, "the overlay's added symbol is grouped into logical_symbols (graph nav)");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),

@@ -92,15 +92,30 @@ pub fn call_tool_for_config(
     finalize_tool_result(config, name, result)
 }
 
-/// Extract the optional `worktree` request field (a linked-worktree checkout path) — common to
-/// every tool, read here rather than declared on each arg struct. Trimmed; empty/absent → `None`.
+/// The caller `worktree` (a linked-worktree checkout path): the explicit `worktree` request field,
+/// else the MCP server's own working directory. `resolve_worktree_scope` downstream VALIDATES it
+/// (non-worktree / foreign-repo / unreadable → base scope), so the cwd fallback is safe
+/// best-effort: an agent working IN a linked worktree gets that branch's overlay without passing
+/// the param, while a server rooted at and launched in the main checkout still resolves to base.
+/// The explicit param stays the reliable path (the server's cwd is launch-dependent — see #219).
+/// Common to every tool, read here rather than declared on each arg struct.
 fn worktree_arg(arguments: &Value) -> Option<std::path::PathBuf> {
+    worktree_arg_or_cwd(arguments, std::env::current_dir().ok())
+}
+
+/// Testable core of [`worktree_arg`]: explicit request field (trimmed; blank → ignored), else
+/// `cwd`.
+fn worktree_arg_or_cwd(
+    arguments: &Value,
+    cwd: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
     arguments
         .get("worktree")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
+        .or(cwd)
 }
 
 /// Post-process a tool result before returning it. Currently only `index_status`: surface the

@@ -944,6 +944,21 @@ fn candidate_count(value: &Value) -> usize {
 }
 
 #[test]
+fn worktree_arg_prefers_request_then_falls_back_to_cwd() {
+    let cwd = Some(PathBuf::from("/server/cwd"));
+    // Explicit request field wins.
+    assert_eq!(
+        worktree_arg_or_cwd(&json!({"worktree": "/explicit"}), cwd.clone()),
+        Some(PathBuf::from("/explicit"))
+    );
+    // Absent / blank request field → fall back to the server cwd (validated downstream).
+    assert_eq!(worktree_arg_or_cwd(&json!({}), cwd.clone()), Some(PathBuf::from("/server/cwd")));
+    assert_eq!(worktree_arg_or_cwd(&json!({"worktree": "  "}), cwd.clone()), cwd);
+    // No request field and no cwd → None (base scope).
+    assert_eq!(worktree_arg_or_cwd(&json!({}), None), None);
+}
+
+#[test]
 fn worktree_param_routes_query_to_branch_overlay() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
