@@ -54,16 +54,18 @@ pub(crate) fn hook_script(hook: &str) -> String {
     --new-head "$2" \
     --branch-checkout "$3" \
     --max-seconds 30"#,
+        // No positional args: git passes post-merge a squash flag (0/1) and post-rewrite the
+        // command (amend/rebase); `rag-rat maintenance` takes no positionals, so forwarding
+        // them ("$@") made the hook abort with `unexpected argument`. The trigger flag is
+        // all maintenance needs — it re-discovers either way.
         "post-merge" =>
             r#"rag-rat maintenance \
     --trigger post-merge \
-    --max-seconds 30 \
-    "$@""#,
+    --max-seconds 30"#,
         "post-rewrite" =>
             r#"rag-rat maintenance \
     --trigger post-rewrite \
-    --max-seconds 30 \
-    "$@""#,
+    --max-seconds 30"#,
         // git passes no positional args to post-commit; HEAD has already advanced, so the
         // maintenance discover-index re-keys the just-committed files under the new commit.
         "post-commit" =>
@@ -82,6 +84,15 @@ fi
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 cd "$repo_root" || exit 0
+
+# Run rag-rat in a CLEAN git environment. Git exports GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / ...
+# to every hook, pointing at the worktree the operation ran in. rag-rat must resolve the repo from
+# its OWN config root (anchored to the main worktree), not the launching git env — otherwise a hook
+# fired in a linked worktree mis-scopes the one shared index (the base + every overlay resolve to
+# that worktree, collapsing deltas and pruning rows). Belt-and-suspenders with discover_repo's
+# path-first resolution; also drops the transient GIT_INDEX_FILE the in-progress git op set.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_PREFIX GIT_NAMESPACE \
+  GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 
 RAG_RAT_HOOK_DISABLE=1 \
   {command} >"${{TMPDIR:-/tmp}}/rag-rat-{hook}.log" 2>&1 &
@@ -102,4 +113,29 @@ pub(crate) fn make_executable(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 pub(crate) fn make_executable(_path: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_hooks_clear_git_env_and_forward_no_positionals() {
+        for hook in ["post-checkout", "post-commit", "post-merge", "post-rewrite"] {
+            let script = hook_script(hook);
+            assert!(script.contains(HOOK_MARKER), "{hook}: missing marker");
+            // git passes post-merge a squash flag (0/1) and post-rewrite a command (amend/rebase);
+            // `rag-rat maintenance` takes no positionals, so forwarding "$@" aborted the hook.
+            assert!(
+                !script.contains("\"$@\""),
+                "{hook}: forwards git's positional args to maintenance"
+            );
+            // The hook must clear git's inherited env BEFORE invoking rag-rat, so a hook fired in a
+            // linked worktree can't hijack the shared index's repo resolution via GIT_DIR/etc.
+            let unset = script.find("unset GIT_DIR").expect("hook clears GIT_DIR");
+            assert!(script.contains("GIT_WORK_TREE") && script.contains("GIT_INDEX_FILE"));
+            let invoke = script.find("rag-rat maintenance").expect("hook invokes maintenance");
+            assert!(unset < invoke, "{hook}: clears git env AFTER invoking rag-rat");
+        }
+    }
 }
