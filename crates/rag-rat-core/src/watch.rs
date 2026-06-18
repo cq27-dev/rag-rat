@@ -247,6 +247,44 @@ fn event_is_relevant(config: &Config, ignore: &IgnoreMatcher, event: &Event) -> 
     })
 }
 
+/// Whether `event` should fire a pass for the LINKED-worktree layer (#219): a content mutation to a
+/// configured target inside a linked worktree checkout (its overlay needs refreshing), or any
+/// change in the worktree registry (`<common_dir>/worktrees`, i.e. a worktree add/remove). Separate
+/// from [`event_is_relevant`] so the base-tree classification — and its tests — stay untouched. The
+/// `config.root` ignore matcher doesn't govern paths outside `config.root`, so a worktree path is
+/// matched by the target globs alone (the overlay pass does its own delta + target filtering).
+fn event_touches_worktree(
+    config: &Config,
+    event: &Event,
+    worktree_roots: &[PathBuf],
+    registry: Option<&Path>,
+) -> bool {
+    if !kind_is_mutation(&event.kind) {
+        return false;
+    }
+    event.paths.iter().any(|path| {
+        if registry.is_some_and(|reg| path.starts_with(reg)) {
+            return true;
+        }
+        worktree_roots.iter().any(|root| {
+            path.strip_prefix(root).ok().is_some_and(|rel| target_for_path(config, rel).is_some())
+        })
+    })
+}
+
+/// Live linked-worktree checkout roots (excluding the base `config.root`) plus the worktree
+/// registry dir (`<common_dir>/worktrees`), for the watcher to subscribe to — branch checkouts for
+/// edits, the registry for add/remove.
+fn worktree_watch_targets(config: &Config) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
+    let base = crate::index::worktree_id_of(&config.root);
+    let roots = worktrees.into_iter().filter(|w| *w != base).map(PathBuf::from).collect();
+    let registry = crate::index::discover_repo(&config.root)
+        .ok()
+        .map(|repo| repo.common_dir().join("worktrees"));
+    (roots, registry)
+}
+
 /// Whether `event` touches the installed binary path — the fleet hot-upgrade trigger. Matches by
 /// full path (`cargo install` renames its temp file to exactly this path) so unrelated churn in
 /// the same directory is ignored.
@@ -368,6 +406,16 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     if let Some(dir) = fleet_dir {
         let _ = notify_watcher.watch(dir, RecursiveMode::NonRecursive);
     }
+    // Linked worktrees (#219): watch each branch checkout recursively so its edits refresh the
+    // overlay, and the worktree registry non-recursively so a `git worktree add`/`remove` fires a
+    // pass. `linked_worktrees` is reconciled after each pass to pick up newly-added worktrees.
+    let (mut linked_worktrees, worktree_registry) = worktree_watch_targets(&config);
+    for worktree in &linked_worktrees {
+        let _ = notify_watcher.watch(worktree, RecursiveMode::Recursive);
+    }
+    if let Some(registry) = &worktree_registry {
+        let _ = notify_watcher.watch(registry, RecursiveMode::NonRecursive);
+    }
 
     let mut debounce = Debounce::new(
         Duration::from_millis(config.watch.debounce_ms),
@@ -393,7 +441,14 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
         match rx.recv_timeout(wait) {
             Ok(Ok(event)) => {
                 let now = Instant::now();
-                if event_is_relevant(&config, &ignore, &event) {
+                if event_is_relevant(&config, &ignore, &event)
+                    || event_touches_worktree(
+                        &config,
+                        &event,
+                        &linked_worktrees,
+                        worktree_registry.as_deref(),
+                    )
+                {
                     debounce.on_event(now);
                     // A `.gitignore` mutation changed the rules — recompile so subsequent events
                     // are classified against current rules, not the matcher
@@ -420,6 +475,16 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
             let _ = maintenance_pass(&config, passes.is_multiple_of(GC_EVERY_PASSES));
             debounce.reset();
             last_pass = Instant::now();
+            // Pick up newly-added worktrees (a registry event fired this pass): watch any live
+            // linked checkout we aren't watching yet. Removed ones keep a now-stale watch
+            // (harmless; their overlay is GC-pruned) — avoids unwatch bookkeeping.
+            let (current, _) = worktree_watch_targets(&config);
+            for worktree in current {
+                if !linked_worktrees.contains(&worktree) {
+                    let _ = notify_watcher.watch(&worktree, RecursiveMode::Recursive);
+                    linked_worktrees.push(worktree);
+                }
+            }
         }
         if fleet_debounce.should_fire(now)
             && let Some(bin) = fleet_bin.as_deref()
@@ -462,6 +527,62 @@ mod tests {
 
     fn mutation_event(path: PathBuf) -> Event {
         Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path)
+    }
+
+    #[test]
+    fn event_touches_worktree_matches_checkout_targets_and_registry() {
+        let config = Config {
+            root: PathBuf::from("/main"),
+            database: PathBuf::from("/main/.rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            watch: WatchConfig::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        let worktree = PathBuf::from("/wt/feat");
+        let registry = PathBuf::from("/main/.git/worktrees");
+        let roots = [worktree.clone()];
+
+        // A target file in a linked worktree fires (its overlay needs refreshing).
+        assert!(event_touches_worktree(
+            &config,
+            &mutation_event(worktree.join("src/a.rs")),
+            &roots,
+            Some(&registry),
+        ));
+        // A non-target file in the worktree does not.
+        assert!(!event_touches_worktree(
+            &config,
+            &mutation_event(worktree.join("README.md")),
+            &roots,
+            Some(&registry),
+        ));
+        // A change in the worktree registry (a `git worktree add`/`remove`) fires.
+        assert!(event_touches_worktree(
+            &config,
+            &mutation_event(registry.join("feat/HEAD")),
+            &roots,
+            Some(&registry),
+        ));
+        // A read event never fires (anti-feedback, same as the base watcher).
+        let read = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+            .add_path(worktree.join("src/a.rs"));
+        assert!(!event_touches_worktree(&config, &read, &roots, Some(&registry)));
+        // No worktrees and no registry → nothing fires.
+        assert!(!event_touches_worktree(
+            &config,
+            &mutation_event(worktree.join("src/a.rs")),
+            &[],
+            None,
+        ));
     }
 
     #[test]
