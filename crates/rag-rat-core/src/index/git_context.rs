@@ -14,10 +14,17 @@ pub(crate) struct GitChangedPaths {
 /// plain `gix::discover` only searches upward from `root`, so it would miss such a repo and leave
 /// git history "unavailable" (clearing the historical tables). All gix discovery goes through here
 /// (#213 review).
+///
+/// Known limitation (#218): gix resolves a RELATIVE `GIT_DIR`/`GIT_WORK_TREE` against the process
+/// cwd, not against `root` (the old `git -C root` resolved them against `root`). Absolute env
+/// values, and relative ones when cwd == `root`, work; relative values from a foreign cwd don't.
+/// gix exposes no way to open with an explicit (git-dir, worktree) pair from outside the crate, so
+/// re-rooting cleanly isn't possible without process-global cwd/env mutation (racy under the
+/// parallel indexer).
 pub(crate) fn discover_repo(root: &Path) -> Result<gix::Repository, Box<gix::discover::Error>> {
-    // Box the error: gix's `discover::Error` is a large enum, and an unboxed large `Err` bloats every
-    // `Result` this returns (clippy::result_large_err). Callers use `.ok()` or `?` (anyhow), both of
-    // which handle the box transparently.
+    // Box the error: gix's `discover::Error` is a large enum, and an unboxed large `Err` bloats
+    // every `Result` this returns (clippy::result_large_err). Callers use `.ok()` or `?`
+    // (anyhow), both of which handle the box transparently.
     gix::discover_with_environment_overrides(root).map_err(Box::new)
 }
 

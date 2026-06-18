@@ -557,11 +557,20 @@ fn read_history_inner(
             body: body.trim().to_string(),
         };
         let hash = record.hash.clone();
+        let parent_ids: Vec<_> = commit.parent_ids().collect();
+        // MERGE commit: `git log --numstat -- .` does NOT pass `--diff-merges`, so a merge shows no
+        // per-file diff. Diffing it against its first parent would wrongly attribute the merged
+        // branch's paths to the merge and inflate `changed_file_count` (#213 review). Record the
+        // commit (it's part of history / FTS) with no file changes.
+        if parent_ids.len() > 1 {
+            commits.push(record);
+            continue;
+        }
         let new_tree = commit.tree()?;
         // A shallow clone's boundary commit lists a parent whose object is ABSENT; treat it like a
         // root commit (diff against the empty tree) instead of aborting, so its changed paths are
         // still recorded — matching `git log --numstat` on a shallow clone (#213 review).
-        let parent_tree = match commit.parent_ids().next() {
+        let parent_tree = match parent_ids.first() {
             Some(parent) => repo
                 .find_commit(parent.detach())
                 .ok()
@@ -573,10 +582,11 @@ fn read_history_inner(
         let mut commit_changes = Vec::new();
         parent_tree
             .changes()?
-            // Full paths for each change; NO rename detection — a rename shows as a deletion +
-            // addition, matching `git log --numstat` without `-M` (and avoiding the Rewrite variant).
+            // Full paths, AND rename detection ON (gix default is off; `git log --numstat` has it ON
+            // unless `--no-renames`): a `git mv` becomes a single Rewrite at the destination rather
+            // than a spurious delete+add that corrupts per-path churn (#213 review).
             .options(|opts| {
-                opts.track_path().track_rewrites(None);
+                opts.track_path().track_rewrites(Some(gix::diff::Rewrites::default()));
             })
             .for_each_to_obtain_tree(&new_tree, |change| {
                 push_file_change(&change, &hash, scope.as_deref(), &mut diff_cache, &mut commit_changes);
@@ -596,11 +606,10 @@ fn read_history_inner(
     Ok(())
 }
 
-/// Record one tree-diff change as a `FileChange` — any leaf path change (regular blob, symlink, OR
-/// submodule gitlink), skipping only directory (tree) entries — with additions/deletions from a
-/// blob line-diff. A binary/uncountable diff (and gitlinks, whose "content" is a commit id) yields
-/// `None` counts (the numstat `-` case). Symlinks and gitlinks are included because `git log
-/// --numstat` records them as changed paths (#213 review).
+/// Record one tree-diff change as a `FileChange` — any leaf path change (regular blob, symlink,
+/// submodule gitlink, OR a rename/copy), skipping only directory (tree) entries. Symlinks and
+/// gitlinks are included because `git log --numstat` records them as changed paths, and renames are
+/// recorded once at the destination (rename detection is on) (#213 review).
 fn push_file_change(
     change: &Change<'_, '_, '_>,
     hash: &str,
@@ -608,27 +617,36 @@ fn push_file_change(
     diff_cache: &mut gix::diff::blob::Platform,
     out: &mut Vec<FileChange>,
 ) {
-    // Keep blob / symlink / gitlink changes; drop only TREE entries (directory nodes the diff may
-    // emit alongside their leaf changes) — matching `git log --numstat`, which lists submodule
-    // pointer changes too (#213 review).
-    let (change_kind, location, is_path_change) = match change {
-        Change::Addition { location, entry_mode, .. } =>
-            ("added", *location, !entry_mode.is_tree()),
-        Change::Deletion { location, entry_mode, .. } =>
-            ("deleted", *location, !entry_mode.is_tree()),
-        Change::Modification { location, entry_mode, .. } =>
-            ("modified", *location, !entry_mode.is_tree()),
-        // Rewrites are disabled above; ignore defensively if config ever forces them on.
-        Change::Rewrite { .. } => return,
+    // Keep any leaf path change; drop only TREE entries (directory nodes the diff may emit
+    // alongside their leaves). A rename/copy is recorded once at the DESTINATION (the old
+    // numstat parser normalized `old => new` to the destination), with counts from the
+    // rewrite's content diff (`None` for a pure 100%-similar rename) (#213 review).
+    let (change_kind, location, additions, deletions) = match change {
+        Change::Addition { location, entry_mode, .. } if !entry_mode.is_tree() => {
+            let (additions, deletions) = blob_line_counts(change, diff_cache);
+            ("added", location.to_string(), additions, deletions)
+        },
+        Change::Deletion { location, entry_mode, .. } if !entry_mode.is_tree() => {
+            let (additions, deletions) = blob_line_counts(change, diff_cache);
+            ("deleted", location.to_string(), additions, deletions)
+        },
+        Change::Modification { location, entry_mode, .. } if !entry_mode.is_tree() => {
+            let (additions, deletions) = blob_line_counts(change, diff_cache);
+            ("modified", location.to_string(), additions, deletions)
+        },
+        Change::Rewrite { location, entry_mode, diff, copy, .. } if !entry_mode.is_tree() => {
+            let (additions, deletions) = diff.as_ref().map_or((None, None), |stats| {
+                (Some(i64::from(stats.insertions)), Some(i64::from(stats.removals)))
+            });
+            (if *copy { "copied" } else { "renamed" }, location.to_string(), additions, deletions)
+        },
+        // A tree entry, or any future variant: not a leaf path change.
+        _ => return,
     };
-    if !is_path_change {
-        return;
-    }
     // `location` is worktree-root-relative. At the worktree root keep it as-is; under a subtree
     // index keep ONLY paths inside the subtree and make them root-relative — paths outside
     // `root` are dropped so a subdirectory index doesn't record the wider worktree's changes
     // (#213 review).
-    let location = location.to_string();
     let path = match scope {
         None => location,
         Some(prefix) => match location.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('/'))
@@ -637,13 +655,6 @@ fn push_file_change(
             None => return,
         },
     };
-    let (additions, deletions) = change
-        .diff(diff_cache)
-        .ok()
-        .and_then(|mut platform| platform.line_counts().ok().flatten())
-        .map_or((None, None), |stats| {
-            (Some(i64::from(stats.insertions)), Some(i64::from(stats.removals)))
-        });
     out.push(FileChange {
         commit_hash: hash.to_string(),
         path,
@@ -651,6 +662,24 @@ fn push_file_change(
         deletions,
         change_kind: change_kind.to_string(),
     });
+}
+
+/// Line counts for a blob/symlink change via gix's blob diff. `(None, None)` for a
+/// binary/uncountable diff — AND for submodule gitlinks (`EntryKind::Commit`, a commit id with no
+/// text content): gix's blob diff accepts only blobs/symlinks. The old `git log --numstat`
+/// synthesized `1/0`,`1/1`,`0/1` for submodule pointer changes; we record the path with unknown
+/// counts rather than fall back to a raw `git` invocation. Tracked in #218.
+fn blob_line_counts(
+    change: &Change<'_, '_, '_>,
+    diff_cache: &mut gix::diff::blob::Platform,
+) -> (Option<i64>, Option<i64>) {
+    change
+        .diff(diff_cache)
+        .ok()
+        .and_then(|mut platform| platform.line_counts().ok().flatten())
+        .map_or((None, None), |stats| {
+            (Some(i64::from(stats.insertions)), Some(i64::from(stats.removals)))
+        })
 }
 
 /// The index `root`'s path WITHIN the worktree (e.g. `Some("tools/rag-rat")`), or `None` when
