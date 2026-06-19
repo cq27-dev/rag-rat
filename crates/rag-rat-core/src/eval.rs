@@ -651,19 +651,17 @@ fn find_current_source_violations(
     db: &IndexDatabase,
     hits: &[crate::search::lexical::SearchHit],
 ) -> anyhow::Result<Vec<CurrentSourceViolation>> {
-    // One dict-bound decompressor for the whole hit set; `read_chunk_current_with` reuses it
-    // instead of reloading the ~112 KB dict per hit (#77 Phase 2). This also drops the graph +
-    // memory work the public `read_chunk` would do — the violation check only reads
-    // path/text/line span.
-    let dict = db.chunk_text_dict()?.unwrap_or_default();
-    let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
+    // `read_chunk_current` builds its own dict decoder per call; this eval pass is a cold CLI
+    // diagnostic (not the hot retrieval path), so the per-call dict load is fine. It also drops the
+    // graph + memory work the public `read_chunk` would do — the violation check only reads
+    // path/text/line span (#77 Phase 2).
     let mut violations = Vec::new();
     let mut checked = BTreeSet::new();
     for hit in hits {
         if !checked.insert(hit.chunk_id) {
             continue;
         }
-        match db.read_chunk_current_with(hit.chunk_id, &mut decompressor) {
+        match db.read_chunk_current(hit.chunk_id) {
             Ok(Some(chunk)) => {
                 let source_path = config.root.join(&chunk.path);
                 match fs::read_to_string(&source_path) {

@@ -675,6 +675,13 @@ pub(crate) fn apply_dispatch_edge_facts_view_exclusion(conn: &Connection) -> rus
 /// needs no `%`-escaping of the `[`/`(` in the markers.)
 pub(crate) fn apply_files_has_test_code(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "files", "has_test_code", "INTEGER NOT NULL DEFAULT 0")?;
+    // The backfill reads chunks.text. On a fresh DB the baseline omits that column (V027 retired
+    // it), and there is nothing to backfill — chunks is empty and the index-time path sets
+    // has_test_code. Only a pre-V027 forward-migrate (column still present, chunks populated)
+    // needs the backfill.
+    if !column_exists(conn, "chunks", "text")? {
+        return Ok(());
+    }
     conn.execute_batch(
         "UPDATE files SET has_test_code = 1 WHERE id IN (
              SELECT DISTINCT file_id FROM chunks
@@ -696,12 +703,12 @@ pub(crate) fn apply_chunk_text_compression_tables(conn: &Connection) -> rusqlite
             chunk_id INTEGER PRIMARY KEY,
             blob BLOB NOT NULL,
             raw_len INTEGER NOT NULL CHECK(raw_len >= 0),
+            dict_version INTEGER NOT NULL,
             FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
         ) STRICT;
         CREATE TABLE IF NOT EXISTS chunk_text_dict(
-            id INTEGER PRIMARY KEY CHECK(id = 1),
-            dict BLOB NOT NULL,
-            dict_version INTEGER NOT NULL DEFAULT 1
+            version INTEGER PRIMARY KEY,
+            dict BLOB NOT NULL
         ) STRICT;
         ",
     )
@@ -716,6 +723,22 @@ pub(crate) fn apply_chunk_text_compression_tables(conn: &Connection) -> rusqlite
 /// table and must be converted; a fresh DB already has the contentless table from the baseline and
 /// this rebuilds it empty (the SELECT over zero chunks is a no-op).
 pub(crate) fn apply_contentless_chunk_fts(conn: &Connection) -> rusqlite::Result<()> {
+    // IDEMPOTENT: this migration's DROP+CREATE is destructive (it discards the chunk_fts index),
+    // and `schema::apply` re-runs every additive migration on each call, so converting
+    // unconditionally would wipe the inline-written contentless index on every open/rebuild.
+    // Only convert when chunk_fts is still the OLD external-content table; if it is already
+    // contentless (or absent — the baseline creates it contentless), do nothing.
+    let already_contentless: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE name = 'chunk_fts' AND sql NOT LIKE '%content=''chunks''%'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if already_contentless {
+        return Ok(());
+    }
     conn.execute_batch(
         "
         DROP TABLE IF EXISTS chunk_fts;
@@ -725,9 +748,16 @@ pub(crate) fn apply_contentless_chunk_fts(conn: &Connection) -> rusqlite::Result
             contentless_delete=1,
             tokenize='porter'
         );
-        INSERT INTO chunk_fts(rowid, text) SELECT id, text FROM chunks;
         ",
-    )
+    )?;
+    // Repopulate from chunks.text only on a pre-V027 forward-migrate, where the column still
+    // exists. On a fresh DB the baseline omits chunks.text (and chunks is empty), so there is
+    // nothing to repopulate — the inline write_fts path fills chunk_fts during the rebuild
+    // instead.
+    if column_exists(conn, "chunks", "text")? {
+        conn.execute("INSERT INTO chunk_fts(rowid, text) SELECT id, text FROM chunks", [])?;
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
@@ -1060,6 +1090,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_024_ID => Some(24),
             MIGRATION_025_ID => Some(25),
             MIGRATION_026_ID => Some(26),
+            MIGRATION_027_ID => Some(27),
             _ => None,
         })
         .max()
@@ -1095,6 +1126,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_024_ID
             | MIGRATION_025_ID
             | MIGRATION_026_ID
+            | MIGRATION_027_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1127,6 +1159,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_024_ID => migration.checksum != MIGRATION_024_CHECKSUM,
         MIGRATION_025_ID => migration.checksum != MIGRATION_025_CHECKSUM,
         MIGRATION_026_ID => migration.checksum != MIGRATION_026_CHECKSUM,
+        MIGRATION_027_ID => migration.checksum != MIGRATION_027_CHECKSUM,
         _ => false,
     }
 }
@@ -1179,6 +1212,41 @@ pub(crate) fn add_column_if_missing(
     }
 
     conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+}
+
+pub(crate) fn column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// V027 (#77 Phase 2): retire the `chunks.text` column — the irreversible payoff step. A fresh DB's
+/// baseline already omits the column; a forward-migrated index still has it plus a (possibly empty)
+/// `chunk_text` store. Build the compressed store FROM `chunks.text` (its last read), guaranteeing
+/// every chunk has a blob, THEN drop the column. Guarded by `column_exists` so a fresh DB (no
+/// column) or a re-run is a clean no-op.
+pub(crate) fn apply_drop_chunks_text(conn: &Connection) -> rusqlite::Result<()> {
+    if !column_exists(conn, "chunks", "text")? {
+        return Ok(());
+    }
+    crate::index::chunk_text_store::build_store(conn, "(SELECT id AS chunk_id, text FROM chunks)")
+        .map_err(|err| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(format!("V027 chunk_text backfill failed before dropping chunks.text: {err}")),
+            )
+        })?;
+    conn.execute("ALTER TABLE chunks DROP COLUMN text", [])?;
+    Ok(())
 }
 
 pub(crate) fn apply_commit_addressable_worktrees(conn: &Connection) -> rusqlite::Result<()> {

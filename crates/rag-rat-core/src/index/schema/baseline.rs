@@ -53,7 +53,8 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             end_byte INTEGER NOT NULL,
             start_line INTEGER NOT NULL,
             end_line INTEGER NOT NULL,
-            text TEXT NOT NULL,
+            -- Chunk text lives ONLY in the compressed chunk_text store (#77 Phase 2); there is no
+            -- inline text column. text_hash stays (it keys embedding/anchor freshness, not text).
             text_hash TEXT NOT NULL,
             source_revision TEXT NOT NULL DEFAULT '',
             anchor_version INTEGER NOT NULL DEFAULT 1,
@@ -78,21 +79,29 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             -- raw_len is the decompress capacity; CHECK(>= 0) so a bad write can't become a huge
             -- usize at the read-side cast and blow up Vec::with_capacity.
             raw_len INTEGER NOT NULL CHECK(raw_len >= 0),
+            -- Which chunk_text_dict version compressed this blob: a zstd blob is only decodable
+            -- against the dict it was made with, so the dict is a per-blob decode key (#77 Phase \
+         2).
+            dict_version INTEGER NOT NULL,
             FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
         ) STRICT;
 
-        -- The single shared zstd dictionary for chunk_text (#77). Stored IN the DB so a copied /
-        -- P2P-streamed index is self-contained: decompress anywhere with no extension. CHECK(id = \
-         1)
-        -- enforces the single-row invariant (two dict rows -> undefined which one wins -> every \
-         blob
-        -- fails to decompress); a dict_version bump retrains + recompresses ALL rows atomically \
-         (no
-        -- per-row version, so the recompress must be one transaction).
+        -- The zstd dictionaries for chunk_text (#77 Phase 2). A trained dict is an IMMUTABLE \
+         decode
+        -- KEY: blobs reference the version they were compressed against \
+         (chunk_text.dict_version), and
+        -- a dict is NEVER mutated/replaced in place (that would orphan every blob built against \
+         it —
+        -- the same footgun as gc nulling pool strings out from under live refs). The first index
+        -- trains version 1 and everything references it; a future retrain ADDS a new version and
+        -- compresses new blobs against it while old blobs keep pointing at theirs (both stay
+        -- resident, so decode is always possible). Stored IN the DB so a copied / P2P-streamed \
+         index
+        -- is self-contained. No FK from chunk_text into this table — gc sweeps versions with zero
+        -- referencing blobs (like the edge_strings pool).
         CREATE TABLE IF NOT EXISTS chunk_text_dict(
-            id INTEGER PRIMARY KEY CHECK(id = 1),
-            dict BLOB NOT NULL,
-            dict_version INTEGER NOT NULL DEFAULT 1
+            version INTEGER PRIMARY KEY,
+            dict BLOB NOT NULL
         ) STRICT;
 
         CREATE TABLE IF NOT EXISTS symbols(

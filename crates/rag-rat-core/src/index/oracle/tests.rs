@@ -161,11 +161,14 @@ impl Harness {
         self.conn
             .execute(
                 "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, \
-                 start_line, end_line, text, text_hash) VALUES (?1, 'symbol', ?2, 0, ?3, 1, 1, \
-                 ?4, ?5)",
-                params![file_id, symbol_path, text.len() as i64, text, sha256_hex(text.as_bytes())],
+                 start_line, end_line, text_hash) VALUES (?1, 'symbol', ?2, 0, ?3, 1, 1, ?4)",
+                params![file_id, symbol_path, text.len() as i64, sha256_hex(text.as_bytes())],
             )
             .unwrap();
+        // chunks.text is gone (#77 Phase 2); seed the compressed chunk_text blob readers INNER
+        // JOIN.
+        let chunk_id = self.conn.last_insert_rowid();
+        crate::index::chunk_text_store::seed_chunk_text(&self.conn, chunk_id, text).unwrap();
     }
 
     /// The persisted moniker row for a logical symbol, if any.
@@ -746,7 +749,7 @@ fn migration_creates_oracle_side_tables() {
         assert!(columns.contains(&expected.to_string()), "edge_oracle missing {expected}");
     }
 
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 26);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 27);
 }
 
 /// The V019 moniker migration: the `logical_symbol_monikers` table (STRICT, NO foreign key — see

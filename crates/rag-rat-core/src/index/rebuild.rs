@@ -137,10 +137,21 @@ impl IndexDatabase {
             ",
         )?;
         self.delete_staged_files_cascade()?;
-        // The shared dictionary is global (one row, not per-file), so the staged cascade above does
-        // not touch it. Clear it here so insert_chunks sees no dict mid-rebuild and skips per-row
-        // compression; build_chunk_text_store retrains + bulk-compresses once at the end (#77).
-        self.storage.execute_batch("DELETE FROM chunk_text_dict;")?;
+        // Do NOT clear chunk_text_dict: dicts are IMMUTABLE decode keys (#77 Phase 2). Other
+        // worktree contexts' blobs reference existing versions, and deleting a version would orphan
+        // them. The staged cascade above already removed THIS context's chunk_text rows;
+        // insert_chunks recompresses them against the latest existing dict version (or, on
+        // the very first index when no dict exists yet, stages the text so
+        // build_chunk_text_store trains version 1). Per-connection staging table for that
+        // first-index path: insert_chunks writes the in-memory text here (there is no
+        // chunks.text column) and build_chunk_text_store reads + clears it.
+        self.storage.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS rebuild_chunk_text(
+                 chunk_id INTEGER PRIMARY KEY,
+                 text TEXT NOT NULL
+             );
+             DELETE FROM temp.rebuild_chunk_text;",
+        )?;
         self.storage.execute_batch("DELETE FROM temp.staged_file_ids;")?;
         Ok(())
     }

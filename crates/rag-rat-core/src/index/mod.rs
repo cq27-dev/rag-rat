@@ -11,7 +11,7 @@ pub mod schema;
 pub mod symbols;
 pub mod walker;
 
-mod chunk_text_store;
+pub(crate) mod chunk_text_store;
 mod discovery;
 mod file_index;
 mod file_rows;

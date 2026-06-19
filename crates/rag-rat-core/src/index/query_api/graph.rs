@@ -616,10 +616,10 @@ impl IndexDatabase {
             "
             SELECT chunks.id, files.path, files.language, files.kind,
                    chunks.start_line, chunks.end_line, chunks.symbol_path,
-                   chunks.text, chunk_text.blob, chunk_text.raw_len
+                   chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version
             FROM chunks
             JOIN files ON files.id = chunks.file_id
-            LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
+            JOIN chunk_text ON chunk_text.chunk_id = chunks.id
             WHERE files.path = ?1
               AND (
                 chunks.symbol_path = ?2
@@ -665,19 +665,19 @@ impl IndexDatabase {
                         importance: None,
                     },
                     crate::index::text_compression::ChunkTextRow {
-                        fallback: row.get(7)?,
-                        blob: row.get(8)?,
-                        raw_len: row.get(9)?,
+                        blob: row.get(7)?,
+                        raw_len: row.get(8)?,
+                        dict_version: row.get(9)?,
                     },
                 ))
             },
         )?;
         let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        let dict = crate::query::chunk_text_dict(conn)?;
-        let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
+        let dicts = crate::query::chunk_text_dicts(conn)?;
+        let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
         let mut hits = Vec::with_capacity(collected.len());
         for (mut hit, text_row) in collected {
-            hit.summary = bounded_summary(&text_row.resolve(&mut decompressor)?);
+            hit.summary = bounded_summary(&text_row.resolve(&mut decoder)?);
             hits.push(hit);
         }
         Ok(hits)

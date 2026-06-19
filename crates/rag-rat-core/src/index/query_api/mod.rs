@@ -391,21 +391,24 @@ impl IndexDatabase {
         Ok(Some(chunk))
     }
 
-    fn read_chunk_current(&self, chunk_id: i64) -> anyhow::Result<Option<crate::query::ReadChunk>> {
-        let dict = crate::query::chunk_text_dict(self.storage.connection())?;
-        let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
-        self.read_chunk_current_with(chunk_id, &mut decompressor)
+    pub(crate) fn read_chunk_current(
+        &self,
+        chunk_id: i64,
+    ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
+        let dicts = crate::query::chunk_text_dicts(self.storage.connection())?;
+        let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+        self.read_chunk_current_with(chunk_id, &mut decoder)
     }
 
-    /// Live-revalidating chunk read that resolves text through a caller-owned, dict-bound
-    /// decompressor (reused across a batch) rather than reloading the dict per call.
+    /// Live-revalidating chunk read that resolves text through a caller-owned dict decoder (reused
+    /// across a batch) rather than reloading the dict versions per call.
     pub(crate) fn read_chunk_current_with(
         &self,
         chunk_id: i64,
-        decompressor: &mut crate::index::text_compression::ChunkDecompressor,
+        decoder: &mut crate::index::text_compression::ChunkTextDecoder,
     ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
         let Some(mut chunk) =
-            crate::query::read_chunk_with(self.storage.connection(), chunk_id, decompressor)?
+            crate::query::read_chunk_with(self.storage.connection(), chunk_id, decoder)?
         else {
             return Ok(None);
         };

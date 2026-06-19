@@ -506,11 +506,11 @@ fn full_rebuild_preserves_other_worktree_contexts() {
             "
                 INSERT INTO main.chunks(
                     file_id, chunk_kind, symbol_path, start_byte, end_byte, start_line, end_line,
-                    text, text_hash, source_revision, anchor_version, normalized_hash,
+                    text_hash, source_revision, anchor_version, normalized_hash,
                     start_boundary_hash, end_boundary_hash, start_context_hash, end_context_hash,
                     context_radius, embedding_policy, embedding_priority
                 )
-                VALUES (?1, 'symbol', 'other_context', 0, 12, 1, 1, 'other context', 'other-text',
+                VALUES (?1, 'symbol', 'other_context', 0, 12, 1, 1, 'other-text',
                     'other-sha', 1, '', '', '', '', '', 2, 'Embed', 1)
                 RETURNING id
                 ",
@@ -518,6 +518,14 @@ fn full_rebuild_preserves_other_worktree_contexts() {
             |row| row.get::<_, i64>(0),
         )
         .unwrap();
+    // chunks.text is gone (#77 Phase 2); seed the chunk_text blob readers INNER JOIN. (The
+    // chunk_fts row for this other-context chunk is seeded a few lines below.)
+    crate::index::chunk_text_store::seed_chunk_text(
+        db.storage.connection(),
+        other_chunk_id,
+        "other context",
+    )
+    .unwrap();
     db.storage
         .connection()
         .execute(
@@ -10174,7 +10182,7 @@ fn v025_creates_chunk_text_compression_tables() {
         assert!(conn_table_exists(&conn, t), "{t} created on fresh apply");
     }
     let cols = conn_table_columns(&conn, "chunk_text");
-    for expected in ["chunk_id", "blob", "raw_len"] {
+    for expected in ["chunk_id", "blob", "raw_len", "dict_version"] {
         assert!(cols.contains(&expected.to_string()), "chunk_text missing {expected}");
     }
     // Forward-migrate path: drop the tables + the V025 ledger row, re-apply → recreated.
@@ -10187,20 +10195,20 @@ fn v025_creates_chunk_text_compression_tables() {
     assert!(conn_table_exists(&conn, "chunk_text"), "V025 recreates chunk_text on forward migrate");
     assert!(conn_table_exists(&conn, "chunk_text_dict"));
 
-    // CHECK constraints (adversary-found). chunk_text_dict is single-row (id = 1); a second dict
-    // row would make "which dict wins" undefined → every blob throws Dictionary mismatch.
-    conn.execute("INSERT INTO chunk_text_dict(id, dict, dict_version) VALUES (1, x'00', 1)", [])
-        .unwrap();
-    assert!(
-        conn.execute("INSERT INTO chunk_text_dict(id, dict, dict_version) VALUES (2, x'00', 1)", [
-        ])
-        .is_err(),
-        "chunk_text_dict rejects id != 1"
-    );
+    // Dicts are immutable + versioned (#77 Phase 2): MULTIPLE versions coexist (the prior
+    // CHECK(id=1) single-row constraint is gone — that was the mutable-global-slot footgun a
+    // retrain would hit).
+    conn.execute("INSERT INTO chunk_text_dict(version, dict) VALUES (1, x'00')", []).unwrap();
+    conn.execute("INSERT INTO chunk_text_dict(version, dict) VALUES (2, x'00')", [])
+        .expect("multiple dict versions coexist");
     // raw_len is the decompress capacity; a negative value would cast to a huge usize.
     assert!(
-        conn.execute("INSERT INTO chunk_text(chunk_id, blob, raw_len) VALUES (1, x'00', -1)", [])
-            .is_err(),
+        conn.execute(
+            "INSERT INTO chunk_text(chunk_id, blob, raw_len, dict_version) VALUES (1, x'00', -1, \
+             1)",
+            [],
+        )
+        .is_err(),
         "chunk_text rejects negative raw_len"
     );
 }
@@ -10233,8 +10241,11 @@ fn v026_recreates_chunk_fts_contentless_and_repopulates() {
         .unwrap();
     assert_eq!(after, 0, "contentless_delete=1 removes the row by rowid");
 
-    // Forward-migrate: rebuild an OLD external-content chunk_fts with a seeded chunk, drop the V026
-    // ledger row, re-apply → V026 converts to contentless and repopulates from chunks.text.
+    // Forward-migrate from a pre-V026 index: re-add the old chunks.text column, seed a chunk + an
+    // external-content chunk_fts, and drop the V026 + V027 ledger rows. Re-applying runs V026
+    // (convert chunk_fts to contentless + repopulate from chunks.text) then V027 (build the
+    // chunk_text store from chunks.text + drop the column) — the full retirement path as a unit.
+    conn.execute("ALTER TABLE chunks ADD COLUMN text TEXT NOT NULL DEFAULT ''", []).unwrap();
     conn.execute(
         "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
          VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0)",
@@ -10243,8 +10254,8 @@ fn v026_recreates_chunk_fts_contentless_and_repopulates() {
     .unwrap();
     conn.execute(
         "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
-                            start_line, end_line, text, text_hash)
-         VALUES (1, 'symbol', 'gamma', 0, 10, 1, 5, 'fn gamma() { delta() }', 'th')",
+                            start_line, end_line, text_hash, text)
+         VALUES (1, 'symbol', 'gamma', 0, 10, 1, 5, 'th', 'fn gamma() { delta() }')",
         [],
     )
     .unwrap();
@@ -10253,7 +10264,8 @@ fn v026_recreates_chunk_fts_contentless_and_repopulates() {
          CREATE VIRTUAL TABLE chunk_fts USING fts5(text, content='chunks', content_rowid='id', \
          tokenize='porter');
          INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild');
-         DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';",
+         DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';
+         DELETE FROM schema_version WHERE id = '027_drop_chunks_text';",
     )
     .unwrap();
     schema::apply(&conn).unwrap();
@@ -10268,7 +10280,11 @@ fn v026_recreates_chunk_fts_contentless_and_repopulates() {
     let hits: i64 = conn
         .query_row("SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'gamma'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(hits, 1, "V026 repopulates chunk_fts from chunks.text");
+    assert_eq!(hits, 1, "V026 repopulates chunk_fts from chunks.text before V027 drops it");
+    // V027 retired the column and built the compressed store from it.
+    assert!(!schema::column_exists(&conn, "chunks", "text").unwrap(), "V027 drops chunks.text");
+    let blobs: i64 = conn.query_row("SELECT count(*) FROM chunk_text", [], |r| r.get(0)).unwrap();
+    assert_eq!(blobs, 1, "V027 builds the chunk_text store from chunks.text");
 }
 
 #[test]
@@ -10330,28 +10346,27 @@ fn full_rebuild_populates_the_chunk_text_store() {
     let stored: i64 = conn.query_row("SELECT COUNT(*) FROM chunk_text", [], |r| r.get(0)).unwrap();
     assert!(chunks > 0, "the rebuild indexed some chunks");
     assert_eq!(stored, chunks, "every chunk is compressed into chunk_text");
-    let dict: Vec<u8> =
-        conn.query_row("SELECT dict FROM chunk_text_dict WHERE id = 1", [], |r| r.get(0)).unwrap();
+    let dict: Vec<u8> = conn
+        .query_row("SELECT dict FROM chunk_text_dict WHERE version = 1", [], |r| r.get(0))
+        .unwrap();
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.text, ct.blob, ct.raw_len FROM chunks c JOIN chunk_text ct ON ct.chunk_id = \
-             c.id",
-        )
-        .unwrap();
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?))
-        })
-        .unwrap();
+    // The chunks.text column is gone (#77 Phase 2), so verify the store is self-consistent: every
+    // blob decompresses to valid UTF-8 and the decompressed corpus contains the indexed source.
+    let mut stmt = conn.prepare("SELECT ct.blob, ct.raw_len FROM chunk_text ct").unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))).unwrap();
+    let mut corpus = String::new();
     let mut checked = 0;
     for row in rows {
-        let (text, blob, raw_len) = row.unwrap();
+        let (blob, raw_len) = row.unwrap();
         let back = super::text_compression::decompress(&blob, &dict, raw_len as usize).unwrap();
-        assert_eq!(back, text.as_bytes(), "chunk_text blob round-trips to chunks.text");
+        corpus.push_str(std::str::from_utf8(&back).expect("chunk_text blob decompresses to UTF-8"));
         checked += 1;
     }
     assert_eq!(checked, chunks);
+    assert!(
+        corpus.contains("alpha") && corpus.contains("beta") && corpus.contains("gamma"),
+        "the decompressed store contains the indexed source"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -10379,27 +10394,24 @@ fn incremental_heal_maintains_the_chunk_text_store() {
         stored, chunks,
         "heal kept chunk_text one-to-one with chunks (no stale/orphan rows)"
     );
-    let dict: Vec<u8> =
-        conn.query_row("SELECT dict FROM chunk_text_dict WHERE id = 1", [], |r| r.get(0)).unwrap();
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.text, ct.blob, ct.raw_len FROM chunks c JOIN chunk_text ct ON ct.chunk_id = \
-             c.id",
-        )
+    let dict: Vec<u8> = conn
+        .query_row("SELECT dict FROM chunk_text_dict WHERE version = 1", [], |r| r.get(0))
         .unwrap();
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?))
-        })
-        .unwrap();
-    let mut saw_changed = false;
+    // chunks.text is gone (#77 Phase 2): decompress the store and assert it reflects the healed
+    // NEW text and not the stale pre-heal text.
+    let mut stmt = conn.prepare("SELECT ct.blob, ct.raw_len FROM chunk_text ct").unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))).unwrap();
+    let mut corpus = String::new();
     for row in rows {
-        let (text, blob, raw_len) = row.unwrap();
+        let (blob, raw_len) = row.unwrap();
         let back = super::text_compression::decompress(&blob, &dict, raw_len as usize).unwrap();
-        assert_eq!(back, text.as_bytes(), "blob round-trips to the chunk's CURRENT text");
-        saw_changed |= text.contains("changed");
+        corpus.push_str(std::str::from_utf8(&back).expect("chunk_text blob decompresses to UTF-8"));
     }
-    assert!(saw_changed, "the healed file's NEW text is what's stored, not the rebuild-time text");
+    assert!(
+        corpus.contains("changed") && corpus.contains("added"),
+        "the healed file's NEW text is what's stored"
+    );
+    assert!(!corpus.contains("original"), "stale pre-heal text is gone from the store");
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -10410,7 +10422,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 26);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 27);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10482,6 +10494,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '024_files_has_test_code';
         DELETE FROM schema_version WHERE id = '025_chunk_text_compression_tables';
         DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';
+        DELETE FROM schema_version WHERE id = '027_drop_chunks_text';
         ",
     )
     .unwrap();
@@ -10574,6 +10587,9 @@ fn has_test_code_backfill_is_case_sensitive() {
     // is case-sensitive, so they agree.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
+    // V024's backfill reads chunks.text, which V027 retired; this test exercises the backfill as a
+    // pre-V027 forward-migrate would, so re-add the column it reads.
+    conn.execute("ALTER TABLE chunks ADD COLUMN text TEXT NOT NULL DEFAULT ''", []).unwrap();
     for (id, path) in [(1, "a.rs"), (2, "b.rs")] {
         conn.execute(
             "INSERT INTO files(id, path, language, kind, sha256, modified_at_ms, indexed_at_ms) \

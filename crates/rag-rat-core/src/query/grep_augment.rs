@@ -586,15 +586,22 @@ mod tests {
             [],
         )
         .unwrap();
+        let chunk_text = "fn watcher_main() { /* election retry loop */ }";
         conn.execute(
             "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
-                                start_line, end_line, text, text_hash)
-             VALUES (1, 'symbol', 'watch::watcher_main', 0, 100, 1, 20,
-                     'fn watcher_main() { /* election retry loop */ }', 'h1')",
+                                start_line, end_line, text_hash)
+             VALUES (1, 'symbol', 'watch::watcher_main', 0, 100, 1, 20, 'h1')",
             [],
         )
         .unwrap();
         let chunk_id = conn.last_insert_rowid();
+        // chunks.text is gone (#77 Phase 2): seed the compressed chunk_text blob (readers INNER
+        // JOIN it) and the contentless chunk_fts tokens.
+        crate::index::chunk_text_store::seed_chunk_text(&conn, chunk_id, chunk_text).unwrap();
+        conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", rusqlite::params![
+            chunk_id, chunk_text
+        ])
+        .unwrap();
         // One caller edge and one callee edge for the counts line.
         conn.execute(
             "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,

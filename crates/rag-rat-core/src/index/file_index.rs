@@ -232,26 +232,32 @@ impl IndexDatabase {
         write_fts: bool,
     ) -> anyhow::Result<()> {
         let ChunkInsertFile { file_id, source_revision } = file;
-        // Maintain the compressed store inline when a dict exists (incremental + heal paths). On a
-        // full rebuild the dict is cleared up front, so this is None and build_chunk_text_store
-        // does the bulk pass at the end (#77). Load the dict BEFORE taking `conn` to avoid
-        // a nested connection borrow. Empty dict = the no-dict (plain zstd) sentinel.
-        let dict = self.chunk_text_dict()?;
-        let mut compressor =
-            dict.as_deref().map(text_compression::ChunkCompressor::new).transpose()?;
+        // Maintain the compressed store inline when a dict exists (incremental + heal, and a full
+        // rebuild after the first one). Compress against the LATEST dict version and record it on
+        // the row — the dict is an immutable decode key (#77 Phase 2). When NO dict exists
+        // (the very first full rebuild), there is nothing to compress against yet, so the
+        // text is staged and build_chunk_text_store trains version 1 at the end. Load the
+        // dict BEFORE taking `conn` to avoid a nested connection borrow. Empty dict bytes =
+        // the no-dict (plain zstd) sentinel.
+        let latest_dict = self.latest_chunk_text_dict()?;
+        let mut compressor = latest_dict
+            .as_ref()
+            .map(|(_, dict)| text_compression::ChunkCompressor::new(dict))
+            .transpose()?;
+        let dict_version = latest_dict.as_ref().map(|(version, _)| *version);
         let conn = self.storage.connection();
         for prepared in chunks {
             let chunk = &prepared.chunk;
             let anchor = &prepared.anchor;
             conn.prepare_cached(
                 "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, \
-                 start_line, end_line, text, text_hash,
+                 start_line, end_line, text_hash,
                                     source_revision, anchor_version, normalized_hash, \
                  start_boundary_hash, end_boundary_hash,
                                     start_context_hash, end_context_hash, context_radius, \
                  embedding_policy, embedding_priority)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                 ?17, ?18, ?19)",
+                 ?17, ?18)",
             )?
             .execute(params![
                 file_id,
@@ -261,7 +267,6 @@ impl IndexDatabase {
                 i64::try_from(chunk.end_byte)?,
                 i64::try_from(chunk.start_line)?,
                 i64::try_from(chunk.end_line)?,
-                chunk.text,
                 prepared.text_hash,
                 source_revision,
                 anchor.version,
@@ -275,20 +280,37 @@ impl IndexDatabase {
                 prepared.embedding.priority,
             ])?;
             let chunk_id = conn.last_insert_rowid();
+            // chunk_fts is contentless (#77 Phase 2): tokens come from the in-memory text here, on
+            // every path (write_fts), never from a chunks.text column.
             if write_fts {
                 conn.prepare_cached("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)")?
                     .execute(params![chunk_id, chunk.text])?;
             }
-            if let Some(compressor) = compressor.as_mut() {
-                let blob = compressor.compress(chunk.text.as_bytes())?;
-                conn.prepare_cached(
-                    "INSERT INTO chunk_text(chunk_id, blob, raw_len) VALUES (?1, ?2, ?3)",
-                )?
-                .execute(params![
-                    chunk_id,
-                    blob,
-                    i64::try_from(chunk.text.len())?
-                ])?;
+            match compressor.as_mut() {
+                // Dict present: compress inline against its version into the durable store.
+                Some(compressor) => {
+                    let blob = compressor.compress(chunk.text.as_bytes())?;
+                    conn.prepare_cached(
+                        "INSERT INTO chunk_text(chunk_id, blob, raw_len, dict_version) VALUES \
+                         (?1, ?2, ?3, ?4)",
+                    )?
+                    .execute(params![
+                        chunk_id,
+                        blob,
+                        i64::try_from(chunk.text.len())?,
+                        dict_version.expect("dict_version is Some whenever the compressor is"),
+                    ])?;
+                },
+                // No dict yet (the FIRST full rebuild): stage the text in the rebuild temp table so
+                // `build_chunk_text_store` trains version 1 over a corpus sample and compresses
+                // every chunk at the end. There is no chunks.text column to read
+                // from.
+                None => {
+                    conn.prepare_cached(
+                        "INSERT INTO temp.rebuild_chunk_text(chunk_id, text) VALUES (?1, ?2)",
+                    )?
+                    .execute(params![chunk_id, chunk.text])?;
+                },
             }
         }
         Ok(())

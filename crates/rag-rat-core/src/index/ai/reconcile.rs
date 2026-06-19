@@ -512,12 +512,11 @@ pub(crate) fn reconcile_with_options_progress(
         if options.force { "" } else { scan.model_id },
         options.changed_first,
     )?;
-    // One dict-bound decompressor for the whole run: each `select_reconcile_batch` loads text for
-    // its batch from the compressed `chunk_text` store (#77 Phase 2), and reusing this
-    // decompressor keeps the ~112 KB dict SELECT + dictionary prep to once per run rather than
-    // once per batch.
-    let dict = crate::query::chunk_text_dict(conn)?;
-    let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
+    // One dict decoder for the whole run: each `select_reconcile_batch` loads text for its batch
+    // from the compressed `chunk_text` store (#77 Phase 2), and reusing this decoder keeps the dict
+    // SELECT + dictionary prep to once per run rather than once per batch.
+    let dicts = crate::query::chunk_text_dicts(conn)?;
+    let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
     let mut cursor = 0usize;
     let mut processed_ids: HashSet<i64> = HashSet::new();
     let mut remaining = options.limit.map(u64::from);
@@ -549,8 +548,7 @@ pub(crate) fn reconcile_with_options_progress(
         if batch_ids.is_empty() {
             break; // candidate list exhausted
         }
-        let selected =
-            select_reconcile_batch(conn, &scan, &batch_ids, &options, &mut decompressor)?;
+        let selected = select_reconcile_batch(conn, &scan, &batch_ids, &options, &mut decoder)?;
         if selected.jobs.is_empty() {
             // Every id in this batch was filtered (ineligible/already current); keep walking the
             // rest of the candidate list rather than stopping.
@@ -677,19 +675,18 @@ pub(crate) fn embedding_policy_skip_summary(
     // (and `reconcile_plan`), so it dominated `index --full` peak memory. The same
     // `embedding_policy_for_chunk` runs over the same chunks, so the counts are identical.
     //
-    // Chunk text comes from the compressed `chunk_text` store (#77 Phase 2); `chunks.text` is the
-    // LEFT-JOIN fallback for a chunk with no blob yet. One dict-bound decompressor for the whole
-    // stream (dict loaded once, reused per row). The old `WHERE chunks.text IS NOT NULL` was
-    // vacuous (text is NOT NULL in the schema), so it's dropped.
-    let dict = crate::query::chunk_text_dict(conn)?;
-    let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
+    // Chunk text comes from the compressed `chunk_text` store (#77 Phase 2); the `chunks.text`
+    // column is gone, so INNER JOIN `chunk_text` (every live chunk has one blob). One dict decoder
+    // for the whole stream (versions loaded once, reused per row).
+    let dicts = crate::query::chunk_text_dicts(conn)?;
+    let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
     let mut stmt = conn.prepare(
         "
         SELECT files.path, files.language, files.kind, chunks.chunk_kind, chunks.symbol_path,
-               chunks.text, chunk_text.blob, chunk_text.raw_len
+               chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version
         FROM chunks
         JOIN files ON files.id = chunks.file_id
-        LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
+        JOIN chunk_text ON chunk_text.chunk_id = chunks.id
         ",
     )?;
     let mut rows = stmt.query([])?;
@@ -700,11 +697,11 @@ pub(crate) fn embedding_policy_skip_summary(
         let chunk_kind = row.get::<_, String>(3)?;
         let symbol_path = row.get::<_, Option<String>>(4)?;
         let text = crate::index::text_compression::ChunkTextRow {
-            fallback: row.get(5)?,
-            blob: row.get(6)?,
-            raw_len: row.get(7)?,
+            blob: row.get(5)?,
+            raw_len: row.get(6)?,
+            dict_version: row.get(7)?,
         }
-        .resolve(&mut decompressor)?;
+        .resolve(&mut decoder)?;
         let decision = embedding_policy_for_chunk(
             std::path::Path::new(&path),
             &language,

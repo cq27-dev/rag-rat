@@ -28,29 +28,29 @@ impl IndexDatabase {
 
     /// Repopulate the contentless `chunk_fts` from scratch (#77 Phase 2): clear it, then
     /// re-tokenize every chunk's text. The text comes from the compressed `chunk_text` store
-    /// (decompressed with one reused decompressor), falling back to `chunks.text` for a chunk
-    /// not yet in the store. This is the recovery path only — the full-rebuild and incremental
-    /// paths write `chunk_fts` inline from the in-memory chunk text (`write_fts`), so this
-    /// never runs there.
+    /// (decompressed with one reused decompressor); the `chunks.text` column is gone, so this INNER
+    /// JOINs `chunk_text`. This is the recovery path only — the full-rebuild and incremental paths
+    /// write `chunk_fts` inline from the in-memory chunk text (`write_fts`), so this never runs
+    /// there.
     fn rebuild_chunk_fts(&self) -> anyhow::Result<()> {
         let conn = self.storage.connection();
         // 'delete-all' is the FTS5 command to clear a contentless index (a bare DELETE is
         // unsupported; on an external-content table it also corrupts a desynced index — #51).
         conn.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('delete-all')", [])?;
-        let dict = crate::query::chunk_text_dict(conn)?;
-        let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
+        let dicts = crate::query::chunk_text_dicts(conn)?;
+        let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
         // Collect (rowid, ChunkTextRow) first: decompress's anyhow::Result can't cross the rusqlite
         // closure, and the SELECT statement can't stay open while we INSERT into chunk_fts.
         let rows: Vec<(i64, crate::index::text_compression::ChunkTextRow)> = {
             let mut stmt = conn.prepare(
-                "SELECT chunks.id, chunks.text, chunk_text.blob, chunk_text.raw_len
-                 FROM chunks LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id",
+                "SELECT chunks.id, chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version
+                 FROM chunks JOIN chunk_text ON chunk_text.chunk_id = chunks.id",
             )?;
             let mapped = stmt.query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, crate::index::text_compression::ChunkTextRow {
-                    fallback: row.get(1)?,
-                    blob: row.get(2)?,
-                    raw_len: row.get(3)?,
+                    blob: row.get(1)?,
+                    raw_len: row.get(2)?,
+                    dict_version: row.get(3)?,
                 }))
             })?;
             let mut out = Vec::new();
@@ -61,7 +61,7 @@ impl IndexDatabase {
         };
         let mut insert = conn.prepare("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)")?;
         for (chunk_id, text_row) in rows {
-            let text = text_row.resolve(&mut decompressor)?;
+            let text = text_row.resolve(&mut decoder)?;
             insert.execute(rusqlite::params![chunk_id, text])?;
         }
         Ok(())

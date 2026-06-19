@@ -1,5 +1,5 @@
 use super::*;
-use crate::index::text_compression::{ChunkDecompressor, ChunkTextRow};
+use crate::index::text_compression::{ChunkTextDecoder, ChunkTextRow};
 
 pub(crate) fn current_chunks(
     conn: &Connection,
@@ -9,11 +9,11 @@ pub(crate) fn current_chunks(
 }
 
 /// Map one candidate row to its `CurrentChunk` (with a placeholder `text`) plus the
-/// [`ChunkTextRow`] carrying the chunk's stored text (compressed `chunk_text` blob + `raw_len`,
-/// with `chunks.text` as the mid-migration fallback). The real `text` is filled in a post-loop via
-/// [`ChunkTextRow::resolve`] — decompress returns `anyhow::Result`, which can't cross this rusqlite
-/// closure (#77 Phase 2). The SELECT order is: 0-5 identity, 6 chunks.text (fallback), 7-14
-/// embedding metadata, 15 blob, 16 raw_len.
+/// [`ChunkTextRow`] carrying the chunk's stored text (the compressed `chunk_text` blob + `raw_len`;
+/// the `chunks.text` column is gone, so the SELECT INNER JOINs `chunk_text`). The real `text` is
+/// filled in a post-loop via [`ChunkTextRow::resolve`] — decompress returns `anyhow::Result`, which
+/// can't cross this rusqlite closure (#77 Phase 2). The SELECT order is: 0-5 identity, 6-13
+/// embedding metadata, 14 blob, 15 raw_len, 16 dict_version.
 pub(crate) fn current_chunk_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<(CurrentChunk, ChunkTextRow)> {
@@ -25,18 +25,18 @@ pub(crate) fn current_chunk_row(
         chunk_kind: row.get(4)?,
         symbol_path: row.get(5)?,
         text: String::new(),
-        text_hash: row.get(7)?,
-        embedding_status: row.get(8)?,
-        source_text_hash: row.get(9)?,
-        model_version: row.get(10)?,
-        embedding_dim: row.get(11)?,
-        input_hash: row.get(12)?,
-        embedding_text_version: row.get(13)?,
-        next_retry_after_ms: row.get(14)?,
+        text_hash: row.get(6)?,
+        embedding_status: row.get(7)?,
+        source_text_hash: row.get(8)?,
+        model_version: row.get(9)?,
+        embedding_dim: row.get(10)?,
+        input_hash: row.get(11)?,
+        embedding_text_version: row.get(12)?,
+        next_retry_after_ms: row.get(13)?,
         reason: ReconcileReason::Forced,
     };
     let text_row =
-        ChunkTextRow { fallback: row.get(6)?, blob: row.get(15)?, raw_len: row.get(16)? };
+        ChunkTextRow { blob: row.get(14)?, raw_len: row.get(15)?, dict_version: row.get(16)? };
     Ok((chunk, text_row))
 }
 
@@ -53,10 +53,9 @@ pub(crate) fn embedding_job_candidates(
     } else {
         "chunks.embedding_priority ASC,"
     };
-    // Chunk text comes from the compressed `chunk_text` store (#77 Phase 2); `chunks.text` stays in
-    // the SELECT as the LEFT-JOIN fallback for a chunk with no blob yet (mid-migration /
-    // incremental before a dict existed). The old `WHERE chunks.text IS NOT NULL` was vacuous
-    // (text is NOT NULL in the schema), so it's dropped.
+    // Chunk text comes from the compressed `chunk_text` store (#77 Phase 2); the `chunks.text`
+    // column is gone, so INNER JOIN `chunk_text` (every live chunk has exactly one blob). The old
+    // `WHERE chunks.text IS NOT NULL` was already dropped as vacuous.
     let sql = format!(
         "
         SELECT chunks.id,
@@ -65,7 +64,6 @@ pub(crate) fn embedding_job_candidates(
                files.kind,
                chunks.chunk_kind,
                chunks.symbol_path,
-               chunks.text,
                chunks.text_hash,
                chunk_embeddings.status,
                chunk_embeddings.source_text_hash,
@@ -75,13 +73,14 @@ pub(crate) fn embedding_job_candidates(
                chunk_embeddings.embedding_text_version,
                chunk_embeddings.next_retry_after_ms,
                chunk_text.blob,
-               chunk_text.raw_len
+               chunk_text.raw_len,
+               chunk_text.dict_version
         FROM chunks
         JOIN files ON files.id = chunks.file_id
         LEFT JOIN chunk_embeddings
           ON chunk_embeddings.chunk_id = chunks.id
          AND chunk_embeddings.model_id = ?1
-        LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
+        JOIN chunk_text ON chunk_text.chunk_id = chunks.id
         ORDER BY
           CASE
             WHEN chunk_embeddings.chunk_id IS NULL THEN 0
@@ -105,14 +104,14 @@ pub(crate) fn embedding_job_candidates(
         ],
         current_chunk_row,
     )?;
-    // Decompress in a post-loop with a single dict-bound decompressor (dict loaded once per call,
-    // not per row) — decompress's anyhow::Result can't cross the rusqlite closure above.
+    // Decompress in a post-loop with a single dict decoder (versions loaded once per call, not per
+    // row) — decompress's anyhow::Result can't cross the rusqlite closure above.
     let collected = collect_rows(rows)?;
-    let dict = crate::query::chunk_text_dict(conn)?;
-    let mut decompressor = ChunkDecompressor::new(&dict)?;
+    let dicts = crate::query::chunk_text_dicts(conn)?;
+    let mut decoder = ChunkTextDecoder::new(&dicts);
     let mut chunks = Vec::with_capacity(collected.len());
     for (mut chunk, text_row) in collected {
-        chunk.text = text_row.resolve(&mut decompressor)?;
+        chunk.text = text_row.resolve(&mut decoder)?;
         if !model_id.is_empty() {
             chunk.reason = ReconcileReason::Missing;
         }
@@ -168,31 +167,31 @@ pub(crate) fn current_chunks_by_ids(
     conn: &Connection,
     model_id: &str,
     ids: &[i64],
-    decompressor: &mut ChunkDecompressor,
+    decoder: &mut ChunkTextDecoder,
 ) -> anyhow::Result<Vec<CurrentChunk>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let placeholders = vec!["?"; ids.len()].join(",");
-    // Chunk text comes from the compressed `chunk_text` store (#77 Phase 2); `chunks.text` is the
-    // LEFT-JOIN fallback for a chunk with no blob yet. The caller reuses one dict-bound
-    // `decompressor` across all batches of a run, so the dict is loaded once per run (not per
-    // batch).
+    // Chunk text comes from the compressed `chunk_text` store (#77 Phase 2); the `chunks.text`
+    // column is gone, so INNER JOIN `chunk_text` (every live chunk has one blob). The caller reuses
+    // one dict `decoder` across all batches of a run, so the dict versions are loaded once per run
+    // (not per batch).
     let sql = format!(
         "
         SELECT chunks.id, files.path, files.language, files.kind, chunks.chunk_kind,
-               chunks.symbol_path, chunks.text, chunks.text_hash,
+               chunks.symbol_path, chunks.text_hash,
                chunk_embeddings.status, chunk_embeddings.source_text_hash,
                chunk_embeddings.model_version, chunk_embeddings.embedding_dim,
                chunk_embeddings.input_hash, chunk_embeddings.embedding_text_version,
                chunk_embeddings.next_retry_after_ms,
-               chunk_text.blob, chunk_text.raw_len
+               chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version
         FROM chunks
         JOIN files ON files.id = chunks.file_id
         LEFT JOIN chunk_embeddings
           ON chunk_embeddings.chunk_id = chunks.id
          AND chunk_embeddings.model_id = ?1
-        LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
+        JOIN chunk_text ON chunk_text.chunk_id = chunks.id
         WHERE chunks.id IN ({placeholders})
         "
     );
@@ -208,7 +207,7 @@ pub(crate) fn current_chunks_by_ids(
     let mut by_id: std::collections::HashMap<i64, CurrentChunk> =
         std::collections::HashMap::with_capacity(ids.len());
     for (mut chunk, text_row) in collect_rows(rows)? {
-        chunk.text = text_row.resolve(decompressor)?;
+        chunk.text = text_row.resolve(decoder)?;
         if !model_id.is_empty() {
             chunk.reason = ReconcileReason::Missing;
         }
@@ -259,12 +258,12 @@ pub(crate) fn select_reconcile_batch(
     scan: &EmbeddingScan<'_>,
     ids: &[i64],
     options: &ReconcileOptions,
-    decompressor: &mut ChunkDecompressor,
+    decoder: &mut ChunkTextDecoder,
 ) -> anyhow::Result<SelectedBatch> {
     // Under --force the candidate ordering does not reflect embedding state, so the empty model_id
     // (matching no chunk_embeddings) keeps every chunk's reason as Forced.
     let model_id = if options.force { "" } else { scan.model_id };
-    let candidates = current_chunks_by_ids(conn, model_id, ids, decompressor)?;
+    let candidates = current_chunks_by_ids(conn, model_id, ids, decoder)?;
     let mut jobs = Vec::new();
     for candidate in candidates {
         let policy = policy_for_job(&candidate, scan.max_embedding_chars);

@@ -95,24 +95,58 @@ impl<'a> ChunkDecompressor<'a> {
     }
 }
 
-/// A chunk's stored text as fetched for a read (#77): the compressed `chunk_text` blob + `raw_len`,
-/// with `chunks.text` as the fallback for a chunk not yet in the store (mid-migration / incremental
-/// before a dict existed). [`resolve`] decompresses the blob (or returns the fallback) — the shared
-/// shape every batch reader (lexical, graph local-context) collects per row before decompressing in
-/// a post-loop, since decompress's `anyhow::Result` can't cross a rusqlite closure.
+/// A chunk's stored text as fetched for a read (#77 Phase 2): the compressed `chunk_text` blob,
+/// `raw_len`, and the `dict_version` it was compressed against. Since `chunks.text` was dropped,
+/// every live chunk has exactly one `chunk_text` row, so readers INNER JOIN `chunk_text` and there
+/// is no fallback. [`resolve`] decompresses the blob against ITS dict version via a
+/// [`ChunkTextDecoder`] — the shared shape every batch reader (lexical, graph, embedding scan)
+/// collects per row before decompressing in a post-loop, since decompress's `anyhow::Result` can't
+/// cross a rusqlite closure.
 pub(crate) struct ChunkTextRow {
-    pub(crate) fallback: String,
-    pub(crate) blob: Option<Vec<u8>>,
-    pub(crate) raw_len: Option<i64>,
+    pub(crate) blob: Vec<u8>,
+    pub(crate) raw_len: i64,
+    pub(crate) dict_version: i64,
 }
 
 impl ChunkTextRow {
-    pub(crate) fn resolve(self, decompressor: &mut ChunkDecompressor) -> Result<String> {
-        match (self.blob, self.raw_len) {
-            (Some(blob), Some(raw_len)) =>
-                Ok(String::from_utf8(decompressor.decompress(&blob, raw_len.max(0) as usize)?)?),
-            _ => Ok(self.fallback),
+    pub(crate) fn resolve(self, decoder: &mut ChunkTextDecoder) -> Result<String> {
+        let bytes =
+            decoder.decompress(self.dict_version, &self.blob, self.raw_len.max(0) as usize)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+}
+
+/// Decodes chunk_text blobs across dict versions, reusing one dict-bound [`ChunkDecompressor`] per
+/// version (#77 Phase 2). A zstd blob only decodes against the dict it was compressed with, and a
+/// retrain ADDS a version rather than replacing one, so a batch can mix versions; this caches a
+/// decompressor per version (built on first use) so the per-call dict prep is paid once per
+/// version, not per row. Borrows the resident dict bytes (load them once with `chunk_text_dicts`);
+/// an absent version falls back to the empty (no-dict) decompressor.
+pub(crate) struct ChunkTextDecoder<'a> {
+    dicts: &'a std::collections::HashMap<i64, Vec<u8>>,
+    cache: std::collections::HashMap<i64, ChunkDecompressor<'a>>,
+}
+
+impl<'a> ChunkTextDecoder<'a> {
+    pub(crate) fn new(dicts: &'a std::collections::HashMap<i64, Vec<u8>>) -> Self {
+        Self { dicts, cache: std::collections::HashMap::new() }
+    }
+
+    pub(crate) fn decompress(
+        &mut self,
+        dict_version: i64,
+        blob: &[u8],
+        capacity: usize,
+    ) -> Result<Vec<u8>> {
+        if !self.cache.contains_key(&dict_version) {
+            let dict = self.dicts.get(&dict_version).map(Vec::as_slice).unwrap_or(&[]);
+            self.cache.insert(dict_version, ChunkDecompressor::new(dict)?);
         }
+        // Present by construction (just inserted if missing).
+        self.cache
+            .get_mut(&dict_version)
+            .expect("decompressor cached above")
+            .decompress(blob, capacity)
     }
 }
 
