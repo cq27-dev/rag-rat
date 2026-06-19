@@ -135,6 +135,10 @@ impl IndexDatabase {
             ",
         )?;
         self.delete_staged_files_cascade()?;
+        // The shared dictionary is global (one row, not per-file), so the staged cascade above does
+        // not touch it. Clear it here so insert_chunks sees no dict mid-rebuild and skips per-row
+        // compression; build_chunk_text_store retrains + bulk-compresses once at the end (#77).
+        self.storage.execute_batch("DELETE FROM chunk_text_dict;")?;
         self.storage.execute_batch("DELETE FROM temp.staged_file_ids;")?;
         Ok(())
     }
@@ -207,6 +211,16 @@ impl IndexDatabase {
                 JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
             );
             DELETE FROM main.docs
+            WHERE chunk_id IN (
+                SELECT chunks.id
+                FROM main.chunks
+                JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
+            );
+            -- chunk_text cascades from chunks via FK, but enumerate it explicitly like the other
+            -- chunk-child tables (#77): the migration runner toggles foreign_keys = OFF, so a \
+             delete
+            -- that ran while FK was off would orphan compressed blobs.
+            DELETE FROM main.chunk_text
             WHERE chunk_id IN (
                 SELECT chunks.id
                 FROM main.chunks

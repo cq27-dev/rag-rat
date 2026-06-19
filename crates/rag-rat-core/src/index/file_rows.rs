@@ -96,9 +96,11 @@ impl IndexDatabase {
             params![path, commit_sha, worktree_id],
         )?;
         // Deleting the chunks cascades (ON DELETE CASCADE, foreign_keys=ON) to git_chunk_blame,
-        // chunk_embeddings, and chunk_summaries — so the gate skipping the full git-history wipe
-        // does NOT leak blame. (`docs` has no FK and is not cleaned here — a pre-existing gap,
-        // tracked separately.)
+        // chunk_embeddings, chunk_summaries, and chunk_text — so the gate skipping the full
+        // git-history wipe does NOT leak blame, and compressed text (#77) doesn't orphan. (`docs`
+        // has no FK and is not cleaned here — a pre-existing gap, tracked separately.) The
+        // full-rebuild / GC path (delete_staged_files_cascade) enumerates these explicitly for the
+        // FK-off-during-migration case; this live path runs with foreign_keys = ON.
         self.storage.connection().execute(
             "DELETE FROM chunks
              WHERE file_id IN (

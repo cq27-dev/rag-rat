@@ -10250,6 +10250,54 @@ fn full_rebuild_populates_the_chunk_text_store() {
 }
 
 #[test]
+fn incremental_heal_maintains_the_chunk_text_store() {
+    // #77 Phase 2 (2b-2a): the incremental/heal path writes chunk_text inline with the existing
+    // dict, so a healed file's compressed blobs match its NEW text (the old rows cascade out with
+    // the chunks). Without this, chunk_text would go stale on every incremental update.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn original() -> u8 { 1 }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Change the file on disk, then heal it (the incremental path: remove + re-index).
+    fs::write(root.join("src/a.rs"), "pub fn changed() -> u8 { 2 }\npub fn added() {}\n").unwrap();
+    db.heal_file(std::path::Path::new("src/a.rs")).unwrap();
+
+    let conn = db.storage.connection();
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+    let stored: i64 = conn.query_row("SELECT COUNT(*) FROM chunk_text", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        stored, chunks,
+        "heal kept chunk_text one-to-one with chunks (no stale/orphan rows)"
+    );
+    let dict: Vec<u8> =
+        conn.query_row("SELECT dict FROM chunk_text_dict WHERE id = 1", [], |r| r.get(0)).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.text, ct.blob, ct.raw_len FROM chunks c JOIN chunk_text ct ON ct.chunk_id = \
+             c.id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?))
+        })
+        .unwrap();
+    let mut saw_changed = false;
+    for row in rows {
+        let (text, blob, raw_len) = row.unwrap();
+        let back = super::text_compression::decompress(&blob, &dict, raw_len as usize).unwrap();
+        assert_eq!(back, text.as_bytes(), "blob round-trips to the chunk's CURRENT text");
+        saw_changed |= text.contains("changed");
+    }
+    assert!(saw_changed, "the healed file's NEW text is what's stored, not the rebuild-time text");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();

@@ -54,4 +54,19 @@ impl IndexDatabase {
         }
         Ok(())
     }
+
+    /// The shared dictionary blob, or `None` when no store/dict exists yet (a fresh DB, or mid
+    /// full rebuild after the dict was cleared). An empty `Vec` is the no-dict sentinel (corpus too
+    /// small to train) — callers pass it straight to [`text_compression`], which treats empty as
+    /// plain zstd. Used by the incremental/heal write path to compress new chunks inline; absent →
+    /// the path skips `chunk_text` (the next full rebuild's bulk pass builds it).
+    pub(super) fn chunk_text_dict(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self
+            .storage
+            .connection()
+            .query_row("SELECT dict FROM chunk_text_dict WHERE id = 1", [], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .optional()?)
+    }
 }

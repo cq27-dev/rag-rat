@@ -232,6 +232,13 @@ impl IndexDatabase {
         write_fts: bool,
     ) -> anyhow::Result<()> {
         let ChunkInsertFile { file_id, source_revision } = file;
+        // Maintain the compressed store inline when a dict exists (incremental + heal paths). On a
+        // full rebuild the dict is cleared up front, so this is None and build_chunk_text_store
+        // does the bulk pass at the end (#77). Load the dict BEFORE taking `conn` to avoid
+        // a nested connection borrow. Empty dict = the no-dict (plain zstd) sentinel.
+        let dict = self.chunk_text_dict()?;
+        let mut compressor =
+            dict.as_deref().map(text_compression::ChunkCompressor::new).transpose()?;
         let conn = self.storage.connection();
         for prepared in chunks {
             let chunk = &prepared.chunk;
@@ -267,10 +274,21 @@ impl IndexDatabase {
                 prepared.embedding.policy,
                 prepared.embedding.priority,
             ])?;
+            let chunk_id = conn.last_insert_rowid();
             if write_fts {
-                let chunk_id = conn.last_insert_rowid();
                 conn.prepare_cached("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)")?
                     .execute(params![chunk_id, chunk.text])?;
+            }
+            if let Some(compressor) = compressor.as_mut() {
+                let blob = compressor.compress(chunk.text.as_bytes())?;
+                conn.prepare_cached(
+                    "INSERT INTO chunk_text(chunk_id, blob, raw_len) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(params![
+                    chunk_id,
+                    blob,
+                    i64::try_from(chunk.text.len())?
+                ])?;
             }
         }
         Ok(())
