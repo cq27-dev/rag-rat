@@ -35,15 +35,19 @@ pub(crate) fn latest_dict(conn: &Connection) -> anyhow::Result<Option<(i64, Vec<
 pub(crate) fn build_store(conn: &Connection, source: &str) -> anyhow::Result<()> {
     let total: i64 =
         conn.query_row(&format!("SELECT COUNT(*) FROM {source}"), [], |row| row.get(0))?;
-    if total == 0 {
-        return Ok(());
-    }
+    // NB: do NOT early-return on total==0. A full rebuild that indexes files but produces ZERO
+    // chunks (e.g. a whitespace-only markdown file) must still establish version 1 — otherwise the
+    // index is left dict-less with files present, and the next incremental/heal hits insert_chunks'
+    // "no dict" branch, which stages into the rebuild-only `temp.rebuild_chunk_text` and either
+    // orphans the chunk (same connection) or errors "no such table" (fresh connection). An empty
+    // corpus trains an empty (no-dict) dict; later chunks compress against it inline.
     let (version, dict) = match latest_dict(conn)? {
         Some(existing) => existing,
         None => {
             // First index: train version 1. Sample evenly across the id space (first-N would bias
             // to one corner of the repo). Fall back to an EMPTY dict (no-dict plain zstd) when the
-            // corpus is too small to train on (`from_samples` hard-errors under ~7 samples).
+            // corpus is too small to train on (`from_samples` hard-errors under ~7 samples; an
+            // empty source yields zero samples → empty dict, which is the no-dict sentinel).
             let stride = (total / DICT_SAMPLE_TARGET).max(1);
             let samples: Vec<Vec<u8>> = {
                 let mut stmt = conn.prepare(&format!(

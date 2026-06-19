@@ -718,7 +718,7 @@ pub(crate) fn apply_chunk_text_compression_tables(conn: &Connection) -> rusqlite
 /// `content='chunks'`) and repopulate it from `chunks.text` — which still exists at migration time
 /// (the column drop is the later V027). Going contentless is the prerequisite for dropping
 /// `chunks.text`: an external-content index re-reads that column on every rebuild. After this,
-/// tokens are written inline at index time (`write_fts`), so the column drop can't break the index.
+/// tokens are written inline at index time, so the column drop can't break the index.
 /// DROP+CREATE (not idempotent `IF NOT EXISTS`) is intended: a pre-V026 DB has the external-content
 /// table and must be converted; a fresh DB already has the contentless table from the baseline and
 /// this rebuilds it empty (the SELECT over zero chunks is a no-op).
@@ -752,7 +752,7 @@ pub(crate) fn apply_contentless_chunk_fts(conn: &Connection) -> rusqlite::Result
     )?;
     // Repopulate from chunks.text only on a pre-V027 forward-migrate, where the column still
     // exists. On a fresh DB the baseline omits chunks.text (and chunks is empty), so there is
-    // nothing to repopulate — the inline write_fts path fills chunk_fts during the rebuild
+    // nothing to repopulate — the inline write path fills chunk_fts during the rebuild
     // instead.
     if column_exists(conn, "chunks", "text")? {
         conn.execute("INSERT INTO chunk_fts(rowid, text) SELECT id, text FROM chunks", [])?;

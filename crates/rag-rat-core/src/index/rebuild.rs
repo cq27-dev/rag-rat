@@ -84,7 +84,7 @@ impl IndexDatabase {
             db.build_chunk_text_store()?;
             mem_trace("after build_chunk_text_store");
             progress(IndexProgress::RebuildingFts);
-            // chunk_fts was written inline during chunk insert (write_fts=true); only commit_fts
+            // chunk_fts was written inline during chunk insert; only commit_fts
             // needs the bulk 'rebuild' here (#77 Phase 2).
             db.finalize_full_rebuild_fts()?;
             mem_trace("after finalize_full_rebuild_fts");

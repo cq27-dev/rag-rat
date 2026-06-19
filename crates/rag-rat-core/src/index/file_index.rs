@@ -117,7 +117,7 @@ impl IndexDatabase {
             };
         // Inline/heal path: keep chunk_fts in sync per row (partial file replace would otherwise
         // desync the external-content index until the next forced rebuild).
-        self.insert_chunks(ChunkInsertFile { file_id, source_revision: &sha256 }, &chunks, true)?;
+        self.insert_chunks(ChunkInsertFile { file_id, source_revision: &sha256 }, &chunks)?;
         self.insert_symbols(file_id, language, &symbols)?;
         if kind != TargetKind::Generated && text.len() <= edges::MAX_GRAPH_PARSE_BYTES {
             edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
@@ -126,9 +126,6 @@ impl IndexDatabase {
         Ok(())
     }
 
-    /// `write_fts`: false on a full rebuild (the closing bulk `rebuild_fts` repopulates
-    /// `chunk_fts`), true on incremental discovery (per-file replace needs the external-content
-    /// index kept in sync in place). See `insert_chunks`.
     /// `graph`: on a full rebuild, `Some` accumulator — symbols (with their new DB ids) and
     /// remapped edge candidates are collected for one in-memory resolve-and-insert pass after
     /// the loop, and NO edges are inserted here. `None` (incremental) inserts edges unresolved
@@ -136,7 +133,6 @@ impl IndexDatabase {
     pub(super) fn insert_prepared_file(
         &self,
         prepared_file: &PreparedIndexFile,
-        write_fts: bool,
         graph: Option<&mut edges::FullRebuildGraph>,
     ) -> anyhow::Result<()> {
         let file = &prepared_file.file;
@@ -185,7 +181,6 @@ impl IndexDatabase {
         self.insert_chunks(
             ChunkInsertFile { file_id, source_revision: &prepared.sha256 },
             &prepared.chunks,
-            write_fts,
         )?;
         let symbol_db_ids = self.insert_symbols(file_id, file.language, &prepared.symbols)?;
         // Edge candidates were computed in the parallel prepare phase with LOCAL symbol indices;
@@ -219,17 +214,16 @@ impl IndexDatabase {
     /// embedding policy were all computed in the parallel prepare phase (see `prepare_chunks`), so
     /// nothing here hashes or parses.
     ///
-    /// `write_fts` controls the per-row `chunk_fts` insert. On a FULL REBUILD it's `false`: the
-    /// rebuild empties `chunk_fts` and the closing `rebuild_fts` repopulates it from the content
-    /// table in one bulk pass, so per-row writes are pure double work. Incremental / heal paths
-    /// pass `true`: they delete and re-insert individual files, which would leave `chunks` rows
-    /// without `chunk_fts` shadow entries (an external-content desync, #51) until a query
-    /// forces a rebuild — the per-row insert keeps the index consistent in place.
+    /// Writes the per-row `chunk_fts` token row inline on EVERY path. `chunk_fts` is contentless
+    /// (#77 Phase 2), so it cannot be bulk-rebuilt from a content column — the only way it stays in
+    /// sync is this inline write at index time (full rebuild, incremental, and heal all insert
+    /// here). The full rebuild's `finalize_full_rebuild_fts` only bulk-rebuilds the separate
+    /// external-content `commit_fts`; `chunk_fts` recovery lives in `rebuild_chunk_fts`
+    /// (decompresses the store).
     fn insert_chunks(
         &self,
         file: ChunkInsertFile<'_>,
         chunks: &[PreparedChunk],
-        write_fts: bool,
     ) -> anyhow::Result<()> {
         let ChunkInsertFile { file_id, source_revision } = file;
         // Maintain the compressed store inline when a dict exists (incremental + heal, and a full
@@ -281,11 +275,10 @@ impl IndexDatabase {
             ])?;
             let chunk_id = conn.last_insert_rowid();
             // chunk_fts is contentless (#77 Phase 2): tokens come from the in-memory text here, on
-            // every path (write_fts), never from a chunks.text column.
-            if write_fts {
-                conn.prepare_cached("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)")?
-                    .execute(params![chunk_id, chunk.text])?;
-            }
+            // EVERY indexing path, never from a chunks.text column (a contentless FTS can't be
+            // bulk-rebuilt from a content table, so the inline write is what keeps it in sync).
+            conn.prepare_cached("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)")?
+                .execute(params![chunk_id, chunk.text])?;
             match compressor.as_mut() {
                 // Dict present: compress inline against its version into the durable store.
                 Some(compressor) => {

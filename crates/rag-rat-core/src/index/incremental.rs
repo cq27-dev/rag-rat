@@ -200,11 +200,11 @@ impl IndexDatabase {
                         kind: prepared_file.file.kind,
                     });
                 }
-                // Write chunk_fts inline from the in-memory chunk text (#77 Phase 2): chunk_fts is
+                // chunk_fts is written inline from the in-memory chunk text (#77 Phase 2): it's
                 // contentless now, so there is no content table for a closing 'rebuild' to re-read,
                 // and the in-memory text is available regardless of whether the chunks.text column
                 // still exists. `finalize_full_rebuild_fts` then only rebuilds commit_fts.
-                self.insert_prepared_file(prepared_file, true, Some(&mut graph))?;
+                self.insert_prepared_file(prepared_file, Some(&mut graph))?;
             }
             // `prepared` (this wave's chunk texts / symbols / edge candidates) drops here.
         }
@@ -390,10 +390,10 @@ impl IndexDatabase {
                 &prepared_file.file.commit_sha,
                 &prepared_file.file.worktree_id,
             )?;
-            // Incremental: per-file replace, so keep chunk_fts synced in place (no full
-            // rebuild_fts). No accumulator — edges are inserted unresolved here and
-            // resolved by resolve_edges.
-            self.insert_prepared_file(prepared_file, true, None)?;
+            // Incremental: per-file replace; chunk_fts is kept synced in place by the inline write
+            // in insert_chunks (no full rebuild_fts). No accumulator — edges are inserted
+            // unresolved here and resolved by resolve_edges.
+            self.insert_prepared_file(prepared_file, None)?;
         }
 
         Ok(files.len() + deleted_count)

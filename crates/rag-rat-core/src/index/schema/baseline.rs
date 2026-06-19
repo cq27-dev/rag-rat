@@ -486,7 +486,7 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         -- text, and does NOT point at `chunks` as a content table — so dropping `chunks.text` \
          can't
         -- break it. Tokens are written from the in-memory chunk text at index time (insert_chunks
-        -- with write_fts=true on every path). `contentless_delete=1` (SQLite >= 3.43) keeps
+        -- inline on every path). `contentless_delete=1` (SQLite >= 3.43) keeps
         -- delete-by-rowid working without a content row to read. Only MATCH + bm25() are used
         -- (snippets come from the compressed chunk_text store, not FTS), so contentless is \
          sufficient.
@@ -594,7 +594,7 @@ pub(crate) fn rebuild_commit_fts(conn: &Connection) -> anyhow::Result<()> {
     //
     // `chunk_fts` is NO LONGER rebuilt here: it is contentless (#77 Phase 2), so 'rebuild' (which
     // re-reads a content table) does not apply. Its tokens are written inline at index time
-    // (write_fts), and the recovery repopulate lives in `IndexDatabase::rebuild_chunk_fts` (it
+    // (insert_chunks), and the recovery repopulate lives in `IndexDatabase::rebuild_chunk_fts` (it
     // decompresses the chunk_text store, which a SQL-only rebuild here can't do).
     conn.execute_batch("INSERT INTO commit_fts(commit_fts) VALUES('rebuild');")?;
     Ok(())

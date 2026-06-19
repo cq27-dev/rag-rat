@@ -10309,7 +10309,7 @@ fn rebuild_fts_repopulates_contentless_chunk_fts_from_the_store() {
             .unwrap()
     };
 
-    // The full rebuild writes chunk_fts inline (write_fts=true).
+    // The full rebuild writes chunk_fts inline.
     assert_eq!(match_count(&db), 1, "full rebuild writes chunk_fts inline");
 
     // Simulate a desync: clear the contentless index, then recover.
@@ -10412,6 +10412,56 @@ fn incremental_heal_maintains_the_chunk_text_store() {
         "the healed file's NEW text is what's stored"
     );
     assert!(!corpus.contains("original"), "stale pre-heal text is gone from the store");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rebuild_with_files_but_no_chunks_still_trains_a_dict_so_incrementals_dont_orphan() {
+    // #77 Phase 2 regression (adversarial finding). A full rebuild that indexes a file producing
+    // ZERO chunks — a whitespace-only markdown file (markdown_chunks has no whole-file fallback) —
+    // must still establish dict version 1. Pre-fix, build_store early-returned on an empty corpus,
+    // leaving the index dict-less with files present; the next incremental/heal then hit
+    // insert_chunks' "no dict" branch, which stages into the rebuild-only `temp.rebuild_chunk_text`
+    // and either ORPHANED the new chunk (same connection: a live chunk with no chunk_text row,
+    // which every reader's INNER JOIN silently drops) or errored "no such table" (fresh
+    // connection).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/empty.md"), "   \n\t\n  \n").unwrap();
+    let config = source_config(root.clone(), Language::Markdown);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    {
+        let conn = db.storage.connection();
+        let files: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+        let dicts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chunk_text_dict", [], |r| r.get(0)).unwrap();
+        assert!(files >= 1, "the whitespace-only markdown file was indexed");
+        assert_eq!(chunks, 0, "it produced zero chunks");
+        assert_eq!(dicts, 1, "version 1 is established even with zero chunks (the fix)");
+    }
+
+    // The (already-tracked) file gains real content; heal it on the SAME connection. Pre-fix this
+    // orphaned the resulting chunk; post-fix it compresses inline against the established v1 dict.
+    fs::write(root.join("src/empty.md"), "# Title\n\nReal content that yields a chunk.\n").unwrap();
+    db.heal_file(std::path::Path::new("src/empty.md")).unwrap();
+    let conn = db.storage.connection();
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+    let stored: i64 = conn.query_row("SELECT COUNT(*) FROM chunk_text", [], |r| r.get(0)).unwrap();
+    assert!(chunks >= 1, "the real markdown file produced a chunk");
+    let orphans: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chunks
+             LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
+             WHERE chunk_text.chunk_id IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphans, 0, "no live chunk lacks a chunk_text blob (readers INNER JOIN it)");
+    assert_eq!(stored, chunks, "chunk_text is one-to-one with chunks");
 
     let _ = fs::remove_dir_all(&root);
 }

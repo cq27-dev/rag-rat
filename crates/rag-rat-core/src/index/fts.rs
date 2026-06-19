@@ -15,7 +15,7 @@ impl IndexDatabase {
         Ok(())
     }
 
-    /// Full-rebuild FTS finalize: `chunk_fts` was written inline (write_fts=true) during chunk
+    /// Full-rebuild FTS finalize: `chunk_fts` was written inline during chunk
     /// insert, so only the external-content `commit_fts` needs the bulk 'rebuild' here. Records
     /// freshness like [`rebuild_fts`], without re-tokenizing every chunk.
     pub(super) fn finalize_full_rebuild_fts(&self) -> anyhow::Result<()> {
@@ -30,8 +30,13 @@ impl IndexDatabase {
     /// re-tokenize every chunk's text. The text comes from the compressed `chunk_text` store
     /// (decompressed with one reused decompressor); the `chunks.text` column is gone, so this INNER
     /// JOINs `chunk_text`. This is the recovery path only — the full-rebuild and incremental paths
-    /// write `chunk_fts` inline from the in-memory chunk text (`write_fts`), so this never runs
-    /// there.
+    /// write `chunk_fts` inline from the in-memory chunk text, so this never runs there.
+    ///
+    /// COST: unlike the old external-content `'rebuild'` (which re-tokenized in-engine from the
+    /// content column), this decompresses the WHOLE store in Rust. It is gated by
+    /// `ensure_fts_fresh` (only fires when the FTS is genuinely dirty/stale — the same trigger
+    /// as before), so a steady-state query never pays it; but a stale-read heal is now a
+    /// heavier one-off.
     fn rebuild_chunk_fts(&self) -> anyhow::Result<()> {
         let conn = self.storage.connection();
         // 'delete-all' is the FTS5 command to clear a contentless index (a bare DELETE is
