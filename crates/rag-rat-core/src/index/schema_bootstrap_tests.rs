@@ -8948,6 +8948,45 @@ fn files_has_test_code_flag_survives_the_heal_path() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[test]
+fn has_test_code_backfill_is_case_sensitive() {
+    // PR #223 review: the V024 backfill must use the SAME case rules as the index-time
+    // `str::contains` (case-sensitive). SQLite `LIKE` is case-insensitive for ASCII, so it would
+    // set the flag for an uppercase `TEST(` that a freshly-indexed file (whose
+    // `contains("test(")` is false) leaves at 0 — a migrated-vs-reindexed divergence. `instr`
+    // is case-sensitive, so they agree.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    for (id, path) in [(1, "a.rs"), (2, "b.rs")] {
+        conn.execute(
+            "INSERT INTO files(id, path, language, kind, sha256, modified_at_ms, indexed_at_ms) \
+             VALUES (?1, ?2, 'rust', 'source', 'x', 0, 0)",
+            rusqlite::params![id, path],
+        )
+        .unwrap();
+    }
+    // File 1: a lowercase marker. File 2: only an UPPERCASE non-marker (no lowercase marker).
+    conn.execute(
+        "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
+         text, text_hash) VALUES (1, 'block', 0, 1, 1, 1, 'fn f() { test() }', 'h1')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
+         text, text_hash) VALUES (2, 'block', 0, 1, 1, 1, 'fn g() { TEST() }', 'h2')",
+        [],
+    )
+    .unwrap();
+    conn.execute("UPDATE files SET has_test_code = 0", []).unwrap();
+    schema::apply_files_has_test_code(&conn).unwrap();
+    let flag = |id: i64| -> i64 {
+        conn.query_row("SELECT has_test_code FROM files WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(flag(1), 1, "lowercase test( marks the file");
+    assert_eq!(flag(2), 0, "uppercase TEST( does NOT (case-sensitive, like str::contains)");
+}
+
 /// End-to-end through the FULL-REBUILD driver (`resolve_and_insert_edges`): a real `rebuild` of a
 /// tiny Cargo workspace must apply per-package + module-aware import scope. A bare reference to a
 /// name `use`d from an EXTERNAL crate stays unresolved; a same-named LOCAL workspace symbol still

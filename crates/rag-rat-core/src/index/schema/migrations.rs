@@ -669,13 +669,17 @@ pub(crate) fn apply_dispatch_edge_facts_view_exclusion(conn: &Connection) -> rus
 /// for, so a forward-migrated index matches a freshly-indexed one immediately (no wait for
 /// reindex). Invariant: the marker set here MUST stay in sync with `index::text_has_test_marker`
 /// (the index-time compute) and `test_items`'s filter, or migrated vs reindexed rows would diverge.
+/// Uses `instr` (case-sensitive, literal substring), NOT `LIKE` — SQLite `LIKE` is case-insensitive
+/// for ASCII, so it would match an uppercase `TEST(` that the case-sensitive `str::contains` at
+/// index time does not, diverging a forward-migrated row from a freshly-indexed one. (`instr` also
+/// needs no `%`-escaping of the `[`/`(` in the markers.)
 pub(crate) fn apply_files_has_test_code(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "files", "has_test_code", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "UPDATE files SET has_test_code = 1 WHERE id IN (
              SELECT DISTINCT file_id FROM chunks
-             WHERE text LIKE '%#[cfg(test)]%' OR text LIKE '%describe(%'
-                OR text LIKE '%it(%' OR text LIKE '%test(%'
+             WHERE instr(text, '#[cfg(test)]') > 0 OR instr(text, 'describe(') > 0
+                OR instr(text, 'it(') > 0 OR instr(text, 'test(') > 0
          );",
     )
 }

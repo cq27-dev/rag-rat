@@ -702,7 +702,14 @@ impl IndexDatabase {
         limit: u32,
         options: &crate::query::impact::ImpactSurfaceOptions,
     ) -> anyhow::Result<crate::query::impact::ImpactSurfaceReport> {
-        self.ensure_fts_fresh()?;
+        // Only the text sections (tests / docs / text-fallback) run `chunk_fts MATCH`; the report
+        // builder's neighbors come from the graph, not FTS. So skip the FTS refresh when the caller
+        // excludes every text section (e.g. MCP `include: ["git"]`) — no point rebuilding FTS for a
+        // report that won't read it. (The non-report wrappers always need it: the flat builder runs
+        // an ungated textual fallback.)
+        if options.include_tests || options.include_docs || options.include_text_fallback {
+            self.ensure_fts_fresh()?;
+        }
         // Surface the `Compiler` tier on impact's direct graph neighbors too (same read-side JOIN
         // as trace_callees/find_callers). The enrichment is now injected INTO the builder so it
         // runs over the OVERFETCHED candidate set before the re-rank + limit truncation (#82
