@@ -1337,6 +1337,14 @@ pub(crate) const CLONE_FINGERPRINT_DDL: &str = "
     ) STRICT;
 ";
 
+/// Migrated-index population gap (#215): V029 only CREATEs the clone tables. Their rows
+/// (`symbol_fingerprints` / `symbol_token_postings` / `clone_token_df`) populate as files are
+/// (re)indexed — there is no backfill here. An existing index migrated forward therefore has
+/// EMPTY clone tables until a `rag-rat index --full`. Incremental discovery only reindexes the
+/// changed files, so `candidate_clone_components` stays empty until a full rebuild fingerprints
+/// the whole corpus. Backfilling at migration time is intentionally NOT done: it would require
+/// parsing the entire repo inside a migration, which migrations must not do. Plan 2's `find_clones`
+/// surface should detect empty clone tables and prompt the user to run a full rebuild.
 pub(crate) fn apply_clone_fingerprint_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CLONE_FINGERPRINT_DDL)
 }

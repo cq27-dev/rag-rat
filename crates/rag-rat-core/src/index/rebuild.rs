@@ -268,6 +268,18 @@ impl IndexDatabase {
                 FROM main.files
                 JOIN temp.staged_file_ids ON staged_file_ids.id = files.id
             );
+            DELETE FROM main.symbol_fingerprints
+            WHERE symbol_id IN (
+                SELECT symbols.id
+                FROM main.symbols
+                JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
+            );
+            DELETE FROM main.symbol_token_postings
+            WHERE symbol_id IN (
+                SELECT symbols.id
+                FROM main.symbols
+                JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
+            );
             DELETE FROM main.symbols
             WHERE file_id IN (SELECT id FROM temp.staged_file_ids);
             DELETE FROM main.chunks

@@ -228,6 +228,12 @@ impl IndexDatabase {
         symbols: &[Symbol],
         symbol_ids: &[i64],
     ) -> anyhow::Result<()> {
+        // Only `kind == "function"` symbols are fingerprinted (#215). Bail before re-parsing the
+        // file when none qualify — the parse is the expensive part of this incremental/heal
+        // wrapper.
+        if symbols.iter().all(|s| s.kind != "function") {
+            return Ok(());
+        }
         let Some(parsed) = parser::parse_file(path, language, text) else {
             return Ok(());
         };
