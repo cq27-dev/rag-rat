@@ -184,17 +184,9 @@ impl IndexDatabase {
             &prepared.chunks,
         )?;
         let symbol_db_ids = self.insert_symbols(file_id, file.language, &prepared.symbols)?;
-        if let Some(root_dir) = self.storage.source_root()
-            && let Ok(text) = std::fs::read_to_string(root_dir.join(&file.relative_path))
-        {
-            self.store_symbol_fingerprints(
-                file.language,
-                &file.relative_path,
-                &text,
-                &prepared.symbols,
-                &symbol_db_ids,
-            )?;
-        }
+        // Clone fingerprints were computed in the parallel prepare phase from the same parse used
+        // for symbols/edges (#230) — no second read, no second parse here, just the DB write.
+        self.write_symbol_fingerprints(&symbol_db_ids, &prepared.symbol_fingerprints)?;
         // Edge candidates were computed in the parallel prepare phase with LOCAL symbol indices;
         // remap them to the real DB ids just assigned.
         match graph {
@@ -225,8 +217,9 @@ impl IndexDatabase {
     /// Compute + persist baseline clone fingerprints for the file's function symbols (#215). A
     /// fingerprint is a pure function of the symbol body, so it is scope-independent and keyed by
     /// symbol_id; the FK cascade discards it when the symbol is removed on reindex. Re-parses the
-    /// file once to walk the AST (Plan 1 keeps this simple; if the kernel perf gate regresses, move
-    /// this into the parallel prepare phase).
+    /// file to walk the AST — the incremental/heal path that calls this already re-reads the file,
+    /// so the extra parse is local to that path. The full-rebuild path computes fingerprints in the
+    /// parallel prepare phase (#230) and calls `write_symbol_fingerprints` directly instead.
     fn store_symbol_fingerprints(
         &self,
         language: Language,
@@ -238,19 +231,24 @@ impl IndexDatabase {
         let Some(parsed) = parser::parse_file(path, language, text) else {
             return Ok(());
         };
-        let root = parsed.root();
+        let fingerprints = clones::fingerprint_symbols(parsed.root(), text, symbols);
+        self.write_symbol_fingerprints(symbol_ids, &fingerprints)
+    }
+
+    /// Write precomputed baseline clone fingerprints (#215). `fingerprints` carries
+    /// `(local_symbol_index, fingerprint)` pairs from `clones::fingerprint_symbols`; each index
+    /// selects the matching DB id in `symbol_db_ids`. This is the DB-write half shared by the
+    /// full-rebuild prepare phase (#230) and the incremental `store_symbol_fingerprints` wrapper,
+    /// so the per-row insert discipline lives in exactly one place.
+    fn write_symbol_fingerprints(
+        &self,
+        symbol_db_ids: &[i64],
+        fingerprints: &[(usize, clones::SymbolFingerprint)],
+    ) -> anyhow::Result<()> {
         let conn = self.storage.connection();
-        for (symbol, &symbol_id) in symbols.iter().zip(symbol_ids) {
-            if symbol.kind != "function" {
-                continue;
-            }
-            let Some(node) = root.descendant_for_byte_range(symbol.start_byte, symbol.end_byte)
-            else {
-                continue;
-            };
-            let Some(fp) = clones::fingerprint_symbol(node, text) else {
-                continue;
-            };
+        let normalizer_kind = clones::NormalizerKind::Baseline.as_db_str();
+        for (local_index, fp) in fingerprints {
+            let symbol_id = symbol_db_ids[*local_index];
             conn.prepare_cached(
                 "INSERT INTO symbol_fingerprints(symbol_id, normalizer_kind, normalizer_version, \
                  oracle_run_id, struct_hash, token_len, created_at_ms)
@@ -258,7 +256,7 @@ impl IndexDatabase {
             )?
             .execute(params![
                 symbol_id,
-                clones::NormalizerKind::Baseline.as_db_str(),
+                normalizer_kind,
                 clones::NORM_VERSION,
                 fp.struct_hash,
                 fp.token_len,
@@ -269,7 +267,6 @@ impl IndexDatabase {
             // candidate read LEFT-JOINs + COALESCEs it), so the incremental/heal bump
             // here is drift-tolerated; a full rebuild recomputes df authoritatively
             // from postings (see rebuild.rs).
-            let normalizer_kind = clones::NormalizerKind::Baseline.as_db_str();
             for &(token_hash, freq) in &fp.token_bag {
                 conn.prepare_cached(
                     "INSERT INTO symbol_token_postings(symbol_id, normalizer_kind, token_hash, \

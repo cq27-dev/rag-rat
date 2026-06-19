@@ -66,6 +66,11 @@ pub(crate) struct PreparedIndexContent {
     // generated / oversized / markdown files. Moving this off the serial insert loop kills the
     // duplicate parse.
     pub(crate) edge_candidates: Vec<edges::EdgeCandidate>,
+    // Baseline clone fingerprints (#215), computed here from the SAME shared parse instead of the
+    // serial insert stage re-reading + re-parsing the file. Keyed by LOCAL index into `symbols`,
+    // remapped to the real DB id in insert_prepared_file. Empty for generated / oversized /
+    // markdown files (no structural parse).
+    pub(crate) symbol_fingerprints: Vec<(usize, clones::SymbolFingerprint)>,
     pub(crate) parser_failure: Option<String>,
 }
 
@@ -283,12 +288,21 @@ pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<Prepared
         None => Vec::new(),
     };
 
+    // Baseline clone fingerprints walk the SAME shared tree (no re-parse, no DB). Keyed by local
+    // symbol index; insert_prepared_file maps each to its DB id and writes. This is what lets the
+    // full-rebuild insert stage skip the second read + second parse the fingerprints used to need.
+    let symbol_fingerprints = parsed
+        .as_ref()
+        .map(|p| clones::fingerprint_symbols(p.root(), &text, &symbols))
+        .unwrap_or_default();
+
     Ok(PreparedIndexContent {
         modified_at_ms,
         sha256,
         chunks,
         symbols,
         edge_candidates,
+        symbol_fingerprints,
         parser_failure,
     })
 }

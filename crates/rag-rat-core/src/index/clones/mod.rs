@@ -64,6 +64,32 @@ pub(crate) fn fingerprint_symbol(node: Node<'_>, text: &str) -> Option<SymbolFin
     })
 }
 
+/// Baseline fingerprints for a file's function symbols, walking the SHARED parse tree (no re-parse,
+/// no DB). Returns `(local_symbol_index, fingerprint)` pairs keyed by index into `symbols`, so the
+/// caller maps each to the right DB id when it writes. Non-function symbols, symbols that can't be
+/// located in the tree, and bodies that normalize below `MIN_TOKENS` are skipped. The full-rebuild
+/// prepare phase calls this from the parse it already did for symbols/edges; the incremental path
+/// re-parses and calls it from `store_symbol_fingerprints`.
+pub(crate) fn fingerprint_symbols(
+    root: Node<'_>,
+    text: &str,
+    symbols: &[crate::index::symbols::Symbol],
+) -> Vec<(usize, SymbolFingerprint)> {
+    let mut out = Vec::new();
+    for (i, symbol) in symbols.iter().enumerate() {
+        if symbol.kind != "function" {
+            continue;
+        }
+        let Some(node) = root.descendant_for_byte_range(symbol.start_byte, symbol.end_byte) else {
+            continue;
+        };
+        if let Some(fp) = fingerprint_symbol(node, text) {
+            out.push((i, fp));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
