@@ -8699,6 +8699,235 @@ fn worktree_overlay_honors_gitignore_and_refreshes_on_change() {
 }
 
 #[test]
+fn worktree_overlay_pending_embeddings_are_detectable_for_retry() {
+    // #219 review (3440746687): a per-overlay embedding reconcile that returns `Partial` (the
+    // shared time budget ran out mid-pass) leaves the overlay's remaining chunks un-embedded.
+    // The next pass sees the overlay rows as unchanged and would skip the embed forever. The
+    // watcher retries on a positive `pending_embedding_jobs` count IN THE OVERLAY SCOPE — this
+    // asserts that count is non-zero for an overlay whose chunks haven't been embedded, and
+    // zero once they have.
+    // Function bodies long enough to clear the embedding eligibility floor (MIN_EMBEDDING_CHARS).
+    let base_src = r#"pub fn base_fn(input: u32) -> u32 {
+    let doubled = input.wrapping_mul(2);
+    let offset = doubled.wrapping_add(7);
+    offset.wrapping_sub(input)
+}
+"#;
+    let branch_src = r#"pub fn linked_fn(input: u32) -> u32 {
+    let tripled = input.wrapping_mul(3);
+    let offset = tripled.wrapping_add(11);
+    offset.wrapping_sub(input)
+}
+"#;
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), base_src).unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    // The base has at least one embeddable chunk before reconcile (so the test isn't vacuous)...
+    set_base_scope(&mut db, &main);
+    assert!(db.pending_embedding_jobs().unwrap() > 0, "base has an embeddable chunk to begin with");
+    // ...and embedding the base clears its backlog.
+    db.reconcile_with_options_progress(ai::ReconcileOptions::default(), |_| {}).unwrap();
+    set_base_scope(&mut db, &main);
+    assert_eq!(db.pending_embedding_jobs().unwrap(), 0, "base scope is fully embedded");
+
+    // A linked worktree modifies the file → the overlay carries a NEW, un-embedded chunk.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), branch_src).unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    // index_worktree_overlay leaves the connection scoped to the overlay (and does NOT embed).
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(
+        db.pending_embedding_jobs().unwrap() > 0,
+        "the overlay's un-embedded chunk is detectable as pending in the overlay scope (retry \
+         gate)",
+    );
+
+    // After reconciling in the overlay scope, the backlog is cleared — a later pass won't re-run.
+    db.reconcile_with_options_progress(ai::ReconcileOptions::default(), |_| {}).unwrap();
+    assert_eq!(
+        db.pending_embedding_jobs().unwrap(),
+        0,
+        "once embedded, the overlay reports no pending jobs (idle-safe, no perpetual retry)",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_fts_freshness_revision_is_scope_invariant() {
+    // #219 review (3440746692): `content_revision` (the FTS freshness digest) read the SCOPED
+    // `files` view, so the global `fts_source_revision` `sync_fts` recorded under a linked-overlay
+    // scope differed from the base-scope digest. Interleaved base/overlay reads then each saw the
+    // global revision as stale and rebuilt the global FTS, alternating forever. The digest must be
+    // GLOBAL (over `main.files`) so it is identical across scopes.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    // The digest computed under the OVERLAY scope (left active by index_worktree_overlay)...
+    let overlay_revision = db.content_revision().unwrap();
+    // ...must equal the digest under the BASE scope: it's a GLOBAL digest, not a per-scope one.
+    set_base_scope(&mut db, &main);
+    let base_revision = db.content_revision().unwrap();
+    assert_eq!(
+        overlay_revision, base_revision,
+        "the FTS freshness digest is global, so it can't alternate as scopes interleave",
+    );
+
+    // And it matches the stored `fts_source_revision` `sync_fts` wrote during the overlay refresh,
+    // so a base read sees FTS as fresh (no rebuild) rather than perpetually stale.
+    assert_eq!(
+        db.meta("fts_source_revision").unwrap().as_deref(),
+        Some(base_revision.as_str()),
+        "fts_source_revision recorded during the overlay pass matches the global digest",
+    );
+    assert!(!db.fts_dirty().unwrap(), "the overlay refresh left FTS clean, not dirty");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_tombstones_a_base_file_a_gitignore_only_change_now_ignores() {
+    // #219 review (3440746674): when the branch's ONLY change is a `.gitignore` rule, the
+    // tree-diff/status candidates contain just `.gitignore` — an UNCHANGED base file the rule now
+    // ignores is never visited, so its (now stale) base row keeps showing in the worktree scope.
+    // The ignore-flip expansion must add that base file as a candidate so it is tombstoned.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    fs::write(main.join("src/keep.rs"), "pub fn keep_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // The branch's ONLY change is a `.gitignore` rule that ignores the (unchanged) `src/a.rs`.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join(".gitignore"), "/src/a.rs\n").unwrap();
+    run_git(&linked, &["add", ".gitignore"]);
+    run_git(&linked, &["commit", "-q", "-m", "ignore a.rs"]);
+
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.tombstoned >= 1, "the ignore-only change tombstones the now-ignored base file");
+    assert!(
+        !path_in_scope(&db, "src/a.rs"),
+        "a base file the branch's `.gitignore` now ignores is hidden in the worktree scope, not \
+         served from its stale base row",
+    );
+    // The sibling the rule does NOT touch is untouched (still served from its shared base row).
+    assert_eq!(
+        names_in_scope(&db, "src/keep.rs"),
+        vec!["keep_fn".to_string()],
+        "an unaffected base file is still served (no over-tombstoning)",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_refreshed_with_the_branch_config_keeps_a_branch_only_target() {
+    // #219 review (3440746699): the main watcher/maintenance process sweeps every linked worktree
+    // with ITS OWN config. A branch whose `rag-rat.toml` ADDS a target (`extra/`) must be refreshed
+    // with the branch's targets (`Config::for_linked_worktree_overlay`), or the overlay rows a
+    // branch-launched hook indexed for `extra/` are filtered out of the delta and PRUNED by the
+    // sweep. This asserts the overlay row survives a sweep that uses the branch config.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    // Main indexes only `src`.
+    fs::write(
+        main.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+    )
+    .unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    // The sweeping process's config is main's: `src` only.
+    let sweep_config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&sweep_config).unwrap();
+
+    // A branch adds an `extra/` target and a file in it, with its own `rag-rat.toml`.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::create_dir_all(linked.join("extra")).unwrap();
+    fs::write(linked.join("extra/more.rs"), "pub fn extra_fn() {}\n").unwrap();
+    fs::write(
+        linked.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\", \"extra\"]\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds extra"]);
+
+    // A branch-launched hook indexes the overlay WITH the branch config — `extra/more.rs` is
+    // overlaid.
+    let branch_config = sweep_config.for_linked_worktree_overlay(&linked);
+    db.index_worktree_overlay(&branch_config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "extra/more.rs"),
+        vec!["extra_fn".to_string()],
+        "the branch-only target file is overlaid by the branch-config pass",
+    );
+
+    // The MAIN sweep refreshes the same worktree. Done with the SWEEP config (`src` only) it would
+    // PRUNE `extra/more.rs`; routed through `for_linked_worktree_overlay` it keeps the branch
+    // target.
+    let refreshed = sweep_config.for_linked_worktree_overlay(&linked);
+    db.index_worktree_overlay(&refreshed, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "extra/more.rs"),
+        vec!["extra_fn".to_string()],
+        "the main-process sweep refreshed with the branch config keeps the branch-only overlay row",
+    );
+
+    // Control: the sweep config alone (no `for_linked_worktree_overlay`) would prune it — proving
+    // the bug is real and the helper is what prevents it.
+    db.index_worktree_overlay(&sweep_config, &linked, &mut |_| {}).unwrap();
+    assert!(
+        !path_in_scope(&db, "extra/more.rs"),
+        "the raw sweep config (src-only) prunes the branch-only overlay row — the bug the helper \
+         fixes",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
 fn worktree_overlay_committed_added_file_symbol_resolves_cross_connection() {
     let main = unique_temp_root();
     let _ = fs::remove_dir_all(&main);

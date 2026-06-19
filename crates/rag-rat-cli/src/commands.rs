@@ -44,7 +44,11 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     if let Some(worktree) = &args.worktree {
         let mut db = open_index(config)?;
         let mut progress = render_index_progress;
-        let report = db.index_worktree_overlay(config, worktree, &mut progress)?;
+        // Index the overlay with the LINKED worktree's OWN target set (its branch `rag-rat.toml`),
+        // not the launching process's base targets — a branch that adds/narrows targets must be
+        // indexed by its own config or its overlay rows are filtered/pruned (#219 review).
+        let overlay_config = config.for_linked_worktree_overlay(worktree);
+        let report = db.index_worktree_overlay(&overlay_config, worktree, &mut progress)?;
         if report.worktree_id.is_empty() {
             anyhow::bail!(
                 "{} is not a linked worktree of {} — nothing indexed",

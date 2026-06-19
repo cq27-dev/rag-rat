@@ -156,6 +156,27 @@ pub(crate) fn compute_linked_worktree_delta(
     // regardless of ignore rules.
     let ignore =
         ignore_rules::IgnoreMatcher::compile(&linked_config_root, &config.target_directories());
+
+    // Ignore-ONLY change expansion. When the branch's only change under a directory is a
+    // `.gitignore` edit, the tree-diff/status candidates contain just `.gitignore` itself — the
+    // UNCHANGED target files whose indexability the new rule FLIPS are never visited, so a base
+    // file the rule now ignores keeps falling through to its (stale-visible) base row. For each
+    // changed `.gitignore`, enumerate the BASE tree's target files under its directory and add
+    // those now NON-indexable in the linked checkout as candidates — the loop below tombstones
+    // them. Still- indexable base files are NOT added (they'd duplicate the shared base row as
+    // overlay rows; the overlay only carries DIFFERENCES). The unignore direction (a
+    // now-readable file) is already covered: an unignored untracked file reappears in the
+    // status read on this same pass, and an unignored tracked file is in the committed diff or
+    // status when its content differs (#219 review).
+    expand_candidates_for_ignore_only_flips(
+        &mut candidates,
+        base_tree.as_ref(),
+        &config_subdir,
+        &linked_config_root,
+        &ignore,
+        config,
+    );
+
     let mut delta = WorktreeOverlayDelta { status_complete, ..Default::default() };
     for repo_rel in candidates {
         // Candidates are repo-relative; the overlay keys rows config-root-relative (matching the
@@ -191,6 +212,76 @@ pub(crate) fn compute_linked_worktree_delta(
         }
     }
     Ok(delta)
+}
+
+/// Add the base-tree target files whose indexability an ignore-ONLY change flipped to NON-indexable
+/// (so they need a tombstone) to `candidates`. Bounded to the directory subtree of each changed
+/// `.gitignore` already in `candidates` — a `.gitignore` rule only affects its own directory and
+/// below. No-op when no `.gitignore` is among the candidates, or there is no base tree (orphan
+/// linked HEAD has no base files to shadow). Adds REPO-relative paths, matching the candidate set.
+fn expand_candidates_for_ignore_only_flips(
+    candidates: &mut BTreeSet<PathBuf>,
+    base_tree: Option<&gix::Tree<'_>>,
+    config_subdir: &Path,
+    linked_config_root: &Path,
+    ignore: &ignore_rules::IgnoreMatcher,
+    config: &Config,
+) {
+    let Some(base_tree) = base_tree else {
+        return;
+    };
+    // The directory subtrees affected by an ignore change: the parent dir of each changed
+    // `.gitignore`, REPO-relative. A repo-root `.gitignore` (no parent) affects the whole tree.
+    let ignore_dirs: Vec<PathBuf> = candidates
+        .iter()
+        .filter(|p| p.file_name().is_some_and(|name| name == ".gitignore"))
+        .map(|p| p.parent().map(Path::to_path_buf).unwrap_or_default())
+        .collect();
+    if ignore_dirs.is_empty() {
+        return;
+    }
+    // Enumerate every base-tree file once, keep those under an affected subtree that the linked
+    // checkout no longer indexes, and add them so the delta loop tombstones them.
+    for repo_rel in base_tree_files(base_tree) {
+        if !ignore_dirs.iter().any(|dir| repo_rel.starts_with(dir)) {
+            continue;
+        }
+        let Ok(rel) = repo_rel.strip_prefix(config_subdir) else {
+            continue; // outside the config subdir — no base row to shadow
+        };
+        if target_for_path(config, rel).is_none() {
+            continue;
+        }
+        let absolute = linked_config_root.join(rel);
+        let indexable = absolute.is_file() && !ignore.is_ignored(&absolute, false);
+        if !indexable {
+            // Newly ignored (or absent) under the changed rule — shadow the base row. The
+            // categorization loop re-confirms `shadows_base_file()` before tombstoning.
+            candidates.insert(repo_rel);
+        }
+    }
+}
+
+/// Every file path in `tree`, REPO-relative, via a diff against the empty tree (all entries appear
+/// as additions) — reusing the same change-walk machinery as the base↔linked diff rather than a
+/// separate recursion. Errors collapse to an empty set: the ignore-flip expansion is best-effort
+/// recall, never a hard failure of the overlay pass.
+fn base_tree_files(tree: &gix::Tree<'_>) -> BTreeSet<PathBuf> {
+    let mut files = BTreeSet::new();
+    let empty = tree.repo.empty_tree();
+    let walked = (|| -> anyhow::Result<()> {
+        empty
+            .changes()?
+            .options(|opts| {
+                opts.track_path().track_rewrites(None);
+            })
+            .for_each_to_obtain_tree(tree, |change| {
+                files.insert(change_location_path(&change));
+                Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
+            })?;
+        Ok(())
+    })();
+    if walked.is_ok() { files } else { BTreeSet::new() }
 }
 
 /// Fold a worktree-status iterator of `Result<Item, E>` into `candidates`, returning whether the

@@ -50,4 +50,11 @@ impl IndexDatabase {
     pub fn current_embedding_count(&self, model_id: &str) -> anyhow::Result<u64> {
         ai::current_embedding_count(self.storage.connection(), model_id)
     }
+
+    /// Chunks in the ACTIVE scope still awaiting embedding — the watcher uses this to retry an
+    /// overlay whose inline reconcile was cut short by the shared time budget (returned `Partial`),
+    /// even on a later pass where the overlay rows themselves did not change (#219 review).
+    pub fn pending_embedding_jobs(&self) -> anyhow::Result<u64> {
+        ai::pending_embedding_jobs(self.storage.connection())
+    }
 }

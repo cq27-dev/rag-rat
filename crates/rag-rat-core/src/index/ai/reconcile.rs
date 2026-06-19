@@ -252,6 +252,32 @@ pub(crate) fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
     })
 }
 
+/// How many chunks in the ACTIVE scope still need embedding (missing / stale / model- or
+/// dim-changed / retryable-failed), using the SAME candidate sizing the reconcile loop uses. The
+/// watcher gates a per-overlay reconcile on `this_changed`; a reconcile that returned `Partial`
+/// (the shared budget ran out mid-pass) leaves a backlog the next pass would skip because the
+/// overlay rows themselves did not change — so the watcher also reconciles an overlay whose `> 0`
+/// pending count means embeddings were left behind (#219 review). Returns 0 when no embedding model
+/// is ready (nothing to retry) rather than erroring — the watcher must not abort a pass over a
+/// missing embedder.
+pub(crate) fn pending_embedding_jobs(conn: &Connection) -> anyhow::Result<u64> {
+    ensure_model_manifest(conn)?;
+    let model_id = active_embedding_model_id(conn)?;
+    let model = model(conn, &model_id)?;
+    if validate_ready_model(&model).is_err() {
+        return Ok(0);
+    }
+    let model_version = active_embedding_model_version(conn, &model_id)?;
+    let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
+    let scan = EmbeddingScan {
+        model_id: &model_id,
+        model_version: &model_version,
+        dim,
+        max_embedding_chars: DEFAULT_MAX_EMBEDDING_CHARS,
+    };
+    estimated_reconcile_jobs(conn, &scan, &ReconcileOptions::default())
+}
+
 pub(crate) fn reconcile_plan(conn: &Connection) -> anyhow::Result<ReconcilePlan> {
     ensure_model_manifest(conn)?;
     let model_id = active_embedding_model_id(conn)?;

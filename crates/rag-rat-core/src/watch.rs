@@ -179,18 +179,35 @@ pub fn refresh_worktree_overlays(
         if worktree == base_id {
             continue; // the rooted checkout is the base scope, not an overlay
         }
-        match db.index_worktree_overlay(config, Path::new(&worktree), &mut |_| {}) {
+        // Refresh the overlay with the LINKED worktree's OWN config targets, not the sweeping
+        // process's. A branch whose `rag-rat.toml` ADDS a target (e.g. `extra/`) would otherwise be
+        // filtered against the sweeper's targets, and a complete-status pass would PRUNE the
+        // overlay rows a branch-launched hook indexed for it. `for_linked_worktree_overlay`
+        // keeps the shared base `root`/`database` but swaps in the branch's target set
+        // (#219 review).
+        let overlay_config = config.for_linked_worktree_overlay(Path::new(&worktree));
+        match db.index_worktree_overlay(&overlay_config, Path::new(&worktree), &mut |_| {}) {
             Ok(report) => {
                 let this_changed = report.indexed > 0 || report.tombstoned > 0 || report.pruned > 0;
                 changed |= this_changed;
-                // Embed the overlay's new/changed chunks NOW, while the connection is still scoped
-                // to this overlay (index_worktree_overlay left it there) — the trailing base
-                // reconcile won't see them (#219 review). Idle-safe: skipped when the overlay was
-                // unchanged, so a static worktree adds no embedding work. `budget.next_options()`
-                // recomputes `max_seconds` from the time left in the SHARED budget, so two changed
-                // overlays plus the base reconcile can't each spend the full `--max-seconds` (#219
-                // review). `None` → the budget is exhausted (or absent); skip the embed.
-                if this_changed
+                // Embed the overlay's chunks NOW, while the connection is still scoped to this
+                // overlay (index_worktree_overlay left it there) — the trailing base reconcile
+                // won't see them (#219 review). Run when the overlay CHANGED, OR
+                // when it has a BACKLOG of un-embedded chunks: an earlier pass's
+                // inline reconcile may have returned `Partial` (the shared time
+                // budget ran out mid-pass), leaving overlay chunks un-embedded. The
+                // next pass sees the overlay rows as unchanged and would skip the embed forever, so
+                // a worktree-scoped `semantic_search` would stay BM25-only for that
+                // branch content until an unrelated file change.
+                // `pending_embedding_jobs` (active overlay scope) retries that
+                // backlog (#219 review). `budget.next_options()` recomputes `max_seconds`
+                // from the time left in the SHARED budget so overlays + base can't each spend the
+                // full `--max-seconds`; `None` → budget exhausted, skip and let the NEXT pass
+                // retry.
+                let needs_embed = this_changed
+                    || reconcile.is_some()
+                        && db.pending_embedding_jobs().is_ok_and(|pending| pending > 0);
+                if needs_embed
                     && let Some(budget) = reconcile
                     && let Some(options) = budget.next_options()
                     && let Err(err) = db.reconcile_with_options_progress(options, |_| {})

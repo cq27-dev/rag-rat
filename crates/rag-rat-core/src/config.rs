@@ -247,6 +247,43 @@ impl Config {
         dirs
     }
 
+    /// A copy of this (BASE) config whose `targets` are re-resolved from a LINKED worktree's own
+    /// `rag-rat.toml` (at `<linked_worktree_root>/rag-rat.toml`), so an overlay refresh indexes
+    /// that branch with its OWN target set — not the sweeping process's. The shared `root`
+    /// (anchored to main), `database`, and the rest are kept: the overlay still resolves
+    /// against the one base index, but the delta + ignore filtering see the branch's targets.
+    /// Returns the config unchanged when the linked worktree has no readable/valid
+    /// `rag-rat.toml`, or when its targets don't validate against the linked checkout — so a
+    /// malformed branch config degrades to base targets rather than dropping the worktree. The
+    /// branch targets are root-relative, so they apply to the shared `root` directly (#219
+    /// review).
+    ///
+    /// Used by `refresh_worktree_overlays`: the main watcher/maintenance process refreshes every
+    /// linked worktree, but a worktree whose branch ADDS a target (e.g. `extra/`) would otherwise
+    /// be filtered against the sweeper's targets — pruning overlay rows a branch-launched hook
+    /// indexed.
+    pub fn for_linked_worktree_overlay(&self, linked_path: &Path) -> Self {
+        let linked_targets = (|| {
+            // `linked_path` may be the checkout root, a subdir of it, or the git dir (a hook); the
+            // branch `rag-rat.toml` lives at the WORKDIR top, so resolve the workdir first.
+            let workdir = crate::index::discover_repo(linked_path)
+                .ok()
+                .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+                .unwrap_or_else(|| linked_path.to_path_buf());
+            let text = fs::read_to_string(workdir.join("rag-rat.toml")).ok()?;
+            let raw: RawConfig = toml::from_str(&text).ok()?;
+            // Targets are relative to the config's `[index].root` (a subdir layout puts the toml at
+            // the worktree top with `root = "<subdir>"`); resolve + validate them there so the
+            // stored, root-relative directories match the base config's spelling exactly.
+            let target_root = workdir.join(raw.index.root.as_deref().unwrap_or("."));
+            resolve_targets(&target_root, raw.target_bindings, raw.target).ok()
+        })();
+        match linked_targets {
+            Some(targets) => Self { targets, ..self.clone() },
+            None => self.clone(),
+        }
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let text = fs::read_to_string(path)?;
@@ -283,7 +320,18 @@ impl Config {
         // anchored to main so every worktree shares one base index.
         // `ResolvedTarget.directories` are root-relative, so the stored targets are
         // identical either way (#219 review).
-        let targets = resolve_targets(&local_root, raw.target_bindings, raw.target)?;
+        let local_targets = resolve_targets(&local_root, raw.target_bindings, raw.target)?;
+        // The stored `Config.targets` are the BASE targets — they drive discovery over the anchored
+        // `root` (= main). When this config was read from a LINKED worktree, its branch
+        // `rag-rat.toml` may NARROW or DROP a target that still exists on main; using the
+        // branch targets for base discovery would classify the now-undiscovered main files
+        // as deleted and tombstone them in the BASE scope, hiding committed files from main
+        // queries. So when anchoring to a different (main) root, re-resolve the base
+        // targets from MAIN's own `rag-rat.toml`. The branch's targets are NOT lost: the
+        // overlay refresh reloads each linked worktree's own config
+        // (`refresh_worktree_overlays`) and indexes the branch with its own target set (#219
+        // review).
+        let targets = main_base_targets(&root, &local_root).unwrap_or(local_targets);
         let local_ai = LocalAiConfig::try_from(raw.local_ai)?;
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
@@ -387,6 +435,27 @@ fn anchor_root_to_main_worktree(root: &Path) -> PathBuf {
     // calls that read `Config.root`. Keep the linked checkout's (validated, existing) root in that
     // case — the overlay still serves the branch; the base just can't anchor there (#219 review).
     if anchored.is_dir() { anchored } else { root.to_path_buf() }
+}
+
+/// The BASE targets for a config that was read from a LINKED worktree: the MAIN checkout's
+/// `rag-rat.toml` targets, resolved against the anchored (main) `root`. `None` — so the caller
+/// keeps the local (branch) targets — when this config is NOT anchored away from its own checkout
+/// (`root == local_root`: the main checkout or a non-git dir), when main has no readable
+/// `rag-rat.toml`, or when main's targets don't validate against `root` (e.g. a main target dir
+/// that only the subdir layout reaches). Reading main's config keeps base DISCOVERY faithful to
+/// main, so a branch that narrows/drops a target can't tombstone main's committed files in the base
+/// scope (#219 review). The branch's own targets still drive its overlay via
+/// `refresh_worktree_overlays`.
+fn main_base_targets(root: &Path, local_root: &Path) -> Option<Vec<ResolvedTarget>> {
+    if root == local_root {
+        return None; // not anchored away — the local config IS the base config
+    }
+    let main_config_path = main_worktree_root(root)?.join("rag-rat.toml");
+    let text = fs::read_to_string(&main_config_path).ok()?;
+    let raw: RawConfig = toml::from_str(&text).ok()?;
+    // Main's targets are root-relative; validate (and store) them against the anchored `root`,
+    // which is the equivalent path under the main worktree the base index is discovered from.
+    resolve_targets(root, raw.target_bindings, raw.target).ok()
 }
 
 /// The main worktree root, derived from the git common dir (`<main>/.git`). Returns `None` outside
@@ -627,12 +696,15 @@ mod tests {
     }
 
     #[test]
-    fn config_load_in_a_linked_worktree_validates_branch_only_target_dirs() {
+    fn config_load_in_a_linked_worktree_uses_main_base_targets_not_the_branch() {
         // #219 review: a linked branch can point `rag-rat.toml` at a target dir that exists ONLY in
         // that branch. `Config::load` anchors `root` to the main worktree for the shared base
-        // index, but it must VALIDATE the targets against the LINKED checkout (where the
-        // config + that dir live) — not the main checkout — or launching the index/MCP in
-        // the linked worktree fails with `MissingDirectory` against main.
+        // index. Two things must hold: (1) loading the branch config must NOT fail with
+        // `MissingDirectory` (the branch-only dir is validated against the linked checkout where it
+        // lives); (2) the stored BASE `targets` must come from MAIN's `rag-rat.toml`, not the
+        // branch's — otherwise base discovery walks main with the branch target set and tombstones
+        // any main file outside it. The branch's extra target is served via the overlay, not the
+        // base config.
         let git = |dir: &Path, args: &[&str]| {
             std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
         };
@@ -668,20 +740,81 @@ mod tests {
         git(&linked, &["add", "-A"]);
         git(&linked, &["commit", "-qm", "branch adds extra"]);
 
-        // `extra` does not exist in the main checkout, so validating against main would fail.
+        // `extra` does not exist in the main checkout, so validating against main would fail —
+        // loading still succeeds because the branch-only dir is validated against the linked
+        // checkout where it lives.
         assert!(!main.join("extra").exists(), "the branch-only dir must be absent from main");
         let from_linked = Config::load(linked.join("rag-rat.toml"))
-            .expect("loading the branch config in the linked worktree must validate against it");
-        // root still anchors to main (one shared base index), targets validated against the branch.
+            .expect("loading the branch config in the linked worktree must not fail (req 1)");
+        // root still anchors to main (one shared base index).
         assert_eq!(
             from_linked.root,
             main.canonicalize().unwrap(),
             "root anchors to the main worktree for the shared base index",
         );
+        // The stored BASE targets come from MAIN's config (`src` only), NOT the branch's
+        // (`src` + `extra`): base discovery must not walk main with the branch's target set (req
+        // 2).
         let dirs = from_linked.target_directories();
+        assert!(dirs.contains(&PathBuf::from("src")), "main's `src` target is the base: {dirs:?}");
+        assert!(
+            !dirs.contains(&PathBuf::from("extra")),
+            "the branch-only target must NOT be a base target (it can't tombstone main): {dirs:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_load_in_a_linked_worktree_keeps_main_targets_when_the_branch_narrows_them() {
+        // #219 review (3440746682): a linked branch's `rag-rat.toml` that NARROWS the target set
+        // (drops a dir that still exists on main) must NOT carry that narrowed set into the BASE
+        // config. The base config drives discovery over the anchored (main) root; with the branch's
+        // narrowed targets, main-only files would be classified `deleted` and tombstoned in the
+        // base scope — hiding committed files from main queries. The stored base targets
+        // must be MAIN's.
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp =
+            std::env::temp_dir().join(format!("ragrat-cfgnarrow-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(main.join("extra")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(main.join("extra/more.rs"), "pub fn b() {}\n").unwrap();
+        // Main indexes BOTH `src` and `extra`.
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\", \"extra\"]\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+
+        // The branch NARROWS to `src` only (drops `extra`), committed on the branch.
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+        std::fs::write(
+            linked.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        git(&linked, &["add", "-A"]);
+        git(&linked, &["commit", "-qm", "branch narrows to src"]);
+
+        let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
+        let dirs = from_linked.target_directories();
+        // Both of main's targets survive in the base config, so base discovery still walks `extra`
+        // on main and never tombstones `extra/more.rs`.
+        assert!(dirs.contains(&PathBuf::from("src")), "base keeps main's `src`: {dirs:?}");
         assert!(
             dirs.contains(&PathBuf::from("extra")),
-            "the branch-only target dir survives validation: {dirs:?}",
+            "base keeps main's `extra` even though the branch dropped it: {dirs:?}",
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

@@ -1014,6 +1014,71 @@ fn worktree_param_routes_query_to_branch_overlay() {
 }
 
 #[test]
+fn compare_graph_to_text_stays_base_scoped_under_a_worktree_param() {
+    // #219 review (3440746678): `compare_graph_to_text` reads LIVE source text through
+    // `source_root` (the MAIN checkout). Under an overlay scope its GRAPH side would be the branch
+    // overlay while its TEXT side stayed main — mismatched. It must stay BASE-scoped even with a
+    // `worktree` arg, so a `worktree`-passed call matches the base call exactly.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Base: `caller` calls `target`.
+    fs::write(root.join("src/a.rs"), "pub fn target() {}\npub fn caller() {\n    target();\n}\n")
+        .unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@e"]);
+    git(&root, &["config", "user.name", "t"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "base"]);
+    let config = rust_config(root.clone());
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Branch: `caller` no longer calls `target` (the callsite is gone on the branch). An
+    // overlay-scoped compare would see 0 graph edges; the base sees 1.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    git(&root, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn target() {}\npub fn caller() {\n}\n").unwrap();
+    git(&linked, &["add", "."]);
+    git(&linked, &["commit", "-q", "-m", "branch drops call"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    drop(db);
+
+    let lookup =
+        call_tool_for_config(&config, "symbol_lookup", json!({"symbol": "target"})).unwrap();
+    let id = lookup["candidates"][0]["id"].as_str().unwrap().to_string();
+    let args = |worktree: Option<&str>| {
+        let mut a = json!({"id": id, "pattern": "target\\(", "resolution": "exact",
+            "edge_kinds": ["calls_name"]});
+        if let Some(w) = worktree {
+            a["worktree"] = json!(w);
+        }
+        a
+    };
+
+    let base = call_tool_for_config(&config, "compare_graph_to_text", args(None)).unwrap();
+    let with_worktree = call_tool_for_config(
+        &config,
+        "compare_graph_to_text",
+        args(Some(linked.to_str().unwrap())),
+    )
+    .unwrap();
+    // The `worktree` call is identical to the base call: graph + text both from main, never the
+    // overlay (which would have dropped the graph edge).
+    assert_eq!(
+        base["summary"], with_worktree["summary"],
+        "compare_graph_to_text must stay base-scoped regardless of the worktree param",
+    );
+    assert!(
+        base["summary"]["graph_edges"].as_u64().unwrap() >= 1,
+        "the base call sees the committed callsite edge: {base:?}",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
 fn heal_index_from_a_linked_worktree_does_not_corrupt_the_overlay() {
     // #219 review: `heal_index` (a WRITE tool) reads file bytes from the stored `source_root` (the
     // MAIN checkout). If the read-write connection were scoped to the linked worktree, the heal

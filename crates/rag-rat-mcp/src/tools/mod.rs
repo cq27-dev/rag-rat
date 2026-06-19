@@ -56,6 +56,18 @@ fn is_read_only_tool(name: &str) -> bool {
     )
 }
 
+/// Read tools that compare indexed graph/symbol data against LIVE on-disk source text, read through
+/// the stored `source_root` (the MAIN checkout). Under a linked-worktree overlay scope these tools'
+/// GRAPH side would come from the branch overlay while their TEXT side still read the main
+/// checkout, so matched / text-only / graph-only would be computed against mismatched sides. They
+/// are kept in the BASE scope even when a `worktree` is passed — the diagnostic stays
+/// self-consistent (graph and text both from main) rather than producing wrong overlay-vs-main
+/// results. Accepted recall: the diagnostic doesn't reflect branch-only changes when invoked with
+/// `worktree` (#219 review).
+fn tool_compares_against_live_source(name: &str) -> bool {
+    matches!(name, "compare_graph_to_text")
+}
+
 pub fn call_tool_for_config(
     config: &Config,
     name: &str,
@@ -68,6 +80,9 @@ pub fn call_tool_for_config(
     // / main / foreign / unreadable path — and only writes the per-connection `temp.*` scope
     // view, so it is safe even on the read-only connection.
     let worktree = worktree_arg(&arguments);
+    // A tool that compares the graph against LIVE main-checkout text stays BASE-scoped even with a
+    // `worktree` arg, so its graph and text sides come from the same checkout (#219 review).
+    let scope_worktree = if tool_compares_against_live_source(name) { None } else { worktree };
     // Read tools run on a lock-free read-only connection (#143). Two fall-backs to the read-write
     // open: (1) `try_open_config_read_only` returns `None` when the index still owes a heal/migrate
     // write; (2) a handful of read tools lazily WRITE on a cold path (`semantic_search` heals stale
@@ -77,7 +92,7 @@ pub fn call_tool_for_config(
     if is_read_only_tool(name)
         && let Some(mut db) = IndexDatabase::try_open_config_read_only(config)?
     {
-        db.use_worktree_scope(&config.root, worktree.as_deref())?;
+        db.use_worktree_scope(&config.root, scope_worktree.as_deref())?;
         match call_tool_with_db(&db, name, arguments.clone()) {
             Ok(result) => return finalize_tool_result(config, name, result),
             Err(err) if rag_rat_core::storage::is_readonly_violation(&err) => {
@@ -97,7 +112,7 @@ pub fn call_tool_for_config(
     // overlay scope (`IndexDatabase::active_scope_is_linked_overlay`) (#219 review).
     let mut db = IndexDatabase::open_config(config)?;
     if is_read_only_tool(name) {
-        db.use_worktree_scope(&config.root, worktree.as_deref())?;
+        db.use_worktree_scope(&config.root, scope_worktree.as_deref())?;
     }
     let result = call_tool_with_db(&db, name, arguments)?;
     finalize_tool_result(config, name, result)
