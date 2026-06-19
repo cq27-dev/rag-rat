@@ -101,6 +101,7 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
 }
 
 fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
+    let started = Instant::now();
     let (mut db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
     let runtime = &config.local_ai.embedding.runtime;
     let options = ReconcileOptions {
@@ -111,13 +112,17 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
         intra_threads: runtime.ort_threads.map(|n| n as usize),
         ..ReconcileOptions::default()
     };
+    // One time budget shared by the per-overlay reconciles AND the base reconcile below, so a pass
+    // with several changed overlays can't blow past `PASS_RECONCILE_MAX_SECONDS` (N+1)× over (#219
+    // review). Measured from `started` so discovery time already counts against it.
+    let budget = ReconcileBudget::new(options, started);
     // Keep every live linked worktree's branch overlay fresh (#219), so a `worktree`-scoped query
     // sees that branch's changes without a manual `index --worktree`. Delta-only and idle-safe (the
     // overlay pass writes nothing when a worktree is unchanged), so it can run every pass; a
     // worktree change counts toward running the tail below even when config.root itself didn't
     // change. Reconcile a CHANGED overlay's embeddings INLINE (while scoped to it) so a worktree
     // query isn't BM25-only for branch content — the base reconcile below can't see overlay chunks.
-    let overlays_changed = refresh_worktree_overlays(&mut db, config, Some(&options));
+    let overlays_changed = refresh_worktree_overlays(&mut db, config, Some(&budget));
     // Idle backstop (issue #63, facet 2): when the sweep changed no content, skip the reconcile /
     // gc / memory-validate tail — an idle server should do no work past discovery. `run_gc` (every
     // GC_EVERY_PASSES) still forces a full tail, so the cases that DON'T flip content_changed are
@@ -127,7 +132,11 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
     if !content_changed && !overlays_changed && !run_gc {
         return Ok(());
     }
-    db.reconcile_with_options_progress(options, |_| {})?;
+    // The base reconcile gets only the budget the overlays left behind; `None` → already exhausted,
+    // so skip it (the embedding backlog rides the next pass) rather than spend a fresh full budget.
+    if let Some(options) = budget.next_options() {
+        db.reconcile_with_options_progress(options, |_| {})?;
+    }
     if run_gc {
         let _ = db.garbage_collect();
     }
@@ -158,10 +167,13 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
 pub fn refresh_worktree_overlays(
     db: &mut IndexDatabase,
     config: &Config,
-    reconcile: Option<&ReconcileOptions>,
+    reconcile: Option<&ReconcileBudget>,
 ) -> bool {
     let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
-    let base_id = crate::index::worktree_id_of(&config.root);
+    // The base id is the ENCLOSING worktree root, not `config.root` itself — see
+    // `enclosing_worktree_id` (a repo-SUBDIR `config.root` would otherwise mis-classify the main
+    // checkout as a linked overlay and re-index it as one) (#219 review).
+    let base_id = enclosing_worktree_id(&config.root);
     let mut changed = false;
     for worktree in worktrees {
         if worktree == base_id {
@@ -174,10 +186,14 @@ pub fn refresh_worktree_overlays(
                 // Embed the overlay's new/changed chunks NOW, while the connection is still scoped
                 // to this overlay (index_worktree_overlay left it there) — the trailing base
                 // reconcile won't see them (#219 review). Idle-safe: skipped when the overlay was
-                // unchanged, so a static worktree adds no embedding work.
+                // unchanged, so a static worktree adds no embedding work. `budget.next_options()`
+                // recomputes `max_seconds` from the time left in the SHARED budget, so two changed
+                // overlays plus the base reconcile can't each spend the full `--max-seconds` (#219
+                // review). `None` → the budget is exhausted (or absent); skip the embed.
                 if this_changed
-                    && let Some(options) = reconcile
-                    && let Err(err) = db.reconcile_with_options_progress(options.clone(), |_| {})
+                    && let Some(budget) = reconcile
+                    && let Some(options) = budget.next_options()
+                    && let Err(err) = db.reconcile_with_options_progress(options, |_| {})
                 {
                     eprintln!("watch: worktree overlay reconcile failed for {worktree}: {err}");
                 }
@@ -189,6 +205,46 @@ pub fn refresh_worktree_overlays(
     // scoped to the last worktree it touched).
     let _ = db.use_worktree_scope(&config.root, None);
     changed
+}
+
+/// A time budget shared across the per-overlay embedding reconciles AND the trailing base reconcile
+/// of one maintenance/watcher pass. Each reconcile call starts its own `Instant` timer against its
+/// `max_seconds`, so handing every overlay (and the base) the same `ReconcileOptions` would let
+/// each spend the FULL advertised budget — N overlays + base = (N+1)×`max_seconds` of held write
+/// lock. `next_options` recomputes `max_seconds` from the time remaining since `start`, so the
+/// whole pass stays within a single budget (#219 review). A budget with no `max_seconds` cap
+/// (`None`) is unbounded and every `next_options` returns the base options unchanged.
+pub struct ReconcileBudget {
+    options: ReconcileOptions,
+    start: Instant,
+    total_seconds: Option<u64>,
+}
+
+impl ReconcileBudget {
+    /// Build a shared budget. `start` is the pass's clock origin — pass the SAME instant the
+    /// surrounding command measured its own setup against (so discovery time already spent counts
+    /// toward the budget); the per-call `max_seconds` is `options.max_seconds` minus elapsed.
+    pub fn new(options: ReconcileOptions, start: Instant) -> Self {
+        let total_seconds = options.max_seconds;
+        Self { options, start, total_seconds }
+    }
+
+    /// The options for the NEXT reconcile in this pass, with `max_seconds` reduced to the time left
+    /// in the shared budget. `None` when the budget is exhausted (so the caller skips the reconcile
+    /// entirely rather than running it with a zero budget). An uncapped budget always yields the
+    /// base options.
+    pub fn next_options(&self) -> Option<ReconcileOptions> {
+        let Some(total) = self.total_seconds else {
+            return Some(self.options.clone());
+        };
+        let remaining = total.saturating_sub(self.start.elapsed().as_secs());
+        if remaining == 0 {
+            return None;
+        }
+        let mut options = self.options.clone();
+        options.max_seconds = Some(remaining);
+        Some(options)
+    }
 }
 
 /// Whether an event KIND should ever fire a pass. Only content mutations do — `Create`, `Remove`,
@@ -328,12 +384,28 @@ fn config_subdir_prefix(config: &Config) -> PathBuf {
         .unwrap_or_default()
 }
 
+/// The `worktree_id` of the worktree that ENCLOSES `root`, canonicalized to match the ids
+/// `live_worktree_contexts` reports. When `root` is a repo SUBDIR (`<repo>/crate`), the enclosing
+/// worktree root is `<repo>` — which is the spelling the main checkout contributes to
+/// `live_worktree_contexts`. Filtering live worktrees by `worktree_id_of(root)` (the subdir path)
+/// instead would never match that entry, so the main checkout would be misread as a LINKED overlay.
+/// Falls back to `root`'s own id outside a git worktree (#219 review).
+fn enclosing_worktree_id(root: &Path) -> String {
+    crate::index::git_history::worktree_root(root)
+        .map_or_else(|| crate::index::worktree_id_of(root), |wt| crate::index::worktree_id_of(&wt))
+}
+
 /// Live linked-worktree checkout roots (excluding the base `config.root`) plus the worktree
 /// registry dir (`<common_dir>/worktrees`), for the watcher to subscribe to — branch checkouts for
 /// edits, the registry for add/remove.
 fn worktree_watch_targets(config: &Config) -> (Vec<PathBuf>, Option<PathBuf>) {
     let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
-    let base = crate::index::worktree_id_of(&config.root);
+    // The base id is the ENCLOSING worktree root, not `config.root` itself. When `config.root` is a
+    // repo SUBDIR (`<repo>/crate`), `live_worktree_contexts` reports the main checkout as `<repo>`
+    // (its workdir), but `worktree_id_of(config.root)` is `<repo>/crate` — they wouldn't match, so
+    // the main checkout would be treated as a linked worktree and the watcher would recursively
+    // subscribe to the whole repo root outside the configured target (#219 review).
+    let base = enclosing_worktree_id(&config.root);
     let roots = worktrees.into_iter().filter(|w| *w != base).map(PathBuf::from).collect();
     let registry = crate::index::discover_repo(&config.root)
         .ok()
@@ -944,6 +1016,85 @@ mod tests {
         let d = Debounce::new(Duration::from_millis(400), Duration::from_millis(2500));
         assert!(d.due_in(Instant::now()).is_none());
         assert!(!d.should_fire(Instant::now()));
+    }
+
+    #[test]
+    fn reconcile_budget_is_shared_across_overlays_and_base() {
+        // #219 review: each overlay reconcile (and the base) starts its OWN `max_seconds` timer, so
+        // handing every one the same options lets the pass spend (N+1)× the advertised budget.
+        // `next_options` recomputes `max_seconds` from the time remaining in the shared budget.
+        let options = ReconcileOptions { max_seconds: Some(30), ..ReconcileOptions::default() };
+        // A budget whose clock STARTED 30s ago is already exhausted → skip the reconcile.
+        let spent = ReconcileBudget::new(
+            options.clone(),
+            Instant::now() - std::time::Duration::from_secs(30),
+        );
+        assert!(spent.next_options().is_none(), "an exhausted budget yields no reconcile");
+
+        // A fresh budget yields options whose `max_seconds` is at most the total (the remaining
+        // time), never a fresh full budget per call.
+        let fresh = ReconcileBudget::new(options, Instant::now());
+        let next = fresh.next_options().expect("a fresh budget has time left");
+        assert!(
+            next.max_seconds.is_some_and(|s| s <= 30),
+            "the per-call budget is bounded by the time remaining, not a fresh full budget: {:?}",
+            next.max_seconds,
+        );
+
+        // An uncapped budget (`max_seconds: None`) always yields the base options.
+        let uncapped = ReconcileBudget::new(ReconcileOptions::default(), Instant::now());
+        assert_eq!(uncapped.next_options().and_then(|o| o.max_seconds), None);
+    }
+
+    #[test]
+    fn worktree_watch_targets_excludes_the_main_checkout_for_a_subdir_config_root() {
+        // #219 review: when `config.root` is a repo SUBDIR (`<repo>/crate`),
+        // `live_worktree_contexts` reports the main checkout as `<repo>` (its workdir), but
+        // filtering by `worktree_id_of(config.root)` (`<repo>/crate`) wouldn't match — so
+        // the main checkout would be misread as a LINKED worktree and the watcher would
+        // recursively subscribe to the whole repo root. The base id must be the ENCLOSING
+        // worktree root.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let main = std::env::temp_dir().join(format!("ragrat-wwt-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(main.join("crate/src")).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap()
+        };
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        std::fs::write(main.join("crate/src/lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+
+        let sub = main.join("crate").canonicalize().unwrap(); // config.root is the subdir.
+        let config = Config {
+            root: sub.clone(),
+            database: sub.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            watch: WatchConfig::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+
+        let (roots, _registry) = worktree_watch_targets(&config);
+        let main_id = crate::index::worktree_id_of(&main.canonicalize().unwrap());
+        assert!(
+            !roots.iter().any(|r| crate::index::worktree_id_of(r) == main_id),
+            "the main checkout must NOT be watched as a linked worktree: {roots:?}",
+        );
+
+        std::fs::remove_dir_all(&main).ok();
     }
 
     #[test]

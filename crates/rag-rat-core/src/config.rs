@@ -377,10 +377,16 @@ fn anchor_root_to_main_worktree(root: &Path) -> PathBuf {
     // canonicalized by `normalize_existing_dir`, so it strips cleanly against the canonical
     // workdir; `root == workdir` (a `root="."` config) yields an empty suffix → the main
     // worktree top.
-    match root.strip_prefix(&workdir) {
+    let anchored = match root.strip_prefix(&workdir) {
         Ok(rel) => main_root.join(rel),
         Err(_) => main_root,
-    }
+    };
+    // The anchored path must EXIST in the main checkout. When the linked branch sets `[index].root`
+    // to a directory that lives only on the branch (not in main), `main_root.join(rel)` points at a
+    // missing path, which would break the later `discover_repo` / database-base / base-indexing
+    // calls that read `Config.root`. Keep the linked checkout's (validated, existing) root in that
+    // case — the overlay still serves the branch; the base just can't anchor there (#219 review).
+    if anchored.is_dir() { anchored } else { root.to_path_buf() }
 }
 
 /// The main worktree root, derived from the git common dir (`<main>/.git`). Returns `None` outside
@@ -747,6 +753,20 @@ mod tests {
         std::fs::create_dir_all(&plain).unwrap();
         let plain_c = plain.canonicalize().unwrap();
         assert_eq!(anchor_root_to_main_worktree(&plain_c), plain_c);
+
+        // A linked-worktree subdir root that does NOT exist in main must NOT anchor to a missing
+        // `main/<rel>` path (#219 review): the branch created `branch_only/`, which main never had.
+        // The anchored `main/branch_only` doesn't exist, so resolution keeps the linked checkout's
+        // (existing) root — otherwise `Config.root` would point outside any discoverable repo path.
+        let branch_only = linked.join("branch_only");
+        std::fs::create_dir_all(&branch_only).unwrap();
+        let branch_only_c = branch_only.canonicalize().unwrap();
+        assert!(!main_c.join("branch_only").exists(), "main never had this dir");
+        assert_eq!(
+            anchor_root_to_main_worktree(&branch_only_c),
+            branch_only_c,
+            "a branch-only root that's missing in main keeps the linked checkout's root",
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -1076,21 +1076,26 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     )?;
 
     let mut db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
-    let elapsed = started.elapsed().as_secs();
-    let remaining_seconds = max_seconds.saturating_sub(elapsed);
-    // Reconcile options shared by the overlay pass and the base reconcile below. `None` (no time
-    // budget left) skips both, so neither the overlay nor the base embeds when out of time.
-    let reconcile_options =
-        (remaining_seconds > 0).then(|| rag_rat_core::index::ai::ReconcileOptions {
-            limit: None,
-            batch_size: Some(config.local_ai.embedding.runtime.batch_size),
-            force: false,
-            until_clean: false,
-            changed_first: true,
-            max_seconds: Some(remaining_seconds),
-            max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
-            intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
-        });
+    // ONE time budget for the whole pass — the per-overlay embedding reconciles AND the base
+    // reconcile below — measured from `started` so discovery already counts against it. Without a
+    // shared budget each overlay (each call starts its own `max_seconds` timer) plus the base could
+    // spend the full `--max-seconds`, holding the write lock (N+1)× past the advertised limit (#219
+    // review). A `0` cap means the caller asked to skip embedding work entirely.
+    let budget = (max_seconds > 0).then(|| {
+        rag_rat_core::watch::ReconcileBudget::new(
+            rag_rat_core::index::ai::ReconcileOptions {
+                limit: None,
+                batch_size: Some(config.local_ai.embedding.runtime.batch_size),
+                force: false,
+                until_clean: false,
+                changed_first: true,
+                max_seconds: Some(max_seconds),
+                max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
+                intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
+            },
+            started,
+        )
+    });
     // Keep every live linked worktree's branch overlay fresh (#219). The git hooks run THIS command
     // (not the foreground watcher), so without this a commit/checkout/merge in a linked worktree
     // would index the base `config.root` but leave that worktree's overlay stale until a watcher
@@ -1098,12 +1103,15 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // CHANGED overlay's embeddings are reconciled INLINE (while scoped to it) so worktree queries
     // aren't BM25-only for branch content. It restores the base scope afterward so the base
     // reconcile/gc/memory-validate below run unscoped.
-    rag_rat_core::watch::refresh_worktree_overlays(&mut db, config, reconcile_options.as_ref());
-    let reconcile_report = match reconcile_options {
-        Some(options) =>
-            Some(db.reconcile_with_options_progress(options, render_reconcile_progress)?),
-        None => None,
-    };
+    rag_rat_core::watch::refresh_worktree_overlays(&mut db, config, budget.as_ref());
+    // The base reconcile gets whatever budget the overlays left; `None` → exhausted (or no cap left
+    // at all), so skip it rather than start a fresh full-budget reconcile.
+    let reconcile_report =
+        match budget.as_ref().and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
+            Some(options) =>
+                Some(db.reconcile_with_options_progress(options, render_reconcile_progress)?),
+            None => None,
+        };
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
     let gc_report = db.garbage_collect().ok();

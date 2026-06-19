@@ -8204,8 +8204,9 @@ fn refresh_worktree_overlays_reconciles_overlay_scope_embeddings() {
     run_git(&linked, &["commit", "-q", "-m", "add branch file"]);
 
     let options = ai::ReconcileOptions { batch_size: Some(8), ..Default::default() };
+    let budget = crate::watch::ReconcileBudget::new(options, std::time::Instant::now());
     // The pass refreshes the overlay AND reconciles its embeddings inline.
-    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, Some(&options));
+    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, Some(&budget));
     assert!(changed, "the overlay changed (a new branch file was indexed)");
 
     // In the overlay scope, the new branch file's chunk must carry a Current embedding — not be
@@ -8261,6 +8262,118 @@ fn worktree_overlay_branch_deleted_file_is_hidden_by_tombstone() {
 
     set_base_scope(&mut db, &main);
     assert!(path_in_scope(&db, "src/gone.rs"), "the base scope still has the file");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_tombstones_an_ignored_replacement_of_a_base_file() {
+    // #219 review: when a branch drops a base file from its tracked/indexable view but an IGNORED
+    // file still sits at that path on disk, the candidate must be TOMBSTONED, not skipped. Before
+    // the fix the on-disk-but-ignored path hit `continue`, so the overlay scope fell through to the
+    // base row and queries returned a file the branch no longer presents.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/data.rs"), "pub fn base_data() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    assert!(path_in_scope(&db, "src/data.rs"));
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // The branch git-rm's the tracked file (→ a deletion candidate in the tree-diff) AND ignores
+    // the path, then drops a NEW untracked file at the same path: on disk it exists but is
+    // gitignored, so it is NOT indexable — exactly the shadow-a-base-file-with-an-ignored-file
+    // case.
+    fs::remove_file(linked.join("src/data.rs")).unwrap();
+    fs::write(linked.join(".gitignore"), "/src/data.rs\n").unwrap();
+    run_git(&linked, &["add", "-A"]);
+    run_git(&linked, &["commit", "-q", "-m", "drop + ignore data"]);
+    fs::write(linked.join("src/data.rs"), "pub fn ignored_replacement() {}\n").unwrap();
+
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.tombstoned >= 1, "the ignored replacement of a base file is tombstoned");
+    assert!(
+        !path_in_scope(&db, "src/data.rs"),
+        "the overlay hides the base file behind a tombstone (the branch's view dropped it)"
+    );
+
+    set_base_scope(&mut db, &main);
+    assert!(path_in_scope(&db, "src/data.rs"), "the base scope still has the file");
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_reads_do_not_heal_against_main() {
+    // #219 review: read tools (symbol_lookup / impact / search) revalidated overlay rows against
+    // `source_root` (the MAIN checkout). A branch that changes more than
+    // MAX_AUTO_HEAL_FILES_PER_CALL files looks entirely stale vs main, so `symbol_candidates`'
+    // matched-file heal tripped `NeedsReindex` (and `heal_file` no-ops under an overlay
+    // anyway). The overlay is authoritative, so the staleness check must be skipped under a
+    // linked-overlay scope.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    // More than the heal cap (4) so an unguarded check would treat every branch file as stale.
+    for i in 0..6 {
+        fs::write(main.join(format!("src/f{i}.rs")), format!("pub fn shared_{i}() {{}}\n"))
+            .unwrap();
+    }
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Every file differs from main on the branch, and one carries a NEW symbol to look up.
+    for i in 0..6 {
+        fs::write(
+            linked.join(format!("src/f{i}.rs")),
+            format!("pub fn shared_{i}() {{}}\npub fn branch_only_{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    run_git(&linked, &["add", "-A"]);
+    run_git(&linked, &["commit", "-q", "-m", "branch changes every file"]);
+
+    // Leaves the connection in the overlay scope.
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    let selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("branch_only_0".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: true,
+        limit: 10,
+    };
+    // Unguarded, this raised NeedsReindex (6 > cap 4 stale-vs-main files); guarded, it resolves the
+    // branch symbol cleanly and flags nothing stale.
+    let lookup = db.symbol_candidates(&selector, false).unwrap();
+    assert!(
+        lookup.candidates.iter().any(|c| c.name == "branch_only_0"),
+        "the overlay symbol resolves without a main-root stale heal: {:?}",
+        lookup.candidates.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+    assert!(
+        lookup.stale_files.is_empty(),
+        "no overlay file is flagged stale against main: {:?}",
+        lookup.stale_files
+    );
+    // Search must also not raise NeedsReindex under the overlay scope.
+    db.search("shared_0", 10, false).expect("search succeeds under the overlay scope");
 
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);

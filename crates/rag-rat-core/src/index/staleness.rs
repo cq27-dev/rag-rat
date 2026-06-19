@@ -105,6 +105,15 @@ impl IndexDatabase {
     }
 
     fn stale_hit_paths(&self, hits: &[SearchHit]) -> anyhow::Result<Vec<String>> {
+        // Under a LINKED-WORKTREE OVERLAY scope, `source_root` is the MAIN checkout — NOT the
+        // branch these hits came from. Revalidating overlay chunks against main's copy of the file
+        // marks every branch-changed file stale; `search_with_heal` then either raises
+        // `NeedsReindex` past the cap or calls the overlay-guarded `heal_file` no-op. The overlay
+        // rows are authoritative (maintained by `index_worktree_overlay`), so report nothing stale
+        // — same rationale as the read_chunk overlay skip (#219 review).
+        if self.active_scope_is_linked_overlay() {
+            return Ok(Vec::new());
+        }
         let Some(root) = self.storage.source_root() else {
             return Ok(Vec::new());
         };

@@ -169,17 +169,24 @@ pub(crate) fn compute_linked_worktree_delta(
         if target_for_path(config, &rel).is_none() {
             continue;
         }
+        // Whether the base HEAD tree carries this path — i.e. there's a base row the overlay must
+        // shadow when the branch's indexable view no longer contains the file.
+        let shadows_base_file = || {
+            base_tree
+                .as_ref()
+                .and_then(|t| t.lookup_entry_by_path(&repo_rel).ok().flatten())
+                .is_some()
+        };
         let absolute = linked_config_root.join(&rel);
-        if absolute.is_file() {
-            if ignore.is_ignored(&absolute, false) {
-                continue; // gitignored in the worktree — the base walker wouldn't index it either
-            }
+        let indexable_in_worktree = absolute.is_file() && !ignore.is_ignored(&absolute, false);
+        if indexable_in_worktree {
             delta.readable.push(rel);
-        } else if base_tree
-            .as_ref()
-            .and_then(|t| t.lookup_entry_by_path(&repo_rel).ok().flatten())
-            .is_some()
-        {
+        } else if shadows_base_file() {
+            // The branch no longer presents an indexable file here (deleted, OR an IGNORED file now
+            // sits at the path — the base walker wouldn't index either), but a base row exists.
+            // Write a tombstone so the overlay shadows the base file; without it the
+            // scope falls through to the base row and queries return a file the
+            // branch's view dropped (#219 review).
             delta.tombstones.push(rel);
         }
     }
@@ -253,73 +260,102 @@ impl IndexDatabase {
         let (_, source_root) =
             linked_config_subdir_and_root(config, &base_repo, &linked_repo, linked_path);
         let scope = FileScope::worktree(worktree_id.clone());
-        let indexed = self.index_explicit_paths_from_root(
-            config,
-            &source_root,
-            &delta.readable,
-            &scope,
-            progress,
-        )?;
-        // Write a tombstone only when one isn't already present, so a re-run on a static worktree
-        // writes nothing (idle-safety, like the readable sha-skip).
-        let mut tombstoned = 0;
-        for path in &delta.tombstones {
-            let exists: bool = self.storage.connection().query_row(
-                "SELECT EXISTS(SELECT 1 FROM main.files WHERE path = ?1 AND commit_sha = '' AND \
-                 worktree_id = ?2 AND kind = 'deleted')",
-                params![path_string(path), worktree_id],
-                |row| row.get(0),
+        // ONE transaction around the whole overlay update — incremental file replacement, tombstone
+        // writes, the prune, AND the global logical-symbol/package/edge/FTS refresh — mirroring the
+        // incremental pass (`index_incremental_with_progress`). Without it a concurrent reader can
+        // observe partially replaced overlay rows or the globally cleared `logical_symbols` table
+        // mid-rebuild, and an error midway leaves the overlay half-applied. BEGIN IMMEDIATE
+        // acquires the write lock up front so a racing writer waits out busy_timeout
+        // instead of failing the deferred read→write upgrade with SQLITE_BUSY; ROLLBACK on
+        // any error (#219 review).
+        self.storage.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> anyhow::Result<(usize, usize, usize)> {
+            let indexed = self.index_explicit_paths_from_root(
+                config,
+                &source_root,
+                &delta.readable,
+                &scope,
+                progress,
             )?;
-            if !exists {
-                self.write_tombstone_in_scope(path, &worktree_id)?;
-                tombstoned += 1;
+            // Write a tombstone only when one isn't already present, so a re-run on a static
+            // worktree writes nothing (idle-safety, like the readable sha-skip).
+            let mut tombstoned = 0;
+            for path in &delta.tombstones {
+                let exists: bool = self.storage.connection().query_row(
+                    "SELECT EXISTS(SELECT 1 FROM main.files WHERE path = ?1 AND commit_sha = '' \
+                     AND worktree_id = ?2 AND kind = 'deleted')",
+                    params![path_string(path), worktree_id],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    self.write_tombstone_in_scope(path, &worktree_id)?;
+                    tombstoned += 1;
+                }
             }
-        }
-        // Prune overlay rows that no longer differ from the base — but ONLY when the delta is
-        // complete. A partial delta (the working-tree status read failed → `status_complete` false)
-        // is missing untracked / working-tree-deleted paths, so pruning against its
-        // `shadowing_paths` would delete valid overlay rows; skip the prune and let the
-        // next complete pass reconcile (mirrors gc's empty-live-set guard) (#219 review).
-        let pruned = if delta.status_complete {
-            self.prune_overlay_rows_not_in_delta(&worktree_id, &delta.shadowing_paths())?
-        } else {
-            0
+            // Prune overlay rows that no longer differ from the base — but ONLY when the delta is
+            // complete. A partial delta (the working-tree status read failed → `status_complete`
+            // false) is missing untracked / working-tree-deleted paths, so pruning against its
+            // `shadowing_paths` would delete valid overlay rows; skip the prune and let the
+            // next complete pass reconcile (mirrors gc's empty-live-set guard) (#219 review).
+            let pruned = if delta.status_complete {
+                self.prune_overlay_rows_not_in_delta(&worktree_id, &delta.shadowing_paths())?
+            } else {
+                0
+            };
+            self.finalize_overlay_refresh(&source_root, &worktree_id, indexed, tombstoned, pruned)?;
+            Ok((indexed, tombstoned, pruned))
+        })();
+        let (indexed, tombstoned, pruned) = match result {
+            Ok(counts) => {
+                self.storage.execute_batch("COMMIT")?;
+                counts
+            },
+            Err(err) => {
+                let _ = self.storage.execute_batch("ROLLBACK");
+                return Err(err);
+            },
         };
-        // Finalize like the incremental pass does — ONLY when something changed, so an unchanged
-        // worktree refresh is a true no-op (the watcher refreshes overlays every pass; this keeps
-        // idle passes write-free and clear of the self-sustaining re-index loop):
-        // - rebuild_logical_symbols: symbol_lookup / graph nav resolve through `logical_symbols`,
-        //   so a NEWLY-ADDED overlay file's symbols are invisible until regrouped (a modified
-        //   file's unchanged symbols resolve via the base's logical rows — which is why only added
-        //   files were missing). This is the field-reported bug.
-        // - resolve_overlay_edges: the overlay inserted edges unresolved. Uses the OVERLAY-SCOPED
-        //   resolver (NOT the base `resolve_edges`): resolution targets span the full overlay view,
-        //   but only the worktree's OWN overlay source rows are re-resolved — a shared committed
-        //   (base) caller's `edges_data`, visible in the overlay view but owned by the base scope,
-        //   must not be rewritten or base `find_callers`/impact would corrupt until a base pass
-        //   resolved it back, flipping by whichever worktree refreshed last (#219 P1).
-        // - refresh_packages: write the overlay scope's `packages` rows from the LINKED checkout's
-        //   manifests BEFORE resolving, so the per-package import scope (#61) is correct for the
-        //   branch. The resolver's `load_package_roots_into_scope` reads `packages` at the active
-        //   `(base_sha, linked_worktree_id)` scope — the base rows live at `(base_sha, '')` and are
-        //   invisible to it — so without this the overlay resolves imports against an empty package
-        //   map (every file falls open to the global union → external-dep suppression downgraded /
-        //   wrong for a branch with a new or changed Cargo.toml or path-dep alias) (#219 review).
-        // - resolve_overlay_edges: the overlay inserted edges unresolved. Uses the OVERLAY-SCOPED
-        //   resolver (NOT the base `resolve_edges`): resolution targets span the full overlay view,
-        //   but only the worktree's OWN overlay source rows are re-resolved — a shared committed
-        //   (base) caller's `edges_data`, visible in the overlay view but owned by the base scope,
-        //   must not be rewritten or base `find_callers`/impact would corrupt until a base pass
-        //   resolved it back, flipping by whichever worktree refreshed last (#219 P1).
-        // - sync_fts: so semantic_search (BM25) sees the overlay's chunks.
-        if indexed > 0 || tombstoned > 0 || pruned > 0 {
-            self.rebuild_logical_symbols()?;
-            self.refresh_packages(&source_root)?;
-            self.resolve_overlay_edges(&worktree_id)?;
-            self.sync_fts()?;
-        }
 
         Ok(WorktreeOverlayReport { worktree_id, indexed, tombstoned, pruned })
+    }
+
+    /// The post-write finalize tail of `index_worktree_overlay`, run INSIDE its transaction — ONLY
+    /// when something changed, so an unchanged worktree refresh is a true no-op (the watcher
+    /// refreshes overlays every pass; this keeps idle passes write-free and clear of the
+    /// self-sustaining re-index loop):
+    /// - rebuild_logical_symbols: symbol_lookup / graph nav resolve through `logical_symbols`, so a
+    ///   NEWLY-ADDED overlay file's symbols are invisible until regrouped (a modified file's
+    ///   unchanged symbols resolve via the base's logical rows — which is why only added files were
+    ///   missing). This is the field-reported bug.
+    /// - refresh_packages: write the overlay scope's `packages` rows from the LINKED checkout's
+    ///   manifests BEFORE resolving, so the per-package import scope (#61) is correct for the
+    ///   branch. The resolver's `load_package_roots_into_scope` reads `packages` at the active
+    ///   `(base_sha, linked_worktree_id)` scope — the base rows live at `(base_sha, '')` and are
+    ///   invisible to it — so without this the overlay resolves imports against an empty package
+    ///   map (every file falls open to the global union → external-dep suppression downgraded /
+    ///   wrong for a branch with a new or changed Cargo.toml or path-dep alias) (#219 review).
+    /// - resolve_overlay_edges: the overlay inserted edges unresolved. Uses the OVERLAY-SCOPED
+    ///   resolver (NOT the base `resolve_edges`): resolution targets span the full overlay view,
+    ///   but only the worktree's OWN overlay source rows are re-resolved — a shared committed
+    ///   (base) caller's `edges_data`, visible in the overlay view but owned by the base scope,
+    ///   must not be rewritten or base `find_callers`/impact would corrupt until a base pass
+    ///   resolved it back, flipping by whichever worktree refreshed last (#219 P1).
+    /// - sync_fts: so semantic_search (BM25) sees the overlay's chunks.
+    fn finalize_overlay_refresh(
+        &self,
+        source_root: &Path,
+        worktree_id: &str,
+        indexed: usize,
+        tombstoned: usize,
+        pruned: usize,
+    ) -> anyhow::Result<()> {
+        if indexed > 0 || tombstoned > 0 || pruned > 0 {
+            self.rebuild_logical_symbols()?;
+            self.refresh_packages(source_root)?;
+            self.resolve_overlay_edges(worktree_id)?;
+            self.sync_fts()?;
+        }
+        Ok(())
     }
 
     /// Index an EXPLICIT set of repo-relative `paths`, reading bytes from `source_root` (which may
