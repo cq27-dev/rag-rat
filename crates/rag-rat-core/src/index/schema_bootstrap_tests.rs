@@ -10206,6 +10206,113 @@ fn v025_creates_chunk_text_compression_tables() {
 }
 
 #[test]
+fn v026_recreates_chunk_fts_contentless_and_repopulates() {
+    // #77 Phase 2: chunk_fts becomes a CONTENTLESS FTS5 index. Fresh apply yields a contentless
+    // table that supports delete-by-rowid (contentless_delete=1); the forward-migrate (V026)
+    // converts an existing external-content table and repopulates it from chunks.text.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    let fts_sql: String = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'", [], |r| r.get(0))
+        .unwrap();
+    assert!(fts_sql.contains("content=''"), "chunk_fts must be contentless: {fts_sql}");
+    assert!(
+        fts_sql.contains("contentless_delete=1"),
+        "chunk_fts needs contentless_delete: {fts_sql}"
+    );
+    // Contentless delete-by-rowid round-trip (the incremental delete path relies on this).
+    conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (1, 'alpha beta')", []).unwrap();
+    let before: i64 = conn
+        .query_row("SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'alpha'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, 1);
+    conn.execute("DELETE FROM chunk_fts WHERE rowid = 1", []).unwrap();
+    let after: i64 = conn
+        .query_row("SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'alpha'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 0, "contentless_delete=1 removes the row by rowid");
+
+    // Forward-migrate: rebuild an OLD external-content chunk_fts with a seeded chunk, drop the V026
+    // ledger row, re-apply → V026 converts to contentless and repopulates from chunks.text.
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+         VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
+                            start_line, end_line, text, text_hash)
+         VALUES (1, 'symbol', 'gamma', 0, 10, 1, 5, 'fn gamma() { delta() }', 'th')",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "DROP TABLE chunk_fts;
+         CREATE VIRTUAL TABLE chunk_fts USING fts5(text, content='chunks', content_rowid='id', \
+         tokenize='porter');
+         INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild');
+         DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';",
+    )
+    .unwrap();
+    schema::apply(&conn).unwrap();
+
+    let migrated_sql: String = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        migrated_sql.contains("content=''"),
+        "V026 makes chunk_fts contentless: {migrated_sql}"
+    );
+    let hits: i64 = conn
+        .query_row("SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'gamma'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(hits, 1, "V026 repopulates chunk_fts from chunks.text");
+}
+
+#[test]
+fn rebuild_fts_repopulates_contentless_chunk_fts_from_the_store() {
+    // #77 Phase 2 recovery path: if the contentless chunk_fts is emptied/desynced,
+    // IndexDatabase::rebuild_fts repopulates it by decompressing the chunk_text store (it does not
+    // re-read chunks.text), and search works again.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn alpha_recovery() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let match_count = |db: &IndexDatabase| -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'alpha_recovery'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    // The full rebuild writes chunk_fts inline (write_fts=true).
+    assert_eq!(match_count(&db), 1, "full rebuild writes chunk_fts inline");
+
+    // Simulate a desync: clear the contentless index, then recover.
+    db.storage
+        .connection()
+        .execute("INSERT INTO chunk_fts(chunk_fts) VALUES('delete-all')", [])
+        .unwrap();
+    assert_eq!(match_count(&db), 0);
+    db.rebuild_fts().unwrap();
+    assert_eq!(
+        match_count(&db),
+        1,
+        "rebuild_fts repopulates contentless chunk_fts from chunk_text"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn full_rebuild_populates_the_chunk_text_store() {
     // #77 Phase 2: a full rebuild compresses every chunk into chunk_text against the shared dict,
     // and every stored blob round-trips to its chunks.text.
@@ -10303,7 +10410,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 25);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 26);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10374,6 +10481,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '023_dispatch_edge_facts_view_exclusion';
         DELETE FROM schema_version WHERE id = '024_files_has_test_code';
         DELETE FROM schema_version WHERE id = '025_chunk_text_compression_tables';
+        DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';
         ",
     )
     .unwrap();

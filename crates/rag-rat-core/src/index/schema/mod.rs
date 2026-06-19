@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 25;
+pub const LATEST_SCHEMA_VERSION: u32 = 26;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -109,6 +109,11 @@ const MIGRATION_025_ID: &str = "025_chunk_text_compression_tables";
 const MIGRATION_025_CHECKSUM: &str = "sha256:rag-rat-chunk-text-compression-tables-v25";
 const MIGRATION_025_DESCRIPTION: &str = "Add chunk_text (zstd blob) + chunk_text_dict (shared \
                                          dictionary) tables for compressed chunk text (#77)";
+const MIGRATION_026_ID: &str = "026_contentless_chunk_fts";
+const MIGRATION_026_CHECKSUM: &str = "sha256:rag-rat-contentless-chunk-fts-v26";
+const MIGRATION_026_DESCRIPTION: &str = "Recreate chunk_fts as a contentless FTS5 index and \
+                                         repopulate it, so chunks.text can be dropped (#77 Phase \
+                                         2)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -336,6 +341,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_025_CHECKSUM,
         description: MIGRATION_025_DESCRIPTION,
         apply: apply_chunk_text_compression_tables,
+    },
+    Migration {
+        id: MIGRATION_026_ID,
+        checksum: MIGRATION_026_CHECKSUM,
+        description: MIGRATION_026_DESCRIPTION,
+        apply: apply_contentless_chunk_fts,
     },
 ];
 

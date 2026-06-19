@@ -473,10 +473,18 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
         );
 
+        -- CONTENTLESS (#77 Phase 2): chunk_fts stores only the inverted index, NOT a copy of the
+        -- text, and does NOT point at `chunks` as a content table — so dropping `chunks.text` \
+         can't
+        -- break it. Tokens are written from the in-memory chunk text at index time (insert_chunks
+        -- with write_fts=true on every path). `contentless_delete=1` (SQLite >= 3.43) keeps
+        -- delete-by-rowid working without a content row to read. Only MATCH + bm25() are used
+        -- (snippets come from the compressed chunk_text store, not FTS), so contentless is \
+         sufficient.
         CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
             text,
-            content='chunks',
-            content_rowid='id',
+            content='',
+            contentless_delete=1,
             tokenize='porter'
         );
 
@@ -568,19 +576,18 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub(crate) fn rebuild_fts(conn: &Connection) -> anyhow::Result<()> {
-    // `chunk_fts` / `commit_fts` are external-content FTS5 tables (content='chunks' /
-    // content='git_commits'). The canonical way to rebuild an external-content index is the
-    // built-in 'rebuild' command, which re-reads the content table. An unqualified
-    // `DELETE FROM <table>` on an external-content FTS5 table corrupts the index when the FTS
-    // and content tables are out of sync (`database disk image is malformed`, SQLite 11/267) —
-    // see #51. 'rebuild' is desync-safe.
-    conn.execute_batch(
-        "
-        INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild');
-        INSERT INTO commit_fts(commit_fts) VALUES('rebuild');
-        ",
-    )?;
+pub(crate) fn rebuild_commit_fts(conn: &Connection) -> anyhow::Result<()> {
+    // `commit_fts` is an external-content FTS5 table (content='git_commits'). The canonical way to
+    // rebuild an external-content index is the built-in 'rebuild' command, which re-reads the
+    // content table. An unqualified `DELETE FROM <table>` on an external-content FTS5 table
+    // corrupts the index when the FTS and content tables are out of sync (`database disk image
+    // is malformed`, SQLite 11/267) — see #51. 'rebuild' is desync-safe.
+    //
+    // `chunk_fts` is NO LONGER rebuilt here: it is contentless (#77 Phase 2), so 'rebuild' (which
+    // re-reads a content table) does not apply. Its tokens are written inline at index time
+    // (write_fts), and the recovery repopulate lives in `IndexDatabase::rebuild_chunk_fts` (it
+    // decompresses the chunk_text store, which a SQL-only rebuild here can't do).
+    conn.execute_batch("INSERT INTO commit_fts(commit_fts) VALUES('rebuild');")?;
     Ok(())
 }
 
@@ -588,35 +595,33 @@ pub(crate) fn rebuild_fts(conn: &Connection) -> anyhow::Result<()> {
 mod rebuild_fts_tests {
     use rusqlite::Connection;
 
-    // Reproduces #51: chunks present that were never inserted into the external-content
-    // `chunk_fts`. The old `DELETE FROM chunk_fts` rebuild corrupts the index on this desync;
-    // the 'rebuild' command recovers it and indexes the content.
+    // Reproduces #51 for the still-external-content `commit_fts`: a git_commits row present that
+    // was never inserted into commit_fts. The old `DELETE FROM <fts>` rebuild corrupts the
+    // index on this desync; the 'rebuild' command recovers it and indexes the content.
+    // (chunk_fts is now contentless — its recovery path is `IndexDatabase::rebuild_chunk_fts`,
+    // tested separately.)
     #[test]
-    fn rebuild_fts_recovers_a_desynced_external_content_index() {
+    fn rebuild_commit_fts_recovers_a_desynced_external_content_index() {
         let conn = Connection::open_in_memory().unwrap();
         super::super::apply(&conn).unwrap();
+        // Seed a commit WITHOUT a matching commit_fts row — the out-of-sync state from #51.
         conn.execute(
-            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
-             VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0)",
-            [],
-        )
-        .unwrap();
-        // Seed a chunk WITHOUT a matching chunk_fts row — the out-of-sync state from #51.
-        conn.execute(
-            "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
-                                start_line, end_line, text, text_hash)
-             VALUES (1, 'symbol', 'alpha', 0, 10, 1, 5, 'fn alpha() { beta() }', 'th')",
+            "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s,
+                                     committed_at_s, subject, body)
+             VALUES ('abc', 'A', 'a@e', 0, 0, 'fix the alpha regression', 'details about beta')",
             [],
         )
         .unwrap();
 
-        super::rebuild_fts(&conn).unwrap();
+        super::rebuild_commit_fts(&conn).unwrap();
 
         let hits: i64 = conn
-            .query_row("SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'alpha'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM commit_fts WHERE commit_fts MATCH 'alpha'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(hits, 1, "rebuilt FTS index must be queryable and contain the chunk");
+        assert_eq!(hits, 1, "rebuilt commit_fts index must be queryable and contain the commit");
     }
 }

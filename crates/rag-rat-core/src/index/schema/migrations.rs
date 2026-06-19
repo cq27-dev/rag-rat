@@ -707,6 +707,29 @@ pub(crate) fn apply_chunk_text_compression_tables(conn: &Connection) -> rusqlite
     )
 }
 
+/// V026 (#77 Phase 2): recreate `chunk_fts` as a CONTENTLESS FTS5 index (it was external-content,
+/// `content='chunks'`) and repopulate it from `chunks.text` — which still exists at migration time
+/// (the column drop is the later V027). Going contentless is the prerequisite for dropping
+/// `chunks.text`: an external-content index re-reads that column on every rebuild. After this,
+/// tokens are written inline at index time (`write_fts`), so the column drop can't break the index.
+/// DROP+CREATE (not idempotent `IF NOT EXISTS`) is intended: a pre-V026 DB has the external-content
+/// table and must be converted; a fresh DB already has the contentless table from the baseline and
+/// this rebuilds it empty (the SELECT over zero chunks is a no-op).
+pub(crate) fn apply_contentless_chunk_fts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS chunk_fts;
+        CREATE VIRTUAL TABLE chunk_fts USING fts5(
+            text,
+            content='',
+            contentless_delete=1,
+            tokenize='porter'
+        );
+        INSERT INTO chunk_fts(rowid, text) SELECT id, text FROM chunks;
+        ",
+    )
+}
+
 pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     let legacy_table: Option<String> = conn
         .query_row(
@@ -1036,6 +1059,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_023_ID => Some(23),
             MIGRATION_024_ID => Some(24),
             MIGRATION_025_ID => Some(25),
+            MIGRATION_026_ID => Some(26),
             _ => None,
         })
         .max()
@@ -1070,6 +1094,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_023_ID
             | MIGRATION_024_ID
             | MIGRATION_025_ID
+            | MIGRATION_026_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1101,6 +1126,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_023_ID => migration.checksum != MIGRATION_023_CHECKSUM,
         MIGRATION_024_ID => migration.checksum != MIGRATION_024_CHECKSUM,
         MIGRATION_025_ID => migration.checksum != MIGRATION_025_CHECKSUM,
+        MIGRATION_026_ID => migration.checksum != MIGRATION_026_CHECKSUM,
         _ => false,
     }
 }
