@@ -512,6 +512,12 @@ pub(crate) fn reconcile_with_options_progress(
         if options.force { "" } else { scan.model_id },
         options.changed_first,
     )?;
+    // One dict-bound decompressor for the whole run: each `select_reconcile_batch` loads text for
+    // its batch from the compressed `chunk_text` store (#77 Phase 2), and reusing this
+    // decompressor keeps the ~112 KB dict SELECT + dictionary prep to once per run rather than
+    // once per batch.
+    let dict = crate::query::chunk_text_dict(conn)?;
+    let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
     let mut cursor = 0usize;
     let mut processed_ids: HashSet<i64> = HashSet::new();
     let mut remaining = options.limit.map(u64::from);
@@ -543,7 +549,8 @@ pub(crate) fn reconcile_with_options_progress(
         if batch_ids.is_empty() {
             break; // candidate list exhausted
         }
-        let selected = select_reconcile_batch(conn, &scan, &batch_ids, &options)?;
+        let selected =
+            select_reconcile_batch(conn, &scan, &batch_ids, &options, &mut decompressor)?;
         if selected.jobs.is_empty() {
             // Every id in this batch was filtered (ineligible/already current); keep walking the
             // rest of the candidate list rather than stopping.
@@ -667,16 +674,22 @@ pub(crate) fn embedding_policy_skip_summary(
     // The previous `current_chunks(conn, None)` loaded ALL chunk rows — including each chunk's full
     // `text` — into a `Vec` just to produce this count. On a kernel-sized index (~4.2M chunks) that
     // is ~4 GB resident for a summary that keeps nothing per row, and it runs on every reconcile
-    // (and `reconcile_plan`), so it dominated `index --full` peak memory. Same WHERE filter
-    // (`chunks.text IS NOT NULL`) and the same `embedding_policy_for_chunk`, so the counts are
-    // identical; only the column set is leaner (no `chunk_embeddings` join — policy ignores it).
+    // (and `reconcile_plan`), so it dominated `index --full` peak memory. The same
+    // `embedding_policy_for_chunk` runs over the same chunks, so the counts are identical.
+    //
+    // Chunk text comes from the compressed `chunk_text` store (#77 Phase 2); `chunks.text` is the
+    // LEFT-JOIN fallback for a chunk with no blob yet. One dict-bound decompressor for the whole
+    // stream (dict loaded once, reused per row). The old `WHERE chunks.text IS NOT NULL` was
+    // vacuous (text is NOT NULL in the schema), so it's dropped.
+    let dict = crate::query::chunk_text_dict(conn)?;
+    let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
     let mut stmt = conn.prepare(
         "
         SELECT files.path, files.language, files.kind, chunks.chunk_kind, chunks.symbol_path,
-               chunks.text
+               chunks.text, chunk_text.blob, chunk_text.raw_len
         FROM chunks
         JOIN files ON files.id = chunks.file_id
-        WHERE chunks.text IS NOT NULL
+        LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
         ",
     )?;
     let mut rows = stmt.query([])?;
@@ -686,7 +699,12 @@ pub(crate) fn embedding_policy_skip_summary(
         let file_kind = row.get::<_, String>(2)?;
         let chunk_kind = row.get::<_, String>(3)?;
         let symbol_path = row.get::<_, Option<String>>(4)?;
-        let text = row.get::<_, String>(5)?;
+        let text = crate::index::text_compression::ChunkTextRow {
+            fallback: row.get(5)?,
+            blob: row.get(6)?,
+            raw_len: row.get(7)?,
+        }
+        .resolve(&mut decompressor)?;
         let decision = embedding_policy_for_chunk(
             std::path::Path::new(&path),
             &language,
