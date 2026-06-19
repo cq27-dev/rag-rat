@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.7.0...rag-rat-core-v0.8.0) - 2026-06-19
+
+### Added
+
+- *(index)* intern symbol qualified_name into the shared name_strings pool ([#224](https://github.com/cq27-dev/rag-rat/pull/224)) ([#227](https://github.com/cq27-dev/rag-rat/pull/227))
+- *(index)* dictionary-zstd chunk-text compression + drop chunks.text (#77 Phase 2) ([#225](https://github.com/cq27-dev/rag-rat/pull/225))
+- *(serve)* worktree-aware serving — linked git worktrees as branch overlays ([#219](https://github.com/cq27-dev/rag-rat/pull/219))
+- *(git)* move all runtime git operations to gix (gitoxide) ([#212](https://github.com/cq27-dev/rag-rat/pull/212)) ([#213](https://github.com/cq27-dev/rag-rat/pull/213))
+- *(graph)* synthesize message-dispatch (actor-channel / enum) edges ([#200](https://github.com/cq27-dev/rag-rat/pull/200)) ([#206](https://github.com/cq27-dev/rag-rat/pull/206))
+- *(graph)* zero-caller find_callers is never low completeness ([#200](https://github.com/cq27-dev/rag-rat/pull/200)) ([#205](https://github.com/cq27-dev/rag-rat/pull/205))
+- *(symbol)* exclude generated bindings from symbol search by default ([#202](https://github.com/cq27-dev/rag-rat/pull/202)) ([#204](https://github.com/cq27-dev/rag-rat/pull/204))
+- *(oracle)* add py-django corpus + tolerate diagnostic exit codes (#182 groundwork) ([#198](https://github.com/cq27-dev/rag-rat/pull/198))
+- *(oracle)* opt-in external-resolution health floor for npm-style corpora ([#185](https://github.com/cq27-dev/rag-rat/pull/185)) ([#196](https://github.com/cq27-dev/rag-rat/pull/196))
+- *(oracle)* scip-java (Kotlin) backend ([#193](https://github.com/cq27-dev/rag-rat/pull/193))
+- *(impact)* compact repo-memory view by default; full bodies on request ([#37](https://github.com/cq27-dev/rag-rat/pull/37)) ([#194](https://github.com/cq27-dev/rag-rat/pull/194))
+
+### Fixed
+
+- *(parser)* bound tree-sitter parse with a wall-clock budget ([#210](https://github.com/cq27-dev/rag-rat/pull/210)) ([#211](https://github.com/cq27-dev/rag-rat/pull/211))
+- *(graph)* synthesize message-dispatch (actor-channel / enum) edges ([#200](https://github.com/cq27-dev/rag-rat/pull/200)) ([#208](https://github.com/cq27-dev/rag-rat/pull/208))
+- *(symbol)* accept a sym_<hex> handle in the ref slot ([#201](https://github.com/cq27-dev/rag-rat/pull/201)) ([#203](https://github.com/cq27-dev/rag-rat/pull/203))
+
+### Other
+
+- *(impact)* stop scanning chunks.text in impact_surface (#77 Phase 1) ([#223](https://github.com/cq27-dev/rag-rat/pull/223))
+- *(oracle)* pin indexer dep tree + lock corpus installs (#185 items 2-3) ([#197](https://github.com/cq27-dev/rag-rat/pull/197))
+
 ## [0.7.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.6.0...rag-rat-core-v0.7.0) - 2026-06-16
 
 ### Added
