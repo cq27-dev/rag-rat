@@ -58,7 +58,12 @@ impl<'a> ChunkCompressor<'a> {
 
 /// Decompress one chunk blob. `capacity` is an upper bound on the decompressed size — store the
 /// original byte length per row and pass it; a too-small value errors rather than truncating. An
-/// empty `dict` means the blob was written without a dictionary (see [`compress`]).
+/// empty `dict` means the blob was written without a dictionary (see [`ChunkCompressor`]).
+///
+/// Single-shot convenience — production read paths all reuse a [`ChunkDecompressor`] across a batch
+/// (the per-call dictionary prep is the cost), so this now serves only round-trip tests (#77 Phase
+/// 2).
+#[cfg(test)]
 pub(crate) fn decompress(blob: &[u8], dict: &[u8], capacity: usize) -> Result<Vec<u8>> {
     if dict.is_empty() {
         return Ok(zstd::bulk::decompress(blob, capacity)?);

@@ -40,8 +40,24 @@ pub struct ReadChunk {
 }
 
 pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<ReadChunk>> {
-    // Text comes from the compressed store (#77 Phase 2); chunks.text is the LEFT-JOIN fallback for
-    // a chunk with no chunk_text row yet (mid-migration / incremental before a dict existed).
+    // One-shot read: load the dict and build a decompressor for this call. Batch readers that loop
+    // over many chunk ids (`stale_hit_paths`, eval) should build ONE decompressor and call
+    // [`read_chunk_with`] instead — the per-call dict SELECT + dictionary prep is ~20x the
+    // decompress itself, so reusing it across a batch is the win (#77 Phase 2 read-path perf).
+    let dict = chunk_text_dict(conn)?;
+    let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
+    read_chunk_with(conn, chunk_id, &mut decompressor)
+}
+
+/// Read one chunk, resolving its text through a caller-owned dict-bound decompressor (reused across
+/// a batch). Text comes from the compressed `chunk_text` store (#77 Phase 2); `chunks.text` is the
+/// LEFT-JOIN fallback for a chunk with no blob yet (mid-migration / incremental before a dict).
+pub(crate) fn read_chunk_with(
+    conn: &Connection,
+    chunk_id: i64,
+    decompressor: &mut crate::index::text_compression::ChunkDecompressor,
+) -> anyhow::Result<Option<ReadChunk>> {
+    use crate::index::text_compression::ChunkTextRow;
     let row = conn
         .query_row(
             "
@@ -64,25 +80,19 @@ pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<Rea
                         start_line: row.get(4)?,
                         end_line: row.get(5)?,
                         symbol_path: row.get(6)?,
-                        text: row.get(7)?,
+                        text: String::new(),
                         graph: None,
                         memories: Vec::new(),
                     },
-                    row.get::<_, Option<Vec<u8>>>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
+                    ChunkTextRow { fallback: row.get(7)?, blob: row.get(8)?, raw_len: row.get(9)? },
                 ))
             },
         )
         .optional()?;
-    let Some((mut chunk, blob, raw_len)) = row else {
+    let Some((mut chunk, text_row)) = row else {
         return Ok(None);
     };
-    if let (Some(blob), Some(raw_len)) = (blob, raw_len) {
-        let dict = chunk_text_dict(conn)?;
-        let bytes =
-            crate::index::text_compression::decompress(&blob, &dict, raw_len.max(0) as usize)?;
-        chunk.text = String::from_utf8(bytes)?;
-    }
+    chunk.text = text_row.resolve(decompressor)?;
     Ok(Some(chunk))
 }
 

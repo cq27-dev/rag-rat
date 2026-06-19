@@ -392,7 +392,21 @@ impl IndexDatabase {
     }
 
     fn read_chunk_current(&self, chunk_id: i64) -> anyhow::Result<Option<crate::query::ReadChunk>> {
-        let Some(mut chunk) = crate::query::read_chunk(self.storage.connection(), chunk_id)? else {
+        let dict = crate::query::chunk_text_dict(self.storage.connection())?;
+        let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
+        self.read_chunk_current_with(chunk_id, &mut decompressor)
+    }
+
+    /// Live-revalidating chunk read that resolves text through a caller-owned, dict-bound
+    /// decompressor (reused across a batch) rather than reloading the dict per call.
+    pub(crate) fn read_chunk_current_with(
+        &self,
+        chunk_id: i64,
+        decompressor: &mut crate::index::text_compression::ChunkDecompressor,
+    ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
+        let Some(mut chunk) =
+            crate::query::read_chunk_with(self.storage.connection(), chunk_id, decompressor)?
+        else {
             return Ok(None);
         };
         // Under a LINKED-WORKTREE OVERLAY scope, `source_root` is the MAIN checkout — NOT the

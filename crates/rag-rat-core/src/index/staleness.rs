@@ -117,6 +117,11 @@ impl IndexDatabase {
         let Some(root) = self.storage.source_root() else {
             return Ok(Vec::new());
         };
+        // One dict-bound decompressor for the whole hit set: this loops `read_chunk` per hit, and
+        // the per-call dict SELECT + dictionary prep is ~20x the decompress itself, so reusing it
+        // across the batch keeps the healing-search check cheap (#77 Phase 2 read-path perf).
+        let dict = crate::query::chunk_text_dict(self.storage.connection())?;
+        let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
         let mut stale = Vec::new();
         let mut seen = BTreeSet::new();
         for hit in hits {
@@ -128,7 +133,11 @@ impl IndexDatabase {
                 stale.push(hit.path.clone());
                 continue;
             };
-            let chunk = crate::query::read_chunk(self.storage.connection(), hit.chunk_id)?;
+            let chunk = crate::query::read_chunk_with(
+                self.storage.connection(),
+                hit.chunk_id,
+                &mut decompressor,
+            )?;
             let Some(chunk) = chunk else {
                 stale.push(hit.path.clone());
                 continue;
