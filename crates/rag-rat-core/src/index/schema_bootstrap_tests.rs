@@ -12457,3 +12457,68 @@ fn candidate_components_unchanged_when_clone_token_df_is_empty() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// The `files.generated = 0` predicate is a READ-SIDE filter: generated files are still
+/// fingerprinted on write but their symbols must not appear in clone components. This test proves
+/// the filter is doing the exclusion (not a missing fingerprint row).
+#[test]
+fn candidate_components_exclude_generated_files_via_read_filter() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    // Two renamed clones — same fixture as
+    // candidate_components_group_renamed_clones_and_exclude_unrelated.
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(store: Db) -> i32 { let o = store.get(20); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Baseline: both files non-generated — one clone component of 2.
+    let before = db.candidate_clone_components().expect("components before marking generated");
+    assert_eq!(before.len(), 1, "baseline: one clone component: {before:?}");
+    assert_eq!(before[0].len(), 2, "baseline component has 2 members: {before:?}");
+
+    // Mark b.rs as generated in the REAL base table (`temp.files` is a view; can't UPDATE it).
+    // This tests that the `files.generated = 0` predicate in the read query does the exclusion;
+    // the write rows (fingerprints/postings) are left intact to prove it's a read-side filter.
+    let conn = db.storage.connection();
+    let updated = conn
+        .execute("UPDATE main.files SET generated = 1 WHERE path LIKE '%b.rs'", [])
+        .unwrap();
+    assert_eq!(updated, 1, "exactly one file row marked generated");
+
+    // b.rs's symbols MUST still have fingerprint rows (proves it's the read filter, not a missing
+    // row).
+    let fp_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM symbol_fingerprints sf
+             JOIN symbols ON symbols.id = sf.symbol_id
+             JOIN main.files ON main.files.id = symbols.file_id
+             WHERE main.files.path LIKE '%b.rs' AND sf.normalizer_kind = 'baseline'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(fp_count > 0, "b.rs still has fingerprint rows after marking generated: {fp_count}");
+
+    // After marking b.rs generated the read filter must drop it — no component pairs a with b.
+    let after = db.candidate_clone_components().expect("components after marking generated");
+    let has_b_pair = after.iter().any(|component| {
+        // Any component that contained b.rs's symbol alongside a.rs's symbol would be size >= 2.
+        // Since b.rs is the only partner for a.rs, if a.rs has no partner the component is gone.
+        component.len() >= 2
+    });
+    assert!(
+        !has_b_pair,
+        "generated b.rs must be excluded from clone components by the read filter: {after:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

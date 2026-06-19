@@ -88,12 +88,15 @@ fn candidate_pairs(conn: &Connection) -> anyhow::Result<Vec<(i64, i64)>> {
 /// via LEFT JOIN + COALESCE so a missing-df token is never dropped (design rev-4 §2).
 fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>> {
     // Scoped baseline fingerprints: struct_hash + token_len per in-scope symbol.
+    // `files.generated = 0` excludes generated files (e.g. `src/generated/…`, `.d.ts`) from the
+    // candidate read — they are fingerprinted on write but must not enter clone components.
     let mut fp_stmt = conn.prepare(
         "SELECT sf.symbol_id, sf.struct_hash, sf.token_len
          FROM symbol_fingerprints sf
          JOIN symbols ON symbols.id = sf.symbol_id
          JOIN files ON files.id = symbols.file_id
-         WHERE sf.normalizer_kind = 'baseline'",
+         WHERE sf.normalizer_kind = 'baseline'
+           AND files.generated = 0",
     )?;
     let mut bags: BTreeMap<i64, SymbolBag> = fp_stmt
         .query_map([], |row| {
@@ -109,6 +112,8 @@ fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>
 
     // Full token bag per scoped baseline symbol, with each token's df LEFT-JOINed + COALESCEd to
     // the fallback sentinel (missing-df tokens must NOT be dropped — rev-4 §2).
+    // `files.generated = 0` mirrors the fingerprint load: only non-generated symbols get postings
+    // loaded, so their bags never enter the inverted index or the exact verify.
     let mut tok_stmt = conn.prepare(
         "SELECT stp.symbol_id, stp.token_hash, stp.freq, COALESCE(df.df, ?1)
          FROM symbol_token_postings stp
@@ -116,7 +121,8 @@ fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>
          JOIN files ON files.id = symbols.file_id
          LEFT JOIN clone_token_df df
            ON df.normalizer_kind = stp.normalizer_kind AND df.token_hash = stp.token_hash
-         WHERE stp.normalizer_kind = 'baseline'",
+         WHERE stp.normalizer_kind = 'baseline'
+           AND files.generated = 0",
     )?;
     let rows = tok_stmt.query_map([DF_FALLBACK], |row| {
         Ok((row.get::<_, i64>(0)?, TokenPosting {
