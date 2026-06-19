@@ -12,6 +12,7 @@ pub mod symbols;
 pub mod walker;
 
 pub(crate) mod chunk_text_store;
+pub(crate) mod clones;
 mod discovery;
 mod file_index;
 mod file_rows;

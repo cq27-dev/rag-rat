@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 28;
+pub const LATEST_SCHEMA_VERSION: u32 = 29;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -122,6 +122,11 @@ const MIGRATION_028_ID: &str = "028_intern_symbol_qualified_names";
 const MIGRATION_028_CHECKSUM: &str = "sha256:rag-rat-intern-symbol-qualified-names-v28";
 const MIGRATION_028_DESCRIPTION: &str = "Intern symbols/logical_symbols qualified_name into the \
                                          shared name_strings pool, then drop the columns (#224)";
+const MIGRATION_029_ID: &str = "029_clone_fingerprint_tables";
+const MIGRATION_029_CHECKSUM: &str = "sha256:rag-rat-clone-fingerprint-tables-v29";
+const MIGRATION_029_DESCRIPTION: &str = "Add symbol_fingerprints + symbol_token_postings + \
+                                         clone_token_df + clone_refinements for clone detection \
+                                         (#215)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -389,6 +394,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_028_CHECKSUM,
         description: MIGRATION_028_DESCRIPTION,
         apply: apply_intern_symbol_qualified_names,
+    },
+    Migration {
+        id: MIGRATION_029_ID,
+        checksum: MIGRATION_029_CHECKSUM,
+        description: MIGRATION_029_DESCRIPTION,
+        apply: apply_clone_fingerprint_tables,
     },
 ];
 

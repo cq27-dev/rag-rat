@@ -1122,6 +1122,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_026_ID => Some(26),
             MIGRATION_027_ID => Some(27),
             MIGRATION_028_ID => Some(28),
+            MIGRATION_029_ID => Some(29),
             _ => None,
         })
         .max()
@@ -1159,6 +1160,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_026_ID
             | MIGRATION_027_ID
             | MIGRATION_028_ID
+            | MIGRATION_029_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1193,6 +1195,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_026_ID => migration.checksum != MIGRATION_026_CHECKSUM,
         MIGRATION_027_ID => migration.checksum != MIGRATION_027_CHECKSUM,
         MIGRATION_028_ID => migration.checksum != MIGRATION_028_CHECKSUM,
+        MIGRATION_029_ID => migration.checksum != MIGRATION_029_CHECKSUM,
         _ => false,
     }
 }
@@ -1280,6 +1283,62 @@ pub(crate) fn apply_drop_chunks_text(conn: &Connection) -> rusqlite::Result<()> 
         })?;
     conn.execute("ALTER TABLE chunks DROP COLUMN text", [])?;
     Ok(())
+}
+
+/// V029 (#215, rework R1): clone-detection fingerprint substrate. All tables are scope-INDEPENDENT
+/// — symbol_fingerprints/symbol_token_postings key by symbol_id (FK CASCADE discards them on
+/// reindex); clone_token_df is a derived selectivity cache; clone_refinements keys by content
+/// (class_key). NEVER add scope columns here (see mem_19ec7384a9b).
+///
+/// R1 replaces the MinHash/LSH fingerprint_bands table with a SourcererCC-style inverted-index
+/// pair: symbol_token_postings (per-symbol token bag) + clone_token_df (document-frequency cache).
+pub(crate) const CLONE_FINGERPRINT_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS symbol_fingerprints(
+        symbol_id          INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+        normalizer_kind    TEXT    NOT NULL,            -- baseline | scip
+        normalizer_version INTEGER NOT NULL,
+        oracle_run_id      INTEGER,                     -- NULL for baseline rows
+        struct_hash        TEXT    NOT NULL,
+        token_len          INTEGER NOT NULL,
+        created_at_ms      INTEGER NOT NULL,
+        PRIMARY KEY (symbol_id, normalizer_kind)
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS idx_symbol_fingerprints_struct
+        ON symbol_fingerprints(normalizer_kind, struct_hash);
+    CREATE TABLE IF NOT EXISTS symbol_token_postings(
+        symbol_id       INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+        normalizer_kind TEXT    NOT NULL,
+        token_hash      INTEGER NOT NULL,              -- FNV-1a(token) as signed i64
+        freq            INTEGER NOT NULL,
+        PRIMARY KEY (symbol_id, normalizer_kind, token_hash)
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS idx_symbol_token_postings_inv
+        ON symbol_token_postings(normalizer_kind, token_hash);
+    CREATE TABLE IF NOT EXISTS clone_token_df(
+        normalizer_kind TEXT    NOT NULL,
+        token_hash      INTEGER NOT NULL,
+        df              INTEGER NOT NULL,
+        PRIMARY KEY (normalizer_kind, token_hash)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS clone_refinements(
+        class_key               TEXT    PRIMARY KEY,
+        language                TEXT    NOT NULL,
+        refine_mode             TEXT    NOT NULL,        -- baseline | scip
+        template                TEXT    NOT NULL,
+        variation_points_json   TEXT    NOT NULL CHECK (json_valid(variation_points_json)),
+        proposed_signature_json TEXT    NOT NULL CHECK (json_valid(proposed_signature_json)),
+        confidence              TEXT    NOT NULL,
+        anti_unify_coverage     REAL    NOT NULL,
+        lcs_ratio               REAL    NOT NULL,
+        refactorability         REAL    NOT NULL,
+        norm_version            INTEGER NOT NULL,
+        alignment_version       INTEGER NOT NULL,
+        created_at_ms           INTEGER NOT NULL
+    ) STRICT;
+";
+
+pub(crate) fn apply_clone_fingerprint_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(CLONE_FINGERPRINT_DDL)
 }
 
 /// V028 (#224): intern `symbols.qualified_name` + `logical_symbols.qualified_name` into the shared

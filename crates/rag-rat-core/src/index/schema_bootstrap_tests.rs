@@ -10491,13 +10491,12 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.storage
             .connection()
-            .execute("DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names'", [
-            ])
+            .execute("DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables'", [])
             .unwrap();
         assert_eq!(
             schema::status(db.storage.connection()).unwrap().state,
             schema::SchemaState::Older,
-            "removing the V028 ledger row makes the schema Older"
+            "removing the V029 ledger row makes the schema Older"
         );
     }
 
@@ -10522,7 +10521,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 28);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 29);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10596,6 +10595,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';
         DELETE FROM schema_version WHERE id = '027_drop_chunks_text';
         DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
+        DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
         ",
     )
     .unwrap();
@@ -10734,13 +10734,16 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
         ",
     )
     .unwrap();
-    // 3. Drop the V028 ledger row so the schema reads Older and the migration replays.
-    conn.execute("DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names'", [])
-        .unwrap();
+    // 3. Drop the V028 and V029 ledger rows so the schema reads Older and the migration replays.
+    conn.execute_batch(
+        "DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
+         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';",
+    )
+    .unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "removing the V028 ledger row makes the pre-V028 shape Older"
+        "removing the V028+V029 ledger rows makes the pre-V028 shape Older"
     );
 
     // --- Forward-migrate ---
@@ -12197,6 +12200,259 @@ fn impact_completeness_flags_a_dirty_callee_definition_file() {
         dirty.completeness_and_caveats.stale_files >= 1,
         "the dirty callee definition file must be flagged: {:?}",
         dirty.completeness_and_caveats
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
+    // Fresh DB: apply() must create the SourcererCC postings tables + refinements, and report
+    // Compatible at the latest version. fingerprint_bands must NOT exist (dropped in R1 rework).
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply");
+    for table in
+        ["symbol_fingerprints", "symbol_token_postings", "clone_token_df", "clone_refinements"]
+    {
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .expect("query");
+        assert_eq!(n, 1, "{table} should exist after apply()");
+    }
+    // fingerprint_bands was replaced by symbol_token_postings + clone_token_df in R1.
+    let bands: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fingerprint_bands'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query bands");
+    assert_eq!(bands, 0, "fingerprint_bands must not exist after R1 rework");
+
+    let status = crate::index::schema::status(&conn).expect("status");
+    assert_eq!(status.current_version, crate::index::schema::LATEST_SCHEMA_VERSION);
+    assert!(matches!(status.state, crate::index::schema::SchemaState::Compatible));
+
+    // Migrated DB: a DB at the prior baseline that runs migrate_forward gains the new tables too.
+    let conn2 = rusqlite::Connection::open_in_memory().expect("open2");
+    crate::index::schema::apply(&conn2).expect("apply2"); // already-latest is a no-op forward
+    crate::index::schema::migrate_forward(&conn2).expect("migrate_forward");
+    let postings: i64 = conn2
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND \
+             name='symbol_token_postings'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query2");
+    assert_eq!(postings, 1, "symbol_token_postings must exist after migrate_forward");
+    let df: i64 = conn2
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='clone_token_df'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query3");
+    assert_eq!(df, 1, "clone_token_df must exist after migrate_forward");
+}
+
+#[test]
+fn indexing_writes_baseline_fingerprints_for_functions() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two near-identical functions (renamed) + one trivial one that must be skipped.
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\npub fn \
+         load_order(store: Db) -> i32 { let o = store.get(20); validate(o); o + 1 }\npub fn \
+         tiny() -> i32 { 0 }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let conn = db.storage.connection();
+    let fps: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM symbol_fingerprints WHERE normalizer_kind='baseline'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fps, 2, "the two functions are fingerprinted; tiny() is below MIN_TOKENS");
+
+    // The inverted index carries postings for exactly the two fingerprinted symbols (R3).
+    let posting_symbols: i64 = conn
+        .query_row(
+            "SELECT count(DISTINCT symbol_id) FROM symbol_token_postings WHERE \
+             normalizer_kind='baseline'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        posting_symbols, 2,
+        "both fingerprinted functions get postings rows; tiny() does not"
+    );
+
+    // df is populated from the postings.
+    let df_rows: i64 =
+        conn.query_row("SELECT count(*) FROM clone_token_df", [], |r| r.get(0)).unwrap();
+    assert!(df_rows > 0, "clone_token_df is populated during indexing");
+
+    // The two functions are renamed clones, so they share tokens — at least one token's df >= 2.
+    let max_df: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(df), 0) FROM clone_token_df WHERE normalizer_kind='baseline'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(max_df >= 2, "a token shared by both clones has df >= 2, got {max_df}");
+
+    // Cascade: deleting a symbol drops its fingerprint AND postings rows (FK + reindex freshness).
+    conn.execute("DELETE FROM symbols", []).unwrap();
+    let after_fps: i64 =
+        conn.query_row("SELECT count(*) FROM symbol_fingerprints", [], |r| r.get(0)).unwrap();
+    assert_eq!(after_fps, 0, "fingerprints cascade on symbol delete");
+    let after_postings: i64 =
+        conn.query_row("SELECT count(*) FROM symbol_token_postings", [], |r| r.get(0)).unwrap();
+    assert_eq!(after_postings, 0, "postings cascade on symbol delete");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn candidate_components_group_renamed_clones_and_exclude_unrelated() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(store: Db) -> i32 { let o = store.get(20); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/c.rs"),
+        "pub fn parse_config(raw: String) -> Vec<u8> { let mut v = Vec::new(); for b in \
+         raw.bytes() { v.push(b ^ 7); } v }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let components = db.candidate_clone_components().expect("components");
+    // Exactly one component: the two renamed clones (a.rs + b.rs). parse_config in c.rs is
+    // structurally unrelated and must not join the component.
+    assert_eq!(components.len(), 1, "exactly one clone component: {components:?}");
+    assert_eq!(components[0].len(), 2, "the component is the two renamed clones: {components:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Adversarial containment (design rev-4 §8): a small function A whose entire token bag is
+/// contained inside a much larger function B (A's body pasted into B amid other statements).
+/// containment = overlap/min ≈ 1.0, but similarity = overlap/max ≈ 0.1 < THETA, so A and B are NOT
+/// a whole-symbol clone — they must not land in a common component. (The size prune `min_len >=
+/// ceil(THETA*max_len)` already excludes this pair before the exact verify.)
+#[test]
+fn candidate_components_reject_small_function_contained_in_large_one() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    // A: a ~20-token real Rust function.
+    let a_body = "let mut acc = 0; let p = compute(seed); acc += p; for q in items.iter() { acc \
+                  += transform(q); } acc";
+    std::fs::write(
+        root.join("src/a.rs"),
+        format!("pub fn small(seed: i32, items: Vec<i32>) -> i32 {{ {a_body} }}\n"),
+    )
+    .unwrap();
+    // B: a ~200-token function that CONTAINS all of A's tokens (A's body pasted in) amid ~10x more
+    // distinct statements, so B's token_len is roughly 10x A's. overlap/min(A) ≈ 1.0 but
+    // overlap/max(B) ≈ 0.1.
+    let mut filler = String::new();
+    for i in 0..40 {
+        filler.push_str(&format!(
+            "let v{i} = step{i}(base{i}, factor{i}) + delta{i}; total += v{i} * weight{i} - \
+             offset{i};\n"
+        ));
+    }
+    std::fs::write(
+        root.join("src/b.rs"),
+        format!(
+            "pub fn big(seed: i32, items: Vec<i32>, base: i32) -> i32 {{ let mut total = base; \
+             {filler} {a_body}; total += acc; total }}\n"
+        ),
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Sanity: both functions cleared MIN_TOKENS (so both are fingerprinted) and B is ~10x A.
+    let conn = db.storage.connection();
+    let lens: Vec<i64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT token_len FROM symbol_fingerprints WHERE normalizer_kind='baseline' ORDER \
+                 BY token_len",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    };
+    assert_eq!(lens.len(), 2, "both functions are fingerprinted: {lens:?}");
+    assert!(
+        lens[1] >= 5 * lens[0],
+        "B is much larger than A so overlap/max stays below THETA: {lens:?}"
+    );
+
+    let components = db.candidate_clone_components().expect("components");
+    assert!(
+        components.is_empty(),
+        "a small function contained in a large one is NOT a whole-symbol clone: {components:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// df is a selectivity hint only (design rev-4 §2, §8): emptying `clone_token_df` must NOT change
+/// the components found. The deterministic token order falls back to `token_hash` via LEFT JOIN +
+/// COALESCE, so no candidate is dropped — only the prefix prune loosens. Uses the
+/// two-renamed-clones fixture.
+#[test]
+fn candidate_components_unchanged_when_clone_token_df_is_empty() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(store: Db) -> i32 { let o = store.get(20); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let before = db.candidate_clone_components().expect("components before df delete");
+    assert_eq!(before.len(), 1, "baseline: one clone component: {before:?}");
+
+    db.storage.connection().execute("DELETE FROM clone_token_df", []).unwrap();
+
+    let after = db.candidate_clone_components().expect("components after df delete");
+    assert_eq!(
+        before, after,
+        "df is selectivity-only: emptying clone_token_df must not change components"
     );
 
     fs::remove_dir_all(root).unwrap();

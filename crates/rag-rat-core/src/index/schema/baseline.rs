@@ -600,6 +600,7 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_repo_memory_call_path_edges(conn)?;
     apply_graph_file_lookup_indexes(conn)?;
     interned_qualified_name_indexes(conn)?;
+    apply_clone_fingerprint_tables(conn)?;
     Ok(())
 }
 

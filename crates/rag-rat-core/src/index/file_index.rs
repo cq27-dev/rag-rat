@@ -118,7 +118,8 @@ impl IndexDatabase {
         // Inline/heal path: keep chunk_fts in sync per row (partial file replace would otherwise
         // desync the external-content index until the next forced rebuild).
         self.insert_chunks(ChunkInsertFile { file_id, source_revision: &sha256 }, &chunks)?;
-        self.insert_symbols(file_id, language, &symbols)?;
+        let symbol_ids = self.insert_symbols(file_id, language, &symbols)?;
+        self.store_symbol_fingerprints(language, path, text, &symbols, &symbol_ids)?;
         if kind != TargetKind::Generated && text.len() <= edges::MAX_GRAPH_PARSE_BYTES {
             edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
         }
@@ -183,6 +184,17 @@ impl IndexDatabase {
             &prepared.chunks,
         )?;
         let symbol_db_ids = self.insert_symbols(file_id, file.language, &prepared.symbols)?;
+        if let Some(root_dir) = self.storage.source_root()
+            && let Ok(text) = std::fs::read_to_string(root_dir.join(&file.relative_path))
+        {
+            self.store_symbol_fingerprints(
+                file.language,
+                &file.relative_path,
+                &text,
+                &prepared.symbols,
+                &symbol_db_ids,
+            )?;
+        }
         // Edge candidates were computed in the parallel prepare phase with LOCAL symbol indices;
         // remap them to the real DB ids just assigned.
         match graph {
@@ -207,6 +219,72 @@ impl IndexDatabase {
                 },
         }
         self.mark_fts_dirty()?;
+        Ok(())
+    }
+
+    /// Compute + persist baseline clone fingerprints for the file's function symbols (#215). A
+    /// fingerprint is a pure function of the symbol body, so it is scope-independent and keyed by
+    /// symbol_id; the FK cascade discards it when the symbol is removed on reindex. Re-parses the
+    /// file once to walk the AST (Plan 1 keeps this simple; if the kernel perf gate regresses, move
+    /// this into the parallel prepare phase).
+    fn store_symbol_fingerprints(
+        &self,
+        language: Language,
+        path: &Path,
+        text: &str,
+        symbols: &[Symbol],
+        symbol_ids: &[i64],
+    ) -> anyhow::Result<()> {
+        let Some(parsed) = parser::parse_file(path, language, text) else {
+            return Ok(());
+        };
+        let root = parsed.root();
+        let conn = self.storage.connection();
+        for (symbol, &symbol_id) in symbols.iter().zip(symbol_ids) {
+            if symbol.kind != "function" {
+                continue;
+            }
+            let Some(node) = root.descendant_for_byte_range(symbol.start_byte, symbol.end_byte)
+            else {
+                continue;
+            };
+            let Some(fp) = clones::fingerprint_symbol(node, text) else {
+                continue;
+            };
+            conn.prepare_cached(
+                "INSERT INTO symbol_fingerprints(symbol_id, normalizer_kind, normalizer_version, \
+                 oracle_run_id, struct_hash, token_len, created_at_ms)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+            )?
+            .execute(params![
+                symbol_id,
+                clones::NormalizerKind::Baseline.as_db_str(),
+                clones::NORM_VERSION,
+                fp.struct_hash,
+                fp.token_len,
+                now_ms(),
+            ])?;
+            // Write the inverted index: one posting row per distinct token, and bump the global
+            // document frequency for that token (#215). df is a selectivity hint only (the
+            // candidate read LEFT-JOINs + COALESCEs it), so the incremental/heal bump
+            // here is drift-tolerated; a full rebuild recomputes df authoritatively
+            // from postings (see rebuild.rs).
+            let normalizer_kind = clones::NormalizerKind::Baseline.as_db_str();
+            for &(token_hash, freq) in &fp.token_bag {
+                conn.prepare_cached(
+                    "INSERT INTO symbol_token_postings(symbol_id, normalizer_kind, token_hash, \
+                     freq)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(params![symbol_id, normalizer_kind, token_hash, freq])?;
+                conn.prepare_cached(
+                    "INSERT INTO clone_token_df(normalizer_kind, token_hash, df)
+                     VALUES (?1, ?2, 1)
+                     ON CONFLICT(normalizer_kind, token_hash) DO UPDATE SET df = df + 1",
+                )?
+                .execute(params![normalizer_kind, token_hash])?;
+            }
+        }
         Ok(())
     }
 

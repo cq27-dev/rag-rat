@@ -202,3 +202,10 @@ and uses `gh api`; normal query tools read only the local cache.
 
 Releases are automated by [release-plz](https://release-plz.dev) (the three crates ship in lockstep;
 see [`docs/releasing.md`](docs/releasing.md)). `rag-rat` is MIT-licensed — see [LICENSE](LICENSE).
+
+## Prior art
+
+rag-rat's clone-detection design is inspired by SourcererCC's scalable token-bag candidate
+generation, NiCad's normalized near-miss clone-detection framing, GumTree's move-aware AST
+differencing, and anti-unification / least-general generalization for template extraction. Planned
+fragment-level mining and copy-paste bug heuristics are inspired by CP-Miner.

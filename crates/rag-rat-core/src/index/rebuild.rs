@@ -88,6 +88,14 @@ impl IndexDatabase {
             // needs the bulk 'rebuild' here (#77 Phase 2).
             db.finalize_full_rebuild_fts()?;
             mem_trace("after finalize_full_rebuild_fts");
+            // Recompute clone token document-frequency authoritatively from the postings just
+            // written (#215). The per-symbol incremental bump in store_symbol_fingerprints drifts
+            // over edits; a full rebuild owns the whole checkout, so derive df exactly here. df is
+            // a selectivity hint only (candidate read LEFT-JOINs + COALESCEs it), never
+            // a correctness input — but keeping it exact maximizes the rare-first
+            // sub-block prune.
+            db.refresh_clone_token_df()?;
+            mem_trace("after refresh_clone_token_df");
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
             db.storage.execute_batch("COMMIT")?;
             mem_trace("after COMMIT");
@@ -105,6 +113,21 @@ impl IndexDatabase {
         let _ = db.storage.execute_batch("PRAGMA synchronous = NORMAL;");
         result?;
         Ok(db)
+    }
+
+    /// Recompute `clone_token_df` exactly from `symbol_token_postings` (#215). One GROUP BY over
+    /// the postings replaces the drift-prone incremental bumps with the authoritative document
+    /// frequency (count of distinct symbols containing each token per normalizer). Runs inside
+    /// the rebuild transaction so the df and the postings it summarizes commit atomically.
+    fn refresh_clone_token_df(&self) -> anyhow::Result<()> {
+        self.storage.execute_batch(
+            "DELETE FROM clone_token_df;
+             INSERT INTO clone_token_df(normalizer_kind, token_hash, df)
+               SELECT normalizer_kind, token_hash, COUNT(DISTINCT symbol_id)
+               FROM symbol_token_postings
+               GROUP BY normalizer_kind, token_hash;",
+        )?;
+        Ok(())
     }
 
     fn clear_full_rebuild_tables(&self) -> anyhow::Result<()> {
