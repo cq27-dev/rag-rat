@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use crate::index::ai;
+use crate::index::{ai, text_compression};
 use crate::query::graph_meta::GraphEvidence;
 
 const BM25_WEIGHT: f64 = 0.45;
@@ -266,10 +266,11 @@ fn bm25_candidates(
         SELECT chunks.id, files.path, files.language, files.kind,
                chunks.start_line, chunks.end_line, chunks.symbol_path,
                bm25(chunk_fts) AS score,
-               chunks.text
+               chunks.text, chunk_text.blob, chunk_text.raw_len
         FROM chunk_fts
         JOIN chunks ON chunks.id = chunk_fts.rowid
         JOIN files ON files.id = chunks.file_id
+        LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
         WHERE chunk_fts MATCH ?1
           AND {generated_filter}
         ORDER BY score
@@ -277,27 +278,61 @@ fn bm25_candidates(
         "
     );
     let mut stmt = conn.prepare(&sql)?;
+    // Snippet text comes from the compressed store (#77); collect blob + raw_len here and
+    // decompress in the post-loop — decompress returns anyhow::Result, which can't cross the
+    // rusqlite closure.
     let rows = stmt.query_map(params![fts_query, limit], |row| {
-        let text: String = row.get(8)?;
-        Ok(SearchHit {
-            chunk_id: row.get(0)?,
-            path: row.get(1)?,
-            language: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            end_line: row.get(5)?,
-            symbol_path: row.get(6)?,
-            score: row.get(7)?,
-            // Placeholder — RankedHit::finish sets the real mode from the scored components.
-            retrieval_mode: String::new(),
-            summary: snippet(&text, query),
-            graph: None,
-            score_components: None,
-            importance: None,
-        })
+        Ok((
+            SearchHit {
+                chunk_id: row.get(0)?,
+                path: row.get(1)?,
+                language: row.get(2)?,
+                kind: row.get(3)?,
+                start_line: row.get(4)?,
+                end_line: row.get(5)?,
+                symbol_path: row.get(6)?,
+                score: row.get(7)?,
+                // Placeholder — RankedHit::finish sets the real mode from the scored components.
+                retrieval_mode: String::new(),
+                summary: String::new(),
+                graph: None,
+                score_components: None,
+                importance: None,
+            },
+            ChunkTextRow { fallback: row.get(8)?, blob: row.get(9)?, raw_len: row.get(10)? },
+        ))
     })?;
+    let collected = collect_rows(rows)?;
+    let dict = crate::query::chunk_text_dict(conn)?;
+    let mut decompressor = text_compression::ChunkDecompressor::new(&dict)?;
+    let mut hits = Vec::with_capacity(collected.len());
+    for (mut hit, text_row) in collected {
+        hit.summary = snippet(&text_row.resolve(&mut decompressor)?, query);
+        hits.push(hit);
+    }
+    Ok(hits)
+}
 
-    collect_rows(rows)
+/// A chunk's stored text as fetched for a search hit (#77): the compressed `chunk_text` blob +
+/// `raw_len`, with `chunks.text` as the fallback for a chunk not yet in the store. [`resolve`]
+/// decompresses the blob (or returns the fallback).
+struct ChunkTextRow {
+    fallback: String,
+    blob: Option<Vec<u8>>,
+    raw_len: Option<i64>,
+}
+
+impl ChunkTextRow {
+    fn resolve(
+        self,
+        decompressor: &mut text_compression::ChunkDecompressor,
+    ) -> anyhow::Result<String> {
+        match (self.blob, self.raw_len) {
+            (Some(blob), Some(raw_len)) =>
+                Ok(String::from_utf8(decompressor.decompress(&blob, raw_len.max(0) as usize)?)?),
+            _ => Ok(self.fallback),
+        }
+    }
 }
 
 fn vector_candidates(
@@ -316,11 +351,12 @@ fn vector_candidates(
         "
         SELECT chunks.id, files.path, files.language, files.kind,
                chunks.start_line, chunks.end_line, chunks.symbol_path,
-               chunks.text, chunk_embeddings.vector_blob
+               chunks.text, chunk_embeddings.vector_blob, chunk_text.blob, chunk_text.raw_len
         FROM chunk_embeddings
         JOIN ai_models ON ai_models.model_id = chunk_embeddings.model_id
         JOIN chunks ON chunks.id = chunk_embeddings.chunk_id
         JOIN files ON files.id = chunks.file_id
+        LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
         WHERE chunk_embeddings.model_id = ?1
           AND ai_models.installed = 1
           AND ai_models.disabled = 0
@@ -344,8 +380,7 @@ fn vector_candidates(
             ai::EMBEDDING_TEXT_VERSION
         ],
         |row| {
-            let text: String = row.get(7)?;
-            let blob: Vec<u8> = row.get(8)?;
+            let vector_blob: Vec<u8> = row.get(8)?;
             Ok((
                 SearchHit {
                     chunk_id: row.get(0)?,
@@ -359,23 +394,29 @@ fn vector_candidates(
                     // Placeholder — RankedHit::finish sets the real mode from the scored
                     // components.
                     retrieval_mode: String::new(),
-                    summary: snippet(&text, query),
+                    // Filled from the compressed store in the post-loop (decompress can't cross the
+                    // rusqlite closure).
+                    summary: String::new(),
                     graph: None,
                     score_components: None,
                     importance: None,
                 },
-                blob,
+                vector_blob,
+                ChunkTextRow { fallback: row.get(7)?, blob: row.get(9)?, raw_len: row.get(10)? },
             ))
         },
     )?;
+    let collected = collect_rows(rows)?;
+    let dict = crate::query::chunk_text_dict(conn)?;
+    let mut decompressor = text_compression::ChunkDecompressor::new(&dict)?;
     let mut hits = Vec::new();
-    for row in rows {
-        let (hit, blob) = row?;
-        let Some(vector) = ai::decode_vector(&blob, query_embedding.dim) else {
+    for (mut hit, vector_blob, text_row) in collected {
+        let Some(vector) = ai::decode_vector(&vector_blob, query_embedding.dim) else {
             continue;
         };
         let similarity = dot(&query_embedding.vector, &vector);
         if similarity > 0.0 {
+            hit.summary = snippet(&text_row.resolve(&mut decompressor)?, query);
             hits.push((hit, similarity));
         }
     }

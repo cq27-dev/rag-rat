@@ -67,6 +67,29 @@ pub(crate) fn decompress(blob: &[u8], dict: &[u8], capacity: usize) -> Result<Ve
     Ok(decompressor.decompress(blob, capacity)?)
 }
 
+/// A decompressor bound to the shared dictionary once, reused across many chunks — the batch read
+/// paths (lexical snippets, the embedding scan) decompress many blobs, and the per-call
+/// [`decompress`] re-prepares the dictionary every time (~7x slower). An empty dict means
+/// no-dictionary (plain zstd). `capacity` per call is the row's stored `raw_len`.
+pub(crate) struct ChunkDecompressor<'a>(Option<zstd::bulk::Decompressor<'a>>);
+
+impl<'a> ChunkDecompressor<'a> {
+    pub(crate) fn new(dict: &'a [u8]) -> Result<Self> {
+        Ok(Self(if dict.is_empty() {
+            None
+        } else {
+            Some(zstd::bulk::Decompressor::with_dictionary(dict)?)
+        }))
+    }
+
+    pub(crate) fn decompress(&mut self, blob: &[u8], capacity: usize) -> Result<Vec<u8>> {
+        match &mut self.0 {
+            Some(decompressor) => Ok(decompressor.decompress(blob, capacity)?),
+            None => Ok(zstd::bulk::decompress(blob, capacity)?),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
