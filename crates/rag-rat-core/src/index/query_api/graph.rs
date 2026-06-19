@@ -599,17 +599,32 @@ impl IndexDatabase {
         symbol: &crate::query::symbol::SymbolHit,
         limit: u32,
     ) -> anyhow::Result<Vec<SearchHit>> {
-        let mut stmt = self.storage.connection().prepare(
+        // The text-mention fallback runs `chunk_fts MATCH` (#77) — you can't LIKE a compressed blob
+        // — so the FTS index must be fresh first (same precondition as search/impact). Omitted when
+        // the symbol name has no FTS token (then it's symbol_path matching only).
+        self.ensure_fts_fresh()?;
+        let conn = self.storage.connection();
+        let name_like = format!("%{}%", symbol.name);
+        let fts = crate::query::impact::fts_phrase_query(&symbol.name);
+        let text_clause = if fts.is_some() {
+            "OR chunks.id IN (SELECT c2.id FROM chunks AS c2 JOIN chunk_fts ON chunk_fts.rowid = \
+             c2.id WHERE chunk_fts MATCH ?4)"
+        } else {
+            ""
+        };
+        let sql = format!(
             "
             SELECT chunks.id, files.path, files.language, files.kind,
-                   chunks.start_line, chunks.end_line, chunks.symbol_path, chunks.text
+                   chunks.start_line, chunks.end_line, chunks.symbol_path,
+                   chunks.text, chunk_text.blob, chunk_text.raw_len
             FROM chunks
             JOIN files ON files.id = chunks.file_id
+            LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
             WHERE files.path = ?1
               AND (
                 chunks.symbol_path = ?2
                 OR chunks.symbol_path LIKE ?3
-                OR chunks.text LIKE ?4
+                {text_clause}
               )
             ORDER BY
               CASE
@@ -619,38 +634,51 @@ impl IndexDatabase {
               END,
               chunks.start_line
             LIMIT ?5
-            ",
-        )?;
+            "
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        // ?4 is bound unconditionally (unreferenced when `text_clause` is empty); decompress the
+        // snippet text in the post-loop (decompress can't cross the rusqlite closure).
         let rows = stmt.query_map(
             params![
                 symbol.path,
                 symbol.qualified_name,
-                format!("%{}%", symbol.name),
-                format!("%{}%", symbol.name),
+                name_like,
+                fts.unwrap_or_default(),
                 i64::from(limit.max(1)),
             ],
             |row| {
-                let text: String = row.get(7)?;
-                Ok(SearchHit {
-                    chunk_id: row.get(0)?,
-                    path: row.get(1)?,
-                    language: row.get(2)?,
-                    kind: row.get(3)?,
-                    start_line: row.get(4)?,
-                    end_line: row.get(5)?,
-                    symbol_path: row.get(6)?,
-                    score: 1.0,
-                    retrieval_mode: "lexical".to_string(),
-                    summary: bounded_summary(&text),
-                    graph: None,
-                    score_components: None,
-                    importance: None,
-                })
+                Ok((
+                    SearchHit {
+                        chunk_id: row.get(0)?,
+                        path: row.get(1)?,
+                        language: row.get(2)?,
+                        kind: row.get(3)?,
+                        start_line: row.get(4)?,
+                        end_line: row.get(5)?,
+                        symbol_path: row.get(6)?,
+                        score: 1.0,
+                        retrieval_mode: "lexical".to_string(),
+                        summary: String::new(),
+                        graph: None,
+                        score_components: None,
+                        importance: None,
+                    },
+                    crate::index::text_compression::ChunkTextRow {
+                        fallback: row.get(7)?,
+                        blob: row.get(8)?,
+                        raw_len: row.get(9)?,
+                    },
+                ))
             },
         )?;
-        let mut hits = Vec::new();
-        for row in rows {
-            hits.push(row?);
+        let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let dict = crate::query::chunk_text_dict(conn)?;
+        let mut decompressor = crate::index::text_compression::ChunkDecompressor::new(&dict)?;
+        let mut hits = Vec::with_capacity(collected.len());
+        for (mut hit, text_row) in collected {
+            hit.summary = bounded_summary(&text_row.resolve(&mut decompressor)?);
+            hits.push(hit);
         }
         Ok(hits)
     }

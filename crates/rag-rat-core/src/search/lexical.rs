@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
+use crate::index::text_compression::ChunkTextRow;
 use crate::index::{ai, text_compression};
 use crate::query::graph_meta::GraphEvidence;
 
@@ -311,28 +312,6 @@ fn bm25_candidates(
         hits.push(hit);
     }
     Ok(hits)
-}
-
-/// A chunk's stored text as fetched for a search hit (#77): the compressed `chunk_text` blob +
-/// `raw_len`, with `chunks.text` as the fallback for a chunk not yet in the store. [`resolve`]
-/// decompresses the blob (or returns the fallback).
-struct ChunkTextRow {
-    fallback: String,
-    blob: Option<Vec<u8>>,
-    raw_len: Option<i64>,
-}
-
-impl ChunkTextRow {
-    fn resolve(
-        self,
-        decompressor: &mut text_compression::ChunkDecompressor,
-    ) -> anyhow::Result<String> {
-        match (self.blob, self.raw_len) {
-            (Some(blob), Some(raw_len)) =>
-                Ok(String::from_utf8(decompressor.decompress(&blob, raw_len.max(0) as usize)?)?),
-            _ => Ok(self.fallback),
-        }
-    }
 }
 
 fn vector_candidates(

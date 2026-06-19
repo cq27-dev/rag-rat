@@ -22,7 +22,7 @@ use crate::query::symbol::SymbolHit;
 /// Wrapped as a quoted FTS5 phrase (embedded `"` doubled) so `::`, `(`, `<`, etc. in a symbol name
 /// tokenize as separators rather than parse as FTS query syntax. Semantics shift substring→token —
 /// more precise for "mentions this symbol" than a substring match.
-pub(super) fn fts_phrase_query(needle: &str) -> Option<String> {
+pub(crate) fn fts_phrase_query(needle: &str) -> Option<String> {
     if !needle.chars().any(char::is_alphanumeric) {
         return None;
     }

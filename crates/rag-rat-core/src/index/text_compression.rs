@@ -90,6 +90,27 @@ impl<'a> ChunkDecompressor<'a> {
     }
 }
 
+/// A chunk's stored text as fetched for a read (#77): the compressed `chunk_text` blob + `raw_len`,
+/// with `chunks.text` as the fallback for a chunk not yet in the store (mid-migration / incremental
+/// before a dict existed). [`resolve`] decompresses the blob (or returns the fallback) — the shared
+/// shape every batch reader (lexical, graph local-context) collects per row before decompressing in
+/// a post-loop, since decompress's `anyhow::Result` can't cross a rusqlite closure.
+pub(crate) struct ChunkTextRow {
+    pub(crate) fallback: String,
+    pub(crate) blob: Option<Vec<u8>>,
+    pub(crate) raw_len: Option<i64>,
+}
+
+impl ChunkTextRow {
+    pub(crate) fn resolve(self, decompressor: &mut ChunkDecompressor) -> Result<String> {
+        match (self.blob, self.raw_len) {
+            (Some(blob), Some(raw_len)) =>
+                Ok(String::from_utf8(decompressor.decompress(&blob, raw_len.max(0) as usize)?)?),
+            _ => Ok(self.fallback),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
