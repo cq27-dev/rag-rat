@@ -10467,6 +10467,50 @@ fn rebuild_with_files_but_no_chunks_still_trains_a_dict_so_incrementals_dont_orp
 }
 
 #[test]
+fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
+    // #226 regression: a CLI write command (index/maintenance/oracle) and a watcher pass hold the
+    // per-DB write lock, then open the index — which may migrate an Older schema UNDER the same
+    // lock. With a raw file lock that self-deadlocks (same process, second fd → flock blocks → 30s
+    // timeout, schema never migrates). WriteLock is reentrant on the holding thread, so the
+    // open-time migrate re-enters instead of blocking.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn f() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db_path = config.database.clone();
+
+    // Build a current index, then make it look Older by removing the newest migration's ledger row
+    // (the DDL stays applied; only the version regresses, so the re-run is an idempotent no-op).
+    {
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.storage
+            .connection()
+            .execute("DELETE FROM schema_version WHERE id = '027_drop_chunks_text'", [])
+            .unwrap();
+        assert_eq!(
+            schema::status(db.storage.connection()).unwrap().state,
+            schema::SchemaState::Older,
+            "removing the V027 ledger row makes the schema Older"
+        );
+    }
+
+    // Hold the write lock exactly as the CLI `index` command does, then open under it. Pre-#226
+    // this blocked 30s on the migrate lock and errored; now it migrates immediately.
+    let _lock = crate::locks::WriteLock::acquire_blocking(&db_path).unwrap();
+    let db =
+        IndexDatabase::open(&db_path).expect("open migrates the Older schema under the held lock");
+    assert_eq!(
+        schema::status(db.storage.connection()).unwrap().state,
+        schema::SchemaState::Compatible,
+        "open re-ran the migration under the held lock; the schema is current"
+    );
+
+    drop(_lock);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();

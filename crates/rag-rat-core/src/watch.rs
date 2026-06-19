@@ -82,16 +82,14 @@ impl Debounce {
 
 /// Run one maintenance pass, blocking on the per-DB write lock (watcher-to-watcher serializes).
 pub fn maintenance_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
-    let lock_path = locks::write_lock_path(&config.database);
-    let _lock = FileLock::acquire_blocking(&lock_path)?;
+    let _lock = locks::WriteLock::acquire_blocking(&config.database)?;
     run_pass(config, run_gc)
 }
 
 /// Run one maintenance pass only if the write lock is free within `SKIP_TIMEOUT`; returns whether
 /// it ran. Used by interactive / hook / shutdown callers so a held lock can't hang them.
 pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result<bool> {
-    let lock_path = locks::write_lock_path(&config.database);
-    match FileLock::acquire_timeout(&lock_path, SKIP_TIMEOUT)? {
+    match locks::WriteLock::acquire_timeout(&config.database, SKIP_TIMEOUT)? {
         Some(_lock) => {
             run_pass(config, run_gc)?;
             Ok(true)
@@ -650,8 +648,7 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
 
 /// A bounded shutdown refresh: take the write lock only if free, run discover (no reconcile/embed).
 fn shutdown_discover(config: &Config) -> anyhow::Result<bool> {
-    let lock_path = locks::write_lock_path(&config.database);
-    match FileLock::acquire_timeout(&lock_path, SKIP_TIMEOUT)? {
+    match locks::WriteLock::acquire_timeout(&config.database, SKIP_TIMEOUT)? {
         Some(_lock) => {
             IndexDatabase::index_discover(config)?;
             Ok(true)

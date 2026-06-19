@@ -10,6 +10,8 @@
 //! Locks release when the file handle drops (the OS also releases on process death), so there is no
 //! stale-pidfile cleanup. Caveat: file locks are unreliable on NFS and WSL2 `drvfs`/`9p` mounts.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -78,6 +80,97 @@ impl FileLock {
 /// shared DB, or `<root>/.rag-rat/` for a single worktree — both excluded from the watch tree).
 pub fn write_lock_path(database: &Path) -> PathBuf {
     database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-write.lock")
+}
+
+thread_local! {
+    /// Reentrancy registry for the per-DB write lock: lock-file path → nesting depth on THIS thread.
+    /// Thread-local because the only legitimate nested acquire is an `open()`-time schema migrate
+    /// running synchronously inside a command / watcher pass that already holds the lock on the SAME
+    /// thread (#226). A different thread wanting the write lock is a genuine second writer and must
+    /// contend on the real OS flock, so it deliberately does not see this thread's hold.
+    static HELD_WRITE_LOCKS: RefCell<BTreeMap<PathBuf, usize>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+fn write_lock_held_on_this_thread(lock_path: &Path) -> bool {
+    HELD_WRITE_LOCKS.with_borrow(|held| held.get(lock_path).is_some_and(|&depth| depth > 0))
+}
+
+fn register_write_lock(lock_path: &Path) {
+    HELD_WRITE_LOCKS.with_borrow_mut(|held| *held.entry(lock_path.to_path_buf()).or_insert(0) += 1);
+}
+
+fn release_write_lock(lock_path: &Path) {
+    HELD_WRITE_LOCKS.with_borrow_mut(|held| {
+        if let Some(depth) = held.get_mut(lock_path) {
+            *depth -= 1;
+            if *depth == 0 {
+                held.remove(lock_path);
+            }
+        }
+    });
+}
+
+/// The per-DB write-serialization lock, made REENTRANT within a thread (unlike the raw
+/// [`FileLock`]).
+///
+/// A CLI write command (`index` / `maintenance` / `oracle run`) and a watcher maintenance pass hold
+/// this lock for their whole duration, and the `open()` they run inside it may itself need to
+/// migrate an `Older` schema under the same lock. With a raw file lock that is a SELF-DEADLOCK: the
+/// same process re-`flock`s the file on a second fd, which blocks (flock is per-open-file-
+/// description), times out after 30s, and leaves the schema unmigrated (#226). `WriteLock` records
+/// the hold in a thread-local registry, so a nested acquire on the same thread is reentrant — it
+/// skips the OS lock and just bumps a depth count; only the outermost guard takes and releases the
+/// real `flock`. A second THREAD still contends on the OS lock, so cross-thread it behaves like a
+/// normal exclusive lock.
+#[derive(Debug)]
+pub struct WriteLock {
+    /// `None` for a reentrant inner acquire (this thread already held the lock, so no OS lock was
+    /// taken — dropping it must only decrement the depth, never unlock the file).
+    _inner: Option<FileLock>,
+    lock_path: PathBuf,
+}
+
+impl WriteLock {
+    /// Blocks until acquired (returns immediately if this thread already holds it). Use only for
+    /// non-interactive writers; interactive / hook callers use [`WriteLock::acquire_timeout`].
+    pub fn acquire_blocking(database: &Path) -> anyhow::Result<WriteLock> {
+        let lock_path = write_lock_path(database);
+        if write_lock_held_on_this_thread(&lock_path) {
+            register_write_lock(&lock_path);
+            return Ok(WriteLock { _inner: None, lock_path });
+        }
+        let inner = FileLock::acquire_blocking(&lock_path)?;
+        register_write_lock(&lock_path);
+        Ok(WriteLock { _inner: Some(inner), lock_path })
+    }
+
+    /// Polls until acquired or `timeout` elapses (returns immediately if this thread already holds
+    /// it); `Ok(None)` on timeout.
+    pub fn acquire_timeout(
+        database: &Path,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<WriteLock>> {
+        let lock_path = write_lock_path(database);
+        if write_lock_held_on_this_thread(&lock_path) {
+            register_write_lock(&lock_path);
+            return Ok(Some(WriteLock { _inner: None, lock_path }));
+        }
+        match FileLock::acquire_timeout(&lock_path, timeout)? {
+            Some(inner) => {
+                register_write_lock(&lock_path);
+                Ok(Some(WriteLock { _inner: Some(inner), lock_path }))
+            },
+            None => Ok(None),
+        }
+    }
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        // Decrement first; `_inner` then drops AFTER this body, unlocking the OS flock for the
+        // outermost guard. A reentrant guard has `_inner: None`, so its drop only decrements.
+        release_write_lock(&self.lock_path);
+    }
 }
 
 /// `sun_path` budget for Unix domain sockets (108 bytes on Linux, 104 on macOS) with headroom.
@@ -199,6 +292,42 @@ mod tests {
         drop(first);
         let reacquired = FileLock::try_acquire(&path).unwrap();
         assert!(reacquired.is_some(), "should acquire after the holder drops");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_lock_is_reentrant_within_a_thread_but_not_across_threads() {
+        // #226: a CLI/watcher write command holds the write lock and opens UNDER it (the open-time
+        // schema migrate re-acquires). Reentrant on the SAME thread → no self-deadlock; a different
+        // thread is a genuine second writer → must still contend on the real OS lock.
+        let dir = temp_dir();
+        let db = dir.join("index.sqlite");
+
+        let outer = WriteLock::acquire_blocking(&db).unwrap();
+        // Nested acquire on the same thread re-enters immediately (a raw lock would self-deadlock).
+        let inner = WriteLock::acquire_timeout(&db, Duration::from_millis(50)).unwrap();
+        assert!(inner.is_some(), "nested same-thread acquire must re-enter, not block");
+        drop(inner);
+
+        // While `outer` is still held, a DIFFERENT thread must not be able to acquire it.
+        let db_other = db.clone();
+        let got = std::thread::spawn(move || {
+            WriteLock::acquire_timeout(&db_other, Duration::from_millis(100)).unwrap().is_some()
+        })
+        .join()
+        .unwrap();
+        assert!(!got, "a second thread must contend on the real OS lock while the first holds it");
+
+        drop(outer);
+        // Fully released once the outermost guard drops: a fresh (cross-thread) acquire succeeds.
+        let db_after = db.clone();
+        let reacquired = std::thread::spawn(move || {
+            WriteLock::acquire_timeout(&db_after, Duration::from_millis(100)).unwrap().is_some()
+        })
+        .join()
+        .unwrap();
+        assert!(reacquired, "the lock is free after the outermost guard drops");
 
         let _ = fs::remove_dir_all(&dir);
     }

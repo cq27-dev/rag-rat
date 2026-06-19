@@ -23,20 +23,23 @@ impl IndexDatabase {
         // An `Older` schema is migrated UNDER THE INDEX WRITE LOCK: auto-migration now fires from
         // ordinary read/MCP opens, so a hot-restarted server and a concurrent `query` could both
         // observe `Older` and race `add_column_if_missing`'s check-then-ALTER into a
-        // duplicate-column DDL failure. Serializing on `write_lock_path` makes one opener
-        // migrate while the other waits, then re-checks under the lock (the waiter sees
-        // `Compatible` and does nothing). Compatible/Newer/Dirty/Missing need no lock —
-        // `ensure_compatible_or_migrate` returns or refuses without writing.
+        // duplicate-column DDL failure. Serializing on the write lock makes one opener migrate
+        // while the other waits, then re-checks under the lock (the waiter sees
+        // `Compatible` and does nothing). `WriteLock` (not the raw `FileLock`) is REENTRANT
+        // on the holding thread: a CLI write command / watcher pass already holds it and
+        // opens UNDER it, so a raw re-acquire here would self-deadlock (same process,
+        // second fd → flock blocks → 30s timeout, schema never migrates — #226). Reentrant
+        // acquire returns immediately when this thread already holds it; a non-holder
+        // (read/MCP/init open) still takes the real lock. Compatible/Newer/Dirty/Missing
+        // need no lock — `ensure_compatible_or_migrate` returns or refuses without writing.
         if schema::status(storage.connection())?.state == schema::SchemaState::Older {
-            let _lock = crate::locks::FileLock::acquire_timeout(
-                &crate::locks::write_lock_path(path),
-                SCHEMA_MIGRATE_LOCK_TIMEOUT,
-            )?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "timed out waiting for the index write lock to auto-migrate the schema"
-                )
-            })?;
+            let _lock =
+                crate::locks::WriteLock::acquire_timeout(path, SCHEMA_MIGRATE_LOCK_TIMEOUT)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "timed out waiting for the index write lock to auto-migrate the schema"
+                        )
+                    })?;
             schema::ensure_compatible_or_migrate(storage.connection())?;
         } else {
             schema::ensure_compatible_or_migrate(storage.connection())?;

@@ -35,9 +35,7 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     }
     // Serialize with the background watcher / other writers (busy_timeout backstops any heal on
     // the query path).
-    let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
-        &rag_rat_core::locks::write_lock_path(&config.database),
-    )?;
+    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
     // `--worktree`: index a linked worktree's branch overlay on top of the existing base index
     // (#219). A distinct mode — the delta vs the base, not a base (re)build — so handle it before
     // the full/discover/changed branches.
@@ -260,9 +258,7 @@ pub(crate) fn with_oracle_write_lock<T>(
     config: &Config,
     body: impl FnOnce(&IndexDatabase) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
-        &rag_rat_core::locks::write_lock_path(&config.database),
-    )?;
+    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
     let db = open_index(config)?;
     body(&db)
 }
@@ -1075,9 +1071,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // Serialize with the background watcher (and other writers). The hook backgrounds this command,
     // so blocking here never holds up the git operation; busy_timeout backstops the query-path
     // heal.
-    let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
-        &rag_rat_core::locks::write_lock_path(&config.database),
-    )?;
+    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
 
     let mut db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
     // ONE time budget for the whole pass — the per-overlay embedding reconciles AND the base
