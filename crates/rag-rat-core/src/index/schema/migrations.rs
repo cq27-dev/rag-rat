@@ -1312,8 +1312,9 @@ pub(crate) const CLONE_FINGERPRINT_DDL: &str = "
         freq            INTEGER NOT NULL,
         PRIMARY KEY (symbol_id, normalizer_kind, token_hash)
     ) STRICT;
-    CREATE INDEX IF NOT EXISTS idx_symbol_token_postings_inv
-        ON symbol_token_postings(normalizer_kind, token_hash);
+    -- Plan-1 candidate read loads postings by symbol_id (the PK prefix) and builds the inverted
+    -- index in Rust; a token_hash secondary index is unused. Plan 2 re-adds one if
+    -- clones_for_symbol moves the reverse lookup to SQL.
     CREATE TABLE IF NOT EXISTS clone_token_df(
         normalizer_kind TEXT    NOT NULL,
         token_hash      INTEGER NOT NULL,
