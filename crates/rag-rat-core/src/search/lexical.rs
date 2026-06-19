@@ -174,17 +174,29 @@ fn search_with_query_embedding(
     let candidate_limit = i64::from(limit.max(10)).saturating_mul(8);
     let vector_available = query_embedding.is_some();
     let mut ranked = BTreeMap::<i64, RankedHit>::new();
+    // One dict-bound decompressor shared by both candidate passes (#77 Phase 2): bm25 and vector
+    // each decompress a batch of snippet text and run sequentially, so building it once here avoids
+    // the duplicate ~112 KB dict SELECT + dictionary prep the two passes used to do independently.
+    let dict = crate::query::chunk_text_dict(conn)?;
+    let mut decompressor = text_compression::ChunkDecompressor::new(&dict)?;
 
     for (rank, hit) in
-        bm25_candidates(conn, query, candidate_limit, include_generated)?.into_iter().enumerate()
+        bm25_candidates(conn, query, candidate_limit, include_generated, &mut decompressor)?
+            .into_iter()
+            .enumerate()
     {
         let entry = ranked.entry(hit.chunk_id).or_insert_with(|| RankedHit::new(hit));
         entry.components.bm25 = BM25_WEIGHT * lexical_rank_score(rank);
     }
 
-    for (hit, similarity) in
-        vector_candidates(conn, query, candidate_limit, include_generated, query_embedding)?
-    {
+    for (hit, similarity) in vector_candidates(
+        conn,
+        query,
+        candidate_limit,
+        include_generated,
+        query_embedding,
+        &mut decompressor,
+    )? {
         let entry = ranked.entry(hit.chunk_id).or_insert_with(|| RankedHit::new(hit));
         entry.components.vector = VECTOR_WEIGHT * f64::from(similarity).clamp(0.0, 1.0);
     }
@@ -256,6 +268,7 @@ fn bm25_candidates(
     query: &str,
     limit: i64,
     include_generated: bool,
+    decompressor: &mut text_compression::ChunkDecompressor,
 ) -> anyhow::Result<Vec<SearchHit>> {
     let fts_query = fts_query(query);
     if fts_query == "\"\"" {
@@ -304,11 +317,9 @@ fn bm25_candidates(
         ))
     })?;
     let collected = collect_rows(rows)?;
-    let dict = crate::query::chunk_text_dict(conn)?;
-    let mut decompressor = text_compression::ChunkDecompressor::new(&dict)?;
     let mut hits = Vec::with_capacity(collected.len());
     for (mut hit, text_row) in collected {
-        hit.summary = snippet(&text_row.resolve(&mut decompressor)?, query);
+        hit.summary = snippet(&text_row.resolve(decompressor)?, query);
         hits.push(hit);
     }
     Ok(hits)
@@ -320,6 +331,7 @@ fn vector_candidates(
     limit: i64,
     include_generated: bool,
     query_embedding: Option<ai::QueryEmbedding>,
+    decompressor: &mut text_compression::ChunkDecompressor,
 ) -> anyhow::Result<Vec<(SearchHit, f32)>> {
     let Some(query_embedding) = query_embedding else {
         return Ok(Vec::new());
@@ -385,22 +397,27 @@ fn vector_candidates(
             ))
         },
     )?;
-    let collected = collect_rows(rows)?;
-    let dict = crate::query::chunk_text_dict(conn)?;
-    let mut decompressor = text_compression::ChunkDecompressor::new(&dict)?;
-    let mut hits = Vec::new();
-    for (mut hit, vector_blob, text_row) in collected {
+    // Score first (decode + dot), then truncate, THEN decompress only the survivors' snippets. This
+    // is a brute-force flat scan, so many rows can clear `similarity > 0`, but only the top `limit`
+    // are kept — decompressing snippet text before the truncate would decompress (and discard) all
+    // the rest (#77 Phase 2 read-path perf).
+    let mut scored: Vec<(SearchHit, f32, ChunkTextRow)> = Vec::new();
+    for (hit, vector_blob, text_row) in collect_rows(rows)? {
         let Some(vector) = ai::decode_vector(&vector_blob, query_embedding.dim) else {
             continue;
         };
         let similarity = dot(&query_embedding.vector, &vector);
         if similarity > 0.0 {
-            hit.summary = snippet(&text_row.resolve(&mut decompressor)?, query);
-            hits.push((hit, similarity));
+            scored.push((hit, similarity, text_row));
         }
     }
-    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    hits.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let mut hits = Vec::with_capacity(scored.len());
+    for (mut hit, similarity, text_row) in scored {
+        hit.summary = snippet(&text_row.resolve(decompressor)?, query);
+        hits.push((hit, similarity));
+    }
     Ok(hits)
 }
 
