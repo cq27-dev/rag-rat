@@ -172,9 +172,13 @@ pub(crate) fn relocate_match_for_logical_symbol(
         },
     };
     let Some(qualified_name) = conn
-        .query_row("SELECT qualified_name FROM symbols WHERE id = ?1", [member_symbol_id], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT qn.value FROM symbols
+             LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+             WHERE symbols.id = ?1",
+            [member_symbol_id],
+            |row| row.get::<_, String>(0),
+        )
         .optional()?
     else {
         return Ok(None);

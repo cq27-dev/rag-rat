@@ -717,9 +717,10 @@ pub(crate) fn current_oracle_verdicts_for_edges(
         // is left heuristic (#82 finding 2).
         let sql = format!(
             "SELECT edge_oracle.edge_id, edge_oracle.kind, edge_oracle.resolved_symbol_id, \
-             (SELECT qualified_name FROM symbols WHERE symbols.id = \
-             edge_oracle.resolved_symbol_id), edge_oracle.scip_symbol{scope_join}{current} AND \
-             edge_oracle.edge_id IN ({placeholders})",
+             (SELECT value FROM name_strings WHERE name_strings.id = (SELECT qualified_name_id \
+             FROM symbols WHERE symbols.id = edge_oracle.resolved_symbol_id)), \
+             edge_oracle.scip_symbol{scope_join}{current} AND edge_oracle.edge_id IN \
+             ({placeholders})",
             scope_join = edge_oracle_scope_join(),
             current = edge_oracle_current_predicate(),
         );
@@ -843,10 +844,10 @@ pub(crate) fn current_oracle_comparisons(
     // WHERE) stays the single source of the scope predicate — a JOIN can't legally follow a WHERE.
     let sql = format!(
         "SELECT edge_oracle.edge_id, edge_oracle.kind, edges.edge_kind, edges.confidence, (SELECT \
-         qualified_name FROM symbols WHERE symbols.id = edges.to_symbol_id), edges.to_name, \
-         edge_oracle.resolved_symbol_id, edge_oracle.scip_symbol, files.path, \
-         COALESCE(NULLIF(edges.source_start_line, 0), 1) {scope_join}{current} ORDER BY \
-         files.path, edges.source_start_line",
+         value FROM name_strings WHERE name_strings.id = (SELECT qualified_name_id FROM symbols \
+         WHERE symbols.id = edges.to_symbol_id)), edges.to_name, edge_oracle.resolved_symbol_id, \
+         edge_oracle.scip_symbol, files.path, COALESCE(NULLIF(edges.source_start_line, 0), 1) \
+         {scope_join}{current} ORDER BY files.path, edges.source_start_line",
         scope_join = edge_oracle_scope_join(),
         current = edge_oracle_current_predicate(),
     );

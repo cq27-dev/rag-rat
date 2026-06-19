@@ -484,12 +484,12 @@ fn graph_boost(conn: &Connection, hit: &SearchHit, terms: &[String]) -> anyhow::
         "
         SELECT ek.value, conf.value, fn.value, tn.value
         FROM edges_data d
-        JOIN edge_strings ek ON ek.id = d.edge_kind_id
-        JOIN edge_strings conf ON conf.id = d.confidence_id
-        LEFT JOIN edge_strings fn ON fn.id = d.from_name_id
-        JOIN edge_strings tn ON tn.id = d.to_name_id
-        WHERE d.from_name_id IN (SELECT id FROM edge_strings WHERE value IN (?1, ?2))
-           OR d.to_name_id IN (SELECT id FROM edge_strings WHERE value IN (?1, ?2))
+        JOIN name_strings ek ON ek.id = d.edge_kind_id
+        JOIN name_strings conf ON conf.id = d.confidence_id
+        LEFT JOIN name_strings fn ON fn.id = d.from_name_id
+        JOIN name_strings tn ON tn.id = d.to_name_id
+        WHERE d.from_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2))
+           OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2))
         ORDER BY
             CASE conf.value
                 WHEN 'Exact' THEN 0
@@ -707,9 +707,9 @@ mod tests {
             .prepare(
                 "EXPLAIN QUERY PLAN
                  SELECT ek.value FROM edges_data d
-                 JOIN edge_strings ek ON ek.id = d.edge_kind_id
-                 WHERE d.from_name_id IN (SELECT id FROM edge_strings WHERE value IN ('a', 'b'))
-                    OR d.to_name_id IN (SELECT id FROM edge_strings WHERE value IN ('a', 'b'))",
+                 JOIN name_strings ek ON ek.id = d.edge_kind_id
+                 WHERE d.from_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b'))
+                    OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b'))",
             )
             .unwrap()
             .query_map([], |row| row.get::<_, String>(3))

@@ -549,11 +549,13 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES ('a::foo')", []).unwrap();
         for _ in 0..3 {
             conn.execute(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
                                      end_byte, signature, docs)
-                 VALUES (1, 'rust', 'foo', 'a::foo', 'function', 0, 10, 'fn foo()', NULL)",
+                 VALUES (1, 'rust', 'foo', (SELECT id FROM name_strings WHERE value = 'a::foo'),
+                         'function', 0, 10, 'fn foo()', NULL)",
                 [],
             )
             .unwrap();
@@ -578,11 +580,15 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES ('watch::watcher_main')", [
+        ])
+        .unwrap();
         conn.execute(
-            "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
                                  end_byte, signature, docs)
-             VALUES (1, 'rust', 'watcher_main', 'watch::watcher_main', 'function', 0, 100,
-                     'fn watcher_main(config: Config)', NULL)",
+             VALUES (1, 'rust', 'watcher_main',
+                     (SELECT id FROM name_strings WHERE value = 'watch::watcher_main'),
+                     'function', 0, 100, 'fn watcher_main(config: Config)', NULL)",
             [],
         )
         .unwrap();

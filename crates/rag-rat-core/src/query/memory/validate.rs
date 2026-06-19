@@ -74,7 +74,7 @@ pub(crate) fn validate_logical_symbol_binding(
             "
             SELECT id, path
             FROM logical_symbols
-            WHERE qualified_name = ?1
+            WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
             LIMIT 1
             ",
             [&binding.binding_id],
@@ -129,7 +129,7 @@ pub(crate) fn validate_symbol_binding(
             SELECT symbols.id, files.path
             FROM symbols
             JOIN files ON files.id = symbols.file_id
-            WHERE symbols.qualified_name = ?1
+            WHERE symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
             LIMIT 1
             ",
             [&binding.binding_id],

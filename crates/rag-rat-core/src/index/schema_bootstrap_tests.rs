@@ -77,7 +77,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
     assert!(edge_columns.contains(&"receiver_hint".to_string()));
     assert!(edge_columns.contains(&"resolution".to_string()));
     let logical_columns = table_columns(&db, "logical_symbols");
-    assert!(logical_columns.contains(&"qualified_name".to_string()));
+    assert!(logical_columns.contains(&"qualified_name_id".to_string()));
     assert!(logical_columns.contains(&"variant_count".to_string()));
     let member_columns = table_columns(&db, "logical_symbol_members");
     assert!(member_columns.contains(&"symbol_id".to_string()));
@@ -227,8 +227,8 @@ fn forward_migration_does_not_rerun_already_applied_migrations() {
 #[test]
 fn forward_migration_reprovisions_missing_baseline_tables() {
     // Forward-only must run the idempotent baseline BEFORE replaying steps (#103 review): a ≤v19
-    // index predates shared tables (e.g. edge_strings) that a later migration INSERTs into.
-    // Simulate by dropping the edges view + edge_strings and EVERY post-019 ledger row (so the
+    // index predates shared tables (e.g. name_strings) that a later migration INSERTs into.
+    // Simulate by dropping the edges view + name_strings and EVERY post-019 ledger row (so the
     // applied set stays contiguous at v19 — not a gap that `known_version` would read as current);
     // open must reprovision the table and reach Compatible rather than fail on a missing-table
     // INSERT.
@@ -240,7 +240,7 @@ fn forward_migration_reprovisions_missing_baseline_tables() {
     let conn = rusqlite::Connection::open(&database).unwrap();
     conn.execute_batch(
         "DROP VIEW IF EXISTS edges;
-         DROP TABLE IF EXISTS edge_strings;
+         DROP TABLE IF EXISTS name_strings;
          DELETE FROM schema_version WHERE id >= '020';",
     )
     .unwrap();
@@ -258,13 +258,13 @@ fn forward_migration_reprovisions_missing_baseline_tables() {
     let conn = rusqlite::Connection::open(&database).unwrap();
     let edge_strings_exists: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'edge_strings'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'name_strings'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     drop(conn);
-    assert_eq!(edge_strings_exists, 1, "baseline did not reprovision edge_strings before replay");
+    assert_eq!(edge_strings_exists, 1, "baseline did not reprovision name_strings before replay");
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -528,14 +528,19 @@ fn full_rebuild_preserves_other_worktree_contexts() {
     .unwrap();
     db.storage
         .connection()
+        .execute("INSERT OR IGNORE INTO main.name_strings(value) VALUES ('other_context')", [])
+        .unwrap();
+    db.storage
+        .connection()
         .execute(
             "
                 INSERT INTO main.symbols(
-                    file_id, language, name, qualified_name, kind, start_byte, end_byte, \
+                    file_id, language, name, qualified_name_id, kind, start_byte, end_byte, \
              signature, docs
                 )
-                VALUES (?1, 'rust', 'other_context', 'other_context', 'function', 0, 12, NULL, \
-             NULL)
+                VALUES (?1, 'rust', 'other_context',
+                    (SELECT id FROM main.name_strings WHERE value = 'other_context'),
+                    'function', 0, 12, NULL, NULL)
                 ",
             [other_file_id],
         )
@@ -2181,7 +2186,7 @@ pub fn upsert(_id: i64) {}
     };
     let data_count = |kind: &str| -> i64 {
         conn.query_row(
-            "SELECT COUNT(*) FROM edges_data d JOIN edge_strings ek ON ek.id = d.edge_kind_id
+            "SELECT COUNT(*) FROM edges_data d JOIN name_strings ek ON ek.id = d.edge_kind_id
              WHERE ek.value = ?1",
             [kind],
             |r| r.get(0),
@@ -7997,7 +8002,7 @@ fn calls_edge_target(db: &IndexDatabase, path: &str) -> Option<i64> {
         .query_row(
             "SELECT d.to_symbol_id FROM edges_data d
              JOIN files f ON f.id = d.source_file_id
-             JOIN edge_strings ek ON ek.id = d.edge_kind_id
+             JOIN name_strings ek ON ek.id = d.edge_kind_id
              WHERE f.path = ?1 AND ek.value = 'calls_name'",
             [path],
             |row| row.get::<_, Option<i64>>(0),
@@ -10486,12 +10491,13 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.storage
             .connection()
-            .execute("DELETE FROM schema_version WHERE id = '027_drop_chunks_text'", [])
+            .execute("DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names'", [
+            ])
             .unwrap();
         assert_eq!(
             schema::status(db.storage.connection()).unwrap().state,
             schema::SchemaState::Older,
-            "removing the V027 ledger row makes the schema Older"
+            "removing the V028 ledger row makes the schema Older"
         );
     }
 
@@ -10516,7 +10522,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 27);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 28);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10589,6 +10595,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '025_chunk_text_compression_tables';
         DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';
         DELETE FROM schema_version WHERE id = '027_drop_chunks_text';
+        DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
         ",
     )
     .unwrap();
@@ -10609,6 +10616,292 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
     }
     // The view was rebuilt and surfaces the columns (a SELECT must not fail).
     conn.query_row("SELECT import_mod_id FROM edges LIMIT 1", [], |_| Ok(())).optional().unwrap();
+}
+
+/// True when an INDEX of this name exists (sqlite_master, type='index').
+fn conn_index_exists(conn: &rusqlite::Connection, index: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [index],
+        |_| Ok(()),
+    )
+    .optional()
+    .unwrap()
+    .is_some()
+}
+
+/// V028 fresh apply (#224): a brand-new index stores qualified names as `qualified_name_id`
+/// (interned into `name_strings`), NOT inline `qualified_name`; the id indexes exist and the old
+/// string indexes do not.
+#[test]
+fn v028_fresh_apply_interns_symbol_qualified_names() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    for table in ["symbols", "logical_symbols"] {
+        let cols = conn_table_columns(&conn, table);
+        assert!(
+            cols.contains(&"qualified_name_id".to_string()),
+            "{table} has the interned id column"
+        );
+        assert!(
+            !cols.contains(&"qualified_name".to_string()),
+            "{table} no longer has the inline text column"
+        );
+    }
+    assert!(conn_index_exists(&conn, "idx_symbols_qualified_name_id"));
+    assert!(conn_index_exists(&conn, "idx_logical_symbols_qualified_name_id"));
+    assert!(!conn_index_exists(&conn, "idx_symbols_qualified_name"));
+    assert!(!conn_index_exists(&conn, "idx_logical_symbols_qualified_name"));
+    // The pool is named `name_strings` (the #224 rename rode this version bump); `edge_strings` is
+    // gone.
+    assert!(conn_table_exists(&conn, "name_strings"));
+    assert!(!conn_table_exists(&conn, "edge_strings"));
+}
+
+/// V028 forward-migrate (#224): simulate a pre-V028 index — re-add the inline `qualified_name` TEXT
+/// column + the old string index, rename the pool back to `edge_strings`, and drop the V028 ledger
+/// row — then re-apply. The forward path must: rename `edge_strings → name_strings`, intern every
+/// symbol/logical qname into the pool, set `qualified_name_id`, drop the inline column, and leave a
+/// forward-migrated row reconstructable to the SAME qualified name as before.
+#[test]
+fn v028_forward_migrate_interns_and_drops_the_inline_column() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    // Seed a file + a symbol + a logical symbol in the CURRENT (interned) shape.
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+         VALUES ('a.rs', 'rust', 'source', 'h', 0, 0)",
+        [],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    let symbol_qn = "a.rs::do_thing";
+    let logical_qn = "a.rs::LogicalThing";
+    for qn in [symbol_qn, logical_qn] {
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", [qn]).unwrap();
+    }
+    conn.execute(
+        "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+         end_byte)
+         VALUES (?1, 'rust', 'do_thing', (SELECT id FROM name_strings WHERE value = ?2),
+                 'function', 0, 10)",
+        params![file_id, symbol_qn],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id, kind,
+                                     variant_count, group_reason)
+         VALUES (7, 'rust', 'a.rs', 'LogicalThing',
+                 (SELECT id FROM name_strings WHERE value = ?1), 'struct', 1, 'single')",
+        params![logical_qn],
+    )
+    .unwrap();
+
+    // --- Regress the schema to the pre-V028 shape ---
+    // 1. Re-add the inline `qualified_name` TEXT column + restore its values from the pool, then
+    //    drop the interned id column + its index.
+    conn.execute_batch(
+        "
+        ALTER TABLE symbols ADD COLUMN qualified_name TEXT;
+        UPDATE symbols SET qualified_name =
+            (SELECT value FROM name_strings WHERE name_strings.id = symbols.qualified_name_id);
+        DROP INDEX IF EXISTS idx_symbols_qualified_name_id;
+        ALTER TABLE symbols DROP COLUMN qualified_name_id;
+        CREATE INDEX idx_symbols_qualified_name ON symbols(qualified_name);
+
+        ALTER TABLE logical_symbols ADD COLUMN qualified_name TEXT;
+        UPDATE logical_symbols SET qualified_name =
+            (SELECT value FROM name_strings WHERE name_strings.id =
+                logical_symbols.qualified_name_id);
+        DROP INDEX IF EXISTS idx_logical_symbols_qualified_name_id;
+        ALTER TABLE logical_symbols DROP COLUMN qualified_name_id;
+        CREATE INDEX idx_logical_symbols_qualified_name ON logical_symbols(qualified_name);
+        ",
+    )
+    .unwrap();
+    // 2. Rename the pool back to the pre-merge name `edge_strings` (the rename guard in
+    //    provision_baseline must adopt it). The view references name_strings, so drop it first; the
+    //    re-apply rebuilds it.
+    conn.execute_batch(
+        "
+        DROP VIEW IF EXISTS edges;
+        DROP TRIGGER IF EXISTS edges_view_insert;
+        DROP TRIGGER IF EXISTS edges_view_update;
+        DROP TRIGGER IF EXISTS edges_view_delete;
+        ALTER TABLE name_strings RENAME TO edge_strings;
+        ",
+    )
+    .unwrap();
+    // 3. Drop the V028 ledger row so the schema reads Older and the migration replays.
+    conn.execute("DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names'", [])
+        .unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().state,
+        schema::SchemaState::Older,
+        "removing the V028 ledger row makes the pre-V028 shape Older"
+    );
+
+    // --- Forward-migrate ---
+    schema::apply(&conn).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+
+    // The rename happened and the inline columns are gone.
+    assert!(conn_table_exists(&conn, "name_strings"), "edge_strings was renamed to name_strings");
+    assert!(!conn_table_exists(&conn, "edge_strings"));
+    for table in ["symbols", "logical_symbols"] {
+        let cols = conn_table_columns(&conn, table);
+        assert!(cols.contains(&"qualified_name_id".to_string()), "{table} has qualified_name_id");
+        assert!(!cols.contains(&"qualified_name".to_string()), "{table} dropped the inline column");
+    }
+    assert!(conn_index_exists(&conn, "idx_symbols_qualified_name_id"));
+    assert!(conn_index_exists(&conn, "idx_logical_symbols_qualified_name_id"));
+    assert!(!conn_index_exists(&conn, "idx_symbols_qualified_name"));
+    assert!(!conn_index_exists(&conn, "idx_logical_symbols_qualified_name"));
+
+    // The ids backfilled correctly: each row reconstructs to its ORIGINAL qualified name via the
+    // join, and a round-trip lookup returns it.
+    let symbol_reconstructed: String = conn
+        .query_row(
+            "SELECT qn.value FROM symbols
+             LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+             WHERE symbols.name = 'do_thing'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(symbol_reconstructed, symbol_qn, "symbol qname is preserved through the migration");
+    let logical_reconstructed: String = conn
+        .query_row(
+            "SELECT qn.value FROM logical_symbols
+             LEFT JOIN name_strings qn ON qn.id = logical_symbols.qualified_name_id
+             WHERE logical_symbols.id = 7",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(logical_reconstructed, logical_qn, "logical qname is preserved");
+
+    // Round-trip through the production read paths: exact lookup (lookup_symbol_path) + logical
+    // read.
+    let hit = crate::query::symbol::lookup_candidates(
+        &conn,
+        &crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: Some(symbol_qn.to_string()),
+            symbol: None,
+            language: None,
+            allow_ambiguous: true,
+            limit: 10,
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        hit.candidates.first().map(|c| c.qualified_name.as_str()),
+        Some(symbol_qn),
+        "lookup_symbol_path resolves the interned qualified name"
+    );
+    let logical = crate::query::symbol::lookup_logical_by_id(&conn, 7).unwrap().unwrap();
+    assert_eq!(logical.qualified_name, logical_qn, "logical read reconstructs the qname");
+}
+
+/// GC must-fix (#224, the highest-severity gate): the orphan-sweep prunes `name_strings` entries
+/// nothing references. After the merge, symbols/logical_symbols `qualified_name_id` are referencing
+/// columns too — so a pool entry referenced ONLY by a symbol (no edge) must SURVIVE gc, or gc nulls
+/// the symbol's qname out.
+#[test]
+fn gc_preserves_a_name_strings_entry_referenced_only_by_a_symbol() {
+    let (root, config) = markdown_config("# Note\nplaceholder\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    // `files`/`symbols` are per-connection scoped TEMP VIEWS after open/rebuild; write the base
+    // tables in `main`. Scope the file to the live commit so gc keeps it.
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+                                commit_sha, worktree_id)
+         VALUES ('only.rs', 'rust', 'source', 'h', 0, 0, ?1, ?2)",
+        params![db.active_commit_sha, db.active_worktree_id],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    // A symbol whose qname is interned but referenced by NO edge.
+    let symbol_only_qn = "only.rs::orphan_if_gc_is_wrong";
+    conn.execute("INSERT OR IGNORE INTO main.name_strings(value) VALUES (?1)", [symbol_only_qn])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO main.symbols(file_id, language, name, qualified_name_id, kind, start_byte,
+                                  end_byte)
+         VALUES (?1, 'rust', 'orphan_if_gc_is_wrong',
+                 (SELECT id FROM main.name_strings WHERE value = ?2), 'function', 0, 10)",
+        params![file_id, symbol_only_qn],
+    )
+    .unwrap();
+
+    // Run the pool-sweep through gc with the symbol's commit kept live.
+    db.prune_to_live(
+        std::slice::from_ref(&db.active_commit_sha),
+        std::slice::from_ref(&db.active_worktree_id),
+    )
+    .unwrap();
+
+    let conn = db.storage.connection();
+    let surviving: i64 = conn
+        .query_row("SELECT COUNT(*) FROM name_strings WHERE value = ?1", [symbol_only_qn], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(surviving, 1, "gc must NOT prune a pool entry a live symbol references");
+    // And the symbol's qname is still reconstructable (not nulled).
+    let reconstructed: Option<String> = conn
+        .query_row(
+            "SELECT qn.value FROM symbols
+             LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+             WHERE symbols.name = 'orphan_if_gc_is_wrong'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reconstructed.as_deref(), Some(symbol_only_qn));
+    drop(db);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Id-width guard (#224): the merged pool's `max(id)` must stay well under the 3→4-byte SQLite
+/// serial-type cliff (8,388,608) — a wider id would be a real edges-side regression (every edge
+/// carries two name-ids). A representative self-index of this repo is far below it; assert a large
+/// margin so a future blow-up surfaces here.
+#[test]
+fn name_strings_max_id_stays_in_the_three_byte_range() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // Seed a representative spread of interned names across edges + symbols.
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+         VALUES ('a.rs', 'rust', 'source', 'h', 0, 0)",
+        [],
+    )
+    .unwrap();
+    for i in 0..1000 {
+        let qn = format!("a.rs::sym_{i}");
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", [&qn]).unwrap();
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
+                                 end_byte)
+             VALUES (1, 'rust', ?1, (SELECT id FROM name_strings WHERE value = ?2), 'function', 0, \
+             1)",
+            params![format!("sym_{i}"), qn],
+        )
+        .unwrap();
+    }
+    let max_id: i64 =
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM name_strings", [], |r| r.get(0)).unwrap();
+    assert!(
+        max_id < 8_388_608,
+        "name_strings max id {max_id} must stay under the 3→4-byte serial-type cliff"
+    );
 }
 
 #[test]

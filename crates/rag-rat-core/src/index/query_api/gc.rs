@@ -106,14 +106,19 @@ impl IndexDatabase {
         // rows would survive the file pruning. Prune them with the SAME live sets, so a run and the
         // edges it produced are dropped together.
         oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
-        // Dictionary hygiene (#79): drop `edge_strings` values no edge references any more. The
-        // dictionary has NO FKs by design (see the schema comment), so orphans accumulate as
-        // edges are pruned; the vocabulary is small, but gc is the natural rate-limited home for
-        // the sweep. Every referencing column must appear here — a missed column would null its
-        // strings out from under live edges.
+        // Dictionary hygiene (#79, extended #224): drop `name_strings` values nothing references
+        // any more. The pool has NO FKs by design (see the schema comment), so orphans
+        // accumulate as edges/symbols are pruned; the vocabulary is small, but gc is the
+        // natural rate-limited home for the sweep. Every referencing column must appear
+        // here — a missed column would null its strings out from under live rows. #224
+        // added `symbols.qualified_name_id` and `logical_symbols.qualified_name_id`
+        // (interned symbol qnames live in this same pool now); omitting them would delete a
+        // pool entry a live symbol points at and null its qname out — the exact footgun
+        // this comment warns about (regression test:
+        // gc_preserves_a_name_strings_entry_referenced_only_by_a_symbol).
         conn.execute(
             "
-            DELETE FROM main.edge_strings
+            DELETE FROM main.name_strings
             WHERE id NOT IN (
                 SELECT from_name_id FROM main.edges_data WHERE from_name_id IS NOT NULL
                 UNION SELECT to_name_id FROM main.edges_data
@@ -124,6 +129,10 @@ impl IndexDatabase {
                 UNION SELECT resolution_id FROM main.edges_data
                 UNION SELECT edge_kind_id FROM main.edges_data
                 UNION SELECT confidence_id FROM main.edges_data
+                UNION SELECT qualified_name_id FROM main.symbols
+                    WHERE qualified_name_id IS NOT NULL
+                UNION SELECT qualified_name_id FROM main.logical_symbols
+                    WHERE qualified_name_id IS NOT NULL
             )
             ",
             [],

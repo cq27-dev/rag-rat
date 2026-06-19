@@ -38,18 +38,32 @@ pub(crate) fn migrate_edges(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "edges", "to_name", "TEXT NOT NULL DEFAULT ''")?;
     apply_edge_source_target_spans(conn)?;
     apply_edge_evidence_and_resolution(conn)?;
+    // This runs inside `apply_baseline`, BEFORE the ladder, so the `symbols` shape depends on the
+    // DB's age: a fresh post-V028 baseline has the interned `qualified_name_id` (and the dropped
+    // `qualified_name`), while a pre-V020 legacy DB still has the inline `qualified_name` TEXT
+    // column (V028 hasn't run yet). SQLite compiles the whole statement, so referencing a missing
+    // column is a hard error even when zero rows match — pick the backfill source by which column
+    // exists (#224). On a fresh DB this `edges` is the empty view; the UPDATE is a no-op either
+    // way.
+    let symbol_qname_expr = if column_exists(conn, "symbols", "qualified_name")? {
+        "(SELECT qualified_name FROM symbols WHERE symbols.id = edges.{side}_symbol_id)"
+    } else {
+        "(SELECT value FROM name_strings WHERE name_strings.id =
+              (SELECT qualified_name_id FROM symbols WHERE symbols.id = edges.{side}_symbol_id))"
+    };
+    let from_expr = symbol_qname_expr.replace("{side}", "from");
+    let to_expr = symbol_qname_expr.replace("{side}", "to");
     conn.execute(
-        "
+        &format!(
+            "
         UPDATE edges
-        SET from_name = COALESCE(from_name, (
-                SELECT qualified_name FROM symbols WHERE symbols.id = edges.from_symbol_id
-            )),
+        SET from_name = COALESCE(from_name, {from_expr}),
             to_name = CASE
                 WHEN to_name != '' THEN to_name
-                ELSE COALESCE((SELECT qualified_name FROM symbols WHERE symbols.id = \
-         edges.to_symbol_id), '')
+                ELSE COALESCE({to_expr}, '')
             END
-        ",
+        "
+        ),
         [],
     )?;
     conn.execute("DELETE FROM edges WHERE to_name = ''", [])?;
@@ -396,6 +410,13 @@ pub(crate) fn apply_graph_file_lookup_indexes(conn: &Connection) -> rusqlite::Re
 }
 
 pub(crate) fn apply_logical_symbol_groups(conn: &Connection) -> rusqlite::Result<()> {
+    // V007 created `logical_symbols` with an inline `qualified_name TEXT` and a string index. On a
+    // fresh post-V028 baseline the table ALREADY exists with the interned `qualified_name_id`
+    // shape, so the `CREATE TABLE IF NOT EXISTS` is a no-op — but the old `ON
+    // logical_symbols(qualified_name)` index would reference a column that no longer exists and
+    // fail. Create the qualified-name index on whichever column the table has (#224); a
+    // pre-V028 DB gets the string index (V028 later swaps it for the id index), a fresh DB gets
+    // the id index directly.
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS logical_symbols(
@@ -421,12 +442,21 @@ pub(crate) fn apply_logical_symbol_groups(conn: &Connection) -> rusqlite::Result
             FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
         );
 
-        CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name
-            ON logical_symbols(qualified_name);
         CREATE INDEX IF NOT EXISTS idx_logical_symbol_members_symbol
             ON logical_symbol_members(symbol_id);
         ",
     )?;
+    if column_exists(conn, "logical_symbols", "qualified_name")? {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name
+                ON logical_symbols(qualified_name);",
+        )?;
+    } else {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name_id
+                ON logical_symbols(qualified_name_id);",
+        )?;
+    }
     Ok(())
 }
 
@@ -648,7 +678,7 @@ pub(crate) fn ensure_edges_data_indexes(conn: &Connection) -> rusqlite::Result<(
 ///
 /// The view reconstructs the historical column shape, so the entire read surface — graph
 /// traversal, impact, memory fingerprints, oracle compare, dev-inspect SQL — keeps working
-/// unchanged. All dictionary joins are LEFT JOINs against the `edge_strings` PRIMARY KEY, so the
+/// unchanged. All dictionary joins are LEFT JOINs against the `name_strings` PRIMARY KEY, so the
 /// planner drops the joins a query doesn't reference.
 ///
 /// The triggers make ad-hoc writes through the view work (tests, migrations, maintenance UPDATEs)
@@ -822,7 +852,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                -- The raw dictionary ids, appended after the legacy shape: hot predicates that the
                -- planner cannot transform through the value joins (an OR-branch string equality
                -- picks a non-selective index otherwise — the query_warm regression) compare these
-               -- against a constant `(SELECT id FROM edge_strings WHERE value = ?)` instead.
+               -- against a constant `(SELECT id FROM name_strings WHERE value = ?)` instead.
                d.from_name_id,
                d.to_name_id,
                d.target_qualified_name_id,
@@ -831,13 +861,13 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                d.confidence_id,
                d.resolution_id
         FROM edges_data d
-        LEFT JOIN edge_strings fn ON fn.id = d.from_name_id
-        LEFT JOIN edge_strings tn ON tn.id = d.to_name_id
-        LEFT JOIN edge_strings tqn ON tqn.id = d.target_qualified_name_id
-        LEFT JOIN edge_strings rh ON rh.id = d.receiver_hint_id
-        LEFT JOIN edge_strings res ON res.id = d.resolution_id
-        LEFT JOIN edge_strings ek ON ek.id = d.edge_kind_id
-        LEFT JOIN edge_strings conf ON conf.id = d.confidence_id
+        LEFT JOIN name_strings fn ON fn.id = d.from_name_id
+        LEFT JOIN name_strings tn ON tn.id = d.to_name_id
+        LEFT JOIN name_strings tqn ON tqn.id = d.target_qualified_name_id
+        LEFT JOIN name_strings rh ON rh.id = d.receiver_hint_id
+        LEFT JOIN name_strings res ON res.id = d.resolution_id
+        LEFT JOIN name_strings ek ON ek.id = d.edge_kind_id
+        LEFT JOIN name_strings conf ON conf.id = d.confidence_id
         -- #200: the internal dispatch FACT rows (`dispatch_construct`/`dispatch_handle`) are \
          inputs
         -- to `synthesize_dispatch_edges`, NOT real edges — the handle fact duplicates the
@@ -851,21 +881,21 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
          so the
         -- planner keeps the indexed-id predicates, not a value-join string compare.
         WHERE d.edge_kind_id NOT IN (
-            SELECT id FROM edge_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
+            SELECT id FROM name_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
         );
 
         -- Interning per column: `INSERT OR IGNORE` + `value NOT NULL` means a NULL string is
         -- silently skipped and its id subselect yields NULL — exactly the legacy nullability.
         -- COALESCE mirrors the legacy table's column DEFAULTs for inserts that omit them.
         CREATE TRIGGER IF NOT EXISTS edges_view_insert INSTEAD OF INSERT ON edges BEGIN
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.from_name);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.to_name);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.target_qualified_name);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.receiver_hint);
-            INSERT OR IGNORE INTO edge_strings(value)
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.from_name);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.to_name);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.target_qualified_name);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.receiver_hint);
+            INSERT OR IGNORE INTO name_strings(value)
                 VALUES (COALESCE(NEW.resolution, 'unresolved'));
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.edge_kind);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.confidence);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.edge_kind);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.confidence);
             INSERT INTO edges_data(
                 id, source_file_id, from_symbol_id, to_symbol_id, from_name_id, to_name_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
@@ -876,37 +906,37 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
             )
             VALUES (
                 NEW.id, NEW.source_file_id, NEW.from_symbol_id, NEW.to_symbol_id,
-                (SELECT id FROM edge_strings WHERE value = NEW.from_name),
-                (SELECT id FROM edge_strings WHERE value = NEW.to_name),
+                (SELECT id FROM name_strings WHERE value = NEW.from_name),
+                (SELECT id FROM name_strings WHERE value = NEW.to_name),
                 COALESCE(NEW.source_start_line, 0), COALESCE(NEW.source_end_line, 0),
                 COALESCE(NEW.source_start_byte, 0), COALESCE(NEW.source_end_byte, 0),
                 NEW.target_start_line, NEW.target_end_line,
-                (SELECT id FROM edge_strings WHERE value = NEW.target_qualified_name),
+                (SELECT id FROM name_strings WHERE value = NEW.target_qualified_name),
                 NEW.evidence,
-                (SELECT id FROM edge_strings WHERE value = NEW.receiver_hint),
-                (SELECT id FROM edge_strings
+                (SELECT id FROM name_strings WHERE value = NEW.receiver_hint),
+                (SELECT id FROM name_strings
                  WHERE value = COALESCE(NEW.resolution, 'unresolved')),
                 NEW.callee_start_byte, NEW.callee_end_byte,
                 NEW.import_scope_start_byte, NEW.import_scope_end_byte, NEW.import_mod_id,
-                (SELECT id FROM edge_strings WHERE value = NEW.edge_kind),
-                (SELECT id FROM edge_strings WHERE value = NEW.confidence)
+                (SELECT id FROM name_strings WHERE value = NEW.edge_kind),
+                (SELECT id FROM name_strings WHERE value = NEW.confidence)
             );
         END;
 
         CREATE TRIGGER IF NOT EXISTS edges_view_update INSTEAD OF UPDATE ON edges BEGIN
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.from_name);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.to_name);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.target_qualified_name);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.receiver_hint);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.resolution);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.edge_kind);
-            INSERT OR IGNORE INTO edge_strings(value) VALUES (NEW.confidence);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.from_name);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.to_name);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.target_qualified_name);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.receiver_hint);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.resolution);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.edge_kind);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.confidence);
             UPDATE edges_data SET
                 source_file_id = NEW.source_file_id,
                 from_symbol_id = NEW.from_symbol_id,
                 to_symbol_id = NEW.to_symbol_id,
-                from_name_id = (SELECT id FROM edge_strings WHERE value = NEW.from_name),
-                to_name_id = (SELECT id FROM edge_strings WHERE value = NEW.to_name),
+                from_name_id = (SELECT id FROM name_strings WHERE value = NEW.from_name),
+                to_name_id = (SELECT id FROM name_strings WHERE value = NEW.to_name),
                 source_start_line = NEW.source_start_line,
                 source_end_line = NEW.source_end_line,
                 source_start_byte = NEW.source_start_byte,
@@ -914,17 +944,17 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 target_start_line = NEW.target_start_line,
                 target_end_line = NEW.target_end_line,
                 target_qualified_name_id =
-                    (SELECT id FROM edge_strings WHERE value = NEW.target_qualified_name),
+                    (SELECT id FROM name_strings WHERE value = NEW.target_qualified_name),
                 evidence = NEW.evidence,
-                receiver_hint_id = (SELECT id FROM edge_strings WHERE value = NEW.receiver_hint),
-                resolution_id = (SELECT id FROM edge_strings WHERE value = NEW.resolution),
+                receiver_hint_id = (SELECT id FROM name_strings WHERE value = NEW.receiver_hint),
+                resolution_id = (SELECT id FROM name_strings WHERE value = NEW.resolution),
                 callee_start_byte = NEW.callee_start_byte,
                 callee_end_byte = NEW.callee_end_byte,
                 import_scope_start_byte = NEW.import_scope_start_byte,
                 import_scope_end_byte = NEW.import_scope_end_byte,
                 import_mod_id = NEW.import_mod_id,
-                edge_kind_id = (SELECT id FROM edge_strings WHERE value = NEW.edge_kind),
-                confidence_id = (SELECT id FROM edge_strings WHERE value = NEW.confidence)
+                edge_kind_id = (SELECT id FROM name_strings WHERE value = NEW.edge_kind),
+                confidence_id = (SELECT id FROM name_strings WHERE value = NEW.confidence)
             WHERE id = OLD.id;
         END;
 
@@ -936,7 +966,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// V020 (#79): convert a legacy `edges` TABLE into `edge_strings` + `edges_data` and re-point
+/// V020 (#79): convert a legacy `edges` TABLE into `name_strings` + `edges_data` and re-point
 /// `edge_oracle`'s FK at `edges_data`. Idempotent: a DB already on the view shape skips the
 /// conversion entirely. The copy runs in ONE transaction (legacy table intact on a crash);
 /// `PRAGMA foreign_keys` toggles outside it (it is a no-op inside one).
@@ -953,19 +983,19 @@ pub(crate) fn apply_edge_string_interning(conn: &Connection) -> rusqlite::Result
         let result = (|| -> rusqlite::Result<()> {
             conn.execute_batch(
                 "
-                INSERT OR IGNORE INTO edge_strings(value)
+                INSERT OR IGNORE INTO name_strings(value)
                     SELECT DISTINCT from_name FROM main.edges WHERE from_name IS NOT NULL;
-                INSERT OR IGNORE INTO edge_strings(value) SELECT DISTINCT to_name FROM main.edges;
-                INSERT OR IGNORE INTO edge_strings(value)
+                INSERT OR IGNORE INTO name_strings(value) SELECT DISTINCT to_name FROM main.edges;
+                INSERT OR IGNORE INTO name_strings(value)
                     SELECT DISTINCT target_qualified_name FROM main.edges
                     WHERE target_qualified_name IS NOT NULL;
-                INSERT OR IGNORE INTO edge_strings(value)
+                INSERT OR IGNORE INTO name_strings(value)
                     SELECT DISTINCT receiver_hint FROM main.edges WHERE receiver_hint IS NOT NULL;
-                INSERT OR IGNORE INTO edge_strings(value)
+                INSERT OR IGNORE INTO name_strings(value)
                     SELECT DISTINCT resolution FROM main.edges;
-                INSERT OR IGNORE INTO edge_strings(value)
+                INSERT OR IGNORE INTO name_strings(value)
                     SELECT DISTINCT edge_kind FROM main.edges;
-                INSERT OR IGNORE INTO edge_strings(value)
+                INSERT OR IGNORE INTO name_strings(value)
                     SELECT DISTINCT confidence FROM main.edges;
                 INSERT INTO main.edges_data(
                     id, source_file_id, from_symbol_id, to_symbol_id, from_name_id, to_name_id,
@@ -975,18 +1005,18 @@ pub(crate) fn apply_edge_string_interning(conn: &Connection) -> rusqlite::Result
                     edge_kind_id, confidence_id
                 )
                 SELECT e.id, e.source_file_id, e.from_symbol_id, e.to_symbol_id,
-                       (SELECT id FROM edge_strings WHERE value = e.from_name),
-                       (SELECT id FROM edge_strings WHERE value = e.to_name),
+                       (SELECT id FROM name_strings WHERE value = e.from_name),
+                       (SELECT id FROM name_strings WHERE value = e.to_name),
                        e.source_start_line, e.source_end_line,
                        e.source_start_byte, e.source_end_byte,
                        e.target_start_line, e.target_end_line,
-                       (SELECT id FROM edge_strings WHERE value = e.target_qualified_name),
+                       (SELECT id FROM name_strings WHERE value = e.target_qualified_name),
                        e.evidence,
-                       (SELECT id FROM edge_strings WHERE value = e.receiver_hint),
-                       (SELECT id FROM edge_strings WHERE value = e.resolution),
+                       (SELECT id FROM name_strings WHERE value = e.receiver_hint),
+                       (SELECT id FROM name_strings WHERE value = e.resolution),
                        e.callee_start_byte, e.callee_end_byte,
-                       (SELECT id FROM edge_strings WHERE value = e.edge_kind),
-                       (SELECT id FROM edge_strings WHERE value = e.confidence)
+                       (SELECT id FROM name_strings WHERE value = e.edge_kind),
+                       (SELECT id FROM name_strings WHERE value = e.confidence)
                 FROM main.edges e;
                 DROP TABLE main.edges;
                 ",
@@ -1091,6 +1121,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_025_ID => Some(25),
             MIGRATION_026_ID => Some(26),
             MIGRATION_027_ID => Some(27),
+            MIGRATION_028_ID => Some(28),
             _ => None,
         })
         .max()
@@ -1127,6 +1158,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_025_ID
             | MIGRATION_026_ID
             | MIGRATION_027_ID
+            | MIGRATION_028_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1160,6 +1192,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_025_ID => migration.checksum != MIGRATION_025_CHECKSUM,
         MIGRATION_026_ID => migration.checksum != MIGRATION_026_CHECKSUM,
         MIGRATION_027_ID => migration.checksum != MIGRATION_027_CHECKSUM,
+        MIGRATION_028_ID => migration.checksum != MIGRATION_028_CHECKSUM,
         _ => false,
     }
 }
@@ -1246,6 +1279,68 @@ pub(crate) fn apply_drop_chunks_text(conn: &Connection) -> rusqlite::Result<()> 
             )
         })?;
     conn.execute("ALTER TABLE chunks DROP COLUMN text", [])?;
+    Ok(())
+}
+
+/// V028 (#224): intern `symbols.qualified_name` + `logical_symbols.qualified_name` into the shared
+/// `name_strings` pool (the pool `edges_data` already references; the `edge_strings → name_strings`
+/// rename rides this version bump and is performed in `provision_baseline`, which runs BEFORE this
+/// replay — so `name_strings` is guaranteed present here). Backfill-before-drop, like the V027
+/// chunk-text precedent, so the column drop is the last step rather than an irreversible one-shot.
+///
+/// Idempotent + guarded so a fresh-baseline DB (already `qualified_name_id`, no `qualified_name`)
+/// is a clean no-op and a re-run after a half-apply is safe:
+/// 1. ADD `qualified_name_id INTEGER` to both tables (guarded — NULLABLE because an `ADD COLUMN …
+///    NOT NULL` fails on a populated table, so the fresh baseline matches).
+/// 2. Backfill ONLY while the old `qualified_name` column still exists: insert the not-yet-present
+///    qnames (`INSERT OR IGNORE` — the ~85% already stored as edge-target names are skipped; the
+///    new ~102K get fresh ids, and plain-PK reuse of prior gc gaps is safe because gc only deletes
+///    orphans), then set `qualified_name_id` from the pool.
+/// 3. Create the id-keyed indexes; drop the old string indexes.
+/// 4. Drop the `qualified_name` column (guarded by `column_exists`).
+pub(crate) fn apply_intern_symbol_qualified_names(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "symbols", "qualified_name_id", "INTEGER")?;
+    add_column_if_missing(conn, "logical_symbols", "qualified_name_id", "INTEGER")?;
+    // Backfill reads the OLD text column; on a fresh-baseline DB it is already gone (and the tables
+    // are empty), so guard each table independently — one may have migrated and the other not on a
+    // re-run after a partial apply.
+    if column_exists(conn, "symbols", "qualified_name")? {
+        conn.execute_batch(
+            "
+            INSERT OR IGNORE INTO name_strings(value) SELECT qualified_name FROM symbols;
+            UPDATE symbols
+               SET qualified_name_id =
+                   (SELECT id FROM name_strings WHERE name_strings.value = symbols.qualified_name);
+            ",
+        )?;
+    }
+    if column_exists(conn, "logical_symbols", "qualified_name")? {
+        conn.execute_batch(
+            "
+            INSERT OR IGNORE INTO name_strings(value) SELECT qualified_name FROM logical_symbols;
+            UPDATE logical_symbols
+               SET qualified_name_id =
+                   (SELECT id FROM name_strings
+                    WHERE name_strings.value = logical_symbols.qualified_name);
+            ",
+        )?;
+    }
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name_id
+            ON symbols(qualified_name_id);
+        CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name_id
+            ON logical_symbols(qualified_name_id);
+        DROP INDEX IF EXISTS idx_symbols_qualified_name;
+        DROP INDEX IF EXISTS idx_logical_symbols_qualified_name;
+        ",
+    )?;
+    if column_exists(conn, "symbols", "qualified_name")? {
+        conn.execute("ALTER TABLE symbols DROP COLUMN qualified_name", [])?;
+    }
+    if column_exists(conn, "logical_symbols", "qualified_name")? {
+        conn.execute("ALTER TABLE logical_symbols DROP COLUMN qualified_name", [])?;
+    }
     Ok(())
 }
 

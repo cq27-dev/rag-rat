@@ -117,11 +117,12 @@ impl IndexDatabase {
         let mut stmt = conn.prepare(
             "
             SELECT symbols.id, main.files.path, symbols.language, symbols.name,
-                   symbols.qualified_name, symbols.kind, symbols.signature, symbols.start_line,
+                   qn.value, symbols.kind, symbols.signature, symbols.start_line,
                    symbols.end_line
             FROM main.symbols AS symbols
             JOIN main.files ON main.files.id = symbols.file_id
-            ORDER BY symbols.language, main.files.path, symbols.name, symbols.qualified_name,
+            LEFT JOIN main.name_strings qn ON qn.id = symbols.qualified_name_id
+            ORDER BY symbols.language, main.files.path, symbols.name, qn.value,
                      symbols.kind, symbols.signature, symbols.start_byte, symbols.end_byte
             ",
         )?;

@@ -213,14 +213,14 @@ pub fn scoped_weighted_fan_in(
     // #89: in-edges are joined THROUGH the per-connection scoped `files` view
     // (`JOIN files ON files.id = edges_data.source_file_id`), NOT raw `main.edges`/`main.files`, so
     // the same symbol identity scores DIFFERENTLY per active scope and a foreign scope's edges
-    // never leak in. `edge_strings` resolves the kind/confidence ids to names for the weight
+    // never leak in. `name_strings` resolves the kind/confidence ids to names for the weight
     // tables; `d.id` keys the optional SCIP-oracle effect lookup.
     let mut stmt = conn.prepare(
         "SELECT d.id, ek.value, cf.value
          FROM edges_data d
          JOIN files ON files.id = d.source_file_id
-         JOIN edge_strings ek ON ek.id = d.edge_kind_id
-         JOIN edge_strings cf ON cf.id = d.confidence_id
+         JOIN name_strings ek ON ek.id = d.edge_kind_id
+         JOIN name_strings cf ON cf.id = d.confidence_id
          WHERE d.to_symbol_id = ?1
            -- Internal dispatch FACT rows (#200) are synthesis inputs, not real in-edges — the
            -- handle fact duplicates the dispatcher's existing calls_name, so counting it would
@@ -309,10 +309,14 @@ mod tests {
 
     /// Insert a symbol in `file_id`, returning its id.
     fn add_symbol(conn: &Connection, file_id: i64, name: &str, qualified: &str) -> i64 {
+        // #224: qualified_name interned into name_strings.
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qualified])
+            .unwrap();
         conn.execute(
-            "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
                                  end_byte, signature, docs)
-             VALUES (?1, 'rust', ?2, ?3, 'function', 0, 10, NULL, NULL)",
+             VALUES (?1, 'rust', ?2, (SELECT id FROM name_strings WHERE value = ?3),
+                     'function', 0, 10, NULL, NULL)",
             params![file_id, name, qualified],
         )
         .unwrap();
@@ -337,7 +341,7 @@ mod tests {
         )
         .unwrap();
         // `edges` is an INSTEAD OF INSERT view over `edges_data`; `last_insert_rowid()` after the
-        // trigger reflects an inner `edge_strings` insert, not the edge row — read the real
+        // trigger reflects an inner `name_strings` insert, not the edge row — read the real
         // `edges_data.id` so the oracle-effects map keys on the value `scoped_weighted_fan_in`'s
         // `d.id` query returns.
         conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get::<_, i64>(0)).unwrap()

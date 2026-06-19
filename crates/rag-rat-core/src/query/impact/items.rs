@@ -15,7 +15,7 @@ pub(crate) fn import_export_items(
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.edge_kind IN ('imports', 'exports')
-          AND (edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM edge_strings WHERE \
+          AND (edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM name_strings WHERE \
          value = ?2))
         ORDER BY files.kind, files.path, edges.edge_kind
         LIMIT ?3
@@ -151,16 +151,17 @@ pub(crate) fn section_like_items(
     let sql = format!(
         "
         SELECT files.path, files.language, files.kind,
-               MAX(CASE WHEN symbols.name LIKE ?1 OR symbols.qualified_name LIKE ?1
-                        THEN symbols.qualified_name END) AS matched_symbol,
+               MAX(CASE WHEN symbols.name LIKE ?1 OR qn.value LIKE ?1
+                        THEN qn.value END) AS matched_symbol,
                MAX(CASE WHEN files.path LIKE ?1 THEN 1 ELSE 0 END) AS path_match
         FROM files
         LEFT JOIN symbols ON symbols.file_id = files.id
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         WHERE ({filter})
           AND (
               files.path LIKE ?1
               OR symbols.name LIKE ?1
-              OR symbols.qualified_name LIKE ?1
+              OR qn.value LIKE ?1
               {chunk_clause}
           )
         GROUP BY files.path, files.language, files.kind

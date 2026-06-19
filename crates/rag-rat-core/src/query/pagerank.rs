@@ -315,7 +315,7 @@ pub fn important_symbols(
     options: ImportanceOptions<'_>,
 ) -> anyhow::Result<RankedImportance> {
     // Symbol→symbol edges in the active checkout whose SOURCE resolved, source file in the scope
-    // view. `edge_strings` resolves the edge-kind and confidence ids to their names — the kind sets
+    // view. `name_strings` resolves the edge-kind and confidence ids to their names — the kind sets
     // the base weight, the confidence scales it (a name-only guess flows less rank than a
     // structurally-resolved call). `d.id` keys the optional SCIP-oracle effect lookup.
     //
@@ -329,8 +329,8 @@ pub fn important_symbols(
         "SELECT d.id, d.from_symbol_id, d.to_symbol_id, ek.value, cf.value
          FROM edges_data d
          JOIN files ON files.id = d.source_file_id
-         JOIN edge_strings ek ON ek.id = d.edge_kind_id
-         JOIN edge_strings cf ON cf.id = d.confidence_id
+         JOIN name_strings ek ON ek.id = d.edge_kind_id
+         JOIN name_strings cf ON cf.id = d.confidence_id
          WHERE d.from_symbol_id IS NOT NULL
            -- Internal dispatch FACT rows (#200) are synthesis inputs, not real edges — they'd
            -- double-count (the handle fact duplicates the dispatcher's existing calls_name) and
@@ -429,9 +429,10 @@ pub fn important_symbols(
         let symbol_id = symbol_ids[idx];
         let row = conn
             .query_row(
-                "SELECT s.qualified_name, s.kind, f.path, lsm.logical_symbol_id
+                "SELECT qn.value, s.kind, f.path, lsm.logical_symbol_id
                  FROM symbols s
                  JOIN files f ON f.id = s.file_id
+                 LEFT JOIN name_strings qn ON qn.id = s.qualified_name_id
                  LEFT JOIN logical_symbol_members lsm ON lsm.symbol_id = s.id
                  WHERE s.id = ?1",
                 [symbol_id],
@@ -560,10 +561,13 @@ mod tests {
         for (name, qname) in
             [("caller_a", "a::caller_a"), ("caller_b", "a::caller_b"), ("hub", "a::hub")]
         {
+            conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qname])
+                .unwrap();
             conn.execute(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
                                      end_byte, signature, docs)
-                 VALUES (1, 'rust', ?1, ?2, 'function', 0, 10, NULL, NULL)",
+                 VALUES (1, 'rust', ?1, (SELECT id FROM name_strings WHERE value = ?2),
+                         'function', 0, 10, NULL, NULL)",
                 params![name, qname],
             )
             .unwrap();
@@ -603,11 +607,15 @@ mod tests {
         )
         .unwrap();
         for i in 1..=n {
+            let qname = format!("a::s{i}");
+            conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qname])
+                .unwrap();
             conn.execute(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
                                      end_byte, signature, docs)
-                 VALUES (1, 'rust', ?1, ?2, 'function', 0, 10, NULL, NULL)",
-                params![format!("s{i}"), format!("a::s{i}")],
+                 VALUES (1, 'rust', ?1, (SELECT id FROM name_strings WHERE value = ?2),
+                         'function', 0, 10, NULL, NULL)",
+                params![format!("s{i}"), qname],
             )
             .unwrap();
         }
@@ -663,11 +671,15 @@ mod tests {
         )
         .unwrap();
         for i in 1..=n {
+            let qname = format!("a::s{i}");
+            conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qname])
+                .unwrap();
             conn.execute(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
                                      end_byte, signature, docs)
-                 VALUES (1, 'rust', ?1, ?2, 'function', 0, 10, NULL, NULL)",
-                params![format!("s{i}"), format!("a::s{i}")],
+                 VALUES (1, 'rust', ?1, (SELECT id FROM name_strings WHERE value = ?2),
+                         'function', 0, 10, NULL, NULL)",
+                params![format!("s{i}"), qname],
             )
             .unwrap();
         }
@@ -698,11 +710,15 @@ mod tests {
         )
         .unwrap();
         for i in 1..=2 {
+            let qname = format!("a::s{i}");
+            conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qname])
+                .unwrap();
             conn.execute(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
                                      end_byte, signature, docs)
-                 VALUES (1, 'rust', ?1, ?2, 'function', 0, 10, NULL, NULL)",
-                params![format!("s{i}"), format!("a::s{i}")],
+                 VALUES (1, 'rust', ?1, (SELECT id FROM name_strings WHERE value = ?2),
+                         'function', 0, 10, NULL, NULL)",
+                params![format!("s{i}"), qname],
             )
             .unwrap();
         }

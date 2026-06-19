@@ -98,7 +98,7 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         -- resident, so decode is always possible). Stored IN the DB so a copied / P2P-streamed \
          index
         -- is self-contained. No FK from chunk_text into this table — gc sweeps versions with zero
-        -- referencing blobs (like the edge_strings pool).
+        -- referencing blobs (like the name_strings pool).
         CREATE TABLE IF NOT EXISTS chunk_text_dict(
             version INTEGER PRIMARY KEY,
             dict BLOB NOT NULL
@@ -109,7 +109,18 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             file_id INTEGER NOT NULL,
             language TEXT NOT NULL,
             name TEXT NOT NULL,
-            qualified_name TEXT NOT NULL,
+            -- The qualified name is INTERNED into the shared `name_strings` pool (#224): edge
+            -- call-target names already store ~85% of symbol qnames, so an integer id into the \
+         pool
+            -- replaces the inline TEXT column + its 49 MB string B-tree (idx on qualified_name_id \
+         is
+            -- ~13 MB of 3-byte ids). NULLABLE on purpose: a forward-migrated DB ADDs the column
+            -- (which can't be NOT NULL on a populated table) before backfilling, so a \
+         freshly-built
+            -- DB must match that shape. Readers reconstruct the text via a JOIN on name_strings;
+            -- gc MUST count this as a referencing column (query_api/gc.rs) or it nulls live \
+         qnames.
+            qualified_name_id INTEGER,
             kind TEXT NOT NULL,
             start_byte INTEGER NOT NULL,
             end_byte INTEGER NOT NULL,
@@ -123,7 +134,11 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             language TEXT NOT NULL,
             path TEXT NOT NULL,
             logical_name TEXT NOT NULL,
-            qualified_name TEXT NOT NULL,
+            -- Interned into `name_strings` (#224), same as symbols.qualified_name_id above. \
+         NULLABLE
+            -- for the same forward-migrate-then-backfill reason; gc counts it as a referencing
+            -- column.
+            qualified_name_id INTEGER,
             kind TEXT NOT NULL,
             variant_count INTEGER NOT NULL,
             group_reason TEXT NOT NULL
@@ -154,7 +169,7 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         -- here once and `edges_data` stores integer ids. Deliberately NO foreign keys from
         -- `edges_data` into this table — gc prunes orphaned values, and an FK would force
         -- dictionary-before-edges delete ordering for no integrity gain.
-        CREATE TABLE IF NOT EXISTS edge_strings(
+        CREATE TABLE IF NOT EXISTS name_strings(
             id INTEGER PRIMARY KEY,
             value TEXT NOT NULL UNIQUE
         ) STRICT;
@@ -530,12 +545,14 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
         CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
-        CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
+        -- The qualified_name_id indexes are created AFTER this batch \
+         (interned_qualified_name_indexes)
+        -- because on a forward-migrate the `symbols`/`logical_symbols` tables may PRE-EXIST in the
+        -- pre-V028 shape (inline `qualified_name`, no `qualified_name_id`) — `CREATE TABLE IF NOT
+        -- EXISTS` above is then a no-op and the id column does not exist yet (V028 adds it). #224.
         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbol_facts_kind_value
             ON symbol_facts(fact_kind, fact_value);
-        CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name
-            ON logical_symbols(qualified_name);
         CREATE INDEX IF NOT EXISTS idx_logical_symbol_members_symbol
             ON logical_symbol_members(symbol_id);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_path ON git_file_changes(path);
@@ -582,6 +599,29 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_repo_memory_call_paths(conn)?;
     apply_repo_memory_call_path_edges(conn)?;
     apply_graph_file_lookup_indexes(conn)?;
+    interned_qualified_name_indexes(conn)?;
+    Ok(())
+}
+
+/// Create the interned qualified-name indexes (#224), but ONLY when the `qualified_name_id` column
+/// exists. On a fresh DB the baseline's `CREATE TABLE symbols/logical_symbols` makes the column, so
+/// this fires immediately. On a forward-migrate the tables PRE-EXIST in the pre-V028 shape (inline
+/// `qualified_name`, no id column) — the `CREATE TABLE IF NOT EXISTS` was a no-op and the column is
+/// absent until V028 adds + backfills it, which is where V028 creates these same indexes. Guarding
+/// here keeps `apply_baseline` from referencing a not-yet-added column on an older DB.
+fn interned_qualified_name_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    if column_exists(conn, "symbols", "qualified_name_id")? {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name_id
+                ON symbols(qualified_name_id);",
+        )?;
+    }
+    if column_exists(conn, "logical_symbols", "qualified_name_id")? {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name_id
+                ON logical_symbols(qualified_name_id);",
+        )?;
+    }
     Ok(())
 }
 

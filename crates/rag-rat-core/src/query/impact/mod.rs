@@ -473,13 +473,14 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
                    files.path AS path,
                    files.language AS language,
                    files.kind AS kind,
-                   symbols.qualified_name AS symbol,
+                   qn.value AS symbol,
                    CASE
                        WHEN symbols.kind = 'impl' THEN 'rust_uniffi_exported_impl'
                        ELSE 'rust_uniffi_export'
                    END AS reason
             FROM symbols
             JOIN files ON files.id = symbols.file_id
+            LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
             JOIN symbol_facts
               ON symbol_facts.symbol_id = symbols.id
              AND symbol_facts.fact_kind = 'rust_attr'
@@ -492,7 +493,7 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
                    files.path AS path,
                    files.language AS language,
                    files.kind AS kind,
-                   members.qualified_name AS symbol,
+                   members_qn.value AS symbol,
                    'rust_uniffi_impl_member' AS reason
             FROM symbols AS impls
             JOIN files ON files.id = impls.file_id
@@ -505,6 +506,7 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
              AND members.start_byte > impls.start_byte
              AND members.end_byte < impls.end_byte
              AND members.kind IN ('function', 'method')
+            LEFT JOIN name_strings members_qn ON members_qn.id = members.qualified_name_id
             WHERE files.language = 'rust'
               AND impls.kind = 'impl'
         ),

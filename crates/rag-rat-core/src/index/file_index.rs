@@ -320,16 +320,21 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         let mut symbol_ids = Vec::with_capacity(symbols.len());
         for symbol in symbols {
+            // Intern the qualified name into the shared `name_strings` pool and store its id (#224)
+            // — the qualified_name TEXT column was dropped in V028. The pool is shared with edge
+            // call-target names (~85% overlap), so most inserts hit an existing id.
+            let qualified_name_id =
+                crate::index::edges::intern_edge_string(conn, &symbol.qualified_name)?;
             conn.prepare_cached(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, scope_path, kind, \
-                 start_byte, end_byte, start_line, end_line, signature, docs)
+                "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, \
+                 kind, start_byte, end_byte, start_line, end_line, signature, docs)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?
             .execute(params![
                 file_id,
                 language.as_str(),
                 symbol.name,
-                symbol.qualified_name,
+                qualified_name_id,
                 symbol.scope_path,
                 symbol.kind,
                 i64::try_from(symbol.start_byte)?,
@@ -363,9 +368,12 @@ impl IndexDatabase {
     ) -> anyhow::Result<()> {
         let group_reason = if members.len() > 1 { "cfg_variant" } else { "single" };
         let logical_symbol_id = key.stable_id();
+        // Intern the qualified name into the shared `name_strings` pool (#224) — the
+        // qualified_name TEXT column was dropped in V028.
+        let qualified_name_id = crate::index::edges::intern_edge_string(conn, &key.qualified_name)?;
         conn.prepare_cached(
             "
-            INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name, kind, \
+            INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id, kind, \
              variant_count, group_reason)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ",
@@ -375,7 +383,7 @@ impl IndexDatabase {
             key.language,
             key.path,
             key.name,
-            key.qualified_name,
+            qualified_name_id,
             key.kind,
             i64::try_from(members.len()).unwrap_or(i64::MAX),
             group_reason,

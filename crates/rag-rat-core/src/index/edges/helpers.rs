@@ -246,11 +246,11 @@ pub(crate) fn symbols_for_file(
 ) -> anyhow::Result<Vec<IndexedSymbol>> {
     let mut stmt = conn.prepare(
         "
-        SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, \
-         symbols.qualified_name, symbols.kind,
+        SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, qn.value, symbols.kind,
                symbols.start_byte, symbols.end_byte, symbols.start_line, symbols.end_line, \
          COALESCE(symbols.scope_path, '')
         FROM symbols
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         WHERE file_id = ?1
         ORDER BY symbols.start_byte, symbols.end_byte
         ",
@@ -265,13 +265,13 @@ pub(crate) fn symbols_for_file(
 pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol>> {
     let mut stmt = conn.prepare(
         "
-        SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, \
-         symbols.qualified_name, symbols.kind,
+        SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, qn.value, symbols.kind,
                symbols.start_byte, symbols.end_byte, symbols.start_line, symbols.end_line, \
          COALESCE(symbols.scope_path, '')
         FROM symbols
         JOIN files ON files.id = symbols.file_id
-        ORDER BY symbols.qualified_name
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+        ORDER BY qn.value
         ",
     )?;
     let rows = stmt.query_map([], symbol_row)?;
@@ -294,13 +294,13 @@ pub(crate) fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSym
         scope_path: row.get(10)?,
     })
 }
-/// Intern one string into `edge_strings`, returning its id (#79). `INSERT OR IGNORE` + lookup —
+/// Intern one string into `name_strings`, returning its id (#79). `INSERT OR IGNORE` + lookup —
 /// two cached statements; callers on bulk paths wrap this in [`EdgeStringInterner`] so repeats
 /// hit a process-side map instead of the b-tree.
 pub(crate) fn intern_edge_string(conn: &Connection, value: &str) -> anyhow::Result<i64> {
-    conn.prepare_cached("INSERT OR IGNORE INTO edge_strings(value) VALUES (?1)")?
+    conn.prepare_cached("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)")?
         .execute([value])?;
-    conn.prepare_cached("SELECT id FROM edge_strings WHERE value = ?1")?
+    conn.prepare_cached("SELECT id FROM name_strings WHERE value = ?1")?
         .query_row([value], |row| row.get(0))
         .map_err(Into::into)
 }

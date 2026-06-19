@@ -177,7 +177,7 @@ impl IndexDatabase {
             .query_row(
                 "SELECT files.path FROM symbols
                  JOIN files ON files.id = symbols.file_id
-                 WHERE symbols.qualified_name = ?1
+                 WHERE symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
                  ORDER BY symbols.id
                  LIMIT 1",
                 [qualified_name],

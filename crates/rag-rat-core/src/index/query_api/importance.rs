@@ -465,7 +465,7 @@ impl IndexDatabase {
             .query_row(
                 "SELECT s.id FROM symbols s
                  JOIN files ON files.id = s.file_id
-                 WHERE s.qualified_name = ?1
+                 WHERE s.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
                  ORDER BY s.id
                  LIMIT 1",
                 [qualified_name],

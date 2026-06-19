@@ -96,11 +96,16 @@ impl Harness {
 
     /// Insert a symbol with a byte span, returning its id.
     fn add_symbol(&self, file_id: i64, name: &str, start_byte: usize, end_byte: usize) -> i64 {
+        // #224: qualified_name interned into name_strings (here name == qualified_name).
+        self.conn
+            .execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![name])
+            .unwrap();
         self.conn
             .execute(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, \
-                 end_byte, start_line, end_line) VALUES (?1, 'rust', ?2, ?2, 'function', ?3, ?4, \
-                 1, 1)",
+                "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, \
+                 start_byte, end_byte, start_line, end_line)
+                 VALUES (?1, 'rust', ?2, (SELECT id FROM name_strings WHERE value = ?2), \
+                 'function', ?3, ?4, 1, 1)",
                 params![file_id, name, start_byte as i64, end_byte as i64],
             )
             .unwrap();
@@ -120,9 +125,16 @@ impl Harness {
         end_byte: usize,
     ) -> i64 {
         self.conn
+            .execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![
+                qualified_name
+            ])
+            .unwrap();
+        self.conn
             .execute(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, \
-                 end_byte, start_line, end_line) VALUES (?1, 'rust', ?2, ?3, ?4, ?5, ?6, 1, 1)",
+                "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, \
+                 start_byte, end_byte, start_line, end_line)
+                 VALUES (?1, 'rust', ?2, (SELECT id FROM name_strings WHERE value = ?3), ?4, ?5, \
+                 ?6, 1, 1)",
                 params![file_id, name, qualified_name, kind, start_byte as i64, end_byte as i64],
             )
             .unwrap();
@@ -139,10 +151,16 @@ impl Harness {
         symbol_id: i64,
     ) {
         self.conn
+            .execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![
+                qualified_name
+            ])
+            .unwrap();
+        self.conn
             .execute(
-                "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name, \
-                 kind, variant_count, group_reason) VALUES (?1, 'rust', ?2, ?3, ?4, 'function', \
-                 1, 'single')",
+                "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id, \
+                 kind, variant_count, group_reason)
+                 VALUES (?1, 'rust', ?2, ?3, (SELECT id FROM name_strings WHERE value = ?4), \
+                 'function', 1, 'single')",
                 params![logical_symbol_id, path, name, qualified_name],
             )
             .unwrap();
@@ -749,7 +767,7 @@ fn migration_creates_oracle_side_tables() {
         assert!(columns.contains(&expected.to_string()), "edge_oracle missing {expected}");
     }
 
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 27);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 28);
 }
 
 /// The V019 moniker migration: the `logical_symbol_monikers` table (STRICT, NO foreign key — see
@@ -4075,7 +4093,7 @@ fn pre_spawn_gate_skips_definition_reindexed_mid_subprocess() {
 // Edge string interning (#79): compat view shape, round-trip writes, dedup, V020 conversion.
 // ---------------------------------------------------------------------------
 
-/// The V020 shape: `edges` is a VIEW over `edges_data` + the `edge_strings` dictionary, with
+/// The V020 shape: `edges` is a VIEW over `edges_data` + the `name_strings` dictionary, with
 /// INSTEAD OF triggers; both backing tables are STRICT; the int indexes replaced the TEXT ones.
 #[test]
 fn edges_is_a_compat_view_over_interned_tables() {
@@ -4088,7 +4106,7 @@ fn edges_is_a_compat_view_over_interned_tables() {
     };
     assert_eq!(object_type("edges"), "view");
     assert_eq!(object_type("edges_data"), "table");
-    assert_eq!(object_type("edge_strings"), "table");
+    assert_eq!(object_type("name_strings"), "table");
     for trigger in ["edges_view_insert", "edges_view_update", "edges_view_delete"] {
         assert_eq!(object_type(trigger), "trigger", "{trigger} must exist");
     }
@@ -4138,7 +4156,7 @@ fn view_writes_round_trip_and_dedup() {
     let shared: i64 = h
         .conn
         .query_row(
-            "SELECT COUNT(*) FROM edge_strings WHERE value IN ('a.rs::caller', 'calls_name', \
+            "SELECT COUNT(*) FROM name_strings WHERE value IN ('a.rs::caller', 'calls_name', \
              'NameOnly', 'unresolved')",
             [],
             |row| row.get(0),
@@ -4179,7 +4197,7 @@ fn v020_converts_a_legacy_edges_table() {
         DROP TRIGGER edges_view_delete;
         DROP VIEW edges;
         DELETE FROM edges_data;
-        DELETE FROM edge_strings;
+        DELETE FROM name_strings;
         CREATE TABLE edges(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_file_id INTEGER,
@@ -4272,7 +4290,7 @@ fn or_branch_name_predicates_use_the_to_name_index() {
     let fixed = plan(
         "SELECT COUNT(*) FROM edges WHERE edge_kind IN ('calls_name','constructs','uses_macro') \
          AND (to_symbol_id = 5 OR (to_symbol_id IS NULL AND to_name_id = (SELECT id FROM \
-         edge_strings WHERE value = 'x')))",
+         name_strings WHERE value = 'x')))",
     );
     assert!(
         fixed.contains("idx_edges_to_name"),

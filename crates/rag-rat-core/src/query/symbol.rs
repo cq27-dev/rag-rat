@@ -214,10 +214,11 @@ pub fn lookup_by_id(conn: &Connection, symbol_id: i64) -> anyhow::Result<Option<
         .query_row(
             "
         SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, \
-             symbols.qualified_name,
+             qn.value,
                symbols.kind, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.docs
         FROM symbols
         JOIN files ON files.id = symbols.file_id
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         WHERE symbols.id = ?1
         ",
             [symbol_id],
@@ -270,13 +271,20 @@ fn lookup_name(
     limit: u32,
     include_generated: bool,
 ) -> anyhow::Result<Vec<SymbolHit>> {
+    // Fuzzy qualified-name match is interned (#224): match against the shared `name_strings` pool
+    // (`qualified_name_id IN (SELECT id FROM name_strings WHERE value LIKE ?2)`) then scope back to
+    // `symbols` via the join. The `name = ?1` exact arm is unaffected and stays on
+    // `idx_symbols_name` — keep it first so a bare-name hit is indexed. The projection reads
+    // the value back through the `qn` join so the output `qualified_name` field is unchanged.
     let mut sql = "
         SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, \
-                   symbols.qualified_name,
+                   qn.value,
                symbols.kind, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.docs
         FROM symbols
         JOIN files ON files.id = symbols.file_id
-        WHERE (symbols.name = ?1 OR symbols.qualified_name LIKE ?2)
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+        WHERE (symbols.name = ?1
+               OR symbols.qualified_name_id IN (SELECT id FROM name_strings WHERE value LIKE ?2))
     "
     .to_string();
     if !include_generated {
@@ -333,9 +341,12 @@ pub fn lookup_logical_by_id(
 ) -> anyhow::Result<Option<LogicalSymbolHit>> {
     conn.query_row(
         "
-        SELECT id, language, path, logical_name, qualified_name, kind, variant_count, group_reason
+        SELECT logical_symbols.id, logical_symbols.language, logical_symbols.path,
+               logical_symbols.logical_name, qn.value, logical_symbols.kind,
+               logical_symbols.variant_count, logical_symbols.group_reason
         FROM logical_symbols
-        WHERE id = ?1
+        LEFT JOIN name_strings qn ON qn.id = logical_symbols.qualified_name_id
+        WHERE logical_symbols.id = ?1
         ",
         [logical_symbol_id],
         logical_symbol_hit_row,
@@ -351,10 +362,11 @@ pub fn logical_for_symbol_id(
     conn.query_row(
         "
         SELECT logical_symbols.id, logical_symbols.language, logical_symbols.path,
-               logical_symbols.logical_name, logical_symbols.qualified_name, logical_symbols.kind,
+               logical_symbols.logical_name, qn.value, logical_symbols.kind,
                logical_symbols.variant_count, logical_symbols.group_reason
         FROM logical_symbol_members
         JOIN logical_symbols ON logical_symbols.id = logical_symbol_members.logical_symbol_id
+        LEFT JOIN name_strings qn ON qn.id = logical_symbols.qualified_name_id
         WHERE logical_symbol_members.symbol_id = ?1
         ",
         [symbol_id],
@@ -400,11 +412,12 @@ fn lookup_logical_members(
     let mut stmt = conn.prepare(
         "
         SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name,
-               symbols.qualified_name, symbols.kind, symbols.start_byte, symbols.end_byte,
+               qn.value, symbols.kind, symbols.start_byte, symbols.end_byte,
                symbols.signature, symbols.docs
         FROM logical_symbol_members
         JOIN symbols ON symbols.id = logical_symbol_members.symbol_id
         JOIN files ON files.id = symbols.file_id
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         WHERE logical_symbol_members.logical_symbol_id = ?1
         ORDER BY symbols.start_byte, symbols.id
         LIMIT ?2
@@ -437,13 +450,16 @@ fn lookup_symbol_path(
     limit: u32,
     include_generated: bool,
 ) -> anyhow::Result<Vec<SymbolHit>> {
+    // Exact qualified-name match is interned (#224): resolve the name to its pool id once, then hit
+    // `idx_symbols_qualified_name_id`. The projection reads the value back through the `qn` join.
     let mut sql = "
         SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, \
-                   symbols.qualified_name,
+                   qn.value,
                symbols.kind, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.docs
         FROM symbols
         JOIN files ON files.id = symbols.file_id
-        WHERE symbols.qualified_name = ?1
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+        WHERE symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
     "
     .to_string();
     if !include_generated {

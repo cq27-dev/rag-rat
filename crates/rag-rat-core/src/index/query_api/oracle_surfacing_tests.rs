@@ -482,9 +482,13 @@ fn important_symbols_retargets_an_in_corpus_contradiction() {
 
     let (edge_id, cs, ce, path) = call_edge(&db);
     let name_of = |id: i64| -> String {
-        conn.query_row("SELECT qualified_name FROM symbols WHERE id = ?1", params![id], |r| {
-            r.get(0)
-        })
+        conn.query_row(
+            "SELECT qn.value FROM symbols
+             LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+             WHERE symbols.id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
         .unwrap()
     };
     let target_sym: i64 = conn
@@ -553,9 +557,13 @@ fn upgrade_hydrates_target_from_compiler_resolution() {
     let target_qualified: String = db
         .storage
         .connection()
-        .query_row("SELECT qualified_name FROM symbols WHERE name = 'target' LIMIT 1", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT qn.value FROM symbols
+             LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+             WHERE symbols.name = 'target' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     let (target_start, target_end): (i64, i64) = db
         .storage

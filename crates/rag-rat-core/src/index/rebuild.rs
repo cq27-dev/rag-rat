@@ -163,13 +163,13 @@ impl IndexDatabase {
     pub(super) fn delete_staged_files_cascade(&self) -> anyhow::Result<()> {
         self.storage.execute_batch(
             "
-            INSERT OR IGNORE INTO main.edge_strings(value) VALUES ('unresolved');
+            INSERT OR IGNORE INTO main.name_strings(value) VALUES ('unresolved');
             UPDATE main.edges_data
             SET to_symbol_id = NULL,
                 target_start_line = NULL,
                 target_end_line = NULL,
                 resolution_id =
-                    (SELECT id FROM main.edge_strings WHERE value = 'unresolved')
+                    (SELECT id FROM main.name_strings WHERE value = 'unresolved')
             WHERE to_symbol_id IN (
                 SELECT symbols.id
                 FROM main.symbols

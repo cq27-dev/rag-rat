@@ -677,13 +677,14 @@ fn live_symbol_candidates(
     // we want all live symbols with this name, ranked by quality, not filtered by content.
     let mut stmt = match conn.prepare(
         "
-        SELECT symbols.qualified_name AS qualified_name,
+        SELECT qn.value             AS qualified_name,
                symbols.kind           AS kind,
                symbols.signature      AS signature
         FROM symbols
         JOIN files ON files.id = symbols.file_id
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         WHERE symbols.name = ?1
-        ORDER BY symbols.qualified_name
+        ORDER BY qn.value
         ",
     ) {
         Ok(s) => s,

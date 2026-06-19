@@ -245,11 +245,15 @@ mod listener_tests {
             )
             .unwrap();
         rw.connection()
+            .execute("INSERT OR IGNORE INTO name_strings(value) VALUES ('lib::frobnicate')", [])
+            .unwrap();
+        rw.connection()
             .execute(
-                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
                                      end_byte, signature, docs)
-                 VALUES (1, 'rust', 'frobnicate', 'lib::frobnicate', 'function', 0, 10,
-                         'fn frobnicate()', NULL)",
+                 VALUES (1, 'rust', 'frobnicate',
+                         (SELECT id FROM name_strings WHERE value = 'lib::frobnicate'),
+                         'function', 0, 10, 'fn frobnicate()', NULL)",
                 [],
             )
             .unwrap();

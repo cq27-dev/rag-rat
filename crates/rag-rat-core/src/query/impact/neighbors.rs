@@ -25,9 +25,9 @@ pub(crate) fn graph_neighbors(
         "COALESCE(to_files.kind, source_files.kind)"
     };
     let source_symbol_col = if reverse {
-        "COALESCE(from_symbols.qualified_name, edges.from_name)"
+        "COALESCE(from_qn.value, edges.from_name)"
     } else {
-        "COALESCE(to_symbols.qualified_name, edges.to_name)"
+        "COALESCE(to_qn.value, edges.to_name)"
     };
     let predicate = impact_graph_predicate(reverse, resolution_mode);
     let sql = format!(
@@ -39,6 +39,8 @@ pub(crate) fn graph_neighbors(
         LEFT JOIN files from_files ON from_files.id = from_symbols.file_id
         LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
         LEFT JOIN files to_files ON to_files.id = to_symbols.file_id
+        LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
+        LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
         LEFT JOIN files source_files ON source_files.id = edges.source_file_id
         WHERE edges.edge_kind IN ('calls_name', 'constructs', 'implements')
           AND ({predicate})
@@ -115,7 +117,7 @@ pub(crate) fn impact_graph_predicate(reverse: bool, mode: GraphResolutionMode) -
             "(edges.from_symbol_id = ?1 OR edges.from_name = ?2)
              AND (edges.to_symbol_id IS NOT NULL OR edges.target_qualified_name IS NOT NULL)",
         (true, GraphResolutionMode::Fuzzy) =>
-            "edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM edge_strings WHERE \
+            "edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM name_strings WHERE \
              value = ?2)",
         (false, GraphResolutionMode::Fuzzy) => "edges.from_symbol_id = ?1 OR edges.from_name = ?2",
     }
@@ -134,7 +136,7 @@ pub(crate) fn import_export_dependents(
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.edge_kind IN ('imports', 'exports')
-          AND (edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM edge_strings WHERE \
+          AND (edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM name_strings WHERE \
          value = ?2))
         ORDER BY files.kind, files.path, edges.edge_kind
         ",
@@ -186,9 +188,10 @@ pub(crate) fn same_file_siblings(
 ) -> anyhow::Result<()> {
     let mut stmt = conn.prepare(
         "
-        SELECT files.path, files.language, files.kind, symbols.qualified_name
+        SELECT files.path, files.language, files.kind, qn.value
         FROM symbols
         JOIN files ON files.id = symbols.file_id
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         WHERE symbols.file_id = ?1 AND symbols.id != ?2
         ORDER BY symbols.start_byte
         LIMIT 20
@@ -239,20 +242,20 @@ pub(crate) fn textual_fallback(
     };
     let sql = format!(
         "
-        SELECT DISTINCT files.path, files.language, files.kind, symbols.qualified_name,
+        SELECT DISTINCT files.path, files.language, files.kind, qn.value,
                CASE
                    WHEN files.path LIKE ?1 THEN 'path LIKE fallback'
-                   WHEN symbols.name LIKE ?1 OR symbols.qualified_name LIKE ?1 THEN 'symbol LIKE \
-         fallback'
+                   WHEN symbols.name LIKE ?1 OR qn.value LIKE ?1 THEN 'symbol LIKE fallback'
                    ELSE 'chunk text match fallback'
                END
         FROM files
         LEFT JOIN symbols ON symbols.file_id = files.id
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         WHERE files.path LIKE ?1
            OR symbols.name LIKE ?1
-           OR symbols.qualified_name LIKE ?1
+           OR qn.value LIKE ?1
            {chunk_clause}
-        ORDER BY files.kind, files.path, symbols.qualified_name
+        ORDER BY files.kind, files.path, qn.value
         LIMIT ?2
         "
     );

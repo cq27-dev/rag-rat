@@ -31,10 +31,12 @@ pub(crate) fn exact_symbols(conn: &Connection, query: &str) -> anyhow::Result<Ve
     let mut stmt = conn.prepare(
         "
         SELECT symbols.id, symbols.file_id, files.path, files.language, files.kind,
-               symbols.name, symbols.qualified_name
+               symbols.name, qn.value
         FROM symbols
         JOIN files ON files.id = symbols.file_id
-        WHERE symbols.name = ?1 OR symbols.qualified_name = ?1
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+        WHERE symbols.name = ?1
+           OR symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
         ORDER BY files.kind, files.path, symbols.start_byte
         ",
     )?;

@@ -204,12 +204,13 @@ fn primary_symbol(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<Pri
     Ok(conn
         .query_row(
             "
-            SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind, files.path
+            SELECT symbols.id, symbols.name, qn.value, symbols.kind, files.path
             FROM chunks
             JOIN symbols ON symbols.file_id = chunks.file_id
              AND symbols.start_byte < chunks.end_byte
              AND symbols.end_byte > chunks.start_byte
             JOIN files ON files.id = symbols.file_id
+            LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
             WHERE chunks.id = ?1
             ORDER BY
               CASE symbols.kind
@@ -253,7 +254,7 @@ fn count_callers(conn: &Connection, symbol: &PrimarySymbol) -> anyhow::Result<u6
         FROM edges
         WHERE edge_kind IN ('calls_name', 'constructs', 'uses_macro')
           AND (to_symbol_id = ?1 OR (to_symbol_id IS NULL AND to_name_id = (SELECT id FROM \
-             edge_strings WHERE value = ?2)))
+             name_strings WHERE value = ?2)))
         ",
         )?
         .query_row(params![symbol.id, symbol.name], |row| row.get::<_, i64>(0))?;
@@ -342,7 +343,7 @@ fn callers(
         "
         SELECT DISTINCT
                source_files.path,
-               COALESCE(source_symbols.qualified_name, edges.from_name, source_files.path),
+               COALESCE(source_qn.value, edges.from_name, source_files.path),
                COALESCE(NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
                COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
          source_chunks.start_line, 1),
@@ -351,12 +352,13 @@ fn callers(
         FROM edges
         JOIN files source_files ON source_files.id = edges.source_file_id
         LEFT JOIN symbols source_symbols ON source_symbols.id = edges.from_symbol_id
+        LEFT JOIN name_strings source_qn ON source_qn.id = source_symbols.qualified_name_id
         LEFT JOIN chunks source_chunks ON source_chunks.file_id = edges.source_file_id
           AND source_symbols.start_byte >= source_chunks.start_byte
           AND source_symbols.start_byte < source_chunks.end_byte
         WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_macro')
           AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
-         (SELECT id FROM edge_strings WHERE value = ?2)))
+         (SELECT id FROM name_strings WHERE value = ?2)))
         ORDER BY
           CASE edges.confidence
             WHEN 'Exact' THEN 0
@@ -402,7 +404,7 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
         SELECT DISTINCT
                edges.to_name,
                target_files.path,
-               target_symbols.qualified_name,
+               target_qn.value,
                COALESCE(edges.target_start_line, target_chunks.start_line),
                source_files.path,
                COALESCE(NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
@@ -413,6 +415,7 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
         FROM edges
         JOIN files source_files ON source_files.id = edges.source_file_id
         LEFT JOIN symbols target_symbols ON target_symbols.id = edges.to_symbol_id
+        LEFT JOIN name_strings target_qn ON target_qn.id = target_symbols.qualified_name_id
         LEFT JOIN files target_files ON target_files.id = target_symbols.file_id
         LEFT JOIN chunks target_chunks ON target_chunks.file_id = target_symbols.file_id
           AND target_symbols.start_byte >= target_chunks.start_byte

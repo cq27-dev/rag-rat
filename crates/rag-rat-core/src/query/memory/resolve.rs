@@ -383,10 +383,11 @@ pub(crate) fn chunk_for_symbol(
                symbols.id AS symbol_id
         FROM symbols
         JOIN files ON files.id = symbols.file_id
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         LEFT JOIN chunks ON chunks.file_id = files.id
-            AND (chunks.symbol_path = symbols.qualified_name OR chunks.symbol_path = ?2)
+            AND (chunks.symbol_path = qn.value OR chunks.symbol_path = ?2)
         WHERE symbols.id = ?1
-        ORDER BY CASE WHEN chunks.symbol_path = symbols.qualified_name THEN 0 ELSE 1 END,
+        ORDER BY CASE WHEN chunks.symbol_path = qn.value THEN 0 ELSE 1 END,
                  chunks.start_line
         LIMIT 1
         ",
@@ -412,8 +413,9 @@ pub(crate) fn chunk_for_logical_symbol(
         FROM logical_symbol_members
         JOIN symbols ON symbols.id = logical_symbol_members.symbol_id
         JOIN files ON files.id = symbols.file_id
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         LEFT JOIN chunks ON chunks.file_id = files.id
-            AND chunks.symbol_path = symbols.qualified_name
+            AND chunks.symbol_path = qn.value
         WHERE logical_symbol_members.logical_symbol_id = ?1
         ORDER BY logical_symbol_members.start_line, chunks.start_line
         LIMIT 1
@@ -455,7 +457,8 @@ pub(crate) fn symbol_id_for_chunk(
         SELECT symbols.id AS symbol_id
         FROM symbols
         JOIN files ON files.id = symbols.file_id
-        WHERE files.path = ?1 AND symbols.qualified_name = ?2
+        WHERE files.path = ?1
+          AND symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?2)
         LIMIT 1
         ",
         params![chunk.path, symbol_path],
@@ -859,10 +862,11 @@ pub(crate) fn relocate_symbol_by_name(
         // The join on `files` keeps this context-scoped, matching the qualified_name fallback
         // above.
         "
-        SELECT symbols.id AS symbol_id, symbols.qualified_name AS qualified_name,
+        SELECT symbols.id AS symbol_id, qn.value AS qualified_name,
                files.path AS path, symbols.kind AS kind, symbols.signature AS signature
         FROM symbols
         JOIN files ON files.id = symbols.file_id
+        LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         WHERE symbols.name = ?1
         ",
     )?;

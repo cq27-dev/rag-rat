@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 27;
+pub const LATEST_SCHEMA_VERSION: u32 = 28;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -86,7 +86,7 @@ const MIGRATION_019_DESCRIPTION: &str = "Add logical_symbol_monikers + moniker p
                                          relocation reason on repo memory bindings (#70)";
 const MIGRATION_020_ID: &str = "020_edge_string_interning";
 const MIGRATION_020_CHECKSUM: &str = "sha256:rag-rat-edge-string-interning-v20";
-const MIGRATION_020_DESCRIPTION: &str = "Normalize repeated edge strings into the edge_strings \
+const MIGRATION_020_DESCRIPTION: &str = "Normalize repeated edge strings into the name_strings \
                                          dictionary behind the edges compatibility view (#79)";
 const MIGRATION_021_ID: &str = "021_symbol_scope_path";
 const MIGRATION_021_CHECKSUM: &str = "sha256:rag-rat-symbol-scope-path-v21";
@@ -118,6 +118,10 @@ const MIGRATION_027_ID: &str = "027_drop_chunks_text";
 const MIGRATION_027_CHECKSUM: &str = "sha256:rag-rat-drop-chunks-text-v27";
 const MIGRATION_027_DESCRIPTION: &str = "Build the compressed chunk_text store from chunks.text, \
                                          then drop the chunks.text column (#77 Phase 2)";
+const MIGRATION_028_ID: &str = "028_intern_symbol_qualified_names";
+const MIGRATION_028_CHECKSUM: &str = "sha256:rag-rat-intern-symbol-qualified-names-v28";
+const MIGRATION_028_DESCRIPTION: &str = "Intern symbols/logical_symbols qualified_name into the \
+                                         shared name_strings pool, then drop the columns (#224)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -150,7 +154,7 @@ pub struct SchemaStatus {
 /// (all `CREATE … IF NOT EXISTS`) wrapped in the dirty marker so a crash mid-baseline is
 /// detectable, then record 001. Shared by [`apply`] (fresh DB) and [`migrate_forward`] (existing DB
 /// behind by N). LOAD-BEARING for forward-only: a pre-interning (≤v19) DB lacks shared tables like
-/// `edge_strings`/`edges_data` that later migrations INSERT into, so the baseline must run BEFORE
+/// `name_strings`/`edges_data` that later migrations INSERT into, so the baseline must run BEFORE
 /// any forward step replays — exactly what the old full `apply` did before the ladder.
 fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -168,6 +172,28 @@ fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
          VALUES (?1, ?2, ?3, ?4)",
         params![DIRTY_MIGRATION_ID, now_ms(), "", "partial migration in progress"],
     )?;
+    // The string pool was `edge_strings` before the name-pool merge (#224, the V028 bump); it now
+    // also holds symbol qualified-names, so the current schema names it `name_strings`. On a
+    // pre-merge DB the POPULATED table is still `edge_strings` — rename it into place HERE, before
+    // `apply_baseline`'s `CREATE TABLE IF NOT EXISTS name_strings` (and the `ensure_edges_view` it
+    // calls), so we adopt the real table instead of creating an empty one beside it (which would
+    // orphan every edge's interned names). Runs before any migration replay, so V023's
+    // `ensure_edges_view` then sees `name_strings`. Fresh / already-merged DBs have no
+    // `edge_strings` → no-op. A pre-merge DB is `Older` (< V028), so it reaches this migrate path;
+    // a `Compatible` open skips migration and is already `name_strings`.
+    let pre_merge_pool: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'edge_strings'",
+        [],
+        |row| row.get(0),
+    )?;
+    let merged_pool: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'name_strings'",
+        [],
+        |row| row.get(0),
+    )?;
+    if pre_merge_pool > 0 && merged_pool == 0 {
+        conn.execute_batch("ALTER TABLE edge_strings RENAME TO name_strings;")?;
+    }
     let result = apply_baseline(conn);
     if let Err(err) = result {
         let _ = conn.execute("UPDATE schema_version SET description = ?2 WHERE id = ?1", params![
@@ -358,11 +384,17 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_027_DESCRIPTION,
         apply: apply_drop_chunks_text,
     },
+    Migration {
+        id: MIGRATION_028_ID,
+        checksum: MIGRATION_028_CHECKSUM,
+        description: MIGRATION_028_DESCRIPTION,
+        apply: apply_intern_symbol_qualified_names,
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
 /// existing index that lags this binary. It first provisions the baseline idempotently (so a
-/// ≤v19 DB that predates a shared table like `edge_strings`/`edges_data` has it before a later
+/// ≤v19 DB that predates a shared table like `name_strings`/`edges_data` has it before a later
 /// migration INSERTs into it), then replays just the unapplied steps. Unlike [`apply`], it never
 /// re-runs an already-applied migration, so a data backfill like 005's resolution rewrite (an
 /// unconditional UPDATE) cannot clobber current values on a routine open. The caller guarantees a

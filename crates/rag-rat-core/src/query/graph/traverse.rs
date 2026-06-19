@@ -25,8 +25,8 @@ pub(crate) fn traverse_with_options(
         let tier = reverse_tier(mode);
         format!(
             "
-            SELECT COALESCE(from_symbols.qualified_name, edges.from_name) AS from_symbol,
-                   COALESCE(to_symbols.qualified_name, edges.to_name) AS to_symbol,
+            SELECT COALESCE(from_qn.value, edges.from_name) AS from_symbol,
+                   COALESCE(to_qn.value, edges.to_name) AS to_symbol,
                    edges.id AS edge_id,
                    edges.edge_kind AS edge_kind,
                    edges.confidence AS confidence,
@@ -45,6 +45,8 @@ pub(crate) fn traverse_with_options(
             JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
             LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
+            LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
+            LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
             ORDER BY match_tier,
@@ -65,8 +67,8 @@ pub(crate) fn traverse_with_options(
         let visibility_filter = forward_visibility_filter(options);
         format!(
             "
-            SELECT COALESCE(from_symbols.qualified_name, edges.from_name) AS from_symbol,
-                   COALESCE(to_symbols.qualified_name, edges.to_name) AS to_symbol,
+            SELECT COALESCE(from_qn.value, edges.from_name) AS from_symbol,
+                   COALESCE(to_qn.value, edges.to_name) AS to_symbol,
                    edges.id AS edge_id,
                    edges.edge_kind AS edge_kind,
                    edges.confidence AS confidence,
@@ -85,6 +87,8 @@ pub(crate) fn traverse_with_options(
             JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
             LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
+            LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
+            LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
               AND ({target_filter})
@@ -204,6 +208,7 @@ pub(crate) fn traversal_summary(
                 SUM(CASE WHEN edges.to_symbol_id IS NULL THEN 1 ELSE 0 END)
             FROM edges
             LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
+            LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
             "
@@ -223,6 +228,7 @@ pub(crate) fn traversal_summary(
                 SUM(CASE WHEN edges.to_symbol_id IS NULL THEN 1 ELSE 0 END)
             FROM edges
             LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
+            LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
               AND ({target_filter})
@@ -378,13 +384,14 @@ pub(crate) fn hidden_unresolved_candidate_count(
             SELECT COUNT(*)
             FROM edges
             LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
+            LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})
               AND edges.to_symbol_id IS NULL
               AND NOT ({predicate})
               AND (
                 edges.target_qualified_name = ?1
                 OR edges.target_qualified_name LIKE ?2
-                OR edges.to_name_id = (SELECT id FROM edge_strings WHERE value = ?3)
+                OR edges.to_name_id = (SELECT id FROM name_strings WHERE value = ?3)
               )
             "
         )
@@ -397,6 +404,7 @@ pub(crate) fn hidden_unresolved_candidate_count(
             SELECT COUNT(*)
             FROM edges
             LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
+            LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})
               AND ({source_predicate})
               AND edges.to_symbol_id IS NULL

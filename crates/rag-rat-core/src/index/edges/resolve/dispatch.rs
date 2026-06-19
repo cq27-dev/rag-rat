@@ -167,8 +167,8 @@ fn collect_constructors(
          d.source_end_line
          FROM edges_data d
          JOIN files ON files.id = d.source_file_id
-         JOIN edge_strings ek ON ek.id = d.edge_kind_id
-         JOIN edge_strings tn ON tn.id = d.to_name_id
+         JOIN name_strings ek ON ek.id = d.edge_kind_id
+         JOIN name_strings tn ON tn.id = d.to_name_id
          WHERE ek.value = 'dispatch_construct' AND d.from_symbol_id IS NOT NULL{}",
         write.files_write_predicate(),
     ))?;
@@ -194,11 +194,12 @@ fn collect_constructors(
 /// never guessed.
 fn collect_handlers(conn: &Connection) -> anyhow::Result<HashMap<String, HashMap<i64, Handler>>> {
     let mut stmt = conn.prepare(
-        "SELECT d.evidence, d.to_symbol_id, sym.qualified_name, sym.start_line, sym.end_line
+        "SELECT d.evidence, d.to_symbol_id, sym_qn.value, sym.start_line, sym.end_line
          FROM edges_data d
          JOIN files ON files.id = d.source_file_id
-         JOIN edge_strings ek ON ek.id = d.edge_kind_id
+         JOIN name_strings ek ON ek.id = d.edge_kind_id
          JOIN symbols sym ON sym.id = d.to_symbol_id
+         LEFT JOIN name_strings sym_qn ON sym_qn.id = sym.qualified_name_id
          WHERE ek.value = 'dispatch_handle' AND d.to_symbol_id IS NOT NULL AND d.evidence IS NOT \
          NULL",
     )?;

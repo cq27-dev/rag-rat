@@ -297,8 +297,8 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         let mut stmt = conn.prepare(
             "SELECT d.source_file_id, files.language, tn.value, d.evidence, \
              d.import_scope_start_byte, d.import_scope_end_byte, d.import_mod_id FROM edges_data \
-             d JOIN files ON files.id = d.source_file_id JOIN edge_strings ek ON ek.id = \
-             d.edge_kind_id LEFT JOIN edge_strings tn ON tn.id = d.to_name_id WHERE ek.value = \
+             d JOIN files ON files.id = d.source_file_id JOIN name_strings ek ON ek.id = \
+             d.edge_kind_id LEFT JOIN name_strings tn ON tn.id = d.to_name_id WHERE ek.value = \
              'imports'",
         )?;
         let mut rows = stmt.query([])?;
@@ -333,10 +333,10 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
     let mut stmt = conn.prepare(&format!(
         "SELECT d.id, d.source_file_id, tn.value, tqn.value, ek.value, conf.value, d.evidence, \
          rh.value, d.source_start_byte FROM edges_data d JOIN files ON files.id = \
-         d.source_file_id LEFT JOIN edge_strings tn ON tn.id = d.to_name_id LEFT JOIN \
-         edge_strings tqn ON tqn.id = d.target_qualified_name_id LEFT JOIN edge_strings ek ON \
-         ek.id = d.edge_kind_id LEFT JOIN edge_strings conf ON conf.id = d.confidence_id LEFT \
-         JOIN edge_strings rh ON rh.id = d.receiver_hint_id WHERE 1 = 1{} ORDER BY d.id",
+         d.source_file_id LEFT JOIN name_strings tn ON tn.id = d.to_name_id LEFT JOIN \
+         name_strings tqn ON tqn.id = d.target_qualified_name_id LEFT JOIN name_strings ek ON \
+         ek.id = d.edge_kind_id LEFT JOIN name_strings conf ON conf.id = d.confidence_id LEFT \
+         JOIN name_strings rh ON rh.id = d.receiver_hint_id WHERE 1 = 1{} ORDER BY d.id",
         write.files_write_predicate(),
     ))?;
     let rows = stmt.query_map([], |row| {

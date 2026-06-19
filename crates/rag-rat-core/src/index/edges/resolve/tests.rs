@@ -23,9 +23,14 @@ fn add_file(conn: &Connection, path: &str, commit: &str) -> i64 {
 }
 
 fn add_symbol(conn: &Connection, file_id: i64, name: &str, qualified: &str) -> i64 {
+    // #224: qualified_name is interned into name_strings; intern then store the id.
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qualified])
+        .unwrap();
     conn.execute(
-        "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, end_byte, \
-         start_line, end_line) VALUES (?1, 'rust', ?2, ?3, 'function', 0, 10, 1, 1)",
+        "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+         end_byte, start_line, end_line)
+         VALUES (?1, 'rust', ?2, (SELECT id FROM name_strings WHERE value = ?3), 'function', 0, \
+         10, 1, 1)",
         params![file_id, name, qualified],
     )
     .unwrap();
@@ -142,9 +147,12 @@ fn add_symbol_kind(
     qualified: &str,
     kind: &str,
 ) -> i64 {
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qualified])
+        .unwrap();
     conn.execute(
-        "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, end_byte, \
-         start_line, end_line) VALUES (?1, 'rust', ?2, ?3, ?4, 0, 10, 1, 1)",
+        "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+         end_byte, start_line, end_line)
+         VALUES (?1, 'rust', ?2, (SELECT id FROM name_strings WHERE value = ?3), ?4, 0, 10, 1, 1)",
         params![file_id, name, qualified, kind],
     )
     .unwrap();
@@ -303,9 +311,12 @@ fn add_symbol_scope(
     qualified: &str,
     scope_path: &str,
 ) -> i64 {
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qualified])
+        .unwrap();
     conn.execute(
-        "INSERT INTO symbols(file_id, language, name, qualified_name, scope_path, kind, \
-         start_byte, end_byte, start_line, end_line) VALUES (?1, 'rust', ?2, ?3, ?4, 'function', \
+        "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind, \
+         start_byte, end_byte, start_line, end_line)
+         VALUES (?1, 'rust', ?2, (SELECT id FROM name_strings WHERE value = ?3), ?4, 'function', \
          0, 10, 1, 1)",
         params![file_id, name, qualified, scope_path],
     )
@@ -767,9 +778,12 @@ fn py_source(conn: &Connection, path: &str) -> i64 {
 }
 
 fn py_sym(conn: &Connection, file_id: i64, name: &str, qualified: &str, kind: &str) -> i64 {
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qualified])
+        .unwrap();
     conn.execute(
-        "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, end_byte, \
-         start_line, end_line) VALUES (?1, 'python', ?2, ?3, ?4, 0, 10, 1, 1)",
+        "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+         end_byte, start_line, end_line)
+         VALUES (?1, 'python', ?2, (SELECT id FROM name_strings WHERE value = ?3), ?4, 0, 10, 1, 1)",
         params![file_id, name, qualified, kind],
     )
     .unwrap();
@@ -792,10 +806,12 @@ fn python_implements_ignores_a_foreign_language_class() {
     )
     .unwrap();
     let ts = conn.last_insert_rowid();
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES ('w.ts::Base')", []).unwrap();
     conn.execute(
-        "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, end_byte, \
-         start_line, end_line) VALUES (?1, 'typescript', 'Base', 'w.ts::Base', 'class', 0, 10, 1, \
-         1)",
+        "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+         end_byte, start_line, end_line)
+         VALUES (?1, 'typescript', 'Base', (SELECT id FROM name_strings WHERE value = \
+         'w.ts::Base'), 'class', 0, 10, 1, 1)",
         params![ts],
     )
     .unwrap();
@@ -1133,10 +1149,13 @@ fn add_py_symbol_scope(
     qualified: &str,
     scope_path: &str,
 ) -> i64 {
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qualified])
+        .unwrap();
     conn.execute(
-        "INSERT INTO symbols(file_id, language, name, qualified_name, scope_path, kind, \
-         start_byte, end_byte, start_line, end_line) VALUES (?1, 'python', ?2, ?3, ?4, \
-         'function', 0, 10, 1, 1)",
+        "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind, \
+         start_byte, end_byte, start_line, end_line)
+         VALUES (?1, 'python', ?2, (SELECT id FROM name_strings WHERE value = ?3), ?4, 'function', \
+         0, 10, 1, 1)",
         params![file_id, name, qualified, scope_path],
     )
     .unwrap();
@@ -1167,9 +1186,13 @@ fn add_py_symbol_at(
     qualified: &str,
     start_byte: i64,
 ) -> i64 {
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qualified])
+        .unwrap();
     conn.execute(
-        "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, end_byte, \
-         start_line, end_line) VALUES (?1, 'python', ?2, ?3, 'class', ?4, ?4 + 10, 1, 1)",
+        "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+         end_byte, start_line, end_line)
+         VALUES (?1, 'python', ?2, (SELECT id FROM name_strings WHERE value = ?3), 'class', ?4, ?4 \
+         + 10, 1, 1)",
         params![file_id, name, qualified, start_byte],
     )
     .unwrap();

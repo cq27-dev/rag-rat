@@ -1,5 +1,14 @@
 use super::*;
 
+// #224 ALIAS CONTRACT: symbol qualified-names are interned into `name_strings`, so these predicate
+// fragments reference the joined pool value `from_qn.value` / `to_qn.value` (NOT a
+// `from_symbols.qualified_name` column, which no longer exists). EVERY query that splices a
+// fragment from this module MUST also provide the matching `LEFT JOIN name_strings from_qn ON
+// from_qn.id = from_symbols.qualified_name_id` (and/or `to_qn`) for the alias it uses — `reverse_*`
+// use `to_qn`, `forward_*` use `from_qn`. The interned-id arms (`edges.to_name_id = (SELECT id FROM
+// name_strings WHERE value = ?3)`) are an edge-side pool lookup and are independent of these symbol
+// joins.
+
 pub(crate) fn validate_edge_kinds(edge_kinds: &[String]) -> anyhow::Result<()> {
     for edge_kind in edge_kinds {
         if !OPTIONAL_EDGE_KINDS.contains(&edge_kind.as_str()) {
@@ -60,31 +69,31 @@ pub(crate) fn reverse_predicate(mode: GraphResolutionMode, logical: bool) -> &'s
                     WHERE logical_symbol_id = ?8
                  )
                  OR to_symbols.name = ?3
-                 OR to_symbols.qualified_name = ?1
-                 OR to_symbols.qualified_name LIKE ?2
+                 OR to_qn.value = ?1
+                 OR to_qn.value LIKE ?2
                  OR edges.target_qualified_name = ?1
                  OR edges.target_qualified_name LIKE ?2
                  OR (?4 = 'true' AND edges.to_name_id =
-                        (SELECT id FROM edge_strings WHERE value = ?3))",
+                        (SELECT id FROM name_strings WHERE value = ?3))",
         };
     }
     match mode {
         GraphResolutionMode::Exact =>
             "edges.to_symbol_id IS NOT NULL
-             AND (edges.to_symbol_id = ?6 OR to_symbols.qualified_name = ?1)",
+             AND (edges.to_symbol_id = ?6 OR to_qn.value = ?1)",
         GraphResolutionMode::Syntactic =>
             "(edges.to_symbol_id = ?6
-              OR to_symbols.qualified_name = ?1
+              OR to_qn.value = ?1
               OR (?7 = 'true' AND to_symbols.name = ?3)
               OR edges.target_qualified_name = ?1)",
         GraphResolutionMode::Fuzzy =>
             "to_symbols.name = ?3
-             OR to_symbols.qualified_name = ?1
-             OR to_symbols.qualified_name LIKE ?2
+             OR to_qn.value = ?1
+             OR to_qn.value LIKE ?2
              OR edges.target_qualified_name = ?1
              OR edges.target_qualified_name LIKE ?2
              OR (?4 = 'true' AND edges.to_name_id =
-                    (SELECT id FROM edge_strings WHERE value = ?3))",
+                    (SELECT id FROM name_strings WHERE value = ?3))",
     }
 }
 pub(crate) fn reverse_tier(mode: GraphResolutionMode) -> &'static str {
@@ -101,7 +110,7 @@ pub(crate) fn reverse_tier(mode: GraphResolutionMode) -> &'static str {
                 WHEN edges.to_symbol_id IS NOT NULL THEN 0
                 WHEN edges.target_qualified_name = ?1 OR edges.target_qualified_name LIKE ?2 THEN 1
                 WHEN ?4 = 'true' AND edges.to_name_id =
-                    (SELECT id FROM edge_strings WHERE value = ?3) THEN 2
+                    (SELECT id FROM name_strings WHERE value = ?3) THEN 2
                 ELSE 4
              END",
     }
@@ -130,8 +139,8 @@ pub(crate) fn forward_source_predicate(mode: GraphResolutionMode, logical: bool)
                     WHERE logical_symbol_id = ?8
                  )
                  OR from_symbols.name = ?3
-                 OR from_symbols.qualified_name = ?1
-                 OR from_symbols.qualified_name LIKE ?2
+                 OR from_qn.value = ?1
+                 OR from_qn.value LIKE ?2
                  OR edges.from_name = ?1
                  OR edges.from_name LIKE ?2",
         };
@@ -139,16 +148,16 @@ pub(crate) fn forward_source_predicate(mode: GraphResolutionMode, logical: bool)
     match mode {
         GraphResolutionMode::Exact =>
             "from_symbols.id IS NOT NULL
-             AND (from_symbols.id = ?6 OR from_symbols.qualified_name = ?1)",
+             AND (from_symbols.id = ?6 OR from_qn.value = ?1)",
         GraphResolutionMode::Syntactic =>
             "from_symbols.id = ?6
-             OR from_symbols.qualified_name = ?1
+             OR from_qn.value = ?1
              OR (?7 = 'true' AND from_symbols.name = ?3)
              OR edges.from_name = ?1",
         GraphResolutionMode::Fuzzy =>
             "from_symbols.name = ?3
-             OR from_symbols.qualified_name = ?1
-             OR from_symbols.qualified_name LIKE ?2
+             OR from_qn.value = ?1
+             OR from_qn.value LIKE ?2
              OR edges.from_name = ?1
              OR edges.from_name LIKE ?2",
     }
