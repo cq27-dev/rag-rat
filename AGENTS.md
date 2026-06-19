@@ -99,7 +99,7 @@ the domain question, with invariant comments and tests (migrations included).
 
 ```bash
 cargo build
-cargo test -p rag-rat-core
+cargo nextest run -p rag-rat-core   # CI runs nextest (`cargo nextest run --workspace`); see .config/nextest.toml
 cargo clippy --all-targets
 cargo +nightly fmt   # CI uses nightly rustfmt; stable fmt silently diverges and reddens CI
 ```

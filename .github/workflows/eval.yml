@@ -34,6 +34,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       # Cache the MiniLM model download (immutable → static key) so the semantic pass doesn't
       # re-fetch ~90 MB from Hugging Face every run; first run / cache-miss warms it.
       - name: cache embedding model
@@ -53,9 +54,9 @@ jobs:
       # current-source-safety violations, and zero-retrieval regressions without a model download.
       # The FULL baseline (incl. the semantic-only expectations) is enforced by the hybrid pass below.
       - name: eval suite (lexical, deterministic smoke)
-        run: cargo test -p rag-rat-core --no-default-features --features eval --locked eval_suite
+        run: cargo nextest run -p rag-rat-core --no-default-features --features eval --locked -E 'test(eval_suite)'
       # Real gate: default features compile the MiniLM backend, so the eval suite installs the model
       # (cached above) + reconciles embeddings and asserts report.pass over the actual hybrid
       # (lexical + semantic) retrieval path the product ships — every must_include_* expectation.
       - name: eval suite (hybrid, full gate)
-        run: cargo test -p rag-rat-core --features eval --locked eval_suite
+        run: cargo nextest run -p rag-rat-core --features eval --locked -E 'test(eval_suite)'
