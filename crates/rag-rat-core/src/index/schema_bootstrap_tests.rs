@@ -12489,9 +12489,8 @@ fn candidate_components_exclude_generated_files_via_read_filter() {
     // This tests that the `files.generated = 0` predicate in the read query does the exclusion;
     // the write rows (fingerprints/postings) are left intact to prove it's a read-side filter.
     let conn = db.storage.connection();
-    let updated = conn
-        .execute("UPDATE main.files SET generated = 1 WHERE path LIKE '%b.rs'", [])
-        .unwrap();
+    let updated =
+        conn.execute("UPDATE main.files SET generated = 1 WHERE path LIKE '%b.rs'", []).unwrap();
     assert_eq!(updated, 1, "exactly one file row marked generated");
 
     // b.rs's symbols MUST still have fingerprint rows (proves it's the read filter, not a missing
