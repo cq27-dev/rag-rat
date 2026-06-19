@@ -32,20 +32,11 @@ pub(crate) fn train_dict(samples: &[Vec<u8>], max_size: usize) -> Result<Vec<u8>
     Ok(zstd::dict::from_samples(&refs, max_size)?)
 }
 
-/// Compress one chunk's text. An EMPTY `dict` means "no dictionary" (plain zstd) — the fallback for
-/// corpora too small to train a dict on (`from_samples` hard-errors under ~7 samples); the read
-/// side recognizes the same empty-dict sentinel, so write and read stay consistent.
-pub(crate) fn compress(text: &[u8], dict: &[u8]) -> Result<Vec<u8>> {
-    if dict.is_empty() {
-        return Ok(zstd::bulk::compress(text, COMPRESSION_LEVEL)?);
-    }
-    let mut compressor = zstd::bulk::Compressor::with_dictionary(COMPRESSION_LEVEL, dict)?;
-    Ok(compressor.compress(text)?)
-}
-
-/// A compressor bound to the shared dictionary once, reused across many chunks. The per-call
-/// [`compress`] re-prepares the dictionary every invocation (~costly over a full corpus), so the
-/// index-time build path uses this instead. An empty dict means no-dictionary (plain zstd).
+/// A compressor bound to the shared dictionary once, reused across many chunks (writes go through
+/// this, not a per-call helper, which would re-prepare the dictionary every invocation — costly
+/// over a full corpus). An empty dict means no-dictionary (plain zstd) — the fallback for corpora
+/// too small to train on (`from_samples` hard-errors under ~7 samples); the read side recognizes
+/// the same empty-dict sentinel, so write and read stay consistent.
 pub(crate) struct ChunkCompressor<'a>(Option<zstd::bulk::Compressor<'a>>);
 
 impl<'a> ChunkCompressor<'a> {
@@ -93,12 +84,16 @@ mod tests {
             .collect()
     }
 
+    fn compress(text: &[u8], dict: &[u8]) -> Vec<u8> {
+        ChunkCompressor::new(dict).unwrap().compress(text).unwrap()
+    }
+
     #[test]
     fn round_trips_with_dict() {
         let dict = train_dict(&sample(), 16 * 1024).unwrap();
         let text =
             b"pub fn handler_x(req: Request, ctx: &Ctx) -> Result<Response, Error> { ok() }\n";
-        let blob = compress(text, &dict).unwrap();
+        let blob = compress(text, &dict);
         let back = decompress(&blob, &dict, text.len() + 64).unwrap();
         assert_eq!(back, text);
     }
@@ -108,7 +103,7 @@ mod tests {
         let samples = sample();
         let dict = train_dict(&samples, 16 * 1024).unwrap();
         let text = samples[0].as_slice();
-        let with_dict = compress(text, &dict).unwrap().len();
+        let with_dict = compress(text, &dict).len();
         let without_dict = zstd::bulk::compress(text, COMPRESSION_LEVEL).unwrap().len();
         assert!(
             with_dict < without_dict,
@@ -119,7 +114,7 @@ mod tests {
     #[test]
     fn empty_text_round_trips() {
         let dict = train_dict(&sample(), 16 * 1024).unwrap();
-        let blob = compress(b"", &dict).unwrap();
+        let blob = compress(b"", &dict);
         assert_eq!(decompress(&blob, &dict, 16).unwrap(), b"");
     }
 
@@ -128,7 +123,7 @@ mod tests {
         // A corpus too small to train on stores an empty dict; compress/decompress must round-trip
         // with no dictionary (plain zstd), so the tiny-repo fallback is transparent to callers.
         let text = b"fn tiny() -> u8 { 7 }\n";
-        let blob = compress(text, &[]).unwrap();
+        let blob = compress(text, &[]);
         assert_eq!(decompress(&blob, &[], text.len() + 16).unwrap(), text);
     }
 }
