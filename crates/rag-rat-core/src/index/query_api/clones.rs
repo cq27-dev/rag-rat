@@ -635,11 +635,9 @@ impl IndexDatabase {
             // production.
             let reparsed_hash = crate::index::clones::tokens::struct_hash(&seq);
             if reparsed_hash != row.struct_hash {
-                eprintln!(
-                    "clones: refine re-parse struct_hash mismatch for symbol {} ({}) — file \
-                     drifted off-index; serving un-refined class",
-                    row.symbol_id, row.path
-                );
+                // Silent degrade: a library read must not write to stderr. The drift is already
+                // surfaced to callers via `completeness.stale_members`; here we just fall back to
+                // the un-refined class rather than align stale tokens.
                 return Ok(None);
             }
 
