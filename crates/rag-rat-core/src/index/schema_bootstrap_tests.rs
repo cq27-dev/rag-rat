@@ -13465,6 +13465,44 @@ fn worktree_overlay_find_clones_reflects_branch_clone_pair() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+/// Plan 4a (#215): the refine driver is BEST-EFFORT — when refine inputs are unavailable it leaves
+/// the class in its Plan-2 un-refined shape rather than erroring. We force `load_refine_members` to
+/// return `None` by deleting the source files AFTER indexing: the bags/fingerprints are already
+/// persisted in SQLite (so `find_clones` can still build the class), but `read_to_string` of each
+/// member's now-missing path fails, tripping the un-refinable fallback. The returned class must be
+/// the bare candidate component with every refinement field cleared — no panic, no error.
+#[test]
+fn find_clones_falls_back_to_unrefined_when_source_unavailable() {
+    let root = unique_temp_root();
+    // Build the index — fingerprints/bags persisted in the DB under `root/.rag-rat`.
+    let db = write_four_renamed_clones(&root);
+
+    // Delete the source trees (a/ and b/) but keep `.rag-rat/` (the SQLite DB). Each member's path
+    // now fails `read_to_string`, so `load_refine_members` returns `None` → un-refinable fallback.
+    fs::remove_dir_all(root.join("a")).unwrap();
+    fs::remove_dir_all(root.join("b")).unwrap();
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        res.classes.len(),
+        1,
+        "the class is still built from persisted bags even with source gone"
+    );
+    let c = &res.classes[0];
+
+    assert!(!c.refined, "source gone → refine inputs unavailable → class stays un-refined");
+    assert_eq!(c.class_kind, "candidate_component", "un-refined classes keep the Plan-2 kind");
+    assert!(c.lcs_ratio.is_none(), "no lcs_ratio on an un-refined class");
+    assert!(c.refactorability.is_none(), "no refactorability on an un-refined class");
+    assert!(c.confidence.is_none(), "no confidence on an un-refined class");
+    assert!(c.refine_mode.is_none(), "no refine_mode on an un-refined class");
+
+    // a/ and b/ are already gone; only `.rag-rat/` remains under root.
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Fix 1 + Fix 2 (#215): a clone class with more than MAX_MEMBERS members exercises two paths that
 /// a small fixture never reaches:
 ///  - Fix 1 (chunked hydration): `build_class` hydrates members in batches of HYDRATION_CHUNK

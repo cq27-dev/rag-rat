@@ -366,6 +366,11 @@ impl IndexDatabase {
             .collect();
         let key = refinement_key(&class.language, &struct_hashes);
 
+        // For coherent classes exceeding METRIC_SAMPLE_CAP members, `class.similarity_min` was
+        // derived from the first `METRIC_SAMPLE_CAP` members only (the metric-sample path in
+        // `build_class`), while `key` spans the FULL struct_hash multiset. The gap is not a
+        // determinism break — the sample is id-ASC stable — but Plan-4b should compute confidence
+        // over the full set or fold the sample into the key.
         let refinement = refine_class(conn, &key, &class.language, &members, class.similarity_min)?;
 
         // Swap the ROI cohesion multiplier for `refactorability` on refined classes (Plan 4a). The
