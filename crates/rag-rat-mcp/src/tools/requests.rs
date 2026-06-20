@@ -773,8 +773,14 @@ impl MemoryUpdateArgs {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FindClonesArgs {
+    /// Minimum pairwise overlap/max_len similarity. Must be in the range [0.5, 1.0]; defaults to
+    /// 0.7 (the θ threshold) when omitted. Out-of-range values are rejected.
     pub min_similarity: Option<f64>,
+    /// Minimum number of copies for a class to be returned (defaults to 2).
     pub min_copies: Option<usize>,
+    /// Maximum number of clone classes to return, sorted by ROI descending. A supplied limit is
+    /// capped at the refine budget (currently 50): `limit: N` returns at most 50 classes, all
+    /// refined. Omit (null) to retrieve all classes (only the top 50 refined, the rest unrefined).
     pub limit: Option<usize>,
 }
 

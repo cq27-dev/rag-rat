@@ -193,7 +193,11 @@ pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> (f64, bool) {
     }
 
     let lcs_sampled = sampled_members || sampled_seq;
-    (if min_ratio == f64::INFINITY { 1.0 } else { min_ratio }, lcs_sampled)
+    // SAFETY: the `seqs.len() < 2` early return guarantees `effective.len() >= 2`, so the inner
+    // loop body (i=0, j=1) executes at least once and `min_ratio` is updated from `f64::INFINITY`.
+    // The `f64::INFINITY` fallback is therefore unreachable — assert it in debug, return min_ratio.
+    debug_assert!(min_ratio.is_finite(), "min_ratio must be set: effective.len() >= 2");
+    (min_ratio, lcs_sampled)
 }
 
 #[cfg(test)]

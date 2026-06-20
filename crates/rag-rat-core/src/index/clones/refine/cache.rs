@@ -32,11 +32,17 @@ pub(crate) struct CachedRefinement {
     pub(crate) confidence: Confidence,
     pub(crate) refactorability: f64,
     pub(crate) refine_mode: &'static str,
-    /// `true` when the LCS fidelity for this refinement engaged a cost cap (member-count sample or
-    /// the per-pair length proxy — see `class_lcs_ratio`). PERSISTED in `clone_refinements`
-    /// (Fix 3, #215 Plan 4a round-2): a cache HIT reads the stored bit back, so the long-sequence
-    /// sampling dimension survives a warm hit instead of degrading to `false`. The caller folds it
-    /// into the class's `metrics_sampled` flag.
+    /// `true` when the LCS fidelity for this refinement engaged EITHER cost-cap dimension — the
+    /// member-count sample ([`LCS_MEMBER_SAMPLE`]) OR the per-pair length proxy
+    /// ([`LCS_MAX_SEQ_TOKENS`]); see `class_lcs_ratio`, which ORs both into the returned bit.
+    /// PERSISTED in `clone_refinements` (Fix 3, #215 Plan 4a round-2): a cache HIT reads the
+    /// stored bit back, so the long-sequence sampling dimension survives a warm hit instead of
+    /// degrading to `false`. The caller (`apply_refinement`) folds it into the class's
+    /// `metrics_sampled` flag — and ALSO independently re-derives the member-count dimension
+    /// there from `class.member_count > LCS_MEMBER_SAMPLE`, as a cache-agnostic guard that
+    /// flags the member-count sample even for a row predating this persisted bit (stored
+    /// default 0). The length-proxy dimension has no such independent re-derivation; it is
+    /// carried only by this persisted bit.
     pub(crate) lcs_sampled: bool,
 }
 

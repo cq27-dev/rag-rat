@@ -179,13 +179,16 @@ pub(crate) struct ImportantSymbolsArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ClonesArgs {
-    /// Minimum pairwise overlap/max_len similarity (default: 0.7 θ threshold).
+    /// Minimum pairwise overlap/max_len similarity. Valid range [0.5, 1.0] (default: 0.7, the θ
+    /// threshold); out-of-range values are rejected.
     #[arg(long)]
     pub min_similarity: Option<f64>,
     /// Minimum number of copies for a class to be returned (default: 2).
     #[arg(long)]
     pub min_copies: Option<usize>,
-    /// Maximum number of clone classes to return, sorted by ROI descending.
+    /// Maximum number of clone classes to return, sorted by ROI descending. A supplied limit is
+    /// capped at the refine budget (currently 50): --limit N returns at most 50 classes, all
+    /// refined. Omit the flag to retrieve all classes (only the top 50 refined).
     #[arg(long)]
     pub limit: Option<usize>,
 }

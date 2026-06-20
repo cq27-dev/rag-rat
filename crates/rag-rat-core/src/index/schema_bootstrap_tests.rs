@@ -13586,48 +13586,67 @@ fn find_clones_limited_result_contains_only_refined_classes() {
 }
 
 /// I2 (#215 Plan 4a adversary): find_clones with a huge limit must clamp effective returned classes
-/// to UNLIMITED_REFINE_BUDGET (50), returning all-refined. This proves the clamp bounds refine
-/// work.
+/// to UNLIMITED_REFINE_BUDGET (50), returning all-refined. This plants MORE than 50 distinct clone
+/// classes so the clamp is actually EXERCISED (the earlier 3-class fixture never tripped it): a
+/// huge `limit` returns EXACTLY 50 classes (all refined), and both `truncated` and
+/// `refine_budget_clamped` are set.
 #[test]
 fn find_clones_huge_limit_clamps_to_refine_budget() {
-    // Plant 3 distinct clone classes (same fixture as
-    // find_clones_limited_result_contains_only_refined_classes). limit=100000 must return at
-    // most 50 classes (all refined), and truncated=true if >50 exist. With only 3 classes here,
-    // all 3 are returned (≤ 50), all refined, truncated=false.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
 
-    let big = |name: &str, v: &str| {
-        format!(
-            "pub fn {name}(db: Db) -> i32 {{ let {v}1 = db.get(1); let {v}2 = db.get(2); let {v}3 \
-             = db.get(3); validate({v}1); validate({v}2); validate({v}3); {v}1 + {v}2 + {v}3 }}\n"
-        )
+    // Generate 18 ops × 4 length-tiers = 72 DISTINCT, non-merging clone classes (> the budget of
+    // 50). Two independent axes keep distinct classes from cross-merging under the SourcererCC
+    // candidate edge test (overlap/max_len >= θ=0.7):
+    //   1. OPERATOR axis: each body is a long left-assoc binary chain `a OP a OP a …` over a single
+    //      operand, so the verbatim operator token dominates the normalized bag. The 18 distinct
+    //      binary operators each yield a separate class (within-tier max similarity < 0.7 once the
+    //      chain is long enough — the smallest tier is 64 reps; 40 reps merges).
+    //   2. LENGTH-TIER axis: four chain lengths ~1.6× apart (> 1/θ ≈ 1.43) so the size-prune
+    //      (min_len >= ceil(θ·max_len)) drops EVERY cross-tier edge regardless of content.
+    // The `_a`/`_b` variants are rename-clones (operand `a` vs `b`, distinct fn names): identical
+    // structure → same struct_hash → exactly one class per pair via the struct-hash fast path.
+    // NOTE: identifier names and literal VALUES are normalization-invariant, so the per-pair
+    // distinction MUST come from structure (operator + chain length), never names/literals.
+    let ops = [
+        "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "<", ">", "<=", ">=", "==", "!=", "&&",
+        "||",
+    ];
+    let tiers = [64usize, 104, 168, 270];
+    let body = |op: &str, n: usize, var: &str, name: &str| {
+        let mut s = format!("pub fn {name}({var}: i64) -> i64 {{\n    {var}");
+        for _ in 0..n {
+            s.push_str(&format!(" {op} {var}"));
+        }
+        s.push_str("\n}\n");
+        s
     };
-    fs::write(root.join("src/big_a.rs"), big("big_user", "u")).unwrap();
-    fs::write(root.join("src/big_b.rs"), big("big_order", "o")).unwrap();
-
-    let matchy = |name: &str, v: &str| {
-        format!(
-            "pub fn {name}(k: i32) -> i32 {{ let {v} = match k {{ 0 => 10, 1 => 20, 2 => 30, _ => \
-             40 }}; {v} + 1 }}\n"
-        )
-    };
-    fs::write(root.join("src/match_a.rs"), matchy("classify_a", "n")).unwrap();
-    fs::write(root.join("src/match_b.rs"), matchy("classify_b", "m")).unwrap();
-
-    let small = |name: &str, v: &str| {
-        format!(
-            "pub fn {name}(xs: Vec<u8>) -> usize {{ let mut {v} = 0; for e in xs {{ {v} += e as \
-             usize; }} {v} }}\n"
-        )
-    };
-    fs::write(root.join("src/small_a.rs"), small("sum_bytes", "s")).unwrap();
-    fs::write(root.join("src/small_b.rs"), small("sum_words", "t")).unwrap();
+    let mut idx = 0usize;
+    for (ti, &n) in tiers.iter().enumerate() {
+        for (oi, op) in ops.iter().enumerate() {
+            let fa = body(op, n, "a", &format!("fn_a_t{ti}_o{oi}"));
+            let fb = body(op, n, "b", &format!("fn_b_t{ti}_o{oi}"));
+            fs::write(root.join(format!("src/clone_a{idx}.rs")), fa).unwrap();
+            fs::write(root.join(format!("src/clone_b{idx}.rs")), fb).unwrap();
+            idx += 1;
+        }
+    }
 
     let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
 
-    // limit=100000 >> total classes (3) — clamps to 50, but only 3 exist so returns 3.
+    // Sanity: the full (unlimited) result must surface MORE than the refine budget of classes,
+    // otherwise the clamp below is vacuous.
+    let all = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(
+        all.classes.len() > 50,
+        "fixture must plant > 50 clone classes to exercise the clamp; got {}",
+        all.classes.len()
+    );
+
+    // limit=100000 >> total classes — clamps to exactly UNLIMITED_REFINE_BUDGET (50).
     let limited = db
         .find_clones(FindClonesOptions {
             min_similarity: None,
@@ -13635,28 +13654,86 @@ fn find_clones_huge_limit_clamps_to_refine_budget() {
             limit: Some(100_000),
         })
         .unwrap();
-    assert!(
-        limited.classes.len() <= 50,
-        "a huge limit must never return more than UNLIMITED_REFINE_BUDGET (50) classes; got {}",
+    assert_eq!(
+        limited.classes.len(),
+        50,
+        "a huge limit over > 50 classes must return EXACTLY the refine budget (50); got {}",
         limited.classes.len()
     );
     assert!(
         limited.classes.iter().all(|c| c.refined),
         "every class in a huge-limited result must be refined"
     );
+    assert!(
+        limited.completeness.truncated,
+        "dropping whole classes to honor the budget must set truncated"
+    );
+    assert!(
+        limited.completeness.refine_budget_clamped,
+        "a limit above the budget that drops classes must set refine_budget_clamped"
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
 
-/// I3 (#215 Plan 4a adversary): load_refine_members caps to LCS_MEMBER_SAMPLE (64) members.
-/// When a class has more than LCS_MEMBER_SAMPLE members, load_refine_members returns exactly
-/// LCS_MEMBER_SAMPLE members (canonical struct_hash/id order) and refine still works.
-/// This is tested at the unit level (no real index): we verify the constant equals 64 and that
-/// LCS_MEMBER_SAMPLE is pub(crate) accessible (compilation test).
+/// I3 (#215 Plan 4a adversary): `load_refine_members` caps the re-parse to LCS_MEMBER_SAMPLE (64)
+/// members. This exercises the RUNTIME cap, not just the constant: it plants a single clone class
+/// with MORE than 64 members, then calls `load_refine_members` and asserts it returns EXACTLY 64
+/// members in canonical (struct_hash, symbol_id) order. Because the members are exact clones their
+/// struct_hashes are all equal, so the canonical order reduces to ascending symbol_id.
 #[test]
-fn load_refine_members_lcs_sample_constant_is_64() {
+fn load_refine_members_caps_to_lcs_sample_at_runtime() {
     use crate::index::clones::refine::align::LCS_MEMBER_SAMPLE;
+    // Keep the constant assertion — the cap value is load-bearing.
     assert_eq!(LCS_MEMBER_SAMPLE, 64, "LCS_MEMBER_SAMPLE must be 64 (the load cap constant)");
+
+    const MEMBERS: usize = LCS_MEMBER_SAMPLE + 1; // 65 — one over the cap.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // 65 rename-clones of ONE structure: identical AST shape, distinct identifier names. Baseline
+    // normalization alpha-renames identifiers to ID<n> and buckets literals, so all 65 collapse to
+    // the SAME struct_hash → one clone class (the struct_hash exact fast path components them).
+    for i in 0..MEMBERS {
+        let src = format!(
+            "pub fn fn_{i}(db: Db) -> i32 {{ let a{i} = db.get(); let b{i} = db.get(); let c{i} = \
+             db.get(); validate(a{i}); validate(b{i}); validate(c{i}); a{i} + b{i} + c{i} }}\n"
+        );
+        fs::write(root.join(format!("src/m{i}.rs")), src).unwrap();
+    }
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Find the single component holding all 65 members.
+    let components = db.candidate_clone_components().expect("components");
+    let mut big = components
+        .into_iter()
+        .find(|c| c.len() == MEMBERS)
+        .unwrap_or_else(|| panic!("expected one component of {MEMBERS} exact clones"));
+    big.sort_unstable();
+
+    // load_refine_members must cap the re-parse to LCS_MEMBER_SAMPLE members.
+    let members = db
+        .load_refine_members(&big)
+        .expect("load_refine_members ok")
+        .expect("refine inputs available for an in-scope class");
+    assert_eq!(
+        members.len(),
+        LCS_MEMBER_SAMPLE,
+        "load_refine_members must cap a {MEMBERS}-member class to LCS_MEMBER_SAMPLE (64)"
+    );
+
+    // All struct_hashes are equal (exact clones), so canonical order is ascending symbol_id — the
+    // first 64 ids of the sorted component.
+    let returned_ids: Vec<i64> = members.iter().map(|m| m.symbol_id).collect();
+    let expected_ids: Vec<i64> = big.iter().copied().take(LCS_MEMBER_SAMPLE).collect();
+    assert_eq!(
+        returned_ids, expected_ids,
+        "capped members must be the first LCS_MEMBER_SAMPLE in canonical (struct_hash, id) order"
+    );
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 /// Fix 3 (#215): `clones_for_symbol` carries eligibility flags. A below-`MIN_TOKENS` function

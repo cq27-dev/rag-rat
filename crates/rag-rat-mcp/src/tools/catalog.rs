@@ -113,7 +113,11 @@ pub fn description(name: &str) -> &'static str {
         "find_clones" =>
             "Ranked candidate clone classes (unrefined; exact overlap metrics). Returns classes \
              sorted by ROI (cross-module spread × member count × token length × load-bearing \
-             factor × cohesion), with a completeness provenance block.",
+             factor × cohesion), with a completeness provenance block. `min_similarity` (if set) \
+             must be in [0.5, 1.0] (default 0.7). A LIMITED query (`limit: N`) is capped at the \
+             refine budget (currently 50) — it returns at most 50 classes, all refined; pass \
+             `limit: null`/omit it to retrieve all classes (only the top 50 refined). \
+             `completeness.refine_budget_clamped` is true when a supplied limit hit that cap.",
         "clones_for_symbol" =>
             "The clone class containing a symbol (by id / ref / path+line). Returns the candidate \
              class if the symbol is fingerprinted and has clone siblings; null if it is unique or \

@@ -126,6 +126,12 @@ pub struct CloneCompleteness {
     pub index_freshness: String,          // reuse index_status freshness summary
     pub oracle_coverage: &'static str,    // "n/a_baseline_only" in Plan 2 (SCIP is Plan 3)
     pub truncated: bool,
+    /// `true` when `limit` was supplied and was clamped by the refine budget (the budget,
+    /// currently 50, is less than the requested limit AND the total built classes exceed the
+    /// budget). A `true` value means classes beyond the refine budget were dropped — use
+    /// `limit: None` to retrieve all classes. Always `false` on the unlimited path and on
+    /// `clones_for_symbol`.
+    pub refine_budget_clamped: bool,
     /// Count of DISTINCT member file paths whose on-disk content no longer matches the indexed
     /// `files.sha256`. A non-zero value means the returned clone classes describe STALE file
     /// contents — consumers should reindex / `rag-rat heal` before acting on these results.
@@ -229,7 +235,10 @@ pub struct FindClonesOptions {
     pub min_similarity: Option<f64>,
     /// Minimum number of copies for a class to be returned. Defaults to 2 if `None`.
     pub min_copies: Option<usize>,
-    /// Maximum number of classes to return (sorted by ROI desc). No limit if `None`.
+    /// Maximum number of classes to return (sorted by ROI desc). No limit if `None`. Note: a
+    /// limited query is clamped to the refine budget (currently 50) — `limit: Some(N)` returns at
+    /// most 50 classes, all refined. To retrieve more classes (only the top 50 refined), use
+    /// `limit: None`.
     pub limit: Option<usize>,
 }
 
@@ -248,6 +257,12 @@ impl IndexDatabase {
     /// score, filters by `min_similarity` / `min_copies`, sorts by ROI descending, and attaches a
     /// [`CloneCompleteness`] provenance block. Classes are UNREFINED (Plan 4 adds coherence
     /// splitting and anti-unification).
+    ///
+    /// **Refine-budget cap:** a limited query (`limit: Some(N)`) clamps to the refine budget
+    /// (currently 50): at most 50 classes are returned, all refined. An unlimited query
+    /// (`limit: None`) returns all classes (only the top 50 refined, the rest unrefined). Use
+    /// `limit: None` to retrieve more than 50 classes. `completeness.refine_budget_clamped`
+    /// reports when a supplied limit was clamped by the budget AND classes were dropped.
     pub fn find_clones(&self, opts: FindClonesOptions) -> anyhow::Result<FindClonesResult> {
         let conn = self.storage.connection();
 
@@ -372,14 +387,28 @@ impl IndexDatabase {
         let truncated = classes.iter().any(|c| c.members_returned < c.total_members)
             || total_classes_built > classes.len();
 
+        // refine_budget_clamped: true when a limit was supplied, the limit exceeded the budget, AND
+        // the budget actually dropped classes (total_classes_built > effective_limit). A limit at
+        // or below the budget never clamps; a limit above the budget only clamps when there
+        // were more built classes than the budget could return.
+        let refine_budget_clamped = opts.limit.is_some_and(|lim| {
+            lim > UNLIMITED_REFINE_BUDGET && total_classes_built > UNLIMITED_REFINE_BUDGET
+        });
+
         let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
 
         // Count DISTINCT member file paths whose on-disk content no longer matches the indexed
         // sha256 (read-only signal; Plan 2 does not heal-before-return).
         let stale_members = count_stale_member_paths(self, conn, &classes)?;
 
-        let completeness =
-            build_completeness(theta, min_copies, truncated, stale_members, freshness);
+        let completeness = build_completeness(
+            theta,
+            min_copies,
+            truncated,
+            refine_budget_clamped,
+            stale_members,
+            freshness,
+        );
 
         Ok(FindClonesResult { classes, completeness })
     }
@@ -531,12 +560,15 @@ fn apply_refinement(
 }
 
 /// Build the [`CloneCompleteness`] provenance block shared by `find_clones` and
-/// `clones_for_symbol`. Only `min_similarity` (θ), `min_copies`, `truncated`, `stale_members`,
-/// and the index freshness summary vary per call; the rest are fixed Plan-2 policy constants.
+/// `clones_for_symbol`. Only `min_similarity` (θ), `min_copies`, `truncated`,
+/// `refine_budget_clamped`, `stale_members`, and the index freshness summary vary per call; the
+/// rest are fixed Plan-2 policy constants. `clones_for_symbol` always passes
+/// `refine_budget_clamped = false` (it has no class limit).
 fn build_completeness(
     min_similarity: f64,
     min_copies: usize,
     truncated: bool,
+    refine_budget_clamped: bool,
     stale_members: usize,
     freshness: String,
 ) -> CloneCompleteness {
@@ -554,6 +586,7 @@ fn build_completeness(
         index_freshness: freshness,
         oracle_coverage: "n/a_baseline_only",
         truncated,
+        refine_budget_clamped,
         stale_members,
         known_index_gaps: vec![
             "#232: TS function-valued declarators not yet fingerprinted".into(),
@@ -608,7 +641,15 @@ impl IndexDatabase {
                 class,
                 symbol_resolved,
                 symbol_fingerprinted,
-                completeness: build_completeness(THETA, 2, truncated, stale_members, freshness),
+                // No class limit on this path → never refine-budget-clamped.
+                completeness: build_completeness(
+                    THETA,
+                    2,
+                    truncated,
+                    false,
+                    stale_members,
+                    freshness,
+                ),
             }
         };
 
