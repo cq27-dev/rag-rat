@@ -137,6 +137,8 @@ fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>
     })?;
     for row in rows {
         let (symbol_id, posting) = row?;
+        // `bags` keyset is already `normalizer_version`-filtered by the fingerprint query above,
+        // so a stale-version symbol (absent from `bags`) has its postings silently dropped here.
         if let Some(bag) = bags.get_mut(&symbol_id) {
             bag.tokens.push(posting);
         }

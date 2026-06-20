@@ -12522,34 +12522,67 @@ fn candidate_components_exclude_generated_files_via_read_filter() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// Max-denominator overlap gate regression: a ~1.4x-length pair that SURVIVES the size prune
-/// (min_len/max_len ≈ 0.7 ≥ θ) but whose partial token overlap keeps overlap/max_len < θ.
-/// This guards against regressing to fragment containment (overlap/min) as the gate.
-/// The existing containment test is stopped by the size prune alone; this one exercises the gate.
+/// Max-denominator overlap gate regression: two structurally different functions whose
+/// token_len ratio is ≥ θ (they SURVIVE the size prune) but whose token-overlap/max_len < θ
+/// (the gate rejects them). This is distinct from the containment test
+/// (`candidate_components_reject_small_function_contained_in_large_one`), which is eliminated
+/// by the size prune alone — this fixture proves it is the overlap/max gate doing the work.
+///
+/// Fixture: `a` is a sequential let-chain; `b` is a loop+match accumulator. They are structurally
+/// different enough that their shared tokens (keywords, operators, AST-node-kind tokens) fall well
+/// below the overlap threshold, even though their token_lens are within the 1/θ ≈ 1.43x band.
 #[test]
 fn candidate_components_reject_partial_overlap_below_max_denominator_theta() {
     let root = unique_temp_root();
     std::fs::create_dir_all(root.join("src")).unwrap();
-    // a: ~30-token body. b: a's tokens PLUS ~13 distinct extra tokens (len ≈ 1.43x), so
-    // overlap≈30, max_len≈43 → 0.70 borderline; tune the extra tokens so overlap/max < 0.70.
+    // a: sequential let-chain with five named sub-computations, returns a sum.
     std::fs::write(
         root.join("src/a.rs"),
-        "pub fn a(db: Db) -> i32 { let x = db.get(1); let y = db.get(2); validate(x); \
-         validate(y); x + y }\n",
+        "pub fn a(x: i32, y: i32) -> i32 { let p = alpha(x); let q = beta(y); let r = gamma(p); \
+         let s = delta(q); let t = epsilon(r, s); p + q + r + s + t }\n",
     )
     .unwrap();
+    // b: loop-based accumulator with a match arm — completely different control flow from a.
     std::fs::write(
         root.join("src/b.rs"),
-        "pub fn b(db: Db) -> i32 { let x = db.get(1); let y = db.get(2); validate(x); \
-         validate(y); let z = compute(x, y, 3); log(z); persist(z); audit(z); x + y + z }\n",
+        "pub fn b(items: Vec<i32>, acc: i32) -> i32 { let mut total = acc; for item in \
+         items.iter() { let v = process(item); match v { 0 => total += 1, _ => total += v } } if \
+         total > 0 { total } else { -1 } }\n",
     )
     .unwrap();
     let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Asserting the pair SURVIVES the size prune isolates the overlap/max gate as the reason for
+    // exclusion (distinct from the 5× containment test, which the size prune kills).
+    //
+    // Measured token_lens: a=92, b=104.  ceil(0.7 * 104) = 73.  92 ≥ 73 → prune passes.
+    // Overlap (Σ min(freq_a, freq_b)) = 51 < 73 → gate fails.  Values are asserted below so a
+    // future fixture change that breaks the isolation is caught immediately.
+    let conn = db.storage.connection();
+    let lens: Vec<i64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT token_len FROM symbol_fingerprints WHERE normalizer_kind='baseline' ORDER \
+                 BY token_len",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    };
+    assert_eq!(lens.len(), 2, "both functions must be fingerprinted: {lens:?}");
+    let min_len = lens[0];
+    let max_len = lens[1];
+    let threshold = (0.7_f64 * max_len as f64).ceil() as i64;
+    assert!(
+        min_len >= threshold,
+        "pair must survive the size prune (min_len={min_len} >= ceil(0.7*max_len)={threshold}) so \
+         the next assertion targets the overlap/max gate, not the prune"
+    );
+
     let comps = db.candidate_clone_components().unwrap();
     assert!(
         comps.is_empty(),
         "a partial-overlap pair below overlap/max θ must NOT be a candidate (no regression to \
-         containment): {comps:?}"
+         containment): min_len={min_len} max_len={max_len} threshold={threshold} {comps:?}"
     );
 
     fs::remove_dir_all(root).unwrap();
