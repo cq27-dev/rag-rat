@@ -152,6 +152,27 @@ pub(crate) fn class_key_for(member_refs: &[String]) -> String {
     crate::index::hex_sha256(joined.as_bytes())[..16].to_string()
 }
 
+/// Minimum pairwise overlap/max_len similarity across all member pairs of `class`. This is the same
+/// cohesion floor `build_class` computes for `similarity_min`, recomputed cheaply here as the
+/// tie-breaker for `clones_for_symbol`'s largest-group selection (when the clique-cover split
+/// returns several equal-size groups containing the subject, the most internally-cohesive wins).
+/// A 1-member (or empty) class has no pairs → cohesion 1.0 (vacuously fully coherent).
+fn min_pairwise_cohesion(class: &[i64], by_id: &BTreeMap<i64, &SymbolBag>) -> f64 {
+    let mut min = f64::MAX;
+    for i in 0..class.len() {
+        for j in (i + 1)..class.len() {
+            if let (Some(ba), Some(bb)) = (by_id.get(&class[i]), by_id.get(&class[j])) {
+                let max_len = ba.token_len.max(bb.token_len);
+                let sim = if max_len == 0 { 1.0 } else { overlap(ba, bb) as f64 / max_len as f64 };
+                if sim < min {
+                    min = sim;
+                }
+            }
+        }
+    }
+    if min == f64::MAX { 1.0 } else { min }
+}
+
 /// Sentinel df for tokens with no `clone_token_df` row (LEFT JOIN miss). i64::MAX sorts them LAST
 /// in `(coalesced_df ASC, token_hash ASC)` order — they are treated as maximally common (least
 /// selective), which is the conservative choice: it can only widen the sub-block, never shrink it,
@@ -549,7 +570,28 @@ impl IndexDatabase {
             },
             THETA,
         );
-        let subject_subclass = coherent_classes.into_iter().find(|cls| cls.contains(&symbol_id));
+        // Pick the largest coherent group containing the subject (tie → highest min-pairwise
+        // cohesion → lowest member id). The greedy clique-cover split can return MULTIPLE
+        // overlapping groups containing the subject (e.g. B is in both {A,B} and {B,C} for chain
+        // A~B / B~C / A!~C) — the subject's "best" class is the largest such group, so a reverse
+        // lookup surfaces the richest coherent neighborhood it belongs to rather than an arbitrary
+        // first-fit pair.
+        let subject_subclass = {
+            let candidates: Vec<Vec<i64>> =
+                coherent_classes.into_iter().filter(|cls| cls.contains(&symbol_id)).collect();
+            candidates.into_iter().max_by(|a, b| {
+                a.len()
+                    .cmp(&b.len())
+                    .then_with(|| {
+                        // Higher min-pairwise cohesion wins.
+                        let cohesion_a = min_pairwise_cohesion(a, &by_id);
+                        let cohesion_b = min_pairwise_cohesion(b, &by_id);
+                        cohesion_a.partial_cmp(&cohesion_b).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    // Lower first-member id wins; `max_by` keeps the greater, so reverse the cmp.
+                    .then_with(|| b[0].cmp(&a[0]))
+            })
+        };
 
         // Pin the resolved subject so it is guaranteed to appear in the (capped) member list even
         // when its id falls past MAX_MEMBERS in the (sub)class id order — the caller asked about

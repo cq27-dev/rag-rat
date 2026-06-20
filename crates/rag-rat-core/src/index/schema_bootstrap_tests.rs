@@ -12935,14 +12935,16 @@ fn find_clones_truncated_reflects_class_limit() {
 /// Plan 4 coherence-splits over-merged components; the A~B~C chain becomes coherent sub-classes.
 ///
 /// A TRANSITIVE-chain component (A–B and B–C both ≥ θ, but A–C < θ) is over-merged by union-find
-/// into one 3-member component. Plan 4a's `coherence_split` breaks it: every returned class must be
-/// internally coherent (all pairs ≥ θ), so NO single class contains all three. For this fixture the
-/// greedy first-fit yields the coherent class {A,B} (C cannot join — C/A is below θ — and drops as
-/// a singleton). `find_clones` therefore returns at most a 2-member class, never the 3-member
-/// chain.
+/// into one 3-member component. Plan 4a's `coherence_split` (greedy maximal clique cover) breaks
+/// it: every returned class is internally coherent (all pairs ≥ θ), so NO single class contains all
+/// three. For this fixture the cover yields BOTH coherent pairs — {A,B} and {B,C} — with B in both
+/// (the overlap is correct: B coheres with two peers that are themselves incompatible).
+/// `find_clones` therefore returns two 2-member classes, never the 3-member chain.
 ///
-/// `clones_for_symbol` keeps a reverse-lookup fallback: a subject that splits to a singleton (C
-/// here) still gets served the FULL un-refined component, so a query ABOUT C is not empty.
+/// `clones_for_symbol(A)` returns the largest coherent group containing A — here the {A,B} pair.
+/// `clones_for_symbol(C)` returns the coherent {B,C} pair (C is NO LONGER a singleton under the
+/// clique cover), so a query ABOUT C surfaces a real refined sub-class, not the over-merged
+/// fallback.
 ///
 /// The fixture is empirically tuned and the test asserts the MEASURED edge similarities so it is
 /// honest about the chain it plants (a tokenizer change that shifts the numbers reddens here, not
@@ -13012,7 +13014,8 @@ fn coherence_split_applied_in_find_clones() {
 
     // Now the full three-member scope. At the default θ=0.70 the over-merged union-find component
     // {A,B,C} is coherence-SPLIT: no returned class contains all three, and every returned class is
-    // internally coherent (all pairs ≥ θ). For this fixture the only coherent ≥2 class is {A,B}.
+    // internally coherent (all pairs ≥ θ). The greedy clique cover yields BOTH coherent pairs:
+    // {A,B} and {B,C}.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -13038,33 +13041,36 @@ fn coherence_split_applied_in_find_clones() {
             class.cohesion_min_pairwise
         );
     }
-    // The chain yields the coherent class {A,B} (C drops as a singleton: C/A < θ).
-    assert_eq!(res.classes.len(), 1, "the chain yields exactly one coherent ≥2 class ({{A,B}})");
-    assert_eq!(res.classes[0].member_count, 2, "the coherent class is the {{A,B}} pair");
+    // After clique-cover split, both {A,B} and {B,C} are returned (B in both).
+    assert_eq!(
+        res.classes.len(),
+        2,
+        "the chain yields two coherent ≥2 classes: {{A,B}} and {{B,C}}"
+    );
+    for class in &res.classes {
+        assert_eq!(class.member_count, 2, "each coherent class has 2 members");
+    }
 
-    // clones_for_symbol(A): A is in the coherent {A,B} sub-class → that 2-member class (refined).
+    // clones_for_symbol(A): A is in {A,B} only. The largest group containing A is {A,B} (refined).
     let by_a = db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::fa".into())).unwrap();
     let a_class = by_a.class.as_ref().expect("fa is in the coherent {A,B} sub-class");
     assert_eq!(a_class.member_count, 2, "clones_for_symbol(fa) returns A's coherent sub-class");
-    assert_eq!(
-        a_class.class_key, res.classes[0].class_key,
+    // A's class must match one of the returned classes from find_clones.
+    assert!(
+        res.classes.iter().any(|c| c.class_key == a_class.class_key),
         "find_clones and clones_for_symbol must return the SAME coherent sub-class for A"
     );
 
-    // clones_for_symbol(C): C split to a singleton → the reverse-lookup fallback serves the FULL
-    // un-refined component (all 3 members, refined=false) so a query ABOUT C is not empty.
+    // clones_for_symbol(C): after the clique cover, C is in the coherent {B,C} sub-class (NOT a
+    // singleton anymore), so the reverse lookup serves that refined 2-member class — no fallback to
+    // the over-merged 3-member component.
     let by_c = db.clones_for_symbol(CloneSymbolSelector::Ref("src/c.rs::fc".into())).unwrap();
-    let c_class = by_c.class.as_ref().expect("fc falls back to the full un-refined component");
+    let c_class = by_c.class.as_ref().expect("fc is in the coherent {B,C} sub-class");
     assert_eq!(
-        c_class.member_count, 3,
-        "clones_for_symbol(fc) falls back to the 3-member component"
+        c_class.member_count, 2,
+        "clones_for_symbol(fc) returns C's coherent {{B,C}} sub-class"
     );
-    assert!(!c_class.refined, "the singleton-subject fallback class is un-refined");
-    assert!(
-        (c_class.cohesion_min_pairwise - ac).abs() < 1e-9,
-        "the fallback component's min-pairwise must equal the measured A/C edge: class={} ac={ac}",
-        c_class.cohesion_min_pairwise
-    );
+    assert!(c_class.refined, "the {{B,C}} sub-class is refined");
 
     fs::remove_dir_all(root).unwrap();
 }
