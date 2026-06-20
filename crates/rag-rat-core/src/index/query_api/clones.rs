@@ -19,6 +19,80 @@ use crate::index::clones::NORM_VERSION;
 /// clone. Tunable later via the query surface.
 const THETA: f64 = 0.7;
 
+// ── Public result types (Plan-2 query API) ────────────────────────────────────────────────────
+
+#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CloneMember {
+    pub r#ref: String, // qualified name "path::symbol"
+    pub path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub token_len: i64,
+    pub language: String,
+}
+
+#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoiFactors {
+    pub member_count: usize,
+    pub cross_module_spread: usize,
+    pub median_token_len: i64,
+    pub load_bearing_factor: f64,
+    pub cohesion_penalty: f64, // = cohesion_min_pairwise (the multiplier applied)
+}
+
+#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateCloneClass {
+    pub class_key: String,        // read-side key (NOT clone_refinements key)
+    pub class_kind: &'static str, // always "candidate_component" in Plan 2
+    pub language: String,
+    pub refined: bool,             // always false in Plan 2
+    pub members: Vec<CloneMember>, // returned subset (capped)
+    pub member_count: usize,
+    pub members_returned: usize,
+    pub total_members: usize,
+    pub similarity_min: f64,        // min pairwise overlap/max_len
+    pub similarity_medoid_min: f64, // min similarity of any member to the medoid
+    pub containment_max: f64,       // max pairwise overlap/min_len (informational)
+    pub cohesion_min_pairwise: f64, // == similarity_min; the ROI cohesion input
+    pub cross_module_spread: usize,
+    pub body_token_len_medoid: i64,
+    pub roi: f64,
+    pub roi_factors: RoiFactors,
+}
+
+#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CloneCompleteness {
+    pub normalizer_kind: &'static str, // "baseline"
+    pub normalizer_version: i64,
+    pub min_similarity: f64,              // θ used
+    pub min_tokens: i64,                  // MIN_TOKENS
+    pub min_copies: usize,                // member-count floor applied
+    pub candidate_metric: &'static str,   // "overlap_max_denominator"
+    pub containment_metric: &'static str, // "overlap_min_denominator"
+    pub generated_excluded: bool,         // true
+    pub tests_excluded: bool,             // current policy
+    pub same_file_policy: &'static str,   // "included" (Plan 2 keeps same-file pairs)
+    pub index_freshness: String,          // reuse index_status freshness summary
+    pub oracle_coverage: &'static str,    // "n/a_baseline_only" in Plan 2 (SCIP is Plan 3)
+    pub truncated: bool,
+    pub known_index_gaps: Vec<String>, /* e.g. "#232: TS function-valued declarators not yet
+                                        * fingerprinted" */
+}
+
+/// Deterministic, order-independent class key: sort `member_refs`, join with `\n`,
+/// `hex_sha256`, take the first 16 hex chars.
+#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
+pub(crate) fn class_key_for(member_refs: &[String]) -> String {
+    let mut sorted = member_refs.to_vec();
+    sorted.sort_unstable();
+    let joined = sorted.join("\n");
+    crate::index::hex_sha256(joined.as_bytes())[..16].to_string()
+}
+
 /// Sentinel df for tokens with no `clone_token_df` row (LEFT JOIN miss). i64::MAX sorts them LAST
 /// in `(coalesced_df ASC, token_hash ASC)` order — they are treated as maximally common (least
 /// selective), which is the conservative choice: it can only widen the sub-block, never shrink it,
@@ -324,9 +398,17 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        SymbolBag, TokenPosting, add_struct_hash_pairs, components_from_pairs,
+        SymbolBag, TokenPosting, add_struct_hash_pairs, class_key_for, components_from_pairs,
         sub_block_candidate_pairs,
     };
+
+    #[test]
+    fn class_key_is_deterministic_and_order_independent() {
+        let k1 = class_key_for(&["a.rs::x".into(), "b.rs::y".into()]);
+        let k2 = class_key_for(&["b.rs::y".into(), "a.rs::x".into()]);
+        assert_eq!(k1, k2);
+        assert_ne!(k1, class_key_for(&["a.rs::x".into(), "c.rs::z".into()]));
+    }
 
     #[test]
     fn union_find_groups_transitively_and_drops_singletons() {
