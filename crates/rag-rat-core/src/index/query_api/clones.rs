@@ -6,7 +6,7 @@
 //! max-denominator overlap verify. df is a *selectivity hint only* — admissibility comes from the
 //! shared total order plus the exact verify, so a missing/stale df never drops a true clone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -103,6 +103,11 @@ pub struct CloneCompleteness {
     pub index_freshness: String,          // reuse index_status freshness summary
     pub oracle_coverage: &'static str,    // "n/a_baseline_only" in Plan 2 (SCIP is Plan 3)
     pub truncated: bool,
+    /// Count of DISTINCT member file paths whose on-disk content no longer matches the indexed
+    /// `files.sha256`. A non-zero value means the returned clone classes describe STALE file
+    /// contents — consumers should reindex / `rag-rat heal` before acting on these results.
+    /// This is a read-only signal; Plan 2 does not heal-before-return.
+    pub stale_members: usize,
     pub known_index_gaps: Vec<String>, /* e.g. "#232: TS function-valued declarators not yet
                                         * fingerprinted" */
 }
@@ -266,19 +271,25 @@ impl IndexDatabase {
 
         let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
 
-        let completeness = build_completeness(theta, min_copies, truncated, freshness);
+        // Count DISTINCT member file paths whose on-disk content no longer matches the indexed
+        // sha256 (read-only signal; Plan 2 does not heal-before-return).
+        let stale_members = count_stale_member_paths(self, conn, &classes)?;
+
+        let completeness =
+            build_completeness(theta, min_copies, truncated, stale_members, freshness);
 
         Ok(FindClonesResult { classes, completeness })
     }
 }
 
 /// Build the [`CloneCompleteness`] provenance block shared by `find_clones` and
-/// `clones_for_symbol`. Only `min_similarity` (θ), `min_copies`, `truncated`, and the index
-/// freshness summary vary per call; the rest are fixed Plan-2 policy constants.
+/// `clones_for_symbol`. Only `min_similarity` (θ), `min_copies`, `truncated`, `stale_members`,
+/// and the index freshness summary vary per call; the rest are fixed Plan-2 policy constants.
 fn build_completeness(
     min_similarity: f64,
     min_copies: usize,
     truncated: bool,
+    stale_members: usize,
     freshness: String,
 ) -> CloneCompleteness {
     CloneCompleteness {
@@ -295,6 +306,7 @@ fn build_completeness(
         index_freshness: freshness,
         oracle_coverage: "n/a_baseline_only",
         truncated,
+        stale_members,
         known_index_gaps: vec![
             "#232: TS function-valued declarators not yet fingerprinted".into(),
             "#232: comments/multi-language literals not yet normalized".into(),
@@ -339,6 +351,7 @@ impl IndexDatabase {
         let make_result = |class: Option<CandidateCloneClass>,
                            symbol_resolved: bool,
                            symbol_fingerprinted: bool,
+                           stale_members: usize,
                            freshness: String| {
             // A single class can only truncate by capping its own member list; there is no
             // class-limit here, so reuse the same member-cap signal as `find_clones`.
@@ -347,7 +360,7 @@ impl IndexDatabase {
                 class,
                 symbol_resolved,
                 symbol_fingerprinted,
-                completeness: build_completeness(THETA, 2, truncated, freshness),
+                completeness: build_completeness(THETA, 2, truncated, stale_members, freshness),
             }
         };
 
@@ -355,14 +368,14 @@ impl IndexDatabase {
 
         let resolved_id = resolve_selector_to_symbol_id(conn, &selector)?;
         let Some(symbol_id) = resolved_id else {
-            return Ok(make_result(None, false, false, freshness));
+            return Ok(make_result(None, false, false, 0, freshness));
         };
 
         let bags = load_scoped_baseline_bags(conn)?;
         // If the resolved symbol has no fingerprint row it is not eligible — it can't be in any
         // clone class (generated file, below MIN_TOKENS, or a non-function symbol).
         if !bags.iter().any(|b| b.symbol_id == symbol_id) {
-            return Ok(make_result(None, true, false, freshness));
+            return Ok(make_result(None, true, false, 0, freshness));
         }
 
         let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
@@ -371,15 +384,60 @@ impl IndexDatabase {
 
         // Find the component that contains this symbol_id.
         let Some(component) = components.into_iter().find(|comp| comp.contains(&symbol_id)) else {
-            return Ok(make_result(None, true, true, freshness));
+            return Ok(make_result(None, true, true, 0, freshness));
         };
 
         // Pin the resolved subject so it is guaranteed to appear in the (capped) member list even
         // when its id falls past MAX_MEMBERS in the component's id order — the caller asked about
         // THIS symbol (Fix 2, #215).
         let class = build_class(&component, &by_id, conn, Some(symbol_id))?;
-        Ok(make_result(class, true, true, freshness))
+
+        // Count stale member paths over just this class's members (None class → 0 stale).
+        let stale_members = match &class {
+            None => 0,
+            Some(c) => {
+                let single = std::slice::from_ref(c);
+                count_stale_member_paths(self, conn, single)?
+            },
+        };
+
+        Ok(make_result(class, true, true, stale_members, freshness))
     }
+}
+
+/// Count DISTINCT member file paths in `classes` whose on-disk content no longer matches the
+/// indexed `files.sha256`. Fetches the indexed sha256 per distinct path from the `files` view
+/// (one query per distinct path) then calls [`IndexDatabase::source_path_is_stale`] — the same
+/// pattern as `graph_index.rs`. This is a read-only signal; callers should reindex if non-zero.
+fn count_stale_member_paths(
+    db: &crate::index::IndexDatabase,
+    conn: &Connection,
+    classes: &[CandidateCloneClass],
+) -> anyhow::Result<usize> {
+    // Collect distinct paths across all returned members.
+    let mut distinct_paths: BTreeSet<String> = BTreeSet::new();
+    for class in classes {
+        for member in &class.members {
+            distinct_paths.insert(member.path.clone());
+        }
+    }
+    let mut stale = 0usize;
+    for path in &distinct_paths {
+        let sha256: Option<String> = conn
+            .query_row("SELECT sha256 FROM files WHERE path = ?1 LIMIT 1", [path.as_str()], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(sha256) = sha256 else {
+            // Path not in index at all — treat as stale.
+            stale += 1;
+            continue;
+        };
+        if db.source_path_is_stale(path, &sha256) {
+            stale += 1;
+        }
+    }
+    Ok(stale)
 }
 
 /// Resolve a [`CloneSymbolSelector`] to an in-scope `symbols.id` rowid, or `None` if the selector
@@ -422,25 +480,60 @@ fn resolve_selector_to_symbol_id(
         },
         CloneSymbolSelector::Ref(qualified_name) => {
             // Exact qualified-name match through the scoped `files` view.
-            // Fix 4 (#215): when the qualified name maps to MULTIPLE rows (cfg splits, overloads,
-            // duplicate spans), PREFER a fingerprinted row — mirror the `Id` arm so a ref doesn't
-            // resolve to an unfingerprinted variant and miss the clone class its sibling is in.
-            // `(sf.symbol_id IS NULL) ASC` sorts fingerprinted rows first, falling back to lowest
-            // rowid when none is fingerprinted.
+            // Ambiguity rule: collect ALL current-version fingerprinted symbols matching this ref.
+            // - 0 fingerprinted → fall back to lowest-rowid unfingerprinted match (preserved
+            //   "resolved but not fingerprinted" path: symbol_resolved=true,
+            //   symbol_fingerprinted=false), or None if no symbol at all.
+            // - 1 fingerprinted → use it (unambiguous).
+            // - >1 fingerprinted → REJECT with a clear error: the ref maps to multiple distinct
+            //   logical symbols (overloads, cfg variants) — the caller must disambiguate with Id or
+            //   PathLine. Silently picking one could return an unrelated overload's class.
+            let mut fingerprinted_ids: Vec<i64> = conn
+                .prepare(
+                    "SELECT symbols.id
+                     FROM symbols
+                     JOIN files ON files.id = symbols.file_id
+                     JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+                     JOIN symbol_fingerprints sf
+                       ON sf.symbol_id = symbols.id
+                       AND sf.normalizer_kind = 'baseline'
+                       AND sf.normalizer_version = ?2
+                     WHERE ns.value = ?1
+                     ORDER BY symbols.id ASC",
+                )?
+                .query_map(rusqlite::params![qualified_name.as_str(), NORM_VERSION], |row| {
+                    row.get(0)
+                })?
+                .collect::<Result<_, _>>()?;
+            // Deduplicate: the same symbols.id can appear multiple times if there are multiple
+            // fingerprint rows (shouldn't happen for a normalizer_version-locked query, but be
+            // safe).
+            fingerprinted_ids.dedup();
+
+            if fingerprinted_ids.len() > 1 {
+                let n = fingerprinted_ids.len();
+                anyhow::bail!(
+                    "clones_for_symbol: ref '{}' matches {} fingerprinted symbols (overloads/cfg \
+                     variants) — use id or path+line to disambiguate",
+                    qualified_name,
+                    n
+                );
+            }
+            if let Some(&id) = fingerprinted_ids.first() {
+                return Ok(Some(id));
+            }
+            // 0 fingerprinted matches: fall back to lowest-rowid unfingerprinted symbol for the
+            // "resolved but not fingerprinted" path.
             let id: Option<i64> = conn
                 .query_row(
                     "SELECT symbols.id
                      FROM symbols
                      JOIN files ON files.id = symbols.file_id
                      JOIN name_strings ns ON ns.id = symbols.qualified_name_id
-                     LEFT JOIN symbol_fingerprints sf
-                       ON sf.symbol_id = symbols.id
-                       AND sf.normalizer_kind = 'baseline'
-                       AND sf.normalizer_version = ?2
                      WHERE ns.value = ?1
-                     ORDER BY (sf.symbol_id IS NULL) ASC, symbols.id ASC
+                     ORDER BY symbols.id ASC
                      LIMIT 1",
-                    rusqlite::params![qualified_name.as_str(), NORM_VERSION],
+                    rusqlite::params![qualified_name.as_str()],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -449,12 +542,12 @@ fn resolve_selector_to_symbol_id(
         CloneSymbolSelector::PathLine { path, line } => {
             // Tightest-spanning symbol whose range contains `line`: smallest (end_line -
             // start_line) among symbols where start_line <= line <= end_line.
-            // Fix 4 (#215): tie-break toward a fingerprinted row before the existing span/rowid
-            // ordering, so a line mapping to duplicate same-span rows doesn't pick an
-            // unfingerprinted variant and miss the clone class. `(sf.symbol_id IS NULL)
-            // ASC` sorts fingerprinted rows first; the span/rowid ordering still
-            // decides among equally-(non-)fingerprinted rows, so the tightest span is
-            // preserved when fingerprint status doesn't differ.
+            // CONTRACT: span is the PRIMARY key — return the symbol AT the cursor and let the
+            // eligibility flags report it as not-fingerprinted; do NOT silently jump to an
+            // enclosing fingerprinted function. Fingerprint presence is a TIE-BREAKER only:
+            // among symbols with equal span, prefer the fingerprinted variant (so a cfg-split
+            // same-span pair doesn't pick the unfingerprinted one and miss the clone class).
+            // rowid is the final stable tie-breaker.
             let id: Option<i64> = conn
                 .query_row(
                     "SELECT symbols.id
@@ -466,7 +559,7 @@ fn resolve_selector_to_symbol_id(
                        AND sf.normalizer_version = ?3
                      WHERE files.path = ?1
                        AND ?2 BETWEEN symbols.start_line AND symbols.end_line
-                     ORDER BY (sf.symbol_id IS NULL) ASC, (symbols.end_line - symbols.start_line) \
+                     ORDER BY (symbols.end_line - symbols.start_line) ASC, (sf.symbol_id IS NULL) \
                      ASC, symbols.id ASC
                      LIMIT 1",
                     rusqlite::params![path.as_str(), line, NORM_VERSION],

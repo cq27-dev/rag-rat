@@ -14,7 +14,7 @@ pub(super) enum Heal {
 }
 
 impl IndexDatabase {
-    pub(super) fn source_path_is_stale(&self, path: &str, indexed_sha256: &str) -> bool {
+    pub(crate) fn source_path_is_stale(&self, path: &str, indexed_sha256: &str) -> bool {
         let Some(root) = self.storage.source_root() else {
             return false;
         };
