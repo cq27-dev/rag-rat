@@ -85,11 +85,19 @@ pub struct CandidateCloneClass {
     pub body_token_len_medoid: i64,
     pub roi: f64,
     pub roi_factors: RoiFactors,
-    /// `true` when the component has more than [`METRIC_SAMPLE_CAP`] members and the pairwise
-    /// metric computation (`similarity_min`, medoid, `similarity_medoid_min`, `containment_max`)
-    /// ran over only the first `METRIC_SAMPLE_CAP` members instead of the full upper triangle.
+    /// `true` when a cost cap engaged for this class's metric computation, so a sampled metric is
+    /// distinguishable from an exact one. Two independent caps set it:
+    /// - The Plan-2 pairwise-metric cap ([`METRIC_SAMPLE_CAP`]): the component has more than
+    ///   `METRIC_SAMPLE_CAP` members and the pairwise loop (`similarity_min`, medoid,
+    ///   `similarity_medoid_min`, `containment_max`) ran over only the first `METRIC_SAMPLE_CAP`.
+    /// - The Plan-4a refine LCS caps (`LCS_MEMBER_SAMPLE` / `LCS_MAX_SEQ_TOKENS`, Fix 1): the
+    ///   refine pass bounded the all-pairs LCS by sampling members and/or replacing very long
+    ///   pairs with the multiset-Dice proxy. `refine_class_in_place` ORs the refinement's
+    ///   `lcs_sampled` into this flag, so a refined class with a cost-bounded fidelity reports
+    ///   `true`.
+    ///
     /// `member_count` / `total_members` / `class_key` are always over the FULL component.
-    /// `false` for all normal-size components (the typical case).
+    /// `false` for all normal-size components computed exactly (the typical case).
     pub metrics_sampled: bool,
     /// Refinement outputs (#215 Plan 4a). All `None` on an UN-refined candidate class; populated
     /// only on classes the two-phase driver refined (`refined == true`). `lcs_ratio` is the NiCad
@@ -303,41 +311,50 @@ impl IndexDatabase {
 
         // ── Two-phase ROI ranking (Plan 4a) ────────────────────────────────────────────────────
         // Phase 1: sort ALL coherent classes by the Plan-2 (un-refined) ROI — the cohesion
-        // multiplier. The refine budget is the top-N by this provisional rank, where N is the
-        // caller's `limit` (default 50): refining is comparatively expensive (re-read + re-parse +
-        // LCS), so only the classes that could plausibly survive the limit get refined.
+        // multiplier. Refining is comparatively expensive (re-read + re-parse + LCS), so the
+        // provisional rank picks which classes are worth refining.
         built.sort_by(|a, b| b.1.roi.partial_cmp(&a.1.roi).unwrap_or(std::cmp::Ordering::Equal));
-        let refine_budget = opts.limit.unwrap_or(50);
 
-        // Phase 2: refine the top-N. Each refined class swaps its ROI cohesion multiplier for
-        // `refactorability` and gets its refinement fields set; un-refinable classes (overlay
-        // scope, drifted source, etc.) keep their Plan-2 shape. After refinement the FULL list is
-        // re-sorted by ROI so a refined class that gained/lost rank lands in the right place.
-        for (idx, (class_ids, class)) in built.iter_mut().enumerate() {
-            if idx >= refine_budget {
-                break;
+        // Total coherent classes BEFORE any limit drop — feeds the `truncated` flag below so a
+        // limited result that dropped whole classes still reports `truncated == true`.
+        let total_classes_built = built.len();
+
+        let classes: Vec<CandidateCloneClass> = if let Some(limit) = opts.limit {
+            // Limited result (Fix 2, Codex P2 #215 Plan 4a): truncate to the top-N by PROVISIONAL
+            // ROI BEFORE refining, refine exactly those N, then re-sort ONLY those N by final
+            // (refactorability) ROI. This guarantees every class in a limited result is either
+            // refined or best-effort-unrefined (`load_refine_members` returned None), all ranked on
+            // a consistent basis — no unrefined rank-(N+1) class can displace a refined one after
+            // re-sorting (the old refine-top-N-then-re-sort-ALL path could).
+            built.truncate(limit);
+            for (class_ids, class) in built.iter_mut() {
+                self.refine_class_in_place(conn, class_ids, &by_id, class)?;
             }
-            self.refine_class_in_place(conn, class_ids, &by_id, class)?;
-        }
-
-        let mut classes: Vec<CandidateCloneClass> = built.into_iter().map(|(_, c)| c).collect();
-
-        // Re-sort by ROI descending AFTER refinement (stable for determinism within ties).
-        classes.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Capture the post-filter class count BEFORE the limit truncation so `truncated` can
-        // report classes dropped by the limit (Fix 2), not just members capped within a class.
-        let classes_after_filter = classes.len();
-
-        if let Some(limit) = opts.limit {
-            classes.truncate(limit);
-        }
+            let mut cs: Vec<CandidateCloneClass> = built.into_iter().map(|(_, c)| c).collect();
+            cs.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
+            cs
+        } else {
+            // Unlimited result: refine the top-`UNLIMITED_REFINE_BUDGET` by provisional ROI, return
+            // ALL classes. Classes beyond the budget keep their Plan-2 (un-refined) shape — the
+            // inherent best-effort case for unlimited results. After refinement the FULL list is
+            // re-sorted by ROI so a refined class that gained/lost rank lands in the right place.
+            const UNLIMITED_REFINE_BUDGET: usize = 50;
+            for (idx, (class_ids, class)) in built.iter_mut().enumerate() {
+                if idx >= UNLIMITED_REFINE_BUDGET {
+                    break;
+                }
+                self.refine_class_in_place(conn, class_ids, &by_id, class)?;
+            }
+            let mut cs: Vec<CandidateCloneClass> = built.into_iter().map(|(_, c)| c).collect();
+            cs.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
+            cs
+        };
 
         // `truncated` is true if ANY returned class capped its member list (members_returned <
-        // total_members) OR the class-limit dropped whole classes (classes_after_filter >
-        // returned).
+        // total_members) OR whole classes were dropped to honor the limit (limited path only —
+        // `total_classes_built` exceeds the returned count).
         let truncated = classes.iter().any(|c| c.members_returned < c.total_members)
-            || classes_after_filter > classes.len();
+            || total_classes_built > classes.len();
 
         let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
 
@@ -443,6 +460,10 @@ impl IndexDatabase {
         class.confidence = Some(refinement.confidence.as_db_str().to_string());
         class.refactorability = Some(refinement.refactorability);
         class.refine_mode = Some(refinement.refine_mode);
+        // Fold the refine LCS cost-cap marker into the class's sampling flag (Fix 1): a refined
+        // class whose fidelity was bounded (member sample / Dice proxy) reports `metrics_sampled`.
+        // OR-in so an already-sampled Plan-2 metric stays flagged.
+        class.metrics_sampled |= refinement.lcs_sampled;
 
         Ok(())
     }

@@ -85,26 +85,89 @@ pub(crate) fn lcs_align(a: &[String], b: &[String]) -> Alignment {
     Alignment { lcs_len, ops }
 }
 
+/// Cap on the number of members used in the LCS all-pairs loop. With n members, pairs = n*(n-1)/2;
+/// at 64 members that is 2016 pairs, which is a manageable upper bound. When the seqs slice has
+/// more than LCS_MEMBER_SAMPLE members, only the first LCS_MEMBER_SAMPLE are used (the slice is
+/// already in canonical sorted order, so the sample is deterministic). The caller sees
+/// `lcs_sampled = true` when this cap engages.
+const LCS_MEMBER_SAMPLE: usize = 64;
+
+/// Cap on the per-pair DP table dimension. When max(|a|, |b|) exceeds this, the pair's LCS
+/// ratio is replaced by a token-multiset Dice coefficient (2·|a∩b| / (|a|+|b|)) — a cheap
+/// O(n) proxy that avoids allocating the (n+1)*(m+1) usize DP table. The Dice proxy is a
+/// reasonable approximation: it equals the exact LCS ratio when sequences are identical or
+/// disjoint, and is within the same order of magnitude otherwise. The caller sees
+/// `lcs_sampled = true` when this cap engages.
+const LCS_MAX_SEQ_TOKENS: usize = 2000;
+
+/// Token-multiset Dice coefficient: `2·|a∩b| / (|a|+|b|)`. Used as a proxy for the LCS ratio
+/// when either sequence exceeds [`LCS_MAX_SEQ_TOKENS`] tokens — avoids the O(n·m) DP table
+/// for very long sequences at the cost of exactness. O(n+m) via sorted-merge.
+///
+/// Returns `1.0` when both are empty, `0.0` when one is empty and the other is not.
+fn multiset_dice(a: &[String], b: &[String]) -> f64 {
+    let denom = (a.len() + b.len()) as f64;
+    if denom == 0.0 {
+        return 1.0;
+    }
+    // Build sorted vecs (clone to sort — inputs are short due to the cap guard).
+    let mut sa = a.to_vec();
+    let mut sb = b.to_vec();
+    sa.sort_unstable();
+    sb.sort_unstable();
+    // Two-pointer multiset intersection count.
+    let (mut ia, mut ib, mut intersection) = (0usize, 0usize, 0usize);
+    while ia < sa.len() && ib < sb.len() {
+        match sa[ia].cmp(&sb[ib]) {
+            std::cmp::Ordering::Less => ia += 1,
+            std::cmp::Ordering::Greater => ib += 1,
+            std::cmp::Ordering::Equal => {
+                intersection += 1;
+                ia += 1;
+                ib += 1;
+            },
+        }
+    }
+    2.0 * intersection as f64 / denom
+}
+
 /// NiCad-style class fidelity: the **minimum** over all unordered member pairs of
 /// `2 * LCS(a, b) / (|a| + |b|)`.
 ///
-/// Returns `1.0` for a slice with fewer than 2 members (degenerate case) and for any pair of
-/// identical sequences. Returns `0.0` when one sequence is empty and the other is not (edge case:
-/// `2*0 / (0 + m) == 0`). Guards `|a| + |b| == 0` (both empty) → `1.0`.
-pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> f64 {
+/// Returns `(1.0, false)` for a slice with fewer than 2 members (degenerate case) and for any pair
+/// of identical sequences. Returns `0.0` when one sequence is empty and the other is not (edge
+/// case: `2*0 / (0 + m) == 0`). Guards `|a| + |b| == 0` (both empty) → `1.0`.
+///
+/// The returned `bool` is `lcs_sampled` — `true` when either cost cap engaged: the member-count cap
+/// ([`LCS_MEMBER_SAMPLE`], only the first N members entered the all-pairs loop) or the per-pair
+/// length cap ([`LCS_MAX_SEQ_TOKENS`], a pair fell back to the [`multiset_dice`] proxy instead of
+/// the exact O(n·m) DP). The caller folds this into the class's `metrics_sampled` flag so a
+/// cost-bounded fidelity is distinguishable from an exact one.
+pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> (f64, bool) {
     if seqs.len() < 2 {
-        return 1.0;
+        return (1.0, false);
     }
 
-    let mut min_ratio = f64::INFINITY;
+    // Member-count cap: use at most LCS_MEMBER_SAMPLE members. The slice is already in canonical
+    // sorted order (by struct_hash then symbol_id), so the first LCS_MEMBER_SAMPLE is a
+    // deterministic, reproducible sample.
+    let sampled_members = seqs.len() > LCS_MEMBER_SAMPLE;
+    let effective = if sampled_members { &seqs[..LCS_MEMBER_SAMPLE] } else { seqs };
 
-    for i in 0..seqs.len() {
-        for j in (i + 1)..seqs.len() {
-            let a = &seqs[i];
-            let b = &seqs[j];
+    let mut min_ratio = f64::INFINITY;
+    let mut sampled_seq = false;
+
+    for i in 0..effective.len() {
+        for j in (i + 1)..effective.len() {
+            let a = &effective[i];
+            let b = &effective[j];
             let denom = (a.len() + b.len()) as f64;
             let ratio = if denom == 0.0 {
                 1.0
+            } else if a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS {
+                // Per-pair length cap: use the Dice proxy instead of the O(n·m) DP.
+                sampled_seq = true;
+                multiset_dice(a, b)
             } else {
                 let lcs = lcs_align(a, b).lcs_len;
                 2.0 * lcs as f64 / denom
@@ -115,7 +178,8 @@ pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> f64 {
         }
     }
 
-    min_ratio
+    let lcs_sampled = sampled_members || sampled_seq;
+    (if min_ratio == f64::INFINITY { 1.0 } else { min_ratio }, lcs_sampled)
 }
 
 #[cfg(test)]
@@ -139,8 +203,9 @@ mod tests {
             assert_eq!(*op, AlignOp::Match(k, k), "op at position {k} was not Match");
         }
 
-        let ratio = class_lcs_ratio(&[a, b]);
+        let (ratio, sampled) = class_lcs_ratio(&[a, b]);
         assert!((ratio - 1.0).abs() < 1e-12, "expected ratio 1.0 for identical seqs, got {ratio}");
+        assert!(!sampled, "small identical seqs must not engage any cost cap");
     }
 
     /// b = a with a contiguous run of K extra tokens inserted in the middle.
@@ -192,7 +257,7 @@ mod tests {
 
         // Exact ratio check.
         let expected = 2.0 * n as f64 / (n + n + k) as f64;
-        let ratio = class_lcs_ratio(&[base, b]);
+        let (ratio, _sampled) = class_lcs_ratio(&[base, b]);
         assert!((ratio - expected).abs() < 1e-12, "ratio: expected {expected}, got {ratio}");
     }
 
@@ -215,7 +280,7 @@ mod tests {
         assert_eq!(del_count, 1, "expected 1 DelA, got {del_count}");
         assert_eq!(ins_count, 1, "expected 1 InsB, got {ins_count}");
 
-        let ratio = class_lcs_ratio(&[a, b]);
+        let (ratio, _sampled) = class_lcs_ratio(&[a, b]);
         assert!(ratio < 1.0, "ratio should be < 1.0 for a renamed token, got {ratio}");
         // exact: 2*(n-1)/(n+n) = (n-1)/n
         let expected = (n - 1) as f64 / n as f64;
@@ -239,7 +304,7 @@ mod tests {
         // ratio_ac should be < 0.5; ensure it's noticeably less than the average of (1.0 + 1.0 +
         // ratio_ac)/3.
 
-        let class_ratio = class_lcs_ratio(&[a, b, c]);
+        let (class_ratio, _sampled) = class_lcs_ratio(&[a, b, c]);
         assert!(
             (class_ratio - ratio_ac).abs() < 1e-12,
             "class_lcs_ratio ({class_ratio}) should equal the minimum pairwise ratio ({ratio_ac})"
@@ -289,11 +354,11 @@ mod tests {
         let nonempty = strs(&["fn", "foo"]);
 
         // Both empty → 1.0.
-        let ratio_both = class_lcs_ratio(&[empty.clone(), empty.clone()]);
+        let (ratio_both, _) = class_lcs_ratio(&[empty.clone(), empty.clone()]);
         assert!((ratio_both - 1.0).abs() < 1e-12, "both empty: expected 1.0, got {ratio_both}");
 
         // One empty → 0.0.
-        let ratio_one = class_lcs_ratio(&[empty.clone(), nonempty.clone()]);
+        let (ratio_one, _) = class_lcs_ratio(&[empty.clone(), nonempty.clone()]);
         assert!(ratio_one.abs() < 1e-12, "one empty: expected 0.0, got {ratio_one}");
 
         // Verify lcs_align itself doesn't panic.
@@ -305,5 +370,51 @@ mod tests {
         assert_eq!(aln_one.lcs_len, 0);
         let aln_one_rev = lcs_align(&nonempty, &empty);
         assert_eq!(aln_one_rev.lcs_len, 0);
+    }
+
+    /// Fix 1 (#215 Plan 4a): the member-count cap. A class with more than [`LCS_MEMBER_SAMPLE`]
+    /// members uses only the first `LCS_MEMBER_SAMPLE` in the all-pairs loop and reports
+    /// `lcs_sampled = true`. The ratio is still computed over the (identical) sample, so it stays
+    /// `1.0`.
+    #[test]
+    fn class_lcs_ratio_caps_member_count_and_sets_sampled() {
+        // Build LCS_MEMBER_SAMPLE + 1 identical sequences → member-count cap kicks in.
+        let seq: Vec<String> = (0..10).map(|i| format!("tok{i}")).collect();
+        let seqs: Vec<Vec<String>> = (0..=LCS_MEMBER_SAMPLE).map(|_| seq.clone()).collect();
+        assert!(seqs.len() > LCS_MEMBER_SAMPLE);
+        let (ratio, sampled) = class_lcs_ratio(&seqs);
+        assert!((ratio - 1.0).abs() < 1e-12, "identical seqs → ratio 1.0, got {ratio}");
+        assert!(sampled, "member-count cap must set lcs_sampled=true");
+    }
+
+    /// Fix 1 (#215 Plan 4a): the per-pair length cap. A pair whose longer sequence exceeds
+    /// [`LCS_MAX_SEQ_TOKENS`] tokens skips the O(n·m) DP and uses the [`multiset_dice`] proxy,
+    /// reporting `lcs_sampled = true`. For two identical long sequences the Dice proxy is exactly
+    /// `1.0`.
+    #[test]
+    fn class_lcs_ratio_caps_long_seq_and_uses_dice_proxy() {
+        // Two sequences each LCS_MAX_SEQ_TOKENS + 1 tokens long → per-pair length cap kicks in.
+        let long_seq: Vec<String> = (0..=LCS_MAX_SEQ_TOKENS).map(|i| format!("t{i}")).collect();
+        let seqs = vec![long_seq.clone(), long_seq.clone()];
+        let (ratio, sampled) = class_lcs_ratio(&seqs);
+        // Identical long sequences → Dice proxy = 2*n/(2*n) = 1.0.
+        assert!((ratio - 1.0).abs() < 1e-12, "identical long seqs → Dice proxy 1.0, got {ratio}");
+        assert!(sampled, "per-pair length cap must set lcs_sampled=true");
+    }
+
+    /// Fix 1 (#215 Plan 4a): the [`multiset_dice`] proxy itself. Identical → 1.0, disjoint → 0.0,
+    /// half-overlap → `2·|a∩b| / (|a|+|b|)`.
+    #[test]
+    fn multiset_dice_basic() {
+        // Identical → 1.0.
+        let a: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        assert!((multiset_dice(&a, &a) - 1.0).abs() < 1e-12);
+        // Disjoint → 0.0.
+        let b: Vec<String> = vec!["x".into(), "y".into()];
+        assert!(multiset_dice(&a, &b).abs() < 1e-12);
+        // Half overlap: a=[a,b,c], b=[b,c,d] → intersection=2, denom=6 → 4/6 ≈ 0.667.
+        let c: Vec<String> = vec!["b".into(), "c".into(), "d".into()];
+        let expected = 4.0 / 6.0;
+        assert!((multiset_dice(&a, &c) - expected).abs() < 1e-9, "got {}", multiset_dice(&a, &c));
     }
 }

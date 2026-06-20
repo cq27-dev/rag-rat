@@ -13331,6 +13331,93 @@ fn unrefined_class_outside_top_n_keeps_plan2_shape() {
     fs::remove_dir_all(root2).unwrap();
 }
 
+/// Fix 2 (Codex P2 #215 Plan 4a): find_clones with limit=Some(N) must never return an unrefined
+/// class. The old implementation refine-budget top-N then re-sort ALL → a rank-(N+1) unrefined
+/// class could displace a refined one after ROI recalculation. The fix truncates to N BEFORE
+/// refining so only refined (or best-effort-unrefined) classes appear in a limited result.
+///
+/// Fixture: 3 structurally distinct clone classes (A db-getter / B match-expr / C loop-reducer —
+/// distinct constructs so they form three separate components, never cross-merge). With
+/// `limit=Some(2)` only the top-2 by provisional ROI are truncated into the refine set, refined,
+/// and returned; the third class (truncated away before refining) never enters the result. The
+/// load-bearing assertion is that EVERY class in the limited result has `refined == true` — the
+/// property the old re-sort-ALL path could violate.
+#[test]
+fn find_clones_limited_result_contains_only_refined_classes() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Class A: big body, high ROI.
+    let big = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(db: Db) -> i32 {{ let {v}1 = db.get(1); let {v}2 = db.get(2); let {v}3 \
+             = db.get(3); validate({v}1); validate({v}2); validate({v}3); {v}1 + {v}2 + {v}3 }}\n"
+        )
+    };
+    fs::write(root.join("src/big_a.rs"), big("big_user", "u")).unwrap();
+    fs::write(root.join("src/big_b.rs"), big("big_order", "o")).unwrap();
+
+    // Class B: a `match`-expression body — structurally distinct from both the db-getter (A) and
+    // the loop-reducer (C), so it forms its OWN component (no cross-class merge). Medium length.
+    let matchy = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(k: i32) -> i32 {{ let {v} = match k {{ 0 => 10, 1 => 20, 2 => 30, _ => \
+             40 }}; {v} + 1 }}\n"
+        )
+    };
+    fs::write(root.join("src/match_a.rs"), matchy("classify_a", "n")).unwrap();
+    fs::write(root.join("src/match_b.rs"), matchy("classify_b", "m")).unwrap();
+
+    // Class C: a loop-reducer body — structurally distinct from A and B. Small length.
+    let small = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(xs: Vec<u8>) -> usize {{ let mut {v} = 0; for e in xs {{ {v} += e as \
+             usize; }} {v} }}\n"
+        )
+    };
+    fs::write(root.join("src/small_a.rs"), small("sum_bytes", "s")).unwrap();
+    fs::write(root.join("src/small_b.rs"), small("sum_words", "t")).unwrap();
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Sanity: all 3 classes exist and unlimited refines all of them (budget=50).
+    let all = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(all.classes.len(), 3, "three distinct clone classes are planted: {:?}", all.classes);
+    assert!(all.classes.iter().all(|c| c.refined), "unlimited refines all 3 (budget=50)");
+
+    // Fresh index for the fix-2 assertion (cache starts empty).
+    let root2 = unique_temp_root();
+    let _ = fs::remove_dir_all(&root2);
+    fs::create_dir_all(root2.join("src")).unwrap();
+    fs::write(root2.join("src/big_a.rs"), big("big_user", "u")).unwrap();
+    fs::write(root2.join("src/big_b.rs"), big("big_order", "o")).unwrap();
+    fs::write(root2.join("src/match_a.rs"), matchy("classify_a", "n")).unwrap();
+    fs::write(root2.join("src/match_b.rs"), matchy("classify_b", "m")).unwrap();
+    fs::write(root2.join("src/small_a.rs"), small("sum_bytes", "s")).unwrap();
+    fs::write(root2.join("src/small_b.rs"), small("sum_words", "t")).unwrap();
+    let db2 = IndexDatabase::rebuild(&source_config(root2.clone(), Language::Rust)).unwrap();
+
+    // limit=2: top-2 by provisional ROI are truncated, refined, returned. Class C never enters.
+    let limited = db2
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: Some(2) })
+        .unwrap();
+    assert_eq!(limited.classes.len(), 2, "limit=2 returns exactly 2 classes");
+    for (i, c) in limited.classes.iter().enumerate() {
+        assert!(
+            c.refined,
+            "every class in a limited result must be refined (or best-effort-unrefined); \
+             class[{i}] (key={}) has refined=false",
+            c.class_key
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(root2);
+}
+
 /// Fix 3 (#215): `clones_for_symbol` carries eligibility flags. A below-`MIN_TOKENS` function
 /// RESOLVES (`symbol_resolved=true`) but is not fingerprinted (`symbol_fingerprinted=false`,
 /// `class=None`); an eligible-but-unique function is fingerprinted with no class; an eligible

@@ -32,6 +32,12 @@ pub(crate) struct CachedRefinement {
     pub(crate) confidence: Confidence,
     pub(crate) refactorability: f64,
     pub(crate) refine_mode: &'static str,
+    /// `true` when the LCS fidelity for THIS compute engaged a cost cap (member-count or per-pair
+    /// length — see `class_lcs_ratio`). Computed on a cache MISS only; on a cache HIT it is
+    /// conservatively `false` (the persisted row carries no sampling marker — `lcs_sampled` is an
+    /// implementation artifact of the compute, not content, so it is deliberately NOT persisted in
+    /// `clone_refinements`). The caller folds it into the class's `metrics_sampled` flag.
+    pub(crate) lcs_sampled: bool,
 }
 
 /// Content-addressed refinement key: `sha256(language ∥ refine_mode ∥ NORM_VERSION ∥
@@ -84,6 +90,8 @@ pub(crate) fn refine_lookup(
         confidence: Confidence::from_db_str(&confidence),
         refactorability,
         refine_mode: REFINE_MODE,
+        // Cache hit: `lcs_sampled` is not persisted (see the field doc) — conservatively `false`.
+        lcs_sampled: false,
     }))
 }
 
@@ -107,7 +115,7 @@ pub(crate) fn refine_compute_and_store(
 ) -> anyhow::Result<CachedRefinement> {
     // Compute the 4a scores from the member token sequences.
     let seqs: Vec<Vec<String>> = members.iter().map(|m| m.seq.clone()).collect();
-    let lcs_ratio = class_lcs_ratio(&seqs);
+    let (lcs_ratio, lcs_sampled) = class_lcs_ratio(&seqs);
     let refactorability = refactorability_v1(lcs_ratio);
     let confidence = confidence_v1(lcs_ratio, similarity_min);
 
@@ -139,7 +147,13 @@ pub(crate) fn refine_compute_and_store(
         ],
     )?;
 
-    Ok(CachedRefinement { lcs_ratio, confidence, refactorability, refine_mode: REFINE_MODE })
+    Ok(CachedRefinement {
+        lcs_ratio,
+        confidence,
+        refactorability,
+        refine_mode: REFINE_MODE,
+        lcs_sampled,
+    })
 }
 
 /// Read-through refinement (writable-connection convenience): [`refine_lookup`] on hit, else
