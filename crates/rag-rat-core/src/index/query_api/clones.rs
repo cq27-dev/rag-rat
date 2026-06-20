@@ -24,6 +24,7 @@ const METRIC_SAMPLE_CAP: usize = 200;
 
 use crate::index::IndexDatabase;
 use crate::index::clones::NORM_VERSION;
+use crate::index::clones::refine::align::LCS_MEMBER_SAMPLE;
 use crate::index::clones::refine::cache::{
     refine_compute_and_store, refine_lookup, refinement_key,
 };
@@ -387,86 +388,128 @@ impl IndexDatabase {
         by_id: &BTreeMap<i64, &SymbolBag>,
         class: &mut CandidateCloneClass,
     ) -> anyhow::Result<()> {
-        // Refine inputs: the re-parsed ordered token sequences, in CANONICAL (struct_hash, id)
-        // order. `None` ⇒ refine unavailable for this class — leave it un-refined.
-        let Some(members) = self.load_refine_members(class_ids)? else {
-            return Ok(());
-        };
-        // An empty member set (shouldn't happen for a ≥2 class) is not refinable.
-        if members.len() < 2 {
-            return Ok(());
-        }
-
-        // Content-addressed key over the member struct_hash multiset — NOT the read-side
-        // `class.class_key` (location-derived). Pull each member's persisted struct_hash from the
-        // already-loaded bags so the key is computable without a DB hit.
+        // ── Phase 0 (CHEAP, NO RE-PARSE): build the content-addressed key from each member's
+        // persisted struct_hash already in `by_id` — no file I/O, no tree-sitter parse.
+        // If a class member's struct_hash is somehow absent from `by_id` (shouldn't happen for a
+        // coherent class, but defend anyway) the key would be over an incomplete multiset, which
+        // could alias a different class. Fall back to leaving this class un-refined rather than
+        // computing a wrong refinement.
         let struct_hashes: Vec<String> = class_ids
             .iter()
             .filter_map(|id| by_id.get(id).map(|b| b.struct_hash.clone()))
             .collect();
-        let key = refinement_key(&class.language, &struct_hashes);
+        if struct_hashes.len() != class_ids.len() {
+            // Defensive: a member's bag is missing — skip rather than key over a partial multiset.
+            return Ok(());
+        }
 
+        // Content-addressed key over the member struct_hash multiset — NOT the read-side
+        // `class.class_key` (location-derived). Two classes with the same structural content share
+        // a refinement; the key survives a reindex that reassigns rowids.
+        //
         // For coherent classes exceeding METRIC_SAMPLE_CAP members, `class.similarity_min` was
         // derived from the first `METRIC_SAMPLE_CAP` members only (the metric-sample path in
         // `build_class`), while `key` spans the FULL struct_hash multiset. The gap is not a
         // determinism break — the sample is id-ASC stable — but Plan-4b should compute confidence
         // over the full set or fold the sample into the key.
+        let key = refinement_key(&class.language, &struct_hashes);
+
+        // ── Phase 1 (PURE READ — warm path): probe the content-addressed cache. A SELECT is safe
+        // on the MCP's read-only connection; a WARM cache hit never takes the write lock and never
+        // re-parses any source file. This is the main perf win: the re-parse (load_refine_members,
+        // below) was previously called BEFORE the cache probe, so a warm hit still paid the full
+        // tree-sitter re-parse cost for every member — now it is bypassed entirely.
         //
-        // Phase 1 — PURE READ: probe the content-addressed cache. A SELECT is safe on the MCP's
-        // read-only connection, so a WARM (cache-hit) refine never takes the write lock and never
-        // recomputes anything.
-        let cached = refine_lookup(conn, &key)?;
-        let refinement = if let Some(cached) = cached {
-            // WARM path: cache hit — no compute, no write, fully RO-safe.
-            cached
-        } else {
-            // COLD path: cache miss. The fix it serves (#215 Plan 4a): do NOT run the expensive LCS
-            // compute on a read-only connection only to have the INSERT fail with SQLITE_READONLY
-            // and the whole MCP call retry read-write — recomputing. Instead, BEFORE any compute,
-            // probe writability. If the connection is read-only, surface a genuine SQLITE_READONLY
-            // error so `is_readonly_violation` flags it and the dispatcher retries read-write; the
-            // retry takes this same cold path but writable (so this branch is skipped) and computes
-            // exactly once.
-            if conn.is_readonly(rusqlite::MAIN_DB)? {
-                // Mint a real SQLITE_READONLY `rusqlite::Error` that `is_readonly_violation`
-                // recognizes, WITHOUT the expensive LCS work. A zero-row write to a real table
-                // (`DELETE … WHERE 1=0`) acquires the write lock → fails with SQLITE_READONLY on a
-                // RO connection. (A `BEGIN IMMEDIATE` does NOT error here — this rusqlite/SQLite
-                // build defers the write-lock acquisition past transaction-start, so the probe must
-                // be an actual write statement.) The `WHERE 1=0` makes it a true no-op even on a
-                // writable connection; in practice this branch only runs on the RO pass, since the
-                // RW retry sees `is_readonly == false` and skips straight to the compute.
-                conn.execute("DELETE FROM clone_refinements WHERE 1=0", [])?;
-                // The probe MUST error on a RO connection; if it somehow didn't, bail rather than
-                // fall through to a compute whose INSERT would itself fail.
-                anyhow::bail!("clone refine requires a writable connection");
-            }
-            // Writable: compute once and persist.
-            refine_compute_and_store(conn, &key, &class.language, &members, class.similarity_min)?
+        // CORRECTNESS NOTE: on a cache HIT we intentionally skip the load_refine_members
+        // struct_hash-faithfulness re-validation. This is safe: the cache is keyed by the persisted
+        // struct_hash multiset, so a drifted source that changes struct_hash produces a different
+        // key → cache miss → cold path (re-parse + faithfulness check). Staleness is separately
+        // surfaced to callers via `completeness.stale_members`. Skipping the re-validation on warm
+        // hits is therefore not a regression; it is the designed behavior.
+        if let Some(refinement) = refine_lookup(conn, &key)? {
+            // WARM path: cache hit — apply the refinement without re-parsing any source files.
+            apply_refinement(class, refinement);
+            return Ok(());
+        }
+
+        // ── Phase 2 (COLD path only): cache miss. Before any expensive work, probe writability. If
+        // the connection is read-only, surface a genuine SQLITE_READONLY error so
+        // `is_readonly_violation` flags it and the MCP dispatcher retries read-write; the retry
+        // takes the same path but writable (Phase 1 may hit the cache on the retry if a concurrent
+        // writer raced us, or falls through to the compute below).
+        if conn.is_readonly(rusqlite::MAIN_DB)? {
+            // Mint a real SQLITE_READONLY `rusqlite::Error` that `is_readonly_violation`
+            // recognizes, WITHOUT any expensive LCS work. A zero-row write to a real table
+            // (`DELETE … WHERE 1=0`) acquires the write lock → fails with SQLITE_READONLY on a
+            // RO connection. (A `BEGIN IMMEDIATE` does NOT error here — this rusqlite/SQLite
+            // build defers the write-lock acquisition past transaction-start, so the probe must
+            // be an actual write statement.) The `WHERE 1=0` makes it a true no-op even on a
+            // writable connection; in practice this branch only runs on the RO pass, since the
+            // RW retry sees `is_readonly == false` and skips straight to the compute.
+            conn.execute("DELETE FROM clone_refinements WHERE 1=0", [])?;
+            // The probe MUST error on a RO connection; if it somehow didn't, bail rather than
+            // fall through to a compute whose INSERT would itself fail.
+            anyhow::bail!("clone refine requires a writable connection");
+        }
+
+        // ── Phase 3 (writable cold path): re-parse each member's source file with tree-sitter,
+        // compute the LCS ratio + refactorability, persist in the cache, and apply.
+        // `load_refine_members` is the expensive step (file reads + tree-sitter parses).
+        // `None` ⇒ refine unavailable (overlay scope, drifted source, parse failure, or a
+        // vanished fingerprint row) — leave the class un-refined.
+        let Some(members) = self.load_refine_members(class_ids)? else {
+            return Ok(());
         };
+        // An empty or singleton member set (shouldn't happen for a ≥2 class) is not refinable.
+        if members.len() < 2 {
+            return Ok(());
+        }
 
-        // Swap the ROI cohesion multiplier for `refactorability` on refined classes (Plan 4a). The
-        // other factors are unchanged (cross-module spread × member count × medoid body tokens ×
-        // load-bearing factor); `cohesion_min_pairwise` stays surfaced for transparency.
-        class.roi = class.cross_module_spread as f64
-            * class.member_count as f64
-            * class.body_token_len_medoid as f64
-            * class.roi_factors.load_bearing_factor
-            * refinement.refactorability;
-
-        class.refined = true;
-        class.class_kind = "refined_class";
-        class.lcs_ratio = Some(refinement.lcs_ratio);
-        class.confidence = Some(refinement.confidence.as_db_str().to_string());
-        class.refactorability = Some(refinement.refactorability);
-        class.refine_mode = Some(refinement.refine_mode);
-        // Fold the refine LCS cost-cap marker into the class's sampling flag (Fix 1): a refined
-        // class whose fidelity was bounded (member sample / Dice proxy) reports `metrics_sampled`.
-        // OR-in so an already-sampled Plan-2 metric stays flagged.
-        class.metrics_sampled |= refinement.lcs_sampled;
+        let refinement =
+            refine_compute_and_store(conn, &key, &class.language, &members, class.similarity_min)?;
+        apply_refinement(class, refinement);
 
         Ok(())
     }
+}
+
+/// Apply a [`CachedRefinement`] to a [`CandidateCloneClass`] in place (Plan 4a). Shared between
+/// the warm (cache-hit) and cold (compute+store) paths of [`IndexDatabase::refine_class_in_place`].
+///
+/// `metrics_sampled` accumulates the sampling dimensions via OR-in:
+/// - `refinement.lcs_sampled` — the per-pair length cap (`LCS_MAX_SEQ_TOKENS`) engaged during the
+///   cold compute. This is NOT persisted in `clone_refinements` (it is an implementation artifact
+///   of the compute, not content), so it is `false` on a cache hit. Residual: the warm path cannot
+///   retroactively flag this dimension, but it is rare in practice.
+/// - `class.member_count > LCS_MEMBER_SAMPLE` — the member-count cap is deterministic from the
+///   class's member count (which the function has independent of cache hit/miss), so it is applied
+///   consistently on BOTH the warm and cold paths. This is the dominant sampling dimension.
+fn apply_refinement(
+    class: &mut CandidateCloneClass,
+    refinement: crate::index::clones::refine::cache::CachedRefinement,
+) {
+    // Swap the ROI cohesion multiplier for `refactorability` on refined classes (Plan 4a). The
+    // other factors are unchanged (cross-module spread × member count × medoid body tokens ×
+    // load-bearing factor); `cohesion_min_pairwise` stays surfaced for transparency.
+    class.roi = class.cross_module_spread as f64
+        * class.member_count as f64
+        * class.body_token_len_medoid as f64
+        * class.roi_factors.load_bearing_factor
+        * refinement.refactorability;
+
+    class.refined = true;
+    class.class_kind = "refined_class";
+    class.lcs_ratio = Some(refinement.lcs_ratio);
+    class.confidence = Some(refinement.confidence.as_db_str().to_string());
+    class.refactorability = Some(refinement.refactorability);
+    class.refine_mode = Some(refinement.refine_mode);
+
+    // Fold the two LCS sampling dimensions into the class's metrics_sampled flag (OR-in so
+    // any already-sampled Plan-2 metric stays flagged):
+    //   1. lcs_sampled (per-pair length cap) — from the cold compute; false on a warm hit.
+    //   2. member_count > LCS_MEMBER_SAMPLE — deterministically known from class size, consistent
+    //      on both warm and cold paths.
+    class.metrics_sampled |= refinement.lcs_sampled || class.member_count > LCS_MEMBER_SAMPLE;
 }
 
 /// Build the [`CloneCompleteness`] provenance block shared by `find_clones` and

@@ -90,7 +90,7 @@ pub(crate) fn lcs_align(a: &[String], b: &[String]) -> Alignment {
 /// more than LCS_MEMBER_SAMPLE members, only the first LCS_MEMBER_SAMPLE are used (the slice is
 /// already in canonical sorted order, so the sample is deterministic). The caller sees
 /// `lcs_sampled = true` when this cap engages.
-const LCS_MEMBER_SAMPLE: usize = 64;
+pub(crate) const LCS_MEMBER_SAMPLE: usize = 64;
 
 /// Cap on the per-pair DP table dimension. When max(|a|, |b|) exceeds this, the pair's LCS
 /// ratio is replaced by a token-multiset Dice coefficient (2·|a∩b| / (|a|+|b|)) — a cheap
@@ -110,7 +110,8 @@ fn multiset_dice(a: &[String], b: &[String]) -> f64 {
     if denom == 0.0 {
         return 1.0;
     }
-    // Build sorted vecs (clone to sort — inputs are short due to the cap guard).
+    // Build sorted vecs (clone to sort — inputs are bounded by LCS_MAX_SEQ_TOKENS≈2000, so the O(n
+    // log n) sort is cheap).
     let mut sa = a.to_vec();
     let mut sb = b.to_vec();
     sa.sort_unstable();
