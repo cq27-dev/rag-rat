@@ -24,7 +24,9 @@ const METRIC_SAMPLE_CAP: usize = 200;
 
 use crate::index::IndexDatabase;
 use crate::index::clones::NORM_VERSION;
-use crate::index::clones::refine::cache::{refine_class, refinement_key};
+use crate::index::clones::refine::cache::{
+    refine_compute_and_store, refine_lookup, refinement_key,
+};
 use crate::index::clones::refine::split::coherence_split;
 
 /// Similarity threshold θ: a candidate pair is kept iff `overlap / max_len >= THETA`. The MAX
@@ -371,7 +373,39 @@ impl IndexDatabase {
         // `build_class`), while `key` spans the FULL struct_hash multiset. The gap is not a
         // determinism break — the sample is id-ASC stable — but Plan-4b should compute confidence
         // over the full set or fold the sample into the key.
-        let refinement = refine_class(conn, &key, &class.language, &members, class.similarity_min)?;
+        //
+        // Phase 1 — PURE READ: probe the content-addressed cache. A SELECT is safe on the MCP's
+        // read-only connection, so a WARM (cache-hit) refine never takes the write lock and never
+        // recomputes anything.
+        let cached = refine_lookup(conn, &key)?;
+        let refinement = if let Some(cached) = cached {
+            // WARM path: cache hit — no compute, no write, fully RO-safe.
+            cached
+        } else {
+            // COLD path: cache miss. The fix it serves (#215 Plan 4a): do NOT run the expensive LCS
+            // compute on a read-only connection only to have the INSERT fail with SQLITE_READONLY
+            // and the whole MCP call retry read-write — recomputing. Instead, BEFORE any compute,
+            // probe writability. If the connection is read-only, surface a genuine SQLITE_READONLY
+            // error so `is_readonly_violation` flags it and the dispatcher retries read-write; the
+            // retry takes this same cold path but writable (so this branch is skipped) and computes
+            // exactly once.
+            if conn.is_readonly(rusqlite::MAIN_DB)? {
+                // Mint a real SQLITE_READONLY `rusqlite::Error` that `is_readonly_violation`
+                // recognizes, WITHOUT the expensive LCS work. A zero-row write to a real table
+                // (`DELETE … WHERE 1=0`) acquires the write lock → fails with SQLITE_READONLY on a
+                // RO connection. (A `BEGIN IMMEDIATE` does NOT error here — this rusqlite/SQLite
+                // build defers the write-lock acquisition past transaction-start, so the probe must
+                // be an actual write statement.) The `WHERE 1=0` makes it a true no-op even on a
+                // writable connection; in practice this branch only runs on the RO pass, since the
+                // RW retry sees `is_readonly == false` and skips straight to the compute.
+                conn.execute("DELETE FROM clone_refinements WHERE 1=0", [])?;
+                // The probe MUST error on a RO connection; if it somehow didn't, bail rather than
+                // fall through to a compute whose INSERT would itself fail.
+                anyhow::bail!("clone refine requires a writable connection");
+            }
+            // Writable: compute once and persist.
+            refine_compute_and_store(conn, &key, &class.language, &members, class.similarity_min)?
+        };
 
         // Swap the ROI cohesion multiplier for `refactorability` on refined classes (Plan 4a). The
         // other factors are unchanged (cross-module spread × member count × medoid body tokens ×

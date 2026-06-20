@@ -4,8 +4,15 @@
 //! refine mode, the version pins, and the member `struct_hash` multiset) — NOT from the read-side
 //! `class_key` (which is location-derived: `ref@path:start-end`). Two clone classes with the same
 //! structural content therefore share a refinement even when they live at different locations, and
-//! the key survives a reindex that reassigns rowids. [`refine_class`] is a read-through cache over
-//! the `clone_refinements` table keyed by this content address: compute on miss, persist, return.
+//! the key survives a reindex that reassigns rowids.
+//!
+//! The cache is split into a pure read ([`refine_lookup`], a SELECT — RO-connection-safe) and a
+//! compute-then-write ([`refine_compute_and_store`], the expensive LCS work + INSERT). Keeping them
+//! separate lets the caller probe the cache on a read-only connection WITHOUT triggering the
+//! expensive compute, then surface an `SQLITE_READONLY` error so the MCP dispatcher retries
+//! read-write — the compute runs exactly once, on the writable retry. [`refine_class`] is the
+//! convenience read-through (lookup → compute-and-store) for callers that already hold a writable
+//! connection.
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -20,7 +27,7 @@ const REFINE_MODE: &str = "baseline";
 /// A computed (or cache-hit) refinement for one clone class. The 4a surface carries only the
 /// scoring outputs; the template / variation-points / proposed-signature are persisted minimally
 /// (4b fills them) and not returned.
-pub(crate) struct Refinement {
+pub(crate) struct CachedRefinement {
     pub(crate) lcs_ratio: f64,
     pub(crate) confidence: Confidence,
     pub(crate) refactorability: f64,
@@ -54,23 +61,15 @@ pub(crate) fn refinement_key(language: &str, struct_hashes: &[String]) -> String
     crate::index::hex_sha256(material.as_bytes())
 }
 
-/// Read-through refinement: return the cached `clone_refinements` row for `refinement_key`
-/// (filtered to the current `NORM_VERSION` / `ALIGNMENT_VERSION` so a stale-version row never
-/// serves), else compute the 4a scores from the member token sequences, persist a minimal row, and
-/// return.
-///
-/// `similarity_min` is the Plan-2 pairwise floor for the class — it feeds the confidence band only,
-/// not the cache key (the key is purely structural). The persisted `template` is a crude LCS
-/// skeleton (4b fills the full anti-unification template + variation points); `anti_unify_coverage`
-/// is the `lcs_ratio` as a 4a proxy.
-pub(crate) fn refine_class(
+/// PURE READ: return the cached `clone_refinements` row for `refinement_key` (filtered to the
+/// current `NORM_VERSION` / `ALIGNMENT_VERSION` so a stale-version row never serves), or `None` on
+/// a cache miss. This is a SELECT only — NO compute, NO write — so it is safe to call on a
+/// read-only connection. Callers that want compute-on-miss decide separately whether the connection
+/// is writable before reaching for [`refine_compute_and_store`].
+pub(crate) fn refine_lookup(
     conn: &Connection,
     refinement_key: &str,
-    language: &str,
-    members: &[RefineMember],
-    similarity_min: f64,
-) -> anyhow::Result<Refinement> {
-    // Cache HIT: a row keyed by this content address at the current version pins.
+) -> anyhow::Result<Option<CachedRefinement>> {
     let hit: Option<(f64, String, f64)> = conn
         .query_row(
             "SELECT lcs_ratio, confidence, refactorability
@@ -80,16 +79,33 @@ pub(crate) fn refine_class(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    if let Some((lcs_ratio, confidence, refactorability)) = hit {
-        return Ok(Refinement {
-            lcs_ratio,
-            confidence: Confidence::from_db_str(&confidence),
-            refactorability,
-            refine_mode: REFINE_MODE,
-        });
-    }
+    Ok(hit.map(|(lcs_ratio, confidence, refactorability)| CachedRefinement {
+        lcs_ratio,
+        confidence: Confidence::from_db_str(&confidence),
+        refactorability,
+        refine_mode: REFINE_MODE,
+    }))
+}
 
-    // Cache MISS: compute the 4a scores from the member token sequences.
+/// COMPUTE + WRITE: compute the 4a scores from the member token sequences, persist a minimal
+/// `clone_refinements` row keyed by `refinement_key`, and return the computed refinement. This is
+/// the expensive half (`class_lcs_ratio` + `lcs_skeleton` + the INSERT) and REQUIRES a writable
+/// connection — call it only after [`refine_lookup`] missed AND the caller confirmed the connection
+/// is read-write (otherwise the INSERT errors with `SQLITE_READONLY`, which is the deliberate
+/// signal the read path uses to retry read-write — see `refine_class_in_place`).
+///
+/// `similarity_min` is the Plan-2 pairwise floor for the class — it feeds the confidence band only,
+/// not the cache key (the key is purely structural). The persisted `template` is a crude LCS
+/// skeleton (4b fills the full anti-unification template + variation points); `anti_unify_coverage`
+/// is the `lcs_ratio` as a 4a proxy.
+pub(crate) fn refine_compute_and_store(
+    conn: &Connection,
+    refinement_key: &str,
+    language: &str,
+    members: &[RefineMember],
+    similarity_min: f64,
+) -> anyhow::Result<CachedRefinement> {
+    // Compute the 4a scores from the member token sequences.
     let seqs: Vec<Vec<String>> = members.iter().map(|m| m.seq.clone()).collect();
     let lcs_ratio = class_lcs_ratio(&seqs);
     let refactorability = refactorability_v1(lcs_ratio);
@@ -123,7 +139,24 @@ pub(crate) fn refine_class(
         ],
     )?;
 
-    Ok(Refinement { lcs_ratio, confidence, refactorability, refine_mode: REFINE_MODE })
+    Ok(CachedRefinement { lcs_ratio, confidence, refactorability, refine_mode: REFINE_MODE })
+}
+
+/// Read-through refinement (writable-connection convenience): [`refine_lookup`] on hit, else
+/// [`refine_compute_and_store`]. Requires a writable connection on a cache miss. The RO-aware read
+/// path (`refine_class_in_place`) calls the two halves directly so it can probe the cache on a
+/// read-only connection and surface `SQLITE_READONLY` BEFORE any expensive compute.
+pub(crate) fn refine_class(
+    conn: &Connection,
+    refinement_key: &str,
+    language: &str,
+    members: &[RefineMember],
+    similarity_min: f64,
+) -> anyhow::Result<CachedRefinement> {
+    if let Some(cached) = refine_lookup(conn, refinement_key)? {
+        return Ok(cached);
+    }
+    refine_compute_and_store(conn, refinement_key, language, members, similarity_min)
 }
 
 /// Crude 4a LCS skeleton: the LCS-common token run of the first member pair (exact for a 2-member
@@ -175,5 +208,77 @@ mod tests {
             ["fn", "f", "(", ")", "{", "}"].iter().map(|s| s.to_string()).collect();
         let seqs = vec![a.clone(), a.clone()];
         assert_eq!(lcs_skeleton(&seqs), a.join(" "));
+    }
+
+    /// [`refine_lookup`] is a PURE READ: a miss returns `None` and writes NOTHING — no
+    /// `clone_refinements` row appears. This is the property that makes the read path safe to run
+    /// on a read-only MCP connection: the cache probe never touches the write lock, so the
+    /// expensive `refine_compute_and_store` (and its INSERT) only runs after the caller has
+    /// confirmed a writable connection.
+    ///
+    /// The read-only-connection RETRY mechanism itself (probe → `BEGIN IMMEDIATE; ROLLBACK;`
+    /// triggering `SQLITE_READONLY` → dispatcher retries read-write → compute runs once) is
+    /// exercised end-to-end by the `refine_cache_is_read_through` integration test in
+    /// `schema_bootstrap_tests.rs`, which drives a real `IndexDatabase`. The unit-level invariant
+    /// here is the load-bearing half: the lookup must not write.
+    #[test]
+    fn refine_lookup_returns_none_on_miss_without_writing() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+
+        let count_rows = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(count_rows(&conn), 0, "table starts empty");
+
+        let key = refinement_key("rust", &["h1".into(), "h2".into()]);
+        let hit = refine_lookup(&conn, &key).unwrap();
+
+        assert!(hit.is_none(), "a miss must return None");
+        assert_eq!(count_rows(&conn), 0, "refine_lookup must NOT write a row on a miss");
+    }
+
+    /// The writable-connection read-through [`refine_class`]: a miss computes + persists exactly
+    /// one row; a second call over the same key is a cache HIT that serves the persisted row
+    /// WITHOUT growing the count. (The RO-aware split path is `refine_class_in_place`; this
+    /// covers the convenience wrapper directly on a writable in-memory connection.)
+    #[test]
+    fn refine_class_read_through_computes_once_then_serves_cache() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+
+        let count_rows = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap()
+        };
+
+        // Two identical ordered token sequences ⇒ a clean, near-perfect class.
+        let seq: Vec<String> = ["fn", "f", "(", ")", "{", "g", "(", ")", ";", "}"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mk = |id: i64| RefineMember {
+            symbol_id: id,
+            lang: crate::language::Language::Rust,
+            path: format!("src/m{id}.rs"),
+            start_byte: 0,
+            end_byte: seq.len(),
+            struct_hash: format!("h{id}"),
+            seq: seq.clone(),
+        };
+        let members = vec![mk(1), mk(2)];
+        let key = refinement_key("rust", &["h1".into(), "h2".into()]);
+
+        // Miss: compute + persist one row.
+        let first = refine_class(&conn, &key, "rust", &members, 1.0).unwrap();
+        assert_eq!(count_rows(&conn), 1, "the miss persists exactly one row");
+        assert!(first.lcs_ratio > 0.99, "identical sequences ⇒ near-perfect lcs_ratio");
+
+        // Hit: same key serves the cache, no new row.
+        let second = refine_class(&conn, &key, "rust", &members, 1.0).unwrap();
+        assert_eq!(count_rows(&conn), 1, "the hit must NOT grow the row count");
+        assert_eq!(
+            first.confidence, second.confidence,
+            "the cache-served refinement matches the computed one"
+        );
     }
 }
