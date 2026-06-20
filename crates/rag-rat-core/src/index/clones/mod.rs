@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 mod normalize;
+pub(crate) mod refine;
 mod tokens;
 
 use tree_sitter::Node;
