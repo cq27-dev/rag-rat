@@ -55,6 +55,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Brief(args) => brief(&config, &args)?,
         Cmd::Clusters(args) => clusters(&config, &args)?,
         Cmd::ImportantSymbols(args) => important_symbols(&config, &args)?,
+        Cmd::Clones(args) => clones(&config, &args)?,
+        Cmd::ClonesFor(args) => clones_for(&config, &args)?,
         Cmd::Mcp => {
             // Refresh the crates.io version cache out of band (a detached thread on this long-lived
             // server) when stale + opted-in, so `index_status` and the next SessionStart digest

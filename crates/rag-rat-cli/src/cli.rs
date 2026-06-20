@@ -57,6 +57,12 @@ pub(crate) enum Command {
     /// Rank the most load-bearing symbols by weighted PageRank over the edge graph.
     ImportantSymbols(ImportantSymbolsArgs),
 
+    /// List candidate clone classes ranked by refactor ROI.
+    Clones(ClonesArgs),
+
+    /// Reverse-lookup: show the clone class containing a given symbol (if any).
+    ClonesFor(ClonesForArgs),
+
     /// Run the stdio MCP server.
     Mcp,
 
@@ -169,6 +175,34 @@ pub(crate) struct ImportantSymbolsArgs {
     /// global-by-default — it never auto-seeds from the git diff).
     #[arg(long, value_delimiter = ',')]
     pub personalize: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ClonesArgs {
+    /// Minimum pairwise overlap/max_len similarity (default: 0.7 θ threshold).
+    #[arg(long)]
+    pub min_similarity: Option<f64>,
+    /// Minimum number of copies for a class to be returned (default: 2).
+    #[arg(long)]
+    pub min_copies: Option<usize>,
+    /// Maximum number of clone classes to return, sorted by ROI descending.
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+/// Selector for `clones-for`: positional `SYMBOL` (a qualified ref or `sym_<hex>` handle), or
+/// `--path` + `--line` for a location-based lookup. Exactly one of these forms is required.
+#[derive(Debug, Args)]
+pub(crate) struct ClonesForArgs {
+    /// Qualified symbol reference (`path/to/file.rs::fn_name`) or a `sym_<hex>` handle.
+    #[arg(value_name = "SYMBOL")]
+    pub symbol: Option<String>,
+    /// File path for a PathLine lookup (requires --line).
+    #[arg(long, value_name = "PATH")]
+    pub path: Option<String>,
+    /// Line number for a PathLine lookup (requires --path).
+    #[arg(long, value_name = "N")]
+    pub line: Option<i64>,
 }
 
 #[derive(Debug, Args)]
@@ -546,6 +580,83 @@ mod tests {
                 assert!(args.claude && args.global);
             },
             other => panic!("expected hooks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clones_parses_min_copies() {
+        let cli = Cli::try_parse_from(["rag-rat", "clones", "--min-copies", "3"]).expect("parse");
+        match cli.command {
+            Command::Clones(args) => {
+                assert_eq!(args.min_copies, Some(3));
+                assert!(args.min_similarity.is_none());
+                assert!(args.limit.is_none());
+            },
+            other => panic!("expected clones, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clones_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "rag-rat",
+            "clones",
+            "--min-similarity",
+            "0.8",
+            "--min-copies",
+            "3",
+            "--limit",
+            "10",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Clones(args) => {
+                assert_eq!(args.min_similarity, Some(0.8));
+                assert_eq!(args.min_copies, Some(3));
+                assert_eq!(args.limit, Some(10));
+            },
+            other => panic!("expected clones, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clones_for_parses_positional_ref() {
+        let cli =
+            Cli::try_parse_from(["rag-rat", "clones-for", "src/a.rs::load_user"]).expect("parse");
+        match cli.command {
+            Command::ClonesFor(args) => {
+                assert_eq!(args.symbol.as_deref(), Some("src/a.rs::load_user"));
+                assert!(args.path.is_none());
+                assert!(args.line.is_none());
+            },
+            other => panic!("expected clones-for, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clones_for_parses_path_line() {
+        let cli =
+            Cli::try_parse_from(["rag-rat", "clones-for", "--path", "src/a.rs", "--line", "1"])
+                .expect("parse");
+        match cli.command {
+            Command::ClonesFor(args) => {
+                assert!(args.symbol.is_none());
+                assert_eq!(args.path.as_deref(), Some("src/a.rs"));
+                assert_eq!(args.line, Some(1));
+            },
+            other => panic!("expected clones-for, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clones_for_parses_sym_handle() {
+        let cli =
+            Cli::try_parse_from(["rag-rat", "clones-for", "sym_deadbeef12345678"]).expect("parse");
+        match cli.command {
+            Command::ClonesFor(args) => {
+                assert_eq!(args.symbol.as_deref(), Some("sym_deadbeef12345678"));
+            },
+            other => panic!("expected clones-for, got {other:?}"),
         }
     }
 
