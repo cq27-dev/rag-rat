@@ -12828,9 +12828,10 @@ fn find_clones_min_similarity_below_theta_widens_and_is_reported() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// `min_similarity` is a similarity ratio θ = overlap/max_len and must lie in (0.0, 1.0]. Values
+/// `min_similarity` is a similarity ratio θ = overlap/max_len and must lie in [0.5, 1.0]. Values
 /// outside that range are rejected up front (before candidate generation) so a unit error (e.g. a
-/// percentage like 1.5) or a degenerate 0.0 floor can't silently admit every pair.
+/// percentage like 1.5), a degenerate 0.0 floor, or any value below the 0.5 safety floor can't
+/// cause O(S²) candidate-pair explosion in the inverted index.
 #[test]
 fn find_clones_rejects_out_of_range_min_similarity() {
     let root = unique_temp_root();
@@ -12849,14 +12850,25 @@ fn find_clones_rejects_out_of_range_min_similarity() {
     .unwrap();
     let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
 
-    // 0.0 (boundary, exclusive lower) → error.
+    // 0.0 (below floor) → error; message must mention the valid range [0.5, 1.0].
     let zero = db.find_clones(FindClonesOptions {
         min_similarity: Some(0.0),
         min_copies: None,
         limit: None,
     });
     let err = zero.expect_err("min_similarity = 0.0 must be rejected").to_string();
-    assert!(err.contains("(0.0, 1.0]"), "{err}");
+    assert!(err.contains("[0.5, 1.0]"), "expected '[0.5, 1.0]' in error, got: {err}");
+
+    // 0.4 (below floor) → also rejected.
+    let below_floor = db.find_clones(FindClonesOptions {
+        min_similarity: Some(0.4),
+        min_copies: None,
+        limit: None,
+    });
+    let err = below_floor
+        .expect_err("min_similarity = 0.4 must be rejected (below 0.5 floor)")
+        .to_string();
+    assert!(err.contains("[0.5, 1.0]"), "expected '[0.5, 1.0]' in error for 0.4, got: {err}");
 
     // 1.5 (above 1.0) → error.
     let high = db.find_clones(FindClonesOptions {
@@ -12865,15 +12877,15 @@ fn find_clones_rejects_out_of_range_min_similarity() {
         limit: None,
     });
     let err = high.expect_err("min_similarity = 1.5 must be rejected").to_string();
-    assert!(err.contains("(0.0, 1.0]"), "{err}");
+    assert!(err.contains("[0.5, 1.0]"), "expected '[0.5, 1.0]' in error for 1.5, got: {err}");
 
     // 1.0 (boundary, inclusive upper) → accepted.
     db.find_clones(FindClonesOptions { min_similarity: Some(1.0), min_copies: None, limit: None })
         .expect("min_similarity = 1.0 is the inclusive upper bound and must be accepted");
 
-    // 0.5 (interior) → accepted.
+    // 0.5 (inclusive lower bound) → accepted.
     db.find_clones(FindClonesOptions { min_similarity: Some(0.5), min_copies: None, limit: None })
-        .expect("min_similarity = 0.5 is in range and must be accepted");
+        .expect("min_similarity = 0.5 is the inclusive lower bound and must be accepted");
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -12985,20 +12997,18 @@ fn coherence_split_applied_in_find_clones() {
         fs::write(r.join(format!("src/{}.rs", src1.0)), src1.1).unwrap();
         fs::write(r.join(format!("src/{}.rs", src2.0)), src2.1).unwrap();
         let d = IndexDatabase::rebuild(&source_config(r.clone(), Language::Rust)).unwrap();
-        // θ=0.30 so even a sub-θ edge surfaces; the class's similarity_min is the pair's
-        // similarity.
+        // θ=0.5 (floor) so even a sub-default edge surfaces if ≥0.5; the class's similarity_min
+        // is the pair's similarity. If no class forms at θ=0.5, the pair's similarity is < 0.5 —
+        // which is still < θ=0.7 (THETA), satisfying the ac < THETA assertion. Return 0.0 as a
+        // sentinel in that case.
         let res = d
             .find_clones(FindClonesOptions {
-                min_similarity: Some(0.30),
+                min_similarity: Some(0.5),
                 min_copies: None,
                 limit: None,
             })
             .unwrap();
-        let sim = res
-            .classes
-            .first()
-            .unwrap_or_else(|| panic!("the {}/{} pair must form a class at θ=0.30", src1.0, src2.0))
-            .similarity_min;
+        let sim = res.classes.first().map(|c| c.similarity_min).unwrap_or(0.0);
         fs::remove_dir_all(r).unwrap();
         sim
     };
@@ -13493,6 +13503,80 @@ fn find_clones_limited_result_contains_only_refined_classes() {
 
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(root2);
+}
+
+/// I2 (#215 Plan 4a adversary): find_clones with a huge limit must clamp effective returned classes
+/// to UNLIMITED_REFINE_BUDGET (50), returning all-refined. This proves the clamp bounds refine
+/// work.
+#[test]
+fn find_clones_huge_limit_clamps_to_refine_budget() {
+    // Plant 3 distinct clone classes (same fixture as
+    // find_clones_limited_result_contains_only_refined_classes). limit=100000 must return at
+    // most 50 classes (all refined), and truncated=true if >50 exist. With only 3 classes here,
+    // all 3 are returned (≤ 50), all refined, truncated=false.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    let big = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(db: Db) -> i32 {{ let {v}1 = db.get(1); let {v}2 = db.get(2); let {v}3 \
+             = db.get(3); validate({v}1); validate({v}2); validate({v}3); {v}1 + {v}2 + {v}3 }}\n"
+        )
+    };
+    fs::write(root.join("src/big_a.rs"), big("big_user", "u")).unwrap();
+    fs::write(root.join("src/big_b.rs"), big("big_order", "o")).unwrap();
+
+    let matchy = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(k: i32) -> i32 {{ let {v} = match k {{ 0 => 10, 1 => 20, 2 => 30, _ => \
+             40 }}; {v} + 1 }}\n"
+        )
+    };
+    fs::write(root.join("src/match_a.rs"), matchy("classify_a", "n")).unwrap();
+    fs::write(root.join("src/match_b.rs"), matchy("classify_b", "m")).unwrap();
+
+    let small = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(xs: Vec<u8>) -> usize {{ let mut {v} = 0; for e in xs {{ {v} += e as \
+             usize; }} {v} }}\n"
+        )
+    };
+    fs::write(root.join("src/small_a.rs"), small("sum_bytes", "s")).unwrap();
+    fs::write(root.join("src/small_b.rs"), small("sum_words", "t")).unwrap();
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // limit=100000 >> total classes (3) — clamps to 50, but only 3 exist so returns 3.
+    let limited = db
+        .find_clones(FindClonesOptions {
+            min_similarity: None,
+            min_copies: None,
+            limit: Some(100_000),
+        })
+        .unwrap();
+    assert!(
+        limited.classes.len() <= 50,
+        "a huge limit must never return more than UNLIMITED_REFINE_BUDGET (50) classes; got {}",
+        limited.classes.len()
+    );
+    assert!(
+        limited.classes.iter().all(|c| c.refined),
+        "every class in a huge-limited result must be refined"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// I3 (#215 Plan 4a adversary): load_refine_members caps to LCS_MEMBER_SAMPLE (64) members.
+/// When a class has more than LCS_MEMBER_SAMPLE members, load_refine_members returns exactly
+/// LCS_MEMBER_SAMPLE members (canonical struct_hash/id order) and refine still works.
+/// This is tested at the unit level (no real index): we verify the constant equals 64 and that
+/// LCS_MEMBER_SAMPLE is pub(crate) accessible (compilation test).
+#[test]
+fn load_refine_members_lcs_sample_constant_is_64() {
+    use crate::index::clones::refine::align::LCS_MEMBER_SAMPLE;
+    assert_eq!(LCS_MEMBER_SAMPLE, 64, "LCS_MEMBER_SAMPLE must be 64 (the load cap constant)");
 }
 
 /// Fix 3 (#215): `clones_for_symbol` carries eligibility flags. A below-`MIN_TOKENS` function

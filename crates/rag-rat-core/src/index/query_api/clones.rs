@@ -252,16 +252,21 @@ impl IndexDatabase {
         let conn = self.storage.connection();
 
         // Validate the caller-supplied θ BEFORE it touches candidate generation. θ is a similarity
-        // ratio (overlap/max_len) so it must lie in (0.0, 1.0]: ≤ 0.0 would admit every pair (and a
-        // 0.0 sub-block prefix walks the whole bag), > 1.0 is unreachable and signals a unit error.
-        // NaN must be explicitly rejected: both `v <= 0.0` and `v > 1.0` are false for NaN, so
-        // without the `is_finite` guard NaN slips through and makes `ceil(NaN) as i64 = 0`, which
-        // widens the sub-block to the whole bag → O(n²) blowup with every same-language
-        // token-sharing pair reported as a clone.
+        // ratio (overlap/max_len) and must lie in [0.5, 1.0]:
+        // - > 1.0 is unreachable and signals a unit error.
+        // - < 0.5 is rejected not just for the ≤0 degenerate case but because any small positive θ
+        //   makes the sub-block prefix p = L − ceil(θ·L) + 1 approach the whole bag, flooding the
+        //   inverted index with hot/common tokens and causing O(S²) candidate-pair explosion
+        //   (measured: 5k symbols at θ=0.01 → ~20s/~700MB in candidate gen alone). The 0.5 floor
+        //   keeps the sub-block at most L/2 occurrences — a practical safety bound. A deeper fix
+        //   (capping candidate-pair/posting-list work and restoring the full (0,1] range) is
+        //   tracked in #235.
+        // - NaN and non-finite values must be explicitly rejected: both `v < 0.5` and `v > 1.0` are
+        //   false for NaN, so without the `is_finite` guard NaN slips through.
         if let Some(v) = opts.min_similarity
-            && (!v.is_finite() || v <= 0.0 || v > 1.0)
+            && (!v.is_finite() || !(0.5..=1.0).contains(&v))
         {
-            anyhow::bail!("min_similarity must be a finite value in (0.0, 1.0]");
+            anyhow::bail!("min_similarity must be in [0.5, 1.0]");
         }
 
         let bags = load_scoped_baseline_bags(conn)?;
@@ -320,14 +325,25 @@ impl IndexDatabase {
         // limited result that dropped whole classes still reports `truncated == true`.
         let total_classes_built = built.len();
 
+        // Refine budget: the maximum number of classes to refine (re-read + re-parse + LCS).
+        // Shared between the limited and unlimited paths — the limited path clamps its effective
+        // returned count to this budget so `find_clones { limit: 100000 }` can't queue unbounded
+        // re-parse work while still returning all-refined classes. The unlimited path refines only
+        // the top-budget classes and returns all (with unrefined tail).
+        const UNLIMITED_REFINE_BUDGET: usize = 50;
+
         let classes: Vec<CandidateCloneClass> = if let Some(limit) = opts.limit {
-            // Limited result (Fix 2, Codex P2 #215 Plan 4a): truncate to the top-N by PROVISIONAL
-            // ROI BEFORE refining, refine exactly those N, then re-sort ONLY those N by final
-            // (refactorability) ROI. This guarantees every class in a limited result is either
-            // refined or best-effort-unrefined (`load_refine_members` returned None), all ranked on
-            // a consistent basis — no unrefined rank-(N+1) class can displace a refined one after
-            // re-sorting (the old refine-top-N-then-re-sort-ALL path could).
-            built.truncate(limit);
+            // Limited result: truncate to min(limit, UNLIMITED_REFINE_BUDGET) so a huge `limit`
+            // doesn't queue unbounded re-parse work. The all-refined-limited invariant (Fix 2
+            // round-1: every class in a limited result is refined, no unrefined rank-(N+1) class)
+            // is preserved because we clamp BEFORE refining — we refine at most
+            // UNLIMITED_REFINE_BUDGET classes and return exactly those. Callers wanting
+            // more than UNLIMITED_REFINE_BUDGET classes (with only the top refined)
+            // should use limit: None. DOCUMENTED BEHAVIOR: a limited query returns at
+            // most UNLIMITED_REFINE_BUDGET (50) classes, all refined; to retrieve more
+            // classes use limit: None.
+            let effective_limit = limit.min(UNLIMITED_REFINE_BUDGET);
+            built.truncate(effective_limit);
             for (class_ids, class) in built.iter_mut() {
                 self.refine_class_in_place(conn, class_ids, &by_id, class)?;
             }
@@ -339,7 +355,6 @@ impl IndexDatabase {
             // ALL classes. Classes beyond the budget keep their Plan-2 (un-refined) shape — the
             // inherent best-effort case for unlimited results. After refinement the FULL list is
             // re-sorted by ROI so a refined class that gained/lost rank lands in the right place.
-            const UNLIMITED_REFINE_BUDGET: usize = 50;
             for (idx, (class_ids, class)) in built.iter_mut().enumerate() {
                 if idx >= UNLIMITED_REFINE_BUDGET {
                     break;
@@ -753,15 +768,40 @@ impl IndexDatabase {
             Some(rows) => rows,
         };
 
+        // I3 (#215 Plan 4a adversary): cap the re-parse to the first LCS_MEMBER_SAMPLE members in
+        // canonical (struct_hash, symbol_id) order. `class_lcs_ratio` and `lcs_skeleton` only use
+        // the first LCS_MEMBER_SAMPLE members anyway (the member-count cap in align.rs), so
+        // parsing the tail is pure waste. Sorting here is O(n log n) over metadata rows — cheap
+        // compared to the file-I/O + tree-sitter parse that follows.
+        //
+        // NOTE for Plan 4b: anti-unification's per_member_values will need ALL members, not just
+        // the LCS sample — when 4b lands, load the full set (or lazily extend) for
+        // variation_points.
+        let mut rows = rows;
+        rows.sort_by(|a, b| {
+            a.struct_hash.cmp(&b.struct_hash).then_with(|| a.symbol_id.cmp(&b.symbol_id))
+        });
+        rows.truncate(LCS_MEMBER_SAMPLE);
+
+        // I3 (#215 Plan 4a adversary): dedup file reads by path. A class whose members cluster in a
+        // few large files would otherwise re-read each file once per member; instead cache each
+        // distinct file's bytes and reuse the cached text for every member in that file.
+        let mut file_cache: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         let mut members: Vec<crate::index::clones::refine::RefineMember> =
             Vec::with_capacity(rows.len());
         for row in rows {
-            let Ok(text) = std::fs::read_to_string(root.join(&row.path)) else {
-                // Source missing/unreadable on disk — can't reproduce the token sequence.
-                return Ok(None);
-            };
+            if !file_cache.contains_key(&row.path) {
+                let Ok(content) = std::fs::read_to_string(root.join(&row.path)) else {
+                    // Source missing/unreadable on disk — can't reproduce the token sequence.
+                    return Ok(None);
+                };
+                file_cache.insert(row.path.clone(), content);
+            }
+            let text = file_cache.get(&row.path).expect("just inserted above");
             let Some(parsed) =
-                crate::index::parser::parse_file(Path::new(&row.path), row.language, &text)
+                crate::index::parser::parse_file(Path::new(&row.path), row.language, text)
             else {
                 // Parse failure (or a no-grammar language like markdown) — no AST to descend.
                 return Ok(None);
@@ -771,7 +811,7 @@ impl IndexDatabase {
                 // No node spans the persisted byte range — the file drifted off-index.
                 return Ok(None);
             };
-            let seq = crate::index::clones::normalize::normalize_baseline(node, &text);
+            let seq = crate::index::clones::normalize::normalize_baseline(node, text);
 
             // Faithfulness pin: the re-parse must reproduce Plan-1's normalization exactly. A
             // mismatch means the on-disk file no longer matches the indexed fingerprint (the
@@ -1675,7 +1715,7 @@ mod tests {
         crate::IndexDatabase::rebuild(&config).unwrap();
         let db = crate::IndexDatabase::open_config(&config).unwrap();
 
-        // NaN must be rejected.
+        // NaN must be rejected (non-finite, caught by !v.is_finite()).
         let err = db
             .find_clones(FindClonesOptions {
                 min_similarity: Some(f64::NAN),
@@ -1684,11 +1724,11 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            err.to_string().contains("finite"),
-            "NaN should produce a 'finite' error message, got: {err}"
+            err.to_string().contains("[0.5, 1.0]"),
+            "NaN should produce a '[0.5, 1.0]' error message, got: {err}"
         );
 
-        // +infinity must be rejected.
+        // +infinity must be rejected (non-finite, caught by !v.is_finite()).
         let err = db
             .find_clones(FindClonesOptions {
                 min_similarity: Some(f64::INFINITY),
@@ -1697,11 +1737,11 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            err.to_string().contains("finite"),
-            "INFINITY should produce a 'finite' error message, got: {err}"
+            err.to_string().contains("[0.5, 1.0]"),
+            "INFINITY should produce a '[0.5, 1.0]' error message, got: {err}"
         );
 
-        // -infinity must be rejected (also non-finite).
+        // -infinity must be rejected (non-finite, caught by !v.is_finite()).
         let err = db
             .find_clones(FindClonesOptions {
                 min_similarity: Some(f64::NEG_INFINITY),
@@ -1710,11 +1750,11 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            err.to_string().contains("finite"),
-            "NEG_INFINITY should produce an error, got: {err}"
+            err.to_string().contains("[0.5, 1.0]"),
+            "NEG_INFINITY should produce a '[0.5, 1.0]' error message, got: {err}"
         );
 
-        // 0.0 still rejected (in-range check, kept from before).
+        // 0.0 still rejected (below the 0.5 floor).
         assert!(
             db.find_clones(FindClonesOptions {
                 min_similarity: Some(0.0),
