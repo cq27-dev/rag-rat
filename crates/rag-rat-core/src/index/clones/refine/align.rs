@@ -16,7 +16,6 @@
 //! mirroring Plan-2's min-not-average discipline.
 
 /// One step in an LCS alignment of two token sequences.
-#[allow(dead_code)] // wired by Plan-4a Task 4 / Plan-4b
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AlignOp {
     /// `a[i] == b[j]` — matched token, kept in both.
@@ -28,7 +27,6 @@ pub(crate) enum AlignOp {
 }
 
 /// The result of aligning two token sequences via LCS.
-#[allow(dead_code)] // wired by Plan-4b (anti-unify consumes ops)
 pub(crate) struct Alignment {
     /// Length of the longest common subsequence.
     pub(crate) lcs_len: usize,
@@ -39,7 +37,6 @@ pub(crate) struct Alignment {
 /// Classic LCS dynamic program with a deterministic backtrace.
 ///
 /// Tie-break: when `dp[i-1][j] == dp[i][j-1]`, prefer `DelA` (decrement `i`). See module doc.
-#[allow(dead_code)] // wired by Plan-4b
 pub(crate) fn lcs_align(a: &[String], b: &[String]) -> Alignment {
     let n = a.len();
     let m = b.len();

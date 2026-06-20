@@ -3,11 +3,13 @@
 //!
 //! Each step lives in a focused sibling file; this module curates the `pub(crate)` surface.
 
-#[allow(dead_code)] // wired by Plan-4a Task 4
 pub(crate) mod split;
 
-#[allow(dead_code)] // wired by Plan-4a Task 4 / Plan-4b
 pub(crate) mod align;
+
+pub(crate) mod cache;
+
+pub(crate) mod score;
 
 /// Input to the LCS-based variation-point analysis for one clone-class member (#215 Plan 4a Task
 /// 2).

@@ -15,6 +15,11 @@ use tree_sitter::Node;
 /// Bumped when normalization changes; invalidates fingerprints (and the later refine cache) without
 /// a schema migration.
 pub(crate) const NORM_VERSION: i64 = 1;
+/// Bumped when the LCS alignment / refinement algorithm changes; participates in the content-
+/// addressed `refinement_key` and in the `clone_refinements` cache freshness predicate, so a bump
+/// invalidates every cached refinement without a schema migration (the same discipline as
+/// [`NORM_VERSION`]).
+pub(crate) const ALIGNMENT_VERSION: i64 = 1;
 /// Smallest normalized-token count a symbol must reach to be fingerprinted (skip trivial getters).
 pub(crate) const MIN_TOKENS: usize = 20;
 

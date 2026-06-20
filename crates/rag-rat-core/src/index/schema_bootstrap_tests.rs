@@ -12682,8 +12682,11 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
     assert_eq!(res.classes.len(), 1, "exactly one clone class (the four rename-clones)");
     let c = &res.classes[0];
     assert_eq!(c.member_count, 4, "all four rename-clone functions are members");
-    assert_eq!(c.class_kind, "candidate_component");
-    assert!(!c.refined, "Plan-2 classes are never refined");
+    // Plan 4a: a clean class inside the refine budget is REFINED (it was the only class, so the
+    // top-N driver refined it). The class_kind flips to "refined_class" and `refined` is true.
+    assert_eq!(c.class_kind, "refined_class");
+    assert!(c.refined, "a clean class inside the refine budget is refined (Plan 4a)");
+    assert_eq!(c.refine_mode, Some("baseline"), "refined classes carry the baseline refine mode");
     assert!(
         c.similarity_min > 0.9,
         "rename-clones are near-identical; expected similarity_min > 0.9, got {}",
@@ -12929,18 +12932,24 @@ fn find_clones_truncated_reflects_class_limit() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// Fix 3 (#215): a TRANSITIVE-chain component (A–B and B–C both ≥ θ, but A–C < θ) stays visible
-/// as ONE clone class — the class-level `similarity_min < θ` filter that previously dropped it is
-/// gone. θ governs CANDIDATE GENERATION only (every EDGE is ≥ θ); a component's aggregate
-/// min-pairwise can legitimately dip below θ for a chain. This also makes `find_clones` and
-/// `clones_for_symbol` AGREE on chain components (the latter never had the filter).
+/// Plan 4 coherence-splits over-merged components; the A~B~C chain becomes coherent sub-classes.
+///
+/// A TRANSITIVE-chain component (A–B and B–C both ≥ θ, but A–C < θ) is over-merged by union-find
+/// into one 3-member component. Plan 4a's `coherence_split` breaks it: every returned class must be
+/// internally coherent (all pairs ≥ θ), so NO single class contains all three. For this fixture the
+/// greedy first-fit yields the coherent class {A,B} (C cannot join — C/A is below θ — and drops as
+/// a singleton). `find_clones` therefore returns at most a 2-member class, never the 3-member
+/// chain.
+///
+/// `clones_for_symbol` keeps a reverse-lookup fallback: a subject that splits to a singleton (C
+/// here) still gets served the FULL un-refined component, so a query ABOUT C is not empty.
 ///
 /// The fixture is empirically tuned and the test asserts the MEASURED edge similarities so it is
 /// honest about the chain it plants (a tokenizer change that shifts the numbers reddens here, not
 /// silently). At HEAD the measured edges are A/B≈0.74, B/C≈0.86, A/C≈0.67 — a genuine chain whose
 /// weakest (A/C) endpoint sits below the default θ=0.70.
 #[test]
-fn find_clones_keeps_transitive_chain_components() {
+fn coherence_split_applied_in_find_clones() {
     // The candidate metric is overlap/MAX_len, so the three members must be ~EQUAL length (a length
     // gap trips the size prune `min_len >= ceil(θ*max_len)` and kills the edges). Identifier names
     // alpha-rename to ID<n>, so only STRUCTURE drives the bag. Each member = a shared CORE of
@@ -13001,8 +13010,9 @@ fn find_clones_keeps_transitive_chain_components() {
         "A/C must be BELOW θ so the three only link transitively through B: measured {ac}"
     );
 
-    // Now the full three-member scope. At the default θ=0.70 the chain forms ONE class of all three
-    // members, with an aggregate min-pairwise (== A/C) below θ — proving the dropped class-filter.
+    // Now the full three-member scope. At the default θ=0.70 the over-merged union-find component
+    // {A,B,C} is coherence-SPLIT: no returned class contains all three, and every returned class is
+    // internally coherent (all pairs ≥ θ). For this fixture the only coherent ≥2 class is {A,B}.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -13014,38 +13024,305 @@ fn find_clones_keeps_transitive_chain_components() {
     let res = db
         .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
         .unwrap();
-    assert_eq!(
-        res.classes.len(),
-        1,
-        "the transitive chain is ONE clone class at default θ: {:?}",
+    // No class may contain all three members — that is the whole point of the coherence split.
+    assert!(
+        res.classes.iter().all(|c| c.member_count < 3),
+        "the over-merged chain must split — no class may keep all 3 members: {:?}",
         res.classes.iter().map(|c| c.member_count).collect::<Vec<_>>()
     );
-    let class = &res.classes[0];
-    assert_eq!(class.member_count, 3, "all three chain members are in the class");
-    assert!(
-        class.cohesion_min_pairwise < THETA,
-        "the chain's aggregate min-pairwise must be below θ (it is the A/C edge), proving the \
-         class-level similarity_min<θ filter is gone: got {}",
-        class.cohesion_min_pairwise
-    );
-    // cohesion_min_pairwise == similarity_min == the measured A/C edge.
-    assert!(
-        (class.cohesion_min_pairwise - ac).abs() < 1e-9,
-        "the class min-pairwise must equal the measured A/C edge: class={} ac={ac}",
-        class.cohesion_min_pairwise
+    // Every returned class must be internally coherent (its aggregate min-pairwise ≥ θ).
+    for class in &res.classes {
+        assert!(
+            class.cohesion_min_pairwise >= THETA - 1e-9,
+            "a coherence-split class must be internally ≥ θ: got {}",
+            class.cohesion_min_pairwise
+        );
+    }
+    // The chain yields the coherent class {A,B} (C drops as a singleton: C/A < θ).
+    assert_eq!(res.classes.len(), 1, "the chain yields exactly one coherent ≥2 class ({{A,B}})");
+    assert_eq!(res.classes[0].member_count, 2, "the coherent class is the {{A,B}} pair");
+
+    // clones_for_symbol(A): A is in the coherent {A,B} sub-class → that 2-member class (refined).
+    let by_a = db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::fa".into())).unwrap();
+    let a_class = by_a.class.as_ref().expect("fa is in the coherent {A,B} sub-class");
+    assert_eq!(a_class.member_count, 2, "clones_for_symbol(fa) returns A's coherent sub-class");
+    assert_eq!(
+        a_class.class_key, res.classes[0].class_key,
+        "find_clones and clones_for_symbol must return the SAME coherent sub-class for A"
     );
 
-    // CONSISTENCY: clones_for_symbol(A) must return the SAME 3-member chain class — the two
-    // surfaces now agree (clones_for_symbol never had the class-filter that find_clones dropped).
-    let by_ref = db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::fa".into())).unwrap();
-    let cfs_class = by_ref.class.as_ref().expect("fa is in the chain class");
-    assert_eq!(cfs_class.member_count, 3, "clones_for_symbol(fa) returns the full 3-member chain");
+    // clones_for_symbol(C): C split to a singleton → the reverse-lookup fallback serves the FULL
+    // un-refined component (all 3 members, refined=false) so a query ABOUT C is not empty.
+    let by_c = db.clones_for_symbol(CloneSymbolSelector::Ref("src/c.rs::fc".into())).unwrap();
+    let c_class = by_c.class.as_ref().expect("fc falls back to the full un-refined component");
     assert_eq!(
-        cfs_class.class_key, class.class_key,
-        "find_clones and clones_for_symbol must return the SAME class for the chain"
+        c_class.member_count, 3,
+        "clones_for_symbol(fc) falls back to the 3-member component"
+    );
+    assert!(!c_class.refined, "the singleton-subject fallback class is un-refined");
+    assert!(
+        (c_class.cohesion_min_pairwise - ac).abs() < 1e-9,
+        "the fallback component's min-pairwise must equal the measured A/C edge: class={} ac={ac}",
+        c_class.cohesion_min_pairwise
     );
 
     fs::remove_dir_all(root).unwrap();
+}
+
+/// Helper: write four renamed clones (identical structure, different identifiers) across two
+/// directories into `root`, returning the rebuilt index. The four functions form ONE clean,
+/// high-fidelity clone class — the canonical refine fixture.
+fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    for (dir, name, var) in [
+        ("a", "load_user", "u"),
+        ("a", "load_order", "o"),
+        ("b", "load_item", "i"),
+        ("b", "load_blob", "x"),
+    ] {
+        fs::write(
+            root.join(dir).join(format!("{name}.rs")),
+            format!(
+                "pub fn {name}(db: Db) -> i32 {{ let {var} = db.get(1); validate({var}); {var} + \
+                 1 }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("a"), PathBuf::from("b")],
+            include: vec!["a/".to_string(), "b/".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+        version_check: Default::default(),
+        oracle: Default::default(),
+    };
+    IndexDatabase::rebuild(&config).unwrap()
+}
+
+/// Plan 4a: four renamed clones (same structure, different names) form ONE class that the refine
+/// driver promotes to a refined class — `refined`, `class_kind == "refined_class"`, a near-perfect
+/// `lcs_ratio`, `confidence == "high"`, `refactorability > 0.9`, `refine_mode == Some("baseline")`,
+/// and a positive ROI (the refactorability multiplier replaces the cohesion one).
+#[test]
+fn find_clones_refines_a_clean_class() {
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(res.classes.len(), 1, "the four renamed clones are one class");
+    let c = &res.classes[0];
+
+    assert!(c.refined, "a clean class inside the refine budget must be refined");
+    assert_eq!(c.class_kind, "refined_class");
+    assert_eq!(c.refine_mode, Some("baseline"));
+    let lcs = c.lcs_ratio.expect("a refined class carries an lcs_ratio");
+    assert!(lcs > 0.95, "renamed clones are near-identical; lcs_ratio should be ~1.0, got {lcs}");
+    assert_eq!(c.confidence.as_deref(), Some("high"), "near-perfect fidelity → high confidence");
+    let refac = c.refactorability.expect("a refined class carries a refactorability");
+    assert!(refac > 0.9, "refactorability should be high for a clean class, got {refac}");
+    // ROI reflects refactorability: cross_module_spread × member_count × medoid × LBF × refac.
+    let expected_roi = c.cross_module_spread as f64
+        * c.member_count as f64
+        * c.body_token_len_medoid as f64
+        * c.roi_factors.load_bearing_factor
+        * refac;
+    assert!(
+        (c.roi - expected_roi).abs() < 1e-6,
+        "refined ROI must use refactorability: roi={} expected={expected_roi}",
+        c.roi
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4a: `clones_for_symbol` always refines the subject's class (when refine inputs are
+/// available). A reverse lookup into the clean 4-member class returns a REFINED class with the
+/// subject present.
+#[test]
+fn clones_for_symbol_returns_refined_class() {
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+
+    let res =
+        db.clones_for_symbol(CloneSymbolSelector::Ref("a/load_user.rs::load_user".into())).unwrap();
+    let class = res.class.as_ref().expect("load_user is in the clone class");
+    assert!(class.refined, "clones_for_symbol refines the subject's class");
+    assert_eq!(class.class_kind, "refined_class");
+    assert_eq!(class.refine_mode, Some("baseline"));
+    assert!(class.lcs_ratio.is_some(), "a refined class carries an lcs_ratio");
+    assert!(
+        class.members.iter().any(|m| m.r#ref.ends_with("load_user.rs::load_user")),
+        "the subject must appear in its own refined class: {:?}",
+        class.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4a: the content-addressed `refinement_key` is over the struct_hash MULTISET (order-
+/// independent), and is DISTINCT from the read-side `class_key` (location-derived). Same multiset →
+/// same key; the two key families never collide for the same class.
+#[test]
+fn refinement_key_is_content_addressed_and_distinct_from_read_key() {
+    use crate::index::clones::refine::cache::refinement_key;
+
+    let hashes = vec!["h1".to_string(), "h2".to_string(), "h3".to_string()];
+    let shuffled = vec!["h3".to_string(), "h1".to_string(), "h2".to_string()];
+    // Same multiset, different order → same refinement_key (content-addressed).
+    assert_eq!(
+        refinement_key("rust", &hashes),
+        refinement_key("rust", &shuffled),
+        "the same struct_hash multiset must address the same refinement"
+    );
+
+    // The refinement key (structural) is NOT the read-side class_key (location-derived). Build a
+    // real clone class, then confirm its persisted refinement key ≠ its read-side class_key.
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    let read_key = &res.classes[0].class_key;
+    // The persisted refinement row's PRIMARY KEY is the content-addressed key; it must not equal
+    // the location-derived read-side class_key.
+    let refinement_pk: String = db
+        .storage
+        .connection()
+        .query_row("SELECT class_key FROM clone_refinements LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert_ne!(
+        &refinement_pk, read_key,
+        "the content-addressed refinement key must differ from the location-derived read key"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4a: the refinement cache is read-through — the first `find_clones` populates a
+/// `clone_refinements` row; a second `find_clones` over the same index serves the cache and does
+/// NOT grow the row count.
+#[test]
+fn refine_cache_is_read_through() {
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+
+    let count_rows = |db: &IndexDatabase| -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    // Before any find_clones run the cache is empty.
+    assert_eq!(count_rows(&db), 0, "no refinements before the first run");
+
+    // Run 1: refines the clean class → exactly one cache row.
+    let r1 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(r1.classes[0].refined, "run 1 refines the class");
+    let after_run1 = count_rows(&db);
+    assert_eq!(after_run1, 1, "run 1 persists exactly one refinement row");
+
+    // Run 2: same inputs → cache HIT, row count unchanged.
+    let r2 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(r2.classes[0].refined, "run 2 still refined (served from cache)");
+    assert_eq!(count_rows(&db), after_run1, "run 2 is a cache hit — the row count must not grow");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4a: only the top-N (by provisional ROI) classes are refined, where N == the caller's limit.
+/// With TWO distinct clean classes and `limit = 1`, exactly ONE class is refined: the returned
+/// (top-1) class is refined, and only ONE `clone_refinements` row is written — the second class is
+/// outside the refine budget and never reaches refinement, keeping its Plan-2 (un-refined) shape.
+/// (Because the output is truncated to the limit, the un-refined class is not in the returned set;
+/// the persisted-row count is the observable proof that only the top-N were refined.)
+#[test]
+fn unrefined_class_outside_top_n_keeps_plan2_shape() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Class 1: two big-body renamed clones (high ROI via long body) — refined first.
+    let big = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(db: Db) -> i32 {{ let {v}1 = db.get(1); let {v}2 = db.get(2); let {v}3 \
+             = db.get(3); validate({v}1); validate({v}2); validate({v}3); {v}1 + {v}2 + {v}3 }}\n"
+        )
+    };
+    fs::write(root.join("src/big_a.rs"), big("big_user", "u")).unwrap();
+    fs::write(root.join("src/big_b.rs"), big("big_order", "o")).unwrap();
+    // Class 2: two small-body renamed clones (lower ROI via short body) — structurally distinct
+    // from class 1 so they form a SEPARATE class, ranked below it.
+    let small = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(xs: Vec<u8>) -> usize {{ let mut {v} = 0; for e in xs {{ {v} += e as \
+             usize; }} {v} }}\n"
+        )
+    };
+    fs::write(root.join("src/small_a.rs"), small("sum_bytes", "n")).unwrap();
+    fs::write(root.join("src/small_b.rs"), small("sum_words", "m")).unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let count_rows = |db: &IndexDatabase| -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    // Sanity: with no limit BOTH classes exist (the default budget 50 refines both).
+    let all = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(all.classes.len(), 2, "two distinct clean classes are planted");
+    assert!(all.classes.iter().all(|c| c.refined), "default budget refines both");
+    assert_eq!(count_rows(&db), 2, "default budget persists both refinements");
+
+    // Fresh index so the cache starts empty for the budget assertion.
+    let root2 = unique_temp_root();
+    let _ = fs::remove_dir_all(&root2);
+    fs::create_dir_all(root2.join("src")).unwrap();
+    fs::write(root2.join("src/big_a.rs"), big("big_user", "u")).unwrap();
+    fs::write(root2.join("src/big_b.rs"), big("big_order", "o")).unwrap();
+    fs::write(root2.join("src/small_a.rs"), small("sum_bytes", "n")).unwrap();
+    fs::write(root2.join("src/small_b.rs"), small("sum_words", "m")).unwrap();
+    let db2 = IndexDatabase::rebuild(&source_config(root2.clone(), Language::Rust)).unwrap();
+
+    // limit=1 ⇒ refine budget 1 ⇒ only the top-1 class is refined.
+    let limited = db2
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: Some(1) })
+        .unwrap();
+    assert_eq!(limited.classes.len(), 1, "limit=1 returns exactly one class");
+    let top = &limited.classes[0];
+    assert!(top.refined, "the single returned (top-1) class is refined");
+    assert!(top.lcs_ratio.is_some(), "the refined class carries an lcs_ratio");
+    assert_eq!(top.refine_mode, Some("baseline"));
+    // Only ONE refinement was computed/persisted: the second class is outside the budget and keeps
+    // its un-refined Plan-2 shape (it never reached `refine_class`).
+    assert_eq!(
+        count_rows(&db2),
+        1,
+        "limit=1 refines only the top-1 class — the out-of-budget class is never refined"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(root2).unwrap();
 }
 
 /// Fix 3 (#215): `clones_for_symbol` carries eligibility flags. A below-`MIN_TOKENS` function
