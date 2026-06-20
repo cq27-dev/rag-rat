@@ -798,15 +798,37 @@ pub struct ClonesForSymbolArgs {
 impl ClonesForSymbolArgs {
     pub(super) fn into_selector(self) -> anyhow::Result<rag_rat_core::index::CloneSymbolSelector> {
         use rag_rat_core::index::CloneSymbolSelector;
+
+        // Enforce EXACTLY ONE selector form: `id`, `ref`, or `path`+`line` (a path and a line
+        // together count as a SINGLE form). Counting populated forms — not first-wins precedence —
+        // is what makes a conflicting `{id, ref}` (or `{id, path, line}`, …) an error instead of a
+        // silently-resolved ambiguity.
+        let has_id = self.logical_symbol_id.is_some();
+        let has_ref = self.symbol_ref.is_some();
+        let has_path_line = match (&self.path, &self.line) {
+            (Some(_), Some(_)) => true,
+            (Some(_), None) => anyhow::bail!("clones_for_symbol: `path` requires `line`"),
+            (None, Some(_)) => anyhow::bail!("clones_for_symbol: `line` requires `path`"),
+            (None, None) => false,
+        };
+
+        let forms = usize::from(has_id) + usize::from(has_ref) + usize::from(has_path_line);
+        if forms != 1 {
+            anyhow::bail!(
+                "clones_for_symbol: provide exactly one of `id`, `ref`, or `path`+`line`"
+            );
+        }
+
         if let Some(id) = self.logical_symbol_id {
             return Ok(CloneSymbolSelector::Id(rag_rat_core::serde_big_id::format_sym_handle(id)));
         }
         if let Some(r) = self.symbol_ref {
             return Ok(CloneSymbolSelector::Ref(r));
         }
+        // The exactly-one count guarantees path+line are both present here.
         match (self.path, self.line) {
             (Some(path), Some(line)) => Ok(CloneSymbolSelector::PathLine { path, line }),
-            _ => anyhow::bail!("clones_for_symbol requires exactly one of: id, ref, or path+line"),
+            _ => unreachable!("forms == 1 with neither id nor ref implies path+line"),
         }
     }
 }
@@ -832,5 +854,78 @@ impl From<MemoryBindArgs> for RepoMemoryBindTarget {
             edge_path: args.edge_path,
             dir: args.dir,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rag_rat_core::index::CloneSymbolSelector;
+
+    use super::ClonesForSymbolArgs;
+
+    fn args(
+        id: Option<i64>,
+        symbol_ref: Option<&str>,
+        path: Option<&str>,
+        line: Option<i64>,
+    ) -> ClonesForSymbolArgs {
+        ClonesForSymbolArgs {
+            logical_symbol_id: id,
+            symbol_ref: symbol_ref.map(str::to_string),
+            path: path.map(str::to_string),
+            line,
+        }
+    }
+
+    #[test]
+    fn into_selector_accepts_exactly_one_form() {
+        // id alone.
+        assert!(matches!(
+            args(Some(7), None, None, None).into_selector().unwrap(),
+            CloneSymbolSelector::Id(_)
+        ));
+        // ref alone.
+        assert!(matches!(
+            args(None, Some("src/a.rs::f"), None, None).into_selector().unwrap(),
+            CloneSymbolSelector::Ref(_)
+        ));
+        // path+line together (one form).
+        assert!(matches!(
+            args(None, None, Some("src/a.rs"), Some(1)).into_selector().unwrap(),
+            CloneSymbolSelector::PathLine { .. }
+        ));
+    }
+
+    #[test]
+    fn into_selector_rejects_conflicting_id_and_ref() {
+        let err = args(Some(7), Some("src/a.rs::f"), None, None).into_selector().unwrap_err();
+        assert!(
+            err.to_string().contains("exactly one"),
+            "both id and ref must be rejected as conflicting selectors: {err}"
+        );
+    }
+
+    #[test]
+    fn into_selector_rejects_conflicting_id_and_path_line() {
+        let err = args(Some(7), None, Some("src/a.rs"), Some(1)).into_selector().unwrap_err();
+        assert!(err.to_string().contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn into_selector_rejects_none() {
+        let err = args(None, None, None, None).into_selector().unwrap_err();
+        assert!(err.to_string().contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn into_selector_rejects_path_without_line() {
+        let err = args(None, None, Some("src/a.rs"), None).into_selector().unwrap_err();
+        assert!(err.to_string().contains("`path` requires `line`"), "{err}");
+    }
+
+    #[test]
+    fn into_selector_rejects_line_without_path() {
+        let err = args(None, None, None, Some(1)).into_selector().unwrap_err();
+        assert!(err.to_string().contains("`line` requires `path`"), "{err}");
     }
 }

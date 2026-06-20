@@ -12825,6 +12825,56 @@ fn find_clones_min_similarity_below_theta_widens_and_is_reported() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// `min_similarity` is a similarity ratio θ = overlap/max_len and must lie in (0.0, 1.0]. Values
+/// outside that range are rejected up front (before candidate generation) so a unit error (e.g. a
+/// percentage like 1.5) or a degenerate 0.0 floor can't silently admit every pair.
+#[test]
+fn find_clones_rejects_out_of_range_min_similarity() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // A single clone pair so the index isn't empty; the range check fires regardless of contents.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // 0.0 (boundary, exclusive lower) → error.
+    let zero = db.find_clones(FindClonesOptions {
+        min_similarity: Some(0.0),
+        min_copies: None,
+        limit: None,
+    });
+    let err = zero.expect_err("min_similarity = 0.0 must be rejected").to_string();
+    assert!(err.contains("min_similarity must be in (0.0, 1.0]"), "{err}");
+
+    // 1.5 (above 1.0) → error.
+    let high = db.find_clones(FindClonesOptions {
+        min_similarity: Some(1.5),
+        min_copies: None,
+        limit: None,
+    });
+    let err = high.expect_err("min_similarity = 1.5 must be rejected").to_string();
+    assert!(err.contains("min_similarity must be in (0.0, 1.0]"), "{err}");
+
+    // 1.0 (boundary, inclusive upper) → accepted.
+    db.find_clones(FindClonesOptions { min_similarity: Some(1.0), min_copies: None, limit: None })
+        .expect("min_similarity = 1.0 is the inclusive upper bound and must be accepted");
+
+    // 0.5 (interior) → accepted.
+    db.find_clones(FindClonesOptions { min_similarity: Some(0.5), min_copies: None, limit: None })
+        .expect("min_similarity = 0.5 is in range and must be accepted");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Fix 2 (#215): `completeness.truncated` reflects whole CLASSES dropped by `limit`, not only
 /// members capped within a class. Plant two distinct clone classes, ask for `limit=1`, and assert
 /// the dropped second class flips `truncated`.
@@ -12874,6 +12924,125 @@ fn find_clones_truncated_reflects_class_limit() {
     assert!(
         limited.completeness.truncated,
         "dropping a whole class via the limit must set completeness.truncated"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 3 (#215): a TRANSITIVE-chain component (A–B and B–C both ≥ θ, but A–C < θ) stays visible
+/// as ONE clone class — the class-level `similarity_min < θ` filter that previously dropped it is
+/// gone. θ governs CANDIDATE GENERATION only (every EDGE is ≥ θ); a component's aggregate
+/// min-pairwise can legitimately dip below θ for a chain. This also makes `find_clones` and
+/// `clones_for_symbol` AGREE on chain components (the latter never had the filter).
+///
+/// The fixture is empirically tuned and the test asserts the MEASURED edge similarities so it is
+/// honest about the chain it plants (a tokenizer change that shifts the numbers reddens here, not
+/// silently). At HEAD the measured edges are A/B≈0.74, B/C≈0.86, A/C≈0.67 — a genuine chain whose
+/// weakest (A/C) endpoint sits below the default θ=0.70.
+#[test]
+fn find_clones_keeps_transitive_chain_components() {
+    // The candidate metric is overlap/MAX_len, so the three members must be ~EQUAL length (a length
+    // gap trips the size prune `min_len >= ceil(θ*max_len)` and kills the edges). Identifier names
+    // alpha-rename to ID<n>, so only STRUCTURE drives the bag. Each member = a shared CORE of
+    // let-bindings + TWO distinct structural slots built from DIFFERENT constructs (their tokens
+    // don't overlap): A shares slot S1 with B; B shares slot S2 with C; A and C share neither, so
+    // A/B and B/C clear θ while A/C falls below it.
+    let core = "let c1 = ca(x); let c2 = cb(c1); let c3 = cc(c2);";
+    let s1 = "if x > 0 { acc = p1(x); } else { acc = p2(x); } if acc > 1 { acc = p3(acc); } else \
+              { acc = p4(acc); }";
+    let s2 = "for it in xs { match it { 0 => acc += q1(it), 1 => acc += q2(it), _ => acc -= \
+              q3(it) } } for jt in ys { match jt { 0 => acc += q4(jt), _ => acc -= q5(jt) } }";
+    let sx = "while acc > 0 { acc = r1(acc); acc = r2(acc); acc = r3(acc); } while acc < 9 { acc \
+              = r4(acc); acc = r5(acc); }";
+    let sy = "loop { acc = s1f(acc); acc = s2f(acc); acc = s3f(acc); if acc == 0 { break; } } \
+              loop { acc = s4f(acc); if acc < 0 { break; } }";
+    // A = CORE + S1 + SX ; B = CORE + S1 + S2 ; C = CORE + S2 + SY.
+    let a = format!("pub fn fa(x: i32) -> i32 {{ {core} {s1} {sx} 0 }}\n");
+    let b = format!("pub fn fb(x: i32) -> i32 {{ {core} {s1} {s2} 0 }}\n");
+    let c = format!("pub fn fc(x: i32) -> i32 {{ {core} {s2} {sy} 0 }}\n");
+    let (a, b, c) = (a.as_str(), b.as_str(), c.as_str());
+
+    const THETA: f64 = 0.7;
+
+    // Measure each pairwise edge by rebuilding a two-file subset (so the only clone class is that
+    // single pair, whose `similarity_min` IS the edge similarity). This makes the chain claim a
+    // measured fact, not an assumption.
+    let edge_sim = |src1: (&str, &str), src2: (&str, &str)| -> f64 {
+        let r = unique_temp_root();
+        let _ = fs::remove_dir_all(&r);
+        fs::create_dir_all(r.join("src")).unwrap();
+        fs::write(r.join(format!("src/{}.rs", src1.0)), src1.1).unwrap();
+        fs::write(r.join(format!("src/{}.rs", src2.0)), src2.1).unwrap();
+        let d = IndexDatabase::rebuild(&source_config(r.clone(), Language::Rust)).unwrap();
+        // θ=0.30 so even a sub-θ edge surfaces; the class's similarity_min is the pair's
+        // similarity.
+        let res = d
+            .find_clones(FindClonesOptions {
+                min_similarity: Some(0.30),
+                min_copies: None,
+                limit: None,
+            })
+            .unwrap();
+        let sim = res
+            .classes
+            .first()
+            .unwrap_or_else(|| panic!("the {}/{} pair must form a class at θ=0.30", src1.0, src2.0))
+            .similarity_min;
+        fs::remove_dir_all(r).unwrap();
+        sim
+    };
+    let ab = edge_sim(("a", a), ("b", b));
+    let bc = edge_sim(("b", b), ("c", c));
+    let ac = edge_sim(("a", a), ("c", c));
+    assert!(ab >= THETA, "A/B must be a real (≥θ) edge: measured {ab}");
+    assert!(bc >= THETA, "B/C must be a real (≥θ) edge: measured {bc}");
+    assert!(
+        ac < THETA,
+        "A/C must be BELOW θ so the three only link transitively through B: measured {ac}"
+    );
+
+    // Now the full three-member scope. At the default θ=0.70 the chain forms ONE class of all three
+    // members, with an aggregate min-pairwise (== A/C) below θ — proving the dropped class-filter.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), a).unwrap();
+    fs::write(root.join("src/b.rs"), b).unwrap();
+    fs::write(root.join("src/c.rs"), c).unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        res.classes.len(),
+        1,
+        "the transitive chain is ONE clone class at default θ: {:?}",
+        res.classes.iter().map(|c| c.member_count).collect::<Vec<_>>()
+    );
+    let class = &res.classes[0];
+    assert_eq!(class.member_count, 3, "all three chain members are in the class");
+    assert!(
+        class.cohesion_min_pairwise < THETA,
+        "the chain's aggregate min-pairwise must be below θ (it is the A/C edge), proving the \
+         class-level similarity_min<θ filter is gone: got {}",
+        class.cohesion_min_pairwise
+    );
+    // cohesion_min_pairwise == similarity_min == the measured A/C edge.
+    assert!(
+        (class.cohesion_min_pairwise - ac).abs() < 1e-9,
+        "the class min-pairwise must equal the measured A/C edge: class={} ac={ac}",
+        class.cohesion_min_pairwise
+    );
+
+    // CONSISTENCY: clones_for_symbol(A) must return the SAME 3-member chain class — the two
+    // surfaces now agree (clones_for_symbol never had the class-filter that find_clones dropped).
+    let by_ref = db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::fa".into())).unwrap();
+    let cfs_class = by_ref.class.as_ref().expect("fa is in the chain class");
+    assert_eq!(cfs_class.member_count, 3, "clones_for_symbol(fa) returns the full 3-member chain");
+    assert_eq!(
+        cfs_class.class_key, class.class_key,
+        "find_clones and clones_for_symbol must return the SAME class for the chain"
     );
 
     fs::remove_dir_all(root).unwrap();

@@ -176,6 +176,16 @@ impl IndexDatabase {
     /// splitting and anti-unification).
     pub fn find_clones(&self, opts: FindClonesOptions) -> anyhow::Result<FindClonesResult> {
         let conn = self.storage.connection();
+
+        // Validate the caller-supplied θ BEFORE it touches candidate generation. θ is a similarity
+        // ratio (overlap/max_len) so it must lie in (0.0, 1.0]: ≤ 0.0 would admit every pair (and a
+        // 0.0 sub-block prefix walks the whole bag), > 1.0 is unreachable and signals a unit error.
+        if let Some(v) = opts.min_similarity
+            && (v <= 0.0 || v > 1.0)
+        {
+            anyhow::bail!("min_similarity must be in (0.0, 1.0]");
+        }
+
         let bags = load_scoped_baseline_bags(conn)?;
         let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
 
@@ -195,14 +205,16 @@ impl IndexDatabase {
             if component.len() < min_copies {
                 continue;
             }
+            // No class-level `similarity_min < theta` filter: θ governs CANDIDATE GENERATION only
+            // (every EDGE in the component is ≥ θ via `candidate_pairs_from_bags`). A component's
+            // aggregate min-pairwise can dip below θ for a TRANSITIVE chain (A–B and B–C both ≥ θ,
+            // but A–C < θ), and that component is legitimately one clone class — it stays visible,
+            // gets ROI-penalized through the cohesion multiplier, and surfaces its low cohesion in
+            // `cohesion_min_pairwise`. Dropping it here also diverged from `clones_for_symbol`,
+            // which never applied this filter, so the two surfaces now agree on chain components.
             match build_class(component, &by_id, conn)? {
                 None => continue,
-                Some(class) => {
-                    if class.similarity_min < theta {
-                        continue;
-                    }
-                    classes.push(class);
-                },
+                Some(class) => classes.push(class),
             }
         }
 
