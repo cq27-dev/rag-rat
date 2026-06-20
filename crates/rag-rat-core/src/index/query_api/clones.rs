@@ -82,6 +82,23 @@ pub struct CloneCompleteness {
                                         * fingerprinted" */
 }
 
+/// Result of [`IndexDatabase::clones_for_symbol`]. Carries eligibility flags + a completeness block
+/// so a caller can distinguish "selector matched nothing" from "matched a symbol that is not
+/// eligible for fingerprinting" from "eligible but unique (in no clone class)".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClonesForSymbolResult {
+    /// The containing candidate clone class, or `None` when the symbol is in no class (unique, not
+    /// eligible, or unresolved).
+    pub class: Option<CandidateCloneClass>,
+    /// The selector matched a scoped symbol.
+    pub symbol_resolved: bool,
+    /// That symbol has a current-version baseline fingerprint loaded into the candidate set
+    /// (eligible: a `kind="function"` symbol ≥ `MIN_TOKENS` in a non-generated, in-scope file).
+    pub symbol_fingerprinted: bool,
+    /// Same provenance block as [`FindClonesResult::completeness`].
+    pub completeness: CloneCompleteness,
+}
+
 /// Deterministic, order-independent class key: sort `member_refs`, join with `\n`,
 /// `hex_sha256`, take the first 16 hex chars.
 pub(crate) fn class_key_for(member_refs: &[String]) -> String {
@@ -161,11 +178,16 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         let bags = load_scoped_baseline_bags(conn)?;
         let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
-        let pairs = candidate_pairs_from_bags(&bags);
+
+        // θ defaults to the const [`THETA`]; a caller-supplied `min_similarity` is honored ALL the
+        // way through candidate generation (not merely post-filtered) so a θ below [`THETA`]
+        // actually widens the candidate set instead of being clamped by the const-θ sub-block /
+        // verify, and a θ above [`THETA`] narrows it.
+        let theta = opts.min_similarity.unwrap_or(THETA);
+        let pairs = candidate_pairs_from_bags(&bags, theta);
         let components = components_from_pairs(&pairs);
 
         let min_copies = opts.min_copies.unwrap_or(2);
-        let min_sim = opts.min_similarity.unwrap_or(THETA);
 
         let mut classes: Vec<CandidateCloneClass> = Vec::new();
 
@@ -176,7 +198,7 @@ impl IndexDatabase {
             match build_class(component, &by_id, conn)? {
                 None => continue,
                 Some(class) => {
-                    if class.similarity_min < min_sim {
+                    if class.similarity_min < theta {
                         continue;
                     }
                     classes.push(class);
@@ -187,35 +209,55 @@ impl IndexDatabase {
         // Sort by ROI descending (stable for determinism within ties).
         classes.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
 
+        // Capture the post-filter class count BEFORE the limit truncation so `truncated` can
+        // report classes dropped by the limit (Fix 2), not just members capped within a class.
+        let classes_after_filter = classes.len();
+
         if let Some(limit) = opts.limit {
             classes.truncate(limit);
         }
 
-        let truncated = classes.iter().any(|c| c.members_returned < c.total_members);
+        // `truncated` is true if ANY returned class capped its member list (members_returned <
+        // total_members) OR the class-limit dropped whole classes (classes_after_filter >
+        // returned).
+        let truncated = classes.iter().any(|c| c.members_returned < c.total_members)
+            || classes_after_filter > classes.len();
 
         let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
 
-        let completeness = CloneCompleteness {
-            normalizer_kind: "baseline",
-            normalizer_version: NORM_VERSION,
-            min_similarity: min_sim,
-            min_tokens: crate::index::clones::MIN_TOKENS as i64,
-            min_copies,
-            candidate_metric: "overlap_max_denominator",
-            containment_metric: "overlap_min_denominator",
-            generated_excluded: true,
-            tests_excluded: false,
-            same_file_policy: "included",
-            index_freshness: freshness,
-            oracle_coverage: "n/a_baseline_only",
-            truncated,
-            known_index_gaps: vec![
-                "#232: TS function-valued declarators not yet fingerprinted".into(),
-                "#232: comments/multi-language literals not yet normalized".into(),
-            ],
-        };
+        let completeness = build_completeness(theta, min_copies, truncated, freshness);
 
         Ok(FindClonesResult { classes, completeness })
+    }
+}
+
+/// Build the [`CloneCompleteness`] provenance block shared by `find_clones` and
+/// `clones_for_symbol`. Only `min_similarity` (θ), `min_copies`, `truncated`, and the index
+/// freshness summary vary per call; the rest are fixed Plan-2 policy constants.
+fn build_completeness(
+    min_similarity: f64,
+    min_copies: usize,
+    truncated: bool,
+    freshness: String,
+) -> CloneCompleteness {
+    CloneCompleteness {
+        normalizer_kind: "baseline",
+        normalizer_version: NORM_VERSION,
+        min_similarity,
+        min_tokens: crate::index::clones::MIN_TOKENS as i64,
+        min_copies,
+        candidate_metric: "overlap_max_denominator",
+        containment_metric: "overlap_min_denominator",
+        generated_excluded: true,
+        tests_excluded: false,
+        same_file_policy: "included",
+        index_freshness: freshness,
+        oracle_coverage: "n/a_baseline_only",
+        truncated,
+        known_index_gaps: vec![
+            "#232: TS function-valued declarators not yet fingerprinted".into(),
+            "#232: comments/multi-language literals not yet normalized".into(),
+        ],
     }
 }
 
@@ -233,8 +275,15 @@ pub enum CloneSymbolSelector {
 }
 
 impl IndexDatabase {
-    /// Return the candidate clone class that contains the symbol identified by `selector`, or
-    /// `None` if the symbol is not in any class (unique, or not fingerprinted).
+    /// Return a [`ClonesForSymbolResult`] for the symbol identified by `selector`: the containing
+    /// candidate clone class (or `None` if the symbol is unique, not eligible, or unresolved),
+    /// plus eligibility flags and the same completeness block as [`Self::find_clones`].
+    ///
+    /// `symbol_resolved` reports whether the selector matched a scoped symbol;
+    /// `symbol_fingerprinted` reports whether that symbol has a current-version baseline
+    /// fingerprint loaded into the candidate set (eligible). A symbol can resolve but not be
+    /// fingerprinted (generated file, below `MIN_TOKENS`, or a non-function symbol) — `class`
+    /// is then `None`.
     ///
     /// Resolution per selector form (all scoped through the active `files` view):
     /// - `Id`: parse the `sym_<hex>` handle → logical-symbol members → first member in a bag.
@@ -243,30 +292,49 @@ impl IndexDatabase {
     pub fn clones_for_symbol(
         &self,
         selector: CloneSymbolSelector,
-    ) -> anyhow::Result<Option<CandidateCloneClass>> {
+    ) -> anyhow::Result<ClonesForSymbolResult> {
         let conn = self.storage.connection();
+
+        let make_result = |class: Option<CandidateCloneClass>,
+                           symbol_resolved: bool,
+                           symbol_fingerprinted: bool,
+                           freshness: String| {
+            // A single class can only truncate by capping its own member list; there is no
+            // class-limit here, so reuse the same member-cap signal as `find_clones`.
+            let truncated = class.as_ref().is_some_and(|c| c.members_returned < c.total_members);
+            ClonesForSymbolResult {
+                class,
+                symbol_resolved,
+                symbol_fingerprinted,
+                completeness: build_completeness(THETA, 2, truncated, freshness),
+            }
+        };
+
+        let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
 
         let resolved_id = resolve_selector_to_symbol_id(conn, &selector)?;
         let Some(symbol_id) = resolved_id else {
-            return Ok(None);
+            return Ok(make_result(None, false, false, freshness));
         };
 
         let bags = load_scoped_baseline_bags(conn)?;
-        // If the resolved symbol has no fingerprint row it can't be in any clone class.
+        // If the resolved symbol has no fingerprint row it is not eligible — it can't be in any
+        // clone class (generated file, below MIN_TOKENS, or a non-function symbol).
         if !bags.iter().any(|b| b.symbol_id == symbol_id) {
-            return Ok(None);
+            return Ok(make_result(None, true, false, freshness));
         }
 
         let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
-        let pairs = candidate_pairs_from_bags(&bags);
+        let pairs = candidate_pairs_from_bags(&bags, THETA);
         let components = components_from_pairs(&pairs);
 
         // Find the component that contains this symbol_id.
         let Some(component) = components.into_iter().find(|comp| comp.contains(&symbol_id)) else {
-            return Ok(None);
+            return Ok(make_result(None, true, true, freshness));
         };
 
-        build_class(&component, &by_id, conn)
+        let class = build_class(&component, &by_id, conn)?;
+        Ok(make_result(class, true, true, freshness))
     }
 }
 
@@ -337,14 +405,17 @@ fn resolve_selector_to_symbol_id(
 }
 
 /// Extract candidate pairs from already-loaded bags (avoids a second DB round-trip in
-/// `find_clones` vs the original `candidate_pairs` path).
-fn candidate_pairs_from_bags(bags: &[SymbolBag]) -> Vec<(i64, i64)> {
+/// `find_clones` vs the original `candidate_pairs` path). `theta` is the similarity threshold
+/// applied to both the sub-block prefix length and the exact overlap/max verify — passing the
+/// caller's `min_similarity` widens (or narrows) candidate generation to match the requested
+/// floor, instead of generating at the const [`THETA`] and post-filtering.
+fn candidate_pairs_from_bags(bags: &[SymbolBag], theta: f64) -> Vec<(i64, i64)> {
     let mut pairs: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
     add_struct_hash_pairs(bags, &mut pairs);
-    let candidate = sub_block_candidate_pairs(bags);
+    let candidate = sub_block_candidate_pairs(bags, theta);
     let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
     for (a, b) in candidate {
-        if verified_clone(by_id[&a], by_id[&b]) {
+        if verified_clone(by_id[&a], by_id[&b], theta) {
             pairs.insert((a, b));
         }
     }
@@ -552,13 +623,15 @@ fn candidate_pairs(conn: &Connection) -> anyhow::Result<Vec<(i64, i64)>> {
     add_struct_hash_pairs(&bags, &mut pairs);
 
     // 2. Sub-block candidate pairs via the inverted index over sub-block tokens only.
-    let candidate = sub_block_candidate_pairs(&bags);
+    //    `candidate_clone_components` keeps the const THETA (behavior unchanged) — only
+    //    `find_clones` threads the caller's `min_similarity` through candidate generation.
+    let candidate = sub_block_candidate_pairs(&bags, THETA);
 
     // 3. Size prune + EXACT max-denominator verify over the FULL bags.
     let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
     for (a, b) in candidate {
         let (ba, bb) = (by_id[&a], by_id[&b]);
-        if verified_clone(ba, bb) {
+        if verified_clone(ba, bb, THETA) {
             pairs.insert((a, b));
         }
     }
@@ -658,14 +731,17 @@ fn add_struct_hash_pairs(bags: &[SymbolBag], pairs: &mut std::collections::BTree
 ///
 /// Language partition: only same-language pairs are emitted — different languages have disjoint
 /// grammar token spaces, so a token-hash collision across languages is a false positive.
-fn sub_block_candidate_pairs(bags: &[SymbolBag]) -> std::collections::BTreeSet<(i64, i64)> {
+fn sub_block_candidate_pairs(
+    bags: &[SymbolBag],
+    theta: f64,
+) -> std::collections::BTreeSet<(i64, i64)> {
     // id → language for the partition guard applied at pair-emit time.
     let lang_of: BTreeMap<i64, &str> =
         bags.iter().map(|b| (b.symbol_id, b.language.as_str())).collect();
 
     let mut inverted: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     for bag in bags {
-        for token_hash in sub_block_tokens(bag) {
+        for token_hash in sub_block_tokens(bag, theta) {
             inverted.entry(token_hash).or_default().push(bag.symbol_id);
         }
     }
@@ -688,14 +764,14 @@ fn sub_block_candidate_pairs(bags: &[SymbolBag]) -> std::collections::BTreeSet<(
 /// A symbol's sub-block: the distinct token hashes whose occurrences reach into the first `p`
 /// occurrences under the deterministic total order `(coalesced_df ASC, token_hash ASC)`.
 ///
-/// `p = token_len - ceil(THETA * token_len) + 1` is the sub-block OCCURRENCE length (clamped to ≥
+/// `p = token_len - ceil(theta * token_len) + 1` is the sub-block OCCURRENCE length (clamped to ≥
 /// 0; if `p >= token_len` the whole bag is the sub-block). The sub-block is defined over EXPANDED
 /// token occurrences (Σ freq), not distinct posting rows, so it matches the multiset `Σ min(freq)`
 /// verifier (design rev-4 §3): walking distinct tokens in order accumulating `freq`, a token is
 /// included if the running occurrence-count BEFORE it is `< p` (i.e. any of its occurrences falls
 /// in the prefix).
-fn sub_block_tokens(bag: &SymbolBag) -> Vec<i64> {
-    let p = sub_block_len(bag.token_len);
+fn sub_block_tokens(bag: &SymbolBag, theta: f64) -> Vec<i64> {
+    let p = sub_block_len(bag.token_len, theta);
     if p <= 0 {
         return Vec::new();
     }
@@ -718,20 +794,20 @@ fn sub_block_tokens(bag: &SymbolBag) -> Vec<i64> {
     sub_block
 }
 
-/// Sub-block occurrence length `p = token_len - ceil(THETA * token_len) + 1`, clamped to ≥ 0.
-fn sub_block_len(token_len: i64) -> i64 {
-    let threshold = (THETA * token_len as f64).ceil() as i64;
+/// Sub-block occurrence length `p = token_len - ceil(theta * token_len) + 1`, clamped to ≥ 0.
+fn sub_block_len(token_len: i64, theta: f64) -> i64 {
+    let threshold = (theta * token_len as f64).ceil() as i64;
     (token_len - threshold + 1).max(0)
 }
 
 /// Size prune + EXACT max-denominator verify (design rev-4 §3b). With `min_len`/`max_len` = the two
-/// token_lens: cheap size prune `min_len >= ceil(THETA * max_len)`; then `overlap = Σ min(freq_a,
-/// freq_b)` over the FULL bags, kept iff `overlap >= ceil(THETA * max_len)`. The GATE is
+/// token_lens: cheap size prune `min_len >= ceil(theta * max_len)`; then `overlap = Σ min(freq_a,
+/// freq_b)` over the FULL bags, kept iff `overlap >= ceil(theta * max_len)`. The GATE is
 /// `similarity = overlap / max_len`; containment = `overlap / min_len` is NOT gated here.
-fn verified_clone(a: &SymbolBag, b: &SymbolBag) -> bool {
+fn verified_clone(a: &SymbolBag, b: &SymbolBag, theta: f64) -> bool {
     let min_len = a.token_len.min(b.token_len);
     let max_len = a.token_len.max(b.token_len);
-    let threshold = (THETA * max_len as f64).ceil() as i64;
+    let threshold = (theta * max_len as f64).ceil() as i64;
 
     // Size prune: a smaller block can't reach θ against a larger one.
     if min_len < threshold {
@@ -806,8 +882,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        SymbolBag, TokenPosting, add_struct_hash_pairs, class_key_for, components_from_pairs,
-        sub_block_candidate_pairs,
+        SymbolBag, THETA, TokenPosting, add_struct_hash_pairs, class_key_for,
+        components_from_pairs, sub_block_candidate_pairs,
     };
 
     #[test]
@@ -865,7 +941,7 @@ mod tests {
         );
 
         // sub-block inverted-index path: same assertions.
-        let sub_pairs = sub_block_candidate_pairs(&bags);
+        let sub_pairs = sub_block_candidate_pairs(&bags, THETA);
         assert!(
             !sub_pairs.contains(&(1, 2)),
             "sub-block path must not pair rust(1) with typescript(2): {sub_pairs:?}"

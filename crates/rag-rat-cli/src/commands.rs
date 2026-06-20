@@ -167,8 +167,9 @@ pub(crate) fn clones_for(config: &Config, args: &ClonesForArgs) -> anyhow::Resul
         },
     };
 
+    // The result always carries eligibility flags + completeness; a miss serializes with
+    // `class: null` (symbol unique, not eligible, or unresolved) — never an error.
     let result = db.clones_for_symbol(selector)?;
-    // None = symbol is unique (no clone class) — print null/empty, not an error.
     print_output(&result)
 }
 

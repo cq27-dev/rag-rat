@@ -17,8 +17,8 @@ mod oracle_runs;
 mod search;
 
 pub use clones::{
-    CandidateCloneClass, CloneCompleteness, CloneMember, CloneSymbolSelector, FindClonesOptions,
-    FindClonesResult, RoiFactors,
+    CandidateCloneClass, CloneCompleteness, CloneMember, CloneSymbolSelector,
+    ClonesForSymbolResult, FindClonesOptions, FindClonesResult, RoiFactors,
 };
 pub use gc::GcReport;
 pub use importance::ImportantSymbolsRequest;

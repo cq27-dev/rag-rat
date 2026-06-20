@@ -12723,10 +12723,9 @@ fn clones_for_symbol_returns_the_class_by_ref_and_by_path_line() {
     let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
 
     // --- Ref selector ---
-    let by_ref = db
-        .clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into()))
-        .unwrap()
-        .expect("src/a.rs::load_user should be in a clone class");
+    let by_ref_res =
+        db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into())).unwrap();
+    let by_ref = by_ref_res.class.as_ref().expect("src/a.rs::load_user should be in a clone class");
     assert_eq!(by_ref.member_count, 2, "class must contain both rename-clones");
     assert!(
         by_ref.members.iter().any(|m| m.r#ref.ends_with("b.rs::load_order")),
@@ -12735,16 +12734,19 @@ fn clones_for_symbol_returns_the_class_by_ref_and_by_path_line() {
     );
 
     // --- PathLine selector — same class_key as Ref ---
-    let by_line = db
+    let by_line_res = db
         .clones_for_symbol(CloneSymbolSelector::PathLine { path: "src/a.rs".into(), line: 1 })
-        .unwrap()
+        .unwrap();
+    let by_line = by_line_res
+        .class
+        .as_ref()
         .expect("PathLine at line 1 in src/a.rs should resolve to the same clone class");
     assert_eq!(
         by_line.class_key, by_ref.class_key,
         "PathLine and Ref must resolve to the same class_key"
     );
 
-    // --- Unrelated solo function → None ---
+    // --- Unrelated solo function → class: None ---
     // A structurally distinct function whose token bag won't reach θ=0.7 against the clones.
     fs::write(
         root.join("src/c.rs"),
@@ -12752,10 +12754,180 @@ fn clones_for_symbol_returns_the_class_by_ref_and_by_path_line() {
     )
     .unwrap();
     let db2 = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
-    assert!(
-        db2.clones_for_symbol(CloneSymbolSelector::Ref("src/c.rs::solo".into())).unwrap().is_none(),
-        "a symbol in no clone class must return None"
+    let solo_res =
+        db2.clones_for_symbol(CloneSymbolSelector::Ref("src/c.rs::solo".into())).unwrap();
+    assert!(solo_res.class.is_none(), "a symbol in no clone class must have class: None");
+    assert!(solo_res.symbol_resolved, "the solo symbol still resolves");
+    assert!(solo_res.symbol_fingerprinted, "the solo function is eligible (fingerprinted)");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 1 (#215): `min_similarity` is honored ALL the way through candidate generation, not merely
+/// post-filtered. A borderline pair whose overlap/max ≈ 0.58 (in [0.5, 0.7)) is below the const θ
+/// so it never even becomes a candidate at the default threshold — only a caller-supplied θ ≤ 0.58
+/// widens candidate generation enough to surface it. The completeness block reports the θ used.
+#[test]
+fn find_clones_min_similarity_below_theta_widens_and_is_reported() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // `a` is a let-chain; `b` shares `a`'s first four statements then diverges into a loop+match,
+    // so their token bags overlap moderately. Measured: token_lens 92 / 136, overlap/max ≈ 0.58.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn a(x: i32, y: i32) -> i32 { let p = alpha(x); let q = beta(y); let r = gamma(p); \
+         let s = delta(q); let t = epsilon(r, s); p + q + r + s + t }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn b(x: i32, y: i32) -> i32 { let p = alpha(x); let q = beta(y); let r = gamma(p); \
+         let s = delta(q); for item in items.iter() { let v = process(item); match v { 0 => total \
+         += 1, _ => total += v } } if total > 0 { total } else { -1 } }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // θ = 0.5 (below the pair's ≈0.58 similarity): the pair becomes a candidate and is returned,
+    // and the completeness block records the requested θ.
+    let widened = db
+        .find_clones(FindClonesOptions { min_similarity: Some(0.5), min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        widened.classes.len(),
+        1,
+        "θ=0.5 must surface the borderline pair as a class: {:?}",
+        widened.classes
     );
+    let sim = widened.classes[0].similarity_min;
+    assert!(
+        (0.5..0.7).contains(&sim),
+        "the planted pair's similarity must sit in [0.5, 0.7): got {sim}"
+    );
+    assert_eq!(
+        widened.completeness.min_similarity, 0.5,
+        "completeness must report the θ actually used (0.5)"
+    );
+
+    // Default θ (None ⇒ 0.7): the pair is below threshold and must NOT be a candidate — proving
+    // the widening was real (candidate generation, not just a post-filter relax).
+    let default = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(
+        default.classes.is_empty(),
+        "θ=0.7 must NOT surface the borderline pair: {:?}",
+        default.classes
+    );
+    assert_eq!(default.completeness.min_similarity, 0.7, "default completeness θ is 0.7");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 2 (#215): `completeness.truncated` reflects whole CLASSES dropped by `limit`, not only
+/// members capped within a class. Plant two distinct clone classes, ask for `limit=1`, and assert
+/// the dropped second class flips `truncated`.
+#[test]
+fn find_clones_truncated_reflects_class_limit() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Class 1: two rename-clones of a `load_*` accessor.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    // Class 2: two rename-clones of a structurally DIFFERENT `sum_*` reducer — its own component.
+    fs::write(
+        root.join("src/c.rs"),
+        "pub fn sum_bytes(v: Vec<u8>) -> usize { let mut n = 0; for b in v { n += b as usize; } n \
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/d.rs"),
+        "pub fn sum_words(w: Vec<u8>) -> usize { let mut m = 0; for c in w { m += c as usize; } m \
+         }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Sanity: with no limit there are two distinct classes and nothing is truncated.
+    let all = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(all.classes.len(), 2, "two distinct clone classes are planted: {:?}", all.classes);
+    assert!(!all.completeness.truncated, "no limit ⇒ not truncated");
+
+    // limit=1 drops one whole class ⇒ truncated must be true (Fix 2).
+    let limited = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: Some(1) })
+        .unwrap();
+    assert_eq!(limited.classes.len(), 1, "limit=1 returns exactly one class");
+    assert!(
+        limited.completeness.truncated,
+        "dropping a whole class via the limit must set completeness.truncated"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 3 (#215): `clones_for_symbol` carries eligibility flags. A below-`MIN_TOKENS` function
+/// RESOLVES (`symbol_resolved=true`) but is not fingerprinted (`symbol_fingerprinted=false`,
+/// `class=None`); an eligible-but-unique function is fingerprinted with no class; an eligible
+/// clone yields `class=Some`.
+#[test]
+fn clones_for_symbol_reports_eligibility() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // tiny: below MIN_TOKENS ⇒ resolves but is never fingerprinted.
+    fs::write(root.join("src/tiny.rs"), "pub fn tiny() -> i32 { 0 }\n").unwrap();
+    // solo: a substantial, structurally distinct function ⇒ fingerprinted but in no clone class.
+    fs::write(
+        root.join("src/solo.rs"),
+        "pub fn solo(v: Vec<u8>) -> usize { let mut n = 0; for b in v { n ^= b as usize; } n }\n",
+    )
+    .unwrap();
+    // a/b: two rename-clones ⇒ an eligible clone class.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // tiny: resolves, not fingerprinted, no class.
+    let tiny = db.clones_for_symbol(CloneSymbolSelector::Ref("src/tiny.rs::tiny".into())).unwrap();
+    assert!(tiny.symbol_resolved, "tiny resolves to a scoped symbol");
+    assert!(!tiny.symbol_fingerprinted, "tiny is below MIN_TOKENS ⇒ not fingerprinted");
+    assert!(tiny.class.is_none(), "an unfingerprinted symbol is in no class");
+
+    // solo: eligible (fingerprinted) but unique ⇒ no class.
+    let solo = db.clones_for_symbol(CloneSymbolSelector::Ref("src/solo.rs::solo".into())).unwrap();
+    assert!(solo.symbol_resolved, "solo resolves");
+    assert!(solo.symbol_fingerprinted, "solo is substantial ⇒ fingerprinted (eligible)");
+    assert!(solo.class.is_none(), "a unique eligible symbol has no clone class");
+
+    // load_user: eligible AND a clone ⇒ class is Some.
+    let clone =
+        db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into())).unwrap();
+    assert!(clone.symbol_resolved, "load_user resolves");
+    assert!(clone.symbol_fingerprinted, "load_user is fingerprinted");
+    let class = clone.class.expect("load_user is in a clone class");
+    assert_eq!(class.member_count, 2, "the clone class has both rename-clones");
 
     fs::remove_dir_all(root).unwrap();
 }
