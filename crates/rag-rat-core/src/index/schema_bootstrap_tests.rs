@@ -13177,3 +13177,174 @@ fn worktree_overlay_find_clones_reflects_branch_clone_pair() {
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
 }
+
+/// Fix 1 + Fix 2 (#215): a clone class with more than MAX_MEMBERS members exercises two paths that
+/// a small fixture never reaches:
+///  - Fix 1 (chunked hydration): `build_class` hydrates members in batches of HYDRATION_CHUNK
+///    rather than one `?` host-param per member. With 60 members the single-statement path would
+///    still fit under the SQLite var limit, but this proves the chunked accumulation produces the
+///    correct `member_count`/`members.len()`/`truncated` semantics with no error — the chunking is
+///    otherwise only stress-visible above ~999 members, which is too expensive to plant in a unit
+///    test.
+///  - Fix 2 (subject pinning): `clones_for_symbol` for a clone whose `symbols.id` falls LATE in the
+///    component (past MAX_MEMBERS by id) must still return that subject in the capped member list —
+///    the caller asked about THAT symbol.
+#[test]
+fn find_clones_caps_large_class_and_pins_late_subject() {
+    use crate::index::query_api::MAX_MEMBERS;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // 60 rename-clone functions: identical structure, only the local variable name changes, so they
+    // share a struct_hash and form ONE clone component well above MAX_MEMBERS. Files are named so
+    // that lexical write order does NOT predetermine symbols.id order (the subject we resolve by
+    // ref is a LATE one, whose rowid lands past MAX_MEMBERS in the component's id-sorted
+    // order).
+    const N: usize = 60;
+    for i in 0..N {
+        let var = format!("v{i}");
+        fs::write(
+            root.join(format!("src/f{i:02}.rs")),
+            format!(
+                "pub fn f{i:02}(db: Db) -> i32 {{ let {var} = db.get(1); validate({var}); {var} + \
+                 1 }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Fix 1: find_clones returns the full-population class — member_count is all 60, the returned
+    // member list is capped at MAX_MEMBERS, truncated is set, and there is NO error.
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        res.classes.len(),
+        1,
+        "the 60 rename-clones form one class: {:?}",
+        res.classes.len()
+    );
+    let class = &res.classes[0];
+    assert_eq!(class.member_count, N, "member_count reflects the FULL component");
+    assert_eq!(class.total_members, N, "total_members reflects the FULL component");
+    assert_eq!(class.members.len(), MAX_MEMBERS, "returned members are capped at MAX_MEMBERS");
+    assert_eq!(class.members_returned, MAX_MEMBERS, "members_returned == cap");
+    assert!(res.completeness.truncated, "a capped member list must set truncated");
+
+    // Find a subject whose symbols.id is LATE in the component (past MAX_MEMBERS in id order), so
+    // the plain `take(cap)` path would DROP it. We read the highest fingerprinted symbol id's
+    // qualified name — that member sorts last in the component's id order, well past
+    // MAX_MEMBERS.
+    let conn = db.storage.connection();
+    let late_ref: String = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT ns.value
+                 FROM symbols
+                 JOIN files ON files.id = symbols.file_id
+                 JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+                 JOIN symbol_fingerprints sf
+                   ON sf.symbol_id = symbols.id AND sf.normalizer_kind = 'baseline'
+                 ORDER BY symbols.id DESC
+                 LIMIT 1",
+            )
+            .unwrap();
+        stmt.query_row([], |r| r.get(0)).unwrap()
+    };
+
+    // Fix 2: clones_for_symbol for that late subject must INCLUDE it in the capped member list.
+    let by_ref = db.clones_for_symbol(CloneSymbolSelector::Ref(late_ref.clone())).unwrap();
+    let pinned = by_ref.class.as_ref().expect("the late subject is in the clone class");
+    assert_eq!(pinned.member_count, N, "the class still reports the full population");
+    assert_eq!(pinned.members.len(), MAX_MEMBERS, "members are capped at MAX_MEMBERS");
+    assert!(
+        pinned.members.iter().any(|m| m.r#ref == late_ref),
+        "the pinned late subject {late_ref} must appear in the capped members: {:?}",
+        pinned.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 5 (#215): the clone surface stays empty (and errors NOT) when no fingerprint rows survive —
+/// `build_class`'s `raw_members.is_empty()` guard returns `None` rather than building an
+/// internally-inconsistent class. We delete every fingerprint row after a clone class was formed
+/// and assert `find_clones` returns no classes with no error.
+#[test]
+fn find_clones_returns_no_class_when_fingerprints_vanish() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Baseline: one clone class.
+    let before = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(before.classes.len(), 1, "baseline: one clone class");
+
+    // Drop every fingerprint row. The candidate read loads bags from the same rows, so no component
+    // forms and the Fix 5 empty-check guarantees no malformed class can leak through. Either way
+    // the surface must be empty with no error.
+    db.storage.connection().execute("DELETE FROM symbol_fingerprints", []).unwrap();
+    let after = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(after.classes.is_empty(), "no fingerprints ⇒ no clone classes (no error): {after:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 4 (#215): the `Ref` and `PathLine` resolution arms now LEFT JOIN symbol_fingerprints and
+/// prefer a fingerprinted row. This is primarily a SQL-correctness change (proven to COMPILE and to
+/// not regress the existing resolution tests). Here we additionally assert the simple positive case
+/// keeps working end-to-end: a fingerprinted clone resolves by `Ref` AND `PathLine` to its class.
+#[test]
+fn clones_for_symbol_prefers_fingerprinted_row_on_resolution() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Ref resolution finds the fingerprinted clone and its class.
+    let by_ref =
+        db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into())).unwrap();
+    assert!(by_ref.symbol_fingerprinted, "Ref must resolve to the fingerprinted row");
+    let ref_class = by_ref.class.as_ref().expect("Ref resolves into the clone class");
+
+    // PathLine resolution at line 1 reaches the same class via the fingerprint-preferred ordering.
+    let by_line = db
+        .clones_for_symbol(CloneSymbolSelector::PathLine { path: "src/a.rs".into(), line: 1 })
+        .unwrap();
+    assert!(by_line.symbol_fingerprinted, "PathLine must resolve to the fingerprinted row");
+    let line_class = by_line.class.as_ref().expect("PathLine resolves into the clone class");
+    assert_eq!(
+        ref_class.class_key, line_class.class_key,
+        "Ref and PathLine must resolve to the same fingerprinted class"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

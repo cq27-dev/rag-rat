@@ -31,7 +31,15 @@ use crate::index::clones::NORM_VERSION;
 const THETA: f64 = 0.7;
 
 /// Maximum members returned per clone class to guard against huge components.
-const MAX_MEMBERS: usize = 50;
+pub(crate) const MAX_MEMBERS: usize = 50;
+
+/// Member-hydration batch size for the `symbols.id IN (…)` query in [`build_class`]. SQLite caps
+/// the number of host parameters per prepared statement (`SQLITE_MAX_VARIABLE_NUMBER` — 999 on
+/// older system libs that the non-bundled `rusqlite` may link against), so a component larger than
+/// that floor would fail `conn.prepare` outright. Hydrating in chunks of [`HYDRATION_CHUNK`] keeps
+/// every statement well under the limit; results are accumulated then re-sorted by `symbol_id` so
+/// the full population is processed deterministically regardless of chunk boundaries.
+const HYDRATION_CHUNK: usize = 900;
 
 // ── Public result types (Plan-2 query API) ────────────────────────────────────────────────────
 
@@ -233,7 +241,7 @@ impl IndexDatabase {
             // gets ROI-penalized through the cohesion multiplier, and surfaces its low cohesion in
             // `cohesion_min_pairwise`. Dropping it here also diverged from `clones_for_symbol`,
             // which never applied this filter, so the two surfaces now agree on chain components.
-            match build_class(component, &by_id, conn)? {
+            match build_class(component, &by_id, conn, None)? {
                 None => continue,
                 Some(class) => classes.push(class),
             }
@@ -366,7 +374,10 @@ impl IndexDatabase {
             return Ok(make_result(None, true, true, freshness));
         };
 
-        let class = build_class(&component, &by_id, conn)?;
+        // Pin the resolved subject so it is guaranteed to appear in the (capped) member list even
+        // when its id falls past MAX_MEMBERS in the component's id order — the caller asked about
+        // THIS symbol (Fix 2, #215).
+        let class = build_class(&component, &by_id, conn, Some(symbol_id))?;
         Ok(make_result(class, true, true, freshness))
     }
 }
@@ -411,16 +422,25 @@ fn resolve_selector_to_symbol_id(
         },
         CloneSymbolSelector::Ref(qualified_name) => {
             // Exact qualified-name match through the scoped `files` view.
+            // Fix 4 (#215): when the qualified name maps to MULTIPLE rows (cfg splits, overloads,
+            // duplicate spans), PREFER a fingerprinted row — mirror the `Id` arm so a ref doesn't
+            // resolve to an unfingerprinted variant and miss the clone class its sibling is in.
+            // `(sf.symbol_id IS NULL) ASC` sorts fingerprinted rows first, falling back to lowest
+            // rowid when none is fingerprinted.
             let id: Option<i64> = conn
                 .query_row(
                     "SELECT symbols.id
                      FROM symbols
                      JOIN files ON files.id = symbols.file_id
                      JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+                     LEFT JOIN symbol_fingerprints sf
+                       ON sf.symbol_id = symbols.id
+                       AND sf.normalizer_kind = 'baseline'
+                       AND sf.normalizer_version = ?2
                      WHERE ns.value = ?1
-                     ORDER BY symbols.id
+                     ORDER BY (sf.symbol_id IS NULL) ASC, symbols.id ASC
                      LIMIT 1",
-                    [qualified_name.as_str()],
+                    rusqlite::params![qualified_name.as_str(), NORM_VERSION],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -429,16 +449,27 @@ fn resolve_selector_to_symbol_id(
         CloneSymbolSelector::PathLine { path, line } => {
             // Tightest-spanning symbol whose range contains `line`: smallest (end_line -
             // start_line) among symbols where start_line <= line <= end_line.
+            // Fix 4 (#215): tie-break toward a fingerprinted row before the existing span/rowid
+            // ordering, so a line mapping to duplicate same-span rows doesn't pick an
+            // unfingerprinted variant and miss the clone class. `(sf.symbol_id IS NULL)
+            // ASC` sorts fingerprinted rows first; the span/rowid ordering still
+            // decides among equally-(non-)fingerprinted rows, so the tightest span is
+            // preserved when fingerprint status doesn't differ.
             let id: Option<i64> = conn
                 .query_row(
                     "SELECT symbols.id
                      FROM symbols
                      JOIN files ON files.id = symbols.file_id
+                     LEFT JOIN symbol_fingerprints sf
+                       ON sf.symbol_id = symbols.id
+                       AND sf.normalizer_kind = 'baseline'
+                       AND sf.normalizer_version = ?3
                      WHERE files.path = ?1
                        AND ?2 BETWEEN symbols.start_line AND symbols.end_line
-                     ORDER BY (symbols.end_line - symbols.start_line) ASC, symbols.id ASC
+                     ORDER BY (sf.symbol_id IS NULL) ASC, (symbols.end_line - symbols.start_line) \
+                     ASC, symbols.id ASC
                      LIMIT 1",
-                    rusqlite::params![path.as_str(), line],
+                    rusqlite::params![path.as_str(), line, NORM_VERSION],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -467,11 +498,19 @@ fn candidate_pairs_from_bags(bags: &[SymbolBag], theta: f64) -> Vec<(i64, i64)> 
 
 /// Build a [`CandidateCloneClass`] from a component (a slice of symbol ids). Returns `None` if
 /// any id is missing from `by_id` (shouldn't happen for a well-formed component derived from the
-/// same bag set). Members are capped at [`MAX_MEMBERS`].
+/// same bag set), or if member hydration yields nothing (TOCTOU: fingerprint rows vanished
+/// mid-read). Members are capped at [`MAX_MEMBERS`].
+///
+/// `pin` is the subject `symbols.id` that MUST appear in the returned (capped) member list when it
+/// is a member of the component — `clones_for_symbol` passes the resolved subject so the caller
+/// always sees the symbol it asked about even when its id falls outside the first [`MAX_MEMBERS`]
+/// by id. `find_clones` passes `None` (no subject to pin). `class_key` / `member_count` /
+/// `total_members` are always over the FULL component regardless of `pin`.
 pub(crate) fn build_class(
     component: &[i64],
     by_id: &BTreeMap<i64, &SymbolBag>,
     conn: &Connection,
+    pin: Option<i64>,
 ) -> anyhow::Result<Option<CandidateCloneClass>> {
     let bags: Vec<&SymbolBag> = component.iter().filter_map(|id| by_id.get(id).copied()).collect();
     if bags.len() != component.len() {
@@ -548,49 +587,70 @@ pub(crate) fn build_class(
     let total_members = component.len();
     let cap = total_members.min(MAX_MEMBERS);
 
-    // Hydrate CloneMembers via a scoped DB query with an IN clause.
-    // Fix 3: filter normalizer_version so stale fingerprint rows don't yield duplicate members
-    // or wrong token_len values. The version bind is appended as the last positional param after
-    // the id list (params_from_iter takes one iterable, so we chain the version onto the ids).
-    let id_placeholders: Vec<String> = (1..=component.len()).map(|i| format!("?{i}")).collect();
-    let version_placeholder = format!("?{}", component.len() + 1);
-    let sql = format!(
-        "SELECT ns.value, files.path, symbols.start_line, symbols.end_line, sf.token_len, \
-         symbols.language
-         FROM symbols
-         JOIN files ON files.id = symbols.file_id
-         JOIN name_strings ns ON ns.id = symbols.qualified_name_id
-         JOIN symbol_fingerprints sf
-           ON sf.symbol_id = symbols.id
-           AND sf.normalizer_kind = 'baseline'
-           AND sf.normalizer_version = {version_placeholder}
-         WHERE symbols.id IN ({})
-         ORDER BY symbols.id",
-        id_placeholders.join(", ")
-    );
-    let params: Vec<i64> = component.iter().copied().chain(std::iter::once(NORM_VERSION)).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let raw_members: Vec<CloneMember> = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok(CloneMember {
-                r#ref: row.get(0)?,
-                path: row.get(1)?,
-                start_line: row.get(2)?,
-                end_line: row.get(3)?,
-                token_len: row.get(4)?,
-                language: row.get(5)?,
-            })
-        })?
-        .collect::<Result<_, _>>()?;
+    // Hydrate CloneMembers via a scoped DB query with an IN clause, in batches of HYDRATION_CHUNK.
+    // Fix 1 (#215): a single statement uses one host param per member id, so a component larger
+    // than SQLITE_MAX_VARIABLE_NUMBER (999 on older non-bundled libs) would fail `conn.prepare`
+    // and error the whole call. Chunking keeps every statement well under the limit; we
+    // accumulate across chunks and re-sort by `symbol_id` so the deterministic id order is
+    // restored regardless of chunk boundaries.
+    // Fix 3 (#215): each chunk also filters normalizer_version so stale fingerprint rows don't
+    // yield duplicate members or wrong token_len values. The version bind is appended as the
+    // last positional param after that chunk's id list.
+    let mut raw_members: Vec<(i64, CloneMember)> = Vec::with_capacity(total_members);
+    for chunk in component.chunks(HYDRATION_CHUNK) {
+        let id_placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+        let version_placeholder = format!("?{}", chunk.len() + 1);
+        let sql = format!(
+            "SELECT symbols.id, ns.value, files.path, symbols.start_line, symbols.end_line, \
+             sf.token_len, symbols.language
+             FROM symbols
+             JOIN files ON files.id = symbols.file_id
+             JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+             JOIN symbol_fingerprints sf
+               ON sf.symbol_id = symbols.id
+               AND sf.normalizer_kind = 'baseline'
+               AND sf.normalizer_version = {version_placeholder}
+             WHERE symbols.id IN ({})
+             ORDER BY symbols.id",
+            id_placeholders.join(", ")
+        );
+        let params: Vec<i64> = chunk.iter().copied().chain(std::iter::once(NORM_VERSION)).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let symbol_id: i64 = row.get(0)?;
+            Ok((symbol_id, CloneMember {
+                r#ref: row.get(1)?,
+                path: row.get(2)?,
+                start_line: row.get(3)?,
+                end_line: row.get(4)?,
+                token_len: row.get(5)?,
+                language: row.get(6)?,
+            }))
+        })?;
+        for row in rows {
+            raw_members.push(row?);
+        }
+    }
+    // Restore the deterministic `symbols.id ASC` order the single-statement path produced.
+    raw_members.sort_unstable_by_key(|(symbol_id, _)| *symbol_id);
 
-    let language =
-        raw_members.first().map(|m| m.language.clone()).unwrap_or_else(|| bags[0].language.clone());
+    // Fix 5 (#215): if hydration returned nothing (all fingerprint rows vanished mid-read), bail to
+    // `None` rather than build an internally-inconsistent class (member_count from the component
+    // but zero members, an empty language fallback, etc.).
+    if raw_members.is_empty() {
+        return Ok(None);
+    }
 
-    // Fix 1: cross_module_spread counts ALL hydrated members (full component), not just the
-    // capped subset — so it is consistent with member_count (both over the full population).
+    let language = raw_members
+        .first()
+        .map(|(_, m)| m.language.clone())
+        .unwrap_or_else(|| bags[0].language.clone());
+
+    // cross_module_spread counts ALL hydrated members (full component), not just the capped subset
+    // — so it is consistent with member_count (both over the full population).
     let parent_dirs: std::collections::BTreeSet<String> = raw_members
         .iter()
-        .map(|m| {
+        .map(|(_, m)| {
             std::path::Path::new(&m.path)
                 .parent()
                 .map(|p| p.display().to_string())
@@ -599,15 +659,48 @@ pub(crate) fn build_class(
         .collect();
     let cross_module_spread = parent_dirs.len();
 
-    // Fix 2: class_key is over ALL members (full component), not just the capped slice — two
-    // classes sharing the first MAX_MEMBERS members but differing later must get different keys.
-    let member_refs: Vec<String> = raw_members.iter().map(|m| m.r#ref.clone()).collect();
-    let class_key = class_key_for(&member_refs);
+    // Fix 3 (#215): the class key is built from per-member identity that includes the source
+    // LOCATION (`ref@path:start-end`), not the qualified-name `ref` alone. Two distinct
+    // components can share the same qualified-name multiset — overloads, cfg variants,
+    // same-named methods on different impls — and would otherwise collide on
+    // `clone_refinements.class_key` (a TEXT PRIMARY KEY in Plan 4), conflating two classes into
+    // one. We deliberately do NOT use `symbols.id`: the rowid is reassigned on every reindex,
+    // so a location-derived key stays stable across reindexes while still distinguishing
+    // same-named members at different spans. Computed over ALL members (full component), not
+    // just the capped slice — two classes sharing the first MAX_MEMBERS members but
+    // differing later must get different keys.
+    let key_material: Vec<String> = raw_members
+        .iter()
+        .map(|(_, m)| format!("{}@{}:{}-{}", m.r#ref, m.path, m.start_line, m.end_line))
+        .collect();
+    let class_key = class_key_for(&key_material);
 
     // Cap the returned member list AFTER computing spread and key from the full set.
+    // Fix 2 (#215): when a `pin` subject is supplied (clones_for_symbol) and that member exists but
+    // would fall OUTSIDE the first `cap` members by id, guarantee its inclusion: keep the first
+    // `cap - 1` by id plus the pinned member, so the caller always sees the symbol it asked about.
+    // When `pin` is `None`, or the subject is already within the first `cap`, this is a no-op and
+    // the selection is identical to the plain `take(cap)` path.
     let member_count = total_members;
     let members_returned = raw_members.len().min(cap);
-    let mut members: Vec<CloneMember> = raw_members.into_iter().take(cap).collect();
+
+    let pinned_idx = pin.and_then(|subject_id| {
+        let pos = raw_members.iter().position(|(id, _)| *id == subject_id)?;
+        // Only act when the pin would otherwise be dropped: it sits at or past `cap` in id order.
+        (pos >= cap).then_some(pos)
+    });
+
+    let chosen: Vec<CloneMember> = match pinned_idx {
+        Some(pos) => {
+            // First `cap - 1` by id, plus the pinned member → exactly `cap` members.
+            let mut chosen: Vec<CloneMember> =
+                raw_members.iter().take(cap - 1).map(|(_, m)| m.clone()).collect();
+            chosen.push(raw_members[pos].1.clone());
+            chosen
+        },
+        None => raw_members.into_iter().take(cap).map(|(_, m)| m).collect(),
+    };
+    let mut members = chosen;
     members.sort_unstable_by(|a, b| a.r#ref.cmp(&b.r#ref));
 
     // Load-bearing factor: 1 + ln(1 + max_fan_in_score) over members. Fan-in proxy via
@@ -1184,6 +1277,24 @@ mod tests {
         let k2 = class_key_for(&["b.rs::y".into(), "a.rs::x".into()]);
         assert_eq!(k1, k2);
         assert_ne!(k1, class_key_for(&["a.rs::x".into(), "c.rs::z".into()]));
+    }
+
+    /// Fix 3 (#215): the class key is built from per-member `ref@path:start-end` material, so two
+    /// components that share the same qualified-name multiset but live at different LOCATIONS get
+    /// distinct keys. This guards `clone_refinements.class_key` (a TEXT PRIMARY KEY in Plan 4) from
+    /// conflating two real clone classes (overloads, cfg variants, same-named methods on different
+    /// impls). `class_key_for` itself is unchanged — only the material `build_class` feeds it is.
+    #[test]
+    fn class_key_distinguishes_same_ref_at_different_locations() {
+        // Same qualified name `x`, same span, DIFFERENT file → distinct keys.
+        let key_a = class_key_for(&["x@a.rs:1-5".into()]);
+        let key_b = class_key_for(&["x@b.rs:1-5".into()]);
+        assert_ne!(key_a, key_b, "same ref in different files must not collide");
+
+        // Same qualified name `x`, same file, DIFFERENT span → distinct keys.
+        let key_span1 = class_key_for(&["x@a.rs:1-5".into()]);
+        let key_span2 = class_key_for(&["x@a.rs:2-6".into()]);
+        assert_ne!(key_span1, key_span2, "same ref/file at different spans must not collide");
     }
 
     #[test]

@@ -16,6 +16,12 @@ mod memory;
 mod oracle_runs;
 mod search;
 
+// Crate-internal: the member-cap constant, re-exported so the schema-bootstrap tests can
+// assert the capped-class semantics by name (instead of hardcoding 50). Keeps the `clones`
+// module private so `build_class`'s reachability stays narrow (no `private_interfaces`
+// widening of `SymbolBag`).
+#[cfg(test)]
+pub(crate) use clones::MAX_MEMBERS;
 pub use clones::{
     CandidateCloneClass, CloneCompleteness, CloneMember, CloneSymbolSelector,
     ClonesForSymbolResult, FindClonesOptions, FindClonesResult, RoiFactors,
