@@ -1334,7 +1334,12 @@ pub(crate) const CLONE_FINGERPRINT_DDL: &str = "
         refactorability         REAL    NOT NULL,
         norm_version            INTEGER NOT NULL,
         alignment_version       INTEGER NOT NULL,
-        created_at_ms           INTEGER NOT NULL
+        created_at_ms           INTEGER NOT NULL,
+        -- Fix 3 (#215 Plan 4a round-2): 1 when this refinement's LCS fidelity engaged a cost cap
+        -- (member-count sample or the per-pair length proxy). Persisted so a warm cache hit can
+        -- still report `metrics_sampled` for the long-sequence dimension. Added additively below
+        -- via add_column_if_missing for already-migrated DBs.
+        lcs_sampled             INTEGER NOT NULL DEFAULT 0
     ) STRICT;
 ";
 
@@ -1347,7 +1352,14 @@ pub(crate) const CLONE_FINGERPRINT_DDL: &str = "
 /// parsing the entire repo inside a migration, which migrations must not do. Plan 2's `find_clones`
 /// surface should detect empty clone tables and prompt the user to run a full rebuild.
 pub(crate) fn apply_clone_fingerprint_tables(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(CLONE_FINGERPRINT_DDL)
+    conn.execute_batch(CLONE_FINGERPRINT_DDL)?;
+    // Fix 3 (#215 Plan 4a round-2): additive `lcs_sampled` column on an ALREADY-EXISTING
+    // clone_refinements table (a DB that ran V029 before this column landed). Fresh DBs already
+    // have it from CLONE_FINGERPRINT_DDL above; this is the no-op-on-fresh / add-on-old guard. No
+    // LATEST_SCHEMA_VERSION bump — additive column, same pattern as the other additive columns in
+    // this file.
+    add_column_if_missing(conn, "clone_refinements", "lcs_sampled", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
 }
 
 /// V028 (#224): intern `symbols.qualified_name` + `logical_symbols.qualified_name` into the shared

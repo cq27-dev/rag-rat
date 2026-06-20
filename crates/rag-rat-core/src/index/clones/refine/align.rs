@@ -98,7 +98,17 @@ pub(crate) const LCS_MEMBER_SAMPLE: usize = 64;
 /// reasonable approximation: it equals the exact LCS ratio when sequences are identical or
 /// disjoint, and is within the same order of magnitude otherwise. The caller sees
 /// `lcs_sampled = true` when this cap engages.
-const LCS_MAX_SEQ_TOKENS: usize = 2000;
+pub(crate) const LCS_MAX_SEQ_TOKENS: usize = 2000;
+
+/// Order-blind upper bound, conservatively clamped. The [`multiset_dice`] proxy used past
+/// [`LCS_MAX_SEQ_TOKENS`] is a token-BAG overlap: it ignores token ORDER, so two long functions
+/// with the same normalized token multiset but very different ordering score ~1.0 even though their
+/// true (order-sensitive) LCS ratio is far lower. Dice is therefore an UPPER BOUND on the LCS
+/// ratio, never a lower one. We clamp a proxied pair's ratio to this ceiling — set just BELOW the
+/// `confidence_v1` High threshold of 0.9 — so a class whose fidelity rests on the order-blind proxy
+/// can reach at most Medium confidence and never full refactorability on the strength of a metric
+/// that can't see ordering.
+const DICE_PROXY_CEILING: f64 = 0.85;
 
 /// Token-multiset Dice coefficient: `2·|a∩b| / (|a|+|b|)`. Used as a proxy for the LCS ratio
 /// when either sequence exceeds [`LCS_MAX_SEQ_TOKENS`] tokens — avoids the O(n·m) DP table
@@ -166,9 +176,12 @@ pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> (f64, bool) {
             let ratio = if denom == 0.0 {
                 1.0
             } else if a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS {
-                // Per-pair length cap: use the Dice proxy instead of the O(n·m) DP.
+                // Per-pair length cap: use the Dice proxy instead of the O(n·m) DP. Dice ignores
+                // token order so it is an UPPER BOUND on the true LCS ratio — clamp to
+                // [`DICE_PROXY_CEILING`] (< the High-confidence threshold) so an order-blind
+                // proxy can't earn a class High confidence / full refactorability.
                 sampled_seq = true;
-                multiset_dice(a, b)
+                multiset_dice(a, b).min(DICE_PROXY_CEILING)
             } else {
                 let lcs = lcs_align(a, b).lcs_len;
                 2.0 * lcs as f64 / denom
@@ -390,17 +403,58 @@ mod tests {
 
     /// Fix 1 (#215 Plan 4a): the per-pair length cap. A pair whose longer sequence exceeds
     /// [`LCS_MAX_SEQ_TOKENS`] tokens skips the O(n·m) DP and uses the [`multiset_dice`] proxy,
-    /// reporting `lcs_sampled = true`. For two identical long sequences the Dice proxy is exactly
-    /// `1.0`.
+    /// reporting `lcs_sampled = true`. Even for two IDENTICAL long sequences (Dice = 1.0) the ratio
+    /// is clamped to [`DICE_PROXY_CEILING`] — the proxy is order-blind, so it can never certify a
+    /// full ratio.
     #[test]
     fn class_lcs_ratio_caps_long_seq_and_uses_dice_proxy() {
         // Two sequences each LCS_MAX_SEQ_TOKENS + 1 tokens long → per-pair length cap kicks in.
         let long_seq: Vec<String> = (0..=LCS_MAX_SEQ_TOKENS).map(|i| format!("t{i}")).collect();
         let seqs = vec![long_seq.clone(), long_seq.clone()];
         let (ratio, sampled) = class_lcs_ratio(&seqs);
-        // Identical long sequences → Dice proxy = 2*n/(2*n) = 1.0.
-        assert!((ratio - 1.0).abs() < 1e-12, "identical long seqs → Dice proxy 1.0, got {ratio}");
+        // Identical long sequences → raw Dice proxy = 1.0, but clamped to the sub-perfect ceiling.
+        assert!(
+            (ratio - DICE_PROXY_CEILING).abs() < 1e-12,
+            "identical long seqs → Dice proxy clamped to {DICE_PROXY_CEILING}, got {ratio}"
+        );
         assert!(sampled, "per-pair length cap must set lcs_sampled=true");
+    }
+
+    /// Fix 1 round-2 (#215 Plan 4a): the order-blind Dice proxy must NOT certify a perfect ratio.
+    /// Two long sequences with the SAME token multiset but REVERSED order have a true LCS ratio far
+    /// below 1.0, yet token-bag Dice scores them ~1.0. `class_lcs_ratio` clamps the proxied pair to
+    /// [`DICE_PROXY_CEILING`], reports `lcs_sampled = true`, and the resulting ratio bands at most
+    /// Medium confidence — never High.
+    #[test]
+    fn class_lcs_ratio_clamps_reversed_order_long_seqs_below_high() {
+        // Build seqs > LCS_MAX_SEQ_TOKENS by repeating a small alphabet, so the multiset is
+        // identical but the order is reversed.
+        let alphabet = ["a", "b", "c", "d", "e"];
+        let forward: Vec<String> =
+            (0..=LCS_MAX_SEQ_TOKENS).map(|i| alphabet[i % alphabet.len()].to_string()).collect();
+        assert!(forward.len() > LCS_MAX_SEQ_TOKENS, "must exceed the per-pair length cap");
+        let reversed: Vec<String> = forward.iter().rev().cloned().collect();
+        // Same multiset (a reversal preserves the bag), different order.
+        {
+            let mut fa = forward.clone();
+            let mut rb = reversed.clone();
+            fa.sort_unstable();
+            rb.sort_unstable();
+            assert_eq!(fa, rb, "reversed seq must have the SAME token multiset");
+        }
+
+        let (ratio, sampled) = class_lcs_ratio(&[forward, reversed]);
+        assert!(sampled, "per-pair length cap must set lcs_sampled=true");
+        assert!(
+            ratio <= DICE_PROXY_CEILING,
+            "order-blind proxy must clamp to ≤ {DICE_PROXY_CEILING}, not ~1.0; got {ratio}"
+        );
+        // Even with a perfect pairwise-similarity floor the clamped ratio cannot reach High.
+        assert_ne!(
+            super::super::score::confidence_v1(ratio, 1.0),
+            super::super::score::Confidence::High,
+            "a Dice-proxied ratio must not band High confidence (ratio {ratio})"
+        );
     }
 
     /// Fix 1 (#215 Plan 4a): the [`multiset_dice`] proxy itself. Identical → 1.0, disjoint → 0.0,

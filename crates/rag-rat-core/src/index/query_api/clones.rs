@@ -477,13 +477,15 @@ impl IndexDatabase {
 /// the warm (cache-hit) and cold (compute+store) paths of [`IndexDatabase::refine_class_in_place`].
 ///
 /// `metrics_sampled` accumulates the sampling dimensions via OR-in:
-/// - `refinement.lcs_sampled` — the per-pair length cap (`LCS_MAX_SEQ_TOKENS`) engaged during the
-///   cold compute. This is NOT persisted in `clone_refinements` (it is an implementation artifact
-///   of the compute, not content), so it is `false` on a cache hit. Residual: the warm path cannot
-///   retroactively flag this dimension, but it is rare in practice.
-/// - `class.member_count > LCS_MEMBER_SAMPLE` — the member-count cap is deterministic from the
-///   class's member count (which the function has independent of cache hit/miss), so it is applied
-///   consistently on BOTH the warm and cold paths. This is the dominant sampling dimension.
+/// - `refinement.lcs_sampled` — either LCS cost cap engaged: the member-count sample
+///   (`LCS_MEMBER_SAMPLE`) OR the per-pair length proxy (`LCS_MAX_SEQ_TOKENS`). This bit is now
+///   PERSISTED in `clone_refinements` (Fix 3, #215 Plan 4a round-2), so it survives a warm cache
+///   hit — the long-sequence dimension is no longer lost on a hit the way it was when the bit was
+///   compute-only.
+/// - `class.member_count > LCS_MEMBER_SAMPLE` — kept as an independent, cache-agnostic guard for
+///   the member-count dimension: it is deterministic from the class's member count regardless of
+///   cache hit/miss, so it flags the member-count sample even for a row that predates the persisted
+///   bit (default 0 on an additively-migrated DB until recomputed).
 fn apply_refinement(
     class: &mut CandidateCloneClass,
     refinement: crate::index::clones::refine::cache::CachedRefinement,
@@ -504,11 +506,12 @@ fn apply_refinement(
     class.refactorability = Some(refinement.refactorability);
     class.refine_mode = Some(refinement.refine_mode);
 
-    // Fold the two LCS sampling dimensions into the class's metrics_sampled flag (OR-in so
-    // any already-sampled Plan-2 metric stays flagged):
-    //   1. lcs_sampled (per-pair length cap) — from the cold compute; false on a warm hit.
-    //   2. member_count > LCS_MEMBER_SAMPLE — deterministically known from class size, consistent
-    //      on both warm and cold paths.
+    // Fold the LCS sampling dimensions into the class's metrics_sampled flag (OR-in so any
+    // already-sampled Plan-2 metric stays flagged):
+    //   1. refinement.lcs_sampled — either cost cap (member-count sample or long-seq proxy), now
+    //      PERSISTED (Fix 3) so it is honored on BOTH the cold compute AND the warm cache hit.
+    //   2. member_count > LCS_MEMBER_SAMPLE — independent, cache-agnostic guard for the
+    //      member-count dimension; covers a pre-persisted-bit row whose stored flag defaults to 0.
     class.metrics_sampled |= refinement.lcs_sampled || class.member_count > LCS_MEMBER_SAMPLE;
 }
 

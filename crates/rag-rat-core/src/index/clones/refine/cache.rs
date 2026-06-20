@@ -16,7 +16,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::align::{class_lcs_ratio, lcs_align};
+use super::align::{LCS_MAX_SEQ_TOKENS, class_lcs_ratio, lcs_align};
 use super::score::{Confidence, confidence_v1, refactorability_v1};
 use crate::index::clones::refine::RefineMember;
 use crate::index::clones::{ALIGNMENT_VERSION, NORM_VERSION};
@@ -32,11 +32,11 @@ pub(crate) struct CachedRefinement {
     pub(crate) confidence: Confidence,
     pub(crate) refactorability: f64,
     pub(crate) refine_mode: &'static str,
-    /// `true` when the LCS fidelity for THIS compute engaged a cost cap (member-count or per-pair
-    /// length — see `class_lcs_ratio`). Computed on a cache MISS only; on a cache HIT it is
-    /// conservatively `false` (the persisted row carries no sampling marker — `lcs_sampled` is an
-    /// implementation artifact of the compute, not content, so it is deliberately NOT persisted in
-    /// `clone_refinements`). The caller folds it into the class's `metrics_sampled` flag.
+    /// `true` when the LCS fidelity for this refinement engaged a cost cap (member-count sample or
+    /// the per-pair length proxy — see `class_lcs_ratio`). PERSISTED in `clone_refinements`
+    /// (Fix 3, #215 Plan 4a round-2): a cache HIT reads the stored bit back, so the long-sequence
+    /// sampling dimension survives a warm hit instead of degrading to `false`. The caller folds it
+    /// into the class's `metrics_sampled` flag.
     pub(crate) lcs_sampled: bool,
 }
 
@@ -76,22 +76,23 @@ pub(crate) fn refine_lookup(
     conn: &Connection,
     refinement_key: &str,
 ) -> anyhow::Result<Option<CachedRefinement>> {
-    let hit: Option<(f64, String, f64)> = conn
+    let hit: Option<(f64, String, f64, i64)> = conn
         .query_row(
-            "SELECT lcs_ratio, confidence, refactorability
+            "SELECT lcs_ratio, confidence, refactorability, lcs_sampled
              FROM clone_refinements
              WHERE class_key = ?1 AND norm_version = ?2 AND alignment_version = ?3",
             rusqlite::params![refinement_key, NORM_VERSION, ALIGNMENT_VERSION],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    Ok(hit.map(|(lcs_ratio, confidence, refactorability)| CachedRefinement {
+    Ok(hit.map(|(lcs_ratio, confidence, refactorability, lcs_sampled)| CachedRefinement {
         lcs_ratio,
         confidence: Confidence::from_db_str(&confidence),
         refactorability,
         refine_mode: REFINE_MODE,
-        // Cache hit: `lcs_sampled` is not persisted (see the field doc) — conservatively `false`.
-        lcs_sampled: false,
+        // Cache hit: read the persisted sampling bit back (Fix 3) so the long-sequence dimension
+        // survives a warm hit.
+        lcs_sampled: lcs_sampled != 0,
     }))
 }
 
@@ -128,8 +129,8 @@ pub(crate) fn refine_compute_and_store(
              class_key, language, refine_mode, template,
              variation_points_json, proposed_signature_json, confidence,
              anti_unify_coverage, lcs_ratio, refactorability,
-             norm_version, alignment_version, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             norm_version, alignment_version, created_at_ms, lcs_sampled
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         rusqlite::params![
             refinement_key,
             language,
@@ -144,6 +145,7 @@ pub(crate) fn refine_compute_and_store(
             NORM_VERSION,
             ALIGNMENT_VERSION,
             crate::index::now_ms(),
+            lcs_sampled as i64, // Fix 3: persist the sampling bit so warm hits keep it.
         ],
     )?;
 
@@ -176,10 +178,30 @@ pub(crate) fn refine_class(
 /// Crude 4a LCS skeleton: the LCS-common token run of the first member pair (exact for a 2-member
 /// class; a heuristic skeleton for larger classes), space-joined. 4b replaces this with the full
 /// N-way anti-unification template; for 4a it is a legible, deterministic placeholder.
+///
+/// LENGTH GUARD (Fix 2, #215 Plan 4a round-2): the exact `lcs_align` allocates a `(|a|+1)·(|b|+1)`
+/// `usize` DP table, so a pair of multi-thousand-token members would burn hundreds of MB on the
+/// cold `find_clones` / `clones_for_symbol` path — even though `class_lcs_ratio` already fell back
+/// to the cheap proxy for those same long pairs. Mirror that cap here: when `max(|a|, |b|)` exceeds
+/// [`LCS_MAX_SEQ_TOKENS`], DON'T run the DP — emit a cheap common-prefix placeholder (the leading
+/// run of positionally-equal tokens, itself capped at [`LCS_MAX_SEQ_TOKENS`]) so the skeleton stays
+/// legible and bounded with no unbounded allocation.
 fn lcs_skeleton(seqs: &[Vec<String>]) -> String {
     match seqs {
         [] | [_] => seqs.first().map(|s| s.join(" ")).unwrap_or_default(),
         [a, b, ..] => {
+            if a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS {
+                // Length-capped: skip the O(|a|·|b|) DP. Cheap common-prefix placeholder — the
+                // leading positionally-equal token run, bounded by the same cap.
+                let prefix: Vec<&str> = a
+                    .iter()
+                    .zip(b.iter())
+                    .take(LCS_MAX_SEQ_TOKENS)
+                    .take_while(|(ta, tb)| ta == tb)
+                    .map(|(ta, _)| ta.as_str())
+                    .collect();
+                return prefix.join(" ");
+            }
             let aln = lcs_align(a, b);
             let matched: Vec<&str> = aln
                 .ops
@@ -222,6 +244,107 @@ mod tests {
             ["fn", "f", "(", ")", "{", "}"].iter().map(|s| s.to_string()).collect();
         let seqs = vec![a.clone(), a.clone()];
         assert_eq!(lcs_skeleton(&seqs), a.join(" "));
+    }
+
+    /// Fix 2 (#215 Plan 4a round-2): the skeleton length guard. A pair whose longer member exceeds
+    /// [`LCS_MAX_SEQ_TOKENS`] tokens must NOT allocate the `(|a|+1)·(|b|+1)` DP table — it returns
+    /// a cheap common-prefix placeholder instead. This runs quickly (no quadratic allocation)
+    /// and the placeholder is the leading positionally-equal token run, bounded by the cap.
+    #[test]
+    fn lcs_skeleton_length_guard_returns_cheap_placeholder() {
+        // Two sequences longer than the cap with a short shared prefix then a divergence. If the
+        // DP ran on these (~2000²·8 bytes ≈ 32 MB+ for the table, and far more for the genuinely
+        // huge inputs the guard targets) this test would be slow / memory-hungry; the guard makes
+        // it cheap.
+        let prefix = ["fn", "f", "(", ")"];
+        let mut a: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+        let mut b = a.clone();
+        // Diverge past the prefix and push both well over the cap with DIFFERENT fillers so the
+        // common-prefix walk stops at the prefix.
+        for i in 0..=LCS_MAX_SEQ_TOKENS {
+            a.push(format!("a{i}"));
+            b.push(format!("b{i}"));
+        }
+        assert!(a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS, "must exceed the length cap");
+
+        let skeleton = lcs_skeleton(&[a, b]);
+        // The placeholder is exactly the shared leading run — the prefix, nothing past the
+        // divergence.
+        assert_eq!(skeleton, prefix.join(" "), "guarded skeleton must be the common-prefix run");
+    }
+
+    /// Fix 2 (#215 Plan 4a round-2): the compute path itself is cheap on long members. A 2-member
+    /// class whose sequences exceed [`LCS_MAX_SEQ_TOKENS`] flows through `refine_compute_and_store`
+    /// without the skeleton DP — it returns promptly, persists one row, and marks `lcs_sampled`
+    /// (the ratio fell back to the clamped Dice proxy).
+    #[test]
+    fn refine_compute_on_long_members_is_cheap_and_sampled() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+
+        let long_seq: Vec<String> = (0..=LCS_MAX_SEQ_TOKENS).map(|i| format!("t{i}")).collect();
+        let mk = |id: i64| RefineMember {
+            symbol_id: id,
+            lang: crate::language::Language::Rust,
+            path: format!("src/m{id}.rs"),
+            start_byte: 0,
+            end_byte: long_seq.len(),
+            struct_hash: format!("h{id}"),
+            seq: long_seq.clone(),
+        };
+        let members = vec![mk(1), mk(2)];
+        let key = refinement_key("rust", &["h1".into(), "h2".into()]);
+
+        let refinement = refine_compute_and_store(&conn, &key, "rust", &members, 1.0).unwrap();
+        assert!(refinement.lcs_sampled, "long-member compute must set lcs_sampled (proxy path)");
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "compute persists exactly one row");
+    }
+
+    /// Fix 3 (#215 Plan 4a round-2): the `lcs_sampled` bit is PERSISTED, so a class with ≤
+    /// `LCS_MEMBER_SAMPLE` members but LONG sequences (sampled via the per-pair length proxy on the
+    /// COLD compute) still reports `lcs_sampled = true` on a WARM cache hit. Before the fix the bit
+    /// was compute-only and `refine_lookup` hardcoded `false`, so the long-sequence sampling
+    /// dimension was lost on a warm hit. This test pins the round-trip end to end.
+    #[test]
+    fn lcs_sampled_survives_cache_hit_for_long_seq_small_class() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+
+        // A 2-member class (well below LCS_MEMBER_SAMPLE) with sequences past LCS_MAX_SEQ_TOKENS:
+        // the member-count cap does NOT engage, only the per-pair length proxy does — exactly the
+        // dimension the OR(member_count > LCS_MEMBER_SAMPLE) in apply_refinement cannot catch.
+        let long_seq: Vec<String> = (0..=LCS_MAX_SEQ_TOKENS).map(|i| format!("t{i}")).collect();
+        let mk = |id: i64| RefineMember {
+            symbol_id: id,
+            lang: crate::language::Language::Rust,
+            path: format!("src/m{id}.rs"),
+            start_byte: 0,
+            end_byte: long_seq.len(),
+            struct_hash: format!("h{id}"),
+            seq: long_seq.clone(),
+        };
+        let members = vec![mk(1), mk(2)];
+        let key = refinement_key("rust", &["h1".into(), "h2".into()]);
+
+        // COLD compute: the length proxy engages → lcs_sampled = true, and it is PERSISTED.
+        let cold = refine_compute_and_store(&conn, &key, "rust", &members, 1.0).unwrap();
+        assert!(cold.lcs_sampled, "cold compute on long seqs must set lcs_sampled");
+
+        // Confirm the bit landed in the row (1, not the DEFAULT 0).
+        let persisted: i64 = conn
+            .query_row(
+                "SELECT lcs_sampled FROM clone_refinements WHERE class_key = ?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 1, "lcs_sampled must be persisted as 1");
+
+        // WARM hit: refine_lookup reads the bit back — it must NOT degrade to false.
+        let warm = refine_lookup(&conn, &key).unwrap().expect("warm hit");
+        assert!(warm.lcs_sampled, "warm cache hit must read lcs_sampled=true back from the row");
     }
 
     /// [`refine_lookup`] is a PURE READ: a miss returns `None` and writes NOTHING — no
