@@ -306,12 +306,15 @@ pub(crate) fn build_class(
         similarity_medoid_min = 1.0;
     }
 
-    let member_count = component.len();
-    let total_members = member_count;
-    let cap = member_count.min(MAX_MEMBERS);
+    let total_members = component.len();
+    let cap = total_members.min(MAX_MEMBERS);
 
     // Hydrate CloneMembers via a scoped DB query with an IN clause.
-    let placeholders: Vec<String> = (1..=component.len()).map(|i| format!("?{i}")).collect();
+    // Fix 3: filter normalizer_version so stale fingerprint rows don't yield duplicate members
+    // or wrong token_len values. The version bind is appended as the last positional param after
+    // the id list (params_from_iter takes one iterable, so we chain the version onto the ids).
+    let id_placeholders: Vec<String> = (1..=component.len()).map(|i| format!("?{i}")).collect();
+    let version_placeholder = format!("?{}", component.len() + 1);
     let sql = format!(
         "SELECT ns.value, files.path, symbols.start_line, symbols.end_line, sf.token_len, \
          symbols.language
@@ -319,13 +322,16 @@ pub(crate) fn build_class(
          JOIN files ON files.id = symbols.file_id
          JOIN name_strings ns ON ns.id = symbols.qualified_name_id
          JOIN symbol_fingerprints sf
-           ON sf.symbol_id = symbols.id AND sf.normalizer_kind = 'baseline'
+           ON sf.symbol_id = symbols.id
+           AND sf.normalizer_kind = 'baseline'
+           AND sf.normalizer_version = {version_placeholder}
          WHERE symbols.id IN ({})",
-        placeholders.join(", ")
+        id_placeholders.join(", ")
     );
+    let params: Vec<i64> = component.iter().copied().chain(std::iter::once(NORM_VERSION)).collect();
     let mut stmt = conn.prepare(&sql)?;
     let raw_members: Vec<CloneMember> = stmt
-        .query_map(rusqlite::params_from_iter(component.iter()), |row| {
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok(CloneMember {
                 r#ref: row.get(0)?,
                 path: row.get(1)?,
@@ -340,11 +346,9 @@ pub(crate) fn build_class(
     let language =
         raw_members.first().map(|m| m.language.clone()).unwrap_or_else(|| bags[0].language.clone());
 
-    let members_returned = raw_members.len().min(cap);
-    let members: Vec<CloneMember> = raw_members.into_iter().take(cap).collect();
-
-    // Distinct parent directories among the (capped) returned members.
-    let parent_dirs: std::collections::BTreeSet<String> = members
+    // Fix 1: cross_module_spread counts ALL hydrated members (full component), not just the
+    // capped subset — so it is consistent with member_count (both over the full population).
+    let parent_dirs: std::collections::BTreeSet<String> = raw_members
         .iter()
         .map(|m| {
             std::path::Path::new(&m.path)
@@ -354,6 +358,16 @@ pub(crate) fn build_class(
         })
         .collect();
     let cross_module_spread = parent_dirs.len();
+
+    // Fix 2: class_key is over ALL members (full component), not just the capped slice — two
+    // classes sharing the first MAX_MEMBERS members but differing later must get different keys.
+    let member_refs: Vec<String> = raw_members.iter().map(|m| m.r#ref.clone()).collect();
+    let class_key = class_key_for(&member_refs);
+
+    // Cap the returned member list AFTER computing spread and key from the full set.
+    let member_count = total_members;
+    let members_returned = raw_members.len().min(cap);
+    let members: Vec<CloneMember> = raw_members.into_iter().take(cap).collect();
 
     // Load-bearing factor: 1 + ln(1 + max_fan_in_score) over members. Fan-in proxy via
     // `scoped_weighted_fan_in` (heuristic-only, no oracle data at this call site).
@@ -379,9 +393,6 @@ pub(crate) fn build_class(
         * body_token_len_medoid as f64
         * load_bearing_factor
         * cohesion_min_pairwise;
-
-    let member_refs: Vec<String> = members.iter().map(|m| m.r#ref.clone()).collect();
-    let class_key = class_key_for(&member_refs);
 
     let roi_factors = RoiFactors {
         member_count,
