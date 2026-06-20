@@ -12759,3 +12759,80 @@ fn clones_for_symbol_returns_the_class_by_ref_and_by_path_line() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Worktree-overlay scope: `find_clones` returns the BRANCH-ONLY clone class under the overlay
+/// scope, and the base scope has no clone classes. Proves the clone read is scope-correct —
+/// only the branch's symbol_fingerprint rows (written by `index_worktree_overlay`) are visible
+/// under the linked scope; the base sees only its own (non-clone) file.
+#[test]
+fn worktree_overlay_find_clones_reflects_branch_clone_pair() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    // Base has only a tiny function — below MIN_TOKENS, so no fingerprint, no clone class.
+    fs::write(main.join("src/base.rs"), "pub fn tiny() -> i32 { 0 }\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Confirm base has NO clone classes.
+    let base_before = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(
+        base_before.classes.is_empty(),
+        "base scope must have no clone classes before overlay: {:?}",
+        base_before.classes
+    );
+
+    // Create a linked worktree on a new branch that ADDS a rename-clone pair.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Two renamed-clone functions — same structure as the existing clone fixture.
+    fs::write(
+        linked.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        linked.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "add clone pair"]);
+
+    // Index the overlay — leaves connection in the linked scope.
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.indexed >= 1, "the branch's new files are indexed as overlay rows");
+
+    // Under the overlay scope, find_clones must return the branch's clone class.
+    let overlay_res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        overlay_res.classes.len(),
+        1,
+        "overlay scope must expose exactly the branch's clone class: {:?}",
+        overlay_res.classes
+    );
+    let class = &overlay_res.classes[0];
+    assert_eq!(class.member_count, 2, "the branch clone class has 2 members");
+
+    // Base scope must still have no clone classes.
+    set_base_scope(&mut db, &main);
+    let base_after = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(
+        base_after.classes.is_empty(),
+        "base scope must have no clone classes after overlay indexing: {:?}",
+        base_after.classes
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}

@@ -167,7 +167,6 @@ impl IndexDatabase {
         let min_copies = opts.min_copies.unwrap_or(2);
         let min_sim = opts.min_similarity.unwrap_or(THETA);
 
-        let mut truncated = false;
         let mut classes: Vec<CandidateCloneClass> = Vec::new();
 
         for component in &components {
@@ -177,9 +176,6 @@ impl IndexDatabase {
             match build_class(component, &by_id, conn)? {
                 None => continue,
                 Some(class) => {
-                    if class.members_returned < class.total_members {
-                        truncated = true;
-                    }
                     if class.similarity_min < min_sim {
                         continue;
                     }
@@ -194,6 +190,8 @@ impl IndexDatabase {
         if let Some(limit) = opts.limit {
             classes.truncate(limit);
         }
+
+        let truncated = classes.iter().any(|c| c.members_returned < c.total_members);
 
         let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
 
@@ -442,7 +440,8 @@ pub(crate) fn build_class(
            ON sf.symbol_id = symbols.id
            AND sf.normalizer_kind = 'baseline'
            AND sf.normalizer_version = {version_placeholder}
-         WHERE symbols.id IN ({})",
+         WHERE symbols.id IN ({})
+         ORDER BY symbols.id",
         id_placeholders.join(", ")
     );
     let params: Vec<i64> = component.iter().copied().chain(std::iter::once(NORM_VERSION)).collect();
@@ -484,7 +483,8 @@ pub(crate) fn build_class(
     // Cap the returned member list AFTER computing spread and key from the full set.
     let member_count = total_members;
     let members_returned = raw_members.len().min(cap);
-    let members: Vec<CloneMember> = raw_members.into_iter().take(cap).collect();
+    let mut members: Vec<CloneMember> = raw_members.into_iter().take(cap).collect();
+    members.sort_unstable_by(|a, b| a.r#ref.cmp(&b.r#ref));
 
     // Load-bearing factor: 1 + ln(1 + max_fan_in_score) over members. Fan-in proxy via
     // `scoped_weighted_fan_in` (heuristic-only, no oracle data at this call site).
