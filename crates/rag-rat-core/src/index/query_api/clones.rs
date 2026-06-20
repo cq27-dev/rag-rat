@@ -414,6 +414,15 @@ fn count_stale_member_paths(
     conn: &Connection,
     classes: &[CandidateCloneClass],
 ) -> anyhow::Result<usize> {
+    // `source_path_is_stale` reads bytes from `source_root` (the MAIN checkout). Under a
+    // linked-worktree overlay scope the scoped clone results come from the BRANCH bytes
+    // (`index_worktree_overlay`), so a main-checkout comparison is meaningless: branch-only files
+    // look "missing" (false stale) and same-path branch edits diff against base content (false
+    // stale). Mirror `heal_file` / the search-heal path / `parser_failures`, which all early-return
+    // under an overlay scope, and report 0 (no main-checkout staleness signal is available here).
+    if db.active_scope_is_linked_overlay() {
+        return Ok(0);
+    }
     // Collect distinct paths across all returned members.
     let mut distinct_paths: BTreeSet<String> = BTreeSet::new();
     for class in classes {

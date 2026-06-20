@@ -13163,6 +13163,16 @@ fn worktree_overlay_find_clones_reflects_branch_clone_pair() {
     let class = &overlay_res.classes[0];
     assert_eq!(class.member_count, 2, "the branch clone class has 2 members");
 
+    // Round-6 regression (#215): `stale_members` must be 0 under an overlay scope. The branch's
+    // members (src/a.rs, src/b.rs) are branch-ONLY — absent from the main checkout — so a
+    // main-checkout staleness comparison would count them both "missing" → stale=2 (false). The
+    // overlay is maintained from branch bytes, so `count_stale_member_paths` correctly skips the
+    // main-checkout check under a linked-overlay scope and reports 0.
+    assert_eq!(
+        overlay_res.completeness.stale_members, 0,
+        "branch-only overlay members must not be falsely reported stale against the main checkout"
+    );
+
     // Base scope must still have no clone classes.
     set_base_scope(&mut db, &main);
     let base_after = db
