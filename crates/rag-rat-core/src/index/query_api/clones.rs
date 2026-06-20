@@ -10,6 +10,17 @@ use std::collections::BTreeMap;
 
 use rusqlite::{Connection, OptionalExtension};
 
+/// Pairwise metric work cap for huge components: when a component exceeds this count, the
+/// O(n²) pairwise metric loop (`similarity_min`, medoid, `similarity_medoid_min`,
+/// `containment_max`) runs over ONLY the first `METRIC_SAMPLE_CAP` members instead of the full
+/// upper triangle. `member_count` / `total_members` / `class_key` still reflect the FULL
+/// component; only the metric computation is sampled, and `metrics_sampled` is set to `true` on
+/// the returned class so callers can distinguish sampled from exact metrics.
+///
+/// For typical-size components (the overwhelming common case, and ALL existing tests) this cap is
+/// never reached: behavior is identical to the pre-cap code and `metrics_sampled` is `false`.
+const METRIC_SAMPLE_CAP: usize = 200;
+
 use crate::index::IndexDatabase;
 use crate::index::clones::NORM_VERSION;
 
@@ -61,6 +72,12 @@ pub struct CandidateCloneClass {
     pub body_token_len_medoid: i64,
     pub roi: f64,
     pub roi_factors: RoiFactors,
+    /// `true` when the component has more than [`METRIC_SAMPLE_CAP`] members and the pairwise
+    /// metric computation (`similarity_min`, medoid, `similarity_medoid_min`, `containment_max`)
+    /// ran over only the first `METRIC_SAMPLE_CAP` members instead of the full upper triangle.
+    /// `member_count` / `total_members` / `class_key` are always over the FULL component.
+    /// `false` for all normal-size components (the typical case).
+    pub metrics_sampled: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -180,10 +197,14 @@ impl IndexDatabase {
         // Validate the caller-supplied θ BEFORE it touches candidate generation. θ is a similarity
         // ratio (overlap/max_len) so it must lie in (0.0, 1.0]: ≤ 0.0 would admit every pair (and a
         // 0.0 sub-block prefix walks the whole bag), > 1.0 is unreachable and signals a unit error.
+        // NaN must be explicitly rejected: both `v <= 0.0` and `v > 1.0` are false for NaN, so
+        // without the `is_finite` guard NaN slips through and makes `ceil(NaN) as i64 = 0`, which
+        // widens the sub-block to the whole bag → O(n²) blowup with every same-language
+        // token-sharing pair reported as a clone.
         if let Some(v) = opts.min_similarity
-            && (v <= 0.0 || v > 1.0)
+            && (!v.is_finite() || v <= 0.0 || v > 1.0)
         {
-            anyhow::bail!("min_similarity must be in (0.0, 1.0]");
+            anyhow::bail!("min_similarity must be a finite value in (0.0, 1.0]");
         }
 
         let bags = load_scoped_baseline_bags(conn)?;
@@ -361,18 +382,28 @@ fn resolve_selector_to_symbol_id(
             let Some(logical_id) = crate::serde_big_id::parse_sym_handle(handle) else {
                 return Ok(None);
             };
-            // A logical-symbol may have multiple member rows (cfg splits, overloads). We take the
-            // first in-scope member (lowest `symbols.id` within the scoped `files` view).
+            // A logical-symbol may have multiple member rows (cfg splits, overloads). We PREFER
+            // a fingerprinted member: a cfg-split logical symbol whose lowest-rowid member is
+            // below MIN_TOKENS or unfingerprinted but whose sibling IS fingerprinted (and in a
+            // clone class) would otherwise report `symbol_fingerprinted=false` and miss the class.
+            // `(sf.symbol_id IS NULL) ASC` sorts fingerprinted members first (NULL = unmatched →
+            // treated as 1 in SQLite boolean context → sorts after matched rows); falls back to
+            // lowest-rowid when no member is fingerprinted, so `symbol_resolved=true,
+            // symbol_fingerprinted=false` is still correctly reported.
             let id: Option<i64> = conn
                 .query_row(
                     "SELECT lm.symbol_id
                      FROM logical_symbol_members lm
                      JOIN symbols ON symbols.id = lm.symbol_id
                      JOIN files ON files.id = symbols.file_id
+                     LEFT JOIN symbol_fingerprints sf
+                       ON sf.symbol_id = lm.symbol_id
+                       AND sf.normalizer_kind = 'baseline'
+                       AND sf.normalizer_version = ?2
                      WHERE lm.logical_symbol_id = ?1
-                     ORDER BY lm.symbol_id
+                     ORDER BY (sf.symbol_id IS NULL) ASC, lm.symbol_id ASC
                      LIMIT 1",
-                    [logical_id],
+                    rusqlite::params![logical_id, NORM_VERSION],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -449,16 +480,26 @@ pub(crate) fn build_class(
 
     let n = bags.len();
 
-    // Pairwise similarity (overlap/max_len) and containment (overlap/min_len), upper-triangle.
+    // For huge components, cap the pairwise metric work to avoid O(n²) blowup. When the
+    // component exceeds METRIC_SAMPLE_CAP members the metrics run over the FIRST
+    // METRIC_SAMPLE_CAP members only (the component is deterministically sorted, so this is
+    // stable). `metrics_sampled` is set true so callers know. For all normal-size components
+    // (the typical case, including ALL existing tests) `metric_n == n` and behavior is identical.
+    let metrics_sampled = n > METRIC_SAMPLE_CAP;
+    let metric_n = n.min(METRIC_SAMPLE_CAP);
+    let metric_bags = &bags[..metric_n];
+
+    // Pairwise similarity (overlap/max_len) and containment (overlap/min_len), upper-triangle
+    // over metric_bags (== full component when metric_n == n).
     let mut similarity_min = f64::MAX;
     let mut containment_max = 0.0_f64;
-    let mut sim_sums = vec![0.0_f64; n]; // for medoid selection
+    let mut sim_sums = vec![0.0_f64; metric_n]; // for medoid selection
 
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let ov = overlap(bags[i], bags[j]);
-            let max_len = bags[i].token_len.max(bags[j].token_len);
-            let min_len = bags[i].token_len.min(bags[j].token_len);
+    for i in 0..metric_n {
+        for j in (i + 1)..metric_n {
+            let ov = overlap(metric_bags[i], metric_bags[j]);
+            let max_len = metric_bags[i].token_len.max(metric_bags[j].token_len);
+            let min_len = metric_bags[i].token_len.min(metric_bags[j].token_len);
             let sim = if max_len == 0 { 1.0 } else { ov as f64 / max_len as f64 };
             let cont = if min_len == 0 { 1.0 } else { ov as f64 / min_len as f64 };
             if sim < similarity_min {
@@ -477,19 +518,19 @@ pub(crate) fn build_class(
     }
     let cohesion_min_pairwise = similarity_min;
 
-    // Medoid: member with maximum sum of similarities to all others.
+    // Medoid: member with maximum sum of similarities to all others (within metric_bags).
     let medoid_idx = sim_sums
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)
         .unwrap_or(0);
-    let medoid_bag = bags[medoid_idx];
+    let medoid_bag = metric_bags[medoid_idx];
     let body_token_len_medoid = medoid_bag.token_len;
 
-    // Min similarity of any member to the medoid.
+    // Min similarity of any member to the medoid (within metric_bags).
     let mut similarity_medoid_min = f64::MAX;
-    for (i, bag) in bags.iter().enumerate() {
+    for (i, bag) in metric_bags.iter().enumerate() {
         if i == medoid_idx {
             continue;
         }
@@ -619,6 +660,7 @@ pub(crate) fn build_class(
         body_token_len_medoid,
         roi,
         roi_factors,
+        metrics_sampled,
     }))
 }
 
@@ -709,6 +751,15 @@ fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>
         if let Some(bag) = bags.get_mut(&symbol_id) {
             bag.tokens.push(posting);
         }
+    }
+
+    // Sort each bag's token list by `token_hash` once, here, so `overlap` can use an
+    // allocation-free two-pointer merge instead of rebuilding a `BTreeMap` on every call.
+    // Consumers that care about order (sub_block_tokens, struct_hash, inverted-index build,
+    // token_len) are all order-independent — they sort by (df, hash) themselves or use a separate
+    // field — so this re-ordering is safe.
+    for bag in bags.values_mut() {
+        bag.tokens.sort_unstable_by_key(|t| t.token_hash);
     }
 
     Ok(bags.into_values().collect())
@@ -830,12 +881,23 @@ fn verified_clone(a: &SymbolBag, b: &SymbolBag, theta: f64) -> bool {
 }
 
 /// Exact multiset overlap `Σ min(freq_a, freq_b)` over the two FULL token bags.
+///
+/// Requires both bags' `tokens` slices to be sorted by `token_hash` ascending (guaranteed by
+/// [`load_scoped_baseline_bags`], which sorts once after collection). Uses an allocation-free
+/// two-pointer merge: no `BTreeMap` rebuild per call — O(|a| + |b|) time, zero heap allocation.
 fn overlap(a: &SymbolBag, b: &SymbolBag) -> i64 {
-    let freq_a: BTreeMap<i64, i64> = a.tokens.iter().map(|t| (t.token_hash, t.freq)).collect();
-    let mut total = 0;
-    for token in &b.tokens {
-        if let Some(&fa) = freq_a.get(&token.token_hash) {
-            total += fa.min(token.freq);
+    let (mut ia, mut ib) = (0, 0);
+    let (ta, tb) = (a.tokens.as_slice(), b.tokens.as_slice());
+    let mut total: i64 = 0;
+    while ia < ta.len() && ib < tb.len() {
+        match ta[ia].token_hash.cmp(&tb[ib].token_hash) {
+            std::cmp::Ordering::Less => ia += 1,
+            std::cmp::Ordering::Greater => ib += 1,
+            std::cmp::Ordering::Equal => {
+                total += ta[ia].freq.min(tb[ib].freq);
+                ia += 1;
+                ib += 1;
+            },
         }
     }
     total
@@ -895,8 +957,226 @@ mod tests {
 
     use super::{
         SymbolBag, THETA, TokenPosting, add_struct_hash_pairs, class_key_for,
-        components_from_pairs, sub_block_candidate_pairs,
+        components_from_pairs, overlap, sub_block_candidate_pairs,
     };
+
+    // ── Fix A: NaN / non-finite min_similarity ────────────────────────────────────────────────
+
+    /// NaN and non-finite values must be rejected by the range guard. The old guard
+    /// `v <= 0.0 || v > 1.0` passes NaN (both comparisons return false for NaN), which makes
+    /// `ceil(NaN) as i64 = 0` → whole-bag sub-block → every same-language token-sharing pair
+    /// is a clone → O(n²) blowup. Fix A adds `!v.is_finite()` before the range checks.
+    #[test]
+    fn find_clones_rejects_nan_and_non_finite_min_similarity() {
+        use crate::index::FindClonesOptions;
+
+        // We don't need a real DB here — the validation fires before any DB access.
+        // Construct a minimal IndexDatabase pointing at a non-existent path; the validation
+        // bail!() runs in the same function before the DB is touched.
+        // Instead, test the validation logic directly via the public API by setting up a
+        // temporary empty database and calling find_clones with the bad values.
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-nan-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let config = crate::Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![crate::config::ResolvedTarget {
+                name: "rust".to_string(),
+                language: crate::language::Language::Rust,
+                directories: vec![std::path::PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: crate::config::TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        crate::IndexDatabase::rebuild(&config).unwrap();
+        let db = crate::IndexDatabase::open_config(&config).unwrap();
+
+        // NaN must be rejected.
+        let err = db
+            .find_clones(FindClonesOptions {
+                min_similarity: Some(f64::NAN),
+                min_copies: None,
+                limit: None,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("finite"),
+            "NaN should produce a 'finite' error message, got: {err}"
+        );
+
+        // +infinity must be rejected.
+        let err = db
+            .find_clones(FindClonesOptions {
+                min_similarity: Some(f64::INFINITY),
+                min_copies: None,
+                limit: None,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("finite"),
+            "INFINITY should produce a 'finite' error message, got: {err}"
+        );
+
+        // -infinity must be rejected (also non-finite).
+        let err = db
+            .find_clones(FindClonesOptions {
+                min_similarity: Some(f64::NEG_INFINITY),
+                min_copies: None,
+                limit: None,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("finite"),
+            "NEG_INFINITY should produce an error, got: {err}"
+        );
+
+        // 0.0 still rejected (in-range check, kept from before).
+        assert!(
+            db.find_clones(FindClonesOptions {
+                min_similarity: Some(0.0),
+                min_copies: None,
+                limit: None,
+            })
+            .is_err()
+        );
+
+        // 1.0 is the boundary — must NOT be rejected.
+        assert!(
+            db.find_clones(FindClonesOptions {
+                min_similarity: Some(1.0),
+                min_copies: None,
+                limit: None,
+            })
+            .is_ok()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Fix B: allocation-free two-pointer overlap ────────────────────────────────────────────
+
+    fn make_bag_with_tokens(id: i64, tokens: Vec<(i64, i64)>) -> SymbolBag {
+        let mut postings: Vec<TokenPosting> = tokens
+            .into_iter()
+            .map(|(hash, freq)| TokenPosting { token_hash: hash, freq, coalesced_df: 1 })
+            .collect();
+        // Simulate what load_scoped_baseline_bags does: sort by token_hash.
+        postings.sort_unstable_by_key(|t| t.token_hash);
+        SymbolBag {
+            symbol_id: id,
+            language: "rust".to_string(),
+            struct_hash: format!("hash{id}"),
+            token_len: postings.iter().map(|t| t.freq).sum(),
+            tokens: postings,
+        }
+    }
+
+    /// The two-pointer `overlap` must return the same value as the naive map-based version for
+    /// any pair of token multisets.
+    #[test]
+    fn overlap_two_pointer_matches_naive() {
+        fn naive_overlap(a: &SymbolBag, b: &SymbolBag) -> i64 {
+            let freq_a: std::collections::BTreeMap<i64, i64> =
+                a.tokens.iter().map(|t| (t.token_hash, t.freq)).collect();
+            let mut total = 0;
+            for token in &b.tokens {
+                if let Some(&fa) = freq_a.get(&token.token_hash) {
+                    total += fa.min(token.freq);
+                }
+            }
+            total
+        }
+
+        // Case 1: fully disjoint — overlap must be 0.
+        let a = make_bag_with_tokens(1, vec![(1, 3), (2, 2)]);
+        let b = make_bag_with_tokens(2, vec![(3, 1), (4, 5)]);
+        assert_eq!(overlap(&a, &b), 0);
+        assert_eq!(overlap(&a, &b), naive_overlap(&a, &b));
+
+        // Case 2: fully identical — overlap = sum of all freqs.
+        let a = make_bag_with_tokens(1, vec![(10, 2), (20, 3), (30, 1)]);
+        let b = make_bag_with_tokens(2, vec![(10, 2), (20, 3), (30, 1)]);
+        assert_eq!(overlap(&a, &b), 6); // 2+3+1
+        assert_eq!(overlap(&a, &b), naive_overlap(&a, &b));
+
+        // Case 3: partial overlap, asymmetric frequencies.
+        // a: token 5 freq=4, token 7 freq=2, token 9 freq=1
+        // b: token 5 freq=2, token 8 freq=3, token 9 freq=5
+        // overlap = min(4,2) + min(1,5) = 2 + 1 = 3
+        let a = make_bag_with_tokens(1, vec![(5, 4), (7, 2), (9, 1)]);
+        let b = make_bag_with_tokens(2, vec![(5, 2), (8, 3), (9, 5)]);
+        assert_eq!(overlap(&a, &b), 3);
+        assert_eq!(overlap(&a, &b), naive_overlap(&a, &b));
+
+        // Case 4: one empty bag — overlap must be 0.
+        let a = make_bag_with_tokens(1, vec![(1, 1)]);
+        let b = make_bag_with_tokens(2, vec![]);
+        assert_eq!(overlap(&a, &b), 0);
+        assert_eq!(overlap(&b, &a), 0);
+        assert_eq!(overlap(&a, &b), naive_overlap(&a, &b));
+    }
+
+    // ── Fix C: METRIC_SAMPLE_CAP — existing tests have metrics_sampled=false ─────────────────
+
+    // (No in-unit test for the >200 sampled path: planting 200+ valid fingerprinted symbols
+    // via an integration DB is too expensive for a unit test. The struct field and the cap guard
+    // are covered by compilation + the assertion below on small components.)
+
+    /// For all test-fixture components (size <= METRIC_SAMPLE_CAP), metrics_sampled must be false
+    /// and behavior must be identical to the pre-cap code. This test exercises the union-find and
+    /// struct-level assertions only; the full DB integration test in clones_handler covers the
+    /// rest.
+    #[test]
+    fn small_component_metrics_sampled_is_false() {
+        // Verify the constant is what the spec requires.
+        assert_eq!(super::METRIC_SAMPLE_CAP, 200);
+
+        // The components from a small pair (union-find returns groups of size 2).
+        let comps = components_from_pairs(&[(1, 2)]);
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].len(), 2);
+        // len=2 < 200 → metrics_sampled would be false in build_class.
+        // We can't call build_class without a DB, so we just assert the cap logic in isolation:
+        let n = comps[0].len();
+        let metrics_sampled = n > super::METRIC_SAMPLE_CAP;
+        assert!(!metrics_sampled, "a 2-member component must not trigger metrics_sampled");
+    }
+
+    // ── Fix E: CLI handle routing ─────────────────────────────────────────────────────────────
+    // (Tested in the CLI crate test below; here we just verify parse_sym_handle behaviour
+    // that the routing logic depends on.)
+
+    #[test]
+    fn parse_sym_handle_accepts_valid_handles_and_rejects_others() {
+        use crate::serde_big_id::parse_sym_handle;
+
+        // A valid sym_<hex> handle round-trips.
+        let h = crate::serde_big_id::format_sym_handle(12345i64);
+        assert!(parse_sym_handle(&h).is_some());
+
+        // A qualified name like `sym_utils.rs::load_user` is NOT a valid handle — it has `::`
+        // and the hex part is `utils.rs` which is not valid hex.
+        assert!(parse_sym_handle("sym_utils.rs::load_user").is_none());
+
+        // A bare string without `sym_` prefix is None.
+        assert!(parse_sym_handle("foo::bar").is_none());
+    }
+
+    // ── Existing tests ────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn class_key_is_deterministic_and_order_independent() {

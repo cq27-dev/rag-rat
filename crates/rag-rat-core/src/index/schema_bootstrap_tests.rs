@@ -12853,7 +12853,7 @@ fn find_clones_rejects_out_of_range_min_similarity() {
         limit: None,
     });
     let err = zero.expect_err("min_similarity = 0.0 must be rejected").to_string();
-    assert!(err.contains("min_similarity must be in (0.0, 1.0]"), "{err}");
+    assert!(err.contains("(0.0, 1.0]"), "{err}");
 
     // 1.5 (above 1.0) → error.
     let high = db.find_clones(FindClonesOptions {
@@ -12862,7 +12862,7 @@ fn find_clones_rejects_out_of_range_min_similarity() {
         limit: None,
     });
     let err = high.expect_err("min_similarity = 1.5 must be rejected").to_string();
-    assert!(err.contains("min_similarity must be in (0.0, 1.0]"), "{err}");
+    assert!(err.contains("(0.0, 1.0]"), "{err}");
 
     // 1.0 (boundary, inclusive upper) → accepted.
     db.find_clones(FindClonesOptions { min_similarity: Some(1.0), min_copies: None, limit: None })
