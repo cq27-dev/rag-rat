@@ -298,3 +298,72 @@ fn unique_temp_root() -> PathBuf {
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("rag-rat-mcp-stdio-test-{}-{id}", std::process::id()))
 }
+
+#[test]
+fn mcp_stdio_find_clones_returns_class_for_planted_pair() {
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two identical functions → struct_hash fast path produces a clone pair.
+    let clone_body = "pub fn cloned_helper(x: i32, y: i32) -> i32 {\n    x + y + 42\n}\n";
+    fs::write(root.join("src/lib.rs"), format!("{clone_body}pub mod a;\npub mod b;\n")).unwrap();
+    fs::write(root.join("src/a.rs"), clone_body).unwrap();
+    fs::write(root.join("src/b.rs"), clone_body).unwrap();
+    fs::write(
+        root.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+
+    let config_path = root.join("rag-rat.toml");
+    let config = Config::load(&config_path).unwrap();
+    rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_rag-rat");
+    let mut child = Command::new(binary)
+        .arg("mcp")
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "rag-rat-test", "version": "0.1"}}
+        }),
+    );
+    let _ = recv(&mut reader);
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "find_clones", "arguments": {"min_copies": 2}}
+        }),
+    );
+    let response = recv(&mut reader);
+    let result = response_text_json(response);
+    let classes = result["classes"].as_array().expect("find_clones returns classes array");
+    assert!(
+        classes.iter().any(|c| c["member_count"].as_u64().unwrap_or(0) >= 2),
+        "find_clones must return at least one class with member_count >= 2 for the planted clone \
+         pair: {result:?}"
+    );
+
+    stop(child);
+    fs::remove_dir_all(root).unwrap();
+}

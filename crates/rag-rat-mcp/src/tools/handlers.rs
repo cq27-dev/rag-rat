@@ -193,6 +193,14 @@ pub(crate) fn call_tool_with_db(
             let args: MemoryIdArgs = serde_json::from_value(arguments)?;
             json!(db.memory_mark_obsolete(&args.memory_id)?)
         },
+        "find_clones" => {
+            let args: FindClonesArgs = serde_json::from_value(arguments)?;
+            find_clones_tool(db, args)?
+        },
+        "clones_for_symbol" => {
+            let args: ClonesForSymbolArgs = serde_json::from_value(arguments)?;
+            clones_for_symbol_tool(db, args)?
+        },
         other => anyhow::bail!("unknown tool `{other}`"),
     };
     Ok(result)
@@ -623,4 +631,22 @@ pub(crate) fn graph_symbol_selector(args: &SymbolGraphArgs) -> anyhow::Result<Sy
         allow_ambiguous: args.allow_ambiguous,
         limit: args.limit,
     })
+}
+
+pub(crate) fn find_clones_tool(db: &IndexDatabase, args: FindClonesArgs) -> anyhow::Result<Value> {
+    use rag_rat_core::index::FindClonesOptions;
+    let result = db.find_clones(FindClonesOptions {
+        min_similarity: args.min_similarity,
+        min_copies: args.min_copies,
+        limit: args.limit,
+    })?;
+    Ok(json!(result))
+}
+
+pub(crate) fn clones_for_symbol_tool(
+    db: &IndexDatabase,
+    args: ClonesForSymbolArgs,
+) -> anyhow::Result<Value> {
+    let selector = args.into_selector()?;
+    Ok(json!(db.clones_for_symbol(selector)?))
 }

@@ -11,11 +11,11 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, tool, tool_handler,
 use serde_json::{Map, Value, json};
 
 use crate::tools::{
-    BlameChunkArgs, CompareGraphTextArgs, EmptyArgs, HealIndexArgs, ImpactArgs,
-    ImportantSymbolsArgs, LimitArgs, MemoryCreateArgs, MemoryForCallPathArgs, MemoryForPathArgs,
-    MemoryForSymbolArgs, MemoryIdArgs, MemoryRebindArgs, MemorySearchArgs, MemoryUpdateArgs,
-    PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs, RepoBriefArgs,
-    RepoClustersArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
+    BlameChunkArgs, ClonesForSymbolArgs, CompareGraphTextArgs, EmptyArgs, FindClonesArgs,
+    HealIndexArgs, ImpactArgs, ImportantSymbolsArgs, LimitArgs, MemoryCreateArgs,
+    MemoryForCallPathArgs, MemoryForPathArgs, MemoryForSymbolArgs, MemoryIdArgs, MemoryRebindArgs,
+    MemorySearchArgs, MemoryUpdateArgs, PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs,
+    ReadChunkArgs, RepoBriefArgs, RepoClustersArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -210,6 +210,28 @@ impl RagRatService {
         Parameters(args): Parameters<ImportantSymbolsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("important_symbols", json!(args))
+    }
+
+    #[tool(
+        name = "find_clones",
+        description = "Ranked candidate clone classes (unrefined; exact overlap metrics)."
+    )]
+    fn find_clones(
+        &self,
+        Parameters(args): Parameters<FindClonesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("find_clones", json!(args))
+    }
+
+    #[tool(
+        name = "clones_for_symbol",
+        description = "The clone class containing a symbol (by id / ref / path+line)."
+    )]
+    fn clones_for_symbol(
+        &self,
+        Parameters(args): Parameters<ClonesForSymbolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("clones_for_symbol", json!(args))
     }
 
     #[tool(

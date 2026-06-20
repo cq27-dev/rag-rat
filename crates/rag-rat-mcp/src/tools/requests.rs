@@ -771,6 +771,46 @@ impl MemoryUpdateArgs {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FindClonesArgs {
+    pub min_similarity: Option<f64>,
+    pub min_copies: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ClonesForSymbolArgs {
+    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
+    #[serde(
+        rename = "id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
+    #[schemars(with = "Option<String>")]
+    pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "ref")]
+    pub symbol_ref: Option<String>,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+}
+
+impl ClonesForSymbolArgs {
+    pub(super) fn into_selector(self) -> anyhow::Result<rag_rat_core::index::CloneSymbolSelector> {
+        use rag_rat_core::index::CloneSymbolSelector;
+        if let Some(id) = self.logical_symbol_id {
+            return Ok(CloneSymbolSelector::Id(rag_rat_core::serde_big_id::format_sym_handle(id)));
+        }
+        if let Some(r) = self.symbol_ref {
+            return Ok(CloneSymbolSelector::Ref(r));
+        }
+        match (self.path, self.line) {
+            (Some(path), Some(line)) => Ok(CloneSymbolSelector::PathLine { path, line }),
+            _ => anyhow::bail!("clones_for_symbol requires exactly one of: id, ref, or path+line"),
+        }
+    }
+}
+
 impl From<MemoryBindArgs> for RepoMemoryBindTarget {
     fn from(args: MemoryBindArgs) -> Self {
         Self {

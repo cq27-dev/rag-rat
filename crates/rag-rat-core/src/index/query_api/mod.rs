@@ -16,7 +16,6 @@ mod memory;
 mod oracle_runs;
 mod search;
 
-#[allow(unused_imports)] // consumed by MCP/CLI layers (Plan-2 T5/T6)
 pub use clones::{
     CandidateCloneClass, CloneCompleteness, CloneMember, CloneSymbolSelector, FindClonesOptions,
     FindClonesResult, RoiFactors,

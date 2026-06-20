@@ -73,6 +73,7 @@ fn arg_struct_handles_survive_an_rmcp_style_serde_round_trip() {
     assert_handle_round_trips!(MemoryBindArgs, "id", json!({ "id": HANDLE }));
     assert_handle_round_trips!(MemoryBindArgs, "start_id", json!({ "start_id": HANDLE }));
     assert_handle_round_trips!(MemoryBindArgs, "end_id", json!({ "end_id": HANDLE }));
+    assert_handle_round_trips!(ClonesForSymbolArgs, "id", json!({ "id": HANDLE }));
 }
 
 #[test]
@@ -158,6 +159,8 @@ fn list_tools_exposes_complete_typed_schemas() {
         "memory_for_call_path",
         "memory_validate",
         "memory_mark_obsolete",
+        "find_clones",
+        "clones_for_symbol",
     ] {
         assert!(names.contains(&expected), "missing MCP tool {expected}");
     }
@@ -288,6 +291,13 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_requires(tools, "memory_mark_obsolete", "memory_id");
     assert_eq!(tool_schema(tools, "memory_validate")["type"], "object");
     assert_eq!(tool_schema(tools, "local_ai_status")["type"], "object");
+    assert_schema_has_property(tools, "find_clones", "min_similarity");
+    assert_schema_has_property(tools, "find_clones", "min_copies");
+    assert_schema_has_property(tools, "find_clones", "limit");
+    assert_schema_has_property(tools, "clones_for_symbol", "id");
+    assert_schema_has_property(tools, "clones_for_symbol", "ref");
+    assert_schema_has_property(tools, "clones_for_symbol", "path");
+    assert_schema_has_property(tools, "clones_for_symbol", "line");
 }
 
 #[test]

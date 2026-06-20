@@ -11,6 +11,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "repo_brief",
     "repo_clusters",
     "important_symbols",
+    "find_clones",
+    "clones_for_symbol",
     "ffi_surface",
     "docs_for_symbol",
     "read_chunk",
@@ -108,6 +110,14 @@ pub fn description(name: &str) -> &'static str {
              pass `personalize` (names, refs, or `sym_<hex>` handles you're working on) to seed it \
              explicitly, or a single `\"global\"` to force whole-repo PageRank. The result is a \
              labeled object: `mode` (which scale), `seed_source` (seed provenance), and `symbols`.",
+        "find_clones" =>
+            "Ranked candidate clone classes (unrefined; exact overlap metrics). Returns classes \
+             sorted by ROI (cross-module spread × member count × token length × load-bearing \
+             factor × cohesion), with a completeness provenance block.",
+        "clones_for_symbol" =>
+            "The clone class containing a symbol (by id / ref / path+line). Returns the candidate \
+             class if the symbol is fingerprinted and has clone siblings; null if it is unique or \
+             not fingerprinted.",
         "ffi_surface" =>
             "Find the FFI surface: #[uniffi::export] items, exported impl members, and generated \
              binding artifacts (detected by path). Empty in repos without FFI.",
@@ -209,6 +219,8 @@ pub fn schema(name: &str) -> Value {
         "repo_brief" => schema_for::<RepoBriefArgs>(),
         "repo_clusters" => schema_for::<RepoClustersArgs>(),
         "important_symbols" => schema_for::<ImportantSymbolsArgs>(),
+        "find_clones" => schema_for::<FindClonesArgs>(),
+        "clones_for_symbol" => schema_for::<ClonesForSymbolArgs>(),
         "ffi_surface" => schema_for::<LimitArgs>(),
         "read_chunk" => schema_for::<ReadChunkArgs>(),
         "git_history_for_path" | "github_refs_for_path" => schema_for::<PathHistoryArgs>(),
