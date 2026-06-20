@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use rusqlite::Connection;
 
 use crate::index::IndexDatabase;
+use crate::index::clones::NORM_VERSION;
 
 /// Similarity threshold θ: a candidate pair is kept iff `overlap / max_len >= THETA`. The MAX
 /// denominator is deliberate (design rev-4 §3b) — it bounds the member length ratio to ≈1/θ, the
@@ -28,6 +29,7 @@ const DF_FALLBACK: i64 = i64::MAX;
 /// One scoped baseline symbol's fingerprint, loaded for the candidate read.
 struct SymbolBag {
     symbol_id: i64,
+    language: String,
     struct_hash: String,
     token_len: i64,
     /// `(token_hash, freq, coalesced_df)` for every distinct token in the symbol's bag.
@@ -46,8 +48,8 @@ impl IndexDatabase {
     /// by EXACT max-denominator overlap, union-found into connected components. Both endpoints
     /// are filtered to the scoped `files` view BEFORE pairing, so a component never mixes
     /// out-of-scope symbols. Baseline postings only (recall is oracle-independent).
-    /// Over-generated on purpose — Plan 2's refine stage splits each component into coherent
-    /// clone classes.
+    /// Over-generated on purpose — `find_clones` (Plan 2) surfaces these as UNREFINED candidate
+    /// classes; the coherence split + anti-unification is Plan 4.
     pub fn candidate_clone_components(&self) -> anyhow::Result<Vec<Vec<i64>>> {
         let conn = self.storage.connection();
         let pairs = candidate_pairs(conn)?;
@@ -91,20 +93,22 @@ fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>
     // `files.generated = 0` excludes generated files (e.g. `src/generated/…`, `.d.ts`) from the
     // candidate read — they are fingerprinted on write but must not enter clone components.
     let mut fp_stmt = conn.prepare(
-        "SELECT sf.symbol_id, sf.struct_hash, sf.token_len
+        "SELECT sf.symbol_id, symbols.language, sf.struct_hash, sf.token_len
          FROM symbol_fingerprints sf
          JOIN symbols ON symbols.id = sf.symbol_id
          JOIN files ON files.id = symbols.file_id
          WHERE sf.normalizer_kind = 'baseline'
+           AND sf.normalizer_version = ?1
            AND files.generated = 0",
     )?;
     let mut bags: BTreeMap<i64, SymbolBag> = fp_stmt
-        .query_map([], |row| {
+        .query_map([NORM_VERSION], |row| {
             let symbol_id: i64 = row.get(0)?;
             Ok((symbol_id, SymbolBag {
                 symbol_id,
-                struct_hash: row.get(1)?,
-                token_len: row.get(2)?,
+                language: row.get(1)?,
+                struct_hash: row.get(2)?,
+                token_len: row.get(3)?,
                 tokens: Vec::new(),
             }))
         })?
@@ -141,12 +145,18 @@ fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>
     Ok(bags.into_values().collect())
 }
 
-/// Exact fast path: every group of symbols sharing a `struct_hash` is
+/// Exact fast path: every group of symbols sharing a `struct_hash` AND `language` is
 /// identical-after-normalization, so it contributes all its pairwise pairs (no overlap math).
+/// Language partition is required: different languages share no grammar token space, so a
+/// struct_hash collision across languages is a false positive.
 fn add_struct_hash_pairs(bags: &[SymbolBag], pairs: &mut std::collections::BTreeSet<(i64, i64)>) {
-    let mut by_hash: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
+    // Key: (struct_hash, language) — only same-language symbols can be struct-hash clones.
+    let mut by_hash: BTreeMap<(&str, &str), Vec<i64>> = BTreeMap::new();
     for bag in bags {
-        by_hash.entry(bag.struct_hash.as_str()).or_default().push(bag.symbol_id);
+        by_hash
+            .entry((bag.struct_hash.as_str(), bag.language.as_str()))
+            .or_default()
+            .push(bag.symbol_id);
     }
     for ids in by_hash.values() {
         for (i, &a) in ids.iter().enumerate() {
@@ -161,7 +171,14 @@ fn add_struct_hash_pairs(bags: &[SymbolBag], pairs: &mut std::collections::BTree
 /// pair of symbols sharing a sub-block token. Admissibility (design rev-4 §3b): two symbols can
 /// reach similarity ≥ θ only if their sub-blocks share a token hash, so this yields every true
 /// candidate pair regardless of df accuracy (given the shared total order).
+///
+/// Language partition: only same-language pairs are emitted — different languages have disjoint
+/// grammar token spaces, so a token-hash collision across languages is a false positive.
 fn sub_block_candidate_pairs(bags: &[SymbolBag]) -> std::collections::BTreeSet<(i64, i64)> {
+    // id → language for the partition guard applied at pair-emit time.
+    let lang_of: BTreeMap<i64, &str> =
+        bags.iter().map(|b| (b.symbol_id, b.language.as_str())).collect();
+
     let mut inverted: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     for bag in bags {
         for token_hash in sub_block_tokens(bag) {
@@ -173,6 +190,10 @@ fn sub_block_candidate_pairs(bags: &[SymbolBag]) -> std::collections::BTreeSet<(
     for ids in inverted.values() {
         for (i, &a) in ids.iter().enumerate() {
             for &b in &ids[i + 1..] {
+                // Language partition: skip cross-language pairs.
+                if lang_of[&a] != lang_of[&b] {
+                    continue;
+                }
                 candidate.insert((a.min(b), a.max(b)));
             }
         }
@@ -298,12 +319,68 @@ fn components_from_pairs(pairs: &[(i64, i64)]) -> Vec<Vec<i64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::components_from_pairs;
+    use std::collections::BTreeSet;
+
+    use super::{
+        SymbolBag, TokenPosting, add_struct_hash_pairs, components_from_pairs,
+        sub_block_candidate_pairs,
+    };
 
     #[test]
     fn union_find_groups_transitively_and_drops_singletons() {
         // 1-2, 2-3 => {1,2,3}; 5-6 => {5,6}; 9 alone => dropped.
         let comps = components_from_pairs(&[(1, 2), (2, 3), (5, 6)]);
         assert_eq!(comps, vec![vec![1, 2, 3], vec![5, 6]]);
+    }
+
+    /// Language partition unit test: two bags with IDENTICAL tokens/struct_hash/token_len but
+    /// DIFFERENT languages must NOT pair via either the struct-hash fast path or the sub-block
+    /// inverted-index path. Two same-language identical bags MUST pair via the struct-hash path.
+    #[test]
+    fn language_partition_blocks_cross_language_pairs_and_keeps_same_language() {
+        // Shared token bag — same tokens, same struct_hash, same token_len.
+        let make_bag = |id: i64, language: &str| SymbolBag {
+            symbol_id: id,
+            language: language.to_string(),
+            struct_hash: "deadbeef".to_string(),
+            token_len: 5,
+            tokens: vec![
+                TokenPosting { token_hash: 1, freq: 2, coalesced_df: 10 },
+                TokenPosting { token_hash: 2, freq: 1, coalesced_df: 20 },
+                TokenPosting { token_hash: 3, freq: 2, coalesced_df: 30 },
+            ],
+        };
+
+        // id=1 is Rust, id=2 is TypeScript — identical token bags, different language.
+        let bag_rust = make_bag(1, "rust");
+        let bag_ts = make_bag(2, "typescript");
+        // id=3 is also Rust, identical to id=1 — same language, same struct_hash.
+        let bag_rust2 = make_bag(3, "rust");
+
+        let bags = vec![bag_rust, bag_ts, bag_rust2];
+
+        // struct-hash fast path: must NOT produce a cross-language pair (1,2) but MUST produce
+        // same-language pair (1,3).
+        let mut hash_pairs: BTreeSet<(i64, i64)> = BTreeSet::new();
+        add_struct_hash_pairs(&bags, &mut hash_pairs);
+        assert!(
+            !hash_pairs.contains(&(1, 2)),
+            "struct-hash path must not pair rust(1) with typescript(2): {hash_pairs:?}"
+        );
+        assert!(
+            hash_pairs.contains(&(1, 3)),
+            "struct-hash path must pair rust(1) with rust(3): {hash_pairs:?}"
+        );
+
+        // sub-block inverted-index path: same assertions.
+        let sub_pairs = sub_block_candidate_pairs(&bags);
+        assert!(
+            !sub_pairs.contains(&(1, 2)),
+            "sub-block path must not pair rust(1) with typescript(2): {sub_pairs:?}"
+        );
+        assert!(
+            sub_pairs.contains(&(1, 3)),
+            "sub-block path must pair rust(1) with rust(3): {sub_pairs:?}"
+        );
     }
 }

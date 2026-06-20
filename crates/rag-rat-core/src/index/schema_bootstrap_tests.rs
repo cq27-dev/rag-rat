@@ -12521,3 +12521,71 @@ fn candidate_components_exclude_generated_files_via_read_filter() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Max-denominator overlap gate regression: a ~1.4x-length pair that SURVIVES the size prune
+/// (min_len/max_len ≈ 0.7 ≥ θ) but whose partial token overlap keeps overlap/max_len < θ.
+/// This guards against regressing to fragment containment (overlap/min) as the gate.
+/// The existing containment test is stopped by the size prune alone; this one exercises the gate.
+#[test]
+fn candidate_components_reject_partial_overlap_below_max_denominator_theta() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    // a: ~30-token body. b: a's tokens PLUS ~13 distinct extra tokens (len ≈ 1.43x), so
+    // overlap≈30, max_len≈43 → 0.70 borderline; tune the extra tokens so overlap/max < 0.70.
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub fn a(db: Db) -> i32 { let x = db.get(1); let y = db.get(2); validate(x); \
+         validate(y); x + y }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.rs"),
+        "pub fn b(db: Db) -> i32 { let x = db.get(1); let y = db.get(2); validate(x); \
+         validate(y); let z = compute(x, y, 3); log(z); persist(z); audit(z); x + y + z }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    let comps = db.candidate_clone_components().unwrap();
+    assert!(
+        comps.is_empty(),
+        "a partial-overlap pair below overlap/max θ must NOT be a candidate (no regression to \
+         containment): {comps:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// normalizer_version filter: after a NORM_VERSION bump the old rows are stale and the read
+/// must ignore them. Simulate by writing rows at version N and then decrementing to N-1.
+#[test]
+fn candidate_read_ignores_stale_normalizer_version_rows() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    assert_eq!(
+        db.candidate_clone_components().unwrap().len(),
+        1,
+        "renamed clones form one component at the current version"
+    );
+    // Simulate a NORM_VERSION bump that left old rows behind: rewrite both rows to an old version.
+    db.storage
+        .connection()
+        .execute("UPDATE symbol_fingerprints SET normalizer_version = normalizer_version - 1", [])
+        .unwrap();
+    assert!(
+        db.candidate_clone_components().unwrap().is_empty(),
+        "stale-version fingerprints must be ignored by the read"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
