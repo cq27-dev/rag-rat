@@ -12622,3 +12622,81 @@ fn candidate_read_ignores_stale_normalizer_version_rows() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// `find_clones` integration test: four near-identical rename-clone functions across two
+/// directories form one candidate class; metrics are plausible and completeness block is populated.
+#[test]
+fn find_clones_ranks_a_clean_clone_class_with_metrics() {
+    use crate::index::clones::NORM_VERSION;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+
+    // Four rename-clone variants — identical structure, only the variable name changes.
+    for (dir, name, var) in [
+        ("a", "load_user", "u"),
+        ("a", "load_order", "o"),
+        ("b", "load_item", "i"),
+        ("b", "load_blob", "x"),
+    ] {
+        fs::write(
+            root.join(dir).join(format!("{name}.rs")),
+            format!(
+                "pub fn {name}(db: Db) -> i32 {{ let {var} = db.get(1); validate({var}); {var} + \
+                 1 }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    // A structurally distinct function that must NOT join the clone class.
+    fs::write(
+        root.join("a/misc.rs"),
+        "pub fn misc(v: Vec<u8>) -> usize { let mut n = 0; for b in v { n += b as usize; } n }\n",
+    )
+    .unwrap();
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("a"), PathBuf::from("b")],
+            include: vec!["a/".to_string(), "b/".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+        version_check: Default::default(),
+        oracle: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+
+    assert_eq!(res.classes.len(), 1, "exactly one clone class (the four rename-clones)");
+    let c = &res.classes[0];
+    assert_eq!(c.member_count, 4, "all four rename-clone functions are members");
+    assert_eq!(c.class_kind, "candidate_component");
+    assert!(!c.refined, "Plan-2 classes are never refined");
+    assert!(
+        c.similarity_min > 0.9,
+        "rename-clones are near-identical; expected similarity_min > 0.9, got {}",
+        c.similarity_min
+    );
+    assert_eq!(c.cross_module_spread, 2, "members span two directories (a/ and b/)");
+    assert_eq!(c.language, "rust");
+    assert!(!c.class_key.is_empty());
+
+    // Completeness block.
+    assert_eq!(res.completeness.candidate_metric, "overlap_max_denominator");
+    assert_eq!(res.completeness.normalizer_version, NORM_VERSION);
+    assert!(!res.completeness.truncated);
+
+    fs::remove_dir_all(root).unwrap();
+}

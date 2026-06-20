@@ -19,9 +19,11 @@ use crate::index::clones::NORM_VERSION;
 /// clone. Tunable later via the query surface.
 const THETA: f64 = 0.7;
 
+/// Maximum members returned per clone class to guard against huge components.
+const MAX_MEMBERS: usize = 50;
+
 // ── Public result types (Plan-2 query API) ────────────────────────────────────────────────────
 
-#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CloneMember {
     pub r#ref: String, // qualified name "path::symbol"
@@ -32,7 +34,6 @@ pub struct CloneMember {
     pub language: String,
 }
 
-#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RoiFactors {
     pub member_count: usize,
@@ -42,7 +43,6 @@ pub struct RoiFactors {
     pub cohesion_penalty: f64, // = cohesion_min_pairwise (the multiplier applied)
 }
 
-#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CandidateCloneClass {
     pub class_key: String,        // read-side key (NOT clone_refinements key)
@@ -63,7 +63,6 @@ pub struct CandidateCloneClass {
     pub roi_factors: RoiFactors,
 }
 
-#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CloneCompleteness {
     pub normalizer_kind: &'static str, // "baseline"
@@ -85,7 +84,6 @@ pub struct CloneCompleteness {
 
 /// Deterministic, order-independent class key: sort `member_refs`, join with `\n`,
 /// `hex_sha256`, take the first 16 hex chars.
-#[allow(dead_code)] // wired into find_clones in Plan-2 Task 3
 pub(crate) fn class_key_for(member_refs: &[String]) -> String {
     let mut sorted = member_refs.to_vec();
     sorted.sort_unstable();
@@ -101,19 +99,19 @@ pub(crate) fn class_key_for(member_refs: &[String]) -> String {
 const DF_FALLBACK: i64 = i64::MAX;
 
 /// One scoped baseline symbol's fingerprint, loaded for the candidate read.
-struct SymbolBag {
-    symbol_id: i64,
-    language: String,
-    struct_hash: String,
-    token_len: i64,
+pub(super) struct SymbolBag {
+    pub(super) symbol_id: i64,
+    pub(super) language: String,
+    pub(super) struct_hash: String,
+    pub(super) token_len: i64,
     /// `(token_hash, freq, coalesced_df)` for every distinct token in the symbol's bag.
-    tokens: Vec<TokenPosting>,
+    pub(super) tokens: Vec<TokenPosting>,
 }
 
-struct TokenPosting {
-    token_hash: i64,
-    freq: i64,
-    coalesced_df: i64,
+pub(super) struct TokenPosting {
+    pub(super) token_hash: i64,
+    pub(super) freq: i64,
+    pub(super) coalesced_df: i64,
 }
 
 impl IndexDatabase {
@@ -129,6 +127,288 @@ impl IndexDatabase {
         let pairs = candidate_pairs(conn)?;
         Ok(components_from_pairs(&pairs))
     }
+}
+
+// ── find_clones public API ────────────────────────────────────────────────────────────────────
+
+/// Options for [`IndexDatabase::find_clones`].
+#[derive(Debug, Clone)]
+pub struct FindClonesOptions {
+    /// Minimum similarity threshold (overlap/max_len). Defaults to [`THETA`] if `None`.
+    pub min_similarity: Option<f64>,
+    /// Minimum number of copies for a class to be returned. Defaults to 2 if `None`.
+    pub min_copies: Option<usize>,
+    /// Maximum number of classes to return (sorted by ROI desc). No limit if `None`.
+    pub limit: Option<usize>,
+}
+
+/// Result of [`IndexDatabase::find_clones`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FindClonesResult {
+    pub classes: Vec<CandidateCloneClass>,
+    pub completeness: CloneCompleteness,
+}
+
+impl IndexDatabase {
+    /// Ranked candidate clone classes over the active scope.
+    ///
+    /// Runs the SourcererCC candidate-pair algorithm, union-finds pairs into components, hydrates
+    /// each component into a [`CandidateCloneClass`] with pairwise similarity metrics and an ROI
+    /// score, filters by `min_similarity` / `min_copies`, sorts by ROI descending, and attaches a
+    /// [`CloneCompleteness`] provenance block. Classes are UNREFINED (Plan 4 adds coherence
+    /// splitting and anti-unification).
+    pub fn find_clones(&self, opts: FindClonesOptions) -> anyhow::Result<FindClonesResult> {
+        let conn = self.storage.connection();
+        let bags = load_scoped_baseline_bags(conn)?;
+        let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
+        let pairs = candidate_pairs_from_bags(&bags);
+        let components = components_from_pairs(&pairs);
+
+        let min_copies = opts.min_copies.unwrap_or(2);
+        let min_sim = opts.min_similarity.unwrap_or(THETA);
+
+        let mut truncated = false;
+        let mut classes: Vec<CandidateCloneClass> = Vec::new();
+
+        for component in &components {
+            if component.len() < min_copies {
+                continue;
+            }
+            match build_class(component, &by_id, conn)? {
+                None => continue,
+                Some(class) => {
+                    if class.members_returned < class.total_members {
+                        truncated = true;
+                    }
+                    if class.similarity_min < min_sim {
+                        continue;
+                    }
+                    classes.push(class);
+                },
+            }
+        }
+
+        // Sort by ROI descending (stable for determinism within ties).
+        classes.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
+
+        if let Some(limit) = opts.limit {
+            classes.truncate(limit);
+        }
+
+        let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
+
+        let completeness = CloneCompleteness {
+            normalizer_kind: "baseline",
+            normalizer_version: NORM_VERSION,
+            min_similarity: min_sim,
+            min_tokens: crate::index::clones::MIN_TOKENS as i64,
+            min_copies,
+            candidate_metric: "overlap_max_denominator",
+            containment_metric: "overlap_min_denominator",
+            generated_excluded: true,
+            tests_excluded: false,
+            same_file_policy: "included",
+            index_freshness: freshness,
+            oracle_coverage: "n/a_baseline_only",
+            truncated,
+            known_index_gaps: vec![
+                "#232: TS function-valued declarators not yet fingerprinted".into(),
+                "#232: comments/multi-language literals not yet normalized".into(),
+            ],
+        };
+
+        Ok(FindClonesResult { classes, completeness })
+    }
+}
+
+/// Extract candidate pairs from already-loaded bags (avoids a second DB round-trip in
+/// `find_clones` vs the original `candidate_pairs` path).
+fn candidate_pairs_from_bags(bags: &[SymbolBag]) -> Vec<(i64, i64)> {
+    let mut pairs: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
+    add_struct_hash_pairs(bags, &mut pairs);
+    let candidate = sub_block_candidate_pairs(bags);
+    let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
+    for (a, b) in candidate {
+        if verified_clone(by_id[&a], by_id[&b]) {
+            pairs.insert((a, b));
+        }
+    }
+    pairs.into_iter().collect()
+}
+
+/// Build a [`CandidateCloneClass`] from a component (a slice of symbol ids). Returns `None` if
+/// any id is missing from `by_id` (shouldn't happen for a well-formed component derived from the
+/// same bag set). Members are capped at [`MAX_MEMBERS`].
+pub(crate) fn build_class(
+    component: &[i64],
+    by_id: &BTreeMap<i64, &SymbolBag>,
+    conn: &Connection,
+) -> anyhow::Result<Option<CandidateCloneClass>> {
+    let bags: Vec<&SymbolBag> = component.iter().filter_map(|id| by_id.get(id).copied()).collect();
+    if bags.len() != component.len() {
+        return Ok(None);
+    }
+
+    let n = bags.len();
+
+    // Pairwise similarity (overlap/max_len) and containment (overlap/min_len), upper-triangle.
+    let mut similarity_min = f64::MAX;
+    let mut containment_max = 0.0_f64;
+    let mut sim_sums = vec![0.0_f64; n]; // for medoid selection
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let ov = overlap(bags[i], bags[j]);
+            let max_len = bags[i].token_len.max(bags[j].token_len);
+            let min_len = bags[i].token_len.min(bags[j].token_len);
+            let sim = if max_len == 0 { 1.0 } else { ov as f64 / max_len as f64 };
+            let cont = if min_len == 0 { 1.0 } else { ov as f64 / min_len as f64 };
+            if sim < similarity_min {
+                similarity_min = sim;
+            }
+            if cont > containment_max {
+                containment_max = cont;
+            }
+            sim_sums[i] += sim;
+            sim_sums[j] += sim;
+        }
+    }
+    if similarity_min == f64::MAX {
+        // Singleton component — shouldn't reach here after min_copies filter, but be safe.
+        similarity_min = 1.0;
+    }
+    let cohesion_min_pairwise = similarity_min;
+
+    // Medoid: member with maximum sum of similarities to all others.
+    let medoid_idx = sim_sums
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let medoid_bag = bags[medoid_idx];
+    let body_token_len_medoid = medoid_bag.token_len;
+
+    // Min similarity of any member to the medoid.
+    let mut similarity_medoid_min = f64::MAX;
+    for (i, bag) in bags.iter().enumerate() {
+        if i == medoid_idx {
+            continue;
+        }
+        let ov = overlap(medoid_bag, bag);
+        let max_len = medoid_bag.token_len.max(bag.token_len);
+        let sim = if max_len == 0 { 1.0 } else { ov as f64 / max_len as f64 };
+        if sim < similarity_medoid_min {
+            similarity_medoid_min = sim;
+        }
+    }
+    if similarity_medoid_min == f64::MAX {
+        similarity_medoid_min = 1.0;
+    }
+
+    let member_count = component.len();
+    let total_members = member_count;
+    let cap = member_count.min(MAX_MEMBERS);
+
+    // Hydrate CloneMembers via a scoped DB query with an IN clause.
+    let placeholders: Vec<String> = (1..=component.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        "SELECT ns.value, files.path, symbols.start_line, symbols.end_line, sf.token_len, \
+         symbols.language
+         FROM symbols
+         JOIN files ON files.id = symbols.file_id
+         JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+         JOIN symbol_fingerprints sf
+           ON sf.symbol_id = symbols.id AND sf.normalizer_kind = 'baseline'
+         WHERE symbols.id IN ({})",
+        placeholders.join(", ")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let raw_members: Vec<CloneMember> = stmt
+        .query_map(rusqlite::params_from_iter(component.iter()), |row| {
+            Ok(CloneMember {
+                r#ref: row.get(0)?,
+                path: row.get(1)?,
+                start_line: row.get(2)?,
+                end_line: row.get(3)?,
+                token_len: row.get(4)?,
+                language: row.get(5)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+
+    let language =
+        raw_members.first().map(|m| m.language.clone()).unwrap_or_else(|| bags[0].language.clone());
+
+    let members_returned = raw_members.len().min(cap);
+    let members: Vec<CloneMember> = raw_members.into_iter().take(cap).collect();
+
+    // Distinct parent directories among the (capped) returned members.
+    let parent_dirs: std::collections::BTreeSet<String> = members
+        .iter()
+        .map(|m| {
+            std::path::Path::new(&m.path)
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let cross_module_spread = parent_dirs.len();
+
+    // Load-bearing factor: 1 + ln(1 + max_fan_in_score) over members. Fan-in proxy via
+    // `scoped_weighted_fan_in` (heuristic-only, no oracle data at this call site).
+    let oracle = crate::query::load_bearing::OracleContext::none();
+    let max_importance = component
+        .iter()
+        .filter_map(|&id| {
+            crate::query::load_bearing::scoped_weighted_fan_in(conn, id, &oracle)
+                .ok()
+                .flatten()
+                .map(|e| e.score)
+        })
+        .fold(0.0_f64, f64::max);
+    let load_bearing_factor = 1.0 + max_importance.ln_1p();
+
+    // Median token_len across all bags in the component.
+    let mut token_lens: Vec<i64> = bags.iter().map(|b| b.token_len).collect();
+    token_lens.sort_unstable();
+    let median_token_len = token_lens[token_lens.len() / 2];
+
+    let roi = cross_module_spread as f64
+        * member_count as f64
+        * body_token_len_medoid as f64
+        * load_bearing_factor
+        * cohesion_min_pairwise;
+
+    let member_refs: Vec<String> = members.iter().map(|m| m.r#ref.clone()).collect();
+    let class_key = class_key_for(&member_refs);
+
+    let roi_factors = RoiFactors {
+        member_count,
+        cross_module_spread,
+        median_token_len,
+        load_bearing_factor,
+        cohesion_penalty: cohesion_min_pairwise,
+    };
+
+    Ok(Some(CandidateCloneClass {
+        class_key,
+        class_kind: "candidate_component",
+        language,
+        refined: false,
+        members,
+        member_count,
+        members_returned,
+        total_members,
+        similarity_min,
+        similarity_medoid_min,
+        containment_max,
+        cohesion_min_pairwise,
+        cross_module_spread,
+        body_token_len_medoid,
+        roi,
+        roi_factors,
+    }))
 }
 
 /// `(symbol_id, symbol_id)` candidate pairs (a < b), both within the scoped `files` view.
