@@ -26,6 +26,16 @@
 /// cap is never reached.
 const SPLIT_MAX: usize = 200;
 
+/// Hard cap on the number of groups the greedy clique-cover may emit before the algorithm
+/// abandons the split and returns the WHOLE component as one class (no member loss). Bounds
+/// the subset-removal at O(MAX_SPLIT_GROUPS² × n): with 256 groups and n ≤ 200 (SPLIT_MAX
+/// guard fires first on larger components) that is at most 256² × 200 ≈ 13 M comparisons —
+/// well within a sub-second budget. A pathological dense-minus-perfect-matching graph that
+/// would otherwise produce O(n²/2) ≈ 20 000 groups trips this budget early and returns
+/// the whole component fast; recall is preserved (the whole component contains every coherent
+/// pair). For the normal case (all existing tests) far fewer than 256 groups are ever produced.
+const MAX_SPLIT_GROUPS: usize = 256;
+
 /// Split an over-merged union-find component into internally-coherent clone classes: every pair
 /// within a returned class has pairwise similarity >= theta.  Union-find over-merges transitive
 /// chains (A~B, B~C, A!~C ⇒ {A,B,C}); this returns coherent sub-classes instead, via a greedy
@@ -107,6 +117,12 @@ pub(crate) fn coherence_split(
         }
         group.sort_unstable(); // deterministic order within group
         groups.push(group);
+        // Budget guard: if we have emitted too many groups, the component is pathologically
+        // tangled (e.g. dense-minus-perfect-matching). Abandon the split and return the whole
+        // component as one class — no member dropped, recall preserved.
+        if groups.len() > MAX_SPLIT_GROUPS {
+            return vec![members];
+        }
     }
 
     // 5. Keep only maximal groups (drop any that is a strict subset of another).
@@ -276,5 +292,52 @@ mod tests {
         let split = coherence_split(&members, sim, 0.70);
         assert_eq!(split.len(), 1, "a >SPLIT_MAX component is one class regardless of coherence");
         assert_eq!(split[0].len(), count, "no members are dropped past SPLIT_MAX");
+    }
+
+    /// Fix 1 (#215 Plan 4a): a dense-minus-perfect-matching component at n≈200 is the pathological
+    /// case for the greedy clique-cover (O(n⁴) without the budget guard — every adjacent pair seeds
+    /// a new group). With `MAX_SPLIT_GROUPS` the budget trips early and the whole component is
+    /// returned as one class — no member dropped, completes in well under a second.
+    #[test]
+    fn coherence_split_pathological_dense_minus_matching_returns_fast() {
+        // n=200 dense-minus-perfect-matching: all pairs above theta EXCEPT the perfect matching
+        // (0,1), (2,3), (4,5), … This is the worst case for maximal-clique enumeration because
+        // every non-matched pair is an edge, yielding O(n²) maximal cliques.
+        let n: i64 = 200;
+        let members: Vec<i64> = (0..n).collect();
+        // Perfect matching: pair (2k, 2k+1) is BELOW theta; all other pairs are ABOVE theta.
+        let sim = |a: i64, b: i64| -> f64 {
+            // If a and b are a matched pair (same "bucket"), below theta.
+            let matched = (a / 2 == b / 2) && (a % 2 != b % 2);
+            if matched { 0.5 } else { 0.9 }
+        };
+        let theta = 0.70;
+
+        let start = std::time::Instant::now();
+        let result = coherence_split(&members, sim, theta);
+        let elapsed = start.elapsed();
+
+        // Must complete FAST (well under 1 second even in debug builds).
+        assert!(
+            elapsed.as_secs() < 2,
+            "coherence_split must not time out on n=200 pathological input: took {elapsed:?}"
+        );
+
+        // Budget tripped → whole component returned as one class (all 200 members, none dropped).
+        // OR (if the graph happens to be resolved under the budget) ≤ MAX_SPLIT_GROUPS groups,
+        // with no member dropped.
+        let all_members: std::collections::BTreeSet<i64> = members.iter().copied().collect();
+        let returned_members: std::collections::BTreeSet<i64> =
+            result.iter().flatten().copied().collect();
+        assert!(
+            returned_members.is_superset(&all_members),
+            "no member may be dropped: missing {:?}",
+            all_members.difference(&returned_members).collect::<Vec<_>>()
+        );
+        assert!(
+            result.len() == 1 || result.len() <= MAX_SPLIT_GROUPS,
+            "must return 1 (budget-tripped whole-component) or ≤ MAX_SPLIT_GROUPS groups, got {}",
+            result.len()
+        );
     }
 }

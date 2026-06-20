@@ -216,10 +216,12 @@ mod tests {
     /// expensive `refine_compute_and_store` (and its INSERT) only runs after the caller has
     /// confirmed a writable connection.
     ///
-    /// The read-only-connection RETRY mechanism itself (probe → `BEGIN IMMEDIATE; ROLLBACK;`
-    /// triggering `SQLITE_READONLY` → dispatcher retries read-write → compute runs once) is
-    /// exercised end-to-end by the `refine_cache_is_read_through` integration test in
-    /// `schema_bootstrap_tests.rs`, which drives a real `IndexDatabase`. The unit-level invariant
+    /// The read-only-connection RETRY mechanism itself (probe → `DELETE FROM clone_refinements
+    /// WHERE 1=0` triggering `SQLITE_READONLY` → dispatcher retries read-write → compute runs
+    /// once on the writable retry) is exercised by
+    /// `refine_ro_connection_probe_fires_sqlite_readonly` (below), which opens a real
+    /// `rusqlite` read-only connection and asserts that the DELETE probe yields a
+    /// `SQLITE_READONLY` error that `is_readonly_violation` flags. The unit-level invariant
     /// here is the load-bearing half: the lookup must not write.
     #[test]
     fn refine_lookup_returns_none_on_miss_without_writing() {
@@ -280,5 +282,42 @@ mod tests {
             first.confidence, second.confidence,
             "the cache-served refinement matches the computed one"
         );
+    }
+
+    /// Fix 2 (#215 Plan 4a): the DELETE-probe in `refine_class_in_place` (the cold-path on a
+    /// read-only connection) fires `SQLITE_READONLY`, which `is_readonly_violation` recognises
+    /// so the MCP dispatcher can retry read-write. This unit test runs the probe against a REAL
+    /// `rusqlite` read-only connection to prove the signal is produced — it is NOT produced by
+    /// the writable `IndexDatabase::rebuild` connection used in `refine_cache_is_read_through`.
+    #[test]
+    fn refine_ro_connection_probe_fires_sqlite_readonly() {
+        use rusqlite::OpenFlags;
+
+        // Build a writable in-memory DB and apply the schema.
+        let rw_path =
+            std::env::temp_dir().join(format!("ragrat-refine-ro-probe-{}.db", std::process::id()));
+        {
+            let rw = rusqlite::Connection::open(&rw_path).unwrap();
+            crate::index::schema::apply(&rw).unwrap();
+        }
+
+        // Open it read-only.
+        let ro = rusqlite::Connection::open_with_flags(
+            &rw_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+
+        // The same DELETE probe used in `refine_class_in_place`.
+        let probe_err = ro.execute("DELETE FROM clone_refinements WHERE 1=0", []).unwrap_err();
+
+        // Wrap in anyhow so `is_readonly_violation` can walk the chain.
+        let anyhow_err = anyhow::Error::from(probe_err);
+        assert!(
+            crate::storage::is_readonly_violation(&anyhow_err),
+            "the DELETE probe on a RO connection must produce SQLITE_READONLY: {anyhow_err}"
+        );
+
+        let _ = std::fs::remove_file(&rw_path);
     }
 }

@@ -588,8 +588,10 @@ impl IndexDatabase {
                         let cohesion_b = min_pairwise_cohesion(b, &by_id);
                         cohesion_a.partial_cmp(&cohesion_b).unwrap_or(std::cmp::Ordering::Equal)
                     })
-                    // Lower first-member id wins; `max_by` keeps the greater, so reverse the cmp.
-                    .then_with(|| b[0].cmp(&a[0]))
+                    // Fully-deterministic final tiebreak: compare the full sorted member-id vector
+                    // (lexicographically, reversed so max_by keeps the lexicographically-smallest).
+                    // `max_by` returns the LAST equal element, so we reverse: "greater" vector loses.
+                    .then_with(|| b.cmp(a))
             })
         };
 
