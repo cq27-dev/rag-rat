@@ -7,6 +7,7 @@
 //! shared total order plus the exact verify, so a missing/stale df never drops a true clone.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -403,6 +404,191 @@ impl IndexDatabase {
 
         Ok(make_result(class, true, true, stale_members, freshness))
     }
+}
+
+/// One member's persisted hydration row before the re-parse: scoped path + byte range + language +
+/// the baseline `struct_hash` (the canonical sort/cache key). Mirrors `build_class`'s member
+/// hydration but additionally pulls `start_byte`/`end_byte` (for the AST descent) and `struct_hash`
+/// (the faithfulness pin).
+#[allow(dead_code)] // helper of load_refine_members; the driver call site lands in Plan-4a Task 4
+struct RefineRow {
+    symbol_id: i64,
+    path: String,
+    start_byte: usize,
+    end_byte: usize,
+    language: crate::language::Language,
+    struct_hash: String,
+}
+
+impl IndexDatabase {
+    /// Load refine inputs for a class's members (#215 Plan 4a Task 2): resolve each member's scoped
+    /// path + byte range, read the active-scope-correct source, parse, descend to the symbol node,
+    /// and `normalize_baseline` into the ordered baseline token sequence. Returns members in
+    /// CANONICAL sorted-by-`struct_hash` order (then `symbol_id` as a tiebreak) — the ordinal basis
+    /// the anti-unify step's `per_member_values[]` aligns to.
+    ///
+    /// Returns `Ok(None)` if refine inputs are unavailable for ANY member — source
+    /// missing/unreadable, a hydration row that vanished mid-read (TOCTOU), a parse failure, no AST
+    /// node at the byte range, or a re-parse whose `struct_hash` no longer matches the persisted
+    /// one (the file drifted off-index). The caller falls back to an un-refined class.
+    /// Returning `None` on ANY missing member (rather than dropping it) keeps the class a
+    /// faithful whole: a partial refine over a subset of members would mis-rank and
+    /// mis-template.
+    ///
+    /// SCOPE LIMITATION (deliberate, mirrors `count_stale_member_paths` / the staleness heal path):
+    /// under a LINKED-WORKTREE OVERLAY scope, `source_root` is the MAIN checkout — NOT the branch
+    /// the overlay's symbol rows came from. Re-reading main's bytes at the overlay member's byte
+    /// range would parse the WRONG source (or fail entirely on a branch-only file). There is no
+    /// scope-correct source read available here for the overlay, so refine is unavailable under an
+    /// overlay scope: return `Ok(None)` and let the caller serve the un-refined class. (When a
+    /// scope-correct overlay source read lands, this guard can be lifted.)
+    #[allow(dead_code)] // driven by the refine driver in Plan-4a Task 4; exercised by tests now
+    pub(crate) fn load_refine_members(
+        &self,
+        member_ids: &[i64],
+    ) -> anyhow::Result<Option<Vec<crate::index::clones::refine::RefineMember>>> {
+        if member_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        // Overlay scope: no scope-correct source read is available (see doc above). Bail to the
+        // un-refined fallback rather than re-parse the wrong (main-checkout) bytes.
+        if self.active_scope_is_linked_overlay() {
+            return Ok(None);
+        }
+
+        let Some(root) = self.storage.source_root() else {
+            return Ok(None);
+        };
+
+        let conn = self.storage.connection();
+        let rows = match load_refine_rows(conn, member_ids)? {
+            None => return Ok(None),
+            Some(rows) => rows,
+        };
+
+        let mut members: Vec<crate::index::clones::refine::RefineMember> =
+            Vec::with_capacity(rows.len());
+        for row in rows {
+            let Ok(text) = std::fs::read_to_string(root.join(&row.path)) else {
+                // Source missing/unreadable on disk — can't reproduce the token sequence.
+                return Ok(None);
+            };
+            let Some(parsed) =
+                crate::index::parser::parse_file(Path::new(&row.path), row.language, &text)
+            else {
+                // Parse failure (or a no-grammar language like markdown) — no AST to descend.
+                return Ok(None);
+            };
+            let Some(node) = parsed.root().descendant_for_byte_range(row.start_byte, row.end_byte)
+            else {
+                // No node spans the persisted byte range — the file drifted off-index.
+                return Ok(None);
+            };
+            let seq = crate::index::clones::normalize::normalize_baseline(node, &text);
+
+            // Faithfulness pin: the re-parse must reproduce Plan-1's normalization exactly. A
+            // mismatch means the on-disk file no longer matches the indexed fingerprint (the
+            // `files.sha256` staleness signal would also flag it) — refining a drifted member would
+            // align stale tokens, so bail to the un-refined fallback rather than panic in
+            // production.
+            let reparsed_hash = crate::index::clones::tokens::struct_hash(&seq);
+            if reparsed_hash != row.struct_hash {
+                eprintln!(
+                    "clones: refine re-parse struct_hash mismatch for symbol {} ({}) — file \
+                     drifted off-index; serving un-refined class",
+                    row.symbol_id, row.path
+                );
+                return Ok(None);
+            }
+
+            members.push(crate::index::clones::refine::RefineMember {
+                symbol_id: row.symbol_id,
+                lang: row.language,
+                path: row.path,
+                start_byte: row.start_byte,
+                end_byte: row.end_byte,
+                struct_hash: row.struct_hash,
+                seq,
+            });
+        }
+
+        // Canonical order: by struct_hash ascending, then symbol_id (the refine ordinal basis).
+        members.sort_by(|a, b| {
+            a.struct_hash.cmp(&b.struct_hash).then_with(|| a.symbol_id.cmp(&b.symbol_id))
+        });
+
+        Ok(Some(members))
+    }
+}
+
+/// Hydrate the scoped path + byte range + language + persisted baseline `struct_hash` for each
+/// `member_ids` symbol, in chunks of [`HYDRATION_CHUNK`] (the same SQLite host-param discipline as
+/// `build_class`). Filters the baseline normalizer version so a stale fingerprint row never feeds
+/// the refine input. Returns `Ok(None)` if ANY requested member is absent (a fingerprint row
+/// vanished mid-read, or the symbol fell out of scope): a partial refine would be unfaithful.
+#[allow(dead_code)] // helper of load_refine_members; the driver call site lands in Plan-4a Task 4
+fn load_refine_rows(
+    conn: &Connection,
+    member_ids: &[i64],
+) -> anyhow::Result<Option<Vec<RefineRow>>> {
+    let mut rows: Vec<RefineRow> = Vec::with_capacity(member_ids.len());
+    for chunk in member_ids.chunks(HYDRATION_CHUNK) {
+        let id_placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+        let version_placeholder = format!("?{}", chunk.len() + 1);
+        let sql = format!(
+            "SELECT symbols.id, files.path, symbols.start_byte, symbols.end_byte, \
+             symbols.language, sf.struct_hash
+             FROM symbols
+             JOIN files ON files.id = symbols.file_id
+             JOIN symbol_fingerprints sf
+               ON sf.symbol_id = symbols.id
+               AND sf.normalizer_kind = 'baseline'
+               AND sf.normalizer_version = {version_placeholder}
+             WHERE symbols.id IN ({})
+             ORDER BY symbols.id",
+            id_placeholders.join(", ")
+        );
+        let params: Vec<i64> = chunk.iter().copied().chain(std::iter::once(NORM_VERSION)).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let chunk_rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let start_byte: i64 = row.get(2)?;
+            let end_byte: i64 = row.get(3)?;
+            let lang_str: String = row.get(4)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                start_byte,
+                end_byte,
+                lang_str,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        for row in chunk_rows {
+            let (symbol_id, path, start_byte, end_byte, lang_str, struct_hash) = row?;
+            // A negative byte offset can't occur (schema NOT NULL, written from usize), but guard
+            // the cast so a corrupt row degrades to the un-refined fallback rather than panicking.
+            let (Ok(start_byte), Ok(end_byte)) =
+                (usize::try_from(start_byte), usize::try_from(end_byte))
+            else {
+                return Ok(None);
+            };
+            // An unparseable language string means the row's language is no longer one this build
+            // understands — bail to the un-refined fallback.
+            let Ok(language) = lang_str.parse::<crate::language::Language>() else {
+                return Ok(None);
+            };
+            rows.push(RefineRow { symbol_id, path, start_byte, end_byte, language, struct_hash });
+        }
+    }
+
+    // EVERY requested member must hydrate. A missing one (vanished fingerprint row, out-of-scope
+    // symbol) makes the class incomplete — refine the whole class or none of it.
+    if rows.len() != member_ids.len() {
+        return Ok(None);
+    }
+    rows.sort_unstable_by_key(|r| r.symbol_id);
+    Ok(Some(rows))
 }
 
 /// Count DISTINCT member file paths in `classes` whose on-disk content no longer matches the

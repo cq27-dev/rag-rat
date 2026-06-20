@@ -6,9 +6,9 @@
 // They are dead until Plan 3 lands; the rest of the module is live (R4's candidate read uses it).
 #![allow(dead_code)]
 
-mod normalize;
+pub(crate) mod normalize;
 pub(crate) mod refine;
-mod tokens;
+pub(crate) mod tokens;
 
 use tree_sitter::Node;
 

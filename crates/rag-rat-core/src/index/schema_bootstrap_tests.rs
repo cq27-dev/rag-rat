@@ -13806,3 +13806,205 @@ fn find_clones_stale_members_zero_on_clean_index_and_nonzero_after_disk_edit() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Resolve the `symbols.id` of a fingerprinted function by its qualified-name `ref` (the
+/// `path::name` form `find_clones`/`clones_for_symbol` emit). Used by the refine-loader tests to
+/// get the raw member ids `load_refine_members` takes.
+fn fingerprinted_symbol_id_for_ref(db: &IndexDatabase, qualified_name: &str) -> i64 {
+    db.storage
+        .connection()
+        .query_row(
+            "SELECT symbols.id
+             FROM symbols
+             JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+             JOIN symbol_fingerprints sf
+               ON sf.symbol_id = symbols.id
+               AND sf.normalizer_kind = 'baseline'
+             WHERE ns.value = ?1
+             ORDER BY symbols.id
+             LIMIT 1",
+            params![qualified_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|e| panic!("no fingerprinted symbol id for ref {qualified_name}: {e}"))
+}
+
+/// Faithfulness pin (#215 Plan 4a Task 2): `load_refine_members` re-parses each member's scoped
+/// source and re-normalizes to the ordered baseline token sequence — the strong correctness
+/// guarantee is that `tokens::struct_hash(&member.seq)` reproduces the PERSISTED
+/// `symbol_fingerprints.struct_hash` exactly (the re-parse is faithful to Plan-1's normalization).
+/// Also pins: seqs are non-empty, members come back sorted by struct_hash, and the lang/byte-range
+/// are populated.
+#[test]
+fn load_refine_members_reparse_is_faithful_to_persisted_struct_hash() {
+    use crate::index::clones::tokens::struct_hash;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two rename-clone functions — identical structure, different identifier names. Both
+    // fingerprint to the SAME struct_hash (renamed clones), so sorting by struct_hash is stable on
+    // symbol_id.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
+    let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
+
+    let members = db
+        .load_refine_members(&[id_a, id_b])
+        .unwrap()
+        .expect("refine inputs available for an unchanged, in-scope clone pair");
+    assert_eq!(members.len(), 2, "both members loaded");
+
+    // Persisted struct_hash per member, for the faithfulness comparison.
+    let persisted = |sid: i64| -> String {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT struct_hash FROM symbol_fingerprints
+                 WHERE symbol_id = ?1 AND normalizer_kind = 'baseline'",
+                params![sid],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+
+    for m in &members {
+        assert!(!m.seq.is_empty(), "the re-parsed token sequence must be non-empty");
+        assert_eq!(m.lang, Language::Rust, "member language is rust");
+        assert!(m.end_byte > m.start_byte, "byte range must be non-empty");
+        // THE PIN: the re-parse reproduces Plan-1's normalization exactly.
+        assert_eq!(
+            struct_hash(&m.seq),
+            m.struct_hash,
+            "re-parsed struct_hash must equal the member's persisted struct_hash"
+        );
+        assert_eq!(
+            m.struct_hash,
+            persisted(m.symbol_id),
+            "the member's carried struct_hash must equal the DB-persisted struct_hash"
+        );
+    }
+
+    // Members are returned in canonical sorted-by-struct_hash (then symbol_id) order.
+    let mut expected =
+        members.iter().map(|m| (m.struct_hash.clone(), m.symbol_id)).collect::<Vec<_>>();
+    expected.sort();
+    let actual = members.iter().map(|m| (m.struct_hash.clone(), m.symbol_id)).collect::<Vec<_>>();
+    assert_eq!(actual, expected, "members must be sorted by (struct_hash, symbol_id)");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Empty input is a valid (empty) refine set — not a failure.
+#[test]
+fn load_refine_members_empty_input_returns_empty() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn f() -> i32 { 0 }\n").unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let members = db.load_refine_members(&[]).unwrap().expect("empty input is a valid empty set");
+    assert!(members.is_empty(), "empty member_ids → empty members");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Missing source: a member whose source file is deleted from disk (but whose fingerprint row is
+/// still persisted) makes the re-parse impossible, so `load_refine_members` returns `Ok(None)` —
+/// the caller falls back to an un-refined class rather than refining over a partial input.
+#[test]
+fn load_refine_members_returns_none_when_source_missing() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
+    let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
+
+    // Delete one member's source file on disk; the fingerprint rows are unchanged in the index.
+    fs::remove_file(root.join("src/b.rs")).unwrap();
+
+    let result = db.load_refine_members(&[id_a, id_b]).unwrap();
+    assert!(
+        result.is_none(),
+        "a member with a deleted source file must yield Ok(None) for the whole class"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Overlay fallback (#215 Plan 4a Task 2): under a LINKED-WORKTREE OVERLAY scope, `source_root` is
+/// the MAIN checkout — not the branch the overlay's symbol rows came from — so no scope-correct
+/// source read is available and `load_refine_members` must return `Ok(None)` BEFORE touching disk.
+/// Mirrors `count_stale_member_paths` / the staleness heal path's overlay early-return.
+#[test]
+fn load_refine_members_returns_none_under_linked_overlay_scope() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    // Base has only a tiny (below-MIN_TOKENS) function — no fingerprint, no clone class.
+    fs::write(main.join("src/base.rs"), "pub fn tiny() -> i32 { 0 }\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Linked worktree on a new branch adds a rename-clone pair.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(
+        linked.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        linked.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "add clone pair"]);
+
+    // Index the overlay — leaves the connection in the linked (overlay) scope.
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(db.active_scope_is_linked_overlay(), "connection must be in the overlay scope");
+
+    // Resolve the branch members' ids (under the overlay scope they are visible).
+    let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
+    let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
+
+    // Even with valid member ids, refine is unavailable under an overlay scope.
+    let result = db.load_refine_members(&[id_a, id_b]).unwrap();
+    assert!(
+        result.is_none(),
+        "refine must be unavailable (Ok(None)) under a linked-worktree overlay scope"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
