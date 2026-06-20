@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 29;
+pub const LATEST_SCHEMA_VERSION: u32 = 30;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -127,6 +127,10 @@ const MIGRATION_029_CHECKSUM: &str = "sha256:rag-rat-clone-fingerprint-tables-v2
 const MIGRATION_029_DESCRIPTION: &str = "Add symbol_fingerprints + symbol_token_postings + \
                                          clone_token_df + clone_refinements for clone detection \
                                          (#215)";
+const MIGRATION_030_ID: &str = "030_clone_refinements_lcs_sampled";
+const MIGRATION_030_CHECKSUM: &str = "sha256:rag-rat-clone-refinements-lcs-sampled-v30";
+const MIGRATION_030_DESCRIPTION: &str =
+    "Add clone_refinements.lcs_sampled (additive; heals indexes already at V029)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -400,6 +404,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_029_CHECKSUM,
         description: MIGRATION_029_DESCRIPTION,
         apply: apply_clone_fingerprint_tables,
+    },
+    Migration {
+        id: MIGRATION_030_ID,
+        checksum: MIGRATION_030_CHECKSUM,
+        description: MIGRATION_030_DESCRIPTION,
+        apply: apply_clone_refinements_lcs_sampled,
     },
 ];
 

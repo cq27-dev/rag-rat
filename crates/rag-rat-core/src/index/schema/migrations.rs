@@ -1123,6 +1123,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_027_ID => Some(27),
             MIGRATION_028_ID => Some(28),
             MIGRATION_029_ID => Some(29),
+            MIGRATION_030_ID => Some(30),
             _ => None,
         })
         .max()
@@ -1161,6 +1162,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_027_ID
             | MIGRATION_028_ID
             | MIGRATION_029_ID
+            | MIGRATION_030_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1196,6 +1198,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_027_ID => migration.checksum != MIGRATION_027_CHECKSUM,
         MIGRATION_028_ID => migration.checksum != MIGRATION_028_CHECKSUM,
         MIGRATION_029_ID => migration.checksum != MIGRATION_029_CHECKSUM,
+        MIGRATION_030_ID => migration.checksum != MIGRATION_030_CHECKSUM,
         _ => false,
     }
 }
@@ -1335,29 +1338,38 @@ pub(crate) const CLONE_FINGERPRINT_DDL: &str = "
         norm_version            INTEGER NOT NULL,
         alignment_version       INTEGER NOT NULL,
         created_at_ms           INTEGER NOT NULL,
-        -- Fix 3 (#215 Plan 4a round-2): 1 when this refinement's LCS fidelity engaged a cost cap
-        -- (member-count sample or the per-pair length proxy). Persisted so a warm cache hit can
-        -- still report `metrics_sampled` for the long-sequence dimension. Added additively below
-        -- via add_column_if_missing for already-migrated DBs.
+        -- 1 when this refinement's LCS fidelity engaged a cost cap (member-count sample or the
+        -- per-pair length proxy). Persisted so a warm cache hit can still report `metrics_sampled`
+        -- for the long-sequence dimension. Present in the V029 DDL for fresh DBs; existing-V029
+        -- indexes get it via the V030 migration (apply_clone_refinements_lcs_sampled).
         lcs_sampled             INTEGER NOT NULL DEFAULT 0
     ) STRICT;
 ";
 
-/// Migrated-index population gap (#215): V029 only CREATEs the clone tables. Their rows
-/// (`symbol_fingerprints` / `symbol_token_postings` / `clone_token_df`) populate as files are
-/// (re)indexed — there is no backfill here. An existing index migrated forward therefore has
-/// EMPTY clone tables until a `rag-rat index --full`. Incremental discovery only reindexes the
-/// changed files, so `candidate_clone_components` stays empty until a full rebuild fingerprints
-/// the whole corpus. Backfilling at migration time is intentionally NOT done: it would require
-/// parsing the entire repo inside a migration, which migrations must not do. Plan 2's `find_clones`
-/// surface should detect empty clone tables and prompt the user to run a full rebuild.
+/// V029 (#215): create the clone-detection substrate tables.
+///
+/// `lcs_sampled` is present in the V029 CREATE TABLE DDL so fresh DBs get it here. Existing
+/// indexes recorded at V029 before the column landed are healed by V030
+/// (`apply_clone_refinements_lcs_sampled`) — an already-applied migration's apply fn is never
+/// re-invoked on an existing DB, so this function cannot add the column retroactively.
+///
+/// Population gap: V029 only CREATEs the clone tables. Their rows (`symbol_fingerprints` /
+/// `symbol_token_postings` / `clone_token_df`) populate as files are (re)indexed — there is no
+/// backfill here. An existing index migrated forward therefore has EMPTY clone tables until a
+/// `rag-rat index --full`. Backfilling at migration time is intentionally NOT done: it would
+/// require parsing the entire repo inside a migration.
 pub(crate) fn apply_clone_fingerprint_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CLONE_FINGERPRINT_DDL)?;
-    // Fix 3 (#215 Plan 4a round-2): additive `lcs_sampled` column on an ALREADY-EXISTING
-    // clone_refinements table (a DB that ran V029 before this column landed). Fresh DBs already
-    // have it from CLONE_FINGERPRINT_DDL above; this is the no-op-on-fresh / add-on-old guard. No
-    // LATEST_SCHEMA_VERSION bump — additive column, same pattern as the other additive columns in
-    // this file.
+    Ok(())
+}
+
+/// V030 (#215 Plan 4a): add `clone_refinements.lcs_sampled` to indexes already recorded at V029.
+///
+/// Fresh DBs get the column from the V029 CREATE TABLE DDL (via baseline → apply_clone_fingerprint_
+/// tables); this migration is the upgrade path for existing-V029 indexes where the column was
+/// absent because V029 was applied before `lcs_sampled` landed. Idempotent: `add_column_if_missing`
+/// is a no-op when the column already exists.
+pub(crate) fn apply_clone_refinements_lcs_sampled(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "clone_refinements", "lcs_sampled", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(())
 }

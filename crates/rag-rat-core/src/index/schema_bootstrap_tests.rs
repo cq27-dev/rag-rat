@@ -10491,12 +10491,13 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.storage
             .connection()
-            .execute("DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables'", [])
+            .execute("DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled'", [
+            ])
             .unwrap();
         assert_eq!(
             schema::status(db.storage.connection()).unwrap().state,
             schema::SchemaState::Older,
-            "removing the V029 ledger row makes the schema Older"
+            "removing the V030 ledger row makes the schema Older"
         );
     }
 
@@ -10521,7 +10522,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 29);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 30);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10596,6 +10597,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '027_drop_chunks_text';
         DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
+        DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
         ",
     )
     .unwrap();
@@ -10734,16 +10736,18 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
         ",
     )
     .unwrap();
-    // 3. Drop the V028 and V029 ledger rows so the schema reads Older and the migration replays.
+    // 3. Drop the V028, V029, and V030 ledger rows so the schema reads Older and the migration
+    //    replays.
     conn.execute_batch(
         "DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
-         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';",
+         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
+         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';",
     )
     .unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "removing the V028+V029 ledger rows makes the pre-V028 shape Older"
+        "removing the V028+V029+V030 ledger rows makes the pre-V028 shape Older"
     );
 
     // --- Forward-migrate ---
@@ -12258,6 +12262,82 @@ fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
         )
         .expect("query3");
     assert_eq!(df, 1, "clone_token_df must exist after migrate_forward");
+}
+
+/// Regression test for the P1 schema bug (#215 Plan 4a): an index recorded at V029 WITHOUT
+/// `clone_refinements.lcs_sampled` (because V029 was applied before the column landed) must have
+/// the column added by the V030 forward migration. Simulates the bug by building a full schema,
+/// dropping the column, deleting the V030 ledger row (making the schema Older), then re-running
+/// `migrate_forward` and asserting the column is present and a direct SELECT succeeds.
+#[test]
+fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    // Start from a fully-applied schema (includes V029 DDL which already has lcs_sampled).
+    crate::index::schema::apply(&conn).expect("apply");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().current_version,
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        "fresh apply reaches V30"
+    );
+
+    // --- Simulate a V029-era index that was recorded before lcs_sampled landed ---
+    // SQLite ≥3.35 supports DROP COLUMN.
+    conn.execute_batch("ALTER TABLE clone_refinements DROP COLUMN lcs_sampled;")
+        .expect("drop lcs_sampled to simulate the pre-column V029 state");
+    // Confirm the column is gone.
+    let cols_before: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(clone_refinements)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(|r| r.unwrap()).collect()
+    };
+    assert!(
+        !cols_before.contains(&"lcs_sampled".to_string()),
+        "lcs_sampled must be absent before the migration runs"
+    );
+    // Remove the V030 ledger row so the schema reads Older and migrate_forward replays it.
+    conn.execute_batch(
+        "DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';",
+    )
+    .expect("delete V030 ledger row");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Older,
+        "schema is Older after removing V030 ledger row"
+    );
+
+    // --- Run the forward migration ---
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+
+    // --- Assert the column is now present and the schema is current ---
+    let cols_after: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(clone_refinements)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(|r| r.unwrap()).collect()
+    };
+    assert!(
+        cols_after.contains(&"lcs_sampled".to_string()),
+        "V030 must add lcs_sampled to an existing V029 clone_refinements table"
+    );
+    // A direct SELECT proves the column is queryable (the original bug: `no such column:
+    // lcs_sampled`).
+    let _: i64 = conn
+        .query_row("SELECT COUNT(lcs_sampled) FROM clone_refinements", [], |r| r.get(0))
+        .expect("SELECT lcs_sampled must succeed after V030 migration");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().current_version,
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST_SCHEMA_VERSION after V030 migration"
+    );
+    assert_eq!(
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        30,
+        "LATEST_SCHEMA_VERSION is 30 after V030"
+    );
+    // Idempotency: running migrate_forward again must not error.
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Compatible,
+        "schema is still Compatible after second migrate_forward"
+    );
 }
 
 #[test]
