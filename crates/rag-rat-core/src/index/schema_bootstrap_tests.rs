@@ -12700,3 +12700,62 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// `clones_for_symbol` integration test: two rename-clone functions (a.rs / b.rs) form one
+/// candidate class; the `Ref` selector resolves to that class, the `PathLine` selector at line 1
+/// resolves to the same `class_key`, and a structurally distinct solo function → `None`.
+#[test]
+fn clones_for_symbol_returns_the_class_by_ref_and_by_path_line() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // --- Ref selector ---
+    let by_ref = db
+        .clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into()))
+        .unwrap()
+        .expect("src/a.rs::load_user should be in a clone class");
+    assert_eq!(by_ref.member_count, 2, "class must contain both rename-clones");
+    assert!(
+        by_ref.members.iter().any(|m| m.r#ref.ends_with("b.rs::load_order")),
+        "siblings must include the other clone; got: {:?}",
+        by_ref.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
+    );
+
+    // --- PathLine selector — same class_key as Ref ---
+    let by_line = db
+        .clones_for_symbol(CloneSymbolSelector::PathLine { path: "src/a.rs".into(), line: 1 })
+        .unwrap()
+        .expect("PathLine at line 1 in src/a.rs should resolve to the same clone class");
+    assert_eq!(
+        by_line.class_key, by_ref.class_key,
+        "PathLine and Ref must resolve to the same class_key"
+    );
+
+    // --- Unrelated solo function → None ---
+    // A structurally distinct function whose token bag won't reach θ=0.7 against the clones.
+    fs::write(
+        root.join("src/c.rs"),
+        "pub fn solo(v: Vec<u8>) -> usize { let mut n = 0; for b in v { n ^= b as usize; } n }\n",
+    )
+    .unwrap();
+    let db2 = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    assert!(
+        db2.clones_for_symbol(CloneSymbolSelector::Ref("src/c.rs::solo".into())).unwrap().is_none(),
+        "a symbol in no clone class must return None"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::index::IndexDatabase;
 use crate::index::clones::NORM_VERSION;
@@ -218,6 +218,123 @@ impl IndexDatabase {
         };
 
         Ok(FindClonesResult { classes, completeness })
+    }
+}
+
+// ── clones_for_symbol public API ─────────────────────────────────────────────────────────────
+
+/// How to identify the subject symbol for [`IndexDatabase::clones_for_symbol`].
+#[derive(Debug, Clone)]
+pub enum CloneSymbolSelector {
+    /// An opaque `sym_<hex>` logical-symbol handle (as emitted by symbol-returning tools).
+    Id(String),
+    /// A fully-qualified `"path/to/file.rs::symbol_name"` reference.
+    Ref(String),
+    /// The tightest-spanning in-scope symbol whose line range contains `line` in `path`.
+    PathLine { path: String, line: i64 },
+}
+
+impl IndexDatabase {
+    /// Return the candidate clone class that contains the symbol identified by `selector`, or
+    /// `None` if the symbol is not in any class (unique, or not fingerprinted).
+    ///
+    /// Resolution per selector form (all scoped through the active `files` view):
+    /// - `Id`: parse the `sym_<hex>` handle → logical-symbol members → first member in a bag.
+    /// - `Ref`: exact qualified-name match via `symbols JOIN name_strings`.
+    /// - `PathLine`: tightest-spanning symbol at that line (`end_line - start_line ASC LIMIT 1`).
+    pub fn clones_for_symbol(
+        &self,
+        selector: CloneSymbolSelector,
+    ) -> anyhow::Result<Option<CandidateCloneClass>> {
+        let conn = self.storage.connection();
+
+        let resolved_id = resolve_selector_to_symbol_id(conn, &selector)?;
+        let Some(symbol_id) = resolved_id else {
+            return Ok(None);
+        };
+
+        let bags = load_scoped_baseline_bags(conn)?;
+        // If the resolved symbol has no fingerprint row it can't be in any clone class.
+        if !bags.iter().any(|b| b.symbol_id == symbol_id) {
+            return Ok(None);
+        }
+
+        let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
+        let pairs = candidate_pairs_from_bags(&bags);
+        let components = components_from_pairs(&pairs);
+
+        // Find the component that contains this symbol_id.
+        let Some(component) = components.into_iter().find(|comp| comp.contains(&symbol_id)) else {
+            return Ok(None);
+        };
+
+        build_class(&component, &by_id, conn)
+    }
+}
+
+/// Resolve a [`CloneSymbolSelector`] to an in-scope `symbols.id` rowid, or `None` if the selector
+/// doesn't match any symbol in the active scope.
+fn resolve_selector_to_symbol_id(
+    conn: &Connection,
+    selector: &CloneSymbolSelector,
+) -> anyhow::Result<Option<i64>> {
+    match selector {
+        CloneSymbolSelector::Id(handle) => {
+            let Some(logical_id) = crate::serde_big_id::parse_sym_handle(handle) else {
+                return Ok(None);
+            };
+            // A logical-symbol may have multiple member rows (cfg splits, overloads). We take the
+            // first in-scope member (lowest `symbols.id` within the scoped `files` view).
+            let id: Option<i64> = conn
+                .query_row(
+                    "SELECT lm.symbol_id
+                     FROM logical_symbol_members lm
+                     JOIN symbols ON symbols.id = lm.symbol_id
+                     JOIN files ON files.id = symbols.file_id
+                     WHERE lm.logical_symbol_id = ?1
+                     ORDER BY lm.symbol_id
+                     LIMIT 1",
+                    [logical_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(id)
+        },
+        CloneSymbolSelector::Ref(qualified_name) => {
+            // Exact qualified-name match through the scoped `files` view.
+            let id: Option<i64> = conn
+                .query_row(
+                    "SELECT symbols.id
+                     FROM symbols
+                     JOIN files ON files.id = symbols.file_id
+                     JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+                     WHERE ns.value = ?1
+                     ORDER BY symbols.id
+                     LIMIT 1",
+                    [qualified_name.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(id)
+        },
+        CloneSymbolSelector::PathLine { path, line } => {
+            // Tightest-spanning symbol whose range contains `line`: smallest (end_line -
+            // start_line) among symbols where start_line <= line <= end_line.
+            let id: Option<i64> = conn
+                .query_row(
+                    "SELECT symbols.id
+                     FROM symbols
+                     JOIN files ON files.id = symbols.file_id
+                     WHERE files.path = ?1
+                       AND ?2 BETWEEN symbols.start_line AND symbols.end_line
+                     ORDER BY (symbols.end_line - symbols.start_line) ASC, symbols.id ASC
+                     LIMIT 1",
+                    rusqlite::params![path.as_str(), line],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(id)
+        },
     }
 }
 
