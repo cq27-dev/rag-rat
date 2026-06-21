@@ -2034,6 +2034,178 @@ fn edge_oracle_stale_after_file_change_not_counted() {
     );
 }
 
+/// #248 END-TO-END (the regression that started the issue): a full `run_oracle` writes verdicts,
+/// then a reindex of the UNCHANGED file rewrites `edges_data` with new ids — and the compare
+/// surface (`current_oracle_comparisons`, the data behind `compare_graph_to_scip`) is STILL
+/// non-empty, re-anchored to the reindexed edge by content key. Before #248 the `ON DELETE CASCADE`
+/// FK wiped the verdict on reindex and the compare surface went empty (the opt-in oracle never
+/// repopulated). Exercises the REAL join+write path (`run_oracle` over a built `.scip` with a call
+/// + def occurrence), not a hand-written verdict.
+#[test]
+fn oracle_run_then_reindex_then_compare_graph_to_scip_nonempty() {
+    let h = Harness::new();
+    let caller = h.add_file("caller.rs", "fn caller() { target(); }\n");
+    let defs = h.add_file("defs.rs", "fn target() {}\nfn other() {}\n");
+    // Heuristic resolved `target` to the WRONG symbol; the oracle CONTRADICTS it (Contradict rows
+    // are exactly what `current_oracle_comparisons` keeps).
+    let wrong_sym = h.add_symbol(defs, "other", 18, 23);
+    let right_sym = h.add_symbol(defs, "target", 3, 9);
+    let edge_v1 = h.add_edge(caller, "target", 14, 20, "Exact", Some(wrong_sym));
+
+    let symbol = "scip-rust crate v1 `target`().";
+    let mut index = Index {
+        documents: vec![Document {
+            relative_path: "caller.rs".to_string(),
+            occurrences: vec![occurrence(
+                0,
+                14,
+                20,
+                symbol,
+                SymbolRole::UnspecifiedSymbolRole as i32,
+            )],
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    index.documents.push(Document {
+        relative_path: "defs.rs".to_string(),
+        occurrences: vec![occurrence(0, 3, 9, symbol, SymbolRole::Definition as i32)],
+        position_encoding: EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
+        ..Default::default()
+    });
+    let bytes = index.write_to_bytes().unwrap();
+
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    assert_eq!(report.rows_written, 1, "the run wrote one verdict");
+
+    // Compare surface is non-empty before reindex (sanity).
+    let before =
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(before.len(), 1, "the contradiction surfaces in compare before reindex");
+    assert_eq!(before[0].edge_id, edge_v1);
+    assert_eq!(before[0].kind, OracleResolutionKind::Contradict);
+
+    // --- Simulate a reindex of the UNCHANGED caller.rs: rewrite the edge (new edges_data rowid),
+    // SAME file content/sha. (The defs.rs symbols are untouched so the def-drift gate stays
+    // satisfied.) ---
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![edge_v1]).unwrap();
+    let edge_v2 = h.add_edge(caller, "target", 14, 20, "Exact", Some(wrong_sym));
+    assert_ne!(edge_v2, edge_v1, "reindex minted a new edge rowid");
+
+    // THE REGRESSION ASSERTION: compare surface is STILL non-empty, re-anchored to the new edge id.
+    let after =
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(after.len(), 1, "compare surface survives reindex (re-anchored by content key)");
+    assert_eq!(
+        after[0].edge_id, edge_v2,
+        "the comparison re-projects onto the LIVE reindexed edge"
+    );
+    assert_eq!(after[0].kind, OracleResolutionKind::Contradict);
+    assert_eq!(
+        after[0].resolved_symbol_id,
+        Some(right_sym),
+        "the re-anchored verdict still names the oracle's correct target",
+    );
+}
+
+/// #248 collision: a `calls_name` edge and a `references_type` edge that share the SAME callee token
+/// (same callee byte range, same call site) get DISTINCT verdicts — the content key includes
+/// `edge_kind`, so the two never collide onto one `edge_oracle` row, and a verdict for one never
+/// leaks onto the other. (This is the design's disambiguation claim — R1: the call-site span + the
+/// callee span + the edge kind make the key unique per edge.)
+#[test]
+fn edge_oracle_collision_same_callee_range_different_kind_disambiguated() {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { Thing(); }\n");
+    let sha = h.file_sha("a.rs");
+    // Two edges on the SAME identifier token `Thing` (callee bytes 14..19, same call site span):
+    // one a `calls_name` (constructor call), one a `references_type`. Same callee range, different
+    // kind — the pre-#248 callee-range-only key would have collided them.
+    let call_edge = h.add_edge_with_kind(f, "Thing", 14, 19, "calls_name", "Exact", None);
+    let ref_edge = h.add_edge_with_kind(f, "Thing", 14, 19, "references_type", "Exact", None);
+    assert_ne!(call_edge, ref_edge, "two distinct edges share the callee token");
+
+    // Distinct verdicts: the call resolves to a function symbol, the type-ref to a type symbol.
+    h.write_verdict(call_edge, &sha, None, "scip x `Thing`#new().", OracleResolutionKind::Upgrade);
+    h.write_verdict(ref_edge, &sha, None, "scip x `Thing`#", OracleResolutionKind::Confirm);
+
+    // Two physical rows (the content key disambiguated by edge_kind), not one overwritten row.
+    let rows: i64 = h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 2, "edge_kind in the content key keeps the two verdicts distinct");
+
+    // Each edge resolves to ITS OWN verdict — no cross-contamination.
+    let (call_kind, _, call_scip) = h.verdict(call_edge).expect("call verdict");
+    assert_eq!(call_kind, OracleResolutionKind::Upgrade.as_db_str());
+    assert_eq!(call_scip, "scip x `Thing`#new().");
+    let (ref_kind, _, ref_scip) = h.verdict(ref_edge).expect("ref verdict");
+    assert_eq!(ref_kind, OracleResolutionKind::Confirm.as_db_str());
+    assert_eq!(ref_scip, "scip x `Thing`#");
+}
+
+/// #248 counts: after a reindex that CHANGES one file (its `files.sha256` drifts), status/eval
+/// counts reflect only LIVE + CURRENT verdicts — the changed file's verdict drops out (file_sha
+/// mismatch in the scope join) and never inflates the totals, while the unchanged file's verdict
+/// stays counted. Without the live-edge content join + the sha gate, dangling/stale verdicts would
+/// inflate the count.
+#[test]
+fn status_eval_counts_unaffected_by_dangling() {
+    let h = Harness::new();
+    // Two files each with a confirmed verdict — both counted initially.
+    let stable = h.add_file("stable.rs", "fn caller() { keep(); }\n");
+    let stable_sha = h.file_sha("stable.rs");
+    let stable_edge = h.add_edge(stable, "keep", 14, 18, "Exact", None);
+    h.write_verdict(
+        stable_edge,
+        &stable_sha,
+        None,
+        "scip x `keep`().",
+        OracleResolutionKind::Confirm,
+    );
+
+    let churn = h.add_file("churn.rs", "fn caller() { drift(); }\n");
+    let churn_sha = h.file_sha("churn.rs");
+    let churn_edge = h.add_edge(churn, "drift", 14, 19, "Exact", None);
+    h.write_verdict(
+        churn_edge,
+        &churn_sha,
+        None,
+        "scip x `drift`().",
+        OracleResolutionKind::Confirm,
+    );
+
+    let status0 = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(status0.total_verdicts, 2, "both verdicts counted before any change");
+    assert_eq!(status0.confirmed, 2);
+
+    // Reindex churn.rs with CHANGED content: rewrite its edge (new rowid) AND drift its
+    // files.sha256 — the verdict's file_sha no longer matches, so it is stale. The stable file
+    // is untouched.
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![churn_edge]).unwrap();
+    let _churn_edge_v2 = h.add_edge(churn, "drift", 14, 19, "Exact", None);
+    h.conn
+        .execute("UPDATE files SET sha256 = 'churn-changed' WHERE id = ?1", params![churn])
+        .unwrap();
+
+    let status1 = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(
+        status1.total_verdicts, 1,
+        "only the live + current (unchanged-file) verdict counts; the changed file's is stale",
+    );
+    assert_eq!(status1.confirmed, 1);
+
+    // Eval metrics use the SAME scoped counts — the stale verdict does not inflate them either.
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, RecallCalls {
+        covered: 1,
+        oracle_only: 0,
+    })
+    .unwrap();
+    assert_eq!(m.confirmed, 1, "eval confirmed count is live + current only");
+}
+
 /// Finding 2: a low-confidence edge in ANOTHER worktree must not inflate the current run's
 /// `oracle_upgradeable_fraction` denominator. With one upgraded low-conf edge in-scope and an
 /// extra unresolved low-conf edge out-of-scope, the scoped fraction is 1/1 = 1.0 (not 1/2).
