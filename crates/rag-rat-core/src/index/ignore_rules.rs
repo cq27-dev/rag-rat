@@ -154,8 +154,15 @@ impl IgnoreMatcher {
         // The gitignore frame: the worktree root if `root` is inside a Git worktree, else `root`.
         // Only accept it when `root` is actually a descendant (or equal) — a `--show-toplevel`
         // result we can't relate to `root` is unusable as a prefix-stripping base.
+        //
+        // `gix`'s `workdir()` is not canonicalized, so on Windows it can carry a different prefix
+        // representation than `root` (e.g. plain `C:\…` vs a verbatim `\\?\C:\…` from a
+        // canonicalized `config.root`) — a raw `root.starts_with(wt)` then wrongly fails and the
+        // ancestor `.gitignore` chain is dropped. Decide the ancestor relationship on canonicalized
+        // forms, but derive `base` by trimming components off `root` itself so it stays a textual
+        // prefix of `root` (and of every caller path `is_ignored` strips against it).
         let base = git_history::worktree_root(root)
-            .filter(|wt| root.starts_with(wt))
+            .and_then(|wt| base_under_worktree(root, &wt))
             .unwrap_or_else(|| root.to_path_buf());
 
         let mut matcher = Self { root: root.to_path_buf(), base, stack: Vec::new() };
@@ -342,6 +349,24 @@ impl IgnoreMatcher {
 /// Whether any component of the (`config.root`-relative) `rel` path is a floor directory name.
 fn rel_contains_floor_dir(rel: &Path) -> bool {
     rel.components().any(|component| component.as_os_str().to_str().is_some_and(is_floor_dir))
+}
+
+/// The gitignore base for `root` given an enclosing worktree root `wt`, or `None` when `wt` is not
+/// an ancestor of (or equal to) `root`. Returns the matching ancestor in `root`'s OWN
+/// representation so it stays a textual prefix of `root` (which `is_ignored`'s
+/// `strip_prefix(&self.base)` — and watch.rs's strip — require for caller paths).
+///
+/// We walk `root`'s own ancestors and pick the one whose CANONICAL form equals the canonical `wt`.
+/// Comparing canonicalized forms tolerates both a prefix-representation mismatch (Windows verbatim
+/// `\\?\C:\…` vs `gix`'s plain `C:\…` workdir) and a symlinked path segment, while keeping the
+/// returned base in `root`'s representation. (A depth-count derived from the canonical paths would
+/// misindex `root.ancestors()` when a symlink makes `root`'s own component count differ.)
+///
+/// Shared with `watch.rs` (gitignore watch-dir + subdir-prefix derivation hit the same mismatch).
+pub(crate) fn base_under_worktree(root: &Path, wt: &Path) -> Option<PathBuf> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let canon_wt = canon(wt);
+    root.ancestors().find(|ancestor| canon(ancestor) == canon_wt).map(Path::to_path_buf)
 }
 
 #[cfg(test)]
@@ -589,5 +614,29 @@ mod tests {
         // Canonicalize so the absolute paths we build match what worktree-root resolution returns
         // (macOS /tmp is a symlink to /private/tmp; git reports the canonical form).
         dir.canonicalize().unwrap_or(dir)
+    }
+
+    // base_under_worktree must return the worktree root in `root`'s OWN representation even when a
+    // symlinked segment makes `root`'s component count differ from its canonical form — a depth
+    // count derived from the canonical paths would misindex `root.ancestors()` and return a wrong
+    // base (the parent of the worktree root, here), breaking the strip_prefix contract.
+    #[cfg(unix)]
+    #[test]
+    fn base_under_worktree_handles_symlinked_root_segment() {
+        use std::os::unix::fs::symlink;
+        let wt = tempdir(); // canonical worktree root
+        fs::create_dir_all(wt.join("a/b")).unwrap();
+        // `<wt>/link` (1 component) resolves to `<wt>/a/b` (2 components) — counts differ.
+        let link = wt.join("link");
+        symlink(wt.join("a/b"), &link).unwrap();
+        // `root` (= the symlink) is NOT canonicalized — the case the helper must tolerate; `wt` is
+        // a genuine textual ancestor of it.
+        let base = base_under_worktree(&link, &wt);
+        assert_eq!(base.as_deref(), Some(wt.as_path()), "base must be wt in root's representation");
+        assert!(
+            link.strip_prefix(base.unwrap()).is_ok(),
+            "base must stay a textual prefix of root"
+        );
+        let _ = fs::remove_dir_all(&wt);
     }
 }

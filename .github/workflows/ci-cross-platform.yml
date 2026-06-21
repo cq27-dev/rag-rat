@@ -1,0 +1,98 @@
+name: CI (cross-platform)
+
+# macOS + Windows coverage for the test/clippy/build-full legs. These platforms are NOT exercised on
+# every PR/push (that would multiply CI minutes for the rare platform regression); the per-PR + main
+# matrix in ci.yml stays Linux-only. Instead this runs only when a release is published — the same
+# `release: published` trigger oracle.yml and bench-release.yml already key off (release-plz cuts the
+# GitHub release, authored with RELEASE_PLZ_TOKEN so downstream workflows fire, once the Release PR's
+# version commit lands on main). workflow_dispatch is kept so the matrix can be validated manually.
+#
+# Jobs mirror ci.yml's Linux legs exactly (toolchain, rust-cache, feature flags) so a real mac/win
+# break surfaces the same way it would on Linux:
+#   - clippy / test run --no-default-features (hash embedder, no ONNX/model download — network-free);
+#   - build-full compiles the default feature set (fastembed + model2vec / ort), the load-bearing leg
+#     where the ONNX Runtime download+link path would actually break on a new platform.
+#
+# NOTE: the Windows legs depend on #237 (rusqlite must be `bundled` so it links without a system
+# SQLite). With that landed, windows-latest links the vendored SQLite amalgamation via cc.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Least privilege: CI only reads the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cross-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  clippy:
+    name: clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --no-default-features = hash-only build: no ONNX/model downloads, fast and network-free.
+      # The full feature set is compile-checked by the build-full job below.
+      - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # Hash embedder only (no model downloads). Mirrors ci.yml's test leg; the Codecov upload is
+      # intentionally dropped here (coverage / test-analytics stay Linux-only).
+      - name: Run tests (nextest)
+        # --no-fail-fast: this matrix runs only on release (rare), so surface EVERY platform-specific
+        # failure in a single run rather than stopping at the first (the ci profile fails fast).
+        run: cargo nextest run --workspace --no-default-features --locked --profile ci --no-fail-fast
+
+  build-full:
+    name: build (fastembed + model2vec) (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Align the MSVC C runtime so the link succeeds. esaxx-rs (a C++ dep via
+      # tokenizers <- model2vec/fastembed) hardcodes cc's .static_crt(true) => /MT, but the ort_sys
+      # ONNX Runtime prebuilt is /MD; the mismatch is LNK2038/LNK1319 on Windows. cc appends env
+      # CFLAGS/CXXFLAGS AFTER its own /MT and cl.exe is last-flag-wins, so /MD here overrides
+      # esaxx's /MT to match ort. Windows-only: on macOS the esaxx build is clang, where -MD means
+      # "emit make dependencies" and would break the build.
+      - name: Align MSVC CRT to dynamic (/MD) to match the ort prebuilt
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "CFLAGS=-MD" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-MD" >> "$GITHUB_ENV"
+      # Compile the default feature set (downloads the ONNX runtime once, then cached) so the
+      # released binary's embedding paths never break silently on mac/Windows.
+      - run: cargo build --workspace --locked

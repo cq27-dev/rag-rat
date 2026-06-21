@@ -287,7 +287,11 @@ fn kind_is_mutation(kind: &EventKind) -> bool {
 /// worktree root) it returns just `config.root` — already covered by the recursive target watches,
 /// so the extra non-recursive watch is a harmless no-op duplicate.
 fn gitignore_watch_dirs(root: &Path) -> Vec<PathBuf> {
-    let base = crate::index::git_history::worktree_root(root).filter(|wt| root.starts_with(wt));
+    // Decide the worktree-root ancestor on canonicalized forms but keep `base` in `root`'s own
+    // representation — gix's workdir isn't canonicalized, so on Windows a raw `starts_with` fails
+    // when `root` is verbatim (`\\?\C:\…`) and the workdir is plain (`C:\…`). See ignore_rules.
+    let base = crate::index::git_history::worktree_root(root)
+        .and_then(|wt| crate::index::ignore_rules::base_under_worktree(root, &wt));
     let mut dirs = Vec::new();
     if let Some(base) = base
         && let Ok(rel) = root.strip_prefix(&base)
@@ -395,7 +399,10 @@ fn event_touches_worktree(
 /// when `config.root` IS the worktree root (the common case) or in a non-git tree.
 fn config_subdir_prefix(config: &Config) -> PathBuf {
     crate::index::git_history::worktree_root(&config.root)
-        .and_then(|wt| config.root.strip_prefix(&wt).ok().map(Path::to_path_buf))
+        // base_under_worktree returns the worktree root in config.root's representation, so the
+        // strip_prefix below succeeds on Windows (verbatim vs plain prefix) — see ignore_rules.
+        .and_then(|wt| crate::index::ignore_rules::base_under_worktree(&config.root, &wt))
+        .and_then(|base| config.root.strip_prefix(&base).ok().map(Path::to_path_buf))
         .unwrap_or_default()
 }
 

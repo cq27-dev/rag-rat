@@ -17,15 +17,19 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 dialoguer = "0.12"
 gix.workspace = true
-libc.workspace = true
 rag-rat-core = { workspace = true }
 rag-rat-mcp = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+# Consumed only by the unix-gated terminal-reset guard (`init/mod.rs`) — dead on non-unix targets,
+# so gate it there to match rag-rat-core / rag-rat-mcp (#240).
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 # MCP tool results render as TOON; integration tests decode them back to JSON Values to assert.

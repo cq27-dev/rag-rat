@@ -43,9 +43,15 @@ impl IndexDatabase {
     /// digest is scope-invariant, so the freshness check is stable regardless of the active
     /// connection scope.
     pub(super) fn content_revision(&self) -> anyhow::Result<String> {
+        // group_concat over an ORDER BY subquery, not `string_agg(... ORDER BY path)`: string_agg()
+        // and aggregate ORDER BY are SQLite 3.44+, and this portable idiom (works on any SQLite)
+        // avoids tying the query to a SQLite version. The subquery's ORDER BY feeds rows to
+        // group_concat in path order, so the digest input is the same deterministic string. Order
+        // only has to be stable per-machine (this digest is compared against a previously-stored
+        // value on the same DB), which this idiom guarantees.
         let value = self.storage.connection().query_row(
-            "SELECT COALESCE(string_agg(path || ':' || sha256, ',' ORDER BY path), '') FROM \
-             main.files WHERE kind != 'deleted'",
+            "SELECT COALESCE(group_concat(pv, ','), '') FROM (SELECT path || ':' || sha256 AS pv \
+             FROM main.files WHERE kind != 'deleted' ORDER BY path)",
             [],
             |row| row.get::<_, String>(0),
         )?;

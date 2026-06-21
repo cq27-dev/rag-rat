@@ -8,7 +8,11 @@
 //! Exit 0 on every path — the hook must never block a tool call or session start.
 
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// PathBuf (socket_path) and Duration (SOCKET_BUDGET) back the unix-only listener path.
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::Duration;
 
 use rag_rat_core::config::Config;
@@ -18,6 +22,8 @@ use rag_rat_core::query::orientation::Orientation;
 use rag_rat_core::storage::IndexConnection;
 use serde::Deserialize;
 
+// Only the unix Unix-socket listener path uses this; dead on Windows (which has no warm listener).
+#[cfg(unix)]
 const SOCKET_BUDGET: Duration = Duration::from_millis(250);
 
 /// Parsed hook input.  Fields absent on `SessionStart` (`tool_name`, `tool_input`) are
@@ -43,6 +49,9 @@ pub struct HookInput {
 pub struct Search {
     pub pattern: String,
     pub search_path: Option<String>,
+    // Set on every platform but read only by the unix listener path (it's sent in the socket
+    // request); on Windows there is no listener, so it's intentionally unread there.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub source: &'static str,
 }
 
@@ -559,6 +568,8 @@ fn ask_listener(
 
 /// Single source of truth via `locks::hook_socket_path_for`; same computation as the MCP
 /// listener's `socket_path_for`, guaranteed not to diverge.
+// Only the unix listener path calls this; dead on Windows.
+#[cfg(unix)]
 fn socket_path(config: &Config) -> PathBuf {
     locks::hook_socket_path_for(config)
 }

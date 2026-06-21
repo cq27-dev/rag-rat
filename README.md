@@ -54,8 +54,31 @@ From a checkout:
 cargo install --path crates/rag-rat-cli --bin rag-rat
 ```
 
-Add `--no-default-features` for a smaller hash-only build without real embeddings. rag-rat links
-against the system SQLite via `rusqlite`.
+Add `--no-default-features` for a smaller hash-only build without real embeddings. SQLite is bundled
+(compiled in via `rusqlite`), so there is no system-library prerequisite — see
+[Platform support](#platform-support) for the per-OS C-toolchain note.
+
+## Platform support
+
+rag-rat builds and tests on Linux, macOS, and Windows. Linux is covered on every PR and on every
+push to main; macOS and Windows are exercised on release, so `cargo install rag-rat` builds and
+links on all three.
+SQLite is bundled (compiled from source via `rusqlite`), so there's no system-library prerequisite,
+but each platform needs a C toolchain: Linux ships one; on macOS install the Xcode Command Line
+Tools (`xcode-select --install`); on Windows install the Visual Studio Build Tools with the C++
+workload (MSVC). Requires **Rust 1.95+** (the bundled SQLite build uses the `cfg_select!` macro,
+stabilized in 1.95).
+
+A few maintenance conveniences are Unix- or Linux-only by design and degrade quietly elsewhere — no
+feature of the index, query, or MCP surface is affected:
+
+- **Hot-upgrade of a running MCP server** (the `SIGUSR1` in-place re-exec) is Unix-only. On Windows,
+  restart `rag-rat mcp` to pick up a new binary.
+- **Fleet auto-upgrade** (signalling other running servers when a new binary lands) is Linux-only —
+  it walks `/proc` — and is a no-op elsewhere.
+- **The grep-augmentation hook** uses a warm Unix-socket listener (with per-session dedupe) on
+  Linux and macOS; on Windows it falls back to a per-call read-only query straight against the
+  index, which works the same but without cross-call dedupe.
 
 ## Quickstart
 

@@ -1,8 +1,9 @@
 # Binary Size
 
-`rag-rat` keeps storage dependencies small. SQLite is provided by the system through
-`rusqlite`; heavyweight embedded database runtimes such as DuckDB are out of scope unless
-a dedicated issue records the need, expected size impact, and accepted tradeoff.
+`rag-rat` keeps storage dependencies small. SQLite is compiled in (bundled) via `rusqlite`, so there
+is no system-library prerequisite and `cargo install` is self-contained on every platform;
+heavyweight embedded database runtimes such as DuckDB are out of scope unless a dedicated issue
+records the need, expected size impact, and accepted tradeoff.
 
 Use this manual check after storage dependency changes:
 

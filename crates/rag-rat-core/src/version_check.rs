@@ -108,14 +108,13 @@ pub fn needs_refresh(cached: Option<&CachedVersion>, now_ms: i64, ttl_ms: i64) -
 /// mandatory: crates.io 403s a request without one.
 pub fn fetch_latest() -> Option<String> {
     let url = format!("https://crates.io/api/v1/crates/{CRATE_NAME}");
-    let agent = ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).build();
-    let body = agent
-        .get(&url)
-        .set("User-Agent", concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (version-check)"))
-        .call()
-        .ok()?
-        .into_string()
-        .ok()?;
+    // crates.io 403s a request without a User-Agent, so set it on the agent config (ureq 3).
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(FETCH_TIMEOUT))
+        .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (version-check)"))
+        .build()
+        .into();
+    let body = agent.get(&url).call().ok()?.body_mut().read_to_string().ok()?;
     parse_latest_response(&body)
 }
 

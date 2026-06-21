@@ -179,6 +179,12 @@ pub(crate) fn fastembed_cache_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home).join(".cache").join("rag-rat").join("models");
     }
+    // On Windows HOME/XDG_CACHE_HOME are usually unset; land the model cache per-user under
+    // %LOCALAPPDATA% rather than per-checkout in the repo-relative fallback below.
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(local).join("rag-rat").join("models");
+    }
     PathBuf::from(".rag-rat").join("models")
 }
 

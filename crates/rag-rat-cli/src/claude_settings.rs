@@ -190,7 +190,11 @@ pub fn hook_status(settings: &Value) -> HookStatus {
 /// Project `.claude/settings.json` or, with `--global`, `~/.claude/settings.json`.
 pub fn settings_path(repo_root: &Path, global: bool) -> anyhow::Result<PathBuf> {
     if global {
-        let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+        // Resolve the user home portably: $HOME on unix, %USERPROFILE% on stock Windows
+        // (where HOME is usually unset).
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .ok_or_else(|| anyhow::anyhow!("neither HOME nor USERPROFILE is set"))?;
         Ok(PathBuf::from(home).join(".claude/settings.json"))
     } else {
         Ok(repo_root.join(".claude/settings.json"))

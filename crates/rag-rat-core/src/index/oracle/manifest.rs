@@ -395,9 +395,14 @@ mod tests {
         assert_eq!(manifest.program, "scip-clang");
         let cmd = manifest.scip_command(Path::new("/repo"), Path::new("/tmp/out.scip"));
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        // `--compdb-path` is synthesized via `root.join(..).display()`, so it carries the
+        // platform's path separator (`\` on Windows) — scip-clang runs locally and wants
+        // the native path. Build the expectation the same way rather than hardcoding `/`,
+        // so the assertion holds on Windows.
+        let compdb = Path::new("/repo").join("compile_commands.json");
         assert_eq!(args, vec![
-            "--compdb-path=/repo/compile_commands.json",
-            "--index-output-path=/tmp/out.scip"
+            format!("--compdb-path={}", compdb.display()),
+            "--index-output-path=/tmp/out.scip".to_string()
         ]);
         // No compile_commands.json under a bogus root → prerequisite Blocked (not a run error).
         assert!(

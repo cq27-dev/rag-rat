@@ -58,6 +58,8 @@ pub(crate) use util::*;
 #[cfg(test)]
 mod anchor_tests;
 #[cfg(test)]
+mod chunker_tests;
+#[cfg(test)]
 mod parser_tests;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -26,9 +26,8 @@ ARG RUST_ANALYZER_URL=https://github.com/rust-lang/rust-analyzer/releases/latest
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        # rag-rat build + general (libsqlite3-dev: rusqlite is non-bundled, links system sqlite3)
+        # rag-rat build + general (rusqlite bundles SQLite via cc; build-essential covers the C compiler)
         build-essential pkg-config git python3 curl ca-certificates xz-utils gzip \
-        libsqlite3-dev \
         # Linux kernel build (for compile_commands.json: the bc-class deps that bit us)
         bc flex bison libelf-dev libssl-dev \
         # scip-clang / rust-analyzer prebuilt-binary runtime libs

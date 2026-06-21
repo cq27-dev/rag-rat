@@ -96,7 +96,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
         schema::LATEST_SCHEMA_VERSION
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn symbols_store_true_source_line_spans() {
     assert_eq!(line_span("alpha"), (2, 2));
     assert_eq!(line_span("beta"), (4, 6));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn rebuild_reports_file_preparation_progress() {
         "missing indexing progress event: {events:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -181,7 +181,7 @@ fn open_refuses_a_legacy_schema_without_version_table() {
     let err = IndexDatabase::open(&database).unwrap_err().to_string();
     assert!(err.contains("rebuild"), "{err}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn forward_migration_does_not_rerun_already_applied_migrations() {
         schema::SchemaState::Compatible
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -266,7 +266,7 @@ fn forward_migration_reprovisions_missing_baseline_tables() {
     drop(conn);
     assert_eq!(edge_strings_exists, 1, "baseline did not reprovision name_strings before replay");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -298,7 +298,7 @@ fn open_auto_migrates_a_forward_older_schema_to_latest() {
     assert_eq!(after.state, schema::SchemaState::Compatible);
     assert_eq!(after.current_version, after.latest_version);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn migrate_adds_edge_name_columns_before_indexing_them() {
     assert_eq!(table_count(&db, "idx_edges_from_name"), 1);
     assert_eq!(table_count(&db, "idx_edges_to_name"), 1);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn migrate_preserves_github_papertrail_cache() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].number, 42);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -451,7 +451,7 @@ fn full_rebuild_preserves_github_papertrail_cache() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].number, 42);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -471,7 +471,7 @@ fn full_rebuild_preserves_installed_model_manifest() {
     assert!(after.embedding.installed);
     assert_eq!(after.embedding.state, "Ready");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -600,7 +600,7 @@ fn full_rebuild_preserves_other_worktree_contexts() {
         1
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -645,7 +645,7 @@ fn compatible_open_refuses_dirty_and_newer_schema() {
     let err = IndexDatabase::open(&database).unwrap_err().to_string();
     assert!(err.contains("newer rag-rat"), "{err}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -688,7 +688,7 @@ fn discover_mode_indexes_new_files_and_removes_deleted_files() {
     );
     assert_eq!(db.symbols("new_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
@@ -705,7 +705,7 @@ fn indexing_skips_symlink_loops() {
 
     assert_eq!(db.symbols("loop_safe_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -756,7 +756,7 @@ fn dirty_git_files_are_indexed_as_worktree_overlay() {
     assert_eq!(overlay_hits.len(), 1);
     assert!(overlay_hits[0].summary.contains("overlay token"));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -794,7 +794,7 @@ fn rebuild_populates_revision_metadata_and_fresh_fts_state() {
     assert_eq!(indexed_revision_count(&db), 1);
     assert_eq!(chunk_source_revision_count(&db), 1);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(not(feature = "fastembed"))]
@@ -812,7 +812,7 @@ fn fastembed_missing_feature_reports_rebuild_command() {
     assert_eq!(status.fastembed.message.as_deref(), Some(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
     assert_eq!(status.fastembed.next.as_deref(), Some("cargo install rag-rat"));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -898,7 +898,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     let stale_embedding_hits = db.search("alpha", 10, false).unwrap();
     assert_eq!(stale_embedding_hits.len(), 1);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(feature = "fastembed")]
@@ -923,7 +923,7 @@ fn cached_fastembed_model_recovers_ready_state() {
     assert_eq!(status.fastembed.status, "Ready");
     assert!(status.fastembed.active);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(feature = "fastembed")]
@@ -954,7 +954,7 @@ fn compatible_migrate_recovers_cached_fastembed_model() {
     assert_eq!(status.fastembed.status, "Ready");
     assert!(status.fastembed.active);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -976,7 +976,7 @@ fn reconcile_without_limit_processes_all_chunks() {
     let second = db.reconcile(None, Some(2)).unwrap();
     assert_eq!(second.processed_chunks, 0);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -999,7 +999,7 @@ fn force_reconcile_processes_each_chunk_once_and_terminates() {
     assert_eq!(report.embeddings_written, 2, "force re-embedded chunks: {report:?}");
     assert_eq!(report.processed_chunks, 2, "force re-processed chunks: {report:?}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1046,7 +1046,7 @@ fn force_reconcile_progress_is_honest_and_terminates_without_limit() {
         }
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1070,7 +1070,7 @@ fn status_counts_only_active_context_chunks() {
     assert_eq!(scoped.total_chunks, 0, "status ignored active context scope");
     assert_eq!(scoped.current, 0);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1091,7 +1091,7 @@ fn watch_maintenance_pass_indexes_new_files() {
     let hits = db.symbols("newly_added_symbol", Some(Language::Rust), 10).unwrap();
     assert!(!hits.is_empty(), "watcher pass did not index the new file");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1145,7 +1145,7 @@ fn discover_deletion_is_worktree_scoped() {
     assert_eq!(active("src/a.rs"), 0, "deleted file still active in own worktree");
     assert_eq!(active("src/b.rs"), 1, "live file dropped from own worktree");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1193,7 +1193,7 @@ fn gc_prunes_dead_context_rows_and_keeps_live_ones() {
         "live chunks were pruned",
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1209,7 +1209,7 @@ fn gc_refuses_to_prune_with_no_live_context() {
     assert_eq!(report.files_pruned, 0);
     assert_eq!(table_row_count(db.storage.connection(), "files").unwrap(), before);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1246,7 +1246,7 @@ int main(void)
     let report = db.reconcile(None, Some(8)).unwrap();
     assert!(report.embeddings_written > 0, "report: {report:?}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1264,7 +1264,7 @@ fn reconcile_policy_skips_tiny_chunks_before_embedding() {
     assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
     assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 0);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1295,7 +1295,7 @@ fn reconcile_plan_reports_policy_skips_for_fastembed_model() {
     assert_eq!(plan.embeddings.missing, 0);
     assert_eq!(plan.embeddings.skipped_by_policy.get("SkipTooSmall"), Some(&1));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(not(feature = "fastembed"))]
@@ -1317,7 +1317,7 @@ fn blocked_fastembed_reconcile_still_reports_policy_skips() {
     assert_eq!(report.status, "Blocked");
     assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1353,7 +1353,7 @@ fn search_explain_reports_weighted_score_components() {
     assert!(components.github <= 0.02);
     assert!(db.search("runtime shutdown", 10, false).unwrap()[0].score_components.is_none());
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1375,7 +1375,7 @@ fn search_explain_labels_missing_vector_runtime() {
         Some("vector search unavailable: no current embedding model")
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1472,7 +1472,7 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
     let cached = db.git_blame_chunk(chunk_id).unwrap().unwrap();
     assert_eq!(cached.source_text_hash, blame.source_text_hash);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// A recognizable bogus row that only a git-history *reload* (full table wipe) would remove.
@@ -1573,7 +1573,7 @@ fn git_history_reload_is_skipped_when_head_is_unchanged() {
     // Real history is left intact (the 2 real commits are untouched by the skip).
     assert_eq!(db.status(&config.database).unwrap().git_history.commit_count, 2);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1595,7 +1595,7 @@ fn git_history_reloads_after_a_new_commit() {
     assert_eq!(sentinel_commit_count(&db), 0, "a new commit must force a reload");
     assert_eq!(db.commit_search("gamma", 10).unwrap().len(), 1, "new commit is indexed");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1620,7 +1620,7 @@ fn git_history_reloads_after_a_history_rewrite() {
     assert_eq!(db.commit_search("delta", 10).unwrap().len(), 1, "rewritten subject is indexed");
     assert_eq!(db.commit_search("beta", 10).unwrap().len(), 0, "old subject is gone after rewrite");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1651,8 +1651,8 @@ fn git_history_reload_is_not_skipped_on_a_shallow_clone() {
     let db = IndexDatabase::index_changed(&config).unwrap();
     assert_eq!(sentinel_commit_count(&db), 0, "a shallow clone must never skip the reload");
 
-    fs::remove_dir_all(origin).unwrap();
-    fs::remove_dir_all(shallow).unwrap();
+    let _ = fs::remove_dir_all(origin);
+    let _ = fs::remove_dir_all(shallow);
 }
 
 fn read_meta(db: &IndexDatabase, key: &str) -> Option<String> {
@@ -1702,7 +1702,7 @@ fn idle_discover_sweep_does_not_rewrite_indexed_at_ms() {
         "a sweep that indexes a new file must update indexed_at_ms"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1721,7 +1721,7 @@ fn index_discover_reporting_flags_content_changes() {
     let (_db, changed) = IndexDatabase::index_discover_reporting(&config).unwrap();
     assert!(changed, "a discover sweep that indexes a new file must report a content change");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1755,7 +1755,7 @@ fn discover_relanguages_h_when_binding_changes_c_to_cpp() {
         .unwrap();
     assert_eq!(lang, "cpp", "the .h must be reindexed as C++ after the binding change");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1805,7 +1805,7 @@ fn caller() {
         "helper callers: {callers:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// The callee identifier byte range (#67) stored on the single edge matching
@@ -1902,7 +1902,7 @@ fn driver() {
     let contains = callee_byte_range(&db, "Obj", "method", "contains");
     assert_eq!(contains, None, "contains edges must have a NULL callee range");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1920,7 +1920,7 @@ fn imports_edge_has_null_callee_byte_range() {
     let import = callee_byte_range(&db, "src/lib.rs", "worker", "imports");
     assert_eq!(import, None, "imports edges must have a NULL callee range");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1954,7 +1954,7 @@ int runtime_open(Runtime *runtime) {
     let (start, end) = (start as usize, end as usize);
     assert_eq!(&source[start..end], "helper", "C callee range must span exactly `helper`");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2036,7 +2036,7 @@ pub fn exported_fn() {}
         "comment-only UniFFI mentions must not create FFI surface rows: {surface:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2064,7 +2064,7 @@ fn find_callers_sees_calls_in_let_bindings() {
     assert!(has("via_let"), "missing `let x = target()` caller; got {names:?}");
     assert!(has("via_let_else"), "missing `let-else` caller; got {names:?}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2148,7 +2148,7 @@ pub fn upsert_journal_embedding(_id: i64) {}
         "an arm side-effect call must not become a dispatch target: {log_callers:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2202,7 +2202,7 @@ pub fn upsert(_id: i64) {}
     // The synthesized real edge is visible through the view.
     assert!(view_count("dispatches") > 0, "the synthesized dispatches edge must stay visible");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2269,7 +2269,7 @@ pub fn run_stop() {}
         "a guard/predicate call must not become a dispatch handler"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2334,7 +2334,7 @@ pub fn banana_handler() {}
         "Self::Variant must not cross-link distinct enums: apple={apple:?} banana={banana:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2385,7 +2385,7 @@ pub fn deliver() {}
     // External/aliased head (`Status` has no local enum definition) is admitted.
     assert!(dispatch_from("deliver", "emit"), "external enum-head dispatch missing");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2445,7 +2445,7 @@ fn embed_text(_text: String) -> Result<i32, ()> { Ok(0) }
         "a wrapper constructor must not be a dispatch handler"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2523,7 +2523,7 @@ fn run_setup() -> Result<Resp, ()> { Ok(Resp::Blank) }
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2600,7 +2600,7 @@ fn start_span() {}
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2702,7 +2702,7 @@ fn finish_response() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2787,7 +2787,7 @@ fn finish_b() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2901,7 +2901,7 @@ fn start_span() -> u8 { 0 }
         "const-generic call must resolve to the callee name"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2984,7 +2984,7 @@ fn e() -> E { E::Ready(0) }
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3071,7 +3071,7 @@ fn finish_c() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3186,7 +3186,7 @@ fn build_deref() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3258,7 +3258,7 @@ fn handler_c() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3351,7 +3351,7 @@ fn finish_fp() -> Result<u8, ()> { Ok(0) }
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3415,7 +3415,7 @@ fn make_worker() -> W { W }
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3465,7 +3465,7 @@ pub fn run() {}
         "a nested-payload variant must not be treated as the handled variant: {senders:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3519,7 +3519,7 @@ pub mod b {
         );
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3582,7 +3582,7 @@ fn symbol_search_excludes_generated_bindings_unless_opted_in() {
     assert_eq!(id_hits.candidates.len(), 1, "explicit id must resolve the generated symbol");
     assert!(id_hits.candidates[0].path.contains("/generated/"));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3635,7 +3635,7 @@ fn stale_generated_flags_are_rederived_on_open() {
         after.candidates.iter().map(|c| &c.path).collect::<Vec<_>>()
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3689,7 +3689,7 @@ fn search_and_read_chunk_attach_bounded_graph_evidence() {
     );
     assert!(full_graph.notes.iter().any(|note| note.contains("tree-sitter/syntactic")));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3746,7 +3746,7 @@ fn graph_exact_mode_requires_verified_symbol_identity() {
     );
     assert!(exact_callees.iter().all(|edge| edge.verified_target_symbol));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3777,7 +3777,7 @@ pub struct Database;
         "impl Database should still be available after the struct: {hits:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3842,7 +3842,7 @@ impl B {
         .collect();
     assert_eq!(reindexed_ids, logical_ids, "logical ids must be stable across reindex");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3961,7 +3961,7 @@ pub fn caller() {
         "a handle in the ref slot is not ambiguous: {by_ref_handle:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4002,7 +4002,7 @@ fn indexes_real_world_rust_graph_patterns() {
         "serve callers: {callers:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4045,7 +4045,7 @@ export const callRun = () => run();
         "callRun callees: {callees:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4077,7 +4077,7 @@ int runtime_open(Runtime *runtime) {
 
     assert_edge(&db, "runtime_open", "helper", "calls_name", "Syntactic");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4131,7 +4131,7 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
         "DEVICE_API hits: {hits:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4162,7 +4162,7 @@ void Runtime::open() {
 
     assert_edge(&db, "open", "helper", "calls_name", "Syntactic");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4197,7 +4197,7 @@ fn indexes_real_world_typescript_graph_patterns() {
         "Shell callees: {callees:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4250,7 +4250,7 @@ fn execute_one() {
     assert_eq!(edge.4, "unresolved");
     assert!(edge.5.as_deref().is_some_and(|value| value.contains("format!")));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4322,7 +4322,7 @@ fn execute_one() {
     assert_eq!(edge.3, "unresolved");
     assert!(edge.4.as_deref().is_some_and(|value| value.contains("format!")));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4379,7 +4379,7 @@ pub fn caller() {
     assert_eq!(edge.3, "NameOnly");
     assert_eq!(edge.4, "unresolved");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4438,7 +4438,7 @@ fn rust_entry() {
     assert_eq!(edge.4, "unresolved");
     assert!(edge.5.as_deref().is_some_and(|value| value.contains("json!")));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4483,7 +4483,7 @@ pub fn second() {
         "spawn_blocking callers: {callers:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4580,7 +4580,7 @@ pub fn related_spawn_with_text() {
         "qualified caller lookup leaked related names or chain evidence: {qualified_callers:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4630,7 +4630,7 @@ pub fn caller() {{
         "impact: {impact:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4692,7 +4692,7 @@ pub fn caller() {
         "type references should not appear as direct impact: {impact:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4746,7 +4746,7 @@ pub fn hub() {
         "an uncapped result must NOT carry a sentinel: {full:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4779,7 +4779,7 @@ fn impact_surface_flat_signals_truncation_from_a_capped_textual_fallback() {
     let real_items = impact.iter().filter(|item| item.category != "completeness").count();
     assert_eq!(real_items, limit as usize, "exactly `limit` real items, plus the sentinel");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4843,7 +4843,7 @@ fn impact_surface_collapses_file_matches_to_one_row_per_file() {
         .count();
     assert_eq!(store_rows, 1, "a file with four symbols collapses to one fallback row");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4912,7 +4912,7 @@ where
         "path-local task_spawn docs should outrank unrelated phrase docs: {hits:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4940,7 +4940,7 @@ fn broken( {
     assert!(symbols.iter().any(|symbol| symbol.name == "caller"), "caller symbols: {symbols:?}");
     assert_edge(&db, "caller", "helper", "calls_name", "Syntactic");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4996,7 +4996,7 @@ pub struct JoinSet;
     assert_eq!(edge.4, "unresolved");
     assert_eq!(edge.5.as_deref(), Some("joinset"));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5085,7 +5085,7 @@ where
         "unresolved-enabled callees: {with_unresolved:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5145,7 +5145,7 @@ pub fn caller(input: Result<String, String>) -> String {
         "common-method-enabled callees: {expanded:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5187,7 +5187,7 @@ fun helper() {}
         "impact: {impact:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5219,7 +5219,7 @@ fn indexes_real_world_kotlin_graph_patterns() {
         "cleaned callers: {callers:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5285,7 +5285,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         "unrelated builder calls should not resolve to WatchProposalBuilder.build: {callers:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5355,7 +5355,7 @@ fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
         })
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5392,7 +5392,7 @@ fn papertrail_for_commit_prefers_commit_sourced_github_refs() {
         "structured commit refs should suppress noisy fallback evidence: {papertrail:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5425,7 +5425,7 @@ fn papertrail_for_symbol_dedupes_duplicate_file_refs() {
         "duplicate #42 refs in one file should collapse to one issue evidence row: {papertrail:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5457,7 +5457,7 @@ fn github_sync_keeps_partial_cache_and_skips_synced_refs_after_404() {
     assert_eq!(second.skipped_refs, 2);
     assert_eq!(second.failed_refs, 0);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5477,7 +5477,7 @@ fn search_recovers_when_fts_is_marked_dirty() {
     assert!(!fresh.fts_dirty);
     assert!(fresh.fts_fresh);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5492,7 +5492,7 @@ fn read_chunk_relocates_small_line_drift_to_current_text() {
     assert_eq!(chunk.end_line, 3);
     assert_eq!(chunk.text, "# Title\nalpha token\n");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5508,7 +5508,7 @@ fn read_chunk_large_drift_reindexes_and_reports_stale_chunk() {
     assert_eq!(hits.len(), 1);
     assert!(db.search("alpha", 10, false).unwrap().is_empty());
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5523,7 +5523,7 @@ fn search_retries_after_healing_stale_hit() {
     assert_eq!(beta_hits.len(), 1);
     assert!(beta_hits[0].summary.contains("beta"));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5538,7 +5538,7 @@ fn search_heals_relocated_hits_before_returning_line_spans() {
     assert_eq!(hits[0].end_line, 3);
     assert!(hits[0].summary.contains("alpha"));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5552,7 +5552,7 @@ fn read_chunk_deleted_source_reports_gone() {
     assert!(err.contains("Gone"), "{err}");
     assert!(db.search("alpha", 10, false).unwrap().is_empty());
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5573,7 +5573,7 @@ fn search_returns_needs_reindex_when_heal_cap_is_exceeded() {
     let err = db.search("common", 20, false).unwrap_err().to_string();
     assert!(err.contains("needs_reindex"), "{err}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5600,7 +5600,7 @@ fn search_drops_deleted_file_instead_of_erroring() {
     assert!(hits.iter().all(|hit| !hit.path.ends_with("drop.md")), "{hits:?}");
     assert!(hits.iter().any(|hit| hit.path.ends_with("keep.md")), "{hits:?}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5621,7 +5621,7 @@ fn heal_index_limit_does_not_warn_when_only_fresh_files_are_skipped() {
     assert_eq!(report.skipped_files, 2);
     assert_eq!(report.message, None);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5640,7 +5640,7 @@ fn search_recovers_when_fts_revision_is_stale() {
     assert_eq!(fresh.fts_source_revision.as_deref(), Some(fresh.content_revision.as_str()));
     assert!(fresh.fts_fresh);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5672,7 +5672,7 @@ fn parser_failures_report_paths() {
     assert_eq!(status.parser_failures, 1);
     assert_eq!(status.parser_failure_paths[0].path, "src/broken.rs");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5756,7 +5756,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
     assert_eq!(impact.completeness_and_caveats.memory_status.active, 1);
     assert_eq!(impact.completeness_and_caveats.memory_status.stale, 0);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5841,7 +5841,7 @@ fn compact_repo_memory_view_projects_primary_binding_then_full_mode_round_trips(
     assert_eq!(full.direct[0].body, full_body);
     assert_eq!(full.direct[0].bindings[0].binding_kind, "logical_symbol");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5930,7 +5930,7 @@ fn compact_repo_memory_view_separates_the_stale_lane() {
     assert_eq!(after.stale[0].memory_id, created.memory.memory_id);
     assert_eq!(after.stale[0].anchor_status.as_deref(), Some("stale"));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6007,7 +6007,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
     assert_eq!(anchored.len(), 1, "memory did not re-anchor to moved symbol");
     assert_ne!(anchored[0].bindings[0].anchor_status, "gone");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6094,7 +6094,7 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
     let gone = db.memory_for_symbol(&symbol, 10).unwrap();
     assert_eq!(gone[0].bindings[0].anchor_status, "gone");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6219,7 +6219,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
     assert_eq!(call_path[0].memory_id, call_path_memory.memory.memory_id);
     assert_eq!(call_path[0].call_paths[0].path_summary, "caller_edge -> target_edge");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6334,7 +6334,7 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
     db.memory_validate().unwrap();
     assert_eq!(call_path_status(&db), "gone", "deleting the call site makes the path gone");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6429,7 +6429,7 @@ fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
         compact.call_path_crossed.iter().map(|m| &m.title).collect::<Vec<_>>()
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6526,7 +6526,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
     assert!(path.contains("b.rs"), "binding path should be b.rs after relocation: {path}");
     assert_ne!(binding.anchor_status, "gone");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6620,7 +6620,7 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
     );
     assert!(!binding.contains("a.rs"), "binding_id must not still reference a.rs: {binding}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6726,7 +6726,7 @@ fn relocation_persists_refreshed_symbol_and_logical_ids() {
         "persisted symbol_id must resolve to a live symbol row"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6760,7 +6760,7 @@ fn full_rebuild_leaves_no_orphan_symbol_rows_for_a_path() {
         "repeated full rebuilds must not accumulate orphan symbol rows for the same path"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6828,7 +6828,7 @@ fn memory_stays_gone_when_moved_symbol_body_changed() {
     assert_eq!(report.gone, 1, "changed body must not trigger relocate, expected gone: {report:?}");
     assert_eq!(report.relocated, 0, "must not relocate when body changed: {report:?}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6939,7 +6939,7 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
         "must not relocate when two identical bodies exist: {report:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7061,7 +7061,7 @@ fn memory_logical_binding_relocates_across_files() {
         "logical binding path should be b.rs after relocation, got: {path}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7186,7 +7186,7 @@ fn memory_chunk_binding_relocates_by_hash() {
         "binding path must reference target.rs: {binding_path:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7343,7 +7343,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
         "binding must be current or relocated after validate: {post_rebind_report:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7428,7 +7428,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
     assert_eq!(health.gone, 0, "expected no gone bindings, got {health:?}");
     assert_eq!(health.stale, 0, "expected no stale bindings, got {health:?}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7520,7 +7520,7 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
         entry.candidates
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7586,7 +7586,7 @@ fn memory_doctor_dedupes_cfg_split_candidates() {
         entry.candidates.iter().filter(|c| c.ends_with("cfg_helper")).collect();
     assert_eq!(cfg_candidates.len(), 1, "cfg twins collapse to one suggestion: {cfg_candidates:?}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7621,7 +7621,7 @@ fn symbol_path_selector_is_exact_not_substring() {
         .expect("one hit");
     assert_eq!(hit.name, "spawn_blocking");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7699,7 +7699,7 @@ fn select_symbol_for_bind_collapses_cfg_split_group() {
         .expect("one member returned");
     assert_eq!(hit.logical_symbol_id, Some(logical_id));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7768,7 +7768,7 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
     assert!(!god_modules.candidates[0].split_hints.is_empty());
     assert!(god_modules.candidates[0].next_tools.iter().any(|tool| tool.tool == "impact_surface"));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -7835,7 +7835,7 @@ fn repo_clusters_groups_cotouched_files() {
     assert!(sync_cluster.representative_paths.contains(&"src/sync/msg.rs".to_string()));
     assert!(sync_cluster.metrics.co_touch_edges >= 2);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 fn hot_module_text(revision: usize) -> String {
@@ -9221,6 +9221,12 @@ fn worktree_overlay_serves_a_subdir_rooted_config() {
     let main = unique_temp_root();
     let _ = fs::remove_dir_all(&main);
     fs::create_dir_all(main.join("crate/src")).unwrap();
+    // Canonicalize the root, mirroring `Config::load`'s `normalize_existing_dir`: production
+    // `config.root` is always canonical, and `linked_config_subdir_and_root` strips it against the
+    // canonicalized base workdir. On macOS `std::env::temp_dir()` is `/var/folders/...` (a symlink
+    // to `/private/var/folders/...`), so an un-canonicalized root fails the `strip_prefix` and the
+    // subdir derivation collapses → zero overlay rows.
+    let main = main.canonicalize().unwrap();
     fs::write(main.join("crate/src/lib.rs"), "pub fn base_fn() {}\n").unwrap();
     init_git_repo(&main);
     run_git(&main, &["add", "."]);
@@ -9347,7 +9353,7 @@ fn rebuild_restores_durable_wal_after_bulk_build() {
     // The index is intact and queryable after the bulk build.
     assert!(!db.symbols("alpha", Some(Language::Rust), 10).unwrap().is_empty());
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -9397,7 +9403,7 @@ fn dir_memory_binds_to_a_directory() {
     assert_eq!(binding.binding_id, "src");
     assert_eq!(binding.anchor_status, "current");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -9475,7 +9481,7 @@ fn dir_memory_validation_current_and_gone() {
     assert_eq!(report.current, 2, "expected 2 current dir bindings");
     assert_eq!(report.gone, 1, "expected 1 gone dir binding");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -9585,7 +9591,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
     assert_eq!(path_only.len(), 1, "expected 1 path-kind summary, got: {path_only:?}");
     assert_eq!(path_only[0].binding_kind, "path");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ─── dir_tree tests ──────────────────────────────────────────────────────────
@@ -9681,7 +9687,7 @@ fn dir_tree_label_depth_flat_siblings() {
     assert_eq!(b.label, "b", "src/b label");
 
     assert_eq!(tree.truncated, 0);
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -9748,7 +9754,7 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
         tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
     );
     assert_eq!(tree.truncated, 0);
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ─── Fix 1 + memory-only inclusion ───────────────────────────────────────────
@@ -9789,7 +9795,7 @@ fn dir_tree_memory_only_dir_appears_without_min_files() {
     assert_eq!(node_a.depth, 1, "src/a depth");
     assert_eq!(node_a.label, "a", "src/a label");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ─── Fix 2: generated exclusion ──────────────────────────────────────────────
@@ -9850,7 +9856,7 @@ fn dir_tree_excludes_generated_files_from_count() {
     });
     assert_eq!(real_node.file_count, 3, "src/real file_count must be 3 (non-generated only)");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ─── Fix 3: real multi-context scoping ───────────────────────────────────────
@@ -9905,7 +9911,7 @@ fn dir_tree_scope_excludes_other_worktree_files() {
         node_a.file_count
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ─── Fix 3: max_nodes cap ────────────────────────────────────────────────────
@@ -9947,7 +9953,7 @@ fn dir_tree_truncates_at_max_nodes() {
     assert!(tree.nodes.len() <= 3, "nodes.len()={} must be <= max_nodes=3", tree.nodes.len());
     assert!(tree.truncated > 0, "truncated must be >0 when nodes were dropped");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ─── original integration test (extended) ────────────────────────────────────
@@ -10038,7 +10044,7 @@ fn dir_tree_builds_annotated_layout() {
     let node_a2 = tree2.nodes.iter().find(|n| n.path == "src/a").unwrap();
     assert_eq!(node_a2.file_count, 3, "file_count changed after scope reinstall");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ─── Bug fix: children of collapsed node must use leaf labels ─────────────────
@@ -10124,7 +10130,7 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
     );
 
     assert_eq!(tree.truncated, 0);
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 fn table_count(db: &IndexDatabase, table: &str) -> i64 {
@@ -10330,7 +10336,7 @@ fn rebuild_fts_repopulates_contentless_chunk_fts_from_the_store() {
         "rebuild_fts repopulates contentless chunk_fts from chunk_text"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -11062,7 +11068,7 @@ fn full_rebuild_applies_per_package_import_scope() {
         "a `Display` use'd from external std must not bind to the local `Display` struct"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 fn indexed_revision_count(db: &IndexDatabase) -> i64 {
@@ -11361,7 +11367,7 @@ fn orientation_composes_read_only() {
     );
     assert_eq!(o2.total_files, o1.total_files, "second call: total_files changed");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -11395,7 +11401,7 @@ fn orientation_composes_through_read_only_connection() {
     assert!(!o.tree.nodes.is_empty(), "tree.nodes empty through read-only conn");
     assert_eq!(o.total_files, 6, "total_files mismatch through read-only conn");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// A git fixture with one committed source file, configured like production (absolute DB path).
@@ -11484,7 +11490,7 @@ fn full_rebuild_survives_stale_overlay_rows() {
     assert_eq!(rows.len(), 1, "exactly one row per path after an authoritative rebuild: {rows:?}");
     assert_eq!(rows[0], (commit, String::new()), "the clean tree indexes at the commit scope");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// #59: a FOREIGN file row — a path the real tree never produces — leaked into the index at the
@@ -11525,7 +11531,7 @@ fn full_rebuild_clears_foreign_leaked_rows_at_the_active_scope() {
         .unwrap();
     assert_eq!(leaked, 0, "the authoritative full rebuild clears foreign rows at the active scope");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// #1 / #106: in a REAL git checkout the active context is `(commit_sha=HEAD, worktree_id=<root
@@ -11626,7 +11632,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
          symbol"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// #87 (self-heal half): an incremental pass drops a stale overlay row whose path is clean.
@@ -11691,7 +11697,7 @@ fn incremental_pass_heals_stale_overlay_rows() {
         "re-stamp is in place — the row id (and ids hanging off it) survive"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Phase 3: the LOCAL structural-load enrichment (`scoped weighted fan-in`) rides along on BOTH the
@@ -11781,7 +11787,7 @@ pub fn caller_three() -> i32 { load_bearing_hub() }
         assert_eq!(importance.label, "local structural load", "search hit labeled correctly");
     }
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Phase 3 regression: a CALLEE neighbor whose call was written with a `::` path carries a
@@ -11861,7 +11867,7 @@ pub fn qualified_caller_two() -> i32 { crate::helper::deep_helper() }
     assert_eq!(importance.signal, "scoped weighted fan-in");
     assert!(importance.score > 0.0, "two callers give the callee positive fan-in");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -11904,7 +11910,7 @@ fn read_only_open_serves_current_index_and_declines_when_heal_is_owed() {
         "a stale graph index owes a heal write → the read-only path must decline"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -11977,7 +11983,7 @@ fn impact_report_flags_a_section_truncated_at_limit() {
         full.completeness_and_caveats.truncated_sections
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -12016,7 +12022,7 @@ fn symbol_lookup_heals_stale_line_numbers_after_an_edit() {
         after.candidates[0].start_byte
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -12066,7 +12072,7 @@ fn symbol_lookup_heals_a_just_added_symbol_without_waiting_for_the_watcher() {
         "a genuine miss must stay empty"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -12096,7 +12102,7 @@ fn impact_completeness_flags_dirty_result_files() {
         dirty.completeness_and_caveats
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -12135,7 +12141,7 @@ fn symbol_lookup_does_not_resurrect_a_deleted_symbol_after_heal() {
         after.candidates
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -12166,7 +12172,7 @@ fn symbol_lookup_by_id_keeps_pre_heal_candidate_flagged_stale() {
     assert!(!res.candidates.is_empty(), "symbol_id selector keeps the pre-heal candidate");
     assert!(!res.stale_files.is_empty(), "and flags the file stale: {:?}", res.stale_files);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -12206,7 +12212,7 @@ fn impact_completeness_flags_a_dirty_callee_definition_file() {
         dirty.completeness_and_caveats
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -12436,7 +12442,7 @@ fn candidate_components_group_renamed_clones_and_exclude_unrelated() {
     assert_eq!(components.len(), 1, "exactly one clone component: {components:?}");
     assert_eq!(components[0].len(), 2, "the component is the two renamed clones: {components:?}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Adversarial containment (design rev-4 §8): a small function A whose entire token bag is
@@ -12500,7 +12506,7 @@ fn candidate_components_reject_small_function_contained_in_large_one() {
         "a small function contained in a large one is NOT a whole-symbol clone: {components:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// df is a selectivity hint only (design rev-4 §2, §8): emptying `clone_token_df` must NOT change
@@ -12535,7 +12541,7 @@ fn candidate_components_unchanged_when_clone_token_df_is_empty() {
         "df is selectivity-only: emptying clone_token_df must not change components"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// The `files.generated = 0` predicate is a READ-SIDE filter: generated files are still
@@ -12599,7 +12605,7 @@ fn candidate_components_exclude_generated_files_via_read_filter() {
         "generated b.rs must be excluded from clone components by the read filter: {after:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Max-denominator overlap gate regression: two structurally different functions whose
@@ -12665,7 +12671,7 @@ fn candidate_components_reject_partial_overlap_below_max_denominator_theta() {
          containment): min_len={min_len} max_len={max_len} threshold={threshold} {comps:?}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// normalizer_version filter: after a NORM_VERSION bump the old rows are stale and the read
@@ -12700,7 +12706,7 @@ fn candidate_read_ignores_stale_normalizer_version_rows() {
         "stale-version fingerprints must be ignored by the read"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// `find_clones` integration test: four near-identical rename-clone functions across two
@@ -12781,7 +12787,7 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
     assert_eq!(res.completeness.normalizer_version, NORM_VERSION);
     assert!(!res.completeness.truncated);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// `clones_for_symbol` integration test: two rename-clone functions (a.rs / b.rs) form one
@@ -12843,7 +12849,7 @@ fn clones_for_symbol_returns_the_class_by_ref_and_by_path_line() {
     assert!(solo_res.symbol_resolved, "the solo symbol still resolves");
     assert!(solo_res.symbol_fingerprinted, "the solo function is eligible (fingerprinted)");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Fix 1 (#215): `min_similarity` is honored ALL the way through candidate generation, not merely
@@ -12905,7 +12911,7 @@ fn find_clones_min_similarity_below_theta_widens_and_is_reported() {
     );
     assert_eq!(default.completeness.min_similarity, 0.7, "default completeness θ is 0.7");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// `min_similarity` is a similarity ratio θ = overlap/max_len and must lie in [0.5, 1.0]. Values
@@ -12967,7 +12973,7 @@ fn find_clones_rejects_out_of_range_min_similarity() {
     db.find_clones(FindClonesOptions { min_similarity: Some(0.5), min_copies: None, limit: None })
         .expect("min_similarity = 0.5 is the inclusive lower bound and must be accepted");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Fix 2 (#215): `completeness.truncated` reflects whole CLASSES dropped by `limit`, not only
@@ -13021,7 +13027,7 @@ fn find_clones_truncated_reflects_class_limit() {
         "dropping a whole class via the limit must set completeness.truncated"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Plan 4 coherence-splits over-merged components; the A~B~C chain becomes coherent sub-classes.
@@ -13089,7 +13095,7 @@ fn coherence_split_applied_in_find_clones() {
             })
             .unwrap();
         let sim = res.classes.first().map(|c| c.similarity_min).unwrap_or(0.0);
-        fs::remove_dir_all(r).unwrap();
+        let _ = fs::remove_dir_all(r);
         sim
     };
     let ab = edge_sim(("a", a), ("b", b));
@@ -13162,7 +13168,7 @@ fn coherence_split_applied_in_find_clones() {
     );
     assert!(c_class.refined, "the {{B,C}} sub-class is refined");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Helper: write four renamed clones (identical structure, different identifiers) across two
@@ -13241,7 +13247,7 @@ fn find_clones_refines_a_clean_class() {
         c.roi
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Plan 4a: `clones_for_symbol` always refines the subject's class (when refine inputs are
@@ -13265,7 +13271,7 @@ fn clones_for_symbol_returns_refined_class() {
         class.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Plan 4a: the content-addressed `refinement_key` is over the struct_hash MULTISET (order-
@@ -13304,7 +13310,7 @@ fn refinement_key_is_content_addressed_and_distinct_from_read_key() {
         "the content-addressed refinement key must differ from the location-derived read key"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Plan 4a: the refinement cache is read-through — the first `find_clones` populates a
@@ -13340,7 +13346,7 @@ fn refine_cache_is_read_through() {
     assert!(r2.classes[0].refined, "run 2 still refined (served from cache)");
     assert_eq!(count_rows(&db), after_run1, "run 2 is a cache hit — the row count must not grow");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Fix A (#215 Plan 4a codex2): the warm path (cache hit) must NOT re-parse any source file.
@@ -13417,7 +13423,7 @@ fn find_clones_warm_cache_metrics_sampled_consistent() {
          ({sampled_warm}) paths"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Plan 4a: only the top-N (by provisional ROI) classes are refined, where N == the caller's limit.
@@ -13494,8 +13500,8 @@ fn unrefined_class_outside_top_n_keeps_plan2_shape() {
         "limit=1 refines only the top-1 class — the out-of-budget class is never refined"
     );
 
-    fs::remove_dir_all(root).unwrap();
-    fs::remove_dir_all(root2).unwrap();
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(root2);
 }
 
 /// Fix 2 (Codex P2 #215 Plan 4a): find_clones with limit=Some(N) must never return an unrefined
@@ -13673,7 +13679,7 @@ fn find_clones_huge_limit_clamps_to_refine_budget() {
         "a limit above the budget that drops classes must set refine_budget_clamped"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// I3 (#215 Plan 4a adversary): `load_refine_members` caps the re-parse to LCS_MEMBER_SAMPLE (64)
@@ -13733,7 +13739,7 @@ fn load_refine_members_caps_to_lcs_sample_at_runtime() {
         "capped members must be the first LCS_MEMBER_SAMPLE in canonical (struct_hash, id) order"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Fix 3 (#215): `clones_for_symbol` carries eligibility flags. A below-`MIN_TOKENS` function
@@ -13786,7 +13792,7 @@ fn clones_for_symbol_reports_eligibility() {
     let class = clone.class.expect("load_user is in a clone class");
     assert_eq!(class.member_count, 2, "the clone class has both rename-clones");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Worktree-overlay scope: `find_clones` returns the BRANCH-ONLY clone class under the overlay
@@ -13890,8 +13896,8 @@ fn find_clones_falls_back_to_unrefined_when_source_unavailable() {
 
     // Delete the source trees (a/ and b/) but keep `.rag-rat/` (the SQLite DB). Each member's path
     // now fails `read_to_string`, so `load_refine_members` returns `None` → un-refinable fallback.
-    fs::remove_dir_all(root.join("a")).unwrap();
-    fs::remove_dir_all(root.join("b")).unwrap();
+    let _ = fs::remove_dir_all(root.join("a"));
+    let _ = fs::remove_dir_all(root.join("b"));
 
     let res = db
         .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
@@ -14002,7 +14008,7 @@ fn find_clones_caps_large_class_and_pins_late_subject() {
         pinned.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Fix 5 (#215): the clone surface stays empty (and errors NOT) when no fingerprint rows survive —
@@ -14041,7 +14047,7 @@ fn find_clones_returns_no_class_when_fingerprints_vanish() {
         .unwrap();
     assert!(after.classes.is_empty(), "no fingerprints ⇒ no clone classes (no error): {after:?}");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Fix 4 (#215): the `Ref` and `PathLine` resolution arms now LEFT JOIN symbol_fingerprints and
@@ -14082,7 +14088,7 @@ fn clones_for_symbol_prefers_fingerprinted_row_on_resolution() {
         "Ref and PathLine must resolve to the same fingerprinted class"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ── Fix 1 regression guard (PathLine tightest-span PRIMARY) ──────────────────────────────────
@@ -14155,7 +14161,7 @@ fn pathline_tightest_span_wins_over_fingerprinted_enclosing() {
         .unwrap();
     if lu_fp_count == 0 {
         // load_user not fingerprinted — can't run this test; skip gracefully.
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
         return;
     }
 
@@ -14317,7 +14323,7 @@ fn pathline_tightest_span_wins_over_fingerprinted_enclosing() {
          (span=19)"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ── Fix 2: Ref ambiguity rejection ───────────────────────────────────────────────────────────
@@ -14363,7 +14369,7 @@ fn clones_for_symbol_ref_single_fingerprinted_resolves_unfingerprinted_falls_bac
     assert!(!tiny_res.symbol_fingerprinted, "tiny is below MIN_TOKENS");
     assert!(tiny_res.class.is_none());
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Fix 2 (#215): injecting TWO distinct fingerprinted `symbols` rows that share the SAME
@@ -14432,7 +14438,7 @@ fn clones_for_symbol_ref_ambiguous_fingerprinted_returns_err() {
 
     let Some((nk, nv, tl, sh)) = fp else {
         // If there's no fingerprint yet the ambiguity path can't be reached; skip gracefully.
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
         return;
     };
 
@@ -14457,7 +14463,7 @@ fn clones_for_symbol_ref_ambiguous_fingerprinted_returns_err() {
         .unwrap();
     if dup_fp_count == 0 {
         // fp INSERT was silently ignored (shouldn't happen) — skip the test.
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
         return;
     }
 
@@ -14472,7 +14478,7 @@ fn clones_for_symbol_ref_ambiguous_fingerprinted_returns_err() {
         "error message must name the ambiguous ref, got: {msg}"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 // ── Fix 3: stale_members in completeness ────────────────────────────────────────────────────
@@ -14530,7 +14536,7 @@ fn find_clones_stale_members_zero_on_clean_index_and_nonzero_after_disk_edit() {
         stale.completeness.stale_members
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Resolve the `symbols.id` of a fingerprinted function by its qualified-name `ref` (the
@@ -14629,7 +14635,7 @@ fn load_refine_members_reparse_is_faithful_to_persisted_struct_hash() {
     let actual = members.iter().map(|m| (m.struct_hash.clone(), m.symbol_id)).collect::<Vec<_>>();
     assert_eq!(actual, expected, "members must be sorted by (struct_hash, symbol_id)");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Empty input is a valid (empty) refine set — not a failure.
@@ -14644,7 +14650,7 @@ fn load_refine_members_empty_input_returns_empty() {
     let members = db.load_refine_members(&[]).unwrap().expect("empty input is a valid empty set");
     assert!(members.is_empty(), "empty member_ids → empty members");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Missing source: a member whose source file is deleted from disk (but whose fingerprint row is
@@ -14679,7 +14685,7 @@ fn load_refine_members_returns_none_when_source_missing() {
         "a member with a deleted source file must yield Ok(None) for the whole class"
     );
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Overlay fallback (#215 Plan 4a Task 2): under a LINKED-WORKTREE OVERLAY scope, `source_root` is

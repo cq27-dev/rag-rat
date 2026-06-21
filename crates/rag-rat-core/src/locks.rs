@@ -357,9 +357,15 @@ mod tests {
 
     #[test]
     fn hook_socket_path_lives_under_base_sockets_dir() {
-        let base = temp_dir();
-        let root = temp_dir();
-        let socket = hook_socket_path(&base, &root);
+        // Short, fixed paths (they need not exist — `hook_socket_path` only builds the string) so
+        // the preferred `<base>/sockets/<hash>.sock` stays within MAX_SOCKET_PATH_LEN on
+        // every platform. The real `temp_dir()` helper roots under `std::env::temp_dir()`,
+        // which on macOS is a long `/var/folders/…` path that busts the budget and falls
+        // back to the XDG candidate (parent `rag-rat`, not `sockets`) — the over-budget
+        // fallback is covered separately via `long_base_dir`.
+        let base = Path::new("/r");
+        let root = Path::new("/repo");
+        let socket = hook_socket_path(base, root);
         assert_eq!(socket.parent().unwrap().file_name().unwrap(), "sockets");
         assert!(socket.extension().is_some_and(|ext| ext == "sock"));
     }

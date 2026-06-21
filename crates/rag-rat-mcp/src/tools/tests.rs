@@ -343,7 +343,7 @@ fn index_status_surfaces_version_when_cached_and_enabled() {
     assert_eq!(version["update_available"], true);
     assert_eq!(version["update_command"], "cargo install rag-rat --force");
 
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -391,7 +391,7 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
     let local_ai = call_tool(&config.database, "local_ai_status", json!({})).unwrap();
     assert_eq!(local_ai["embedding"]["state"], "MissingModel");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -485,7 +485,7 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
             .unwrap();
     assert_eq!(obsolete["status"], "obsolete");
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -513,7 +513,7 @@ fn mcp_read_chunk_and_heal_index_do_not_return_stale_text() {
     let fresh = call_tool_for_config(&config, "semantic_search", json!({"query": "beta"})).unwrap();
     assert_eq!(fresh.as_array().unwrap().len(), 1);
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -684,7 +684,7 @@ fn mcp_handle_selection_disambiguates_graph_tools() {
     .unwrap();
     assert!(papertrail["current_source"]["symbol"].as_str().unwrap().contains("shared"));
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -720,7 +720,7 @@ fn find_callers_zero_callers_is_not_low_completeness() {
     assert_eq!(callee["summary"]["completeness_risk"], "low");
     assert!(callee["summary"]["completeness_note"].is_null());
 
-    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 fn assert_schema_requires(tools: &[Value], name: &str, field: &str) {
@@ -845,7 +845,7 @@ fn mcp_rewrites_ranking_hint_when_auto_run_enabled() {
         Some(rag_rat_core::query::pagerank::RANKING_HINT_RUN_ORACLE),
     );
 
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn tool_schema<'a>(tools: &'a [Value], name: &str) -> &'a Value {
@@ -1180,7 +1180,7 @@ fn read_tool_lazy_write_retries_read_write_not_readonly_error() {
         "the lazy write must be retried read-write, never surfaced as SQLITE_READONLY: {err:?}"
     );
 
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

@@ -14,7 +14,10 @@ resolver = "3"
 version = "0.8.0"
 authors = ["Kristaps Karlsons"]
 edition = "2024"
-rust-version = "1.89"
+# Bundled SQLite (rusqlite `bundled` -> libsqlite3-sys 0.38.1) compiles a build script that uses the
+# `cfg_select!` macro, stabilized in Rust 1.95 — so the whole workspace's MSRV is 1.95 on every
+# platform. (Latest non-SQLite deps need only 1.88: darling, ort-sys.)
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/cq27-dev/rag-rat"
 readme = "README.md"
@@ -28,22 +31,22 @@ categories = ["command-line-utilities", "development-tools"]
 rag-rat-core = { version = "0.8.0", path = "crates/rag-rat-core", default-features = false }
 rag-rat-mcp = { version = "0.8.0", path = "crates/rag-rat-mcp", default-features = false }
 anyhow = "1.0"
-fastembed = { version = "5.1.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 gix = { version = "0.84.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
 libc = "0.2"
 rmcp = { version = "1.7.0", features = ["transport-io"] }
-rusqlite = "0.40"
-rayon = "1.11"
-regex = "1.11"
+rusqlite = { version = "0.40", features = ["bundled"] }
+rayon = "1.12"
+regex = "1.12"
 schemars = { version = "1.2.1", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-std"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-std"] }
 # Minimal blocking HTTP for the crates.io version check (and future GitHub/GitLab/Bitbucket REST).
 # rustls (no system OpenSSL); gzip off — the responses are tiny. The only HTTP at the core edge.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # TOON (Token-Oriented Object Notation): the default render for CLI + MCP output. ~34% fewer tokens
 # than compact JSON on uniform-row payloads, neutral on nested ones — see rag_rat_core::output.
 # default-features = false drops its `cli` feature (ratatui/crossterm/arboard/syntect/tiktoken-rs/…)
@@ -58,3 +61,10 @@ tree-sitter-kotlin = { package = "tree-sitter-kotlin-ng", version = "1.1.0" }
 tree-sitter-python = "=0.25.0"
 tree-sitter-rust = "=0.24.2"
 tree-sitter-typescript = "=0.23.2"
+
+# `cc` compiles the bundled SQLite amalgamation at the profile's opt-level, which is 0 for
+# `cargo build`/`cargo test` — an unoptimized SQLite is dramatically slower at the heavy INSERT
+# workload the indexing tests run. Build just this one C-heavy dep at opt-level 3 so dev/test stays
+# fast; it's compiled once then cached.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3

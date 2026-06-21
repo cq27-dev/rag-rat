@@ -20,6 +20,9 @@ use std::path::Path;
 pub const UPGRADE_BIN_ENV: &str = "RAG_RAT_UPGRADE_BIN";
 
 /// A candidate process discovered under `/proc`, reduced to what target selection needs.
+// Linux-only: the only consumers are `trigger`/`scan_proc`/`select_targets`, all gated to Linux —
+// without this gate it is dead code under `-D warnings` on macOS/Windows.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcInfo {
     pub pid: i32,
@@ -33,6 +36,7 @@ pub(crate) struct ProcInfo {
 /// Choose which PIDs to `SIGUSR1`, ordered so this process upgrades **last** (others ascending,
 /// self appended). A process is a target iff it is [`ProcInfo::eligible`] and running an outdated
 /// binary (`exe_inode != installed_inode`). Pure, so it is unit-testable without `/proc`.
+#[cfg(target_os = "linux")]
 pub(crate) fn select_targets(procs: &[ProcInfo], installed_inode: u64) -> Vec<i32> {
     let mut others: Vec<i32> = Vec::new();
     let mut own: Option<i32> = None;
@@ -146,7 +150,8 @@ mod linux {
     }
 }
 
-#[cfg(test)]
+// `select_targets`/`ProcInfo` exist only on Linux, so their unit tests are Linux-only too.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

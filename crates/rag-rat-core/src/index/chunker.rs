@@ -38,7 +38,8 @@ fn markdown_chunks(text: &str) -> Vec<Chunk> {
     let mut buffer = String::new();
     let mut byte = 0;
 
-    for (idx, line) in text.lines().enumerate() {
+    for (idx, raw) in text.split_inclusive('\n').enumerate() {
+        let line = raw.trim_end_matches('\n').trim_end_matches('\r');
         if line.starts_with('#') && !buffer.trim().is_empty() {
             chunks.push(make_chunk(
                 "markdown",
@@ -57,7 +58,7 @@ fn markdown_chunks(text: &str) -> Vec<Chunk> {
         }
         buffer.push_str(line);
         buffer.push('\n');
-        byte += line.len() + 1;
+        byte += raw.len();
     }
 
     if !buffer.trim().is_empty() {
@@ -199,16 +200,19 @@ fn line_span(text: &str, start_line: usize, end_line: usize) -> Option<LineSpan>
     let mut byte = 0;
     let mut start_byte = None;
     let mut out = String::new();
-    for (idx, line) in text.lines().enumerate() {
+    for (idx, raw) in text.split_inclusive('\n').enumerate() {
         let line_no = idx + 1;
         if line_no == start_line {
             start_byte = Some(byte);
         }
         if line_no >= start_line && line_no <= end_line {
-            out.push_str(line);
-            out.push('\n');
+            // Keep the raw on-disk bytes (incl. any CRLF) so the returned span's length equals its
+            // real byte length; `split_symbol` re-normalizes each line when it builds chunk text,
+            // and advances its byte cursor over these raw lengths so code-chunk offsets stay
+            // aligned with the tree-sitter symbol offsets `query::graph_meta` joins against.
+            out.push_str(raw);
         }
-        byte += line.len() + 1;
+        byte += raw.len();
         if line_no >= end_line {
             break;
         }
@@ -235,10 +239,11 @@ fn split_text_chunks(path: &Path, kind: &'static str, text: &str, max_lines: usi
     let mut start_byte = 0;
     let mut byte = 0;
     let mut buffer = String::new();
-    for (idx, line) in text.lines().enumerate() {
+    for (idx, raw) in text.split_inclusive('\n').enumerate() {
+        let line = raw.trim_end_matches('\n').trim_end_matches('\r');
         buffer.push_str(line);
         buffer.push('\n');
-        byte += line.len() + 1;
+        byte += raw.len();
         let line_no = idx + 1;
         if line_no - start_line + 1 >= max_lines {
             chunks.push(make_chunk(
@@ -317,10 +322,11 @@ fn split_symbol(
     let mut start_line = base_line;
     let mut byte = base_byte;
     let mut buffer = String::new();
-    for (idx, line) in text.lines().enumerate() {
+    for (idx, raw) in text.split_inclusive('\n').enumerate() {
+        let line = raw.trim_end_matches('\n').trim_end_matches('\r');
         buffer.push_str(line);
         buffer.push('\n');
-        byte += line.len() + 1;
+        byte += raw.len();
         let line_no = base_line + idx;
         if line_no - start_line + 1 >= max_lines {
             parts.push(ChunkPart {
