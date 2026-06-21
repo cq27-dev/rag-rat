@@ -12464,35 +12464,20 @@ fn migration_031_edge_oracle_no_fk_content_key() {
     assert_eq!(remaining, 1, "edge_oracle survives a full edges_data delete (no cascade)");
 }
 
-/// STRUCTURAL TRIP-WIRE (#248): the "can't happen again" guard for the whole bug CLASS. Every
-/// oracle-DERIVED persisted table (`schema::ORACLE_PERSISTED_TABLES`) is introspected via
-/// `PRAGMA foreign_key_list`, and NONE may carry an `ON DELETE CASCADE` (or `RESTRICT`) FK to a
-/// reindex-VOLATILE parent (`schema::REINDEX_VOLATILE_PARENTS`: `edges_data`, `symbols`,
-/// `logical_symbols`, the rowid-keyed `files`). This is the exact check that would have FAILED on
-/// the original `edge_oracle` `FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE` —
-/// the FK that silently wiped every verdict on the first reindex. A new oracle-derived table is
-/// forced to opt into the const, so it cannot reintroduce the bug without this test catching it.
-/// (If this test ever fails on a CURRENT table, that is ANOTHER instance of the #248 bug to FIX —
-/// re-anchor the table on a content key + drop the FK — not a test to relax.)
-#[test]
-fn oracle_persisted_tables_have_no_reindex_cascading_fk() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    crate::index::schema::apply(&conn).expect("apply reaches LATEST");
-
-    for &table in crate::index::schema::ORACLE_PERSISTED_TABLES {
-        // The table must exist (a typo in the const would otherwise silently skip the check).
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                params![table],
-                |r| r.get(0),
-            )
+/// Every `ON DELETE CASCADE`/`RESTRICT` FK to a reindex-volatile parent, as
+/// `(child_table, parent_table, on_delete)`, scanned from a FULLY-MIGRATED DB. Enumerates EVERY
+/// table in `sqlite_master` (not a hand-maintained list) so a new offender is caught automatically.
+fn cascading_fks_to_volatile_parents(conn: &rusqlite::Connection) -> Vec<(String, String, String)> {
+    let tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .unwrap();
-        assert_eq!(exists, 1, "ORACLE_PERSISTED_TABLES lists `{table}` but it does not exist");
-
+        stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect()
+    };
+    let mut found = Vec::new();
+    for table in tables {
         // `pragma_foreign_key_list` columns: `id`, `seq`, `table` (parent), `from`, `to`,
-        // `on_update`, `on_delete`, `match`. A CASCADE/RESTRICT FK to a volatile parent is the #248
-        // bug shape.
+        // `on_update`, `on_delete`, `match`.
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT \"table\", on_delete FROM pragma_foreign_key_list('{table}')"
@@ -12501,22 +12486,97 @@ fn oracle_persisted_tables_have_no_reindex_cascading_fk() {
         let fks: Vec<(String, String)> = stmt
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
             .unwrap()
-            .map(|r| r.unwrap())
+            .map(Result::unwrap)
             .collect();
-
         for (parent, on_delete) in fks {
             let is_volatile_parent =
                 crate::index::schema::REINDEX_VOLATILE_PARENTS.contains(&parent.as_str());
             let is_cascading = matches!(on_delete.to_uppercase().as_str(), "CASCADE" | "RESTRICT");
-            assert!(
-                !(is_volatile_parent && is_cascading),
-                "oracle-derived table `{table}` has an ON DELETE {on_delete} FK to the \
-                 reindex-volatile parent `{parent}` — that wipes the oracle output on every \
-                 reindex (the #248 bug). Re-anchor `{table}` on a content key + drop the FK; \
-                 reads must join the live parent so dangling rows never resolve.",
-            );
+            if is_volatile_parent && is_cascading {
+                found.push((table.clone(), parent, on_delete));
+            }
         }
     }
+    found
+}
+
+/// ENFORCING STRUCTURAL TRIP-WIRE (#248): the "can't happen again" guard for the whole bug CLASS,
+/// rewritten to ENUMERATE EVERY table in a fully-migrated DB (via
+/// [`cascading_fks_to_volatile_parents`]) rather than iterate a hand-maintained list. It asserts NO
+/// table carries an `ON DELETE CASCADE`/`RESTRICT` FK to a reindex-VOLATILE parent
+/// (`schema::REINDEX_VOLATILE_PARENTS`: `edges_data`, `symbols`, `logical_symbols`, the rowid-keyed
+/// `files`) EXCEPT the explicit `schema::CASCADE_FK_ALLOWLIST` of `(child, parent)` pairs that are
+/// rebuilt-with-their-parent and hold no oracle/durable state.
+///
+/// This is the exact check that would have FAILED on the original `edge_oracle`
+/// `FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE` — the FK that silently wiped
+/// every verdict on the first reindex. Crucially, because it scans `sqlite_master` (not
+/// `ORACLE_PERSISTED_TABLES`), a FUTURE oracle/durable table that forgets to opt into any list
+/// still FAILS automatically: the author must EITHER content-anchor it (no cascading FK) OR
+/// consciously add it to the allowlist with a reason — and the allowlist is explicitly NOT for
+/// durable state.
+///
+/// If this fails on a NEW table that genuinely holds oracle/durable output, that is ANOTHER
+/// instance of the #248 bug to FIX (re-anchor on a content key + drop the FK), not to allowlist.
+#[test]
+fn no_table_has_a_reindex_cascading_fk_to_a_volatile_parent() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply reaches LATEST");
+
+    // Every declared oracle-derived table exists and is implicitly covered by the scan below (a
+    // typo in the const would otherwise drift from reality unnoticed). The const stays the
+    // canonical declaration of which outputs MUST survive reindex; the scan is what ENFORCES
+    // the FK shape.
+    for &table in crate::index::schema::ORACLE_PERSISTED_TABLES {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "ORACLE_PERSISTED_TABLES lists `{table}` but it does not exist");
+    }
+
+    let disallowed: Vec<(String, String, String)> = cascading_fks_to_volatile_parents(&conn)
+        .into_iter()
+        .filter(|(table, parent, _)| {
+            !crate::index::schema::CASCADE_FK_ALLOWLIST.contains(&(table.as_str(), parent.as_str()))
+        })
+        .collect();
+
+    assert!(
+        disallowed.is_empty(),
+        "table(s) carry a reindex-cascading FK to a volatile parent (the #248 bug class): \
+         {disallowed:?}\noracle/durable outputs MUST survive reindex — content-key + no \
+         reindex-cascading FK; reads join the live parent so dangling rows never resolve. If a \
+         flagged table is genuinely ephemeral-with-its-parent (rebuilt with it, no durable \
+         state), add (table, parent) to schema::CASCADE_FK_ALLOWLIST with a reason. Never \
+         allowlist a table that holds oracle/durable state.",
+    );
+
+    // NEGATIVE SUB-ASSERTION (the trip-wire has teeth): a synthetic table WITH a cascading FK to a
+    // volatile parent (`edges_data`) IS flagged by the scan — proving a future offender would not
+    // slip through. Built on its own connection so the production scan above stays clean.
+    let probe = rusqlite::Connection::open_in_memory().expect("open probe");
+    crate::index::schema::apply(&probe).expect("apply reaches LATEST");
+    probe
+        .execute_batch(
+            "CREATE TABLE __trip_wire_probe__(
+                 id INTEGER PRIMARY KEY,
+                 x INTEGER,
+                 FOREIGN KEY(x) REFERENCES edges_data(id) ON DELETE CASCADE
+             );",
+        )
+        .unwrap();
+    let probe_hits = cascading_fks_to_volatile_parents(&probe);
+    assert!(
+        probe_hits.iter().any(|(t, p, od)| t == "__trip_wire_probe__"
+            && p == "edges_data"
+            && od.eq_ignore_ascii_case("CASCADE")),
+        "the scan must flag a synthetic CASCADE FK to edges_data — otherwise the trip-wire is \
+         toothless; got {probe_hits:?}",
+    );
 }
 
 #[test]

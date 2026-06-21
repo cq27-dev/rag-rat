@@ -658,14 +658,25 @@ pub(crate) fn count_edge_oracle_scoped(
     kind: Option<OracleResolutionKind>,
 ) -> anyhow::Result<u64> {
     let scope_join = edge_oracle_scope_join();
+    // COUNT(DISTINCT edge_oracle.rowid), not COUNT(*): the scope join joins each `edge_oracle` row
+    // to its LIVE edge by the content key. That key is measured 1:1 with a live edge (0
+    // collisions / 1.03M rows — the call-site source span makes it unique), so today this
+    // equals COUNT(*). The DISTINCT is defense-in-depth (#248): if a future extract/resolve
+    // span change ever made one content key fan onto MULTIPLE live edges, COUNT(*) would
+    // inflate the verdict total by counting the row once per matched edge — DISTINCT on the
+    // physical verdict's rowid pins the count to the number of persisted verdicts regardless.
+    // (`edge_oracle` is STRICT, not WITHOUT ROWID, so it has an implicit rowid.) Pairs with
+    // `edge_oracle_same_full_content_key_upserts_one_row`.
     let count: i64 = match kind {
         Some(kind) => conn.query_row(
-            &format!("SELECT COUNT(*){scope_join} AND edge_oracle.kind = ?5"),
+            &format!(
+                "SELECT COUNT(DISTINCT edge_oracle.rowid){scope_join} AND edge_oracle.kind = ?5"
+            ),
             params![tool.as_db_str(), tool_version, commit_sha, worktree_id, kind.as_db_str()],
             |row| row.get(0),
         )?,
         None => conn.query_row(
-            &format!("SELECT COUNT(*){scope_join}"),
+            &format!("SELECT COUNT(DISTINCT edge_oracle.rowid){scope_join}"),
             params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
             |row| row.get(0),
         )?,

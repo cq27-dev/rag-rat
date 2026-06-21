@@ -2146,6 +2146,50 @@ fn edge_oracle_collision_same_callee_range_different_kind_disambiguated() {
     assert_eq!(ref_scip, "scip x `Thing`#");
 }
 
+/// #248 content-key collision SEMANTICS (the schema-permitted, organically-unreachable edge case):
+/// two verdicts with the SAME FULL content key
+/// `(tool, tool_version, source_path, source_start_byte, source_end_byte, callee_start_byte,
+/// callee_end_byte, edge_kind)` — differing only in the resolved target (`resolved_symbol_id` /
+/// `scip_symbol`) and verdict `kind` — collapse to EXACTLY ONE physical `edge_oracle` row via the
+/// PRIMARY-KEY upsert (last write wins). The unique-key disambiguation test above keeps two rows by
+/// changing `edge_kind`; THIS test pins what happens when even `edge_kind` matches.
+///
+/// This is DOCUMENTED as schema-PERMITTED but organically UNREACHABLE for real extracted edges: the
+/// call-site source span (`source_start_byte`/`source_end_byte`) is part of the key, and two
+/// distinct call sites always carry distinct source spans (measured 0 collisions / 1.03M rows). The
+/// key is NOT schema-enforced to be 1:1 with a live edge — it is unique only because real call-site
+/// spans are. Pinning the upsert here means a FUTURE extract/resolve span change that made the same
+/// full key reachable for two genuinely-different edges would surface as a behavior change this
+/// test catches (the count helpers assume this measured 1:1, per `count_edge_oracle_scoped`).
+#[test]
+fn edge_oracle_same_full_content_key_upserts_one_row() {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { thing(); }\n");
+    let sha = h.file_sha("a.rs");
+    // ONE edge → ONE content key. Writing two verdicts for it reuses the identical full key.
+    let edge = h.add_edge(f, "thing", 14, 19, "Exact", None);
+
+    // First verdict: an Upgrade naming target A.
+    h.write_verdict(edge, &sha, Some(101), "scip x `thing`#A().", OracleResolutionKind::Upgrade);
+    // Second verdict, SAME full content key (same edge → same path + spans + edge_kind, same
+    // TOOL/VERSION), differing only in the resolved target and the verdict kind.
+    h.write_verdict(edge, &sha, Some(202), "scip x `thing`#B().", OracleResolutionKind::Confirm);
+
+    // EXACTLY ONE physical row — the second write UPSERTED the first (it did not insert a sibling).
+    let rows: i64 = h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 1, "same full content key collapses to one edge_oracle row (PK upsert)");
+
+    // Last write wins: the surviving row carries the SECOND verdict's target + kind.
+    let (kind, resolved, scip) = h.verdict(edge).expect("the single upserted verdict");
+    assert_eq!(
+        kind,
+        OracleResolutionKind::Confirm.as_db_str(),
+        "the later verdict's kind survives"
+    );
+    assert_eq!(resolved, Some(202), "the later verdict's resolved target survives");
+    assert_eq!(scip, "scip x `thing`#B().", "the later verdict's scip symbol survives");
+}
+
 /// #248 counts: after a reindex that CHANGES one file (its `files.sha256` drifts), status/eval
 /// counts reflect only LIVE + CURRENT verdicts — the changed file's verdict drops out (file_sha
 /// mismatch in the scope join) and never inflates the totals, while the unchanged file's verdict

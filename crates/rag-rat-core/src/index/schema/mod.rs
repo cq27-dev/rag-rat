@@ -18,14 +18,17 @@ pub const LATEST_SCHEMA_VERSION: u32 = 31;
 /// (#248) after its `FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE` silently
 /// wiped every verdict on the first reindex.
 ///
-/// The structural trip-wire `oracle_persisted_tables_have_no_reindex_cascading_fk` asserts every
-/// table here has no `ON DELETE CASCADE`/`RESTRICT` FK to a volatile parent — the exact check that
-/// would have caught the original `edge_oracle` FK. A NEW oracle-derived table is FORCED to opt in
-/// here (and thus to satisfy the trip-wire), so the next agent can't add a CASCADE-on-reindex table
-/// without the guard catching it.
-// Consumed only by the `oracle_persisted_tables_have_no_reindex_cascading_fk` trip-wire
-// (#[cfg(test)]), so the non-test lib build sees no reader; it is intentionally a durable
-// schema-invariant declaration.
+/// The ENFORCING structural trip-wire `no_table_has_a_reindex_cascading_fk_to_a_volatile_parent`
+/// scans EVERY table in `sqlite_master` (not this list) and asserts none carries an `ON DELETE
+/// CASCADE`/`RESTRICT` FK to a volatile parent except the explicit [`CASCADE_FK_ALLOWLIST`] — the
+/// exact check that would have caught the original `edge_oracle` FK, and which catches a future
+/// oracle/durable table automatically even if it forgets to opt into any list. This const remains
+/// the canonical DECLARATION of which outputs must survive reindex — the same trip-wire asserts
+/// each listed table exists, and the lifecycle guard
+/// `oracle_outputs_survive_full_and_incremental_reindex` exercises their survival behaviorally
+/// across both reindex shapes.
+// Consumed only by the reindex trip-wires (#[cfg(test)]), so the non-test lib build sees no reader;
+// it is intentionally a durable schema-invariant declaration.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ORACLE_PERSISTED_TABLES: &[&str] =
     &["edge_oracle", "logical_symbol_monikers", "oracle_runs"];
@@ -38,6 +41,37 @@ pub(crate) const ORACLE_PERSISTED_TABLES: &[&str] =
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const REINDEX_VOLATILE_PARENTS: &[&str] =
     &["edges_data", "symbols", "logical_symbols", "files"];
+
+/// The `(child_table, volatile_parent)` pairs that LEGITIMATELY carry an `ON DELETE
+/// CASCADE`/`RESTRICT` FK to a reindex-volatile parent ([`REINDEX_VOLATILE_PARENTS`]) — every one a
+/// table that is *rebuilt with its parent* on every reindex and holds NO oracle/durable state, so
+/// the cascade is the desired freshness behavior (the child must die with the parent row that
+/// produced it), not the #248 data-loss bug.
+///
+/// INVARIANT (#248): this is the EXPLICIT opt-out the enforcing trip-wire
+/// [`no_table_has_a_reindex_cascading_fk_to_a_volatile_parent`] consults. The trip-wire scans EVERY
+/// table in `sqlite_master` (not a hand-maintained list), so a NEW table that adds a cascading FK
+/// to a volatile parent FAILS the test automatically unless it is added here WITH a reason. Never
+/// allowlist a table that holds oracle/durable state — that re-creates the #248 bug; re-anchor such
+/// a table on a content key + drop the FK instead.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const CASCADE_FK_ALLOWLIST: &[(&str, &str)] = &[
+    // `chunks` are per-file text/embedding inputs, re-chunked from scratch when a file is
+    // reindexed.
+    ("chunks", "files"),
+    // `edges_data` is the heuristic graph itself, rebuilt per-file (it IS a volatile parent).
+    ("edges_data", "files"),
+    // `symbols` are rebuilt per-file (AUTOINCREMENT rowids re-mint on reindex).
+    ("symbols", "files"),
+    // Logical-symbol grouping is rebuilt wholesale from the live symbols on every pass.
+    ("logical_symbol_members", "symbols"),
+    ("logical_symbol_members", "logical_symbols"),
+    // Per-symbol derived facts, rebuilt with the symbols they describe.
+    ("symbol_facts", "symbols"),
+    // Clone-detection fingerprints + their inverted-index postings, rebuilt with the symbols.
+    ("symbol_fingerprints", "symbols"),
+    ("symbol_token_postings", "symbols"),
+];
 
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
