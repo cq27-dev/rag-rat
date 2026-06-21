@@ -10497,13 +10497,12 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.storage
             .connection()
-            .execute("DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled'", [
-            ])
+            .execute("DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor'", [])
             .unwrap();
         assert_eq!(
             schema::status(db.storage.connection()).unwrap().state,
             schema::SchemaState::Older,
-            "removing the V030 ledger row makes the schema Older"
+            "removing the newest (V031) ledger row makes the schema Older"
         );
     }
 
@@ -10528,7 +10527,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 30);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 31);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -12299,11 +12298,14 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
         !cols_before.contains(&"lcs_sampled".to_string()),
         "lcs_sampled must be absent before the migration runs"
     );
-    // Remove the V030 ledger row so the schema reads Older and migrate_forward replays it.
+    // Remove the V030 ledger row (and every later one) so the schema reads Older and
+    // migrate_forward replays V030. Later migrations (V031+) must also be unrecorded or
+    // `known_version` would still report LATEST and the schema would read Compatible.
     conn.execute_batch(
-        "DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';",
+        "DELETE FROM schema_version
+         WHERE id IN ('030_clone_refinements_lcs_sampled', '031_edge_oracle_content_anchor');",
     )
-    .expect("delete V030 ledger row");
+    .expect("delete V030+ ledger rows");
     assert_eq!(
         crate::index::schema::status(&conn).unwrap().state,
         crate::index::schema::SchemaState::Older,
@@ -12334,8 +12336,8 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     );
     assert_eq!(
         crate::index::schema::LATEST_SCHEMA_VERSION,
-        30,
-        "LATEST_SCHEMA_VERSION is 30 after V030"
+        31,
+        "LATEST_SCHEMA_VERSION is 31 after V031"
     );
     // Idempotency: running migrate_forward again must not error.
     crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
@@ -12344,6 +12346,119 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
         crate::index::schema::SchemaState::Compatible,
         "schema is still Compatible after second migrate_forward"
     );
+}
+
+/// V031 (#248): a DB migrated to LATEST has `edge_oracle` content-anchored — NO `edges_data` FK,
+/// the content-key columns present, and a `DELETE FROM edges_data` does NOT cascade-wipe a manually
+/// inserted `edge_oracle` row (the bug: V018's `ON DELETE CASCADE` wiped every verdict on reindex).
+/// Drives the migration path explicitly: build the OLD (V018) FK shape, record the ledger one short
+/// of V031, then `migrate_forward` and assert the rebuilt shape.
+#[test]
+fn migration_031_edge_oracle_no_fk_content_key() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    crate::index::schema::apply(&conn).expect("apply reaches V31");
+
+    // Simulate a V030-era index whose `edge_oracle` still has the OLD edge_id-keyed FK shape: drop
+    // the content-anchored table and recreate the V018 shape, then remove the V031 ledger row so
+    // migrate_forward replays the rebuild.
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+        DROP TABLE edge_oracle;
+        CREATE TABLE edge_oracle(
+            edge_id INTEGER NOT NULL,
+            file_sha TEXT NOT NULL,
+            tool TEXT NOT NULL,
+            tool_version TEXT NOT NULL,
+            resolved_symbol_id INTEGER,
+            scip_symbol TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            computed_at INTEGER NOT NULL,
+            PRIMARY KEY(edge_id, tool, tool_version),
+            FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE
+        ) STRICT;
+        PRAGMA foreign_keys = ON;
+        ",
+    )
+    .expect("recreate legacy V018 edge_oracle");
+    conn.execute_batch("DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';")
+        .expect("drop V031 ledger row");
+    assert_eq!(
+        schema::status(&conn).unwrap().state,
+        schema::SchemaState::Older,
+        "schema is Older after dropping the V031 ledger row + reverting the table shape"
+    );
+    // Confirm the legacy FK is really there before migrating.
+    let fk_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('edge_oracle')", [], |r| r.get(0))
+        .unwrap();
+    assert!(fk_before > 0, "legacy edge_oracle has an edges_data FK before V031");
+
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward replays V031");
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST after V031"
+    );
+
+    // (1) No FK on edge_oracle.
+    let fk_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('edge_oracle')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fk_after, 0, "V031 edge_oracle has NO foreign key");
+
+    // (2) The content-key columns exist.
+    let cols = conn_table_columns(&conn, "edge_oracle");
+    for expected in [
+        "source_path",
+        "source_start_byte",
+        "source_end_byte",
+        "callee_start_byte",
+        "callee_end_byte",
+        "edge_kind",
+    ] {
+        assert!(cols.contains(&expected.to_string()), "edge_oracle missing {expected}");
+    }
+    assert!(!cols.contains(&"edge_id".to_string()), "edge_id column is gone");
+
+    // (3) A DELETE FROM edges_data does NOT delete a manually-inserted edge_oracle row (no
+    // cascade). Seed a file + an edge so edges_data is non-empty, then insert a verdict whose
+    // content key is independent of any edge id.
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id) VALUES ('a.rs', 'rust', 'source', 'sha-a', 0, 0, 'c', '')",
+        [],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO name_strings(value) VALUES ('target'), ('calls_name'), ('unresolved'), \
+         ('NameOnly') ON CONFLICT DO NOTHING",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges_data(source_file_id, to_name_id, callee_start_byte, callee_end_byte, \
+         resolution_id, edge_kind_id, confidence_id) VALUES (?1, (SELECT id FROM name_strings \
+         WHERE value='target'), 14, 20, (SELECT id FROM name_strings WHERE value='unresolved'), \
+         (SELECT id FROM name_strings WHERE value='calls_name'), (SELECT id FROM name_strings \
+         WHERE value='NameOnly'))",
+        params![file_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edge_oracle(source_path, source_start_byte, source_end_byte, \
+         callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+         resolved_symbol_id, scip_symbol, kind, computed_at) VALUES ('a.rs', 0, 0, 14, 20, \
+         'calls_name', 'sha-a', 'rust-analyzer', 'v', NULL, 's', 'upgrade', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM edges_data", []).unwrap();
+    let remaining: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(remaining, 1, "edge_oracle survives a full edges_data delete (no cascade)");
 }
 
 #[test]

@@ -557,6 +557,26 @@ pub(crate) fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
     // can diff the two and `compare_graph_to_scip` (#69) has both. INVARIANT: writing an
     // `edge_oracle` row must not UPDATE `edges.resolution` / `edges.to_symbol_id`.
     //
+    // CONTENT-ANCHORED (V031, #248): a verdict is keyed by the edge's CONTENT identity, NOT the
+    // volatile `edges_data.id` rowid, and there is NO FK to `edges_data`. The original V018 shape
+    // keyed on `edge_id` with `FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE` —
+    // but every reindex rewrites `edges_data` (full rebuild + `remove_file_in_scope`), so the
+    // cascade wiped EVERY verdict and the opt-in oracle never repopulated (it does not auto-run).
+    // This mirrors `logical_symbol_monikers`: a content key + no reindex-cascading FK, with reads
+    // joining LIVE `edges` so a dangling row never resolves. An UNCHANGED file (same
+    // `files.sha256`) re-anchors its verdict to the reindexed edge for free; a CHANGED file's
+    // sha differs so its verdict no longer matches (stale → not surfaced/counted, swept by the
+    // next run's clear / gc).
+    //
+    // Content key = `(tool, tool_version, source_path, source_start_byte, source_end_byte,
+    // callee_start_byte, callee_end_byte, edge_kind)`. Measured UNIQUE over the resolvable
+    // (non-NULL callee range) edge population the oracle rows — the call SITE span + the callee
+    // span
+    // + the edge kind disambiguate (a `calls_name` and a `references_type` on the same identifier
+    // token differ in `edge_kind`). `edge_kind` is stored as TEXT (resolved from
+    // `edges_data.edge_kind_id` via `name_strings` at write time), NOT the interned id (which is
+    // not guaranteed stable across reindex).
+    //
     // Staleness key is `(file_sha, tool, tool_version)` (content addressing, exactly like the
     // embedding `input_hash`): a row is valid iff the file bytes it was computed against are
     // unchanged. `file_sha` is the `files.sha256` of the edge's source file at compute time, so a
@@ -586,7 +606,12 @@ pub(crate) fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
         ) STRICT;
 
         CREATE TABLE IF NOT EXISTS edge_oracle(
-            edge_id INTEGER NOT NULL,
+            source_path TEXT NOT NULL,
+            source_start_byte INTEGER NOT NULL,
+            source_end_byte INTEGER NOT NULL,
+            callee_start_byte INTEGER NOT NULL,
+            callee_end_byte INTEGER NOT NULL,
+            edge_kind TEXT NOT NULL,
             file_sha TEXT NOT NULL,
             tool TEXT NOT NULL,
             tool_version TEXT NOT NULL,
@@ -594,19 +619,22 @@ pub(crate) fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
             scip_symbol TEXT NOT NULL,
             kind TEXT NOT NULL,
             computed_at INTEGER NOT NULL,
-            PRIMARY KEY(edge_id, tool, tool_version),
-            -- A verdict is meaningless once its edge is gone. The full rebuild and
-            -- `remove_file_in_scope` delete + reinsert edges with new ids and recompute the \
-         oracle,
-            -- so cascading old verdicts away (rather than orphaning them, where status/eval would
-            -- keep counting them) is correct. `PRAGMA foreign_keys=ON` is set, so this fires.
-            FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE
+            -- Content key (#248): reindex-stable, no rowid. NO FK to edges_data — the read join to
+            -- live edges (by this key + `files.sha256 = file_sha`) is what filters dangling rows,
+            -- exactly like the moniker model.
+            PRIMARY KEY(
+                tool, tool_version, source_path,
+                source_start_byte, source_end_byte,
+                callee_start_byte, callee_end_byte, edge_kind
+            )
         ) STRICT;
 
         CREATE INDEX IF NOT EXISTS idx_edge_oracle_staleness
             ON edge_oracle(file_sha, tool, tool_version);
         CREATE INDEX IF NOT EXISTS idx_edge_oracle_symbol
             ON edge_oracle(resolved_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_edge_oracle_anchor
+            ON edge_oracle(source_path, callee_start_byte, callee_end_byte, edge_kind);
         ",
     )?;
     Ok(())
@@ -1124,6 +1152,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_028_ID => Some(28),
             MIGRATION_029_ID => Some(29),
             MIGRATION_030_ID => Some(30),
+            MIGRATION_031_ID => Some(31),
             _ => None,
         })
         .max()
@@ -1163,6 +1192,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_028_ID
             | MIGRATION_029_ID
             | MIGRATION_030_ID
+            | MIGRATION_031_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1199,6 +1229,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_028_ID => migration.checksum != MIGRATION_028_CHECKSUM,
         MIGRATION_029_ID => migration.checksum != MIGRATION_029_CHECKSUM,
         MIGRATION_030_ID => migration.checksum != MIGRATION_030_CHECKSUM,
+        MIGRATION_031_ID => migration.checksum != MIGRATION_031_CHECKSUM,
         _ => false,
     }
 }
@@ -1371,6 +1402,83 @@ pub(crate) fn apply_clone_fingerprint_tables(conn: &Connection) -> rusqlite::Res
 /// is a no-op when the column already exists.
 pub(crate) fn apply_clone_refinements_lcs_sampled(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "clone_refinements", "lcs_sampled", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
+/// V031 (#248): rebuild `edge_oracle` content-anchored — drop the `edges_data` FK + the volatile
+/// `edge_id` PK, key by the edge's CONTENT identity instead, so verdicts SURVIVE reindex.
+///
+/// THE BUG: V018 keyed `edge_oracle` on `edge_id` with `FOREIGN KEY(edge_id) REFERENCES
+/// edges_data(id) ON DELETE CASCADE`. Every reindex rewrites `edges_data` (full rebuild +
+/// `remove_file_in_scope`), so the cascade wiped every verdict; the oracle is opt-in (no auto-run)
+/// so it never repopulated. The fix mirrors `logical_symbol_monikers`: content key + no
+/// reindex-cascading FK, reads join LIVE edges so a dangling row never resolves.
+///
+/// DATA: the rebuild RENAME→CREATE→DROP **drops** any legacy verdicts. A DB where the oracle ran
+/// but hasn't reindexed has rows, but the legacy rows lack the content-key columns and back-filling
+/// them via `edge_id → edges_data` is lossy (the edges may already be gone). `edge_oracle` is
+/// ephemeral + opt-in; the next `oracle run` repopulates with the new shape. We accept the one-time
+/// drop — NO INSERT SELECT.
+///
+/// SQLite can't drop a FK in place, so this is a table REBUILD using the V020 recipe: `PRAGMA
+/// foreign_keys=OFF` OUTSIDE `BEGIN IMMEDIATE`, RENAME→CREATE→DROP, recreate indexes, ROLLBACK on
+/// error, then `COMMIT; PRAGMA foreign_keys=ON`.
+///
+/// IDEMPOTENT: a fresh DB ran the NEW `apply_oracle_tables` shape at V018, so V031 must be a no-op
+/// there — short-circuit when `edge_oracle` already has the content-key columns (or no
+/// `edges_data` FK). `migrate_forward` only replays unapplied steps, but a re-run after a partial
+/// apply must still be safe, hence the guard.
+pub(crate) fn apply_edge_oracle_content_anchor(conn: &Connection) -> rusqlite::Result<()> {
+    // Short-circuit if already on the content-anchored shape (fresh DB at V018, or a re-run): the
+    // new table has `source_path` and no `edges_data` FK. Detect via the column; the FK-list check
+    // is the belt-and-suspenders companion (an empty foreign_key_list == no cascade to wipe).
+    if column_exists(conn, "edge_oracle", "source_path")? {
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "
+            ALTER TABLE main.edge_oracle RENAME TO edge_oracle_legacy;
+            CREATE TABLE main.edge_oracle(
+                source_path TEXT NOT NULL,
+                source_start_byte INTEGER NOT NULL,
+                source_end_byte INTEGER NOT NULL,
+                callee_start_byte INTEGER NOT NULL,
+                callee_end_byte INTEGER NOT NULL,
+                edge_kind TEXT NOT NULL,
+                file_sha TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                tool_version TEXT NOT NULL,
+                resolved_symbol_id INTEGER,
+                scip_symbol TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                computed_at INTEGER NOT NULL,
+                PRIMARY KEY(
+                    tool, tool_version, source_path,
+                    source_start_byte, source_end_byte,
+                    callee_start_byte, callee_end_byte, edge_kind
+                )
+            ) STRICT;
+            -- NO INSERT SELECT: the legacy rows lack the content-key columns; we accept the
+            -- one-time verdict drop (ephemeral/opt-in; the next oracle run repopulates).
+            DROP TABLE main.edge_oracle_legacy;
+            CREATE INDEX IF NOT EXISTS idx_edge_oracle_staleness
+                ON edge_oracle(file_sha, tool, tool_version);
+            CREATE INDEX IF NOT EXISTS idx_edge_oracle_symbol
+                ON edge_oracle(resolved_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_edge_oracle_anchor
+                ON edge_oracle(source_path, callee_start_byte, callee_end_byte, edge_kind);
+            ",
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+        return result;
+    }
+    conn.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?;
     Ok(())
 }
 

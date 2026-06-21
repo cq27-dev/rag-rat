@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 30;
+pub const LATEST_SCHEMA_VERSION: u32 = 31;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -131,6 +131,10 @@ const MIGRATION_030_ID: &str = "030_clone_refinements_lcs_sampled";
 const MIGRATION_030_CHECKSUM: &str = "sha256:rag-rat-clone-refinements-lcs-sampled-v30";
 const MIGRATION_030_DESCRIPTION: &str =
     "Add clone_refinements.lcs_sampled (additive; heals indexes already at V029)";
+const MIGRATION_031_ID: &str = "031_edge_oracle_content_anchor";
+const MIGRATION_031_CHECKSUM: &str = "sha256:rag-rat-edge-oracle-content-anchor-v31";
+const MIGRATION_031_DESCRIPTION: &str = "Rebuild edge_oracle content-anchored (drop edges_data FK \
+                                         + edge_id PK) so verdicts survive reindex (#248)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -410,6 +414,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_030_CHECKSUM,
         description: MIGRATION_030_DESCRIPTION,
         apply: apply_clone_refinements_lcs_sampled,
+    },
+    Migration {
+        id: MIGRATION_031_ID,
+        checksum: MIGRATION_031_CHECKSUM,
+        description: MIGRATION_031_DESCRIPTION,
+        apply: apply_edge_oracle_content_anchor,
     },
 ];
 
