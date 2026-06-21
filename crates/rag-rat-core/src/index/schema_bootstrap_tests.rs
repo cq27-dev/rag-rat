@@ -12464,6 +12464,61 @@ fn migration_031_edge_oracle_no_fk_content_key() {
     assert_eq!(remaining, 1, "edge_oracle survives a full edges_data delete (no cascade)");
 }
 
+/// STRUCTURAL TRIP-WIRE (#248): the "can't happen again" guard for the whole bug CLASS. Every
+/// oracle-DERIVED persisted table (`schema::ORACLE_PERSISTED_TABLES`) is introspected via
+/// `PRAGMA foreign_key_list`, and NONE may carry an `ON DELETE CASCADE` (or `RESTRICT`) FK to a
+/// reindex-VOLATILE parent (`schema::REINDEX_VOLATILE_PARENTS`: `edges_data`, `symbols`,
+/// `logical_symbols`, the rowid-keyed `files`). This is the exact check that would have FAILED on
+/// the original `edge_oracle` `FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE` —
+/// the FK that silently wiped every verdict on the first reindex. A new oracle-derived table is
+/// forced to opt into the const, so it cannot reintroduce the bug without this test catching it.
+/// (If this test ever fails on a CURRENT table, that is ANOTHER instance of the #248 bug to FIX —
+/// re-anchor the table on a content key + drop the FK — not a test to relax.)
+#[test]
+fn oracle_persisted_tables_have_no_reindex_cascading_fk() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply reaches LATEST");
+
+    for &table in crate::index::schema::ORACLE_PERSISTED_TABLES {
+        // The table must exist (a typo in the const would otherwise silently skip the check).
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "ORACLE_PERSISTED_TABLES lists `{table}` but it does not exist");
+
+        // `pragma_foreign_key_list` columns: `id`, `seq`, `table` (parent), `from`, `to`,
+        // `on_update`, `on_delete`, `match`. A CASCADE/RESTRICT FK to a volatile parent is the #248
+        // bug shape.
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT \"table\", on_delete FROM pragma_foreign_key_list('{table}')"
+            ))
+            .unwrap();
+        let fks: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        for (parent, on_delete) in fks {
+            let is_volatile_parent =
+                crate::index::schema::REINDEX_VOLATILE_PARENTS.contains(&parent.as_str());
+            let is_cascading = matches!(on_delete.to_uppercase().as_str(), "CASCADE" | "RESTRICT");
+            assert!(
+                !(is_volatile_parent && is_cascading),
+                "oracle-derived table `{table}` has an ON DELETE {on_delete} FK to the \
+                 reindex-volatile parent `{parent}` — that wipes the oracle output on every \
+                 reindex (the #248 bug). Re-anchor `{table}` on a content key + drop the FK; \
+                 reads must join the live parent so dangling rows never resolve.",
+            );
+        }
+    }
+}
+
 #[test]
 fn indexing_writes_baseline_fingerprints_for_functions() {
     let root = unique_temp_root();

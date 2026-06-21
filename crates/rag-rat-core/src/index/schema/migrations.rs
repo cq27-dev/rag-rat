@@ -549,6 +549,14 @@ pub(crate) fn apply_edge_callee_byte_range(conn: &Connection) -> rusqlite::Resul
 pub(crate) fn apply_oracle_tables(conn: &Connection) -> rusqlite::Result<()> {
     // SCIP-oracle side tables (#68). Greenfield, STRICT per repo convention.
     //
+    // INVARIANT (load-bearing, #248): every oracle-DERIVED persisted table here is enumerated in
+    // `schema::ORACLE_PERSISTED_TABLES` and MUST survive reindex — content-keyed with NO
+    // reindex-cascading FK to a volatile parent (`schema::REINDEX_VOLATILE_PARENTS`); reads join
+    // the live parents so a dangling row never resolves. A NEW oracle-derived table created
+    // here must be added to that const, which forces it through the
+    // `oracle_persisted_tables_have_no_ reindex_cascading_fk` trip-wire. See the const's doc
+    // comment for the full rationale + the `logical_symbol_monikers` precedent.
+    //
     // `oracle_runs`: one row per oracle pass (a `.scip` consumed against a checkout). `stats_json`
     // is an opaque per-run `OracleReport` snapshot, suffixed `_json` per the naming convention.
     //

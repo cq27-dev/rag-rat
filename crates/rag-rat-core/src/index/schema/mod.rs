@@ -6,6 +6,39 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 pub const LATEST_SCHEMA_VERSION: u32 = 31;
+
+/// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
+/// reindex.
+///
+/// INVARIANT (load-bearing, #248): oracle-derived outputs MUST survive reindex. They achieve this
+/// by being **content-keyed with NO reindex-cascading FK** to a reindex-volatile parent
+/// ([`REINDEX_VOLATILE_PARENTS`]); their reads JOIN the live parents by that content key, so a
+/// dangling row (whose parent was rewritten) simply never resolves rather than being CASCADE-wiped.
+/// This is the model `logical_symbol_monikers` shipped (#70) and `edge_oracle` was retrofitted to
+/// (#248) after its `FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE` silently
+/// wiped every verdict on the first reindex.
+///
+/// The structural trip-wire `oracle_persisted_tables_have_no_reindex_cascading_fk` asserts every
+/// table here has no `ON DELETE CASCADE`/`RESTRICT` FK to a volatile parent — the exact check that
+/// would have caught the original `edge_oracle` FK. A NEW oracle-derived table is FORCED to opt in
+/// here (and thus to satisfy the trip-wire), so the next agent can't add a CASCADE-on-reindex table
+/// without the guard catching it.
+// Consumed only by the `oracle_persisted_tables_have_no_reindex_cascading_fk` trip-wire
+// (#[cfg(test)]), so the non-test lib build sees no reader; it is intentionally a durable
+// schema-invariant declaration.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const ORACLE_PERSISTED_TABLES: &[&str] =
+    &["edge_oracle", "logical_symbol_monikers", "oracle_runs"];
+
+/// The parent tables a reindex REWRITES (full rebuild and/or per-file `remove_file_in_scope`), so
+/// an `ON DELETE CASCADE`/`RESTRICT` FK from an oracle-derived table to one of these wipes the
+/// oracle output on every reindex — the #248 bug class. The trip-wire forbids exactly such an FK.
+/// `files` is rowid-keyed and rewritten per file; `edges_data` / `symbols` / `logical_symbols` are
+/// all rebuilt (DELETE-all + reinsert) on a full reindex.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const REINDEX_VOLATILE_PARENTS: &[&str] =
+    &["edges_data", "symbols", "logical_symbols", "files"];
+
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";

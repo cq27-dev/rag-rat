@@ -3552,6 +3552,128 @@ fn oracle_rerun_clears_prior_monikers_for_tool() {
     assert!(h.moniker(1001).is_none(), "authoritative clear removed the stale moniker");
 }
 
+/// BEHAVIORAL LIFECYCLE GUARD (#248): the integration test the suite never had. Every prior oracle
+/// test wrote+read its outputs with NO reindex in between — which is exactly why the CASCADE-on-
+/// reindex bug was invisible for so long. This runs the oracle to populate BOTH oracle-derived
+/// outputs (`edge_oracle` via a call/def join, `logical_symbol_monikers` via the def→logical map),
+/// then exercises the two reindex shapes that rewrite the volatile parents, and asserts BOTH
+/// outputs still resolve through their LIVE-JOIN reads afterward. The two shapes are a FULL reindex
+/// (`DELETE FROM edges_data` + a wholesale `logical_symbols` rebuild — DELETE-all + reinsert with
+/// the SAME content-derived id, modelling an UNCHANGED symbol) and a per-file INCREMENTAL reindex
+/// on an UNCHANGED file (`remove_file_in_scope` deletes + the indexer re-inserts the same edge, the
+/// `file_rows.rs` path). It is paired with a CHANGED-file/CHANGED-symbol staleness assertion, so it
+/// pins BOTH directions: unchanged content survives, changed content goes stale.
+#[test]
+fn oracle_outputs_survive_full_and_incremental_reindex() {
+    use crate::query::memory::{MonikerResolution, resolve_moniker};
+
+    let h = Harness::new();
+    // A caller + a def file. The def's symbol is grouped into a logical symbol (content-derived id
+    // 1001 here; stable across rebuilds in production), so the moniker pass writes a moniker for
+    // it.
+    let caller = h.add_file("caller.rs", "fn caller() { target(); }\n");
+    let defs = h.add_file("defs.rs", "fn target() {}\n");
+    let target_sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+    h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", target_sym);
+    // The heuristic resolved the call; the oracle CONFIRMS it (an in-corpus verdict + a moniker).
+    let edge_v1 = h.add_edge(caller, "target", 14, 20, "Exact", Some(target_sym));
+
+    let bytes = scip_bytes_docs(vec![
+        ("caller.rs", vec![occurrence(
+            0,
+            14,
+            20,
+            TARGET_MONIKER,
+            SymbolRole::UnspecifiedSymbolRole as i32,
+        )]),
+        ("defs.rs", vec![occurrence(0, 3, 9, TARGET_MONIKER, SymbolRole::Definition as i32)]),
+    ]);
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    assert_eq!(report.rows_written, 1, "the run wrote a verdict");
+    assert_eq!(report.monikers_written, 1, "the run wrote a moniker");
+
+    // Both outputs resolve through their LIVE-JOIN reads before any reindex (sanity).
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "verdict counted before reindex"
+    );
+    assert!(
+        matches!(
+            resolve_moniker(&h.conn, TARGET_MONIKER, TOOL.as_db_str()).unwrap(),
+            MonikerResolution::Unique { logical_symbol_id: 1001, .. }
+        ),
+        "moniker resolves to the live logical symbol before reindex"
+    );
+
+    // --- FULL reindex: rewrite edges_data (DELETE + re-insert the SAME edge → new rowid) AND
+    // rebuild logical_symbols wholesale (DELETE-all + reinsert the SAME content-derived id 1001,
+    // the unchanged-symbol case). The caller/def file shas are untouched. ---
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![edge_v1]).unwrap();
+    let edge_v2 = h.add_edge(caller, "target", 14, 20, "Exact", Some(target_sym));
+    assert_ne!(edge_v2, edge_v1, "full reindex minted a new edge rowid");
+    // Wholesale logical_symbols rebuild: drop the members + the logical row, reinsert with the SAME
+    // id (unchanged symbol → stable content-derived id).
+    h.conn
+        .execute("DELETE FROM logical_symbol_members WHERE logical_symbol_id = 1001", [])
+        .unwrap();
+    h.conn.execute("DELETE FROM logical_symbols WHERE id = 1001", []).unwrap();
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", target_sym);
+
+    // BOTH outputs still resolve after the full reindex (re-anchored by content key / stable id).
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "edge_oracle survives the FULL reindex (re-anchored by content key)"
+    );
+    assert!(
+        matches!(
+            resolve_moniker(&h.conn, TARGET_MONIKER, TOOL.as_db_str()).unwrap(),
+            MonikerResolution::Unique { logical_symbol_id: 1001, .. }
+        ),
+        "moniker survives the FULL logical_symbols rebuild (stable content-derived id)"
+    );
+
+    // --- INCREMENTAL reindex on the UNCHANGED caller.rs: the per-file path deletes the file's
+    // edges then the indexer re-inserts the same one. Model `remove_file_in_scope`'s edge
+    // delete + the re-insert; the file row + sha stay put. ---
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![edge_v2]).unwrap();
+    let edge_v3 = h.add_edge(caller, "target", 14, 20, "Exact", Some(target_sym));
+    assert_ne!(edge_v3, edge_v2, "incremental reindex minted a new edge rowid");
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "edge_oracle survives the per-file INCREMENTAL reindex of an unchanged file"
+    );
+
+    // --- CHANGED-content staleness (the other direction): drift the caller's sha → its verdict
+    // goes stale (file_sha mismatch); mint a new logical id for the symbol → its moniker
+    // dangles. ---
+    h.conn
+        .execute("UPDATE files SET sha256 = 'caller-changed' WHERE id = ?1", params![caller])
+        .unwrap();
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        0,
+        "a CHANGED file's verdict is stale (file_sha mismatch) — not counted"
+    );
+    // A changed symbol mints a NEW content-derived logical id; the old moniker row dangles.
+    h.conn
+        .execute("DELETE FROM logical_symbol_members WHERE logical_symbol_id = 1001", [])
+        .unwrap();
+    h.conn.execute("DELETE FROM logical_symbols WHERE id = 1001", []).unwrap();
+    h.add_logical_symbol(2002, "defs.rs", "target", "defs.rs::target", target_sym);
+    assert!(
+        matches!(
+            resolve_moniker(&h.conn, TARGET_MONIKER, TOOL.as_db_str()).unwrap(),
+            MonikerResolution::Dangling
+        ),
+        "a CHANGED symbol's moniker dangles (its content-derived logical id died) — not resolved"
+    );
+}
+
 /// Create a memory bound to the harness symbol, asserting the automatic `scip_moniker` binding.
 fn create_target_memory(h: &Harness, symbol_id: i64) -> String {
     let created = create_memory(&h.conn, RepoMemoryCreate {
