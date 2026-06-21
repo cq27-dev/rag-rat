@@ -10603,6 +10603,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
+        DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
         ",
     )
     .unwrap();
@@ -10741,18 +10742,20 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
         ",
     )
     .unwrap();
-    // 3. Drop the V028, V029, and V030 ledger rows so the schema reads Older and the migration
-    //    replays.
+    // 3. Drop the V028..V031 ledger rows so the schema reads Older and the migration replays. Every
+    //    later row must go — `known_version` reads the MAX applied version, so leaving any (e.g.
+    //    V031) would keep the schema Compatible and skip the forward migrate.
     conn.execute_batch(
         "DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
          DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
-         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';",
+         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
+         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';",
     )
     .unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "removing the V028+V029+V030 ledger rows makes the pre-V028 shape Older"
+        "removing the V028..V031 ledger rows makes the pre-V028 shape Older"
     );
 
     // --- Forward-migrate ---

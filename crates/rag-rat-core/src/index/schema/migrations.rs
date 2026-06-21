@@ -1049,15 +1049,20 @@ pub(crate) fn apply_edge_string_interning(conn: &Connection) -> rusqlite::Result
                 DROP TABLE main.edges;
                 ",
             )?;
-            // Re-point edge_oracle's FK from the (now dropped) legacy table at edges_data. The
-            // rebuilt table keeps the V018 shape; verdict rows survive byte-for-byte.
+            // Re-point edge_oracle's FK from the (now dropped) legacy table at edges_data — ONLY
+            // for the OLD `edge_id`-keyed V018 shape (the FK points at
+            // `edges`/`edges_data`). On a fresh `apply`, V018's `apply_oracle_tables`
+            // already created the V031 content-anchored shape (cols `source_path`, NO
+            // FK), so there is nothing to re-point and copying its 13 columns
+            // into the 8-column legacy template below would fail (#248). Skip when `source_path`
+            // exists — V031 owns the final shape.
             let has_oracle: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
                  'edge_oracle')",
                 [],
                 |row| row.get(0),
             )?;
-            if has_oracle {
+            if has_oracle && !column_exists(conn, "edge_oracle", "source_path")? {
                 conn.execute_batch(
                     "
                     ALTER TABLE main.edge_oracle RENAME TO edge_oracle_legacy;

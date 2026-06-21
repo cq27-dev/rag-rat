@@ -95,9 +95,21 @@ pub(crate) fn count_symbols_with_moniker(
 /// plus enough context to write a verdict and to recognise agreement/disagreement.
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeJoinCandidate {
+    /// The live edge rowid. Since #248 the write path keys verdicts by the CONTENT fields below
+    /// (not this rowid), so production no longer reads `edge_id` — it is retained as the
+    /// candidate's live identity and asserted by `edge_join_candidates` ordering tests.
+    /// `allow(dead_code)` because the lib build (no test cfg) sees no reader.
+    #[allow(dead_code)]
     pub(crate) edge_id: i64,
     pub(crate) source_path: String,
     pub(crate) file_sha: String,
+    /// The call SITE byte range (`edges_data.source_start_byte`/`source_end_byte`). Part of the
+    /// content key (#248): the call site disambiguates two callee-range-equal edges (a
+    /// `calls_name` and a `references_type` on the same identifier token, or repeated calls).
+    /// Both default to 0 on edges that predate source spans, but the resolvable population the
+    /// oracle rows carries real spans, so the content key stays unique.
+    pub(crate) source_start_byte: i64,
+    pub(crate) source_end_byte: i64,
     pub(crate) callee_start_byte: i64,
     pub(crate) callee_end_byte: i64,
     pub(crate) confidence: String,
@@ -139,6 +151,8 @@ pub(crate) fn edge_join_candidates(
         SELECT edges.id,
                files.path,
                files.sha256,
+               edges.source_start_byte,
+               edges.source_end_byte,
                edges.callee_start_byte,
                edges.callee_end_byte,
                edges.confidence,
@@ -158,11 +172,13 @@ pub(crate) fn edge_join_candidates(
             edge_id: row.get(0)?,
             source_path: row.get(1)?,
             file_sha: row.get(2)?,
-            callee_start_byte: row.get(3)?,
-            callee_end_byte: row.get(4)?,
-            confidence: row.get(5)?,
-            edge_kind: row.get(6)?,
-            to_symbol_id: row.get(7)?,
+            source_start_byte: row.get(3)?,
+            source_end_byte: row.get(4)?,
+            callee_start_byte: row.get(5)?,
+            callee_end_byte: row.get(6)?,
+            confidence: row.get(7)?,
+            edge_kind: row.get(8)?,
+            to_symbol_id: row.get(9)?,
         })
     })?;
     let mut out = Vec::new();
@@ -335,16 +351,29 @@ pub(crate) fn clear_edge_oracle_for_tool(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<()> {
+    // CONTENT-JOIN scope (#248): with no `edge_id` FK there is no rowid to match — restrict the
+    // DELETE to verdicts whose CONTENT key has a live edge in the active checkout, the same key the
+    // read join uses. `edges_data` is queried directly (not the 7-LEFT-JOIN `edges` view) with ONE
+    // `name_strings` join for the `edge_kind` text match. The callsite-file `files.sha256` is NOT
+    // gated here: the authoritative clear must drop the prior verdict for a content-matching edge
+    // even when the file drifted (the run rewrites it), exactly as the old rowid clear did.
     conn.execute(
         &format!(
             "
         DELETE FROM edge_oracle
         WHERE tool = ?1 AND tool_version = ?2
-          AND edge_id IN (
-            SELECT edges.id
-            FROM edges
-            JOIN files ON files.id = edges.source_file_id
-            WHERE {scope}
+          AND EXISTS (
+            SELECT 1
+            FROM edges_data
+            JOIN files ON files.id = edges_data.source_file_id
+            JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
+            WHERE files.path = edge_oracle.source_path
+              AND edges_data.source_start_byte = edge_oracle.source_start_byte
+              AND edges_data.source_end_byte = edge_oracle.source_end_byte
+              AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
+              AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
+              AND ek.value = edge_oracle.edge_kind
+              AND {scope}
           )
         ",
             scope = active_checkout_file_predicate("?3", "?4"),
@@ -354,17 +383,29 @@ pub(crate) fn clear_edge_oracle_for_tool(
     Ok(())
 }
 
-/// A verdict to persist for one edge.
+/// A verdict to persist for one edge, keyed by the edge's CONTENT identity (#248) rather than the
+/// volatile `edges_data.id` rowid — so the verdict survives reindex and re-anchors to the
+/// reindexed edge for free. The content key is `(tool, tool_version, source_path,
+/// source_start_byte, source_end_byte, callee_start_byte, callee_end_byte, edge_kind)`; `edge_kind`
+/// is stored as TEXT (the candidate already carries the resolved text via the `edges` view's
+/// `name_strings` join), NOT the interned id (which is not reindex-stable).
 pub(crate) struct EdgeOracleRow<'a> {
-    pub(crate) edge_id: i64,
+    pub(crate) source_path: &'a str,
+    pub(crate) source_start_byte: i64,
+    pub(crate) source_end_byte: i64,
+    pub(crate) callee_start_byte: i64,
+    pub(crate) callee_end_byte: i64,
+    pub(crate) edge_kind: &'a str,
     pub(crate) file_sha: &'a str,
     pub(crate) resolved_symbol_id: Option<i64>,
     pub(crate) scip_symbol: &'a str,
     pub(crate) kind: OracleResolutionKind,
 }
 
-/// Upsert one `edge_oracle` row. Keyed by `(edge_id, tool, tool_version)`; re-running the same tool
-/// version overwrites the prior verdict (content addressed by `file_sha`). NEVER touches `edges`.
+/// Upsert one `edge_oracle` row. Keyed by the content key
+/// `(tool, tool_version, source_path, source_start_byte, source_end_byte, callee_start_byte,
+/// callee_end_byte, edge_kind)`; re-running the same tool version overwrites the prior verdict
+/// (staleness still content-addressed by `file_sha`). NEVER touches `edges`.
 pub(crate) fn write_edge_oracle(
     conn: &Connection,
     tool: OracleTool,
@@ -374,11 +415,17 @@ pub(crate) fn write_edge_oracle(
     conn.execute(
         "
         INSERT INTO edge_oracle(
-            edge_id, file_sha, tool, tool_version,
+            source_path, source_start_byte, source_end_byte,
+            callee_start_byte, callee_end_byte, edge_kind,
+            file_sha, tool, tool_version,
             resolved_symbol_id, scip_symbol, kind, computed_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        ON CONFLICT(edge_id, tool, tool_version) DO UPDATE SET
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ON CONFLICT(
+            tool, tool_version, source_path,
+            source_start_byte, source_end_byte,
+            callee_start_byte, callee_end_byte, edge_kind
+        ) DO UPDATE SET
             file_sha = excluded.file_sha,
             resolved_symbol_id = excluded.resolved_symbol_id,
             scip_symbol = excluded.scip_symbol,
@@ -386,7 +433,12 @@ pub(crate) fn write_edge_oracle(
             computed_at = excluded.computed_at
         ",
         params![
-            row.edge_id,
+            row.source_path,
+            row.source_start_byte,
+            row.source_end_byte,
+            row.callee_start_byte,
+            row.callee_end_byte,
+            row.edge_kind,
             row.file_sha,
             tool.as_db_str(),
             tool_version,
@@ -558,12 +610,35 @@ pub(crate) fn any_run_in_scope(
 /// `AND` — #82 P0. Slots `?3`/`?4` (commit_sha / worktree_id) flow into it; `?1`/`?2`
 /// (tool / version) gate the side table. Callers append ` AND <extra>` exactly as before — the
 /// statement still ends in a trailing `WHERE`, so a JOIN can't legally follow.
+///
+/// CONTENT JOIN (load-bearing, #248): the join to live `edges` is by the edge's CONTENT key
+/// (`source_path → files.path`, source/callee byte spans, `edge_kind` text), NOT by the old
+/// `edges.id = edge_oracle.edge_id` rowid — there is no `edge_id` column any more. After a reindex
+/// rewrites `edges_data` with new ids, an UNCHANGED file's verdict re-anchors to the reindexed edge
+/// for free (its content key + `files.sha256` are unchanged); a dangling verdict (no content match)
+/// simply produces no row, so the COUNT paths exclude it WITHOUT the FK pre-delete that V018 used.
+/// `files.sha256 = edge_oracle.file_sha` is part of the join so a CHANGED file's verdict (sha
+/// mismatch) never matches — the metric reads see only live, current-content verdicts.
+///
+/// ALIASING (R7): bare table names (`edges`/`files`) are kept — no `e`/`f` aliases — so the
+/// appended [`edge_oracle_current_predicate`] (bare `files.sha256` + its inner `JOIN files`) and
+/// the consumer SELECTs (`edges.confidence`/`edge_kind`/`to_symbol_id`/`to_name`/`id`,
+/// `files.path`) still resolve. The `edges` VIEW (not `edges_data`) is used here because consumers
+/// need its `name_strings`-joined text columns (`edge_kind`, `confidence`, `to_name`); the
+/// surfacing reads are bound by an `edge_id IN (...)` list or the staleness/anchor indexes, so the
+/// view's joins are not on an unbounded hot scan.
 pub(crate) fn edge_oracle_scope_join() -> String {
     format!(
         "
     FROM edge_oracle
-    JOIN edges ON edges.id = edge_oracle.edge_id
-    JOIN files ON files.id = edges.source_file_id
+    JOIN files ON files.path = edge_oracle.source_path
+              AND files.sha256 = edge_oracle.file_sha
+    JOIN edges ON edges.source_file_id = files.id
+              AND edges.source_start_byte = edge_oracle.source_start_byte
+              AND edges.source_end_byte = edge_oracle.source_end_byte
+              AND edges.callee_start_byte = edge_oracle.callee_start_byte
+              AND edges.callee_end_byte = edge_oracle.callee_end_byte
+              AND edges.edge_kind = edge_oracle.edge_kind
     WHERE edge_oracle.tool = ?1 AND edge_oracle.tool_version = ?2
       AND {scope}",
         scope = active_checkout_file_predicate("?3", "?4"),
@@ -715,12 +790,15 @@ pub(crate) fn current_oracle_verdicts_for_edges(
         // deleted/reinserted
         // resolved symbol yields NULL here, so the `Upgrade` target can't be surfaced and the hop
         // is left heuristic (#82 finding 2).
+        // Re-project the LIVE edge id (#248): `edge_oracle.edge_id` is gone — the verdict joins to
+        // the reindexed `edges` row by content key, so its CURRENT rowid is `edges.id`. Callers key
+        // this map by the heuristic-traversal edge id (graph.rs `hop.edge_id`), which is that same
+        // live id, and the `edge_ids` filter is against live edges.
         let sql = format!(
-            "SELECT edge_oracle.edge_id, edge_oracle.kind, edge_oracle.resolved_symbol_id, \
-             (SELECT value FROM name_strings WHERE name_strings.id = (SELECT qualified_name_id \
-             FROM symbols WHERE symbols.id = edge_oracle.resolved_symbol_id)), \
-             edge_oracle.scip_symbol{scope_join}{current} AND edge_oracle.edge_id IN \
-             ({placeholders})",
+            "SELECT edges.id, edge_oracle.kind, edge_oracle.resolved_symbol_id, (SELECT value \
+             FROM name_strings WHERE name_strings.id = (SELECT qualified_name_id FROM symbols \
+             WHERE symbols.id = edge_oracle.resolved_symbol_id)), \
+             edge_oracle.scip_symbol{scope_join}{current} AND edges.id IN ({placeholders})",
             scope_join = edge_oracle_scope_join(),
             current = edge_oracle_current_predicate(),
         );
@@ -776,9 +854,10 @@ pub(crate) fn current_oracle_verdicts_all(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<std::collections::HashMap<i64, (OracleResolutionKind, Option<i64>)>> {
+    // Re-project the LIVE edge id (#248): keyed by `edges.id` (the reindexed rowid the content join
+    // resolves to), which is the id the importance ranker's heuristic traversal carries.
     let sql = format!(
-        "SELECT edge_oracle.edge_id, edge_oracle.kind, \
-         edge_oracle.resolved_symbol_id{scope_join}{current}",
+        "SELECT edges.id, edge_oracle.kind, edge_oracle.resolved_symbol_id{scope_join}{current}",
         scope_join = edge_oracle_scope_join(),
         current = edge_oracle_current_predicate(),
     );
@@ -842,10 +921,12 @@ pub(crate) fn current_oracle_comparisons(
     // The heuristic target's qualified name is fetched via a correlated subquery rather than a
     // trailing LEFT JOIN, so the shared `edge_oracle_scope_join` string (which already ends in a
     // WHERE) stays the single source of the scope predicate — a JOIN can't legally follow a WHERE.
+    // Re-project the LIVE edge id (#248): `edge_oracle.edge_id` is gone; the compare surface keys
+    // on `edges.id` (the reindexed rowid the content join resolves to).
     let sql = format!(
-        "SELECT edge_oracle.edge_id, edge_oracle.kind, edges.edge_kind, edges.confidence, (SELECT \
-         value FROM name_strings WHERE name_strings.id = (SELECT qualified_name_id FROM symbols \
-         WHERE symbols.id = edges.to_symbol_id)), edges.to_name, edge_oracle.resolved_symbol_id, \
+        "SELECT edges.id, edge_oracle.kind, edges.edge_kind, edges.confidence, (SELECT value FROM \
+         name_strings WHERE name_strings.id = (SELECT qualified_name_id FROM symbols WHERE \
+         symbols.id = edges.to_symbol_id)), edges.to_name, edge_oracle.resolved_symbol_id, \
          edge_oracle.scip_symbol, files.path, COALESCE(NULLIF(edges.source_start_line, 0), 1) \
          {scope_join}{current} ORDER BY files.path, edges.source_start_line",
         scope_join = edge_oracle_scope_join(),

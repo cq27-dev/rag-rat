@@ -317,8 +317,16 @@ pub(crate) fn run_in_tx(
         }
 
         join::tally(&mut report, verdict.kind);
+        // Persist by the edge's CONTENT key (#248), not its rowid, so the verdict re-anchors to the
+        // reindexed edge on an unchanged file. `edge_kind` is the candidate's resolved TEXT (the
+        // `edges` view already joined `name_strings`).
         store::write_edge_oracle(conn, input.tool, input.tool_version, &EdgeOracleRow {
-            edge_id: candidate.edge_id,
+            source_path: &candidate.source_path,
+            source_start_byte: candidate.source_start_byte,
+            source_end_byte: candidate.source_end_byte,
+            callee_start_byte: candidate.callee_start_byte,
+            callee_end_byte: candidate.callee_end_byte,
+            edge_kind: &candidate.edge_kind,
             file_sha: &candidate.file_sha,
             resolved_symbol_id: verdict.resolved_symbol_id,
             scip_symbol: &verdict.scip_symbol,
