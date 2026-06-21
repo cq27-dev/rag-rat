@@ -135,7 +135,100 @@ pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
         min_copies: args.min_copies,
         limit: args.limit,
     })?;
+
+    // `--explain <CLASS_KEY>`: print a human-readable refinement breakdown for one class from the
+    // SAME result set (so the explained class went through the same refine pass as the listing),
+    // instead of the JSON/TOON listing.
+    if let Some(key) = &args.explain {
+        let Some(class) = result.classes.iter().find(|c| &c.class_key == key) else {
+            anyhow::bail!("no clone class with key `{key}` in results");
+        };
+        print_clone_explain(class);
+        return Ok(());
+    }
+
     print_output(&result)
+}
+
+/// Render a human-readable explanation of a refined clone class: the anti-unification template,
+/// its variation points (with per-member values), and the proposed extracted-helper signature.
+/// Reads the parsed `variation_points` / `proposed_signature` JSON values surfaced on the class
+/// (Plan 4b); un-refined classes simply print the header with `n/a` fields.
+fn print_clone_explain(class: &rag_rat_core::index::CandidateCloneClass) {
+    println!("Clone class: {}", class.class_key);
+    println!(
+        "  {} members, confidence: {}, coverage: {:.2}",
+        class.member_count,
+        class.confidence.as_deref().unwrap_or("n/a"),
+        class.anti_unify_coverage.unwrap_or(0.0),
+    );
+    println!();
+
+    if let Some(template) = &class.template {
+        println!("Template:");
+        println!("{template}");
+        println!();
+    }
+
+    if let Some(arr) = class.variation_points.as_ref().and_then(|v| v.as_array())
+        && !arr.is_empty()
+    {
+        // `per_member_values` is ordinal-aligned to `canonical_member_refs` (canonical
+        // `(struct_hash, path, start_byte)` order) — NOT to the `r#ref`-sorted `members` field.
+        // Pair each value with its member ref so a printed value maps to the member it came
+        // from. Falls back to the bare `value | value` join when the canonical refs are
+        // unavailable (un-refined / legacy class).
+        let canon_refs = class.canonical_member_refs.as_deref();
+        println!("Variation points ({}):", arr.len());
+        for vp in arr {
+            let id = vp["metavar_id"].as_str().unwrap_or("?");
+            let role = vp["extraction_role"].as_str().unwrap_or("?");
+            let conf = vp["confidence"].as_str().unwrap_or("?");
+            print!("  {id} ({role}, {conf})");
+            if let Some(vals) = vp["per_member_values"].as_array() {
+                let rendered: Vec<String> = match canon_refs {
+                    // Zip value↔member when the canonical refs line up (same arity).
+                    Some(refs) if refs.len() == vals.len() => vals
+                        .iter()
+                        .zip(refs.iter())
+                        .map(|(v, r)| {
+                            let val = v.as_str().unwrap_or("");
+                            // The gap sentinel is the empty string — render it explicitly.
+                            let shown = if val.is_empty() { "<gap>" } else { val };
+                            format!("{r}={shown}")
+                        })
+                        .collect(),
+                    // No refs / arity mismatch → bare values (still useful, just unlabeled).
+                    _ => vals.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect(),
+                };
+                print!(": {}", rendered.join(" | "));
+            }
+            println!();
+        }
+        println!();
+    }
+
+    if let Some(sig) = &class.proposed_signature {
+        let typedness = sig["typedness"].as_str().unwrap_or("unknown");
+        println!("Proposed signature (typedness: {typedness}):");
+        // `ProposedSignature` serializes a pre-rendered `text` (e.g. `fn extracted(arg0: i32)`);
+        // fall back to assembling the params array if a legacy row lacks it.
+        if let Some(text) = sig["text"].as_str() {
+            println!("  {text}");
+        } else if let Some(params) = sig["params"].as_array() {
+            let param_strs: Vec<String> = params
+                .iter()
+                .map(|p| {
+                    let name = p["name"].as_str().unwrap_or("_");
+                    match p["type_text"].as_str() {
+                        Some(t) => format!("{name}: {t}"),
+                        None => name.to_string(),
+                    }
+                })
+                .collect();
+            println!("  fn extracted({}) {{ ... }}", param_strs.join(", "));
+        }
+    }
 }
 
 pub(crate) fn clones_for(config: &Config, args: &ClonesForArgs) -> anyhow::Result<()> {
@@ -1327,7 +1420,8 @@ mod tests {
         };
         IndexDatabase::rebuild(&config).unwrap();
 
-        let args = ClonesArgs { min_similarity: None, min_copies: Some(2), limit: None };
+        let args =
+            ClonesArgs { min_similarity: None, min_copies: Some(2), limit: None, explain: None };
         // The handler must not error.
         super::clones(&config, &args).unwrap_or_else(|err| panic!("clones handler failed: {err}"));
 

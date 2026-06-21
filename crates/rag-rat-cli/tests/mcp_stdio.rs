@@ -367,3 +367,233 @@ fn mcp_stdio_find_clones_returns_class_for_planted_pair() {
     stop(child);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// End-to-end (#215 Plan 4b Task 8): a Type-2 clone pair — two functions whose ONLY difference is
+/// a single literal whose KIND differs (int `10` vs float `2.5`) — refines through the MCP
+/// `find_clones` path and surfaces the anti-unify payload (`template`, `variation_points`,
+/// `anti_unify_coverage`). After baseline normalization the local identifiers collapse to `ID<n>`
+/// and equal-KIND literals collapse to the same `LIT_<KIND>` bucket, so only a DIFFERING literal
+/// kind makes the column variant — int vs float keeps the two `struct_hash`es distinct → a
+/// candidate pair that refines to a `value_param` variation point. Uses `--json` for plain JSON.
+#[test]
+fn mcp_stdio_find_clones_returns_refined_payload_for_type2_clone() {
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two functions differing ONLY in the literal KIND (int 10 vs float 2.5). Baseline
+    // normalization buckets literals by kind (`LIT_INTEGER_LITERAL` vs `LIT_FLOAT_LITERAL`), so the
+    // differing KIND — not the differing value — is what yields a variant column + distinct
+    // struct_hashes. Same-value-different-value integers would bucket identically (coverage 1.0).
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn process_a(input: i32) -> i32 {\n    let factor = 10;\n    input * factor + 1\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn process_b(input: i32) -> i32 {\n    let factor = 2.5;\n    input * factor + 1\n}\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    fs::write(
+        root.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+
+    let config_path = root.join("rag-rat.toml");
+    let config = Config::load(&config_path).unwrap();
+    rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_rag-rat");
+    let mut child = Command::new(binary)
+        .arg("mcp")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--json")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "rag-rat-test", "version": "0.1"}}
+        }),
+    );
+    let _ = recv(&mut reader);
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "find_clones", "arguments": {"min_copies": 2}}
+        }),
+    );
+    let response = recv(&mut reader);
+    // `--json` server → tool result text is plain JSON.
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    let result: Value = serde_json::from_str(text)
+        .unwrap_or_else(|err| panic!("find_clones result is not valid JSON ({err}):\n{text}"));
+
+    let classes = result["classes"].as_array().expect("find_clones returns classes array");
+    let refined =
+        classes.iter().find(|c| c["refined"].as_bool().unwrap_or(false)).unwrap_or_else(|| {
+            panic!("expected a refined class for the Type-2 clone pair: {result:?}")
+        });
+
+    // The anti-unify payload is surfaced on the refined class.
+    assert!(
+        refined["template"].as_str().is_some_and(|t| !t.is_empty()),
+        "refined class must carry a non-empty template: {refined:?}"
+    );
+    assert!(
+        refined["anti_unify_coverage"].as_f64().is_some(),
+        "refined class must carry anti_unify_coverage: {refined:?}"
+    );
+    let vps = refined["variation_points"]
+        .as_array()
+        .expect("refined class must carry a variation_points array");
+    assert!(
+        vps.iter().any(|vp| vp["extraction_role"].as_str() == Some("value_param")),
+        "the differing literal must surface as a value_param variation point: {vps:?}"
+    );
+
+    // Codex #5: `medoid_symbol_id` is INTERNAL (a reindex-unstable rowid) — `#[serde(skip)]` keeps
+    // it out of the API payload so clients can't cache an id that breaks on rebuild.
+    assert!(
+        refined.get("medoid_symbol_id").is_none(),
+        "medoid_symbol_id (a rowid) must NOT be serialized in the find_clones payload: {refined:?}"
+    );
+
+    stop(child);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// CLI surface (#215 Plan 4b Task 8): `rag-rat clones --explain <CLASS_KEY>` prints the refined
+/// class's template + variation points instead of the listing. The key isn't known ahead of time,
+/// so first run `clones --json` to read a refined class's `class_key`, then re-run with
+/// `--explain <key>` and assert the human output names a metavar (`m0`) and the value_param role.
+#[test]
+fn cli_clones_explain_prints_template_and_metavar_for_type2_clone() {
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Same Type-2 fixture as the MCP refined-payload test: bodies identical except a differing
+    // literal KIND (int 10 vs float 2.5), which is what forces a value_param variation point.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn process_a(input: i32) -> i32 {\n    let factor = 10;\n    input * factor + 1\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn process_b(input: i32) -> i32 {\n    let factor = 2.5;\n    input * factor + 1\n}\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    fs::write(
+        root.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+
+    let config_path = root.join("rag-rat.toml");
+    let config = Config::load(&config_path).unwrap();
+    rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_rag-rat");
+
+    // Step 1: `clones --json` → find a refined class's class_key.
+    let listing = Command::new(binary)
+        .arg("clones")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        listing.status.success(),
+        "clones --json must succeed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listing_json: Value = serde_json::from_slice(&listing.stdout).unwrap_or_else(|err| {
+        panic!(
+            "clones --json is not valid JSON ({err}):\n{}",
+            String::from_utf8_lossy(&listing.stdout)
+        )
+    });
+    let classes = listing_json["classes"].as_array().expect("clones returns classes array");
+    let key = classes
+        .iter()
+        .find(|c| c["refined"].as_bool().unwrap_or(false))
+        .and_then(|c| c["class_key"].as_str())
+        .unwrap_or_else(|| panic!("expected a refined class with a class_key: {listing_json:?}"))
+        .to_string();
+
+    // Step 2: `clones --explain <key>` → human-readable breakdown.
+    let explain = Command::new(binary)
+        .arg("clones")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--explain")
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(
+        explain.status.success(),
+        "clones --explain must succeed: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+    let out = String::from_utf8_lossy(&explain.stdout);
+    assert!(out.contains(&key), "explain output must echo the class key:\n{out}");
+    assert!(out.contains("Template:"), "explain output must have a Template section:\n{out}");
+    assert!(out.contains("Variation points"), "explain output must list variation points:\n{out}");
+    assert!(out.contains("m0"), "explain output must name the m0 metavar:\n{out}");
+    assert!(out.contains("value_param"), "explain output must name the value_param role:\n{out}");
+
+    // Member-key fix (#215 Plan 4b): each per-member value must be printed ALONGSIDE the member it
+    // belongs to (`identity=value`), so a reader can map a value back to a member. Both clone
+    // members' refs must appear, paired with their differing literal value (`10` / `2.5`).
+    assert!(
+        out.contains("process_a") && out.contains("process_b"),
+        "explain output must name both member refs next to their values:\n{out}"
+    );
+    // Codex #4: the per-member identity is LOCATION-BEARING (`ref@path:start-end`), so the printed
+    // label is `…process_a@…:<lines>=<value>`, not the bare `process_a=value`. Assert the member
+    // ref and its value appear in the SAME `=`-joined token (location-bearing identity →
+    // value), so a class with duplicate refs would still be disambiguated.
+    assert!(
+        out.lines().any(|line| {
+            line.contains("process_a@")
+                && (line.contains("=10") || line.contains("=2.5"))
+                && line.contains("process_a")
+        }),
+        "explain output must pair the LOCATION-BEARING member identity (process_a@path:lines) \
+         with its per-member value:\n{out}"
+    );
+    assert!(
+        out.contains("process_a@") && out.contains("process_b@"),
+        "explain output must carry location-bearing member identities (ref@path:start-end):\n{out}"
+    );
+    // The variation-points line carries the `identity=value` pairing separated by ` | `.
+    assert!(
+        out.contains("=10") && out.contains("=2.5") && out.contains(" | "),
+        "explain output must zip per-member values with member identity (identity=value | \
+         identity=value):\n{out}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

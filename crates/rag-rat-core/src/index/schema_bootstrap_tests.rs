@@ -13283,11 +13283,14 @@ fn refinement_key_is_content_addressed_and_distinct_from_read_key() {
 
     let hashes = vec!["h1".to_string(), "h2".to_string(), "h3".to_string()];
     let shuffled = vec!["h3".to_string(), "h1".to_string(), "h2".to_string()];
-    // Same multiset, different order → same refinement_key (content-addressed).
+    let discs = vec!["d1".to_string(), "d2".to_string(), "d3".to_string()];
+    let discs_shuffled = vec!["d3".to_string(), "d1".to_string(), "d2".to_string()];
+    // Same multiset, different order (struct_hashes AND source discriminators) → same
+    // refinement_key (content-addressed, order-independent).
     assert_eq!(
-        refinement_key("rust", &hashes),
-        refinement_key("rust", &shuffled),
-        "the same struct_hash multiset must address the same refinement"
+        refinement_key("rust", &hashes, &discs),
+        refinement_key("rust", &shuffled, &discs_shuffled),
+        "the same struct_hash + source-discriminator multiset must address the same refinement"
     );
 
     // The refinement key (structural) is NOT the read-side class_key (location-derived). Build a
@@ -13682,24 +13685,32 @@ fn find_clones_huge_limit_clamps_to_refine_budget() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// I3 (#215 Plan 4a adversary): `load_refine_members` caps the re-parse to LCS_MEMBER_SAMPLE (64)
-/// members. This exercises the RUNTIME cap, not just the constant: it plants a single clone class
-/// with MORE than 64 members, then calls `load_refine_members` and asserts it returns EXACTLY 64
-/// members in canonical (struct_hash, symbol_id) order. Because the members are exact clones their
-/// struct_hashes are all equal, so the canonical order reduces to ascending symbol_id.
+/// Plan 4b Task 5b: `load_refine_members` caps the re-parse to `MEMBER_VALUE_CAP` (50, previously
+/// `LCS_MEMBER_SAMPLE` = 64 in Plan 4a). Plants a single clone class with more than
+/// `MEMBER_VALUE_CAP` members, calls `load_refine_members`, and asserts it returns EXACTLY
+/// `MEMBER_VALUE_CAP` members in canonical (struct_hash, path, start_byte) order. Also asserts the
+/// constants are still consistent (MEMBER_VALUE_CAP == MAX_MEMBERS == 50, LCS_MEMBER_SAMPLE == 64,
+/// MEMBER_VALUE_CAP < LCS_MEMBER_SAMPLE — the align cap never sees more members than the value cap
+/// loads).
 #[test]
-fn load_refine_members_caps_to_lcs_sample_at_runtime() {
+fn load_refine_members_returns_up_to_value_cap() {
     use crate::index::clones::refine::align::LCS_MEMBER_SAMPLE;
-    // Keep the constant assertion — the cap value is load-bearing.
-    assert_eq!(LCS_MEMBER_SAMPLE, 64, "LCS_MEMBER_SAMPLE must be 64 (the load cap constant)");
+    use crate::index::query_api::{MAX_MEMBERS, MEMBER_VALUE_CAP};
+    // Constant consistency assertions — these values are load-bearing.
+    assert_eq!(MEMBER_VALUE_CAP, 50, "MEMBER_VALUE_CAP must be 50");
+    assert_eq!(MAX_MEMBERS, 50, "MAX_MEMBERS must be 50");
+    assert_eq!(LCS_MEMBER_SAMPLE, 64, "LCS_MEMBER_SAMPLE must be 64");
+    // MEMBER_VALUE_CAP < LCS_MEMBER_SAMPLE is a compile-time invariant: move to const context so
+    // clippy::assertions_on_constants doesn't fire.
+    const { assert!(MEMBER_VALUE_CAP < LCS_MEMBER_SAMPLE) };
 
-    const MEMBERS: usize = LCS_MEMBER_SAMPLE + 1; // 65 — one over the cap.
+    const MEMBERS: usize = MEMBER_VALUE_CAP + 1; // 51 — one over the value cap.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
 
-    // 65 rename-clones of ONE structure: identical AST shape, distinct identifier names. Baseline
-    // normalization alpha-renames identifiers to ID<n> and buckets literals, so all 65 collapse to
+    // 51 rename-clones of ONE structure: identical AST shape, distinct identifier names. Baseline
+    // normalization alpha-renames identifiers to ID<n> and buckets literals, so all 51 collapse to
     // the SAME struct_hash → one clone class (the struct_hash exact fast path components them).
     for i in 0..MEMBERS {
         let src = format!(
@@ -13711,7 +13722,7 @@ fn load_refine_members_caps_to_lcs_sample_at_runtime() {
 
     let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
 
-    // Find the single component holding all 65 members.
+    // Find the single component holding all 51 members.
     let components = db.candidate_clone_components().expect("components");
     let mut big = components
         .into_iter()
@@ -13719,24 +13730,135 @@ fn load_refine_members_caps_to_lcs_sample_at_runtime() {
         .unwrap_or_else(|| panic!("expected one component of {MEMBERS} exact clones"));
     big.sort_unstable();
 
-    // load_refine_members must cap the re-parse to LCS_MEMBER_SAMPLE members.
+    // load_refine_members must cap the re-parse to MEMBER_VALUE_CAP members.
     let members = db
         .load_refine_members(&big)
         .expect("load_refine_members ok")
         .expect("refine inputs available for an in-scope class");
     assert_eq!(
         members.len(),
-        LCS_MEMBER_SAMPLE,
-        "load_refine_members must cap a {MEMBERS}-member class to LCS_MEMBER_SAMPLE (64)"
+        MEMBER_VALUE_CAP,
+        "load_refine_members must cap a {MEMBERS}-member class to MEMBER_VALUE_CAP (50)"
     );
 
     // All struct_hashes are equal (exact clones), so canonical order is ascending symbol_id — the
-    // first 64 ids of the sorted component.
+    // first 50 ids of the sorted component.
     let returned_ids: Vec<i64> = members.iter().map(|m| m.symbol_id).collect();
-    let expected_ids: Vec<i64> = big.iter().copied().take(LCS_MEMBER_SAMPLE).collect();
+    let expected_ids: Vec<i64> = big.iter().copied().take(MEMBER_VALUE_CAP).collect();
     assert_eq!(
         returned_ids, expected_ids,
-        "capped members must be the first LCS_MEMBER_SAMPLE in canonical (struct_hash, id) order"
+        "capped members must be the first MEMBER_VALUE_CAP in canonical (struct_hash, id) order"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4b Task 5b: every `RefineMember` returned by `load_refine_members` must carry
+/// `node_spans` with the same length as `seq` (bijection invariant from §1.5), a non-empty `text`
+/// buffer (the whole-file source), and spans whose byte ranges recover real source text. Also
+/// confirms that members sharing a file share the same `Arc<str>` allocation
+/// (`Arc::ptr_eq`) — one read per file, not one per member.
+#[test]
+fn refine_member_carries_spans_len_eq_seq() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two rename-clone functions in TWO files (so we can also test same-file Arc sharing below via
+    // a third function added to a.rs).
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
+    let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
+
+    let members =
+        db.load_refine_members(&[id_a, id_b]).expect("load ok").expect("refine inputs available");
+    assert_eq!(members.len(), 2, "both members must be returned");
+
+    for m in &members {
+        // Bijection invariant: node_spans.len() == seq.len().
+        assert_eq!(
+            m.node_spans.len(),
+            m.seq.len(),
+            "node_spans.len() must equal seq.len() for member {}",
+            m.symbol_id
+        );
+        // text must be non-empty (whole-file source, not sliced).
+        assert!(!m.text.is_empty(), "member text must be non-empty");
+        // At least one span's byte range must recover a real (non-empty) source slice.
+        let any_real_slice = m
+            .node_spans
+            .iter()
+            .any(|sp| m.text.get(sp.start_byte..sp.end_byte).is_some_and(|s| !s.is_empty()));
+        assert!(
+            any_real_slice,
+            "at least one span in node_spans must recover a non-empty source slice for member {}",
+            m.symbol_id
+        );
+        // A leaf span (is_leaf=true) must recover a real identifier (non-empty, non-whitespace).
+        if let Some(leaf_sp) = m.node_spans.iter().find(|s| s.is_leaf) {
+            let slice =
+                m.text.get(leaf_sp.start_byte..leaf_sp.end_byte).expect("leaf span byte range");
+            assert!(!slice.trim().is_empty(), "leaf span must recover non-empty source text");
+        }
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4b Task 5b: the faithfulness pin still drops drifted members. A member whose on-disk
+/// content changed after indexing (struct_hash mismatch between re-parse and persisted) causes
+/// `load_refine_members` to return `Ok(None)` — the caller falls back to the un-refined class
+/// rather than aligning stale tokens.
+#[test]
+fn faithfulness_pin_still_drops_drifted_member() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
+    let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
+
+    // Sanity: before drift, refine inputs are available.
+    assert!(
+        db.load_refine_members(&[id_a, id_b]).unwrap().is_some(),
+        "before drift: refine inputs must be available"
+    );
+
+    // Drift one member's on-disk source: overwrite b.rs with a structurally DIFFERENT function
+    // (adds a while loop → different struct_hash). The index still holds the old fingerprint row.
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); while o > 0 { o -= 1; } o }\n",
+    )
+    .unwrap();
+
+    // After drift: the re-parse of b.rs produces a different struct_hash → faithfulness pin fires
+    // → load_refine_members returns Ok(None).
+    let result = db.load_refine_members(&[id_a, id_b]).unwrap();
+    assert!(
+        result.is_none(),
+        "a drifted member (struct_hash mismatch) must cause load_refine_members to return Ok(None)"
     );
 
     let _ = fs::remove_dir_all(root);
@@ -13793,6 +13915,74 @@ fn clones_for_symbol_reports_eligibility() {
     assert_eq!(class.member_count, 2, "the clone class has both rename-clones");
 
     let _ = fs::remove_dir_all(root);
+}
+
+/// Plan 4b Task 5c: `build_class` threads the medoid's `symbol_id` out as
+/// `CandidateCloneClass::medoid_symbol_id`. For a normal (non-sampled) clone class:
+///   - `medoid_symbol_id` is `Some`.
+///   - The id it contains is one of the class's member symbol_ids.
+///   - It is stable across two independent `find_clones` calls on the same index.
+///
+/// The medoid is the bag-overlap medoid (max Σ overlap/max_len), NOT an LCS-distance medoid —
+/// sound as a template-spine anchor for a coherence-split class (§1.1). Task 5d uses it as the
+/// anti-unify anchor, falling back to the canonical-first `(struct_hash, path, start_byte)` member
+/// when `None`.
+#[test]
+fn build_class_surfaces_medoid_symbol_id() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Two rename-clone functions: same structure, different local names. Both fingerprint to the
+    // SAME struct_hash (rename-clone), so they form one class via the struct_hash fast path.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(res.classes.len(), 1, "one clone class");
+    let class = &res.classes[0];
+
+    // medoid_symbol_id must be Some for any non-degenerate class.
+    let medoid_id = class
+        .medoid_symbol_id
+        .expect("medoid_symbol_id must be Some for a non-degenerate clone class");
+
+    // Collect the actual symbol_ids of the class members by resolving their qualified names from
+    // the DB — `CloneMember` doesn't expose the rowid, so we look it up via the helper.
+    let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
+    let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
+    let member_ids = [id_a, id_b];
+
+    assert!(
+        member_ids.contains(&medoid_id),
+        "medoid_symbol_id ({medoid_id}) must be one of the class's member symbol_ids \
+         ({member_ids:?})"
+    );
+
+    // Stability: a second find_clones call on the same index must return the same medoid_symbol_id.
+    let res2 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    let medoid_id2 =
+        res2.classes[0].medoid_symbol_id.expect("medoid_symbol_id must be Some on second call");
+    assert_eq!(
+        medoid_id, medoid_id2,
+        "medoid_symbol_id must be deterministic across repeated calls"
+    );
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 /// Worktree-overlay scope: `find_clones` returns the BRANCH-ONLY clone class under the overlay
@@ -14614,7 +14804,6 @@ fn load_refine_members_reparse_is_faithful_to_persisted_struct_hash() {
     for m in &members {
         assert!(!m.seq.is_empty(), "the re-parsed token sequence must be non-empty");
         assert_eq!(m.lang, Language::Rust, "member language is rust");
-        assert!(m.end_byte > m.start_byte, "byte range must be non-empty");
         // THE PIN: the re-parse reproduces Plan-1's normalization exactly.
         assert_eq!(
             struct_hash(&m.seq),
@@ -14628,12 +14817,22 @@ fn load_refine_members_reparse_is_faithful_to_persisted_struct_hash() {
         );
     }
 
-    // Members are returned in canonical sorted-by-struct_hash (then symbol_id) order.
+    // Members are returned in canonical sorted-by-struct_hash order. Production keys the canonical
+    // order on the REINDEX-STABLE `(struct_hash, path, start_byte)`; `RefineMember` carries no
+    // `path`/`start_byte`, so this test can only re-derive `(struct_hash, symbol_id)` — the
+    // fixtures arrange `symbol_id` to coincide with `(path, start_byte)`, so the orders match
+    // here. The REAL reindex-stable-order guard is the unit test
+    // `refine_member_order_is_reindex_stable`.
     let mut expected =
         members.iter().map(|m| (m.struct_hash.clone(), m.symbol_id)).collect::<Vec<_>>();
     expected.sort();
     let actual = members.iter().map(|m| (m.struct_hash.clone(), m.symbol_id)).collect::<Vec<_>>();
-    assert_eq!(actual, expected, "members must be sorted by (struct_hash, symbol_id)");
+    assert_eq!(
+        actual, expected,
+        "members must be in canonical (struct_hash, path, start_byte) order — \
+         struct_hash-ascending here (fixtures pin symbol_id to coincide); real guard: \
+         refine_member_order_is_reindex_stable"
+    );
 
     let _ = fs::remove_dir_all(root);
 }

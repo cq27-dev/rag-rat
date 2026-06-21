@@ -85,12 +85,48 @@ pub(crate) fn lcs_align(a: &[String], b: &[String]) -> Alignment {
     Alignment { lcs_len, ops }
 }
 
-/// Cap on the number of members used in the LCS all-pairs loop. With n members, pairs = n*(n-1)/2;
-/// at 64 members that is 2016 pairs, which is a manageable upper bound. When the seqs slice has
-/// more than LCS_MEMBER_SAMPLE members, only the first LCS_MEMBER_SAMPLE are used (the slice is
-/// already in canonical sorted order, so the sample is deterministic). The caller sees
+/// Defensive cap on the number of members used in the LCS all-pairs loop. With n members, pairs =
+/// n*(n-1)/2; at 64 members that is 2016 pairs, which is a manageable upper bound. When the seqs
+/// slice has more than LCS_MEMBER_SAMPLE members, only the first LCS_MEMBER_SAMPLE are used (the
+/// slice is already in canonical sorted order, so the sample is deterministic). The caller sees
 /// `lcs_sampled = true` when this cap engages.
+///
+/// NOTE — NOT the binding cap. `load_refine_members` truncates the refine population to
+/// `MEMBER_VALUE_CAP = MAX_MEMBERS = 50` BEFORE it reaches `class_lcs_ratio`, and
+/// `MEMBER_VALUE_CAP < LCS_MEMBER_SAMPLE` is a load-bearing invariant (asserted in
+/// `query_api/clones.rs`; the value cap must stay below the align cap so the 51..=64 member range
+/// the loader already sampled is flagged via `member_count > MEMBER_VALUE_CAP`). So in production
+/// this 64-member cap NEVER engages — the binding member cap is the loaded 50. It is kept ONLY as a
+/// defensive bound for a pathological direct caller (mirroring `align_to_anchor`'s defensive member
+/// cap), and is therefore deliberately NOT lowered to ≤ `MEMBER_VALUE_CAP`. What actually bounds
+/// the AGGREGATE exact-DP cost regardless of member count is [`LCS_AGGREGATE_CELLS_BUDGET`].
 pub(crate) const LCS_MEMBER_SAMPLE: usize = 64;
+
+/// AGGREGATE cap on the total number of exact-DP cells `class_lcs_ratio` will compute across ALL
+/// member pairs in one class. The per-pair length cap ([`LCS_MAX_SEQ_TOKENS`]) only fires when ONE
+/// sequence EXCEEDS 2000 tokens — so a class of many members all JUST UNDER 2000 tokens slips past
+/// it and runs an exact O(n·m) DP for EVERY pair (a 50-member ~1999-token class = 1225 exact DPs ≈
+/// minutes of CPU, blowing any MCP timeout — ADVERSARY-B perf cliff, mem_19ee957937e). The per-pair
+/// and member-count caps bound a single pair and the member count, but NOT the `pairs × per-pair`
+/// product; this budget closes that gap.
+///
+/// `class_lcs_ratio` tracks the running sum of `|a|·|b|` over the exact-DP pairs it has actually
+/// computed; once that sum EXCEEDS this budget, ALL remaining pairs fall back to the cheap
+/// order-blind [`multiset_dice`] proxy (clamped to [`DICE_PROXY_CEILING`]) and `lcs_sampled` is
+/// set, so a budget-truncated class can never be reported as exact.
+///
+/// COST (measured, debug build, this box): the exact DP runs ~9–11 ns/cell — NOT the ~2.3 ns an
+/// earlier comment claimed; the (n+1)·(m+1) `usize` table (~32 MB at 1900² per pair) thrashes
+/// cache, so per-cell cost is dominated by memory traffic, not arithmetic. At ~10 ns/cell the
+/// exact-DP portion of one class is bounded to ≈ 1.0 s (100M cells). The post-budget pairs are NOT
+/// free: the [`multiset_dice`] proxy is O(n+m) but sorts two ~1900-element vecs per pair, which on
+/// a 50-member class (1225 pairs, ~1200 proxied after ~26 exact) is the same order as the exact
+/// portion — so the realistic per-class worst case is ≈ 0.85–1.06 s (exact + proxy together).
+/// Across the 50-class refine budget that is ≈ 48–52 s worst-case in aggregate. Still far better
+/// than the pre-budget cliff (a single all-exact 50×~1999 class was ~96 s–10 min, cold; warm runs
+/// hit the cache), and it keeps any one class well under an MCP timeout — but the bound is
+/// seconds-per-class, not the sub-quarter-second the old comment implied.
+pub(crate) const LCS_AGGREGATE_CELLS_BUDGET: u64 = 100_000_000;
 
 /// Cap on the per-pair DP table dimension. When max(|a|, |b|) exceeds this, the pair's LCS
 /// ratio is replaced by a token-multiset Dice coefficient (2·|a∩b| / (|a|+|b|)) — a cheap
@@ -149,24 +185,54 @@ fn multiset_dice(a: &[String], b: &[String]) -> f64 {
 /// of identical sequences. Returns `0.0` when one sequence is empty and the other is not (edge
 /// case: `2*0 / (0 + m) == 0`). Guards `|a| + |b| == 0` (both empty) → `1.0`.
 ///
-/// The returned `bool` is `lcs_sampled` — `true` when either cost cap engaged: the member-count cap
-/// ([`LCS_MEMBER_SAMPLE`], only the first N members entered the all-pairs loop) or the per-pair
+/// The returned `bool` is `lcs_sampled` — `true` when ANY cost cap engaged: the member-count cap
+/// ([`LCS_MEMBER_SAMPLE`], only the first N members entered the all-pairs loop), the per-pair
 /// length cap ([`LCS_MAX_SEQ_TOKENS`], a pair fell back to the [`multiset_dice`] proxy instead of
-/// the exact O(n·m) DP). The caller folds this into the class's `metrics_sampled` flag so a
-/// cost-bounded fidelity is distinguishable from an exact one.
+/// the exact O(n·m) DP), or the AGGREGATE cell budget ([`LCS_AGGREGATE_CELLS_BUDGET`], the running
+/// sum of exact-DP cells across pairs exceeded the budget and the remaining pairs fell back to the
+/// proxy). The caller folds this into the class's `metrics_sampled` flag so a cost-bounded fidelity
+/// is distinguishable from an exact one.
 pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> (f64, bool) {
+    let (ratio, sampled, _exact_dp_pairs) = class_lcs_ratio_counted(seqs);
+    (ratio, sampled)
+}
+
+/// The body of [`class_lcs_ratio`], additionally returning how many pairs actually ran the exact
+/// O(n·m) DP (the rest took the [`multiset_dice`] proxy). The count is what the aggregate-budget
+/// test asserts is BOUNDED — it is otherwise an implementation detail, so the public wrapper drops
+/// it. Uses the production aggregate budget ([`LCS_AGGREGATE_CELLS_BUDGET`]).
+fn class_lcs_ratio_counted(seqs: &[Vec<String>]) -> (f64, bool, u64) {
+    class_lcs_ratio_counted_with_budget(seqs, LCS_AGGREGATE_CELLS_BUDGET)
+}
+
+/// [`class_lcs_ratio_counted`] with an INJECTABLE aggregate cell budget. Production always uses the
+/// [`LCS_AGGREGATE_CELLS_BUDGET`] default (via the wrapper above); the budget is a parameter only
+/// so the aggregate-budget test can trip the cutover with a TINY budget on SMALL sequences in
+/// milliseconds, instead of running ~26 real 1900² DPs to exhaust the 100M production budget (~11
+/// s). The cutover logic is byte-identical regardless of the budget value, so the fast test
+/// exercises the same code path as production.
+fn class_lcs_ratio_counted_with_budget(seqs: &[Vec<String>], budget: u64) -> (f64, bool, u64) {
     if seqs.len() < 2 {
-        return (1.0, false);
+        return (1.0, false, 0);
     }
 
     // Member-count cap: use at most LCS_MEMBER_SAMPLE members. The slice is already in canonical
-    // sorted order (by struct_hash then symbol_id), so the first LCS_MEMBER_SAMPLE is a
-    // deterministic, reproducible sample.
+    // sorted order (the reindex-stable (struct_hash, path, start_byte) key), so the first
+    // LCS_MEMBER_SAMPLE is a deterministic, reproducible sample. (In production this never engages
+    // — the loader already caps the population at MEMBER_VALUE_CAP=50 < LCS_MEMBER_SAMPLE=64;
+    // see the constant doc.)
     let sampled_members = seqs.len() > LCS_MEMBER_SAMPLE;
     let effective = if sampled_members { &seqs[..LCS_MEMBER_SAMPLE] } else { seqs };
 
     let mut min_ratio = f64::INFINITY;
     let mut sampled_seq = false;
+    // AGGREGATE exact-DP budget: track the cumulative `Σ |a|·|b|` over the pairs that actually ran
+    // the exact O(n·m) DP. Once it exceeds LCS_AGGREGATE_CELLS_BUDGET, every REMAINING pair falls
+    // back to the order-blind Dice proxy — so no class runs unbounded exact DP regardless of member
+    // count or per-member length-under-cap (the ADVERSARY-B perf cliff).
+    let mut exact_dp_cells: u64 = 0;
+    let mut exact_dp_pairs: u64 = 0;
+    let mut budget_exhausted = false;
 
     for i in 0..effective.len() {
         for j in (i + 1)..effective.len() {
@@ -175,14 +241,23 @@ pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> (f64, bool) {
             let denom = (a.len() + b.len()) as f64;
             let ratio = if denom == 0.0 {
                 1.0
-            } else if a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS {
-                // Per-pair length cap: use the Dice proxy instead of the O(n·m) DP. Dice ignores
-                // token order so it is an UPPER BOUND on the true LCS ratio — clamp to
-                // [`DICE_PROXY_CEILING`] (< the High-confidence threshold) so an order-blind
-                // proxy can't earn a class High confidence / full refactorability.
+            } else if budget_exhausted || a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS {
+                // Per-pair length cap OR aggregate budget exhausted: use the Dice proxy instead of
+                // the O(n·m) DP. Dice ignores token order so it is an UPPER BOUND on the true LCS
+                // ratio — clamp to [`DICE_PROXY_CEILING`] (< the High-confidence threshold) so an
+                // order-blind proxy can't earn a class High confidence / full refactorability.
                 sampled_seq = true;
                 multiset_dice(a, b).min(DICE_PROXY_CEILING)
             } else {
+                // Charge this pair against the aggregate budget BEFORE computing, then run the
+                // exact DP. Once the running sum exceeds the budget, the NEXT pairs
+                // take the proxy branch above — but this pair, already accounted,
+                // still computes exactly.
+                exact_dp_cells = exact_dp_cells.saturating_add((a.len() as u64) * (b.len() as u64));
+                exact_dp_pairs += 1;
+                if exact_dp_cells > budget {
+                    budget_exhausted = true;
+                }
                 let lcs = lcs_align(a, b).lcs_len;
                 2.0 * lcs as f64 / denom
             };
@@ -197,7 +272,7 @@ pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> (f64, bool) {
     // loop body (i=0, j=1) executes at least once and `min_ratio` is updated from `f64::INFINITY`.
     // The `f64::INFINITY` fallback is therefore unreachable — assert it in debug, return min_ratio.
     debug_assert!(min_ratio.is_finite(), "min_ratio must be set: effective.len() >= 2");
-    (min_ratio, lcs_sampled)
+    (min_ratio, lcs_sampled, exact_dp_pairs)
 }
 
 #[cfg(test)]
@@ -458,6 +533,83 @@ mod tests {
             super::super::score::confidence_v1(ratio, 1.0),
             super::super::score::Confidence::High,
             "a Dice-proxied ratio must not band High confidence (ratio {ratio})"
+        );
+    }
+
+    /// C-B (ADVERSARY-B perf cliff, #215 Plan 4b): the AGGREGATE exact-DP cell budget. A class of
+    /// MANY members each LARGE but UNDER [`LCS_MAX_SEQ_TOKENS`] (so the per-pair length cap never
+    /// fires) must NOT run an exact O(n·m) DP for every pair — once the running `Σ |a|·|b|` exceeds
+    /// [`LCS_AGGREGATE_CELLS_BUDGET`] the remaining pairs fall back to the Dice proxy and
+    /// `lcs_sampled` is set. Without the budget this class would run all `50·49/2 = 1225` exact DPs
+    /// (the measured ~minutes cliff); with it, only a bounded handful run.
+    #[test]
+    fn class_lcs_ratio_aggregate_budget_caps_exact_dp() {
+        // Same invariant the production budget enforces, exercised with a TINY INJECTED budget on
+        // SMALL sequences so it runs in milliseconds. (The production budget is 100M cells;
+        // tripping it for real needs ~26 exact 1900² DPs ≈ 11 s — that cost is in the
+        // cutover arithmetic, identical at any budget, so a small budget hits the SAME code
+        // path far cheaper.)
+        //
+        // 20 members, each 10 tokens → 100 cells/pair, 190 pairs. With a 250-cell budget the
+        // running Σ|a|·|b| exceeds it after 3 exact pairs (300 > 250), so the rest fall
+        // back to the proxy.
+        let per_member = 10usize;
+        let member_count = 20usize;
+        let tiny_budget: u64 = 250;
+        let seqs: Vec<Vec<String>> = (0..member_count)
+            .map(|m| (0..per_member).map(|i| format!("m{m}t{i}")).collect())
+            .collect();
+
+        // Sanity: every member is under the per-pair length cap, so the ONLY bound that can fire is
+        // the (injected) aggregate budget.
+        assert!(
+            seqs.iter().all(|s| s.len() <= LCS_MAX_SEQ_TOKENS),
+            "members must be under the per-pair length cap so only the aggregate budget bounds \
+             cost"
+        );
+        let total_pairs = (member_count * (member_count - 1) / 2) as u64; // 190
+
+        let (_ratio, sampled, exact_dp_pairs) =
+            class_lcs_ratio_counted_with_budget(&seqs, tiny_budget);
+
+        // The budget tripped → sampled flag set (a budget-truncated class is never reported exact).
+        assert!(sampled, "aggregate-budget truncation must set lcs_sampled=true");
+
+        // Only a bounded HANDFUL of exact DPs ran — far below all-pairs. At 100 cells/pair, a
+        // 250-cell budget admits exactly 3 exact pairs (100, 200 within budget; the 3rd pushes the
+        // sum to 300 > 250 and is the last exact pair, the rest take the proxy).
+        assert!(
+            exact_dp_pairs < total_pairs,
+            "aggregate budget must cap exact DPs below all {total_pairs} pairs, ran \
+             {exact_dp_pairs}"
+        );
+        // The budget-implied bound: ⌈budget / cells_per_pair⌉ + 1 (the pair that trips it still
+        // computes exactly). cells_per_pair = per_member² = 100.
+        let max_exact = tiny_budget / ((per_member as u64) * (per_member as u64)) + 1;
+        assert!(
+            exact_dp_pairs <= max_exact,
+            "exact DPs ({exact_dp_pairs}) must not exceed the budget-implied bound ({max_exact})"
+        );
+    }
+
+    /// C-B companion: a SMALL class within the aggregate budget runs ALL pairs exactly and is NOT
+    /// reported sampled — the budget must not perturb the ratio value for normal-size classes.
+    #[test]
+    fn class_lcs_ratio_small_class_within_budget_is_exact() {
+        // Three modest members (well under the aggregate budget): all 3 pairs run exact DP, no
+        // sampling, and the ratio matches the pre-budget minimum-pairwise behavior.
+        let a = strs(&["fn", "foo", "(", ")", "{", "x", "}"]);
+        let b = strs(&["fn", "bar", "(", ")", "{", "x", "}"]); // one token differs
+        let c = a.clone();
+        let (ratio, sampled, exact_dp_pairs) = class_lcs_ratio_counted(&[a.clone(), b.clone(), c]);
+        assert!(!sampled, "a small class within budget must not be sampled");
+        assert_eq!(exact_dp_pairs, 3, "all 3 pairs of a 3-member class run exact DP within budget");
+        // Min pairwise: a↔b differ by one token (DelA+InsB), a↔c & b↔c... a==c (1.0). The min is
+        // the a↔b ratio = 2*(7-1)/(7+7) = 6/7.
+        let expected = 2.0 * (a.len() - 1) as f64 / (a.len() + b.len()) as f64;
+        assert!(
+            (ratio - expected).abs() < 1e-12,
+            "small-class ratio unchanged by the budget: expected {expected}, got {ratio}"
         );
     }
 

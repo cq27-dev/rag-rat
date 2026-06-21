@@ -19,7 +19,13 @@ pub(crate) const NORM_VERSION: i64 = 1;
 /// addressed `refinement_key` and in the `clone_refinements` cache freshness predicate, so a bump
 /// invalidates every cached refinement without a schema migration (the same discipline as
 /// [`NORM_VERSION`]).
-pub(crate) const ALIGNMENT_VERSION: i64 = 1;
+///
+/// `2` (#215 Plan 4b): the placeholder 4a refinement (crude LCS skeleton template, `"[]"` /
+/// `"{}"` payloads, `lcs_ratio` coverage proxy, v1 scores) is replaced by the full
+/// anti-unification (real template + variation points + proposed signature + REAL coverage, v2
+/// scores). Every 4a-cached row at `alignment_version = 1` therefore MISSES the lookup
+/// (`WHERE … alignment_version = ?3`) and is recomputed with the 4b payload on the next refine.
+pub(crate) const ALIGNMENT_VERSION: i64 = 2;
 /// Smallest normalized-token count a symbol must reach to be fingerprinted (skip trivial getters).
 pub(crate) const MIN_TOKENS: usize = 20;
 

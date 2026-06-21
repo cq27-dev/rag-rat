@@ -191,6 +191,11 @@ pub(crate) struct ClonesArgs {
     /// refined. Omit the flag to retrieve all classes (only the top 50 refined).
     #[arg(long)]
     pub limit: Option<usize>,
+    /// Print a human-readable explanation (template + variation points + proposed signature) for
+    /// the refined class with this key (from the `class_key` field of a prior `clones` run)
+    /// instead of the JSON/TOON listing.
+    #[arg(long, value_name = "CLASS_KEY")]
+    pub explain: Option<String>,
 }
 
 /// Selector for `clones-for`: positional `SYMBOL` (a qualified ref or `sym_<hex>` handle), or
@@ -594,6 +599,7 @@ mod tests {
                 assert_eq!(args.min_copies, Some(3));
                 assert!(args.min_similarity.is_none());
                 assert!(args.limit.is_none());
+                assert!(args.explain.is_none());
             },
             other => panic!("expected clones, got {other:?}"),
         }
@@ -610,6 +616,8 @@ mod tests {
             "3",
             "--limit",
             "10",
+            "--explain",
+            "deadbeef12345678",
         ])
         .expect("parse");
         match cli.command {
@@ -617,6 +625,7 @@ mod tests {
                 assert_eq!(args.min_similarity, Some(0.8));
                 assert_eq!(args.min_copies, Some(3));
                 assert_eq!(args.limit, Some(10));
+                assert_eq!(args.explain.as_deref(), Some("deadbeef12345678"));
             },
             other => panic!("expected clones, got {other:?}"),
         }

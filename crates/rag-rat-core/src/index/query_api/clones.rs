@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -24,7 +25,6 @@ const METRIC_SAMPLE_CAP: usize = 200;
 
 use crate::index::IndexDatabase;
 use crate::index::clones::NORM_VERSION;
-use crate::index::clones::refine::align::LCS_MEMBER_SAMPLE;
 use crate::index::clones::refine::cache::{
     refine_compute_and_store, refine_lookup, refinement_key,
 };
@@ -38,6 +38,34 @@ const THETA: f64 = 0.7;
 
 /// Maximum members returned per clone class to guard against huge components.
 pub(crate) const MAX_MEMBERS: usize = 50;
+
+/// Cap on how many members `load_refine_members` re-parses and returns WITH spans+text+seq — the
+/// population from which `per_member_values` are collected (Plan 4b §1.6).
+///
+/// Three caps, reconciled:
+/// - `MEMBER_VALUE_CAP = 50` (= `MAX_MEMBERS`): how many members get per-member values; the loader
+///   truncates here so every returned member carries spans + text.
+/// - `LCS_MEMBER_SAMPLE = 64`: the bound on the STAR ALIGNMENT pass in Task 5d — at most 64
+///   (anchor, N−1 non-anchor) pairings enter the LCS DP. Since 50 < 64, all loaded members are
+///   within the align cap automatically: the value cap is the binding constraint.
+/// - `MAX_MEMBERS = 50`: the build_class returned-member list cap (distinct from the loader cap but
+///   equal in value; the loader honors the same floor so the two populations stay in sync).
+///
+/// NOTE: `MEMBER_VALUE_CAP < LCS_MEMBER_SAMPLE` is load-bearing: Task 5d collects values across
+/// ALL loaded members while capping the alignment work at `LCS_MEMBER_SAMPLE`. With the current
+/// values (50 < 64) the alignment never sees more members than it can process without sampling.
+pub(crate) const MEMBER_VALUE_CAP: usize = MAX_MEMBERS; // = 50
+
+// `MEMBER_VALUE_CAP < LCS_MEMBER_SAMPLE` is load-bearing (see the doc above): the loader truncates
+// the refine population at `MEMBER_VALUE_CAP` (50), so the `metrics_sampled` member-count guard in
+// `apply_refinement` keys off `MEMBER_VALUE_CAP` — using the larger align cap (`LCS_MEMBER_SAMPLE`,
+// 64) would miss the 51..=64 range the loader already sampled. Pin the relationship at compile time
+// in PRODUCTION (a module-level `const _`), not just under `#[cfg(test)]`, so a future bump that
+// inverts the two caps fails the build here rather than silently regressing the sampling flag.
+const _: () = assert!(
+    MEMBER_VALUE_CAP < crate::index::clones::refine::align::LCS_MEMBER_SAMPLE,
+    "MEMBER_VALUE_CAP must be below LCS_MEMBER_SAMPLE so the cap+1 member range is still flagged"
+);
 
 /// Member-hydration batch size for the `symbols.id IN (…)` query in [`build_class`]. SQLite caps
 /// the number of host parameters per prepared statement (`SQLITE_MAX_VARIABLE_NUMBER` — 999 on
@@ -100,6 +128,32 @@ pub struct CandidateCloneClass {
     /// `member_count` / `total_members` / `class_key` are always over the FULL component.
     /// `false` for all normal-size components computed exactly (the typical case).
     pub metrics_sampled: bool,
+    /// The `symbol_id` (`symbols.id` rowid) of the **medoid member** — the member that maximises
+    /// the sum of pairwise bag-overlap similarities within the metric-sampled subset of the class.
+    ///
+    /// **Caveat (Plan 4b §1.1):** this is the *bag-overlap* medoid (max Σ overlap/max_len), NOT an
+    /// LCS-distance medoid. For a coherence-split class (all pairs ≥ θ) it is a sound,
+    /// deterministic template-spine anchor for anti-unification; the distinction is documented
+    /// and harmless.
+    ///
+    /// **Metrics-sampled note:** when [`metrics_sampled`] is `true`, the medoid is selected over
+    /// the first [`METRIC_SAMPLE_CAP`] members (id-ASC stable order), not the full component.
+    /// The resolved `symbol_id` is still a real member's id and is a valid anchor; only the
+    /// coverage of the medoid search is reduced. Task 5d falls back to the canonical-first
+    /// `(struct_hash, path, start_byte)` member when this field is `None`.
+    ///
+    /// `None` only in the degenerate case where `metric_bags` is empty (a component with zero
+    /// members that passed the size filter — should not occur in practice).
+    ///
+    /// Codex #5: NOT serialized (`#[serde(skip)]`). This is a `symbols.id` ROWID, reassigned on
+    /// every reindex — the API contract is stable refs / `sym_<hex>` handles, never raw
+    /// rowids. It is INTERNAL state, threaded only into the anti-unify anchor
+    /// (`resolve_anchor_idx`); consumers (MCP / CLI / clients) don't need it and must not be
+    /// tempted to cache it across a rebuild.
+    ///
+    /// [`metrics_sampled`]: Self::metrics_sampled
+    #[serde(skip)]
+    pub medoid_symbol_id: Option<i64>,
     /// Refinement outputs (#215 Plan 4a). All `None` on an UN-refined candidate class; populated
     /// only on classes the two-phase driver refined (`refined == true`). `lcs_ratio` is the NiCad
     /// class fidelity (min pairwise `2·LCS/(|a|+|b|)`); `confidence` is the persisted band
@@ -109,6 +163,34 @@ pub struct CandidateCloneClass {
     pub confidence: Option<String>,
     pub refactorability: Option<f64>,
     pub refine_mode: Option<&'static str>,
+    /// Anti-unification template text (Plan 4b): fixed runs verbatim, variation runs as `⟨m0⟩`,
+    /// gapped runs as `⟨m2?⟩`. `None` on un-refined classes.
+    pub template: Option<String>,
+    /// Variation points parsed from `variation_points_json`. Each point has `metavar_id`, `kind`,
+    /// `occurrences`, `per_member_values`, `extraction_role`, `type_hint`, `confidence`. The
+    /// `per_member_values` array is ordinal-aligned to the canonical `(struct_hash, path,
+    /// start_byte)` sorted member order (the `load_refine_members` basis) — NOT to the `members`
+    /// field above, which `build_class` emits in `symbol_id` order. `None` on un-refined classes.
+    pub variation_points: Option<serde_json::Value>,
+    /// Proposed signature parsed from `proposed_signature_json` (Plan 4b): `params`, `typedness`,
+    /// `confidence`, `text`, `unresolved_type_slots`, `return_type`. `None` on un-refined classes.
+    pub proposed_signature: Option<serde_json::Value>,
+    /// Real anti-unify coverage (`fixed_spine_columns / total_spine_columns` ∈ [0,1]; `1.0` when
+    /// all members are structurally identical). Distinct from `lcs_ratio` (NiCad class fidelity).
+    /// `None` on un-refined classes.
+    pub anti_unify_coverage: Option<f64>,
+    /// LOCATION-BEARING member identities (`ref@path:start-end`) in the canonical
+    /// `(struct_hash, path, start_byte)` order — capped at the same `MEMBER_VALUE_CAP` — that
+    /// `load_refine_members` aligns `per_member_values` to. ORDINAL-ALIGNED to
+    /// `variation_points[*].per_member_values`, so a consumer (`clones --explain`, MCP output) can
+    /// map each per-member value back to a UNIQUE member. Codex #4: the identity is
+    /// location-bearing (the SAME shape `class_key` uses), not the bare qualified `ref` — a
+    /// class with duplicate refs (overloads / same-named methods in one file) would otherwise
+    /// label values indistinguishably. Distinct from `members` (which is `r#ref`-sorted
+    /// display order). Always populated by `build_class` (cheap, no re-parse) so it is present
+    /// on refined classes regardless of warm/cold refine path; `None` only on the degenerate
+    /// stub paths that never run `build_class`.
+    pub canonical_member_refs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -165,6 +247,31 @@ pub(crate) fn class_key_for(member_refs: &[String]) -> String {
     sorted.sort_unstable();
     let joined = sorted.join("\n");
     crate::index::hex_sha256(joined.as_bytes())[..16].to_string()
+}
+
+/// The REINDEX-STABLE canonical member ordering key (#215 Plan 4b Fix 2, Codex round-4).
+///
+/// `(struct_hash, path, start_byte)` is the single source of truth for the ordinal basis the
+/// anti-unify `per_member_values[]` align to. BOTH `IndexDatabase::load_refine_members` (which
+/// orders the members the values are collected over) and `build_class`'s `canonical_member_refs`
+/// (which labels each value with a member identity) sort by THIS key, so a value at ordinal `i`
+/// always maps to the member ref at ordinal `i`.
+///
+/// Why NOT `symbol_id`: it is a `symbols.id` rowid REASSIGNED on every reindex. The 4b cache is
+/// content-addressed (`refinement_key` over struct_hash + source-byte discriminators), so a
+/// file-unchanged reindex serves the SAME cached `per_member_values` — frozen at the OLD member
+/// order — while `canonical_member_refs` is recomputed live. If the live order keyed off
+/// `symbol_id` it could differ from the frozen value order whenever two members share a struct_hash
+/// (the common case in a clone class), mislabelling values. `(path, start_byte)` uniquely
+/// identifies a member (no two symbols start at the same byte in one file) and is stable across a
+/// file-unchanged reindex, so the two orders always agree. Keep both call sites threading through
+/// this helper.
+fn canonical_member_order_key<'a>(
+    struct_hash: &'a str,
+    path: &'a str,
+    start_byte: i64,
+) -> (&'a str, &'a str, i64) {
+    (struct_hash, path, start_byte)
 }
 
 /// Minimum pairwise overlap/max_len similarity across all member pairs of `class`. This is the same
@@ -447,16 +554,32 @@ impl IndexDatabase {
             return Ok(());
         }
 
-        // Content-addressed key over the member struct_hash multiset — NOT the read-side
-        // `class.class_key` (location-derived). Two classes with the same structural content share
-        // a refinement; the key survives a reindex that reassigns rowids.
+        // ── Source discriminators (cheap SELECT, NO RE-PARSE): pin each member's EXACT source
+        // bytes so the content-addressed key discriminates two classes that share a
+        // struct_hash multiset (the NORMALIZED token sequence) but differ in real source.
+        // The 4b cached payload (template, per-member values, signature) is
+        // SOURCE-SPECIFIC; a structure-only key would serve one class's payload to a
+        // structurally-identical-but-source-different class (cache poisoning).
+        // `"{file_sha256}:{start}-{end}"` pins the file content hash + body range →
+        // together they uniquely determine the raw source. This is a SELECT (the same symbols/files
+        // join the bags path already touches), so the warm-probe-before-reparse stays a probe.
+        // If any member's discriminator can't be fetched, leave the class un-refined rather than
+        // key over a partial/structure-only multiset (which could alias a different class).
+        let Some(source_discriminators) = load_source_discriminators(conn, class_ids)? else {
+            return Ok(());
+        };
+
+        // Content-addressed key over the member struct_hash multiset + the per-member source
+        // discriminators — NOT the read-side `class.class_key` (location-derived). Two classes with
+        // the same structural content AND the same exact source bodies share a refinement; the key
+        // survives a reindex that reassigns rowids.
         //
         // For coherent classes exceeding METRIC_SAMPLE_CAP members, `class.similarity_min` was
         // derived from the first `METRIC_SAMPLE_CAP` members only (the metric-sample path in
         // `build_class`), while `key` spans the FULL struct_hash multiset. The gap is not a
         // determinism break — the sample is id-ASC stable — but Plan-4b should compute confidence
         // over the full set or fold the sample into the key.
-        let key = refinement_key(&class.language, &struct_hashes);
+        let key = refinement_key(&class.language, &struct_hashes, &source_discriminators);
 
         // ── Phase 1 (PURE READ — warm path): probe the content-addressed cache. A SELECT is safe
         // on the MCP's read-only connection; a WARM cache hit never takes the write lock and never
@@ -509,8 +632,16 @@ impl IndexDatabase {
             return Ok(());
         }
 
-        let refinement =
-            refine_compute_and_store(conn, &key, &class.language, &members, class.similarity_min)?;
+        // Thread the bag-overlap medoid (Plan 4b §1.1) as the anti-unify spine anchor; the compute
+        // half falls back to the canonical-first member when it is `None`.
+        let refinement = refine_compute_and_store(
+            conn,
+            &key,
+            &class.language,
+            &members,
+            class.similarity_min,
+            class.medoid_symbol_id,
+        )?;
         apply_refinement(class, refinement);
 
         Ok(())
@@ -526,10 +657,13 @@ impl IndexDatabase {
 ///   PERSISTED in `clone_refinements` (Fix 3, #215 Plan 4a round-2), so it survives a warm cache
 ///   hit — the long-sequence dimension is no longer lost on a hit the way it was when the bit was
 ///   compute-only.
-/// - `class.member_count > LCS_MEMBER_SAMPLE` — kept as an independent, cache-agnostic guard for
-///   the member-count dimension: it is deterministic from the class's member count regardless of
-///   cache hit/miss, so it flags the member-count sample even for a row that predates the persisted
-///   bit (default 0 on an additively-migrated DB until recomputed).
+/// - `class.member_count > MEMBER_VALUE_CAP` — an independent, cache-agnostic guard for the
+///   REFINE-INPUT sampling dimension (P2d): `load_refine_members` truncates refine inputs to
+///   `MEMBER_VALUE_CAP` (50), so a class above that cap DROPS members from the refine population —
+///   including the 51..=64 range that the larger `LCS_MEMBER_SAMPLE` (64) align cap would miss. The
+///   threshold is therefore the loader cap, not the align cap. Deterministic from the class's
+///   member count regardless of cache hit/miss, so it flags the sample even for a row that predates
+///   the persisted `lcs_sampled` bit (default 0 on an additively-migrated DB until recomputed).
 fn apply_refinement(
     class: &mut CandidateCloneClass,
     refinement: crate::index::clones::refine::cache::CachedRefinement,
@@ -550,13 +684,28 @@ fn apply_refinement(
     class.refactorability = Some(refinement.refactorability);
     class.refine_mode = Some(refinement.refine_mode);
 
+    // Plan 4b anti-unification payload — surfaced on BOTH the warm (cache-hit) and cold
+    // (compute+store) paths because both flow through this helper. The two JSON columns are parsed
+    // back into `serde_json::Value`; `.ok()` degrades a malformed/legacy row to `None` rather than
+    // failing the whole class.
+    class.template = Some(refinement.template.clone());
+    class.variation_points = serde_json::from_str(&refinement.variation_points_json).ok();
+    class.proposed_signature = serde_json::from_str(&refinement.proposed_signature_json).ok();
+    class.anti_unify_coverage = Some(refinement.anti_unify_coverage);
+
     // Fold the LCS sampling dimensions into the class's metrics_sampled flag (OR-in so any
     // already-sampled Plan-2 metric stays flagged):
     //   1. refinement.lcs_sampled — either cost cap (member-count sample or long-seq proxy), now
     //      PERSISTED (Fix 3) so it is honored on BOTH the cold compute AND the warm cache hit.
-    //   2. member_count > LCS_MEMBER_SAMPLE — independent, cache-agnostic guard for the
-    //      member-count dimension; covers a pre-persisted-bit row whose stored flag defaults to 0.
-    class.metrics_sampled |= refinement.lcs_sampled || class.member_count > LCS_MEMBER_SAMPLE;
+    //   2. member_count > MEMBER_VALUE_CAP — independent, cache-agnostic guard for the REFINE-INPUT
+    //      sampling dimension (P2d): `load_refine_members` truncates inputs to `MEMBER_VALUE_CAP`
+    //      (50), so a class with 51..=64 members DROPS ≥1 member from the refine population even
+    //      though it is below `LCS_MEMBER_SAMPLE` (64). The threshold is therefore the loader cap
+    //      `MEMBER_VALUE_CAP`, not `LCS_MEMBER_SAMPLE` — using the larger align cap would miss the
+    //      51..=64 range that the loader already sampled. (`MEMBER_VALUE_CAP < LCS_MEMBER_SAMPLE`,
+    //      so this strictly subsumes the old member-count guard.) Covers a pre-persisted-bit row
+    //      whose stored flag defaults to 0.
+    class.metrics_sampled |= refinement.lcs_sampled || class.member_count > MEMBER_VALUE_CAP;
 }
 
 /// Build the [`CloneCompleteness`] provenance block shared by `find_clones` and
@@ -809,25 +958,39 @@ impl IndexDatabase {
             Some(rows) => rows,
         };
 
-        // I3 (#215 Plan 4a adversary): cap the re-parse to the first LCS_MEMBER_SAMPLE members in
-        // canonical (struct_hash, symbol_id) order. `class_lcs_ratio` and `lcs_skeleton` only use
-        // the first LCS_MEMBER_SAMPLE members anyway (the member-count cap in align.rs), so
-        // parsing the tail is pure waste. Sorting here is O(n log n) over metadata rows — cheap
-        // compared to the file-I/O + tree-sitter parse that follows.
+        // Sort then cap at MEMBER_VALUE_CAP (= 50) in canonical (struct_hash, path, start_byte)
+        // order — the REINDEX-STABLE ordinal basis (Fix 2, #215 Plan 4b Codex round-4).
         //
-        // NOTE for Plan 4b: anti-unification's per_member_values will need ALL members, not just
-        // the LCS sample — when 4b lands, load the full set (or lazily extend) for
-        // variation_points.
+        // Why NOT (struct_hash, symbol_id): `symbol_id` is a `symbols.id` rowid REASSIGNED on every
+        // reindex. The cached 4b payload (`per_member_values`, template) is anchored to this member
+        // order, but a file-unchanged reindex hits the same warm refinement_key (struct_hash +
+        // source discriminators are content-derived) while the canonical order recomputed
+        // here can REORDER members that share a struct_hash (common in a clone class) — so
+        // a cached per_member_values[i] would label a DIFFERENT member than
+        // canonical_member_refs[i] recomputes to. `(path, start_byte)` uniquely identifies
+        // a member (no two symbols start at the same byte in one file) and is stable across
+        // reindex when the file content is unchanged, so the cached value order always
+        // matches the recomputed canonical_member_refs order. `build_class`'s
+        // `canonical_member_refs` builder uses the SAME (struct_hash, path, start_byte) key.
+        //
+        // Plan 4b change: the cap was previously LCS_MEMBER_SAMPLE (64). It is now MEMBER_VALUE_CAP
+        // (50, = MAX_MEMBERS) so every returned member carries spans + text for per_member_values
+        // collection in Task 5d. Since MEMBER_VALUE_CAP (50) < LCS_MEMBER_SAMPLE (64), the align
+        // pass in 5d never receives more members than the align cap can accommodate — no additional
+        // truncation is needed there. (See MEMBER_VALUE_CAP doc comment above.) The cap is a
+        // stable-PREFIX of this reindex-stable order.
         let mut rows = rows;
         rows.sort_by(|a, b| {
-            a.struct_hash.cmp(&b.struct_hash).then_with(|| a.symbol_id.cmp(&b.symbol_id))
+            canonical_member_order_key(&a.struct_hash, &a.path, a.start_byte as i64)
+                .cmp(&canonical_member_order_key(&b.struct_hash, &b.path, b.start_byte as i64))
         });
-        rows.truncate(LCS_MEMBER_SAMPLE);
+        rows.truncate(MEMBER_VALUE_CAP);
 
-        // I3 (#215 Plan 4a adversary): dedup file reads by path. A class whose members cluster in a
-        // few large files would otherwise re-read each file once per member; instead cache each
-        // distinct file's bytes and reuse the cached text for every member in that file.
-        let mut file_cache: std::collections::HashMap<String, String> =
+        // Dedup file reads by path (Plan 4a I3). Cache is now `Arc<str>` so members in the same
+        // file share the single allocation — the anti-unify step (Plan 4b §1.6) relies on
+        // `member.text.get(span.start_byte..span.end_byte)` using ABSOLUTE file offsets, so the
+        // whole-file buffer must be kept, not sliced to the symbol range.
+        let mut file_cache: std::collections::HashMap<String, Arc<str>> =
             std::collections::HashMap::new();
 
         let mut members: Vec<crate::index::clones::refine::RefineMember> =
@@ -838,11 +1001,12 @@ impl IndexDatabase {
                     // Source missing/unreadable on disk — can't reproduce the token sequence.
                     return Ok(None);
                 };
-                file_cache.insert(row.path.clone(), content);
+                file_cache.insert(row.path.clone(), Arc::from(content.as_str()));
             }
-            let text = file_cache.get(&row.path).expect("just inserted above");
+            let text: Arc<str> =
+                Arc::clone(file_cache.get(&row.path).expect("just inserted above"));
             let Some(parsed) =
-                crate::index::parser::parse_file(Path::new(&row.path), row.language, text)
+                crate::index::parser::parse_file(Path::new(&row.path), row.language, &text)
             else {
                 // Parse failure (or a no-grammar language like markdown) — no AST to descend.
                 return Ok(None);
@@ -852,7 +1016,11 @@ impl IndexDatabase {
                 // No node spans the persisted byte range — the file drifted off-index.
                 return Ok(None);
             };
-            let seq = crate::index::clones::normalize::normalize_baseline(node, text);
+            // Plan 4b: use normalize_baseline_spanned so each token carries its AST span.
+            // The seq (.0) is byte-identical to the old normalize_baseline output (faithfulness
+            // pin).
+            let (seq, node_spans) =
+                crate::index::clones::normalize::normalize_baseline_spanned(node, &text);
 
             // Faithfulness pin: the re-parse must reproduce Plan-1's normalization exactly. A
             // mismatch means the on-disk file no longer matches the indexed fingerprint (the
@@ -870,18 +1038,24 @@ impl IndexDatabase {
             members.push(crate::index::clones::refine::RefineMember {
                 symbol_id: row.symbol_id,
                 lang: row.language,
-                path: row.path,
-                start_byte: row.start_byte,
-                end_byte: row.end_byte,
                 struct_hash: row.struct_hash,
                 seq,
+                node_spans,
+                text,
             });
         }
 
-        // Canonical order: by struct_hash ascending, then symbol_id (the refine ordinal basis).
-        members.sort_by(|a, b| {
-            a.struct_hash.cmp(&b.struct_hash).then_with(|| a.symbol_id.cmp(&b.symbol_id))
-        });
+        // `members` is built by iterating `rows` in order, and `rows` was already sorted into the
+        // canonical REINDEX-STABLE (struct_hash, path, start_byte) order above (then truncated).
+        // That order is authoritative — `RefineMember` does NOT carry `path`/`start_byte`,
+        // so we must NOT re-sort here on a different key (a `(struct_hash, symbol_id)`
+        // re-sort would REORDER equal-struct_hash members and break the per_member_values ↔
+        // canonical_member_refs alignment that Fix 2 establishes). The members are already
+        // in the ordinal basis.
+        debug_assert!(
+            members.windows(2).all(|w| w[0].struct_hash <= w[1].struct_hash),
+            "members must stay in the row-sorted struct_hash-ascending canonical order"
+        );
 
         Ok(Some(members))
     }
@@ -953,6 +1127,54 @@ fn load_refine_rows(
     }
     rows.sort_unstable_by_key(|r| r.symbol_id);
     Ok(Some(rows))
+}
+
+/// Fetch a per-member SOURCE DISCRIMINATOR — `"{file_sha256}:{start_byte}-{end_byte}"` — for the
+/// refinement cache key (#215 Plan 4b, cache-poisoning fix). `file_sha256` is the indexed file
+/// content hash; the body byte span pins the member's source range. Together they uniquely
+/// determine the member's raw source bytes, so two structurally-identical-but-source-different
+/// classes (same `struct_hash` multiset, different real literals) get DISTINCT keys → no
+/// cross-class poisoning of the source-specific 4b payload (template / per-member values /
+/// signature). Two BYTE-IDENTICAL-source classes still share the discriminator multiset → the same
+/// key → true content-addressing of real duplicates is preserved.
+///
+/// CHEAP — a pure SELECT joining `symbols → files` (no tree-sitter re-parse), so a warm cache probe
+/// stays a probe: `refine_class_in_place` calls this BEFORE `refine_lookup`, and the lookup still
+/// short-circuits the expensive `load_refine_members` re-parse on a hit. Returns `Ok(None)` when
+/// ANY member fails to hydrate (vanished row, out-of-scope symbol) — the caller leaves the class
+/// un-refined rather than key over a partial (and therefore structure-only-aliasing) multiset.
+fn load_source_discriminators(
+    conn: &Connection,
+    member_ids: &[i64],
+) -> anyhow::Result<Option<Vec<String>>> {
+    if member_ids.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut discriminators: Vec<String> = Vec::with_capacity(member_ids.len());
+    for chunk in member_ids.chunks(HYDRATION_CHUNK) {
+        let id_placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT files.sha256, symbols.start_byte, symbols.end_byte
+             FROM symbols
+             JOIN files ON files.id = symbols.file_id
+             WHERE symbols.id IN ({})",
+            id_placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let chunk_rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        for row in chunk_rows {
+            let (sha256, start_byte, end_byte) = row?;
+            discriminators.push(format!("{sha256}:{start_byte}-{end_byte}"));
+        }
+    }
+    // EVERY requested member must hydrate, exactly as `load_refine_rows` requires — a partial
+    // multiset would alias a different class. Mismatch ⇒ leave un-refined.
+    if discriminators.len() != member_ids.len() {
+        return Ok(None);
+    }
+    Ok(Some(discriminators))
 }
 
 /// Count DISTINCT member file paths in `classes` whose on-disk content no longer matches the
@@ -1218,6 +1440,13 @@ pub(crate) fn build_class(
         .unwrap_or(0);
     let medoid_bag = metric_bags[medoid_idx];
     let body_token_len_medoid = medoid_bag.token_len;
+    // Thread the medoid's symbol_id out onto the class for Plan 4b Task 5d (anti-unify spine
+    // anchor). This is the bag-overlap medoid (max Σ overlap/max_len over metric_bags), NOT an
+    // LCS-distance medoid — sound as a template anchor for a coherence-split class (all pairs ≥ θ)
+    // where the bag-overlap medoid is representatively central. When metrics_sampled is true,
+    // medoid_idx is over the first METRIC_SAMPLE_CAP members (id-ASC stable); the resolved id is
+    // still a real member.
+    let medoid_symbol_id = Some(medoid_bag.symbol_id);
 
     // Min similarity of any member to the medoid (within metric_bags).
     let mut similarity_medoid_min = f64::MAX;
@@ -1248,13 +1477,19 @@ pub(crate) fn build_class(
     // Fix 3 (#215): each chunk also filters normalizer_version so stale fingerprint rows don't
     // yield duplicate members or wrong token_len values. The version bind is appended as the
     // last positional param after that chunk's id list.
-    let mut raw_members: Vec<(i64, CloneMember)> = Vec::with_capacity(total_members);
+    // The tuple carries `start_byte` (Fix 2, #215 Plan 4b Codex round-4) so `canonical_member_refs`
+    // can sort on the REINDEX-STABLE (struct_hash, path, start_byte) key — the SAME key
+    // `load_refine_members` uses for the `per_member_values` ordinal basis. `start_byte` (not the
+    // public `CloneMember.start_line`) is what `load_refine_members` orders by, and two symbols can
+    // share a line but never a start byte, so it is the exact, total tiebreak that keeps the two
+    // member orderings byte-for-byte identical.
+    let mut raw_members: Vec<(i64, i64, CloneMember)> = Vec::with_capacity(total_members);
     for chunk in component.chunks(HYDRATION_CHUNK) {
         let id_placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
         let version_placeholder = format!("?{}", chunk.len() + 1);
         let sql = format!(
             "SELECT symbols.id, ns.value, files.path, symbols.start_line, symbols.end_line, \
-             sf.token_len, symbols.language
+             sf.token_len, symbols.language, symbols.start_byte
              FROM symbols
              JOIN files ON files.id = symbols.file_id
              JOIN name_strings ns ON ns.id = symbols.qualified_name_id
@@ -1270,7 +1505,8 @@ pub(crate) fn build_class(
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
             let symbol_id: i64 = row.get(0)?;
-            Ok((symbol_id, CloneMember {
+            let start_byte: i64 = row.get(7)?;
+            Ok((symbol_id, start_byte, CloneMember {
                 r#ref: row.get(1)?,
                 path: row.get(2)?,
                 start_line: row.get(3)?,
@@ -1284,7 +1520,7 @@ pub(crate) fn build_class(
         }
     }
     // Restore the deterministic `symbols.id ASC` order the single-statement path produced.
-    raw_members.sort_unstable_by_key(|(symbol_id, _)| *symbol_id);
+    raw_members.sort_unstable_by_key(|(symbol_id, _, _)| *symbol_id);
 
     // Fix 5 (#215): if hydration returned nothing (all fingerprint rows vanished mid-read), bail to
     // `None` rather than build an internally-inconsistent class (member_count from the component
@@ -1295,14 +1531,14 @@ pub(crate) fn build_class(
 
     let language = raw_members
         .first()
-        .map(|(_, m)| m.language.clone())
+        .map(|(_, _, m)| m.language.clone())
         .unwrap_or_else(|| bags[0].language.clone());
 
     // cross_module_spread counts ALL hydrated members (full component), not just the capped subset
     // — so it is consistent with member_count (both over the full population).
     let parent_dirs: std::collections::BTreeSet<String> = raw_members
         .iter()
-        .map(|(_, m)| {
+        .map(|(_, _, m)| {
             std::path::Path::new(&m.path)
                 .parent()
                 .map(|p| p.display().to_string())
@@ -1323,9 +1559,55 @@ pub(crate) fn build_class(
     // differing later must get different keys.
     let key_material: Vec<String> = raw_members
         .iter()
-        .map(|(_, m)| format!("{}@{}:{}-{}", m.r#ref, m.path, m.start_line, m.end_line))
+        .map(|(_, _, m)| format!("{}@{}:{}-{}", m.r#ref, m.path, m.start_line, m.end_line))
         .collect();
     let class_key = class_key_for(&key_material);
+
+    // Canonical-ordered member refs (#215 Plan 4b): the qualified `ref` of each member in the SAME
+    // canonical `(struct_hash, path, start_byte)` order, capped at the same `MEMBER_VALUE_CAP`,
+    // that `load_refine_members` uses — so this is ORDINAL-ALIGNED to a refined class's
+    // `variation_points[*].per_member_values`. The `members` field above is `r#ref`-sorted (display
+    // order) and cannot be mapped to a `per_member_values` slot; `clones --explain` zips THIS
+    // vector with the values so each printed value carries its member identity. Computed here
+    // (not in `apply_refinement`) because the warm cache path skips `load_refine_members`
+    // entirely, while `raw_members` (carrying `symbol_id`, `start_byte`, and `r#ref`) and `by_id`
+    // (the `struct_hash`) are always available on both paths.
+    //
+    // Fix 2 (#215 Plan 4b Codex round-4): the sort key is `(struct_hash, path, start_byte)`, NOT
+    // `(struct_hash, symbol_id)`. `symbol_id` is a rowid reassigned on every reindex, so a warm
+    // refinement (same content key → cached per_member_values frozen at the OLD member order) could
+    // be served against a `canonical_member_refs` recomputed in a DIFFERENT order — labelling one
+    // member's value with another's identity. `(path, start_byte)` uniquely identifies a member and
+    // is stable across a file-unchanged reindex, so the recomputed order always matches the cached
+    // value order. This MUST stay byte-for-byte identical to `load_refine_members`' sort key.
+    //
+    // Codex #4 (round-3): the identity carried per member is LOCATION-BEARING
+    // (`ref@path:start-end`), the SAME identity `class_key` uses — NOT the bare qualified
+    // `ref`. A class with DUPLICATE qualified refs (same-named methods/overloads in one file,
+    // cfg variants) would otherwise label its `per_member_values` with indistinguishable names,
+    // so a consumer (`clones --explain`, MCP output) could not map a value back to a UNIQUE
+    // member. Only the string identity each entry carries changed in round-3; round-4 changes
+    // only the SORT KEY.
+    let canonical_member_refs: Vec<String> = {
+        let mut ordered: Vec<(&str, &str, i64, String)> = raw_members
+            .iter()
+            .filter_map(|(id, start_byte, m)| {
+                by_id.get(id).map(|b| {
+                    (
+                        b.struct_hash.as_str(),
+                        m.path.as_str(),
+                        *start_byte,
+                        format!("{}@{}:{}-{}", m.r#ref, m.path, m.start_line, m.end_line),
+                    )
+                })
+            })
+            .collect();
+        ordered.sort_unstable_by(|a, b| {
+            canonical_member_order_key(a.0, a.1, a.2)
+                .cmp(&canonical_member_order_key(b.0, b.1, b.2))
+        });
+        ordered.into_iter().take(MEMBER_VALUE_CAP).map(|(_, _, _, r)| r).collect()
+    };
 
     // Cap the returned member list AFTER computing spread and key from the full set.
     // Fix 2 (#215): when a `pin` subject is supplied (clones_for_symbol) and that member exists but
@@ -1337,7 +1619,7 @@ pub(crate) fn build_class(
     let members_returned = raw_members.len().min(cap);
 
     let pinned_idx = pin.and_then(|subject_id| {
-        let pos = raw_members.iter().position(|(id, _)| *id == subject_id)?;
+        let pos = raw_members.iter().position(|(id, _, _)| *id == subject_id)?;
         // Only act when the pin would otherwise be dropped: it sits at or past `cap` in id order.
         (pos >= cap).then_some(pos)
     });
@@ -1346,11 +1628,11 @@ pub(crate) fn build_class(
         Some(pos) => {
             // First `cap - 1` by id, plus the pinned member → exactly `cap` members.
             let mut chosen: Vec<CloneMember> =
-                raw_members.iter().take(cap - 1).map(|(_, m)| m.clone()).collect();
-            chosen.push(raw_members[pos].1.clone());
+                raw_members.iter().take(cap - 1).map(|(_, _, m)| m.clone()).collect();
+            chosen.push(raw_members[pos].2.clone());
             chosen
         },
-        None => raw_members.into_iter().take(cap).map(|(_, m)| m).collect(),
+        None => raw_members.into_iter().take(cap).map(|(_, _, m)| m).collect(),
     };
     let mut members = chosen;
     members.sort_unstable_by(|a, b| a.r#ref.cmp(&b.r#ref));
@@ -1406,12 +1688,18 @@ pub(crate) fn build_class(
         roi,
         roi_factors,
         metrics_sampled,
+        medoid_symbol_id,
         // Refinement fields are None on an un-refined candidate class; the two-phase driver in
         // `find_clones` / `clones_for_symbol` populates them (and flips `refined`/`class_kind`).
         lcs_ratio: None,
         confidence: None,
         refactorability: None,
         refine_mode: None,
+        template: None,
+        variation_points: None,
+        proposed_signature: None,
+        anti_unify_coverage: None,
+        canonical_member_refs: Some(canonical_member_refs),
     }))
 }
 
@@ -1955,6 +2243,107 @@ mod tests {
         assert_ne!(key_span1, key_span2, "same ref/file at different spans must not collide");
     }
 
+    /// Codex #4 (#215 Plan 4b): `canonical_member_refs` carries LOCATION-BEARING identities
+    /// (`ref@path:start-end`), so a class with DUPLICATE qualified refs (same-named methods /
+    /// overloads at different spans in one file) labels each `per_member_values` slot with a UNIQUE
+    /// member identity. The bare-`ref` identity the old code used would emit two indistinguishable
+    /// labels. This pins the construction the inlined `build_class` builder performs: same `ref`,
+    /// different `path:start-end` → DISTINCT entries, while the ordinal order + cap are preserved.
+    #[test]
+    fn canonical_member_refs_are_location_bearing_for_duplicate_refs() {
+        // Two members with the SAME qualified `ref` but DIFFERENT spans — the duplicate-ref case
+        // (overloads / same-named methods). Mirror the build_class identity construction
+        // (`ref@path:start-end`) so the test pins the exact production shape.
+        let members: [(&str, &str, i64, i64); 2] =
+            [("mod::overload", "src/a.rs", 1, 5), ("mod::overload", "src/a.rs", 10, 14)];
+        let refs: Vec<String> =
+            members.iter().map(|(r, p, s, e)| format!("{r}@{p}:{s}-{e}")).collect();
+
+        // The two entries must be DISTINCT (location-bearing disambiguates the shared `ref`).
+        assert_ne!(
+            refs[0], refs[1],
+            "duplicate-ref members must get DISTINCT location-bearing identities, got {refs:?}"
+        );
+        assert!(
+            refs.iter().all(|r| r.starts_with("mod::overload@")),
+            "each identity must carry the qualified ref AND its location, got {refs:?}"
+        );
+        // The bare ref alone WOULD collide (the bug the location-bearing identity fixes).
+        let bare: Vec<&str> = members.iter().map(|(r, _, _, _)| *r).collect();
+        assert_eq!(bare[0], bare[1], "the bare refs collide — exactly what location-bearing fixes");
+        // The cap is unchanged: ≤ MEMBER_VALUE_CAP entries (here 2, well under the cap).
+        assert!(refs.len() <= super::MEMBER_VALUE_CAP, "the MEMBER_VALUE_CAP cap is preserved");
+    }
+
+    /// Fix 2 (#215 Plan 4b Codex round-4): the canonical member ordering is REINDEX-STABLE — keyed
+    /// on `(struct_hash, path, start_byte)`, NOT `(struct_hash, symbol_id)`. `symbol_id` is a rowid
+    /// reassigned on every reindex; the 4b cache is content-addressed, so a file-unchanged reindex
+    /// serves cached `per_member_values` frozen at the OLD member order while
+    /// `canonical_member_refs` is recomputed live. If the order keyed off `symbol_id`, two
+    /// members sharing a struct_hash could REORDER across the reindex → value[i] labelled by
+    /// the wrong member.
+    ///
+    /// This pins the SORT KEY directly (the single source of truth `canonical_member_order_key`,
+    /// used byte-for-byte by BOTH `load_refine_members` and `build_class`'s
+    /// `canonical_member_refs`): two equal-struct_hash members whose `symbol_id`s are SWAPPED
+    /// (the reindex simulation) must sort to the SAME order — so per_member_values[i] still
+    /// maps to canonical_member_refs[i].
+    #[test]
+    fn refine_member_order_is_reindex_stable() {
+        // Two equal-struct_hash members at distinct (path, start_byte) locations. Model each member
+        // as the (struct_hash, path, start_byte, symbol_id) the two sort sites carry.
+        let sh = "shared_struct_hash";
+        let member_a = (sh, "src/a.rs", 100i64); // location A
+        let member_b = (sh, "src/b.rs", 200i64); // location B
+
+        // The ordering key is independent of symbol_id, so the order from BOTH symbol_id
+        // assignments is identical. "Reindex" = swap which rowid each location got.
+        let order_for = |id_a: i64, id_b: i64| -> Vec<(&str, i64)> {
+            // (key-tuple, symbol_id, location-identity) — exactly the shape both call sites sort.
+            let mut rows = vec![
+                (member_a.0, member_a.1, member_a.2, id_a, (member_a.1, member_a.2)),
+                (member_b.0, member_b.1, member_b.2, id_b, (member_b.1, member_b.2)),
+            ];
+            // Sort by the SAME helper both production sites use — symbol_id is NOT part of the key.
+            rows.sort_unstable_by(|x, y| {
+                super::canonical_member_order_key(x.0, x.1, x.2)
+                    .cmp(&super::canonical_member_order_key(y.0, y.1, y.2))
+            });
+            rows.into_iter().map(|r| r.4).collect()
+        };
+
+        // First index: A=rowid 1, B=rowid 2. Reindex: rowids swapped (A=2, B=1).
+        let first = order_for(1, 2);
+        let after_reindex = order_for(2, 1);
+        assert_eq!(
+            first, after_reindex,
+            "swapping symbol_ids (reindex) must NOT change the member order — the key is \
+             (struct_hash, path, start_byte): {first:?} vs {after_reindex:?}"
+        );
+
+        // And the order is the location-derived one (path then start_byte), not the rowid order:
+        // src/a.rs:100 sorts before src/b.rs:200 regardless of which rowid each got.
+        assert_eq!(
+            first,
+            vec![("src/a.rs", 100i64), ("src/b.rs", 200i64)],
+            "the canonical order is (path, start_byte)-ascending, reindex-independent: {first:?}"
+        );
+
+        // Negative control: the OLD (struct_hash, symbol_id) key WOULD flip on the reindex (it is
+        // exactly the bug). With rowids 1,2 the symbol_id order is A,B; swapped to 2,1 it is B,A —
+        // proving the symbol_id key is unstable while the new key is not.
+        let by_symbol_id = |id_a: i64, id_b: i64| -> Vec<(&str, i64)> {
+            let mut rows = vec![(member_a.1, member_a.2, id_a), (member_b.1, member_b.2, id_b)];
+            rows.sort_unstable_by_key(|r| r.2); // (struct_hash equal) → symbol_id alone
+            rows.into_iter().map(|r| (r.0, r.1)).collect()
+        };
+        assert_ne!(
+            by_symbol_id(1, 2),
+            by_symbol_id(2, 1),
+            "the OLD symbol_id key is reindex-UNSTABLE — this is the bug Fix 2 removes"
+        );
+    }
+
     #[test]
     fn union_find_groups_transitively_and_drops_singletons() {
         // 1-2, 2-3 => {1,2,3}; 5-6 => {5,6}; 9 alone => dropped.
@@ -2010,6 +2399,91 @@ mod tests {
         assert!(
             sub_pairs.contains(&(1, 3)),
             "sub-block path must pair rust(1) with rust(3): {sub_pairs:?}"
+        );
+    }
+
+    // ── P2d: the refine-sampling flag fires at MEMBER_VALUE_CAP, not LCS_MEMBER_SAMPLE ───────────
+
+    /// Build a minimal refined-eligible `CandidateCloneClass` with the given `member_count` and
+    /// `metrics_sampled = false`, so `apply_refinement` is the only thing that can flip the flag.
+    fn class_with_member_count(member_count: usize) -> super::CandidateCloneClass {
+        super::CandidateCloneClass {
+            class_key: "k".to_string(),
+            class_kind: "candidate_component",
+            language: "rust".to_string(),
+            refined: false,
+            members: Vec::new(),
+            member_count,
+            members_returned: 0,
+            total_members: member_count,
+            similarity_min: 1.0,
+            similarity_medoid_min: 1.0,
+            containment_max: 1.0,
+            cohesion_min_pairwise: 1.0,
+            cross_module_spread: 1,
+            body_token_len_medoid: 10,
+            roi: 0.0,
+            roi_factors: super::RoiFactors {
+                member_count,
+                cross_module_spread: 1,
+                median_token_len: 10,
+                load_bearing_factor: 1.0,
+                cohesion_penalty: 1.0,
+            },
+            metrics_sampled: false,
+            medoid_symbol_id: None,
+            lcs_ratio: None,
+            confidence: None,
+            refactorability: None,
+            refine_mode: None,
+            template: None,
+            variation_points: None,
+            proposed_signature: None,
+            anti_unify_coverage: None,
+            canonical_member_refs: None,
+        }
+    }
+
+    /// A `CachedRefinement` whose `lcs_sampled` is FALSE — so the ONLY way `metrics_sampled` can
+    /// flip is the member-count guard in `apply_refinement`.
+    fn unsampled_refinement() -> crate::index::clones::refine::cache::CachedRefinement {
+        crate::index::clones::refine::cache::CachedRefinement {
+            lcs_ratio: 1.0,
+            confidence: crate::index::clones::refine::score::Confidence::High,
+            refactorability: 1.0,
+            refine_mode: "baseline",
+            template: String::new(),
+            variation_points_json: "[]".to_string(),
+            proposed_signature_json: "{}".to_string(),
+            anti_unify_coverage: 1.0,
+            lcs_sampled: false,
+        }
+    }
+
+    #[test]
+    fn refine_metrics_sampled_at_value_cap() {
+        use super::{MEMBER_VALUE_CAP, apply_refinement};
+
+        // A class with exactly MEMBER_VALUE_CAP members is NOT truncated by the loader → not
+        // sampled (with lcs_sampled false).
+        let mut at_cap = class_with_member_count(MEMBER_VALUE_CAP);
+        apply_refinement(&mut at_cap, unsampled_refinement());
+        assert!(
+            !at_cap.metrics_sampled,
+            "a class AT the value cap ({MEMBER_VALUE_CAP}) is not truncated → not sampled"
+        );
+
+        // The smallest class ABOVE the cap (51 with the current cap of 50) IS truncated by
+        // `load_refine_members` (drops ≥1 member) yet sits BELOW LCS_MEMBER_SAMPLE (64) — exactly
+        // the range the old `> LCS_MEMBER_SAMPLE` guard missed. That `MEMBER_VALUE_CAP <
+        // LCS_MEMBER_SAMPLE` relationship is pinned at compile time by the module-level `const _`
+        // next to the `MEMBER_VALUE_CAP` definition (now guarding production, not just this test).
+        let mut above_cap = class_with_member_count(MEMBER_VALUE_CAP + 1);
+        apply_refinement(&mut above_cap, unsampled_refinement());
+        assert!(
+            above_cap.metrics_sampled,
+            "a {}-member class is truncated to {MEMBER_VALUE_CAP} refine inputs → metrics_sampled",
+            MEMBER_VALUE_CAP + 1
         );
     }
 }
