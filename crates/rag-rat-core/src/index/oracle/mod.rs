@@ -556,14 +556,24 @@ pub(crate) fn any_run_in_scope(
     store::any_run_in_scope(conn, commit_sha, worktree_id)
 }
 
-/// Prune `oracle_runs` rows for dead `(commit_sha, worktree_id)` contexts — the gc companion to the
-/// `edge_oracle` FK cascade. See [`store::prune_oracle_runs_outside_scope`]. Returns rows deleted.
+/// Prune `oracle_runs` rows for dead `(commit_sha, worktree_id)` contexts — a gc companion that
+/// drops a dead checkout's run rows (nothing cascades `oracle_runs`, keyed by `(commit,
+/// worktree)`). See [`store::prune_oracle_runs_outside_scope`]. Returns rows deleted.
 pub fn prune_oracle_runs_outside_scope(
     conn: &Connection,
     live_commits: &[String],
     live_worktrees: &[String],
 ) -> anyhow::Result<u64> {
     store::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)
+}
+
+/// Sweep `edge_oracle` verdicts whose content key matches no live edge ANYWHERE — the gc
+/// replacement for the `edges_data` FK cascade dropped in #248 (correctness no longer depends on
+/// it; it is anti-growth hygiene). GLOBAL, not checkout-scoped, so a sweep never deletes a sibling
+/// worktree's live verdict. See [`store::prune_edge_oracle_without_live_edge`]. Returns rows
+/// deleted.
+pub fn prune_edge_oracle_without_live_edge(conn: &Connection) -> anyhow::Result<u64> {
+    store::prune_edge_oracle_without_live_edge(conn)
 }
 
 /// The `tool_version` the surfacing reads (the `Compiler` tier) should key on for `tool` in the

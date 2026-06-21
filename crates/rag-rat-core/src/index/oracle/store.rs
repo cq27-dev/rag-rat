@@ -1012,6 +1012,46 @@ pub(crate) fn prune_oracle_runs_outside_scope(
     Ok(u64::try_from(deleted).unwrap_or(0))
 }
 
+/// Prune `edge_oracle` verdicts whose CONTENT key matches ZERO live edges anywhere in the index —
+/// the gc replacement for the `edges_data` FK cascade dropped in #248. With no FK, a deleted edge
+/// no longer cascades its verdict away, so an incremental reindex (`remove_file_in_scope` DELETEs a
+/// changed file's edges every pass) leaves dangling verdict rows behind; this sweep is what stops
+/// them accumulating without bound.
+///
+/// GLOBAL by design (R6, #248): the match is against live edges across ALL scopes (no
+/// `active_checkout_file_predicate`), so a sweep run in one worktree never deletes a SIBLING
+/// worktree's still-live verdict. A verdict is swept iff NO live edge anywhere shares its content
+/// key (`source_path`, source/callee byte spans, `edge_kind` text) — matched by joining live
+/// `edges_data` to `files.path` + one `name_strings` for the `edge_kind` text, the same content key
+/// the read join uses. Returns the number of rows deleted.
+///
+/// CORRECTNESS DOES NOT DEPEND ON THIS SWEEP. The read path joins live `edges` by content key +
+/// `files.sha256 = file_sha`, so a dangling verdict simply produces no row and is never counted or
+/// surfaced — exactly the moniker model. This is anti-unbounded-growth hygiene, nothing more, so it
+/// is deliberately decoupled from sweep timing (the next `oracle run`'s authoritative clear also
+/// removes content-matching stale rows; this catches the rows that have no live edge at all).
+pub(crate) fn prune_edge_oracle_without_live_edge(conn: &Connection) -> anyhow::Result<u64> {
+    let deleted = conn.execute(
+        "
+        DELETE FROM edge_oracle
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM edges_data
+            JOIN files ON files.id = edges_data.source_file_id
+            JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
+            WHERE files.path = edge_oracle.source_path
+              AND edges_data.source_start_byte = edge_oracle.source_start_byte
+              AND edges_data.source_end_byte = edge_oracle.source_end_byte
+              AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
+              AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
+              AND ek.value = edge_oracle.edge_kind
+        )
+        ",
+        [],
+    )?;
+    Ok(u64::try_from(deleted).unwrap_or(0))
+}
+
 /// Render a slice of strings as a SQL `IN (...)` value list with single-quote escaping. Inputs are
 /// commit shas / worktree ids (hex / path-derived), never user free-text, but we escape `'` anyway
 /// so the list can't break the statement. An empty slice yields `''` (a value nothing matches),

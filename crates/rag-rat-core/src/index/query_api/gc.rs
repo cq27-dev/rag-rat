@@ -100,11 +100,18 @@ impl IndexDatabase {
         )?;
         self.delete_staged_files_cascade()?;
         conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
-        // `edge_oracle` verdicts cascade away with their edges via the FK ON DELETE CASCADE (fired
-        // by the cascade above, with `PRAGMA foreign_keys=ON`). `oracle_runs`, however, is keyed by
-        // `(commit_sha, worktree_id)` directly — nothing cascades it — so a dead checkout's run
-        // rows would survive the file pruning. Prune them with the SAME live sets, so a run and the
+        // Since #248 `edge_oracle` is content-keyed with NO `edges_data` FK (it survives reindex,
+        // the moniker model), so the file/edge prune above no longer cascades verdicts
+        // away. Dangling verdicts are harmless for correctness — every read joins live
+        // `edges` by content key, so a verdict whose edge is gone never resolves — but the
+        // per-file incremental reindex (`remove_file_in_scope`) DELETEs a changed file's
+        // edges every pass and would otherwise let those orphan rows grow without bound.
+        // Sweep them GLOBALLY here (rows with no live edge in ANY scope; a checkout-scoped
+        // sweep would wrongly delete a sibling worktree's live verdict). `oracle_runs` is
+        // keyed by `(commit_sha, worktree_id)` directly — nothing cascades it either — so
+        // prune a dead checkout's run rows with the SAME live sets, so a run and the
         // edges it produced are dropped together.
+        oracle::prune_edge_oracle_without_live_edge(conn)?;
         oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
         // Dictionary hygiene (#79, extended #224): drop `name_strings` values nothing references
         // any more. The pool has NO FKs by design (see the schema comment), so orphans

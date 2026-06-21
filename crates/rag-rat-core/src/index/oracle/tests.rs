@@ -3221,6 +3221,75 @@ fn prune_oracle_runs_drops_dead_contexts_only() {
     assert_eq!(remaining, 2);
 }
 
+/// gc (#248): `prune_edge_oracle_without_live_edge` is a GLOBAL sweep — it deletes a verdict whose
+/// content key matches NO live edge in ANY scope, but KEEPS one that matches a live edge anywhere
+/// (so a sibling worktree's still-live verdict is never swept by a sweep run in another checkout).
+/// This is the gc hygiene that replaces the dropped FK cascade; correctness never depended on it
+/// (dangling verdicts already never resolve via the live join — see
+/// `edge_oracle_survives_reindex_for_unchanged_file`), so this only guards unbounded growth.
+#[test]
+fn gc_prunes_edge_oracle_rows_with_no_live_edge() {
+    let h = Harness::new();
+
+    // (A) A verdict whose edge is LIVE in the active checkout — must be kept.
+    let live_file = h.add_file("live.rs", "fn caller() { target(); }\n");
+    let live_sha = h.file_sha("live.rs");
+    let live_edge = h.add_edge(live_file, "target", 14, 20, "Exact", None);
+    h.write_verdict(
+        live_edge,
+        &live_sha,
+        None,
+        "scip x `target`().",
+        OracleResolutionKind::Confirm,
+    );
+
+    // (B) A verdict whose edge lives in a SIBLING checkout (another commit). The global sweep does
+    // NOT apply the active-checkout predicate, so it must still see this edge as live and keep its
+    // verdict — a sweep in THIS checkout must never delete a sibling's live verdict.
+    let sibling_file = h.add_file_in_scope("sibling.rs", OTHER_COMMIT, OTHER_WORKTREE);
+    let sibling_sha = h.file_sha_for_commit("sibling.rs", OTHER_COMMIT);
+    let sibling_edge = h.add_edge(sibling_file, "thing", 14, 19, "Exact", None);
+    h.write_verdict(
+        sibling_edge,
+        &sibling_sha,
+        None,
+        "scip x `thing`().",
+        OracleResolutionKind::Confirm,
+    );
+
+    // (C) A DANGLING verdict — content key matches no live edge anywhere (the edge was deleted in a
+    // reindex, leaving the FK-less verdict behind). Build it by writing a verdict, then deleting
+    // its edge (simulating `remove_file_in_scope` dropping a changed file's edges).
+    let dangling_file = h.add_file("dangling.rs", "fn caller() { gone(); }\n");
+    let dangling_sha = h.file_sha("dangling.rs");
+    let dangling_edge = h.add_edge(dangling_file, "gone", 14, 18, "Exact", None);
+    h.write_verdict(
+        dangling_edge,
+        &dangling_sha,
+        None,
+        "scip x `gone`().",
+        OracleResolutionKind::Confirm,
+    );
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![dangling_edge]).unwrap();
+
+    let before: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, 3, "three verdicts before the sweep (live, sibling, dangling)");
+
+    let deleted = store::prune_edge_oracle_without_live_edge(&h.conn).unwrap();
+    assert_eq!(deleted, 1, "only the dangling verdict (no live edge anywhere) is swept");
+
+    let after: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(after, 2, "the live + sibling verdicts survive the global sweep");
+    // The two survivors still resolve to their live edges by content key.
+    assert!(h.verdict(live_edge).is_some(), "the active-checkout verdict is kept");
+    assert!(
+        h.verdict(sibling_edge).is_some(),
+        "the sibling-checkout verdict is kept (global sweep)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Moniker anchors (#70, phase 3): oracle-run moniker pass + memory relocation.
 // ---------------------------------------------------------------------------
