@@ -132,7 +132,9 @@ impl IndexDatabase {
         // connection borrow. NULL `token_bag` rows (un-reindexed after the V032 migration) and any
         // stale/corrupt blob (decode → None) contribute nothing, exactly as a missing postings row
         // would have.
-        let mut df: BTreeMap<(String, i64), i64> = BTreeMap::new();
+        // Outer key: normalizer_kind (cloned once per kind, not per (symbol, token) pair).
+        // Inner key: token_hash → df count.
+        let mut df: BTreeMap<String, BTreeMap<i64, i64>> = BTreeMap::new();
         {
             let conn = self.storage.connection();
             let mut stmt =
@@ -146,8 +148,9 @@ impl IndexDatabase {
                 let Some(bag) = clones::bag_blob::decode_token_bag(&blob) else {
                     continue;
                 };
+                let inner = df.entry(normalizer_kind).or_default();
                 for (token_hash, _freq) in bag {
-                    *df.entry((normalizer_kind.clone(), token_hash)).or_insert(0) += 1;
+                    *inner.entry(token_hash).or_insert(0) += 1;
                 }
             }
         }
@@ -155,11 +158,14 @@ impl IndexDatabase {
         // Phase 2 (write): replace the table contents with the recomputed df.
         let conn = self.storage.connection();
         conn.execute_batch("DELETE FROM clone_token_df;")?;
-        for ((normalizer_kind, token_hash), count) in df {
-            conn.prepare_cached(
-                "INSERT INTO clone_token_df(normalizer_kind, token_hash, df) VALUES (?1, ?2, ?3)",
-            )?
-            .execute(params![normalizer_kind, token_hash, count])?;
+        for (normalizer_kind, inner) in df {
+            for (token_hash, count) in inner {
+                conn.prepare_cached(
+                    "INSERT INTO clone_token_df(normalizer_kind, token_hash, df) VALUES (?1, ?2, \
+                     ?3)",
+                )?
+                .execute(params![normalizer_kind, token_hash, count])?;
+            }
         }
         Ok(())
     }

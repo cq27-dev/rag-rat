@@ -1924,7 +1924,8 @@ fn verified_clone(a: &SymbolBag, b: &SymbolBag, theta: f64) -> bool {
 /// Exact multiset overlap `Σ min(freq_a, freq_b)` over the two FULL token bags.
 ///
 /// Requires both bags' `tokens` slices to be sorted by `token_hash` ascending (guaranteed by
-/// [`load_scoped_baseline_bags`], which sorts once after collection). Uses an allocation-free
+/// the encoded token-bag BLOB, which is sorted at encode time by `tokens::token_bag` and
+/// asserted by the `debug_assert` in `bag_blob::encode_token_bag`). Uses an allocation-free
 /// two-pointer merge: no `BTreeMap` rebuild per call — O(|a| + |b|) time, zero heap allocation.
 fn overlap(a: &SymbolBag, b: &SymbolBag) -> i64 {
     let (mut ia, mut ib) = (0, 0);

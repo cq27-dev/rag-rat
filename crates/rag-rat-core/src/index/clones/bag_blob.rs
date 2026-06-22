@@ -25,6 +25,7 @@ const PAIR_LEN: usize = 16;
 /// order verbatim, so the decode is byte-lossless and the bag never needs re-sorting on read.
 pub(crate) fn encode_token_bag(bag: &[(i64, i64)]) -> Vec<u8> {
     let count = bag.len();
+    debug_assert!(count <= u32::MAX as usize, "token bag exceeds u32 count header");
     let mut buf = Vec::with_capacity(HEADER_LEN + count * PAIR_LEN);
     buf.extend_from_slice(&BAG_BLOB_VERSION.to_le_bytes());
     buf.extend_from_slice(&(count as u32).to_le_bytes());
