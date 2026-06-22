@@ -1737,11 +1737,22 @@ fn candidate_pairs(conn: &Connection) -> anyhow::Result<Vec<(i64, i64)>> {
 /// so only the ACTIVE version of each file participates (SCOPED-VIEW REQUIREMENT #89). df is read
 /// via LEFT JOIN + COALESCE so a missing-df token is never dropped (design rev-4 §2).
 fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>> {
-    // Scoped baseline fingerprints: struct_hash + token_len per in-scope symbol.
+    // Load `clone_token_df` ONCE into a map (#231 R3): the token bag now lives in an opaque
+    // `token_bag` BLOB, so df can no longer be a per-token SQL JOIN. Each decoded token's df is
+    // looked up here in Rust and COALESCEd to the fallback sentinel — a missing-df token must NOT
+    // be dropped (design rev-4 §2). Only the baseline normalizer feeds candidate recall.
+    let mut df_stmt = conn
+        .prepare("SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = 'baseline'")?;
+    let df_by_token: std::collections::HashMap<i64, i64> = df_stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+    // Scoped baseline fingerprints + their token-bag BLOB, in one read (no per-token join).
     // `files.generated = 0` excludes generated files (e.g. `src/generated/…`, `.d.ts`) from the
     // candidate read — they are fingerprinted on write but must not enter clone components.
+    // `token_len` comes from the COLUMN (R3); the bag itself is decoded from the BLOB.
     let mut fp_stmt = conn.prepare(
-        "SELECT sf.symbol_id, symbols.language, sf.struct_hash, sf.token_len
+        "SELECT sf.symbol_id, symbols.language, sf.struct_hash, sf.token_len, sf.token_bag
          FROM symbol_fingerprints sf
          JOIN symbols ON symbols.id = sf.symbol_id
          JOIN files ON files.id = symbols.file_id
@@ -1749,59 +1760,50 @@ fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>
            AND sf.normalizer_version = ?1
            AND files.generated = 0",
     )?;
-    let mut bags: BTreeMap<i64, SymbolBag> = fp_stmt
-        .query_map([NORM_VERSION], |row| {
-            let symbol_id: i64 = row.get(0)?;
-            Ok((symbol_id, SymbolBag {
-                symbol_id,
-                language: row.get(1)?,
-                struct_hash: row.get(2)?,
-                token_len: row.get(3)?,
-                tokens: Vec::new(),
-            }))
-        })?
-        .collect::<Result<_, _>>()?;
-
-    // Full token bag per scoped baseline symbol, with each token's df LEFT-JOINed + COALESCEd to
-    // the fallback sentinel (missing-df tokens must NOT be dropped — rev-4 §2).
-    // `files.generated = 0` mirrors the fingerprint load: only non-generated symbols get postings
-    // loaded, so their bags never enter the inverted index or the exact verify.
-    let mut tok_stmt = conn.prepare(
-        "SELECT stp.symbol_id, stp.token_hash, stp.freq, COALESCE(df.df, ?1)
-         FROM symbol_token_postings stp
-         JOIN symbols ON symbols.id = stp.symbol_id
-         JOIN files ON files.id = symbols.file_id
-         LEFT JOIN clone_token_df df
-           ON df.normalizer_kind = stp.normalizer_kind AND df.token_hash = stp.token_hash
-         WHERE stp.normalizer_kind = 'baseline'
-           AND files.generated = 0",
-    )?;
-    let rows = tok_stmt.query_map([DF_FALLBACK], |row| {
-        Ok((row.get::<_, i64>(0)?, TokenPosting {
-            token_hash: row.get(1)?,
-            freq: row.get(2)?,
-            coalesced_df: row.get(3)?,
-        }))
-    })?;
-    for row in rows {
-        let (symbol_id, posting) = row?;
-        // `bags` keyset is already `normalizer_version`-filtered by the fingerprint query above,
-        // so a stale-version symbol (absent from `bags`) has its postings silently dropped here.
-        if let Some(bag) = bags.get_mut(&symbol_id) {
-            bag.tokens.push(posting);
-        }
+    let mut bags: Vec<SymbolBag> = Vec::new();
+    let mut rows = fp_stmt.query([NORM_VERSION])?;
+    while let Some(row) = rows.next()? {
+        // R4: a NULL `token_bag` (un-reindexed after the V032 migration) is a NO-BAG row — SKIP it
+        // (not an empty bag, no panic). Byte-identical recall holds only for a FULLY (re)indexed
+        // DB; clone recall is undefined for NULL-bag symbols until the post-migration
+        // reindex.
+        let Some(blob) = row.get::<_, Option<Vec<u8>>>(4)? else {
+            continue;
+        };
+        let Some(bag_pairs) = crate::index::clones::bag_blob::decode_token_bag(&blob) else {
+            // A stale/corrupt blob (version mismatch / truncation) decodes to None — treat as
+            // no-bag, same as NULL. It is repopulated on the next reindex.
+            continue;
+        };
+        let tokens: Vec<TokenPosting> = bag_pairs
+            .into_iter()
+            .map(|(token_hash, freq)| TokenPosting {
+                token_hash,
+                freq,
+                coalesced_df: df_by_token.get(&token_hash).copied().unwrap_or(DF_FALLBACK),
+            })
+            .collect();
+        // The BLOB is stored token_hash-sorted (the producer's invariant), which is exactly the
+        // order `overlap`'s two-pointer merge and `sub_block_tokens` expect — so no re-sort is
+        // needed on read. Assert it in debug to catch a producer regression.
+        debug_assert!(
+            tokens.windows(2).all(|w| w[0].token_hash <= w[1].token_hash),
+            "decoded token_bag must be token_hash-sorted"
+        );
+        bags.push(SymbolBag {
+            symbol_id: row.get(0)?,
+            language: row.get(1)?,
+            struct_hash: row.get(2)?,
+            token_len: row.get(3)?,
+            tokens,
+        });
     }
 
-    // Sort each bag's token list by `token_hash` once, here, so `overlap` can use an
-    // allocation-free two-pointer merge instead of rebuilding a `BTreeMap` on every call.
-    // Consumers that care about order (sub_block_tokens, struct_hash, inverted-index build,
-    // token_len) are all order-independent — they sort by (df, hash) themselves or use a separate
-    // field — so this re-ordering is safe.
-    for bag in bags.values_mut() {
-        bag.tokens.sort_unstable_by_key(|t| t.token_hash);
-    }
-
-    Ok(bags.into_values().collect())
+    // Return bags in `symbol_id` order, matching the prior `BTreeMap<symbol_id, _>` keyset (the SQL
+    // has no ORDER BY). The candidate set is order-independent (it dedups into a BTreeSet), but a
+    // stable order keeps any incidental iteration deterministic.
+    bags.sort_unstable_by_key(|bag| bag.symbol_id);
+    Ok(bags)
 }
 
 /// Exact fast path: every group of symbols sharing a `struct_hash` AND `language` is
@@ -2485,5 +2487,149 @@ mod tests {
             "a {}-member class is truncated to {MEMBER_VALUE_CAP} refine inputs → metrics_sampled",
             MEMBER_VALUE_CAP + 1
         );
+    }
+
+    // ── T5a (#231): the LOAD-BEARING recall-parity pin ──────────────────────────────────────────
+
+    /// THE recall-correctness pin for the BLOB-pack (#231). Builds a real index, then proves the
+    /// BLOB read path produces SymbolBags BYTE-IDENTICAL to the pre-BLOB postings grouping — same
+    /// token lists, freqs, AND coalesced df — and that the resulting `candidate_pairs` are
+    /// unchanged. The "postings-era" expectation is reconstructed independently in the test from
+    /// the same BLOBs + df, replicating the old `GROUP BY symbol_token_postings` + per-token
+    /// `LEFT JOIN clone_token_df` + `COALESCE(df, DF_FALLBACK)` + sort-by-token_hash semantics. If
+    /// these diverge, recall has regressed.
+    #[test]
+    fn recall_candidates_identical_blob_vs_postings_grouping() {
+        use std::collections::HashMap;
+
+        use super::{DF_FALLBACK, candidate_pairs, load_scoped_baseline_bags};
+
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-recall-parity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // Two renamed-clone groups + one unrelated function, across files.
+        std::fs::write(
+            root.join("src/a.rs"),
+            "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\npub fn \
+             compute_totals(items: Vec<i64>) -> i64 { let mut s = 0; for it in items { s += it * \
+             2; } s + 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/b.rs"),
+            "pub fn load_order(store: Db) -> i32 { let o = store.get(20); validate(o); o + 1 \
+             }\npub fn tally_amounts(values: Vec<i64>) -> i64 { let mut t = 0; for v in values { \
+             t += v * 2; } t + 1 }\n",
+        )
+        .unwrap();
+        let config = crate::Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![crate::config::ResolvedTarget {
+                name: "rust".to_string(),
+                language: crate::language::Language::Rust,
+                directories: vec![std::path::PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: crate::config::TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        let conn = db.storage.connection();
+
+        // --- Independently reconstruct the postings-era SymbolBags from the BLOBs + df ---
+        // df map, exactly as the old per-token `LEFT JOIN clone_token_df` would have resolved.
+        let mut df_stmt = conn
+            .prepare("SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = 'baseline'")
+            .unwrap();
+        let df_by_token: HashMap<i64, i64> = df_stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // For each scoped baseline fingerprint (generated = 0, matching the production filter),
+        // decode its bag into the same `(symbol_id, language, struct_hash, token_len, [(hash, freq,
+        // coalesced_df)])` shape, with the per-token list sorted by token_hash.
+        let mut fp_stmt = conn
+            .prepare(
+                "SELECT sf.symbol_id, symbols.language, sf.struct_hash, sf.token_len, sf.token_bag
+                 FROM symbol_fingerprints sf
+                 JOIN symbols ON symbols.id = sf.symbol_id
+                 JOIN files ON files.id = symbols.file_id
+                 WHERE sf.normalizer_kind = 'baseline'
+                   AND sf.normalizer_version = ?1
+                   AND files.generated = 0",
+            )
+            .unwrap();
+        // (symbol_id, language, struct_hash, token_len, sorted [(token_hash, freq, df)])
+        type ExpectedBag = (i64, String, String, i64, Vec<(i64, i64, i64)>);
+        let mut expected: Vec<ExpectedBag> = fp_stmt
+            .query_map([super::NORM_VERSION], |r| {
+                let blob: Option<Vec<u8>> = r.get(4)?;
+                let pairs = blob
+                    .and_then(|b| crate::index::clones::bag_blob::decode_token_bag(&b))
+                    .unwrap_or_default();
+                let mut tokens: Vec<(i64, i64, i64)> = pairs
+                    .into_iter()
+                    .map(|(h, f)| (h, f, df_by_token.get(&h).copied().unwrap_or(DF_FALLBACK)))
+                    .collect();
+                tokens.sort_unstable_by_key(|&(h, _, _)| h);
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, tokens))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        expected.sort_unstable_by_key(|b| b.0);
+        assert!(expected.len() >= 4, "fixture indexed at least 4 fingerprinted functions");
+
+        // --- The production read path must produce byte-identical bags ---
+        let mut actual: Vec<ExpectedBag> = load_scoped_baseline_bags(conn)
+            .unwrap()
+            .into_iter()
+            .map(|bag| {
+                let tokens: Vec<(i64, i64, i64)> =
+                    bag.tokens.iter().map(|t| (t.token_hash, t.freq, t.coalesced_df)).collect();
+                (bag.symbol_id, bag.language, bag.struct_hash, bag.token_len, tokens)
+            })
+            .collect();
+        actual.sort_unstable_by_key(|b| b.0);
+        assert_eq!(
+            actual, expected,
+            "BLOB-decoded SymbolBags must equal the postings-era grouping (token lists, freqs, df)"
+        );
+
+        // --- And the candidate pairs are unchanged: the two renamed groups each pair up ---
+        let pairs = candidate_pairs(conn).unwrap();
+        let id_of = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT s.id FROM symbols s WHERE s.name = ?1 AND s.kind = 'function'",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (lu, lo) = (id_of("load_user"), id_of("load_order"));
+        let (ct, ta) = (id_of("compute_totals"), id_of("tally_amounts"));
+        let has = |a: i64, b: i64| pairs.contains(&(a.min(b), a.max(b)));
+        assert!(has(lu, lo), "load_user/load_order are renamed clones → a candidate pair");
+        assert!(has(ct, ta), "compute_totals/tally_amounts are renamed clones → a candidate pair");
+        assert!(
+            !has(lu, ct) && !has(lu, ta) && !has(lo, ct) && !has(lo, ta),
+            "the two clone GROUPS do not cross-pair"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
