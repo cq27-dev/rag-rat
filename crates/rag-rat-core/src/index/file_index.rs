@@ -264,13 +264,16 @@ impl IndexDatabase {
     /// full-rebuild prepare phase (#230) and the incremental `store_symbol_fingerprints` wrapper,
     /// so the per-row insert discipline lives in exactly one place.
     ///
+    /// The token bag is serialized into the `symbol_fingerprints.token_bag` BLOB column (#231),
+    /// one BLOB per symbol — there is no longer a `symbol_token_postings` row-per-token write.
+    ///
     /// `bump_df` gates the per-token `clone_token_df` upsert. On the full-rebuild path it is
     /// `BumpDf(false)`: `refresh_clone_token_df` (rebuild.rs) recomputes df exactly from the
-    /// postings at finalize, so bumping it per token here is recomputed-and-discarded work plus
-    /// hot-row B-tree contention on common tokens. On the incremental/heal paths it is
+    /// token-bag BLOBs at finalize, so bumping it per token here is recomputed-and-discarded work
+    /// plus hot-row B-tree contention on common tokens. On the incremental/heal paths it is
     /// `BumpDf(true)` — no finalize runs there, so the drift-tolerated bump is how df stays current
-    /// (df is a selectivity hint only; the candidate read LEFT-JOINs + COALESCEs it, so drift never
-    /// changes a result — see query_api/clones.rs).
+    /// (df is a selectivity hint only; the candidate read COALESCEs it, so drift never changes a
+    /// result — see query_api/clones.rs).
     fn write_symbol_fingerprints(
         &self,
         symbol_db_ids: &[i64],
@@ -281,10 +284,15 @@ impl IndexDatabase {
         let normalizer_kind = clones::NormalizerKind::Baseline.as_db_str();
         for (local_index, fp) in fingerprints {
             let symbol_id = symbol_db_ids[*local_index];
+            // The token bag rides the fingerprint row as ONE serialized BLOB (#231), replacing the
+            // ~N-rows-per-symbol symbol_token_postings INSERTs (the dominant full-rebuild write
+            // cost). `fp.token_bag` is already token_hash-sorted with no duplicate hashes, so the
+            // BLOB is deterministic and the candidate read decodes it without re-sorting.
+            let token_bag_blob = clones::bag_blob::encode_token_bag(&fp.token_bag);
             conn.prepare_cached(
                 "INSERT INTO symbol_fingerprints(symbol_id, normalizer_kind, normalizer_version, \
-                 oracle_run_id, struct_hash, token_len, created_at_ms)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+                 oracle_run_id, struct_hash, token_len, token_bag, created_at_ms)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
             )?
             .execute(params![
                 symbol_id,
@@ -292,22 +300,16 @@ impl IndexDatabase {
                 clones::NORM_VERSION,
                 fp.struct_hash,
                 fp.token_len,
+                token_bag_blob,
                 now_ms(),
             ])?;
-            // Write the inverted index: one posting row per distinct token (#215). The global
-            // document frequency for the token is bumped here ONLY when `bump_df`
-            // (incremental/heal): df is a selectivity hint only (the candidate read
-            // LEFT-JOINs + COALESCEs it), so the bump is drift-tolerated. A full
-            // rebuild skips the bump and instead recomputes df authoritatively from the
-            // postings at finalize (refresh_clone_token_df, rebuild.rs).
-            for &(token_hash, freq) in &fp.token_bag {
-                conn.prepare_cached(
-                    "INSERT INTO symbol_token_postings(symbol_id, normalizer_kind, token_hash, \
-                     freq)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )?
-                .execute(params![symbol_id, normalizer_kind, token_hash, freq])?;
-                if bump_df.0 {
+            // Bump the global document frequency per distinct token ONLY when `bump_df`
+            // (incremental/heal): df is a selectivity hint only (the candidate read COALESCEs it),
+            // so the bump is drift-tolerated. A full rebuild skips the bump and instead recomputes
+            // df authoritatively from the token-bag BLOBs at finalize (refresh_clone_token_df,
+            // rebuild.rs). R7: iterate the IN-MEMORY `fp.token_bag` here — no decode round-trip.
+            if bump_df.0 {
+                for &(token_hash, _freq) in &fp.token_bag {
                     conn.prepare_cached(
                         "INSERT INTO clone_token_df(normalizer_kind, token_hash, df)
                          VALUES (?1, ?2, 1)

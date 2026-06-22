@@ -12676,21 +12676,44 @@ fn indexing_writes_baseline_fingerprints_for_functions() {
         .unwrap();
     assert_eq!(fps, 2, "the two functions are fingerprinted; tiny() is below MIN_TOKENS");
 
-    // The inverted index carries postings for exactly the two fingerprinted symbols (R3).
-    let posting_symbols: i64 = conn
+    // The token bag rides each fingerprint row as a non-NULL `token_bag` BLOB (#231) — there is no
+    // symbol_token_postings table any more. Both fingerprinted symbols carry a bag that decodes to
+    // a non-empty `(token_hash, freq)` multiset matching their `token_len`.
+    let bagged_symbols: i64 = conn
         .query_row(
-            "SELECT count(DISTINCT symbol_id) FROM symbol_token_postings WHERE \
-             normalizer_kind='baseline'",
+            "SELECT count(*) FROM symbol_fingerprints
+             WHERE normalizer_kind='baseline' AND token_bag IS NOT NULL",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(
-        posting_symbols, 2,
-        "both fingerprinted functions get postings rows; tiny() does not"
-    );
+    assert_eq!(bagged_symbols, 2, "both fingerprinted functions carry a non-NULL token_bag BLOB");
 
-    // df is populated from the postings.
+    // Decode each BLOB and confirm it is a real bag (lossless: token_len == sum of freqs, no
+    // duplicate token_hash — the codec invariants exercised against indexed data).
+    let mut stmt = conn
+        .prepare(
+            "SELECT token_len, token_bag FROM symbol_fingerprints
+             WHERE normalizer_kind='baseline'",
+        )
+        .unwrap();
+    let rows: Vec<(i64, Vec<u8>)> = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    for (token_len, blob) in &rows {
+        let bag = crate::index::clones::bag_blob::decode_token_bag(blob).expect("BLOB decodes");
+        assert!(!bag.is_empty(), "a fingerprinted symbol has a non-empty bag");
+        let total_freq: i64 = bag.iter().map(|&(_, f)| f).sum();
+        assert_eq!(total_freq, *token_len, "token_len == sum of freqs (lossless bag)");
+        let mut hashes: Vec<i64> = bag.iter().map(|&(h, _)| h).collect();
+        let distinct = hashes.len();
+        hashes.dedup();
+        assert_eq!(hashes.len(), distinct, "no duplicate token_hash in the indexed bag");
+    }
+
+    // df is populated (recomputed from the BLOBs at finalize).
     let df_rows: i64 =
         conn.query_row("SELECT count(*) FROM clone_token_df", [], |r| r.get(0)).unwrap();
     assert!(df_rows > 0, "clone_token_df is populated during indexing");
@@ -12705,14 +12728,11 @@ fn indexing_writes_baseline_fingerprints_for_functions() {
         .unwrap();
     assert!(max_df >= 2, "a token shared by both clones has df >= 2, got {max_df}");
 
-    // Cascade: deleting a symbol drops its fingerprint AND postings rows (FK + reindex freshness).
+    // Cascade: deleting a symbol drops its fingerprint row (the bag rides it as the BLOB column).
     conn.execute("DELETE FROM symbols", []).unwrap();
     let after_fps: i64 =
         conn.query_row("SELECT count(*) FROM symbol_fingerprints", [], |r| r.get(0)).unwrap();
-    assert_eq!(after_fps, 0, "fingerprints cascade on symbol delete");
-    let after_postings: i64 =
-        conn.query_row("SELECT count(*) FROM symbol_token_postings", [], |r| r.get(0)).unwrap();
-    assert_eq!(after_postings, 0, "postings cascade on symbol delete");
+    assert_eq!(after_fps, 0, "fingerprints (and their token_bag BLOBs) cascade on symbol delete");
 
     let _ = fs::remove_dir_all(root);
 }

@@ -274,12 +274,10 @@ impl IndexDatabase {
                 FROM main.symbols
                 JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
             );
-            DELETE FROM main.symbol_token_postings
-            WHERE symbol_id IN (
-                SELECT symbols.id
-                FROM main.symbols
-                JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
-            );
+            -- The token bag rides the symbol_fingerprints row deleted above as the `token_bag`
+            -- BLOB column (#231); symbol_token_postings was dropped in V032, so there is no
+            -- separate per-token table to cascade here (R1: a DELETE on it would error
+            -- `no such table` on every reindex).
             DELETE FROM main.symbols
             WHERE file_id IN (SELECT id FROM temp.staged_file_ids);
             DELETE FROM main.chunks
