@@ -6,6 +6,7 @@
 // They are dead until Plan 3 lands; the rest of the module is live (R4's candidate read uses it).
 #![allow(dead_code)]
 
+pub(crate) mod bag_blob;
 pub(crate) mod normalize;
 pub(crate) mod refine;
 pub(crate) mod tokens;
@@ -59,7 +60,8 @@ impl NormalizerKind {
 pub(crate) struct SymbolFingerprint {
     pub struct_hash: String,
     pub token_len: i64,
-    /// `(token_hash, freq)` multiset sorted by `token_hash`. Stored in `symbol_token_postings`.
+    /// `(token_hash, freq)` multiset sorted by `token_hash`. Serialized into the
+    /// `symbol_fingerprints.token_bag` BLOB column (#231; `bag_blob::encode_token_bag`).
     pub token_bag: Vec<(i64, i64)>,
 }
 
