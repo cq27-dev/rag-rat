@@ -12737,6 +12737,66 @@ fn indexing_writes_baseline_fingerprints_for_functions() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// T4 (#231): `refresh_clone_token_df` recomputed from the token-bag BLOBs equals the postings-era
+/// `GROUP BY symbol_token_postings` semantics — df = the count of DISTINCT symbols whose decoded
+/// bag contains each `(normalizer_kind, token_hash)`, with NO generated-file filter (R6). Build a
+/// real index, then independently re-derive the expected df from the BLOBs and assert it equals the
+/// persisted `clone_token_df` row-for-row.
+#[test]
+fn clone_token_df_recomputed_from_blobs_matches_postings_era() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two renamed clones (shared tokens → some df == 2) + one distinct function (its tokens → df
+    // 1).
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\npub fn \
+         load_order(store: Db) -> i32 { let o = store.get(20); validate(o); o + 1 }\npub fn \
+         compute_totals(items: Vec<i64>) -> i64 { let mut s = 0; for it in items { s += it * 2; } \
+         s + 1 }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // Independently re-derive df from EVERY fingerprint BLOB (no generated filter — R6).
+    let mut stmt =
+        conn.prepare("SELECT normalizer_kind, token_bag FROM symbol_fingerprints").unwrap();
+    let mut expected: std::collections::BTreeMap<(String, i64), i64> =
+        std::collections::BTreeMap::new();
+    let mut rows = stmt.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let kind: String = row.get(0).unwrap();
+        let Some(blob) = row.get::<_, Option<Vec<u8>>>(1).unwrap() else {
+            continue;
+        };
+        let bag = crate::index::clones::bag_blob::decode_token_bag(&blob).expect("decodes");
+        for (token_hash, _freq) in bag {
+            *expected.entry((kind.clone(), token_hash)).or_insert(0) += 1;
+        }
+    }
+    assert!(!expected.is_empty(), "fixture produced fingerprints");
+
+    // The persisted clone_token_df must match the independent recompute exactly.
+    let mut df_stmt =
+        conn.prepare("SELECT normalizer_kind, token_hash, df FROM clone_token_df").unwrap();
+    let mut persisted: std::collections::BTreeMap<(String, i64), i64> =
+        std::collections::BTreeMap::new();
+    let mut df_rows = df_stmt.query([]).unwrap();
+    while let Some(row) = df_rows.next().unwrap() {
+        persisted.insert((row.get(0).unwrap(), row.get(1).unwrap()), row.get(2).unwrap());
+    }
+    assert_eq!(persisted, expected, "clone_token_df == distinct-symbol count per token from BLOBs");
+    assert!(
+        expected.values().any(|&d| d == 2),
+        "the two renamed clones share at least one token (df == 2)"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn candidate_components_group_renamed_clones_and_exclude_unrelated() {
     let root = unique_temp_root();

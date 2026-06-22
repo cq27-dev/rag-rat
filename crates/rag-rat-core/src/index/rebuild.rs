@@ -88,12 +88,11 @@ impl IndexDatabase {
             // needs the bulk 'rebuild' here (#77 Phase 2).
             db.finalize_full_rebuild_fts()?;
             mem_trace("after finalize_full_rebuild_fts");
-            // Recompute clone token document-frequency authoritatively from the postings just
-            // written (#215). The per-symbol incremental bump in store_symbol_fingerprints drifts
-            // over edits; a full rebuild owns the whole checkout, so derive df exactly here. df is
-            // a selectivity hint only (candidate read LEFT-JOINs + COALESCEs it), never
-            // a correctness input — but keeping it exact maximizes the rare-first
-            // sub-block prune.
+            // Recompute clone token document-frequency authoritatively from the token-bag BLOBs
+            // just written (#231). The per-symbol incremental bump in store_symbol_fingerprints
+            // drifts over edits; a full rebuild owns the whole checkout, so derive df exactly here.
+            // df is a selectivity hint only (candidate read COALESCEs it), never a correctness
+            // input — but keeping it exact maximizes the rare-first sub-block prune.
             db.refresh_clone_token_df()?;
             mem_trace("after refresh_clone_token_df");
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
@@ -115,18 +114,53 @@ impl IndexDatabase {
         Ok(db)
     }
 
-    /// Recompute `clone_token_df` exactly from `symbol_token_postings` (#215). One GROUP BY over
-    /// the postings replaces the drift-prone incremental bumps with the authoritative document
-    /// frequency (count of distinct symbols containing each token per normalizer). Runs inside
-    /// the rebuild transaction so the df and the postings it summarizes commit atomically.
+    /// Recompute `clone_token_df` exactly from the `symbol_fingerprints.token_bag` BLOBs (#231).
+    /// A Rust aggregate over the decoded bags replaces the former `GROUP BY symbol_token_postings`
+    /// (that table is dropped in V032) with the same authoritative document frequency: the count of
+    /// distinct symbols whose bag contains each token, per `(normalizer_kind, token_hash)`. Runs
+    /// inside the rebuild transaction so the df and the fingerprints it summarizes commit
+    /// atomically.
+    ///
+    /// R6 — SCOPE PARITY: this must match the old GROUP BY EXACTLY. That query had NO
+    /// `files.generated` filter, so it counted generated-file symbols too; this aggregate likewise
+    /// reads EVERY `symbol_fingerprints` row (generated included). df feeds candidate GENERATION
+    /// (the `sub_block_tokens` ordering), not just ranking, so a scope mismatch would change
+    /// recall. Each symbol's decoded bag has no duplicate `token_hash` (the codec invariant),
+    /// so counting one increment per (symbol, token) pair equals `COUNT(DISTINCT symbol_id)`.
     fn refresh_clone_token_df(&self) -> anyhow::Result<()> {
-        self.storage.execute_batch(
-            "DELETE FROM clone_token_df;
-             INSERT INTO clone_token_df(normalizer_kind, token_hash, df)
-               SELECT normalizer_kind, token_hash, COUNT(DISTINCT symbol_id)
-               FROM symbol_token_postings
-               GROUP BY normalizer_kind, token_hash;",
-        )?;
+        // Phase 1 (read): decode every fingerprint's bag and accumulate df in memory, off the
+        // connection borrow. NULL `token_bag` rows (un-reindexed after the V032 migration) and any
+        // stale/corrupt blob (decode → None) contribute nothing, exactly as a missing postings row
+        // would have.
+        let mut df: BTreeMap<(String, i64), i64> = BTreeMap::new();
+        {
+            let conn = self.storage.connection();
+            let mut stmt =
+                conn.prepare("SELECT normalizer_kind, token_bag FROM symbol_fingerprints")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let normalizer_kind: String = row.get(0)?;
+                let Some(blob) = row.get::<_, Option<Vec<u8>>>(1)? else {
+                    continue;
+                };
+                let Some(bag) = clones::bag_blob::decode_token_bag(&blob) else {
+                    continue;
+                };
+                for (token_hash, _freq) in bag {
+                    *df.entry((normalizer_kind.clone(), token_hash)).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Phase 2 (write): replace the table contents with the recomputed df.
+        let conn = self.storage.connection();
+        conn.execute_batch("DELETE FROM clone_token_df;")?;
+        for ((normalizer_kind, token_hash), count) in df {
+            conn.prepare_cached(
+                "INSERT INTO clone_token_df(normalizer_kind, token_hash, df) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![normalizer_kind, token_hash, count])?;
+        }
         Ok(())
     }
 
