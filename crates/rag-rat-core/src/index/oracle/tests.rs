@@ -874,7 +874,7 @@ fn migration_creates_oracle_side_tables() {
     }
     assert!(!columns.contains(&"edge_id".to_string()), "edge_id column was dropped");
 
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 31);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 32);
 }
 
 /// The V019 moniker migration: the `logical_symbol_monikers` table (STRICT, NO foreign key — see

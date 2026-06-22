@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 31;
+pub const LATEST_SCHEMA_VERSION: u32 = 32;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -202,6 +202,11 @@ const MIGRATION_031_ID: &str = "031_edge_oracle_content_anchor";
 const MIGRATION_031_CHECKSUM: &str = "sha256:rag-rat-edge-oracle-content-anchor-v31";
 const MIGRATION_031_DESCRIPTION: &str = "Rebuild edge_oracle content-anchored (drop edges_data FK \
                                          + edge_id PK) so verdicts survive reindex (#248)";
+const MIGRATION_032_ID: &str = "032_clone_token_bag_blob";
+const MIGRATION_032_CHECKSUM: &str = "sha256:rag-rat-clone-token-bag-blob-v32";
+const MIGRATION_032_DESCRIPTION: &str = "Add symbol_fingerprints.token_bag BLOB + drop \
+                                         symbol_token_postings (BLOB-pack the clone token bag) \
+                                         (#231)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -487,6 +492,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_031_CHECKSUM,
         description: MIGRATION_031_DESCRIPTION,
         apply: apply_edge_oracle_content_anchor,
+    },
+    Migration {
+        id: MIGRATION_032_ID,
+        checksum: MIGRATION_032_CHECKSUM,
+        description: MIGRATION_032_DESCRIPTION,
+        apply: apply_token_bag_blob,
     },
 ];
 

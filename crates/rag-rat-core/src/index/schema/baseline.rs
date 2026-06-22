@@ -601,6 +601,13 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_graph_file_lookup_indexes(conn)?;
     interned_qualified_name_indexes(conn)?;
     apply_clone_fingerprint_tables(conn)?;
+    // V032 (#231): converge the clone substrate to its BLOB-packed shape. The line above
+    // (re)creates `symbol_token_postings` from V029's DDL; this transform adds the
+    // `symbol_fingerprints.token_bag` column and DROPs the postings table — so the baseline
+    // produces the CURRENT schema directly, and a routine `migrate_forward` (which re-runs the
+    // baseline) cannot leave the postings table behind it. R5: V029's DDL is not edited; the
+    // convergence lives here, not in the checksummed migration body.
+    apply_token_bag_blob(conn)?;
     Ok(())
 }
 

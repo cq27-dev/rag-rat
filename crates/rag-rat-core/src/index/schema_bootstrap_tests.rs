@@ -10497,12 +10497,12 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.storage
             .connection()
-            .execute("DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor'", [])
+            .execute("DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob'", [])
             .unwrap();
         assert_eq!(
             schema::status(db.storage.connection()).unwrap().state,
             schema::SchemaState::Older,
-            "removing the newest (V031) ledger row makes the schema Older"
+            "removing the newest (V032) ledger row makes the schema Older"
         );
     }
 
@@ -10527,7 +10527,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 31);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 32);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10604,6 +10604,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
+        DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
         ",
     )
     .unwrap();
@@ -10749,13 +10750,14 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
         "DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
          DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
          DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
-         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';",
+         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
+         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';",
     )
     .unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "removing the V028..V031 ledger rows makes the pre-V028 shape Older"
+        "removing the V028..V032 ledger rows makes the pre-V028 shape Older"
     );
 
     // --- Forward-migrate ---
@@ -12218,14 +12220,14 @@ fn impact_completeness_flags_a_dirty_callee_definition_file() {
 }
 
 #[test]
-fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
-    // Fresh DB: apply() must create the SourcererCC postings tables + refinements, and report
-    // Compatible at the latest version. fingerprint_bands must NOT exist (dropped in R1 rework).
+fn clone_substrate_has_token_bag_blob_and_no_postings_on_fresh_and_migrated_dbs() {
+    // V032 (#231) BLOB-packs the token bag: `symbol_token_postings` is dropped and a `token_bag`
+    // BLOB column rides `symbol_fingerprints`. V029 still CREATEs the postings table; V032 drops it
+    // (R5 — V029 is never edited), so after apply()/migrate_forward the postings table must be GONE
+    // and the column present. The other clone tables (refinements, df) survive.
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     crate::index::schema::apply(&conn).expect("apply");
-    for table in
-        ["symbol_fingerprints", "symbol_token_postings", "clone_token_df", "clone_refinements"]
-    {
+    for table in ["symbol_fingerprints", "clone_token_df", "clone_refinements"] {
         let n: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -12235,21 +12237,27 @@ fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
             .expect("query");
         assert_eq!(n, 1, "{table} should exist after apply()");
     }
-    // fingerprint_bands was replaced by symbol_token_postings + clone_token_df in R1.
-    let bands: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fingerprint_bands'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("query bands");
-    assert_eq!(bands, 0, "fingerprint_bands must not exist after R1 rework");
+    // symbol_token_postings is dropped by V032; fingerprint_bands was already gone (R1 rework).
+    for absent in ["symbol_token_postings", "fingerprint_bands"] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [absent],
+                |r| r.get(0),
+            )
+            .expect("query absent");
+        assert_eq!(n, 0, "{absent} must not exist after V032");
+    }
+    assert!(
+        conn_table_columns(&conn, "symbol_fingerprints").contains(&"token_bag".to_string()),
+        "symbol_fingerprints gains the token_bag BLOB column on a fresh apply()"
+    );
 
     let status = crate::index::schema::status(&conn).expect("status");
     assert_eq!(status.current_version, crate::index::schema::LATEST_SCHEMA_VERSION);
     assert!(matches!(status.state, crate::index::schema::SchemaState::Compatible));
 
-    // Migrated DB: a DB at the prior baseline that runs migrate_forward gains the new tables too.
+    // Migrated DB: a DB driven through migrate_forward reaches the same post-V032 shape.
     let conn2 = rusqlite::Connection::open_in_memory().expect("open2");
     crate::index::schema::apply(&conn2).expect("apply2"); // already-latest is a no-op forward
     crate::index::schema::migrate_forward(&conn2).expect("migrate_forward");
@@ -12261,7 +12269,11 @@ fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
             |r| r.get(0),
         )
         .expect("query2");
-    assert_eq!(postings, 1, "symbol_token_postings must exist after migrate_forward");
+    assert_eq!(postings, 0, "symbol_token_postings must be gone after migrate_forward");
+    assert!(
+        conn_table_columns(&conn2, "symbol_fingerprints").contains(&"token_bag".to_string()),
+        "symbol_fingerprints carries token_bag after migrate_forward"
+    );
     let df: i64 = conn2
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='clone_token_df'",
@@ -12270,6 +12282,64 @@ fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
         )
         .expect("query3");
     assert_eq!(df, 1, "clone_token_df must exist after migrate_forward");
+}
+
+/// V032 forward migrate (#231): an index recorded at V031 (postings table present, NO `token_bag`
+/// column) must, after migrate_forward, gain the `token_bag` BLOB column and lose
+/// `symbol_token_postings`. Simulates the pre-V032 shape by re-creating the postings table +
+/// dropping the column + deleting the V032 ledger row (making the schema Older), then replays.
+#[test]
+fn migration_032_adds_token_bag_drops_postings() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply");
+
+    // --- Simulate a V031-era index: postings table present, no token_bag column ---
+    conn.execute_batch(
+        "ALTER TABLE symbol_fingerprints DROP COLUMN token_bag;
+         CREATE TABLE IF NOT EXISTS symbol_token_postings(
+             symbol_id       INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+             normalizer_kind TEXT    NOT NULL,
+             token_hash      INTEGER NOT NULL,
+             freq            INTEGER NOT NULL,
+             PRIMARY KEY (symbol_id, normalizer_kind, token_hash)
+         ) STRICT;
+         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';",
+    )
+    .expect("revert to V031 shape");
+    assert!(
+        !conn_table_columns(&conn, "symbol_fingerprints").contains(&"token_bag".to_string()),
+        "token_bag is absent before the migration runs"
+    );
+    assert!(conn_table_exists(&conn, "symbol_token_postings"), "postings present at V031");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Older,
+        "schema is Older after removing the V032 ledger row"
+    );
+
+    // --- Run the forward migration ---
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+
+    assert!(
+        conn_table_columns(&conn, "symbol_fingerprints").contains(&"token_bag".to_string()),
+        "V032 adds the token_bag BLOB column"
+    );
+    assert!(!conn_table_exists(&conn, "symbol_token_postings"), "V032 drops symbol_token_postings");
+    // The column is a queryable BLOB.
+    let _: i64 = conn
+        .query_row("SELECT COUNT(token_bag) FROM symbol_fingerprints", [], |r| r.get(0))
+        .expect("SELECT token_bag must succeed after V032");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().current_version,
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST_SCHEMA_VERSION after V032"
+    );
+    // Idempotency: a second migrate_forward is a clean no-op (guarded on the token_bag column).
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
+    assert!(matches!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Compatible
+    ));
 }
 
 /// Regression test for the P1 schema bug (#215 Plan 4a): an index recorded at V029 WITHOUT
@@ -12306,7 +12376,8 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     // `known_version` would still report LATEST and the schema would read Compatible.
     conn.execute_batch(
         "DELETE FROM schema_version
-         WHERE id IN ('030_clone_refinements_lcs_sampled', '031_edge_oracle_content_anchor');",
+         WHERE id IN ('030_clone_refinements_lcs_sampled', '031_edge_oracle_content_anchor',
+                      '032_clone_token_bag_blob');",
     )
     .expect("delete V030+ ledger rows");
     assert_eq!(
@@ -12339,8 +12410,8 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     );
     assert_eq!(
         crate::index::schema::LATEST_SCHEMA_VERSION,
-        31,
-        "LATEST_SCHEMA_VERSION is 31 after V031"
+        32,
+        "LATEST_SCHEMA_VERSION is 32 after V032"
     );
     // Idempotency: running migrate_forward again must not error.
     crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");

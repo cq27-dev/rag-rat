@@ -1166,6 +1166,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_029_ID => Some(29),
             MIGRATION_030_ID => Some(30),
             MIGRATION_031_ID => Some(31),
+            MIGRATION_032_ID => Some(32),
             _ => None,
         })
         .max()
@@ -1206,6 +1207,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_029_ID
             | MIGRATION_030_ID
             | MIGRATION_031_ID
+            | MIGRATION_032_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1243,6 +1245,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_029_ID => migration.checksum != MIGRATION_029_CHECKSUM,
         MIGRATION_030_ID => migration.checksum != MIGRATION_030_CHECKSUM,
         MIGRATION_031_ID => migration.checksum != MIGRATION_031_CHECKSUM,
+        MIGRATION_032_ID => migration.checksum != MIGRATION_032_CHECKSUM,
         _ => false,
     }
 }
@@ -1492,6 +1495,40 @@ pub(crate) fn apply_edge_oracle_content_anchor(conn: &Connection) -> rusqlite::R
         return result;
     }
     conn.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?;
+    Ok(())
+}
+
+/// V032 (#231): BLOB-pack the clone token bag. Add `symbol_fingerprints.token_bag BLOB` and DROP
+/// `symbol_token_postings` — collapsing the ~490k single-row postings INSERTs of a full rebuild
+/// into ONE serialized `(token_hash, freq)` BLOB per fingerprint row
+/// (`bag_blob::encode_token_bag`). The candidate read decodes the BLOB back into the same
+/// `(token_hash, freq)` multiset, so recall is byte-identical on a fully (re)indexed DB;
+/// `clone_token_df` is recomputed by aggregating the BLOBs.
+///
+/// SHAPE (R5): follows the V031 idempotency-guarded-transform pattern — V029's
+/// `CLONE_FINGERPRINT_DDL` (which still CREATEs both tables) is NEVER edited. On a FRESH DB, V029
+/// creates `symbol_token_postings` and this migration drops it; on an EXISTING DB it does the same.
+/// Guard on the `token_bag` column so a re-run (or a fresh DB already transformed) is a clean
+/// no-op.
+///
+/// NO BACK-FILL (R8): existing fingerprint rows get `token_bag = NULL` on `ADD COLUMN`. The
+/// candidate read SKIPs NULL-bag rows, so clone recall is undefined for those symbols until the
+/// post-migration reindex repopulates them — the same one-time-loss posture as V029/V031 (clone
+/// data is rebuildable; no parse-the-whole-repo work belongs in a migration).
+pub(crate) fn apply_token_bag_blob(conn: &Connection) -> rusqlite::Result<()> {
+    // Both operations are individually idempotent — NO early-return guard. A short-circuit on the
+    // column's presence would be a bug here: `apply` runs this transform from BOTH the baseline
+    // (apply_baseline) AND the V032 migration step, and V029's `CREATE TABLE IF NOT EXISTS
+    // symbol_token_postings` runs BETWEEN them (the migration replay re-creates the table the
+    // baseline already dropped). An early return keyed on the now-present `token_bag` column would
+    // skip the DROP and leave that re-created postings table behind. Running both ops
+    // unconditionally (each a no-op when already in the target state) converges regardless of
+    // call order.
+    //
+    // Additive column — STRICT-valid BLOB type; existing rows default to NULL (R8).
+    add_column_if_missing(conn, "symbol_fingerprints", "token_bag", "BLOB")?;
+    // The per-token inverted-index table is replaced by the BLOB; its indexes drop with it.
+    conn.execute_batch("DROP TABLE IF EXISTS symbol_token_postings;")?;
     Ok(())
 }
 
