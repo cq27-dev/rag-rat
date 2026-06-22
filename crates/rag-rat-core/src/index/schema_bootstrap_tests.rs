@@ -12456,12 +12456,17 @@ fn migration_031_edge_oracle_no_fk_content_key() {
         ",
     )
     .expect("recreate legacy V018 edge_oracle");
-    conn.execute_batch("DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';")
-        .expect("drop V031 ledger row");
+    // Drop the V031 AND V032 ledger rows: `known_version` reads the MAX applied version, so
+    // leaving V032 recorded would keep the schema Compatible and skip the forward migrate.
+    conn.execute_batch(
+        "DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
+         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';",
+    )
+    .expect("drop V031+ ledger rows");
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "schema is Older after dropping the V031 ledger row + reverting the table shape"
+        "schema is Older after dropping the V031/V032 ledger rows + reverting the table shape"
     );
     // Confirm the legacy FK is really there before migrating.
     let fk_before: i64 = conn

@@ -68,9 +68,10 @@ pub(crate) const CASCADE_FK_ALLOWLIST: &[(&str, &str)] = &[
     ("logical_symbol_members", "logical_symbols"),
     // Per-symbol derived facts, rebuilt with the symbols they describe.
     ("symbol_facts", "symbols"),
-    // Clone-detection fingerprints + their inverted-index postings, rebuilt with the symbols.
+    // Clone-detection fingerprints, rebuilt with the symbols. The token bag rides this row as the
+    // `token_bag` BLOB column (#231) — `symbol_token_postings` was dropped in V032, so its former
+    // allowlist entry is gone.
     ("symbol_fingerprints", "symbols"),
-    ("symbol_token_postings", "symbols"),
 ];
 
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
