@@ -1,22 +1,13 @@
 use rag_rat_core::Config;
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 #[cfg(not(unix))]
 use rmcp::transport::stdio;
-use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
-use serde_json::{Map, Value, json};
-
-use crate::tools::{
-    BlameChunkArgs, ClonesForSymbolArgs, CompareGraphTextArgs, EmptyArgs, FindClonesArgs,
-    HealIndexArgs, ImpactArgs, ImportantSymbolsArgs, LimitArgs, MemoryCreateArgs,
-    MemoryForCallPathArgs, MemoryForPathArgs, MemoryForSymbolArgs, MemoryIdArgs, MemoryRebindArgs,
-    MemorySearchArgs, MemoryUpdateArgs, PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs,
-    ReadChunkArgs, RepoBriefArgs, RepoClustersArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
-};
+use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
+use serde_json::{Map, Value};
 
 #[derive(Clone)]
 pub struct RagRatService {
@@ -93,450 +84,6 @@ impl RagRatService {
     }
 }
 
-#[tool_router]
-impl RagRatService {
-    #[tool(
-        name = "semantic_search",
-        description = "Search indexed source and docs with hybrid BM25/vector/structural ranking; \
-                       optionally explains score components."
-    )]
-    fn semantic_search(
-        &self,
-        Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("semantic_search", json!(args))
-    }
-
-    #[tool(
-        name = "symbol_lookup",
-        description = "Find exact or fuzzy Rust, TypeScript, Kotlin, C, C++, or Python symbols."
-    )]
-    fn symbol_lookup(
-        &self,
-        Parameters(args): Parameters<SymbolArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("symbol_lookup", json!(args))
-    }
-
-    #[tool(
-        name = "find_callers",
-        description = "Traverse tree-sitter-derived reverse graph edges for callers."
-    )]
-    fn find_callers(
-        &self,
-        Parameters(args): Parameters<SymbolGraphArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("find_callers", json!(args))
-    }
-
-    #[tool(
-        name = "trace_callees",
-        description = "Traverse tree-sitter-derived forward graph edges for callees."
-    )]
-    fn trace_callees(
-        &self,
-        Parameters(args): Parameters<SymbolGraphArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("trace_callees", json!(args))
-    }
-
-    #[tool(
-        name = "compare_graph_to_text",
-        description = "Compare graph caller edges for a symbol against regex text hits in indexed \
-                       source."
-    )]
-    fn compare_graph_to_text(
-        &self,
-        Parameters(args): Parameters<CompareGraphTextArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("compare_graph_to_text", json!(args))
-    }
-
-    #[tool(
-        name = "compare_graph_to_scip",
-        description = "Report edges where the tree-sitter graph and the SCIP compiler oracle \
-                       disagree on resolution (contradictions). Requires `rag-rat oracle run`."
-    )]
-    fn compare_graph_to_scip(
-        &self,
-        Parameters(_args): Parameters<EmptyArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("compare_graph_to_scip", json!({}))
-    }
-
-    #[tool(
-        name = "impact_surface",
-        description = "Graph-backed coding preflight with structural, textual fallback, and \
-                       papertrail evidence."
-    )]
-    fn impact_surface(
-        &self,
-        Parameters(args): Parameters<ImpactArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("impact_surface", json!(args))
-    }
-
-    #[tool(
-        name = "repo_brief",
-        description = "Orientation-first repo brief with spine, churn, god-module, and \
-                       refactor-candidate modes."
-    )]
-    fn repo_brief(
-        &self,
-        Parameters(args): Parameters<RepoBriefArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("repo_brief", json!(args))
-    }
-
-    #[tool(
-        name = "repo_clusters",
-        description = "Cheap file-level ownership clusters using path proximity, graph edges, and \
-                       git co-touches."
-    )]
-    fn repo_clusters(
-        &self,
-        Parameters(args): Parameters<RepoClustersArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("repo_clusters", json!(args))
-    }
-
-    #[tool(
-        name = "important_symbols",
-        description = "Rank the most load-bearing symbols by weighted PageRank over the edge \
-                       graph — the spine to not reinvent or break. Run before editing."
-    )]
-    fn important_symbols(
-        &self,
-        Parameters(args): Parameters<ImportantSymbolsArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("important_symbols", json!(args))
-    }
-
-    #[tool(
-        name = "find_clones",
-        description = "Ranked candidate clone classes (unrefined; exact overlap metrics)."
-    )]
-    fn find_clones(
-        &self,
-        Parameters(args): Parameters<FindClonesArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("find_clones", json!(args))
-    }
-
-    #[tool(
-        name = "clones_for_symbol",
-        description = "The clone class containing a symbol (by id / ref / path+line)."
-    )]
-    fn clones_for_symbol(
-        &self,
-        Parameters(args): Parameters<ClonesForSymbolArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("clones_for_symbol", json!(args))
-    }
-
-    #[tool(
-        name = "ffi_surface",
-        description = "Find UniFFI/export/generated-binding/call-site candidates."
-    )]
-    fn ffi_surface(
-        &self,
-        Parameters(args): Parameters<LimitArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("ffi_surface", json!(args))
-    }
-
-    #[tool(name = "docs_for_symbol", description = "Find docs chunks related to a symbol.")]
-    fn docs_for_symbol(
-        &self,
-        Parameters(args): Parameters<SymbolGraphArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("docs_for_symbol", json!(args))
-    }
-
-    #[tool(
-        name = "read_chunk",
-        description = "Read current text for one selected chunk ID with anchor validation."
-    )]
-    fn read_chunk(
-        &self,
-        Parameters(args): Parameters<ReadChunkArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("read_chunk", json!(args))
-    }
-
-    #[tool(
-        name = "commit_search",
-        description = "Search historical git commit subjects and bodies."
-    )]
-    fn commit_search(
-        &self,
-        Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("commit_search", json!(args))
-    }
-
-    #[tool(
-        name = "git_history_for_path",
-        description = "Return historical commits that touched one current path."
-    )]
-    fn git_history_for_path(
-        &self,
-        Parameters(args): Parameters<PathHistoryArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("git_history_for_path", json!(args))
-    }
-
-    #[tool(
-        name = "git_history_for_symbol",
-        description = "Resolve a current symbol, then return historical commits touching its path."
-    )]
-    fn git_history_for_symbol(
-        &self,
-        Parameters(args): Parameters<SymbolArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("git_history_for_symbol", json!(args))
-    }
-
-    #[tool(
-        name = "commits_touching_query",
-        description = "Combine commit-message and current file-change evidence for a query."
-    )]
-    fn commits_touching_query(
-        &self,
-        Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("commits_touching_query", json!(args))
-    }
-
-    #[tool(
-        name = "git_blame_chunk",
-        description = "Compute lazy hash-bound git blame summary for one current chunk."
-    )]
-    fn git_blame_chunk(
-        &self,
-        Parameters(args): Parameters<BlameChunkArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("git_blame_chunk", json!(args))
-    }
-
-    #[tool(
-        name = "papertrail_for_chunk",
-        description = "Return current chunk context plus cached GitHub rationale."
-    )]
-    fn papertrail_for_chunk(
-        &self,
-        Parameters(args): Parameters<PapertrailChunkArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("papertrail_for_chunk", json!(args))
-    }
-
-    #[tool(
-        name = "papertrail_for_symbol",
-        description = "Return current symbol context plus cached GitHub rationale."
-    )]
-    fn papertrail_for_symbol(
-        &self,
-        Parameters(args): Parameters<SymbolArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("papertrail_for_symbol", json!(args))
-    }
-
-    #[tool(
-        name = "papertrail_for_commit",
-        description = "Return cached GitHub rationale related to a historical commit."
-    )]
-    fn papertrail_for_commit(
-        &self,
-        Parameters(args): Parameters<PapertrailCommitArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("papertrail_for_commit", json!(args))
-    }
-
-    #[tool(name = "github_issue_search", description = "Search cached GitHub issue and PR text.")]
-    fn github_issue_search(
-        &self,
-        Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("github_issue_search", json!(args))
-    }
-
-    #[tool(
-        name = "github_refs_for_path",
-        description = "List discovered GitHub references for one current path."
-    )]
-    fn github_refs_for_path(
-        &self,
-        Parameters(args): Parameters<PathHistoryArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("github_refs_for_path", json!(args))
-    }
-
-    #[tool(name = "rationale_search", description = "Search cached GitHub rationale snippets.")]
-    fn rationale_search(
-        &self,
-        Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("rationale_search", json!(args))
-    }
-
-    #[tool(
-        name = "local_ai_status",
-        description = "Report explicit local AI capability and artifact status."
-    )]
-    fn local_ai_status(
-        &self,
-        Parameters(_args): Parameters<EmptyArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("local_ai_status", json!({}))
-    }
-
-    #[tool(
-        name = "heal_index",
-        description = "Repair stale already-indexed files and refresh SQLite FTS."
-    )]
-    fn heal_index(
-        &self,
-        Parameters(args): Parameters<HealIndexArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("heal_index", json!(args))
-    }
-
-    #[tool(
-        name = "github_sync_status",
-        description = "Report local GitHub papertrail cache status."
-    )]
-    fn github_sync_status(
-        &self,
-        Parameters(_args): Parameters<EmptyArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("github_sync_status", json!({}))
-    }
-
-    #[tool(
-        name = "index_status",
-        description = "Report SQLite index freshness, git metadata, parser failures, and file \
-                       counts."
-    )]
-    fn index_status(
-        &self,
-        Parameters(_args): Parameters<EmptyArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("index_status", json!({}))
-    }
-
-    #[tool(
-        name = "memory_create",
-        description = "Create a source-anchored repo memory bound to a symbol, chunk, path, \
-                       commit, or GitHub ref."
-    )]
-    fn memory_create(
-        &self,
-        Parameters(args): Parameters<MemoryCreateArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_create", json!(args))
-    }
-
-    #[tool(
-        name = "memory_rebind",
-        description = "Re-anchor an existing repo memory to a different symbol, chunk, path, or \
-                       other source location after it moved or was renamed."
-    )]
-    fn memory_rebind(
-        &self,
-        Parameters(args): Parameters<MemoryRebindArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_rebind", json!(args))
-    }
-
-    #[tool(
-        name = "memory_update",
-        description = "Update typed repo-memory text, status, confidence, kind, or tags."
-    )]
-    fn memory_update(
-        &self,
-        Parameters(args): Parameters<MemoryUpdateArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_update", json!(args))
-    }
-
-    #[tool(
-        name = "memory_search",
-        description = "Search active or stale repo memories with deterministic FTS recall."
-    )]
-    fn memory_search(
-        &self,
-        Parameters(args): Parameters<MemorySearchArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_search", json!(args))
-    }
-
-    #[tool(
-        name = "memory_for_symbol",
-        description = "Return repo memories bound to a selected symbol or logical symbol."
-    )]
-    fn memory_for_symbol(
-        &self,
-        Parameters(args): Parameters<MemoryForSymbolArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_for_symbol", json!(args))
-    }
-
-    #[tool(name = "memory_for_path", description = "Return repo memories bound to one path.")]
-    fn memory_for_path(
-        &self,
-        Parameters(args): Parameters<MemoryForPathArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_for_path", json!(args))
-    }
-
-    #[tool(
-        name = "memory_for_call_path",
-        description = "Return repo memories bound to one call-path edge sequence hash."
-    )]
-    fn memory_for_call_path(
-        &self,
-        Parameters(args): Parameters<MemoryForCallPathArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_for_call_path", json!(args))
-    }
-
-    #[tool(
-        name = "memory_validate",
-        description = "Validate repo-memory anchors and mark current, relocated, stale, or gone."
-    )]
-    fn memory_validate(
-        &self,
-        Parameters(_args): Parameters<EmptyArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_validate", json!({}))
-    }
-
-    #[tool(
-        name = "memory_doctor",
-        description = "List repo memories with stale/gone anchors plus suggested re-anchor \
-                       targets — the actionable companion to memory_validate. Rebind them with \
-                       memory_rebind."
-    )]
-    fn memory_doctor(
-        &self,
-        Parameters(_args): Parameters<EmptyArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_doctor", json!({}))
-    }
-
-    #[tool(
-        name = "memory_mark_obsolete",
-        description = "Mark a repo memory obsolete without deleting its audit trail."
-    )]
-    fn memory_mark_obsolete(
-        &self,
-        Parameters(args): Parameters<MemoryIdArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.call("memory_mark_obsolete", json!(args))
-    }
-}
-
-#[tool_handler]
 impl ServerHandler for RagRatService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -545,6 +92,20 @@ impl ServerHandler for RagRatService {
                 "Read-only-source repo intelligence. Index and auto-heal writes are confined to \
                  the configured SQLite database.",
             )
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // The catalog (TOOL_NAMES / schema / description) is the single source of truth advertised
+        // by `list_tools`, and `call_tool_for_config` (via `call`) is the by-name dispatcher.
+        // Forward the raw request arguments straight to the `call()` chokepoint: no per-tool
+        // `#[tool]` forwarder and no `Parameters<T>` serialize->deserialize round-trip — the client
+        // JSON reaches exactly one deserialize, in `call_tool_with_db`.
+        let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
+        self.call(&request.name, args)
     }
 
     async fn list_tools(
@@ -691,7 +252,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::tools::EmptyArgs;
 
     static N: AtomicU64 = AtomicU64::new(0);
 
@@ -798,29 +358,6 @@ mod tests {
             assert!(!result.content.is_empty(), "{name} returned no content");
         }
         assert!(svc.call("definitely_not_a_tool", json!({})).is_err(), "unknown tool must error");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn tool_wrappers_forward_to_call() {
-        // The #[tool] methods are thin forwarders to `call()`; exercise a representative set across
-        // the distinct arg shapes so the forwarding path is covered in-process (the stdio test runs
-        // the server out-of-process, where coverage isn't collected).
-        let (root, svc) = service_over_temp_repo();
-        // Each method takes a distinct Parameters<T>, so the args are built inline per call
-        // (a shared closure would monomorphize to a single T).
-        let sym = json!({ "symbol": "open_database" });
-        svc.semantic_search(Parameters(
-            serde_json::from_value(json!({ "query": "open_database" })).unwrap(),
-        ))
-        .unwrap();
-        svc.symbol_lookup(Parameters(serde_json::from_value(sym.clone()).unwrap())).unwrap();
-        svc.find_callers(Parameters(serde_json::from_value(sym.clone()).unwrap())).unwrap();
-        svc.impact_surface(Parameters(serde_json::from_value(sym.clone()).unwrap())).unwrap();
-        svc.repo_brief(Parameters(serde_json::from_value(json!({})).unwrap())).unwrap();
-        svc.important_symbols(Parameters(serde_json::from_value(json!({})).unwrap())).unwrap();
-        svc.index_status(Parameters(EmptyArgs {})).unwrap();
-        svc.local_ai_status(Parameters(EmptyArgs {})).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }
