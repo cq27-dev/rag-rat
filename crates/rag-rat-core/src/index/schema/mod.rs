@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 32;
+pub const LATEST_SCHEMA_VERSION: u32 = 33;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -208,6 +208,11 @@ const MIGRATION_032_CHECKSUM: &str = "sha256:rag-rat-clone-token-bag-blob-v32";
 const MIGRATION_032_DESCRIPTION: &str = "Add symbol_fingerprints.token_bag BLOB + drop \
                                          symbol_token_postings (BLOB-pack the clone token bag) \
                                          (#231)";
+const MIGRATION_033_ID: &str = "033_dream_findings";
+const MIGRATION_033_CHECKSUM: &str = "sha256:rag-rat-dream-findings-v33";
+const MIGRATION_033_DESCRIPTION: &str = "Add dream_findings (dream-mode worklist: findings ABOUT \
+                                         memories, identity-keyed supersede/decay, never mutate \
+                                         memories) (#122)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -499,6 +504,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_032_CHECKSUM,
         description: MIGRATION_032_DESCRIPTION,
         apply: apply_token_bag_blob,
+    },
+    Migration {
+        id: MIGRATION_033_ID,
+        checksum: MIGRATION_033_CHECKSUM,
+        description: MIGRATION_033_DESCRIPTION,
+        apply: apply_dream_findings,
     },
 ];
 

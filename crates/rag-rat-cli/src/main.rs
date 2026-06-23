@@ -87,6 +87,7 @@ fn main() -> anyhow::Result<()> {
                 ))?;
         },
         Cmd::Memory(args) => memory(&config, &args)?,
+        Cmd::Dream(args) => dream(&config, &args)?,
         Cmd::Github(args) => github(&config, &args)?,
         Cmd::Hooks(args) => hooks(&config, &args)?,
         Cmd::Maintenance(args) => maintenance(&config, &args)?,

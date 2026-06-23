@@ -8,6 +8,7 @@ use crate::search::lexical::SearchOptions;
 
 mod ai_lifecycle;
 mod clones;
+mod dream;
 mod gc;
 mod graph;
 mod history;

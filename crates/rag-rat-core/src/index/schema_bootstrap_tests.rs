@@ -10497,12 +10497,16 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.storage
             .connection()
-            .execute("DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob'", [])
+            .execute(
+                "DELETE FROM schema_version WHERE id = (SELECT id FROM schema_version ORDER BY id \
+                 DESC LIMIT 1)",
+                [],
+            )
             .unwrap();
         assert_eq!(
             schema::status(db.storage.connection()).unwrap().state,
             schema::SchemaState::Older,
-            "removing the newest (V032) ledger row makes the schema Older"
+            "removing the newest ledger row makes the schema Older"
         );
     }
 
@@ -10527,7 +10531,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 32);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 33);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10605,6 +10609,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
+        DELETE FROM schema_version WHERE id = '033_dream_findings';
         ",
     )
     .unwrap();
@@ -10751,7 +10756,8 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
          DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
          DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
          DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
-         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';",
+         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
+         DELETE FROM schema_version WHERE id = '033_dream_findings';",
     )
     .unwrap();
     assert_eq!(
@@ -12303,7 +12309,8 @@ fn migration_032_adds_token_bag_drops_postings() {
              freq            INTEGER NOT NULL,
              PRIMARY KEY (symbol_id, normalizer_kind, token_hash)
          ) STRICT;
-         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';",
+         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
+         DELETE FROM schema_version WHERE id = '033_dream_findings';",
     )
     .expect("revert to V031 shape");
     assert!(
@@ -12377,7 +12384,7 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     conn.execute_batch(
         "DELETE FROM schema_version
          WHERE id IN ('030_clone_refinements_lcs_sampled', '031_edge_oracle_content_anchor',
-                      '032_clone_token_bag_blob');",
+                      '032_clone_token_bag_blob', '033_dream_findings');",
     )
     .expect("delete V030+ ledger rows");
     assert_eq!(
@@ -12410,8 +12417,8 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     );
     assert_eq!(
         crate::index::schema::LATEST_SCHEMA_VERSION,
-        32,
-        "LATEST_SCHEMA_VERSION is 32 after V032"
+        33,
+        "LATEST_SCHEMA_VERSION is 33 after V033"
     );
     // Idempotency: running migrate_forward again must not error.
     crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
@@ -12456,11 +12463,12 @@ fn migration_031_edge_oracle_no_fk_content_key() {
         ",
     )
     .expect("recreate legacy V018 edge_oracle");
-    // Drop the V031 AND V032 ledger rows: `known_version` reads the MAX applied version, so
-    // leaving V032 recorded would keep the schema Compatible and skip the forward migrate.
+    // Drop the V031 AND every newer ledger row: `known_version` reads the MAX applied version, so
+    // leaving any later row recorded would keep the schema Compatible and skip the forward migrate.
     conn.execute_batch(
         "DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
-         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';",
+         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
+         DELETE FROM schema_version WHERE id = '033_dream_findings';",
     )
     .expect("drop V031+ ledger rows");
     assert_eq!(

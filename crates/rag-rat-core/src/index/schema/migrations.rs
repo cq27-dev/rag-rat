@@ -1167,6 +1167,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_030_ID => Some(30),
             MIGRATION_031_ID => Some(31),
             MIGRATION_032_ID => Some(32),
+            MIGRATION_033_ID => Some(33),
             _ => None,
         })
         .max()
@@ -1208,6 +1209,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_030_ID
             | MIGRATION_031_ID
             | MIGRATION_032_ID
+            | MIGRATION_033_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1246,6 +1248,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_030_ID => migration.checksum != MIGRATION_030_CHECKSUM,
         MIGRATION_031_ID => migration.checksum != MIGRATION_031_CHECKSUM,
         MIGRATION_032_ID => migration.checksum != MIGRATION_032_CHECKSUM,
+        MIGRATION_033_ID => migration.checksum != MIGRATION_033_CHECKSUM,
         _ => false,
     }
 }
@@ -1529,6 +1532,39 @@ pub(crate) fn apply_token_bag_blob(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "symbol_fingerprints", "token_bag", "BLOB")?;
     // The per-token inverted-index table is replaced by the BLOB; its indexes drop with it.
     conn.execute_batch("DROP TABLE IF EXISTS symbol_token_postings;")?;
+    Ok(())
+}
+
+/// V033 (#122): the dream-mode worklist. Findings are ABOUT memories (a reviewable triage list),
+/// NEVER mutations of them — dream mode proposes, a human/strong-agent confirms; nothing here ever
+/// rewrites a `repo_memories` row. Identity is `(kind, subject, claim_hash)`: a re-run with the
+/// same claim_hash REFRESHES (no duplicate), a materially-changed finding SUPERSEDES the prior one,
+/// and a finding the run no longer reports is RESOLVED. `subject` is polymorphic (a
+/// `repo_memories.id` for memory-scoped kinds, a symbol/path ref for `coverage_gap`) so it carries
+/// NO FK. `status` drives the lifecycle; `base_rank` + the `first_seen_at_ms` clock drive age
+/// decay. Additive + idempotent.
+pub(crate) fn apply_dream_findings(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS dream_findings(
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            claim_hash TEXT NOT NULL,
+            evidence TEXT NOT NULL,
+            base_rank REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            superseded_by TEXT,
+            first_seen_at_ms INTEGER NOT NULL,
+            last_seen_at_ms INTEGER NOT NULL,
+            reviewed_at_ms INTEGER,
+            UNIQUE(kind, subject, claim_hash)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dream_findings_status ON dream_findings(status);
+        CREATE INDEX IF NOT EXISTS idx_dream_findings_subject ON dream_findings(kind, subject);
+        ",
+    )?;
     Ok(())
 }
 

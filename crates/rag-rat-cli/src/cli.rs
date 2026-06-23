@@ -69,6 +69,10 @@ pub(crate) enum Command {
     /// Inspect and re-anchor source-anchored repo memories.
     Memory(MemoryArgs),
 
+    /// Dream-mode memory-maintenance worklist (#122): deterministic coverage-gap + stale-reference
+    /// findings written to `dream_findings`. Surfaces findings ABOUT memories; never mutates them.
+    Dream(DreamArgs),
+
     /// GitHub papertrail sync.
     Github(GithubArgs),
 
@@ -175,6 +179,13 @@ pub(crate) struct ImportantSymbolsArgs {
     /// global-by-default — it never auto-seeds from the git diff).
     #[arg(long, value_delimiter = ',')]
     pub personalize: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DreamArgs {
+    /// Max coverage-gap findings to surface (stale-reference findings are always all reported).
+    #[arg(long)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Args)]

@@ -6,10 +6,10 @@ use super::*;
 #[cfg(feature = "eval")]
 use crate::cli::EvalArgs;
 use crate::cli::{
-    BriefArgs, ClonesArgs, ClonesForArgs, ClustersArgs, GithubArgs, GithubCommand, HookAction,
-    HooksArgs, ImportantSymbolsArgs, IndexArgs, MaintenanceArgs, MemoryArgs, MemoryCommand,
-    ModelsArgs, ModelsCommand, OracleArgs, OracleCommand, OracleReportArgs, OracleRunArgs,
-    OracleStatusArgs, QueryArgs, ReconcileArgs,
+    BriefArgs, ClonesArgs, ClonesForArgs, ClustersArgs, DreamArgs, GithubArgs, GithubCommand,
+    HookAction, HooksArgs, ImportantSymbolsArgs, IndexArgs, MaintenanceArgs, MemoryArgs,
+    MemoryCommand, ModelsArgs, ModelsCommand, OracleArgs, OracleCommand, OracleReportArgs,
+    OracleRunArgs, OracleStatusArgs, QueryArgs, ReconcileArgs,
 };
 
 /// Process-wide output format, set once from the global `--json` flag in `main` before any command
@@ -126,6 +126,22 @@ pub(crate) fn important_symbols(
     })?;
     apply_auto_run_ranking_hint(&mut result, config);
     print_output(&result)
+}
+
+/// Dream-mode worklist (#122): run the deterministic memory-maintenance pass (coverage gaps +
+/// stale references), sync it into `dream_findings`, and render the open worklist. Writes ONLY to
+/// `dream_findings` — never mutates a memory.
+pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
+    let db = open_index(config)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let report = db.dream_run(rag_rat_core::dream::DreamOptions {
+        now_ms,
+        limit: args.limit.unwrap_or(20) as usize,
+    })?;
+    print_output(&report)
 }
 
 pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
