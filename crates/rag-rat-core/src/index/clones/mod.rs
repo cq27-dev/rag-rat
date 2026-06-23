@@ -15,7 +15,15 @@ use tree_sitter::Node;
 
 /// Bumped when normalization changes; invalidates fingerprints (and the later refine cache) without
 /// a schema migration.
-pub(crate) const NORM_VERSION: i64 = 1;
+///
+/// `2` (#232): the normalization stream changed in two ways that affect every fingerprint — (1)
+/// comments and other tree-sitter EXTRAs are skipped (`walk_spanned`), and (2) multi-language
+/// literal leaves bucket (TS `string_fragment` → `LIT_STRING_FRAGMENT`; `true`/`false` value-erase
+/// to `LIT_BOOL`). The already-shipped read filter (`sf.normalizer_version = NORM_VERSION` on every
+/// fingerprint read) auto-EXCLUDES the v1 rows, which are recomputed at v2 on the next reindex; the
+/// 4b refinement cache invalidates via `NORM_VERSION` in the content-addressed `refinement_key` +
+/// the freshness predicate (`refine::cache`). No schema migration is needed.
+pub(crate) const NORM_VERSION: i64 = 2;
 /// Bumped when the LCS alignment / refinement algorithm changes; participates in the content-
 /// addressed `refinement_key` and in the `clone_refinements` cache freshness predicate, so a bump
 /// invalidates every cached refinement without a schema migration (the same discipline as
@@ -137,6 +145,15 @@ mod tests {
     /// Rust-only wrapper — the existing Rust fingerprint tests call this unchanged.
     fn fp(src: &str) -> Option<SymbolFingerprint> {
         fp_lang(src, "t.rs", Language::Rust)
+    }
+
+    #[test]
+    fn norm_version_is_2() {
+        // #232: the comment-skip (T2) + multi-language literal bucketing (T3) changed the
+        // normalization stream, so NORM_VERSION must be 2. The read filter + content-addressed
+        // refinement key both key off this constant, so a stream change without the bump silently
+        // serves stale fingerprints/refinements.
+        assert_eq!(NORM_VERSION, 2);
     }
 
     #[test]
