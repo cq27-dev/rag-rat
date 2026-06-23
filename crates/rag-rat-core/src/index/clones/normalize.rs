@@ -97,6 +97,19 @@ fn walk_spanned(
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
 
+    // (#232 #1) Comments and other tree-sitter EXTRAs (e.g. Python `line_continuation`) carry no
+    // semantic token: skip the WHOLE subtree, pushing NEITHER a token NOR a span so the seq↔span
+    // bijection is preserved. The OR is load-bearing (R4): `is_extra()` catches every grammar's
+    // comments via the runtime EXTRA flag PLUS non-comment extras like `line_continuation`, while
+    // the explicit `kind.contains("comment")` is a belt-and-braces guard for any grammar that
+    // flags a comment as a normal (non-extra) node — neither predicate alone covers all six
+    // grammars, so we keep both. (Comments themselves never anchor a clone variation point;
+    // skipping them at the source means no caller — antiunify, signature recovery — ever sees a
+    // comment span.)
+    if node.is_extra() || kind.contains("comment") {
+        return;
+    }
+
     if node.child_count() == 0 {
         // Leaf: push the token and its span.
         let leaf = node.utf8_text(src).unwrap_or("");
@@ -198,6 +211,57 @@ mod tests {
         );
         assert!(!py.is_empty(), "Python normalize stream must be non-empty");
         assert!(py.iter().any(|t| t == "return_statement"), "Python stream missing body: {py:?}");
+    }
+
+    // ── Task 2 (#232): comments are ignored
+    // ──────────────────────────────────────────
+
+    /// For Rust (`//`, `/* */`), TS (`//`, `/* */`), and Python (`#`): two function bodies that
+    /// differ ONLY by comments normalize to the SAME token stream (comments carry no semantic
+    /// token), and the seq↔span bijection holds throughout.
+    #[test]
+    fn comments_are_ignored_across_languages() {
+        // Rust — line + block comments.
+        let rust_plain = "fn f(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }";
+        let rust_commented = "fn f(db: Db) -> i32 {\n    // load it\n    let u = db.get(10); /* \
+                              hmm */ validate(u); u + 1 }";
+        let (tp, sp) = spanned(rust_plain);
+        let (tc, sc) = spanned(rust_commented);
+        assert_eq!(tp, tc, "Rust comment-only diff must normalize equal");
+        assert_eq!(tp.len(), sp.len(), "bijection broken (rust plain)");
+        assert_eq!(tc.len(), sc.len(), "bijection broken (rust commented)");
+
+        // TypeScript — line + block comments.
+        let ts_plain = "function f() { const a = get(1); const b = get(2); return a + b; }";
+        let ts_commented =
+            "function f() {\n  // a\n  const a = get(1); /* b */ const b = get(2); return a + b; }";
+        let (ttp, _) = spanned_lang(ts_plain, "t.ts", Language::TypeScript);
+        let (ttc, ttcs) = spanned_lang(ts_commented, "t.ts", Language::TypeScript);
+        assert_eq!(ttp, ttc, "TS comment-only diff must normalize equal");
+        assert_eq!(ttc.len(), ttcs.len(), "bijection broken (ts commented)");
+
+        // Python — `#` comments.
+        let py_plain = "def f():\n    a = get(1)\n    b = get(2)\n    return a + b\n";
+        let py_commented =
+            "def f():\n    # load a\n    a = get(1)\n    b = get(2)  # and b\n    return a + b\n";
+        let (typ, _) = spanned_lang(py_plain, "t.py", Language::Python);
+        let (tyc, tycs) = spanned_lang(py_commented, "t.py", Language::Python);
+        assert_eq!(typ, tyc, "Python comment-only diff must normalize equal");
+        assert_eq!(tyc.len(), tycs.len(), "bijection broken (py commented)");
+    }
+
+    /// Python `line_continuation` (`\` at EOL) is a tree-sitter EXTRA leaf, not a comment — the
+    /// `is_extra()` arm of the skip catches it (R4). It carries no semantic token, so a body with a
+    /// line continuation normalizes equal to the same body written on one line, and the bijection
+    /// still holds.
+    #[test]
+    fn python_line_continuation_is_skipped() {
+        let one_line = "def f():\n    x = aaa + bbb + ccc\n    return x\n";
+        let continued = "def f():\n    x = aaa + \\\n        bbb + ccc\n    return x\n";
+        let (t1, _) = spanned_lang(one_line, "t.py", Language::Python);
+        let (t2, s2) = spanned_lang(continued, "t.py", Language::Python);
+        assert_eq!(t1, t2, "line_continuation must not change the normalized stream");
+        assert_eq!(t2.len(), s2.len(), "bijection broken (py line_continuation)");
     }
 
     // ── Original tests (must stay green)
