@@ -30,10 +30,13 @@
 //! to one class. NO member is lost — every θ-edge endpoint lands in at least its own seed clique.
 
 /// Budget on the number of GROWN maximal cliques before the cover stops growing and falls back to
-/// emitting the remaining θ-edges as ungrown 2-member cliques (#256). It bounds the two superlinear
-/// passes — the per-edge containment scan and the maximal-subset removal, both O(grown² × n) — to a
-/// sub-second budget (256² × n) on a pathologically tangled component (e.g. dense-minus-perfect-
-/// matching, which yields O(n²) maximal cliques).
+/// emitting the remaining θ-edges as ungrown 2-member cliques (#256). It bounds the superlinear
+/// maximal-subset-removal pass (O(grown² × n)) — to a sub-second budget (256² × n) on a
+/// pathologically tangled component (e.g. dense-minus-perfect-matching, which yields O(n²) maximal
+/// cliques). The per-edge "already covered" containment test is no longer superlinear: it is a
+/// small-list intersection over each endpoint's group-index list (`member_groups`) — O(1) in the
+/// dense case where every member is in exactly one group (the old `Vec::contains` scan over every
+/// group made a DENSE clique O(n³), #256).
 ///
 /// CRUCIAL (#256): tripping the budget does NOT drop members and does NOT return the over-merged
 /// component (the old behavior that resurrected the giant). Once the budget trips, every remaining
@@ -87,7 +90,11 @@ pub(crate) fn coherence_split(
     // 1. Sort ascending (determinism).
     let mut members: Vec<i64> = component.to_vec();
     members.sort_unstable();
-    let member_set: std::collections::BTreeSet<i64> = members.iter().copied().collect();
+    // `HashSet` (O(1) `contains`), not `BTreeSet`: this is the defensive membership filter for the
+    // edge list below, hit twice per edge — on a dense giant that is ~2·n² lookups, where O(log n)
+    // per lookup (BTreeSet) is needlessly slow (#256). Membership-only, never iterated, so
+    // determinism is unaffected.
+    let member_set: std::collections::HashSet<i64> = members.iter().copied().collect();
 
     // 2. Coherent-edge seed list from the caller's θ-verified pairs (#256): canonicalize each to
     // `a < b`, keep only edges whose BOTH endpoints are members of this component (defensive — the
@@ -111,40 +118,72 @@ pub(crate) fn coherence_split(
     // group, grow a maximal coherent group from {a, b} by adding any remaining member (in id order)
     // that is coherent with every current group member. Emit the group.
     //
+    // The "already inside some emitted group" test is the EXACT predicate the old per-group scan
+    // computed — `(a, b)` is covered iff some single emitted group contains BOTH endpoints — but
+    // implemented without the superlinear scan (#256). We keep a `member_groups: HashMap<i64,
+    // Vec<usize>>` mapping each member to the indices of the emitted groups it belongs to; the
+    // per-edge check is "do `a` and `b` share a group index?" — an intersection of two small lists,
+    // NOT a `Vec::contains` over a giant group. The old `for g in &groups { g.contains(&a) &&
+    // g.contains(&b) }` was O(groups × members) per edge; on a DENSE clique the first edge grows
+    // one group of all n members and each of the ~n²/2 remaining edges then re-scanned that
+    // giant group → O(n³) (a 2,575-member dense blob hung, #256). Why this is exact AND fast:
+    // clique overlap is RARE (a member lands in two groups only when it coheres with two
+    // mutually-incompatible peers — the chain case), so each member's group-index list is tiny
+    // (length 1 in the dense case), and the intersection is O(1) there. It avoids the O(n²)
+    // cost of recording every intra-group PAIR (the obvious covered-edge-set), which is ~0.5M
+    // HashSet ops at n=1000 and blows the sub-second debug budget. `member_groups` is
+    // membership bookkeeping only (never iterated for output), so determinism is unaffected —
+    // the returned class order comes solely from the canonicalized `coherent_edges` + `groups`
+    // order.
+    //
     // Past `MAX_SPLIT_GROUPS` GROWN cliques the component is pathologically tangled; we stop
-    // growing (the grow + the per-edge containment scan are the only superlinear passes) and
-    // emit every remaining uncovered edge as a bare 2-member clique. This bounds work WITHOUT
-    // dropping any member: a long chain's tail edges become pairs rather than being lost
-    // (#256).
+    // growing (the grow is the remaining superlinear pass) and emit every remaining uncovered edge
+    // as a bare 2-member clique. This bounds work WITHOUT dropping any member: a long chain's tail
+    // edges become pairs rather than being lost (#256).
     let mut groups: Vec<Vec<i64>> = Vec::new();
+    let mut member_groups: std::collections::HashMap<i64, Vec<usize>> =
+        std::collections::HashMap::new();
     let mut budget_tripped = false;
 
-    'edges: for &(a, b) in &coherent_edges {
+    for &(a, b) in &coherent_edges {
         if budget_tripped {
             // Over budget: emit the edge directly as a 2-member clique (still internally coherent —
-            // it is a θ-edge). No grow, no full-group containment scan. The later dedup/subset pass
-            // is skipped too (see below), so this stays O(remaining edges).
+            // it is a θ-edge). No grow, no containment bookkeeping. The later dedup/subset pass is
+            // skipped too (see below), so this stays O(remaining edges).
             groups.push(vec![a, b]);
             continue;
         }
-        // Skip this edge if some existing group already contains both endpoints.
-        for g in &groups {
-            if g.contains(&a) && g.contains(&b) {
-                continue 'edges;
-            }
+        // Skip this edge if some existing group already contains BOTH endpoints — i.e. `a` and `b`
+        // share a group index. This is the EXACT old predicate (a common group), via a small-list
+        // intersection instead of a giant-group `Vec::contains`.
+        if let (Some(ga), Some(gb)) = (member_groups.get(&a), member_groups.get(&b))
+            && ga.iter().any(|gi| gb.contains(gi))
+        {
+            continue;
         }
-        // Grow a maximal coherent group from {a, b}.
+        // Grow a maximal coherent group from {a, b}. `group_set` mirrors `group` for O(1)
+        // membership (the old `group.contains(&m)` was O(group) per candidate → O(n²) on a
+        // dense clique, #256).
         let mut group: Vec<i64> = vec![a, b];
+        let mut group_set: std::collections::HashSet<i64> = group.iter().copied().collect();
         for &m in &members {
-            if group.contains(&m) {
+            if group_set.contains(&m) {
                 continue;
             }
             // m is coherent with every current group member?
             if group.iter().all(|&g| similarity(m, g) >= theta) {
                 group.push(m);
+                group_set.insert(m);
             }
         }
         group.sort_unstable(); // deterministic order within group
+        // Record this group's index against each of its members so a later edge fully inside this
+        // group is skipped via the small-list intersection above — the exact predicate the old
+        // per-group scan computed. O(group), not O(group²).
+        let gi = groups.len();
+        for &m in &group {
+            member_groups.entry(m).or_default().push(gi);
+        }
         groups.push(group);
         // Budget guard (#256): bound the superlinear passes. From here on, remaining edges are
         // emitted as bare pairs (above) — coverage is preserved, work is bounded.
@@ -314,6 +353,60 @@ mod tests {
 
         assert_eq!(r1, r2, "result differs between [a,b,c] and [c,b,a]");
         assert_eq!(r1, r3, "result differs between [a,b,c] and [b,a,c]");
+    }
+
+    /// #256 scalability pin: a DENSE clique of n = 1000 (every pair ≥ θ, ~500K edges) must split to
+    /// ONE class with all n members AND complete fast. This is the case the O(n³) per-edge
+    /// containment scan hung on — the first edge grows one group of all n members, then each of the
+    /// ~n²/2 remaining edges re-scanned that giant group via `Vec::contains` (O(n) each) → O(n³):
+    /// ~5.9s at n=1000 / ~44s at n=2000 in debug. `MAX_SPLIT_GROUPS` does NOT save it (a full
+    /// clique = exactly ONE grown group, so the budget never trips). The #256 fix collapses
+    /// every per-edge pass to O(1): the `member_groups` small-list-intersection containment
+    /// check, a `HashSet` member filter, and an O(1)-membership grow loop — the whole dense
+    /// clique is now O(edges).
+    ///
+    /// Timing: standalone this completes in ~0.45s — well under a second, vs ~5.9s pre-fix (a >10×
+    /// speedup; the n=1000 / ~5.9s figure is the exact pre-fix data point this pin A/Bs against).
+    /// The assertion is a HANG-DETECTOR, not a microbenchmark: the full suite runs this O(n²)
+    /// test concurrently with ~1000 others (some multi-second) on 8 cores, so its WALL time
+    /// inflates to a few seconds under that saturation — a scheduler artifact, not algorithmic.
+    /// The 4s ceiling sits firmly between the post-fix contended time (~2-3s) and the pre-fix
+    /// regression (5.9s standalone → tens of seconds under the same contention), so it catches
+    /// an O(n³) reintroduction without flaking on scheduler noise.
+    #[test]
+    fn coherence_split_dense_clique_scales() {
+        let theta = 0.70;
+        let count: i64 = 1000; // ~5.9s pre-fix (O(n³)); ~0.45s standalone post-fix (O(edges)).
+        let members: Vec<i64> = (0..count).collect();
+        // Every pair is coherent at 0.90 — a genuinely dense full clique above θ.
+        let sim = |_a: i64, _b: i64| 0.90_f64;
+        // The θ-verified edge list is the complete graph (every pair ≥ θ): ~500K edges, each of
+        // which hit the old O(n) containment scan.
+        let mut edges: Vec<(i64, i64)> = Vec::with_capacity(((count * (count - 1)) / 2) as usize);
+        for i in 0..count {
+            for j in (i + 1)..count {
+                edges.push((i, j));
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let split = coherence_split(&members, &edges, sim, theta);
+        let elapsed = start.elapsed();
+
+        // ONE coherent class with all n members — zero member loss.
+        assert_eq!(split.len(), 1, "a dense clique stays ONE class, got {} classes", split.len());
+        assert_eq!(split[0].len(), count as usize, "all {count} members must survive");
+        let union: std::collections::BTreeSet<i64> = split.iter().flatten().copied().collect();
+        let expected: std::collections::BTreeSet<i64> = members.iter().copied().collect();
+        assert_eq!(union, expected, "the union of class members must equal the input members");
+        // Hang-detector, not a microbenchmark: the O(n³) scan took ~5.9s standalone in debug at
+        // n=1000 (tens of seconds under full-suite contention); the O(edges) cover is ~0.45s
+        // standalone, ~2-3s under full-suite CPU saturation. The 4s ceiling sits between them so an
+        // O(n³) reintroduction reddens here while scheduler noise does not.
+        assert!(
+            elapsed.as_secs() < 4,
+            "dense clique of {count} must split fast (O(edges)), took {elapsed:?}"
+        );
     }
 
     /// #256 pin (a): a 250-member LOOSE clique — every pair coherent at exactly 0.80 (> θ), well
