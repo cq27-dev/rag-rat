@@ -383,6 +383,9 @@ fn literal_bucket_to_type(bucket: &str) -> Option<&'static str> {
         // them — booleans route to `LIT_BOOL`) but are kept as defensive aliases.
         "LIT_BOOL" | "LIT_BOOLEAN_LITERAL" | "LIT_BOOL_LITERAL" => Some("bool"),
         // Unmapped bucket: NO stable Rust type → unresolved, never the opaque `{literal}`-as-typed.
+        // `LIT_CHARACTER` (the C/C++ char-literal VALUE leaf, #253) lands here DELIBERATELY: it has
+        // no stable Rust type cross-language (like `LIT_CHAR`), so it stays unresolved rather than
+        // over-claim a `char` type. Recall-only fix; never promotes typedness.
         _ => None,
     }
 }
@@ -675,7 +678,7 @@ mod tests {
         let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("a function symbol");
         let node =
             parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
-        let (seq, node_spans) = normalize_baseline_spanned(node, &text);
+        let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::Rust);
         let struct_hash = tokens::struct_hash(&seq);
         RefineMember { symbol_id, lang: Language::Rust, struct_hash, seq, node_spans, text }
     }

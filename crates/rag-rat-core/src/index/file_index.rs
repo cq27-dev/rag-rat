@@ -261,7 +261,7 @@ impl IndexDatabase {
         let Some(parsed) = parser::parse_file(path, language, text) else {
             return Ok(());
         };
-        let fingerprints = clones::fingerprint_symbols(parsed.root(), text, symbols);
+        let fingerprints = clones::fingerprint_symbols(parsed.root(), text, language, symbols);
         // Heal/inline path runs no full-rebuild finalize, so the df must be kept current here via
         // the per-token bump (drift-tolerated; see write_symbol_fingerprints).
         self.write_symbol_fingerprints(symbol_ids, &fingerprints, BumpDf(true))

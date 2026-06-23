@@ -2746,7 +2746,7 @@ mod tests {
         let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("a function symbol");
         let node =
             parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
-        let (seq, node_spans) = normalize_baseline_spanned(node, &text);
+        let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::Rust);
         let struct_hash = tokens::struct_hash(&seq);
         RefineMember { symbol_id, lang: Language::Rust, struct_hash, seq, node_spans, text }
     }
@@ -2764,12 +2764,12 @@ mod tests {
             .iter()
             .filter_map(|s| {
                 let n = parsed.root().descendant_for_byte_range(s.start_byte, s.end_byte)?;
-                Some((normalize_baseline_spanned(n, &text).0.len(), n))
+                Some((normalize_baseline_spanned(n, &text, Language::TypeScript).0.len(), n))
             })
             .max_by_key(|(len, _)| *len)
             .map(|(_, n)| n)
             .expect("a body symbol");
-        let (seq, node_spans) = normalize_baseline_spanned(node, &text);
+        let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::TypeScript);
         let struct_hash = tokens::struct_hash(&seq);
         RefineMember { symbol_id, lang: Language::TypeScript, struct_hash, seq, node_spans, text }
     }

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use tree_sitter::Node;
 
+use crate::language::Language;
+
 /// A leaf tree-sitter kind that names a binding/reference identifier (kept language-agnostic by
 /// matching the `*identifier` suffix tree-sitter grammars use).
 fn is_identifier_kind(kind: &str) -> bool {
@@ -14,12 +16,21 @@ fn is_identifier_kind(kind: &str) -> bool {
 /// counterpart to Python's `string_content` — both are the value-bearing inner leaf, #232 #2a). It
 /// buckets to `LIT_STRING_FRAGMENT`, which the anti-unify/signature contract maps to `&str` (see
 /// `signature::literal_bucket_to_type`).
-fn is_literal_kind(kind: &str) -> bool {
+///
+/// `character` is the C/C++ char-LITERAL VALUE leaf: `tree-sitter-c`/`-cpp` parse `'x'` as a
+/// `char_literal` node (which already buckets via the `ends_with("literal")` arm) wrapping a
+/// `'` / `character` / `'` leaf triple — the quotes are structural (identical for any char), but
+/// the inner `character` leaf carries the value, so `'x'` vs `'y'` would leak verbatim without it
+/// (#253). GATED to C/C++ via `lang`: `character` is a generic-enough kind name that we only bucket
+/// it where it's known to be the char-literal value leaf, never speculatively across other
+/// grammars.
+fn is_literal_kind(kind: &str, lang: Language) -> bool {
     kind.ends_with("literal")
         || matches!(
             kind,
             "string_content" | "string_fragment" | "integer" | "float" | "number" | "char"
         )
+        || (matches!(lang, Language::C | Language::Cpp) && kind == "character")
 }
 
 /// A leaf kind that is a boolean literal in the grammars that expose booleans as their own leaf
@@ -31,12 +42,33 @@ fn is_literal_kind(kind: &str) -> bool {
 /// is why this is NOT routed through the generic `LIT_{kind.uppercased}` path — that would encode
 /// the value.
 ///
-/// NOT covered: `tree-sitter-kotlin-ng` emits `true`/`false`/`null` as plain `identifier` leaves,
-/// so Kotlin booleans are alpha-renamed (`ID<n>`) rather than value-erased. This is a deferred
-/// recall gap, not a correctness bug — the language partition guarantees Kotlin only ever
-/// clone-matches Kotlin, where identifiers and booleans are treated consistently (#232 follow-up).
+/// Kotlin is handled separately by leaf TEXT (see [`kotlin_identifier_token`]):
+/// `tree-sitter-kotlin` emits `true`/`false`/`null` as plain `identifier` leaves, so they never
+/// reach this kind-based predicate. The fix (#253) intercepts them under the identifier branch in
+/// `walk_spanned`, GATED to Kotlin, mapping `true`/`false` to `LIT_BOOL` (was alpha-renamed to
+/// `ID<n>` — a recall leak, partition-contained since Kotlin only clone-matches Kotlin).
 fn is_boolean_leaf_kind(kind: &str) -> bool {
     matches!(kind, "true" | "false")
+}
+
+/// Kotlin-only override for an `identifier`-kind leaf whose TEXT is a boolean or null keyword.
+/// `tree-sitter-kotlin` lexes `true`/`false`/`null` as bare `identifier` leaves (not their own
+/// kinds), so the generic `is_boolean_leaf_kind`/`is_identifier_kind` path would alpha-rename them
+/// to `ID<n>` and leak the value into matching (#253). Returns:
+/// - `Some("LIT_BOOL")` for `true`/`false` — value-erased to the same single bucket every other
+///   grammar's booleans use, so a Kotlin `true`↔`false`-only diff normalizes equal.
+/// - `Some("null")` for `null` — kept VERBATIM (the cross-language null-family policy, #232 #2c:
+///   not bucketed, but also not alpha-renamed to an `ID<n>`).
+/// - `None` for any other identifier text — falls through to the normal `ID<n>` alpha-rename.
+///
+/// GATED to Kotlin by the caller; other grammars emit these as dedicated leaf kinds and must not be
+/// matched by text here.
+fn kotlin_identifier_token(leaf: &str) -> Option<&'static str> {
+    match leaf {
+        "true" | "false" => Some("LIT_BOOL"),
+        "null" => Some("null"),
+        _ => None,
+    }
 }
 
 /// `true` for a tree-sitter node kind that names a Rust type position — a bare type name
@@ -95,11 +127,12 @@ pub(crate) struct NodeSpan {
 pub(crate) fn normalize_baseline_spanned(
     node: Node<'_>,
     text: &str,
+    lang: Language,
 ) -> (Vec<String>, Vec<NodeSpan>) {
     let mut tokens = Vec::new();
     let mut spans = Vec::new();
     let mut idents: HashMap<String, usize> = HashMap::new();
-    walk_spanned(node, text.as_bytes(), &mut idents, &mut tokens, &mut spans);
+    walk_spanned(node, text.as_bytes(), lang, &mut idents, &mut tokens, &mut spans);
     (tokens, spans)
 }
 
@@ -107,13 +140,14 @@ pub(crate) fn normalize_baseline_spanned(
 /// node — structural node kinds for internal nodes; for leaves, an alpha-renamed `ID<n>` for
 /// identifiers (numbered by first occurrence), a `LIT_<KIND>` bucket for literals, and the verbatim
 /// text for operators/keywords/punctuation. Scope-independent: depends only on this node's subtree.
-pub(crate) fn normalize_baseline(node: Node<'_>, text: &str) -> Vec<String> {
-    normalize_baseline_spanned(node, text).0
+pub(crate) fn normalize_baseline(node: Node<'_>, text: &str, lang: Language) -> Vec<String> {
+    normalize_baseline_spanned(node, text, lang).0
 }
 
 fn walk_spanned(
     node: Node<'_>,
     src: &[u8],
+    lang: Language,
     idents: &mut HashMap<String, usize>,
     tokens: &mut Vec<String>,
     spans: &mut Vec<NodeSpan>,
@@ -139,14 +173,24 @@ fn walk_spanned(
         // Leaf: push the token and its span.
         let leaf = node.utf8_text(src).unwrap_or("");
         let token = if is_identifier_kind(kind) {
-            let next = idents.len();
-            let id = *idents.entry(leaf.to_string()).or_insert(next);
-            format!("ID{id}")
+            // (#253) Kotlin lexes `true`/`false`/`null` as bare `identifier` leaves, so they reach
+            // the identifier branch FIRST. GATED to Kotlin, intercept by leaf text: `true`/`false`
+            // value-erase to `LIT_BOOL` (same single bucket as every other grammar's booleans),
+            // `null` stays verbatim (null-family policy). Every other identifier alpha-renames.
+            if let Some(tok) =
+                (lang == Language::Kotlin).then(|| kotlin_identifier_token(leaf)).flatten()
+            {
+                tok.to_string()
+            } else {
+                let next = idents.len();
+                let id = *idents.entry(leaf.to_string()).or_insert(next);
+                format!("ID{id}")
+            }
         } else if is_boolean_leaf_kind(kind) {
             // Value-erase booleans to ONE bucket (NOT `LIT_{kind.uppercased}`): `true`/`false`
             // collapse to `LIT_BOOL` so a true↔false-only diff is a clone (#232 #2b).
             "LIT_BOOL".to_string()
-        } else if is_literal_kind(kind) {
+        } else if is_literal_kind(kind, lang) {
             format!("LIT_{}", kind.to_ascii_uppercase())
         } else {
             // (#232 #2c) NULL-FAMILY out of scope (low value + wrapped-node hazard): `null` /
@@ -166,7 +210,7 @@ fn walk_spanned(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_spanned(child, src, idents, tokens, spans);
+        walk_spanned(child, src, lang, idents, tokens, spans);
     }
 }
 
@@ -184,13 +228,17 @@ mod tests {
     /// `function`, TS `const`/function-valued declarators, and Python `function` symbols — the
     /// languages disagree on the symbol `kind` string but agree that the biggest normalized subtree
     /// is the body we want to compare.
-    fn target_node_for<'a>(parsed: &'a parser::ParsedFile, src: &str) -> tree_sitter::Node<'a> {
+    fn target_node_for<'a>(
+        parsed: &'a parser::ParsedFile,
+        src: &str,
+        language: Language,
+    ) -> tree_sitter::Node<'a> {
         parsed
             .symbols
             .iter()
             .filter_map(|s| {
                 let node = parsed.root().descendant_for_byte_range(s.start_byte, s.end_byte)?;
-                let len = normalize_baseline(node, src).len();
+                let len = normalize_baseline(node, src, language).len();
                 Some((len, node))
             })
             .max_by_key(|(len, _)| *len)
@@ -202,13 +250,13 @@ mod tests {
     /// grammar / generated heuristics), select the target symbol, return its normalized stream.
     fn norm_lang(src: &str, path: &str, language: Language) -> Vec<String> {
         let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
-        normalize_baseline(target_node_for(&parsed, src), src)
+        normalize_baseline(target_node_for(&parsed, src, language), src, language)
     }
 
     /// Generalized spanned-normalize harness (token stream + parallel `NodeSpan`s).
     fn spanned_lang(src: &str, path: &str, language: Language) -> (Vec<String>, Vec<NodeSpan>) {
         let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
-        normalize_baseline_spanned(target_node_for(&parsed, src), src)
+        normalize_baseline_spanned(target_node_for(&parsed, src, language), src, language)
     }
 
     /// Rust-only wrappers — the existing Rust tests call these unchanged.
@@ -372,6 +420,84 @@ mod tests {
         assert!(
             nt.iter().any(|tok| tok == "boolean_literal"),
             "wrapping boolean_literal node kind still pushed: {nt:?}"
+        );
+    }
+
+    // ── #253: intra-language literal-bucketing recall gaps
+    // ──────────────────────────────────────
+
+    /// Kotlin lexes `true`/`false` as bare `identifier` leaves (not their own kinds), so before
+    /// #253 they alpha-renamed to `ID<n>` and a `true`↔`false`-only diff did NOT normalize equal.
+    /// The Kotlin-gated leaf-TEXT override now value-erases them to the SAME `LIT_BOOL` bucket
+    /// every other grammar's booleans use, so two Kotlin fns differing only in a boolean ARE a
+    /// clone. Also pins that `null` (also a bare `identifier` leaf in Kotlin) stays VERBATIM —
+    /// neither bucketed nor alpha-renamed to an `ID<n>` — matching the cross-language
+    /// null-family policy.
+    #[test]
+    fn kotlin_booleans_bucket_to_lit_bool() {
+        let t = "fun f(): Boolean { val a = compute(); val b = a; val x = true; return x }";
+        let f = "fun f(): Boolean { val a = compute(); val b = a; val x = false; return x }";
+        let nt = norm_lang(t, "t.kt", Language::Kotlin);
+        let nf = norm_lang(f, "t.kt", Language::Kotlin);
+        assert_eq!(nt, nf, "Kotlin true/false-only diff must normalize equal (LIT_BOOL)");
+        assert_eq!(
+            nt.iter().filter(|tok| *tok == "LIT_BOOL").count(),
+            1,
+            "exactly one LIT_BOOL leaf for the Kotlin boolean: {nt:?}"
+        );
+        // The boolean must NOT have leaked as a verbatim `true`/`false` NOR as an alpha-renamed ID
+        // sharing the identifier numbering (the pre-#253 bug).
+        assert!(
+            !nt.iter().any(|tok| tok == "true" || tok == "false"),
+            "no verbatim Kotlin bool: {nt:?}"
+        );
+
+        // `null` stays verbatim — not bucketed, not alpha-renamed.
+        let n = "fun g(): String? { val a = compute(); val b = a; val x = null; return x }";
+        let nn = norm_lang(n, "t.kt", Language::Kotlin);
+        assert!(
+            nn.iter().any(|tok| tok == "null"),
+            "Kotlin null stays verbatim (null-family policy): {nn:?}"
+        );
+        assert!(
+            !nn.iter().any(|tok| tok.starts_with("LIT_")),
+            "Kotlin null must NOT bucket to any LIT_ token: {nn:?}"
+        );
+    }
+
+    /// C and C++ parse `'x'` as a `char_literal` node wrapping a `'` / `character` / `'` leaf
+    /// triple. The quotes are structural (identical for any char) but the inner `character`
+    /// leaf carries the VALUE — before #253 it leaked verbatim, so two fns differing only in a
+    /// char (`'x'` vs `'y'`) did NOT normalize equal. The C/C++-gated `character` bucket
+    /// value-erases it to `LIT_CHARACTER`, so a char-value-only diff IS a clone. Checked for
+    /// both C and C++.
+    #[test]
+    fn c_and_cpp_char_value_buckets() {
+        // C: differ only in the char value.
+        let c_x = "int f(void) { int a = compute(); int b = a; char x = 'p'; return b; }";
+        let c_y = "int f(void) { int a = compute(); int b = a; char x = 'q'; return b; }";
+        let nc_x = norm_lang(c_x, "t.c", Language::C);
+        let nc_y = norm_lang(c_y, "t.c", Language::C);
+        assert_eq!(nc_x, nc_y, "C char-value-only diff must normalize equal (LIT_CHARACTER)");
+        assert!(
+            nc_x.iter().any(|tok| tok == "LIT_CHARACTER"),
+            "C char value must bucket to LIT_CHARACTER: {nc_x:?}"
+        );
+        // The value must not have leaked verbatim.
+        assert!(
+            !nc_x.iter().any(|tok| tok == "p"),
+            "C char value must not leak verbatim: {nc_x:?}"
+        );
+
+        // C++: differ only in the char value.
+        let cpp_x = "int f() { int a = compute(); int b = a; char x = 'p'; return b; }";
+        let cpp_y = "int f() { int a = compute(); int b = a; char x = 'q'; return b; }";
+        let ncpp_x = norm_lang(cpp_x, "t.cpp", Language::Cpp);
+        let ncpp_y = norm_lang(cpp_y, "t.cpp", Language::Cpp);
+        assert_eq!(ncpp_x, ncpp_y, "C++ char-value-only diff must normalize equal (LIT_CHARACTER)");
+        assert!(
+            ncpp_x.iter().any(|tok| tok == "LIT_CHARACTER"),
+            "C++ char value must bucket to LIT_CHARACTER: {ncpp_x:?}"
         );
     }
 

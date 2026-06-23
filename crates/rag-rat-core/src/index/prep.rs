@@ -303,7 +303,7 @@ pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<Prepared
     } else {
         parsed
             .as_ref()
-            .map(|p| clones::fingerprint_symbols(p.root(), &text, &symbols))
+            .map(|p| clones::fingerprint_symbols(p.root(), &text, file.language, &symbols))
             .unwrap_or_default()
     };
 

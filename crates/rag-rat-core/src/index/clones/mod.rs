@@ -23,7 +23,15 @@ use tree_sitter::Node;
 /// fingerprint read) auto-EXCLUDES the v1 rows, which are recomputed at v2 on the next reindex; the
 /// 4b refinement cache invalidates via `NORM_VERSION` in the content-addressed `refinement_key` +
 /// the freshness predicate (`refine::cache`). No schema migration is needed.
-pub(crate) const NORM_VERSION: i64 = 2;
+///
+/// `3` (#253): two intra-language literal-bucketing recall gaps close, both partition-contained
+/// (the language partition already blocks cross-language pairing, so these are MISSED-clone recall,
+/// never false positives) — (1) Kotlin `true`/`false` (lexed as bare `identifier` leaves) now
+/// value-erase to `LIT_BOOL` instead of alpha-renaming to `ID<n>`, and `null` stays verbatim
+/// instead of alpha-renaming; (2) the C/C++ `char_literal` VALUE leaf (`character`) now buckets to
+/// `LIT_CHARACTER` instead of leaking the char value verbatim. Same auto-exclude-then-recompute
+/// path as the v2 bump (no schema migration); a bump forces re-fingerprinting on the next reindex.
+pub(crate) const NORM_VERSION: i64 = 3;
 /// Bumped when the LCS alignment / refinement algorithm changes; participates in the content-
 /// addressed `refinement_key` and in the `clone_refinements` cache freshness predicate, so a bump
 /// invalidates every cached refinement without a schema migration (the same discipline as
@@ -83,8 +91,14 @@ pub(crate) struct SymbolFingerprint {
 }
 
 /// Baseline fingerprint for a symbol's AST node, or `None` if it normalizes below `MIN_TOKENS`.
-pub(crate) fn fingerprint_symbol(node: Node<'_>, text: &str) -> Option<SymbolFingerprint> {
-    let tokens = normalize::normalize_baseline(node, text);
+/// `lang` selects the per-language normalization overrides (Kotlin boolean/null leaves, C/C++ char
+/// value — #253); it must match the grammar that produced `node`.
+pub(crate) fn fingerprint_symbol(
+    node: Node<'_>,
+    text: &str,
+    lang: crate::language::Language,
+) -> Option<SymbolFingerprint> {
+    let tokens = normalize::normalize_baseline(node, text, lang);
     if tokens.len() < MIN_TOKENS {
         return None;
     }
@@ -123,6 +137,7 @@ fn symbol_is_function_valued(node: Node<'_>) -> bool {
 pub(crate) fn fingerprint_symbols(
     root: Node<'_>,
     text: &str,
+    lang: crate::language::Language,
     symbols: &[crate::index::symbols::Symbol],
 ) -> Vec<(usize, SymbolFingerprint)> {
     let mut out = Vec::new();
@@ -135,7 +150,7 @@ pub(crate) fn fingerprint_symbols(
         if symbol.kind != "function" && !symbol_is_function_valued(node) {
             continue;
         }
-        if let Some(fp) = fingerprint_symbol(node, text) {
+        if let Some(fp) = fingerprint_symbol(node, text, lang) {
             out.push((i, fp));
         }
     }
@@ -163,13 +178,13 @@ mod tests {
             .iter()
             .filter_map(|s| {
                 let node = parsed.root().descendant_for_byte_range(s.start_byte, s.end_byte)?;
-                let len = normalize::normalize_baseline(node, src).len();
+                let len = normalize::normalize_baseline(node, src, language).len();
                 Some((len, node))
             })
             .max_by_key(|(len, _)| *len)
             .map(|(_, node)| node)
             .expect("at least one symbol with a normalizable subtree");
-        fingerprint_symbol(node, src)
+        fingerprint_symbol(node, src, language)
     }
 
     /// Rust-only wrapper — the existing Rust fingerprint tests call this unchanged.
@@ -178,12 +193,13 @@ mod tests {
     }
 
     #[test]
-    fn norm_version_is_2() {
-        // #232: the comment-skip (T2) + multi-language literal bucketing (T3) changed the
-        // normalization stream, so NORM_VERSION must be 2. The read filter + content-addressed
-        // refinement key both key off this constant, so a stream change without the bump silently
-        // serves stale fingerprints/refinements.
-        assert_eq!(NORM_VERSION, 2);
+    fn norm_version_is_3() {
+        // #253: the Kotlin boolean/null leaf-text override + the C/C++ `character` value bucket
+        // changed the normalization stream again (on top of the #232 comment-skip + multi-language
+        // bucketing that took it to 2), so NORM_VERSION must be 3. The read filter + content-
+        // addressed refinement key both key off this constant, so a stream change without the bump
+        // silently serves stale fingerprints/refinements.
+        assert_eq!(NORM_VERSION, 3);
     }
 
     #[test]
@@ -209,6 +225,38 @@ mod tests {
     #[test]
     fn trivial_bodies_below_min_tokens_are_not_fingerprinted() {
         assert!(fp("fn x() -> i32 { 0 }").is_none());
+    }
+
+    /// #253: two Kotlin fns differing ONLY in a boolean leaf fingerprint identically. Pre-#253 the
+    /// `true`/`false` leaves alpha-renamed to `ID<n>` (and into the shared identifier numbering),
+    /// so the struct_hash diverged and the clone was MISSED. The Kotlin-gated `LIT_BOOL`
+    /// override makes them a clone. (Both bodies clear MIN_TOKENS.)
+    #[test]
+    fn kotlin_boolean_only_diff_is_a_clone() {
+        let t = "fun f(): Boolean { val a = compute(); val b = check(a); val c = wrap(b); val x = \
+                 true; return x }";
+        let f = "fun f(): Boolean { val a = compute(); val b = check(a); val c = wrap(b); val x = \
+                 false; return x }";
+        let ft = fp_lang(t, "t.kt", Language::Kotlin).expect("true body fingerprinted");
+        let ff = fp_lang(f, "t.kt", Language::Kotlin).expect("false body fingerprinted");
+        assert_eq!(ft.struct_hash, ff.struct_hash, "Kotlin boolean-only diff must be a clone");
+        assert_eq!(ft.token_bag, ff.token_bag);
+    }
+
+    /// #253: two C++ fns differing ONLY in a char value (`'p'` vs `'q'`) fingerprint identically.
+    /// Pre-#253 the inner `character` leaf leaked the value verbatim, diverging the struct_hash and
+    /// MISSING the clone; the C/C++-gated `LIT_CHARACTER` bucket value-erases it. (Both bodies
+    /// clear MIN_TOKENS.) C and C++ share the `character` leaf; the C/C++ gate covers both.
+    #[test]
+    fn cpp_char_value_only_diff_is_a_clone() {
+        let p = "int f() { int a = compute(); int b = check(a); int c = wrap(b); char x = 'p'; \
+                 return c; }";
+        let q = "int f() { int a = compute(); int b = check(a); int c = wrap(b); char x = 'q'; \
+                 return c; }";
+        let fp_p = fp_lang(p, "t.cpp", Language::Cpp).expect("'p' body fingerprinted");
+        let fp_q = fp_lang(q, "t.cpp", Language::Cpp).expect("'q' body fingerprinted");
+        assert_eq!(fp_p.struct_hash, fp_q.struct_hash, "C++ char-value-only diff must be a clone");
+        assert_eq!(fp_p.token_bag, fp_q.token_bag);
     }
 
     // ── Task 5 (#232): function-valued declarators are fingerprinted (kind unchanged)
@@ -262,15 +310,20 @@ mod tests {
             parsed.root().descendant_for_byte_range(decl.start_byte, decl.end_byte).expect("node");
         // Clears MIN_TOKENS (so this isn't the size gate) but is NOT function-valued.
         assert!(
-            normalize::normalize_baseline(node, big_object).len() >= MIN_TOKENS,
+            normalize::normalize_baseline(node, big_object, Language::TypeScript).len()
+                >= MIN_TOKENS,
             "fixture must clear MIN_TOKENS so the negative isolates the value guard"
         );
         assert!(
             !symbol_is_function_valued(node),
             "object-literal const must not be function-valued"
         );
-        let fps =
-            fingerprint_symbols(parsed.root(), big_object, &symbols::from_parsed(&parsed.symbols));
+        let fps = fingerprint_symbols(
+            parsed.root(),
+            big_object,
+            Language::TypeScript,
+            &symbols::from_parsed(&parsed.symbols),
+        );
         assert!(
             fps.is_empty(),
             "a large non-function-value const must NOT be fingerprinted: {fps:?}"

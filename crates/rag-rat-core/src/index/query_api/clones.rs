@@ -797,9 +797,10 @@ fn build_completeness(
         refine_budget_clamped,
         stale_members,
         // #232 closed the previously-advertised multi-language gaps: comments are now skipped,
-        // string + boolean literals bucket multi-language (NORM_VERSION = 2), and TS
-        // function-valued declarators are fingerprinted. No clone-substrate gaps are
-        // currently advertised open.
+        // string + boolean literals bucket multi-language, and TS function-valued declarators are
+        // fingerprinted. #253 closed two more intra-language literal-bucketing recall gaps (Kotlin
+        // boolean/null leaves, the C/C++ char value leaf) — see `NORM_VERSION` (now 3). No
+        // clone-substrate gaps are currently advertised open.
         known_index_gaps: Vec::new(),
     }
 }
@@ -1088,8 +1089,11 @@ impl IndexDatabase {
             // Plan 4b: use normalize_baseline_spanned so each token carries its AST span.
             // The seq (.0) is byte-identical to the old normalize_baseline output (faithfulness
             // pin).
-            let (seq, node_spans) =
-                crate::index::clones::normalize::normalize_baseline_spanned(node, &text);
+            let (seq, node_spans) = crate::index::clones::normalize::normalize_baseline_spanned(
+                node,
+                &text,
+                row.language,
+            );
 
             // Faithfulness pin: the re-parse must reproduce Plan-1's normalization exactly. A
             // mismatch means the on-disk file no longer matches the indexed fingerprint (the
