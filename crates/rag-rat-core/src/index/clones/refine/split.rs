@@ -68,11 +68,15 @@ const MAX_SPLIT_GROUPS: usize = 256;
 /// # Algorithm (greedy maximal clique cover)
 ///
 /// 1. Sort members ascending by id (determinism).
-/// 2. Canonicalize + sort + dedup `edges` into the coherent-edge seed list (each is ≥ θ by
-///    construction at the call site).
+/// 2. Canonicalize + dedup `edges`, then order the seed list by DESCENDING pairwise similarity
+///    (tie-break `(a, b)`) so tight real cliques grow before `MAX_SPLIT_GROUPS` trips (#256 R-A).
 /// 3. For each coherent edge not already fully contained in an emitted group, grow a maximal
 ///    coherent group from `{a, b}` by adding any remaining member (in id order) that is ≥ θ to
-///    every current group member.
+///    every current group member. (The grow scans members in id order; only the SEED order is
+///    similarity-ranked.) The cover is greedy and therefore seed-order-dependent, but: no member is
+///    ever dropped (the union of classes is order-invariant — post-budget endpoints become bare
+///    pairs), and on a single connected component (the only shape this receives — callers iterate
+///    per union-find component) descending-sim cover quality is ≥ id-order, never worse.
 /// 4. Drop groups that are a strict subset of another (keep only maximal cliques), de-duplicate
 ///    identical groups, drop singletons, and sort by lowest member id.
 ///
@@ -126,11 +130,10 @@ pub(crate) fn coherence_split(
     // keeps the seed order deterministic.
     let mut seeds: Vec<(f64, i64, i64)> =
         coherent_edges.iter().map(|&(a, b)| (similarity(a, b), a, b)).collect();
-    seeds.sort_by(|x, y| {
-        y.0.partial_cmp(&x.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| (x.1, x.2).cmp(&(y.1, y.2)))
-    });
+    // `total_cmp` (not `partial_cmp(...).unwrap_or(Equal)`): a guaranteed TOTAL order so the sort
+    // can never panic on a non-total comparator. similarity() cannot produce NaN today (both call
+    // sites guard `max_len == 0 → 1.0`), but total_cmp removes that footgun for any future caller.
+    seeds.sort_by(|x, y| y.0.total_cmp(&x.0).then_with(|| (x.1, x.2).cmp(&(y.1, y.2))));
 
     // 3. Greedy maximal clique cover: for each coherent edge not already fully inside some emitted
     // group, grow a maximal coherent group from {a, b} by adding any remaining member (in id order)
