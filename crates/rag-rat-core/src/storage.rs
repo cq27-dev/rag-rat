@@ -27,6 +27,24 @@ pub fn is_readonly_violation(err: &anyhow::Error) -> bool {
     })
 }
 
+/// A `SQLITE_BUSY` / `SQLITE_LOCKED` ("database is locked") failure: a writer (the background
+/// watcher, an `index` pass, a lazy heal) held the lock past this connection's `busy_timeout`. The
+/// MCP read path's read-write fallback retries on this with bounded backoff (#220) rather than
+/// surfacing a `-32603` to the agent. Walks the full `anyhow` cause chain — the rusqlite error is
+/// wrapped by the time it reaches the caller, same as [`is_readonly_violation`].
+pub fn is_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
+}
+
 #[derive(Debug)]
 pub struct IndexConnection {
     conn: Connection,
@@ -108,15 +126,16 @@ impl IndexConnection {
     }
 
     fn setup(&self) -> anyhow::Result<()> {
+        // busy_timeout is set FIRST so it is already active for `journal_mode = WAL` below: that
+        // pragma itself briefly needs the lock and would otherwise fail fast under a concurrent
+        // writer (#220). It makes a connection wait out a writer (the watcher mid-pass, a lazy
+        // heal) instead of failing with SQLITE_BUSY — WAL allows one writer at a time.
         self.conn.execute_batch(
             "
+            PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = ON;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
-            -- Wait out a concurrent writer (e.g. the background watcher mid-pass, or a lazy heal
-            -- on the query path) instead of failing with SQLITE_BUSY. WAL allows one writer at a
-            -- time; this serializes them safely without erroring.
-            PRAGMA busy_timeout = 5000;
             ",
         )?;
         Ok(())
@@ -189,5 +208,25 @@ mod tests {
         assert!(!is_readonly_violation(&syntax_err), "a non-readonly error must not be flagged");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn sqlite_failure(result_code: i32) -> anyhow::Error {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(result_code),
+            Some("database is locked".to_string()),
+        ))
+    }
+
+    #[test]
+    fn is_busy_flags_only_busy_and_locked_errors() {
+        // SQLITE_BUSY (5) and SQLITE_LOCKED (6) → busy; the MCP read-write fallback retries these.
+        assert!(is_busy(&sqlite_failure(rusqlite::ffi::SQLITE_BUSY)));
+        assert!(is_busy(&sqlite_failure(rusqlite::ffi::SQLITE_LOCKED)));
+        // A read-only violation (8) is NOT busy — it routes to the read-write open, not a backoff
+        // retry — and a plain error must not be mistaken for either.
+        let ro = sqlite_failure(rusqlite::ffi::SQLITE_READONLY);
+        assert!(!is_busy(&ro));
+        assert!(is_readonly_violation(&ro));
+        assert!(!is_busy(&anyhow::anyhow!("some unrelated error")));
     }
 }

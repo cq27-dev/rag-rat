@@ -3209,6 +3209,7 @@ dependencies = [
  "libc",
  "rag-rat-core",
  "rmcp",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

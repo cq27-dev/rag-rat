@@ -1209,3 +1209,43 @@ fn read_only_classification_covers_every_tool_and_denies_writers() {
         );
     }
 }
+
+#[test]
+fn busy_retry_rides_out_a_short_writer_but_is_bounded() {
+    use std::cell::Cell;
+
+    fn busy() -> anyhow::Error {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        ))
+    }
+
+    // Busy twice, then success — the read-write fallback rides out a brief writer instead of
+    // surfacing -32603 to the agent (#220).
+    let calls = Cell::new(0u32);
+    let ok: anyhow::Result<&str> = with_busy_retry(|| {
+        calls.set(calls.get() + 1);
+        if calls.get() < 3 { Err(busy()) } else { Ok("ok") }
+    });
+    assert_eq!(ok.unwrap(), "ok");
+    assert_eq!(calls.get(), 3, "retries the busy attempts");
+
+    // A non-busy error returns immediately — never mask a real error behind a backoff.
+    let calls = Cell::new(0u32);
+    let err: anyhow::Result<()> = with_busy_retry(|| {
+        calls.set(calls.get() + 1);
+        Err(anyhow::anyhow!("syntax error"))
+    });
+    assert!(err.is_err());
+    assert_eq!(calls.get(), 1, "non-busy errors are not retried");
+
+    // A sustained writer gives up after the bound, returning the busy error (not a hang).
+    let calls = Cell::new(0u32);
+    let exhausted: anyhow::Result<()> = with_busy_retry(|| {
+        calls.set(calls.get() + 1);
+        Err(busy())
+    });
+    assert!(rag_rat_core::storage::is_busy(&exhausted.unwrap_err()));
+    assert_eq!(calls.get(), 3, "bounded to MAX_ATTEMPTS");
+}

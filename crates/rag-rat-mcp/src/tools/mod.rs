@@ -110,12 +110,38 @@ pub fn call_tool_for_config(
     // READ tool keeps the worktree scope so its query still serves the overlay on this fallback;
     // its lazy heal can't corrupt the overlay because the heal paths skip writes under a linked
     // overlay scope (`IndexDatabase::active_scope_is_linked_overlay`) (#219 review).
-    let mut db = IndexDatabase::open_config(config)?;
-    if is_read_only_tool(name) {
-        db.use_worktree_scope(&config.root, scope_worktree.as_deref())?;
-    }
-    let result = call_tool_with_db(&db, name, arguments)?;
+    // A concurrent writer (the watcher mid-pass, an `index` pass, the post-commit `maintenance`
+    // hook) can hold the write lock past this connection's `busy_timeout`, so `open_config` + the
+    // call can still fail `SQLITE_BUSY` ("database is locked"). Retry the whole read-write attempt
+    // with bounded backoff rather than surfacing a `-32603` to the agent (#220). The common path —
+    // no writer, or the read-only open above — never reaches this fallback.
+    let result = with_busy_retry(|| {
+        let mut db = IndexDatabase::open_config(config)?;
+        if is_read_only_tool(name) {
+            db.use_worktree_scope(&config.root, scope_worktree.as_deref())?;
+        }
+        call_tool_with_db(&db, name, arguments.clone())
+    })?;
     finalize_tool_result(config, name, result)
+}
+
+/// Run a read-write tool attempt, retrying on `SQLITE_BUSY`/`SQLITE_LOCKED` with bounded
+/// exponential backoff. A writer can hold the lock past the connection's `busy_timeout`; rather
+/// than surface that to the agent as a `-32603`, re-open and retry a few times (#220). Bounded so a
+/// sustained writer (a rare full rebuild during interactive use) eventually returns the error
+/// instead of blocking indefinitely. Non-busy errors return immediately.
+fn with_busy_retry<T>(mut attempt: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut tries = 0u32;
+    loop {
+        match attempt() {
+            Err(err) if tries + 1 < MAX_ATTEMPTS && rag_rat_core::storage::is_busy(&err) => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25 * (1 << tries)));
+            },
+            result => return result,
+        }
+    }
 }
 
 /// The caller `worktree` (a linked-worktree checkout path): the explicit `worktree` request field,

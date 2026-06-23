@@ -26,6 +26,11 @@ tokio = { workspace = true, features = ["sync", "io-util"] }
 libc.workspace = true
 tokio = { workspace = true, features = ["net", "time", "signal"] }
 
+[dev-dependencies]
+# Already built transitively via rag-rat-core; a direct dev-dep lets the busy-retry test (#220)
+# construct a SQLITE_BUSY error to drive `with_busy_retry`.
+rusqlite.workspace = true
+
 [features]
 default = ["fastembed", "model2vec"]
 fastembed = ["rag-rat-core/fastembed"]
