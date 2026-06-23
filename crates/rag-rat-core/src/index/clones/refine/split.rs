@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn coherence_split_dense_clique_scales() {
         let theta = 0.70;
-        let count: i64 = 1000; // ~5.9s pre-fix (O(n³)); ~0.45s standalone post-fix (O(edges)).
+        let count: i64 = 1500; // O(n³) regression ~40-60s+ under load; O(edges) cover ~10s.
         let members: Vec<i64> = (0..count).collect();
         // Every pair is coherent at 0.90 — a genuinely dense full clique above θ.
         let sim = |_a: i64, _b: i64| 0.90_f64;
@@ -399,13 +399,15 @@ mod tests {
         let union: std::collections::BTreeSet<i64> = split.iter().flatten().copied().collect();
         let expected: std::collections::BTreeSet<i64> = members.iter().copied().collect();
         assert_eq!(union, expected, "the union of class members must equal the input members");
-        // Hang-detector, not a microbenchmark: the O(n³) scan took ~5.9s standalone in debug at
-        // n=1000 (tens of seconds under full-suite contention); the O(edges) cover is ~0.45s
-        // standalone, ~2-3s under full-suite CPU saturation. The 4s ceiling sits between them so an
-        // O(n³) reintroduction reddens here while scheduler noise does not.
+        // COARSE hang-detector, NOT a microbenchmark — the durable guard is the correctness
+        // assertion above. A wall-clock ceiling under nextest's per-core parallelism is inherently
+        // noisy: the old 4s ceiling at n=1000 flaked at ~4.25s under full-suite CPU saturation. So
+        // this uses generous headroom — at n=1500 the O(edges) cover is ~10s under load while an
+        // O(n³) reintroduction is ~40-60s+; the 30s ceiling sits ~3x clear of the pass case (no
+        // scheduler-noise flake) yet still reddens on a cubic regression.
         assert!(
-            elapsed.as_secs() < 4,
-            "dense clique of {count} must split fast (O(edges)), took {elapsed:?}"
+            elapsed.as_secs() < 30,
+            "dense clique of {count} must split in ~O(edges), not O(n³); took {elapsed:?}"
         );
     }
 
