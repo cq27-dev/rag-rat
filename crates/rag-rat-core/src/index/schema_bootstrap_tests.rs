@@ -10176,6 +10176,20 @@ fn conn_table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
     .is_some()
 }
 
+/// Delete every `schema_version` ledger row for a migration NEWER than `version`, so a freshly
+/// `apply`ed in-memory DB reads as if it stopped at `version` and the next
+/// `apply`/`migrate_forward` replays `version + 1` onward. `known_version` reads the MAX applied
+/// version, so EVERY later row must go (leaving one would keep the schema Compatible and skip the
+/// forward migrate). Migration ids are `NNN_name`, so the leading three digits are the version.
+/// Migration-count-agnostic: a newly added migration is truncated automatically, so a schema bump
+/// no longer means editing a growing list of named `DELETE FROM schema_version` lines (#222).
+fn truncate_schema_to(conn: &rusqlite::Connection, version: u32) {
+    conn.execute("DELETE FROM schema_version WHERE CAST(substr(id, 1, 3) AS INTEGER) > ?1", [
+        i64::from(version),
+    ])
+    .expect("truncate schema_version ledger");
+}
+
 /// V022 bootstrap (fresh-applies-all): a brand-new index applies every migration through V022 and
 /// ends with the `packages` table and the three DEDICATED edge import-scope columns — and the
 /// `edges` compatibility view surfaces them. There is NO `files.package_id` column: the
@@ -10531,7 +10545,6 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 33);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10593,26 +10606,14 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         ALTER TABLE edges_data DROP COLUMN import_scope_start_byte;
         ALTER TABLE edges_data DROP COLUMN import_scope_end_byte;
         ALTER TABLE edges_data DROP COLUMN import_mod_id;
-        DELETE FROM schema_version WHERE id = '022_per_package_import_scope';
-        -- Also drop the later migration rows so `known_version` reads the contiguous V21 below;
-        -- leaving any would make the applied-set max > 21 and skip the migrate. (The artifacts
-        -- those later migrations added — the edges view (V023), files.has_test_code (V024) — can
-        -- stay: their apply fns are idempotent, so the forward-migrate below is a clean no-op for
-        -- the parts already present.)
-        DELETE FROM schema_version WHERE id = '023_dispatch_edge_facts_view_exclusion';
-        DELETE FROM schema_version WHERE id = '024_files_has_test_code';
-        DELETE FROM schema_version WHERE id = '025_chunk_text_compression_tables';
-        DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';
-        DELETE FROM schema_version WHERE id = '027_drop_chunks_text';
-        DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
-        DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
-        DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
-        DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
-        DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
-        DELETE FROM schema_version WHERE id = '033_dream_findings';
         ",
     )
     .unwrap();
+    // Truncate the ledger to V21 so `known_version` reads V21 and the forward-migrate replays
+    // V022+. The artifacts the later migrations added — the edges view (V023),
+    // files.has_test_code (V024), … — can stay: their apply fns are idempotent, so the
+    // forward-migrate is a clean no-op for the parts already present.
+    truncate_schema_to(&conn, 21);
     assert_eq!(schema::status(&conn).unwrap().current_version, 21, "now looks like a V21 index");
     assert!(!conn_table_exists(&conn, "packages"));
 
@@ -10748,22 +10749,12 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
         ",
     )
     .unwrap();
-    // 3. Drop the V028..V031 ledger rows so the schema reads Older and the migration replays. Every
-    //    later row must go — `known_version` reads the MAX applied version, so leaving any (e.g.
-    //    V031) would keep the schema Compatible and skip the forward migrate.
-    conn.execute_batch(
-        "DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
-         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
-         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
-         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
-         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
-         DELETE FROM schema_version WHERE id = '033_dream_findings';",
-    )
-    .unwrap();
+    // 3. Truncate the ledger to V27 so the pre-V028 shape reads Older and the migration replays.
+    truncate_schema_to(&conn, 27);
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "removing the V028..V032 ledger rows makes the pre-V028 shape Older"
+        "truncating the ledger to V27 makes the pre-V028 shape Older"
     );
 
     // --- Forward-migrate ---
@@ -12308,11 +12299,10 @@ fn migration_032_adds_token_bag_drops_postings() {
              token_hash      INTEGER NOT NULL,
              freq            INTEGER NOT NULL,
              PRIMARY KEY (symbol_id, normalizer_kind, token_hash)
-         ) STRICT;
-         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
-         DELETE FROM schema_version WHERE id = '033_dream_findings';",
+         ) STRICT;",
     )
     .expect("revert to V031 shape");
+    truncate_schema_to(&conn, 31);
     assert!(
         !conn_table_columns(&conn, "symbol_fingerprints").contains(&"token_bag".to_string()),
         "token_bag is absent before the migration runs"
@@ -12378,19 +12368,12 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
         !cols_before.contains(&"lcs_sampled".to_string()),
         "lcs_sampled must be absent before the migration runs"
     );
-    // Remove the V030 ledger row (and every later one) so the schema reads Older and
-    // migrate_forward replays V030. Later migrations (V031+) must also be unrecorded or
-    // `known_version` would still report LATEST and the schema would read Compatible.
-    conn.execute_batch(
-        "DELETE FROM schema_version
-         WHERE id IN ('030_clone_refinements_lcs_sampled', '031_edge_oracle_content_anchor',
-                      '032_clone_token_bag_blob', '033_dream_findings');",
-    )
-    .expect("delete V030+ ledger rows");
+    // Truncate the ledger to V29 so the schema reads Older and migrate_forward replays V030.
+    truncate_schema_to(&conn, 29);
     assert_eq!(
         crate::index::schema::status(&conn).unwrap().state,
         crate::index::schema::SchemaState::Older,
-        "schema is Older after removing V030 ledger row"
+        "schema is Older after truncating the ledger to V29"
     );
 
     // --- Run the forward migration ---
@@ -12463,18 +12446,12 @@ fn migration_031_edge_oracle_no_fk_content_key() {
         ",
     )
     .expect("recreate legacy V018 edge_oracle");
-    // Drop the V031 AND every newer ledger row: `known_version` reads the MAX applied version, so
-    // leaving any later row recorded would keep the schema Compatible and skip the forward migrate.
-    conn.execute_batch(
-        "DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
-         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
-         DELETE FROM schema_version WHERE id = '033_dream_findings';",
-    )
-    .expect("drop V031+ ledger rows");
+    // Truncate the ledger to V30 so the schema reads Older and the forward migrate replays V031.
+    truncate_schema_to(&conn, 30);
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "schema is Older after dropping the V031/V032 ledger rows + reverting the table shape"
+        "schema is Older after truncating the ledger to V30 + reverting the table shape"
     );
     // Confirm the legacy FK is really there before migrating.
     let fk_before: i64 = conn
