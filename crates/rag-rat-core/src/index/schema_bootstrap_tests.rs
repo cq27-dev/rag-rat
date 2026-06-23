@@ -13858,6 +13858,65 @@ fn clones_for_chained_symbol_serves_tight_neighborhood() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// #256 (R7) recall pin: a 7-copy structurally-identical clone family (the `collect_rows`-style
+/// shape that motivated the issue) is STILL found after the over-merge fix, and the genuine clone
+/// class is refined with full coverage + ranks well. The fix only ever PARTITIONS an over-merged
+/// component into ≤-coherent classes; it must never drop a real multi-copy clone below the recall
+/// floor. The seven bodies are byte-identical up to identifier names (alpha-renamed to ID<n>), so
+/// they share one struct_hash → ONE coherent 7-member class via the struct-hash fast path.
+#[test]
+fn find_clones_recall_pin_seven_copy_clone_still_found() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Seven copies of the same DB-getter shape, differing only in fn + variable names. Same
+    // structural token sequence ⇒ same struct_hash ⇒ one clone class (no member loss).
+    for (i, (name, var)) in [
+        ("collect_a", "a"),
+        ("collect_b", "b"),
+        ("collect_c", "c"),
+        ("collect_d", "d"),
+        ("collect_e", "e"),
+        ("collect_f", "f"),
+        ("collect_g", "g"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        fs::write(
+            root.join(format!("src/f{i}.rs")),
+            format!(
+                "pub fn {name}(db: Db) -> i32 {{ let {var} = db.get(1); validate({var}); \
+                 transform({var}); {var} + 1 }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    // The 7-copy clone must be found as ONE class with all 7 members (recall preserved — no member
+    // dropped by the split).
+    let seven = res
+        .classes
+        .iter()
+        .find(|c| c.member_count == 7)
+        .expect("the 7-copy clone class must still be found at θ=0.7");
+    // Genuine clone → refined with full coverage and a strong refactorability (the coverage gate
+    // does NOT penalize it; it ranks well, not buried).
+    assert!(seven.refined, "the 7-copy clone is refined");
+    assert!(
+        seven.anti_unify_coverage.unwrap_or(0.0) >= 0.5,
+        "a byte-identical 7-copy clone must have high coverage, got {:?}",
+        seven.anti_unify_coverage
+    );
+    assert!(seven.roi > 0.0, "a genuine clone keeps a positive ROI");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Helper: write four renamed clones (identical structure, different identifiers) across two
 /// directories into `root`, returning the rebuilt index. The four functions form ONE clean,
 /// high-fidelity clone class — the canonical refine fixture.
