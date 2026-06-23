@@ -1559,7 +1559,7 @@ pub(crate) fn apply_dream_findings(conn: &Connection) -> rusqlite::Result<()> {
             last_seen_at_ms INTEGER NOT NULL,
             reviewed_at_ms INTEGER,
             UNIQUE(kind, subject, claim_hash)
-        );
+        ) STRICT;
 
         CREATE INDEX IF NOT EXISTS idx_dream_findings_status ON dream_findings(status);
         CREATE INDEX IF NOT EXISTS idx_dream_findings_subject ON dream_findings(kind, subject);

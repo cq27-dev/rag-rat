@@ -42,6 +42,17 @@ pub struct DreamOptions {
     pub limit: usize, // max coverage_gap findings
 }
 
+/// Half-life for worklist rank decay: an unreviewed finding loses half its rank every 2 weeks, so a
+/// stale item sinks below fresh ones instead of squatting the top forever (anti-rot).
+const RANK_HALF_LIFE_MS: f64 = 14.0 * 86_400_000.0;
+
+/// `base_rank` decayed by age since the finding was first surfaced (`first_seen_at_ms`). This is
+/// the effective ordering rank the worklist exposes — the schema's documented age-decay, made real.
+fn effective_rank(base_rank: f64, first_seen_at_ms: i64, now_ms: i64) -> f64 {
+    let age = (now_ms - first_seen_at_ms).max(0) as f64;
+    base_rank * 0.5_f64.powf(age / RANK_HALF_LIFE_MS)
+}
+
 fn claim_hash(kind: &str, subject: &str, evidence: &str) -> String {
     let mut h = Sha256::new();
     h.update(kind.as_bytes());
@@ -68,17 +79,26 @@ fn hex16(bytes: &[u8]) -> String {
 
 /// `coverage_gap`: top call-graph in-degree symbols with no memory binding (load-bearing code with
 /// no institutional memory). Importance = DISTINCT caller count (`edges_data` carries several rows
-/// per caller pair, so `COUNT(*)` would over-count). The covered-symbol/path and test-infra filters
-/// are applied IN SQL *before* the LIMIT, so the budget is spent on ELIGIBLE rows — a pre-filter
-/// LIMIT lets high-in-degree covered/test symbols starve real gaps below the window.
+/// per caller pair, so `COUNT(*)` would over-count). COVERAGE mirrors the canonical memory query
+/// (query/memory/api.rs): a callee is covered if a binding matches its `symbol_id`, its logical
+/// symbol (mapped through `logical_symbol_members` — a logical_symbol binding covers ALL its member
+/// variants, not just the one stored `symbol_id`), or its file path. Test infra is filtered by
+/// `has_test_code`, NOT an unanchored `path LIKE '%test%'` (which would drop real files like
+/// `attestation.rs`/`latest.rs`). All filters run IN SQL *before* the LIMIT so the budget is spent
+/// on ELIGIBLE rows. The `files` join resolves to the active-checkout `temp.files` view so callees
+/// are checkout-scoped; the caller in-degree is not yet scoped (follow-up: reuse the scoped
+/// `important_symbols` PageRank instead of this raw in-degree proxy).
 fn coverage_gap(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<DreamFinding>> {
     let mut stmt = conn.prepare(
         "SELECT s.name, f.path, COUNT(DISTINCT e.from_symbol_id) AS d FROM edges_data e JOIN \
          symbols s ON s.id = e.to_symbol_id JOIN files f ON f.id = s.file_id WHERE e.to_symbol_id \
-         IS NOT NULL AND e.from_symbol_id IS NOT NULL AND f.path NOT LIKE '%test%' AND \
-         e.to_symbol_id NOT IN (SELECT symbol_id FROM repo_memory_bindings WHERE symbol_id IS NOT \
-         NULL) AND f.path NOT IN (SELECT path FROM repo_memory_bindings WHERE path IS NOT NULL) \
-         GROUP BY e.to_symbol_id ORDER BY d DESC LIMIT ?1",
+         IS NOT NULL AND e.from_symbol_id IS NOT NULL AND f.has_test_code = 0 AND e.to_symbol_id \
+         NOT IN (SELECT symbol_id FROM repo_memory_bindings WHERE symbol_id IS NOT NULL) AND \
+         e.to_symbol_id NOT IN (SELECT lsm.symbol_id FROM logical_symbol_members lsm JOIN \
+         repo_memory_bindings b ON b.logical_symbol_id = lsm.logical_symbol_id WHERE \
+         b.logical_symbol_id IS NOT NULL) AND f.path NOT IN (SELECT path FROM \
+         repo_memory_bindings WHERE path IS NOT NULL) GROUP BY e.to_symbol_id ORDER BY d DESC \
+         LIMIT ?1",
     )?;
     let rows: Vec<(String, String, i64)> = stmt
         .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -108,7 +128,10 @@ fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
     let re = Regex::new(r"\b((?:crates|apps|tools|src)/[\w./-]+\.rs)\b").expect("static regex");
 
     let mut out = Vec::new();
-    let mut stmt = conn.prepare("SELECT id, body FROM repo_memories WHERE status = 'active'")?;
+    // 'stale'-status memories are still LIVE (just flagged) and are the ones most likely to hold a
+    // moved/deleted path — scan them too, matching the memory layer's status IN ('active','stale').
+    let mut stmt =
+        conn.prepare("SELECT id, body FROM repo_memories WHERE status IN ('active', 'stale')")?;
     let mems: Vec<(String, String)> =
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     for (id, body) in mems {
@@ -138,8 +161,21 @@ fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
 }
 
 /// Sync findings into `dream_findings` with the identity-keyed lifecycle (refresh / supersede /
-/// resolve). Returns (opened, refreshed, superseded, resolved).
+/// resolve), ATOMICALLY: all writes run in one transaction so a mid-run failure can't leave a torn
+/// worklist (the per-finding upserts + the resolve pass commit together or not at all). Returns
+/// (opened, refreshed, superseded, resolved).
 fn sync(
+    conn: &Connection,
+    findings: &[DreamFinding],
+    now_ms: i64,
+) -> rusqlite::Result<(usize, usize, usize, usize)> {
+    let tx = conn.unchecked_transaction()?;
+    let counts = sync_in_tx(&tx, findings, now_ms)?;
+    tx.commit()?;
+    Ok(counts)
+}
+
+fn sync_in_tx(
     conn: &Connection,
     findings: &[DreamFinding],
     now_ms: i64,
@@ -228,23 +264,27 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<Drea
     findings.extend(stale_reference(conn)?);
     let (opened, refreshed, superseded, resolved) = sync(conn, &findings, opts.now_ms)?;
 
-    // emit the OPEN worklist from the store (post-sync), ranked
+    // emit the OPEN worklist from the store (post-sync); each finding's exposed rank is its
+    // base_rank DECAYED by age since first_seen (effective_rank) — a stale unreviewed finding
+    // sinks below fresh ones (the documented anti-rot, now real, not just base_rank DESC).
     let mut open: Vec<DreamFinding> = conn
         .prepare(
-            "SELECT kind, subject, evidence, base_rank FROM dream_findings WHERE status = 'open' \
-             ORDER BY base_rank DESC, subject",
+            "SELECT kind, subject, evidence, base_rank, first_seen_at_ms FROM dream_findings \
+             WHERE status = 'open'",
         )?
         .query_map([], |r| {
+            let base: f64 = r.get(3)?;
+            let first_seen: i64 = r.get(4)?;
             Ok(DreamFinding {
                 kind: r.get(0)?,
                 subject: r.get(1)?,
                 evidence: r.get(2)?,
-                rank: r.get(3)?,
+                rank: effective_rank(base, first_seen, opts.now_ms),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    // deterministic order: rank desc, then subject (ties — e.g. all stale_reference at 0.5 — are
-    // stable across runs/reindexes instead of arbitrary SQLite row order).
+    // deterministic order: effective rank desc, then subject (ties — e.g. fresh stale_reference at
+    // base 0.5 — are stable across runs/reindexes instead of arbitrary SQLite row order).
     open.sort_by(|a, b| {
         b.rank
             .partial_cmp(&a.rank)
@@ -380,6 +420,17 @@ mod tests {
         assert!(
             report.findings.iter().any(|f| f.kind == "stale_reference" && f.subject == "m1"),
             "non-vacuous: the seeded memory produced a stale_reference finding"
+        );
+    }
+
+    #[test]
+    fn rank_decays_with_age() {
+        let hl = RANK_HALF_LIFE_MS as i64;
+        assert!((effective_rank(1.0, 0, 0) - 1.0).abs() < 1e-9, "no decay at age 0");
+        assert!((effective_rank(1.0, 0, hl) - 0.5).abs() < 0.01, "one half-life halves the rank");
+        assert!(
+            effective_rank(1.0, 0, 2 * hl) < effective_rank(1.0, 0, hl),
+            "older unreviewed findings sink further"
         );
     }
 }
