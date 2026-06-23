@@ -114,6 +114,24 @@ pub(crate) fn coherence_split(
     coherent_edges.sort_unstable();
     coherent_edges.dedup();
 
+    // 2b. Seed high-similarity edges FIRST so tight real cliques grow WITHIN the MAX_SPLIT_GROUPS
+    // budget instead of falling into the bare-pair tail (#256 R-A). On the dogfood a true 7-member
+    // `collect_rows` clique (all pairs sim ≥ 0.959) was fragmented to 2-member pairs because its
+    // edges sorted late (by id) inside a 2,599-member sparse transitive component glued by generic
+    // low-`df` tokens — the budget tripped on 256 noise cliques before collect_rows was reached.
+    // Ordering by descending similarity grows the tight cliques first; the low-similarity
+    // transitive "glue" edges sort last and become the bare pairs after the trip — correct,
+    // since they are the over-merge noise, not real clones. Similarity is computed ONCE per
+    // edge here (O(edges)), NOT in the comparator. The descending-sim + `(a, b)` tie-break
+    // keeps the seed order deterministic.
+    let mut seeds: Vec<(f64, i64, i64)> =
+        coherent_edges.iter().map(|&(a, b)| (similarity(a, b), a, b)).collect();
+    seeds.sort_by(|x, y| {
+        y.0.partial_cmp(&x.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| (x.1, x.2).cmp(&(y.1, y.2)))
+    });
+
     // 3. Greedy maximal clique cover: for each coherent edge not already fully inside some emitted
     // group, grow a maximal coherent group from {a, b} by adding any remaining member (in id order)
     // that is coherent with every current group member. Emit the group.
@@ -145,7 +163,7 @@ pub(crate) fn coherence_split(
         std::collections::HashMap::new();
     let mut budget_tripped = false;
 
-    for &(a, b) in &coherent_edges {
+    for &(_sim, a, b) in &seeds {
         if budget_tripped {
             // Over budget: emit the edge directly as a 2-member clique (still internally coherent —
             // it is a θ-edge). No grow, no containment bookkeeping. The later dedup/subset pass is
@@ -409,6 +427,63 @@ mod tests {
             elapsed.as_secs() < 30,
             "dense clique of {count} must split in ~O(edges), not O(n³); took {elapsed:?}"
         );
+    }
+
+    /// #256 R-A regression: a true high-similarity clique buried in a giant transitive component
+    /// (whose generic low-`df` "glue" trips `MAX_SPLIT_GROUPS`) must still be GROWN, not fragmented
+    /// to bare pairs. Pre-fix the clique's edges sorted late (by id) into the post-budget bare-pair
+    /// tail — on the dogfood the real 7-copy `collect_rows` clique came back as 2-member pairs.
+    /// Seeding by descending similarity grows the tight clique first.
+    #[test]
+    fn coherence_split_grows_tight_clique_before_budget_trips() {
+        let theta = 0.70;
+        // A 7-member tight clique (high ids, sim 1.0) connected to a 300-leaf star hub (sim 0.70);
+        // the star's 301 disjoint 2-cliques trip MAX_SPLIT_GROUPS (256) before any id-ordered pass
+        // would reach the high-id clique edges.
+        let clique: Vec<i64> = (1000..=1006).collect();
+        let clique_set: std::collections::HashSet<i64> = clique.iter().copied().collect();
+        let mut members: Vec<i64> = vec![0];
+        members.extend(1..=300);
+        members.extend(clique.iter().copied());
+
+        let sim = |a: i64, b: i64| -> f64 {
+            if clique_set.contains(&a) && clique_set.contains(&b) {
+                1.0 // tight clique: every pair maximally coherent
+            } else if (a == 0 && ((1..=300).contains(&b) || b == 1000))
+                || (b == 0 && ((1..=300).contains(&a) || a == 1000))
+            {
+                0.70 // hub↔leaf (and the hub↔clique connector that joins the component)
+            } else {
+                0.0 // leaves don't cohere with each other or the clique → small cliques
+            }
+        };
+
+        let mut edges: Vec<(i64, i64)> = Vec::new();
+        for i in 1..=300 {
+            edges.push((0, i)); // star: 300 disjoint 2-cliques
+        }
+        edges.push((0, 1000)); // connector: clique shares the star's component
+        for i in 0..clique.len() {
+            for j in (i + 1)..clique.len() {
+                edges.push((clique[i], clique[j])); // 21 tight-clique pairs, high ids
+            }
+        }
+
+        let split = coherence_split(&members, &edges, sim, theta);
+
+        // The tight 7-clique is GROWN as ONE group (descending-sim seed), not 21 bare pairs.
+        assert!(
+            split.iter().any(|g| {
+                let s: std::collections::HashSet<i64> = g.iter().copied().collect();
+                s == clique_set
+            }),
+            "the tight high-similarity clique must be grown as ONE group, not fragmented: \
+             {split:?}"
+        );
+        // Zero member loss across the whole (budget-tripping) component.
+        let union: std::collections::BTreeSet<i64> = split.iter().flatten().copied().collect();
+        let expected: std::collections::BTreeSet<i64> = members.iter().copied().collect();
+        assert_eq!(union, expected, "no member may be dropped");
     }
 
     /// #256 pin (a): a 250-member LOOSE clique — every pair coherent at exactly 0.80 (> θ), well
