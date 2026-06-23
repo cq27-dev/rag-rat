@@ -34,7 +34,16 @@ pub(crate) const NORM_VERSION: i64 = 2;
 /// anti-unification (real template + variation points + proposed signature + REAL coverage, v2
 /// scores). Every 4a-cached row at `alignment_version = 1` therefore MISSES the lookup
 /// (`WHERE … alignment_version = ?3`) and is recomputed with the 4b payload on the next refine.
-pub(crate) const ALIGNMENT_VERSION: i64 = 2;
+///
+/// `3` (#254 / #274 items 16): three string-hole widening fixes change the rendered template +
+/// variation-point payload for affected classes — a TS/JS `template_string` (`` `hi` ``) now
+/// widens to the whole backtick literal, an empty-`""`-vs-nonempty diff now widens its quote run to
+/// the whole `string_literal` (no stray quote), and an interpolated `` `…${x}…` `` is left
+/// un-widened (the `${x}` stays fixed). A class refined + cached at `alignment_version = 2` holds
+/// the OLD (broken) template, so the bump invalidates those rows; they recompute with the corrected
+/// payload on the next refine. Display-only — scoring/coverage SEMANTICS are unchanged; this is the
+/// cache-freshness discipline, not a behavior change to the over-claim contract.
+pub(crate) const ALIGNMENT_VERSION: i64 = 3;
 /// Smallest normalized-token count a symbol must reach to be fingerprinted (skip trivial getters).
 pub(crate) const MIN_TOKENS: usize = 20;
 

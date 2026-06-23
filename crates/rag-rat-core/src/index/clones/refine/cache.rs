@@ -627,12 +627,12 @@ mod tests {
 
     /// An `ALIGNMENT_VERSION` bump invalidates a stale-version row: a row written at
     /// `alignment_version = 1` (the 4a pin) MISSES the lookup at the current `ALIGNMENT_VERSION`
-    /// (= 2), so it is never served; recomputing writes the row at the current version with the
+    /// (= 3), so it is never served; recomputing writes the row at the current version with the
     /// REAL 4b payload. (The bump lives in the lookup WHERE + the content key — no schema
     /// migration.)
     #[test]
     fn alignment_version_bump_invalidates_and_recomputes() {
-        assert_eq!(ALIGNMENT_VERSION, 2, "this test pins the post-4b alignment version");
+        assert_eq!(ALIGNMENT_VERSION, 3, "this test pins the current alignment version");
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::index::schema::apply(&conn).unwrap();

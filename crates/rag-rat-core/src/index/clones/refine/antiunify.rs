@@ -1669,32 +1669,82 @@ fn is_string_body_leaf_kind(kind: &str) -> bool {
     matches!(kind, "string_content" | "string_fragment")
 }
 
-/// The quote-bearing string-NODE kinds that wrap a string-body leaf: Rust/Python `string_literal`
-/// and TS/JS `string` (#232 #2a).
+/// The quote-bearing string-NODE kinds that wrap a string-body leaf: Rust/Python `string_literal`,
+/// TS/JS `string` (#232 #2a), and TS/JS `template_string` — the `` `…` `` template literal (#254).
+///
+/// A `template_string` is admitted here so a differing `string_fragment` inside a backtick literal
+/// (`` `hi` `` vs `` `lo` ``) widens to the WHOLE `` `hi` `` (backticks included), exactly like a
+/// `"…"`. CAUTION — an INTERPOLATED template (`` `hi${x}lo` ``) contains a `template_substitution`
+/// child; widening a fragment run to the whole `template_string` there would SWALLOW the `${x}`
+/// interpolation into the hole. The single caller [`widen_string_content_run`] guards against that
+/// by REFUSING to widen to any string node whose subtree carries a `template_substitution` — the
+/// bare fragment run is left as-is (an honest under-report, never an over-claim). So this predicate
+/// stays a simple kind test; the interpolation safety lives in the widen gate.
 fn is_string_node_kind(kind: &str) -> bool {
-    matches!(kind, "string_literal" | "string")
+    matches!(kind, "string_literal" | "string" | "template_string")
 }
 
-/// Widen a Raw run that is a bare string-body LEAF (`string_content` / `string_fragment`) to the
-/// enclosing quote-bearing string NODE's whole span, so the hole covers the WHOLE `"hello"` (quotes
-/// included) — not just the inner text (Fix 3, #215 Plan 4b Codex round-5; extended to TS/JS in
-/// #232 #2a). A non-string run is returned unchanged.
+/// `true` for a leaf that can legitimately sit INSIDE a quote-bearing string node — either the
+/// value-erased body leaf (`string_content` / `string_fragment`) or one of the DELIMITER leaves the
+/// grammar emits around it. The delimiter set covers the empty-literal case (#274 item 16): an
+/// empty `""` / `` `` `` has NO body leaf, only the two quote/backtick leaves, so a `""`-vs-`"x"`
+/// diff surfaces the variation run on a QUOTE leaf rather than a `string_content`. Admitting quote
+/// leaves lets that run still widen to the whole literal (the quotes are part of the `&str` value),
+/// instead of leaving a stray `"`/`` ` `` as fixed template text. Escape-sequence leaves (`\n`)
+/// inside a non-empty literal are also string-internal and widen the same way.
+///
+/// NOT a `template_substitution` delimiter (`${` / `}`): those bound an interpolation, which the
+/// widen gate refuses to cross — see [`is_string_node_kind`].
+fn is_string_delimiter_or_body_leaf_kind(kind: &str) -> bool {
+    is_string_body_leaf_kind(kind) || matches!(kind, "\"" | "`" | "'" | "escape_sequence")
+}
+
+/// `true` when the anchor subtree rooted at `str_col` contains a `template_substitution` — i.e. it
+/// is an INTERPOLATED template literal (`` `hi${x}lo` ``). Widening a fragment/quote run to such a
+/// node would swallow the `${…}` interpolation into the hole, so [`widen_string_content_run`] does
+/// not widen across it (#254 caution). Walks the contiguous pre-order subtree by byte containment,
+/// mirroring [`subtree_token_count`].
+fn string_node_has_interpolation(anchor: &RefineMember, str_col: usize) -> bool {
+    let root_end = anchor.node_spans[str_col].end_byte;
+    let mut k = str_col + 1;
+    while k < anchor.node_spans.len() && anchor.node_spans[k].start_byte < root_end {
+        if anchor.node_spans[k].kind == "template_substitution" {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+/// Widen a Raw run that is a single string-internal LEAF — the value-erased body
+/// (`string_content` / `string_fragment`) OR a delimiter/quote leaf of an empty literal — to the
+/// enclosing quote-bearing string NODE's whole span, so the hole covers the WHOLE `"hello"` /
+/// `` `hi` `` (quotes included) — not just the inner text (Fix 3, #215 Plan 4b Codex round-5;
+/// extended to TS/JS `string` in #232 #2a; to TS/JS `template_string` and to the empty-literal
+/// quote run in #254 / #274 items 16). A non-string run is returned unchanged.
 ///
 /// Reconstructs the enclosing string node from the pre-order `node_spans` (no parent pointers): the
-/// tightest `string_literal`/`string` node whose byte span CONTAINS the content leaf, then the
-/// contiguous pre-order token range of that node (its root column through the last column inside
-/// its byte span). Falls back to the original run if no enclosing string node is found (defensive —
-/// a bare body leaf with no wrapper, which the grammars never emit).
+/// tightest `string_literal` / `string` / `template_string` node whose byte span CONTAINS the leaf,
+/// then the contiguous pre-order token range of that node (its root column through the last column
+/// inside its byte span). Falls back to the original run if no enclosing string node is found
+/// (defensive — a bare body leaf with no wrapper, which the grammars never emit).
+///
+/// INTERPOLATION SAFETY (#254): an interpolated `` `hi${x}lo` `` is NEVER widened — the chosen
+/// string node would carry a `template_substitution`, so widening would swallow the `${x}` into the
+/// hole. Such a node is rejected (`string_node_has_interpolation`) and the bare fragment run is
+/// left as-is: an honest under-report (a stray backtick at worst), never an over-claim across the
+/// interpolation boundary.
 fn widen_string_content_run(anchor: &RefineMember, lo: usize, hi: usize) -> (usize, usize) {
-    // Only a single string-body leaf needs widening — a wider run already covers its quotes.
+    // Only a single string-internal leaf needs widening — a wider run already covers its quotes.
     if lo != hi {
         return (lo, hi);
     }
     let leaf = &anchor.node_spans[lo];
-    if !(leaf.is_leaf && is_string_body_leaf_kind(leaf.kind)) {
+    if !(leaf.is_leaf && is_string_delimiter_or_body_leaf_kind(leaf.kind)) {
         return (lo, hi);
     }
-    // Tightest enclosing string node (smallest byte span containing the content leaf).
+    // Tightest enclosing string node (smallest byte span containing the leaf) that is NOT an
+    // interpolated template (widening across a `${…}` would swallow the interpolation — #254).
     let mut best: Option<usize> = None;
     let mut best_width = usize::MAX;
     for (c, sp) in anchor.node_spans.iter().enumerate() {
@@ -1703,7 +1753,7 @@ fn widen_string_content_run(anchor: &RefineMember, lo: usize, hi: usize) -> (usi
         }
         if sp.start_byte <= leaf.start_byte && leaf.end_byte <= sp.end_byte {
             let width = sp.end_byte.saturating_sub(sp.start_byte);
-            if width < best_width {
+            if width < best_width && !string_node_has_interpolation(anchor, c) {
                 best_width = width;
                 best = Some(c);
             }
@@ -2699,6 +2749,29 @@ mod tests {
         let (seq, node_spans) = normalize_baseline_spanned(node, &text);
         let struct_hash = tokens::struct_hash(&seq);
         RefineMember { symbol_id, lang: Language::Rust, struct_hash, seq, node_spans, text }
+    }
+
+    /// Build a `RefineMember` from a TypeScript snippet — the TS analogue of [`member`]. Picks the
+    /// target symbol by MAX normalized-token count (the function body), exactly as the production
+    /// loader / the `normalize` tests' `target_node_for` do, so it works for TS `function`,
+    /// `const`/arrow declarators, etc. Used by the template-literal / TS-string tests (#254 #274).
+    fn member_ts(symbol_id: i64, src: &str) -> RefineMember {
+        let text: Arc<str> = Arc::from(src);
+        let parsed =
+            parser::parse_file(Path::new("t.ts"), Language::TypeScript, &text).expect("parse");
+        let node = parsed
+            .symbols
+            .iter()
+            .filter_map(|s| {
+                let n = parsed.root().descendant_for_byte_range(s.start_byte, s.end_byte)?;
+                Some((normalize_baseline_spanned(n, &text).0.len(), n))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, n)| n)
+            .expect("a body symbol");
+        let (seq, node_spans) = normalize_baseline_spanned(node, &text);
+        let struct_hash = tokens::struct_hash(&seq);
+        RefineMember { symbol_id, lang: Language::TypeScript, struct_hash, seq, node_spans, text }
     }
 
     /// Sort members into the canonical order the loader guarantees. Production keys on the
@@ -4210,6 +4283,151 @@ mod tests {
             (template.anti_unify_coverage - 1.0).abs() < 1e-12,
             "identical members → coverage 1.0, got {}",
             template.anti_unify_coverage
+        );
+    }
+
+    #[test]
+    fn ts_template_literal_hole_widens_to_whole_template_string() {
+        // #254: a differing `string_fragment` inside a TS/JS `template_string` (`` `hi` `` vs
+        // `` `lo` ``) must widen its hole to the WHOLE `` `hi` `` (backticks included), exactly
+        // like the `"hello"`/`"world"` `string` case. Before the fix, `is_string_node_kind` knew
+        // only `string_literal`/`string`, so the enclosing `template_string` was not recognised and
+        // the backticks rendered as FIXED text around a bare-fragment hole (`` `⟨m0⟩` ``). After:
+        // the hole is the whole literal → bare `⟨m0⟩`, per_member_values carry the backticks,
+        // ValueParam High &str.
+        let a = member_ts(1, "function a() { const s = `hi`; sink(s); }");
+        let b = member_ts(2, "function b() { const s = `lo`; sink(s); }");
+        let (members, template) = run(vec![a, b]);
+
+        let str_vp = template
+            .variation_points
+            .iter()
+            .find(|vp| vp.kind == MetavarKind::ValueParam)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a value_param metavar for the template-literal hole, got {:?}",
+                    template.variation_points
+                )
+            });
+
+        // per_member_values are the WHOLE template literals (backticks INCLUDED).
+        let mut vals = str_vp.per_member_values.clone();
+        vals.sort();
+        assert_eq!(
+            vals,
+            vec!["`hi`".to_string(), "`lo`".to_string()],
+            "per_member_values must be the whole `` `hi` ``/`` `lo` `` (backticks included), got \
+             {:?}",
+            str_vp.per_member_values
+        );
+        assert_eq!(str_vp.per_member_values.len(), members.len());
+        assert_eq!(str_vp.type_hint.as_deref(), Some("LIT_STRING_CONTENT"));
+
+        // The template renders a BARE hole — the backticks are INSIDE it, NOT fixed text around it
+        // (no `` `⟨m0⟩` ``).
+        let label = format!("⟨{}⟩", str_vp.metavar_id);
+        assert!(
+            template.text.contains(&label),
+            "template must render the hole, got {:?}",
+            template.text
+        );
+        assert!(
+            !template.text.contains(&format!("`{label}`")),
+            "the backticks must be INSIDE the hole, not fixed text around it (no `` `⟨m0⟩` ``), \
+             got {:?}",
+            template.text
+        );
+    }
+
+    #[test]
+    fn ts_template_literal_interpolation_is_not_swallowed_by_widen() {
+        // #254 CAUTION: an INTERPOLATED template (`` `hi${x}lo` `` vs `` `aa${x}bb` ``) carries a
+        // `template_substitution` child. Widening a fragment run to the WHOLE `template_string`
+        // there would SWALLOW the `${x}` interpolation into the hole — an over-widen. The widen
+        // gate must REFUSE to cross the substitution: the `${x}` stays FIXED template text
+        // and each differing fragment is its own (un-widened, bare-fragment) hole. Never an
+        // over-claim across the interpolation boundary.
+        let a = member_ts(1, "function a() { const s = `hi${x}lo`; sink(s); }");
+        let b = member_ts(2, "function b() { const s = `aa${x}bb`; sink(s); }");
+        let (_members, template) = run(vec![a, b]);
+
+        // The `${x}` interpolation survives verbatim in the template (NOT inside any hole).
+        assert!(
+            template.text.contains("${x}"),
+            "the `${{x}}` interpolation must stay fixed, not be swallowed into a hole, got {:?}",
+            template.text
+        );
+
+        // The two differing fragments surface as their OWN holes with the fragment values — the
+        // widen did NOT collapse the whole template into one hole spanning the interpolation.
+        let all_vals: Vec<String> = template
+            .variation_points
+            .iter()
+            .flat_map(|vp| vp.per_member_values.iter().cloned())
+            .collect();
+        assert!(
+            all_vals.iter().all(|v| !v.contains("${")),
+            "no per-member value may contain the interpolation `${{` (widen must stop at it), got \
+             {all_vals:?}",
+        );
+        for v in ["hi", "lo", "aa", "bb"] {
+            assert!(
+                all_vals.iter().any(|val| val == v),
+                "fragment {v:?} must surface as its own hole value, got {all_vals:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn empty_string_vs_nonempty_widens_no_stray_quote() {
+        // #274 item 16: an empty `""` has NO `string_content` leaf — only the two `"` quote leaves
+        // — so a `""`-vs-`"x"` diff surfaces the variation run on a QUOTE leaf, not a
+        // `string_content`. Before the fix, `widen_string_content_run` gated only on the body leaf,
+        // so the quote run was NOT widened: the template rendered a stray trailing `"`
+        // (`let s = ⟨m0⟩";`) and the hole classified ClosureParam Low with values `["\"", "\"x"]`.
+        // After: the quote run widens to the whole `string_literal` → bare `⟨m0⟩`, values are the
+        // WHOLE `""`/`"x"`, ValueParam High &str. Distinct from #254 (this is the empty-literal
+        // delimiter run, not the template-string node kind).
+        let a = member(1, "fn a() { let s = \"\"; sink(s); }");
+        let b = member(2, "fn b() { let s = \"x\"; sink(s); }");
+        let (members, template) = run(vec![a, b]);
+
+        let str_vp = template
+            .variation_points
+            .iter()
+            .find(|vp| vp.kind == MetavarKind::ValueParam)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the empty-vs-nonempty string hole must be a value_param, got {:?}",
+                    template.variation_points
+                )
+            });
+
+        // per_member_values are the WHOLE literals (quotes included), NOT the broken `["\"",
+        // "\"x"]`.
+        let mut vals = str_vp.per_member_values.clone();
+        vals.sort();
+        assert_eq!(
+            vals,
+            vec!["\"\"".to_string(), "\"x\"".to_string()],
+            "per_member_values must be the whole `\"\"`/`\"x\"` (quotes included), got {:?}",
+            str_vp.per_member_values
+        );
+        assert_eq!(str_vp.per_member_values.len(), members.len());
+        assert_eq!(str_vp.type_hint.as_deref(), Some("LIT_STRING_CONTENT"));
+
+        // NO stray quote: the template renders a BARE hole with no `"` adjacent to the label.
+        let label = format!("⟨{}⟩", str_vp.metavar_id);
+        assert!(
+            template.text.contains(&label),
+            "template must render the hole, got {:?}",
+            template.text
+        );
+        assert!(
+            !template.text.contains(&format!("{label}\""))
+                && !template.text.contains(&format!("\"{label}")),
+            "no stray quote may sit adjacent to the hole (the quotes are INSIDE it), got {:?}",
+            template.text
         );
     }
 
