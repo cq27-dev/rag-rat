@@ -17,20 +17,40 @@ use crate::language::Language;
 /// How well the syntactic type recovery succeeded for the proposed signature.
 ///
 /// `serde` serializes to the same machine string as [`Typedness::as_db_str`]
-/// (`syntactic`/`partial`/`unknown`) — the persisted `proposed_signature_json` shape (Plan-4b Task
-/// 7).
+/// (`syntactic`/`structural`/`partial`/`unknown`) — the persisted `proposed_signature_json` shape
+/// (Plan-4b Task 7). The string is opaque to consumers (the CLI prints it; nothing parses it back
+/// into this enum), so a new variant is additive: no migration, no reader change. A stale cached
+/// row written before this variant existed surfaces the OLD label until the class is recomputed,
+/// which is a less-honest label, never an over-claim.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Typedness {
-    /// Every promoted param was assigned a type (from an AST annotation or a literal-bucket
-    /// coarse mapping) AND there are no `unresolved_type_slots`. The signature is complete enough
-    /// for display.
+    /// Every promoted param was assigned a CONCRETE type (from an AST annotation or a
+    /// literal-bucket coarse mapping) AND there are no `unresolved_type_slots`. The signature
+    /// is complete enough for display.
     Syntactic,
+    /// Every promoted param carries a STRUCTURAL type with no concrete referent, there are no
+    /// `unresolved_type_slots`, and NO param has a concrete (`type_source != "none"`) type. Today
+    /// the only structural type is `impl Fn()` minted for a `closure_param` — we know the hole is a
+    /// callable but cannot recover the concrete closure type without SCIP.
+    ///
+    /// This is deliberately distinct from BOTH neighbors and exists to remove the #274-item-10
+    /// surprise (a render like `fn extracted(arg0: impl Fn())` paired with `typedness=unknown`):
+    /// - NOT `Syntactic`: that would over-claim a resolved/concrete referent a `closure_param` does
+    ///   not have (no annotation, no literal bucket — `type_source` stays `"none"`). The hard
+    ///   "never over-claim" contract forbids it.
+    /// - NOT `Unknown`: that under-reports. The rendered signature visibly carries `impl Fn()`, so
+    ///   "no type info" reads as wrong. `Structural` says exactly what is true: structurally typed,
+    ///   no concrete referent.
+    ///
+    /// A MIX of concrete + structural params is `Partial` (some concrete, some not), never
+    /// `Structural`.
+    Structural,
     /// Some promoted params have a type, some do not; OR `unresolved_type_slots` is non-empty
     /// (a gapped metavar is present). Displayable but incomplete.
     Partial,
-    /// No promoted params have a usable type, or there are no promoted params (non-Rust / all
-    /// closures with no annotation). Signature is positional only.
+    /// No promoted params have a usable type string at all, or there are no promoted params
+    /// (non-Rust / a closure with no `impl Fn()` placeholder). Signature is positional only.
     Unknown,
 }
 
@@ -38,6 +58,7 @@ impl Typedness {
     pub(crate) fn as_db_str(&self) -> &'static str {
         match self {
             Typedness::Syntactic => "syntactic",
+            Typedness::Structural => "structural",
             Typedness::Partial => "partial",
             Typedness::Unknown => "unknown",
         }
@@ -556,7 +577,25 @@ fn compute_typedness(
     if all_typed && !has_gaps {
         Typedness::Syntactic
     } else if typed_count == 0 && generic_params.is_empty() && !has_gaps {
-        Typedness::Unknown
+        // No CONCRETE types (`typed_count == 0` ⟺ every param has `type_source == "none"`), no
+        // generics, no gaps. Two sub-cases hide here and must NOT share a label:
+        //
+        // (a) every param carries a STRUCTURAL type string (today only `impl Fn()` from a
+        //     `closure_param`) → `Structural`. The render visibly shows `arg0: impl Fn()`, so the
+        //     `Unknown` "no type info" label is the #274-item-10 surprise. `Structural` is honest:
+        //     structurally typed, no concrete referent. It does NOT over-claim — `type_source` is
+        //     still `"none"`, so we never assert a resolved closure type.
+        //
+        // (b) at least one param has NO type string at all (`type_text == None` — non-Rust, or a
+        //     closure with no `impl Fn()` placeholder) → `Unknown`, positional only.
+        //
+        // A value_param with an unresolved generic `T<n>` placeholder never reaches here: it sets
+        // `unresolved_type_slots`, so `has_gaps` is true and this branch is skipped for it.
+        if params.iter().all(|p| p.type_text.is_some()) {
+            Typedness::Structural
+        } else {
+            Typedness::Unknown
+        }
     } else {
         Typedness::Partial
     }
@@ -963,6 +1002,133 @@ mod tests {
             matches!(sig.confidence, Confidence::Medium | Confidence::Low),
             "closure_param class must have confidence ≤ Medium, got {:?}",
             sig.confidence
+        );
+
+        // #274 item 10: the render carries `impl Fn()`, so typedness must NOT be the surprising
+        // `Unknown` ("no type info"). For a pure-closure class (every promoted param is an
+        // `impl Fn()` structural type, no concrete types, no gaps) the honest label is
+        // `Structural`.
+        let pure_closure = !sig.params.is_empty()
+            && sig.params.iter().all(|p| p.type_text.as_deref() == Some("impl Fn()"))
+            && sig.unresolved_type_slots.is_empty();
+        if pure_closure {
+            assert_eq!(
+                sig.typedness,
+                Typedness::Structural,
+                "a pure-closure class renders `impl Fn()` → typedness is Structural, not the \
+                 surprising Unknown, got {:?}",
+                sig.typedness
+            );
+        }
+    }
+
+    // ── #274 item 10: a pure-closure class is Structural (impl Fn() typed, no concrete referent)
+    // ──
+
+    #[test]
+    fn pure_closure_param_typedness_is_structural_not_unknown() {
+        // #274 item 10: a class whose ONLY variation is a differing callee mints one
+        // `closure_param` VP rendered as `impl Fn()`. That param has `type_source ==
+        // "none"` (no annotation, no literal bucket — the concrete closure type needs
+        // SCIP), so `compute_typedness`'s `typed_count` is 0 and the class used to fall to
+        // `Unknown`. The render shows `arg0: impl Fn()` while typedness said "no type info"
+        // — internally consistent but surprising. The honest label is `Structural`:
+        // structurally typed, no concrete referent.
+        //
+        // Crucially this is NOT an over-claim: `type_source` stays `"none"` (we never assert a
+        // resolved/concrete type for a closure), and `Structural` is strictly weaker than
+        // `Syntactic`. The contract "may under-report, must never over-claim" holds — we only
+        // upgrade the DISPLAY label from Unknown to the more precise Structural.
+        let (_, template, sig) =
+            make_sig(&["pub fn a() { foo(); foo() }", "pub fn b() { foo(); bar() }"]);
+
+        // Precondition: a pure-closure class — exactly the closure_param VP, no value/type/gapped
+        // VP.
+        let closure_count = template
+            .variation_points
+            .iter()
+            .filter(|vp| vp.kind == MetavarKind::ClosureParam)
+            .count();
+        assert_eq!(closure_count, 1, "expected exactly one closure_param VP, got {closure_count}");
+        assert!(
+            !template.variation_points.iter().any(|vp| matches!(
+                vp.kind,
+                MetavarKind::ValueParam | MetavarKind::TypeParam | MetavarKind::Gapped
+            )),
+            "this fixture must be a PURE closure class (no value/type/gapped VPs), got {:?}",
+            template.variation_points
+        );
+
+        // The single param is `impl Fn()` with `type_source == "none"` (no concrete recovery).
+        assert_eq!(sig.params.len(), 1, "one promoted closure param, got {:?}", sig.params);
+        let p = &sig.params[0];
+        assert_eq!(p.type_text.as_deref(), Some("impl Fn()"), "closure param renders impl Fn()");
+        assert_eq!(
+            p.type_source, "none",
+            "a closure param has NO concrete type source — recovering one would over-claim a \
+             resolved referent the class does not have"
+        );
+        assert!(sig.unresolved_type_slots.is_empty(), "pure-closure class has no gapped slots");
+        assert!(sig.generic_params.is_empty(), "pure-closure class promotes no generics");
+
+        // The honest typedness is Structural — neither the over-claiming Syntactic nor the
+        // surprising/under-reporting Unknown.
+        assert_eq!(
+            sig.typedness,
+            Typedness::Structural,
+            "pure-closure typedness must be Structural, got {:?}",
+            sig.typedness
+        );
+        assert_ne!(sig.typedness, Typedness::Syntactic, "Structural must never become Syntactic");
+        assert_ne!(
+            sig.typedness,
+            Typedness::Unknown,
+            "the impl Fn() render must not read as Unknown"
+        );
+
+        // The serialized/DB string is the new `structural` token (additive — opaque to readers).
+        assert_eq!(sig.typedness.as_db_str(), "structural");
+        assert_eq!(
+            serde_json::to_value(&sig.typedness).unwrap(),
+            serde_json::Value::String("structural".to_string()),
+            "serde must serialize Structural to the same `structural` token as as_db_str"
+        );
+    }
+
+    #[test]
+    fn no_runtime_param_typedness_distinguishes_unknown_from_structural() {
+        // Guard the Structural/Unknown split at the unit level so it can't silently collapse:
+        // - a closure param (`impl Fn()`, type_text Some, type_source none) → Structural;
+        // - a truly untyped positional param (type_text None) → Unknown;
+        // - a MIX of the two → Partial (some concrete-less-but-structural, some none).
+        let closure = SigParam {
+            name: "arg0".to_string(),
+            type_text: Some("impl Fn()".to_string()),
+            type_source: "none",
+            metavar_id: "m0".to_string(),
+        };
+        let bare = SigParam {
+            name: "arg1".to_string(),
+            type_text: None,
+            type_source: "none",
+            metavar_id: "m1".to_string(),
+        };
+
+        // Pure structural → Structural.
+        assert_eq!(
+            compute_typedness(std::slice::from_ref(&closure), 0, &[], &[]),
+            Typedness::Structural
+        );
+        // Pure untyped → Unknown.
+        assert_eq!(compute_typedness(std::slice::from_ref(&bare), 0, &[], &[]), Typedness::Unknown);
+        // Mixed structural + untyped → not all `type_text.is_some()` → Unknown is wrong, must be
+        // Unknown only when EVERY param lacks a type string; a structural + bare mix is Unknown
+        // here too (one param has no type string), which is honest (positional for the bare one).
+        // The point: a bare param drags the band down, never up.
+        assert_eq!(
+            compute_typedness(&[closure, bare], 0, &[], &[]),
+            Typedness::Unknown,
+            "a param with NO type string keeps the class out of Structural"
         );
     }
 
