@@ -132,6 +132,9 @@ pub(crate) fn important_symbols(
 /// stale references), sync it into `dream_findings`, and render the open worklist. Writes ONLY to
 /// `dream_findings` — never mutates a memory.
 pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
+    // `dream` WRITES dream_findings — serialize with the watcher/index like every other write
+    // command (index/maintenance/oracle); WriteLock is reentrant so the open-time migrate is safe.
+    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
     let db = open_index(config)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

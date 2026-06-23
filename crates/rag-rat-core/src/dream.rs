@@ -19,8 +19,6 @@ use rusqlite::Connection;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const COVERAGE_GAP_SCAN: usize = 400; // in-degree candidates to consider before filtering/limiting
-
 #[derive(Debug, Clone, Serialize)]
 pub struct DreamFinding {
     pub kind: String,
@@ -69,54 +67,32 @@ fn hex16(bytes: &[u8]) -> String {
 }
 
 /// `coverage_gap`: top call-graph in-degree symbols with no memory binding (load-bearing code with
-/// no institutional memory). Importance proxy = raw in-degree; rank normalized to the top.
+/// no institutional memory). Importance = DISTINCT caller count (`edges_data` carries several rows
+/// per caller pair, so `COUNT(*)` would over-count). The covered-symbol/path and test-infra filters
+/// are applied IN SQL *before* the LIMIT, so the budget is spent on ELIGIBLE rows — a pre-filter
+/// LIMIT lets high-in-degree covered/test symbols starve real gaps below the window.
 fn coverage_gap(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<DreamFinding>> {
-    let covered_syms: HashSet<i64> = conn
-        .prepare("SELECT DISTINCT symbol_id FROM repo_memory_bindings WHERE symbol_id IS NOT NULL")?
-        .query_map([], |r| r.get::<_, i64>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let covered_paths: HashSet<String> = conn
-        .prepare("SELECT DISTINCT path FROM repo_memory_bindings WHERE path IS NOT NULL")?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-
     let mut stmt = conn.prepare(
-        "SELECT to_symbol_id, COUNT(*) AS d FROM edges_data WHERE to_symbol_id IS NOT NULL GROUP \
-         BY to_symbol_id ORDER BY d DESC LIMIT ?1",
+        "SELECT s.name, f.path, COUNT(DISTINCT e.from_symbol_id) AS d FROM edges_data e JOIN \
+         symbols s ON s.id = e.to_symbol_id JOIN files f ON f.id = s.file_id WHERE e.to_symbol_id \
+         IS NOT NULL AND e.from_symbol_id IS NOT NULL AND f.path NOT LIKE '%test%' AND \
+         e.to_symbol_id NOT IN (SELECT symbol_id FROM repo_memory_bindings WHERE symbol_id IS NOT \
+         NULL) AND f.path NOT IN (SELECT path FROM repo_memory_bindings WHERE path IS NOT NULL) \
+         GROUP BY e.to_symbol_id ORDER BY d DESC LIMIT ?1",
     )?;
-    let candidates: Vec<(i64, i64)> = stmt
-        .query_map([COVERAGE_GAP_SCAN as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let rows: Vec<(String, String, i64)> = stmt
+        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let top_d = candidates.first().map(|(_, d)| *d).unwrap_or(1).max(1) as f64;
-
-    let mut out = Vec::new();
-    for (sym_id, d) in candidates {
-        if out.len() >= limit {
-            break;
-        }
-        if covered_syms.contains(&sym_id) {
-            continue;
-        }
-        let row = conn
-            .query_row(
-                "SELECT s.name, f.path FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.id \
-                 = ?1",
-                [sym_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .ok();
-        let Some((name, path)) = row else { continue };
-        if covered_paths.contains(&path) || path.to_lowercase().contains("test") {
-            continue; // test infra is high-in-degree but not a real coverage gap (spike eval: 4/20)
-        }
-        out.push(DreamFinding {
+    let top_d = rows.first().map(|(_, _, d)| *d).unwrap_or(1).max(1) as f64;
+    Ok(rows
+        .into_iter()
+        .map(|(name, path, d)| DreamFinding {
             kind: "coverage_gap".into(),
             subject: format!("{path}::{name}"),
-            evidence: format!("{d} callers, no memory binding [E0 importance proxy]"),
+            evidence: format!("{d} distinct callers, no memory binding [E0 importance proxy]"),
             rank: d as f64 / top_d,
-        });
-    }
-    Ok(out)
+        })
+        .collect())
 }
 
 /// `stale_reference`: a memory body references a `.rs` path that no longer resolves against the
@@ -136,9 +112,15 @@ fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
     let mems: Vec<(String, String)> =
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     for (id, body) in mems {
+        let bytes = body.as_bytes();
         let mut gone: Vec<String> = re
             .captures_iter(&body)
-            .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .filter_map(|c| c.get(1))
+            // skip refs embedded in a URL or a longer path (preceded by '/' or ':') — a common
+            // false-positive source; a genuine reference is preceded by whitespace/punctuation.
+            // (Rust's regex has no lookbehind, so this is a post-filter on the match start.)
+            .filter(|m| m.start() == 0 || !matches!(bytes[m.start() - 1], b'/' | b':'))
+            .map(|m| m.as_str().to_string())
             .filter(|p| !resolves(p))
             .collect();
         gone.sort();
@@ -167,37 +149,60 @@ fn sync(
     for f in findings {
         let ch = claim_hash(&f.kind, &f.subject, &f.evidence);
         seen.insert((f.kind.clone(), f.subject.clone()));
-        let existing: Option<String> = conn
+        // Look up by the EXACT claim (incl. its current status) — NOT status-blind, or an evidence
+        // flip-back (A→B→A) or a resolved-then-reappears would match a terminal row and silently
+        // refresh it, stranding the actually-current finding.
+        let existing: Option<(String, String)> = conn
             .query_row(
-                "SELECT id FROM dream_findings WHERE kind = ?1 AND subject = ?2 AND claim_hash = \
-                 ?3",
+                "SELECT id, status FROM dream_findings WHERE kind = ?1 AND subject = ?2 AND \
+                 claim_hash = ?3",
                 rusqlite::params![f.kind, f.subject, ch],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok();
-        if existing.is_some() {
+        // supersede any OTHER current row for this (kind, subject) — used by both the revive and
+        // the brand-new branches (the world changed, so a prior verdict no longer applies).
+        let supersede_others = |id: &str| {
             conn.execute(
-                "UPDATE dream_findings SET last_seen_at_ms = ?1, base_rank = ?2 WHERE kind = ?3 \
-                 AND subject = ?4 AND claim_hash = ?5",
-                rusqlite::params![now_ms, f.rank, f.kind, f.subject, ch],
-            )?;
-            refreshed += 1;
-            continue;
+                "UPDATE dream_findings SET status = 'superseded', superseded_by = ?1 WHERE kind = \
+                 ?2 AND subject = ?3 AND id != ?1 AND status IN ('open','accepted','dismissed')",
+                rusqlite::params![id, f.kind, f.subject],
+            )
+        };
+        match existing {
+            // same claim still current: refresh, preserving any human verdict (accepted/dismissed)
+            Some((id, status)) if matches!(status.as_str(), "open" | "accepted" | "dismissed") => {
+                conn.execute(
+                    "UPDATE dream_findings SET last_seen_at_ms = ?1, base_rank = ?2 WHERE id = ?3",
+                    rusqlite::params![now_ms, f.rank, id],
+                )?;
+                refreshed += 1;
+            },
+            // same claim was terminal (resolved/superseded/archived) but REAPPEARED: revive to open
+            // (UNIQUE(kind,subject,claim_hash) forbids a fresh insert) + supersede other current
+            // rows.
+            Some((id, _terminal)) => {
+                conn.execute(
+                    "UPDATE dream_findings SET status = 'open', superseded_by = NULL, \
+                     last_seen_at_ms = ?1, base_rank = ?2 WHERE id = ?3",
+                    rusqlite::params![now_ms, f.rank, id],
+                )?;
+                opened += 1;
+                superseded += supersede_others(&id)?;
+            },
+            // brand-new claim for this (kind, subject): open fresh + supersede prior current rows
+            None => {
+                let id = finding_id(&f.kind, &f.subject, &ch);
+                conn.execute(
+                    "INSERT INTO dream_findings(id, kind, subject, claim_hash, evidence, \
+                     base_rank, status, first_seen_at_ms, last_seen_at_ms) \
+                     VALUES(?1,?2,?3,?4,?5,?6,'open',?7,?7)",
+                    rusqlite::params![id, f.kind, f.subject, ch, f.evidence, f.rank, now_ms],
+                )?;
+                opened += 1;
+                superseded += supersede_others(&id)?;
+            },
         }
-        // new claim for this (kind, subject): supersede any current (open/verdict) finding, open
-        // fresh
-        let id = finding_id(&f.kind, &f.subject, &ch);
-        conn.execute(
-            "INSERT INTO dream_findings(id, kind, subject, claim_hash, evidence, base_rank, \
-             status, first_seen_at_ms, last_seen_at_ms) VALUES(?1,?2,?3,?4,?5,?6,'open',?7,?7)",
-            rusqlite::params![id, f.kind, f.subject, ch, f.evidence, f.rank, now_ms],
-        )?;
-        opened += 1;
-        superseded += conn.execute(
-            "UPDATE dream_findings SET status = 'superseded', superseded_by = ?1 WHERE kind = ?2 \
-             AND subject = ?3 AND id != ?1 AND status NOT IN ('resolved','superseded','archived')",
-            rusqlite::params![id, f.kind, f.subject],
-        )?;
     }
     // resolve: any current finding whose (kind, subject) was not reported this run -> drift gone
     let current: Vec<(String, String, String)> = conn
@@ -226,7 +231,8 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<Drea
     // emit the OPEN worklist from the store (post-sync), ranked
     let mut open: Vec<DreamFinding> = conn
         .prepare(
-            "SELECT kind, subject, evidence, base_rank FROM dream_findings WHERE status = 'open'",
+            "SELECT kind, subject, evidence, base_rank FROM dream_findings WHERE status = 'open' \
+             ORDER BY base_rank DESC, subject",
         )?
         .query_map([], |r| {
             Ok(DreamFinding {
@@ -237,7 +243,14 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<Drea
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    open.sort_by(|a, b| b.rank.partial_cmp(&a.rank).unwrap_or(std::cmp::Ordering::Equal));
+    // deterministic order: rank desc, then subject (ties — e.g. all stale_reference at 0.5 — are
+    // stable across runs/reindexes instead of arbitrary SQLite row order).
+    open.sort_by(|a, b| {
+        b.rank
+            .partial_cmp(&a.rank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.subject.cmp(&b.subject))
+    });
     Ok(DreamReport { findings: open, opened, refreshed, superseded, resolved })
 }
 
@@ -283,15 +296,90 @@ mod tests {
     }
 
     #[test]
-    fn dream_run_writes_findings_never_touches_memories() {
+    fn flip_back_and_resolved_reappears_keep_the_worklist_correct() {
         let c = mem_db();
-        let before: i64 =
-            c.query_row("SELECT COUNT(*) FROM repo_memories", [], |r| r.get(0)).unwrap();
+        let cg = |ev: &str, rank: f64| {
+            vec![DreamFinding {
+                kind: "coverage_gap".into(),
+                subject: "x::F".into(),
+                evidence: ev.into(),
+                rank,
+            }]
+        };
+        let open_evidence = |c: &Connection| -> (String, f64) {
+            c.query_row(
+                "SELECT evidence, base_rank FROM dream_findings WHERE status='open'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let count = |c: &Connection, status: &str| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM dream_findings WHERE status=?1", [status], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        // A -> B -> A: the flip-back must leave A current with A's evidence, NOT strand B as open.
+        sync(&c, &cg("10 callers", 0.1), 1000).unwrap();
+        sync(&c, &cg("40 callers", 0.9), 2000).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 3000).unwrap();
+        assert_eq!(count(&c, "open"), 1, "exactly one open row after flip-back");
+        assert_eq!(
+            open_evidence(&c),
+            ("10 callers".into(), 0.1),
+            "current (A) is open, not stale B"
+        );
+        // resolve, then reappear with the SAME evidence: must revive to open, not stay resolved.
+        sync(&c, &[], 4000).unwrap();
+        assert!(count(&c, "resolved") >= 1, "absent finding resolves");
+        sync(&c, &cg("10 callers", 0.1), 5000).unwrap();
+        assert_eq!(count(&c, "open"), 1, "reappearing resolved finding is revived to open");
+    }
+
+    #[test]
+    fn dream_run_never_mutates_any_memory_column() {
+        let c = mem_db();
+        // seed a memory whose body references a gone path so stale_reference is forced to READ it
+        // and emit a finding keyed on this memory (makes the assertion non-vacuous).
+        c.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version) VALUES \
+             ('m1','Invariant','t','refs \
+             crates/ghost/src/vanished.rs','high','active','agent',1,1,'agent','v1')",
+            [],
+        )
+        .unwrap();
+        // snapshot every column dream could plausibly mutate (stronger than a row COUNT: an
+        // in-place UPDATE to body/status/etc. would pass a count check but fail this).
+        let snap = |c: &Connection| {
+            c.query_row(
+                "SELECT body, status, confidence, kind, title, created_by, created_at_ms, \
+                 updated_at_ms, source, memory_version FROM repo_memories WHERE id='m1'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, i64>(7)?,
+                        r.get::<_, String>(8)?,
+                        r.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let before = snap(&c);
         let report = dream_run(&c, DreamOptions { now_ms: 1000, limit: 10 }).unwrap();
-        let after: i64 =
-            c.query_row("SELECT COUNT(*) FROM repo_memories", [], |r| r.get(0)).unwrap();
-        assert_eq!(before, after, "dream_run must never mutate repo_memories");
-        // empty index -> no findings, but the call succeeds and the table is usable
-        assert!(report.findings.is_empty());
+        assert_eq!(before, snap(&c), "dream_run must leave EVERY repo_memories column unchanged");
+        assert!(
+            report.findings.iter().any(|f| f.kind == "stale_reference" && f.subject == "m1"),
+            "non-vacuous: the seeded memory produced a stale_reference finding"
+        );
     }
 }
