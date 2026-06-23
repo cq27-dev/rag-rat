@@ -333,21 +333,34 @@ fn anchor_leaf_is_literal(anchor: &RefineMember, lo: usize) -> bool {
 /// promote the signature to `Syntactic` (`{literal}` is not a type — the signature is not actually
 /// syntactically typed). `None` routes the slot to `unresolved_type_slots` in the caller, capping
 /// typedness at `Partial`. The buckets the baseline normalizer can emit are `LIT_{kind.uppercased}`
-/// for every `is_literal_kind` tree-sitter kind (see `clones::normalize::is_literal_kind`): the
-/// Rust `*_literal` kinds (integer/float/string/raw_string/char/boolean/byte_string/negative) PLUS
-/// the cross-language explicit set (`string_content`, `integer`, `float`, `number`, `char`). Every
-/// one either maps to a real Rust type here or falls to `None` — none silently becomes a typed
-/// `{literal}`. The common remaining Rust buckets are mapped: `char` → `char`, raw string → `&str`,
-/// byte string → `&[u8]`. The cross-language numeric/string buckets (`LIT_INTEGER`/`LIT_FLOAT`/
+/// for every `is_literal_kind` tree-sitter kind (see `clones::normalize::is_literal_kind`) PLUS the
+/// special value-erased `LIT_BOOL` bucket (#232 #2b — `true`/`false` collapse to ONE bucket, NOT
+/// `LIT_TRUE`/`LIT_FALSE`):
+/// - Rust `*_literal` kinds (integer/float/string/raw_string/char/byte_string/negative);
+/// - the cross-language explicit set (`string_content`, `string_fragment`, `integer`, `float`,
+///   `number`, `char`) — `string_fragment` is the TS/JS string-body leaf, the sibling of Python's
+///   `string_content`, both → `&str` (#232 #2a);
+/// - `LIT_BOOL` (#232 #2b) → `bool` — the single bucket every grammar's `true`/`false` collapses
+///   to.
+///
+/// Every one either maps to a real Rust type here or falls to `None` — none silently becomes a
+/// typed `{literal}`. The common remaining Rust buckets are mapped: `char` → `char`, raw string →
+/// `&str`, byte string → `&[u8]`. The cross-language numeric buckets (`LIT_INTEGER`/`LIT_FLOAT`/
 /// `LIT_NUMBER`/`LIT_CHAR`) and anything else fall to `None` (no stable Rust type cross-language).
 fn literal_bucket_to_type(bucket: &str) -> Option<&'static str> {
     match bucket {
         "LIT_INTEGER_LITERAL" => Some("i64"),
         "LIT_FLOAT_LITERAL" => Some("f64"),
-        "LIT_STRING_LITERAL" | "LIT_STRING_CONTENT" | "LIT_RAW_STRING_LITERAL" => Some("&str"),
+        "LIT_STRING_LITERAL"
+        | "LIT_STRING_CONTENT"
+        | "LIT_STRING_FRAGMENT"
+        | "LIT_RAW_STRING_LITERAL" => Some("&str"),
         "LIT_BYTE_STRING_LITERAL" => Some("&[u8]"),
         "LIT_CHAR_LITERAL" => Some("char"),
-        "LIT_BOOLEAN_LITERAL" | "LIT_BOOL_LITERAL" => Some("bool"),
+        // `LIT_BOOL` is the value-erased boolean bucket (#232 #2b). The legacy
+        // `LIT_BOOLEAN_LITERAL`/`LIT_BOOL_LITERAL` arms are now dead (the normalizer never emits
+        // them — booleans route to `LIT_BOOL`) but are kept as defensive aliases.
+        "LIT_BOOL" | "LIT_BOOLEAN_LITERAL" | "LIT_BOOL_LITERAL" => Some("bool"),
         // Unmapped bucket: NO stable Rust type → unresolved, never the opaque `{literal}`-as-typed.
         _ => None,
     }
@@ -714,6 +727,12 @@ mod tests {
         assert_eq!(literal_bucket_to_type("LIT_CHAR_LITERAL"), Some("char"));
         assert_eq!(literal_bucket_to_type("LIT_RAW_STRING_LITERAL"), Some("&str"));
         assert_eq!(literal_bucket_to_type("LIT_BYTE_STRING_LITERAL"), Some("&[u8]"));
+        // #232 #2a: the TS/JS string-body bucket maps to `&str`, same as Python's `string_content`.
+        assert_eq!(literal_bucket_to_type("LIT_STRING_FRAGMENT"), Some("&str"));
+        assert_eq!(literal_bucket_to_type("LIT_STRING_CONTENT"), Some("&str"));
+        // #232 #2b: the value-erased boolean bucket maps to `bool` (the one the normalizer emits
+        // now).
+        assert_eq!(literal_bucket_to_type("LIT_BOOL"), Some("bool"));
         // Fix 3: a bucket with NO stable Rust type returns `None` (NEVER the opaque
         // `Some("{literal}")` that used to count as typed) — so the slot goes unresolved and cannot
         // lift typedness to Syntactic.

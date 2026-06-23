@@ -9,9 +9,28 @@ fn is_identifier_kind(kind: &str) -> bool {
 }
 
 /// A leaf kind that is a literal whose *value* must not drive matching.
+///
+/// `string_fragment` is the TypeScript/JavaScript string-body leaf (the text inside the quotes, the
+/// counterpart to Python's `string_content` — both are the value-bearing inner leaf, #232 #2a). It
+/// buckets to `LIT_STRING_FRAGMENT`, which the anti-unify/signature contract maps to `&str` (see
+/// `signature::literal_bucket_to_type`).
 fn is_literal_kind(kind: &str) -> bool {
     kind.ends_with("literal")
-        || matches!(kind, "string_content" | "integer" | "float" | "number" | "char")
+        || matches!(
+            kind,
+            "string_content" | "string_fragment" | "integer" | "float" | "number" | "char"
+        )
+}
+
+/// A leaf kind that is a boolean literal across the wired grammars: Rust emits `true`/`false` as
+/// leaves under an internal `boolean_literal`; TypeScript and Python emit bare `true`/`false`
+/// leaves (Python lexemes `True`/`False` map to kinds `true`/`false`). Bucketing both to ONE
+/// `LIT_BOOL` token (not `LIT_TRUE`/`LIT_FALSE`) value-ERASES the boolean: two bodies differing
+/// only in `true` vs `false` then normalize equal, and `LIT_BOOL` recovers `bool` typing in the
+/// signature contract (#232 #2b). The single bucket is why this is NOT routed through the generic
+/// `LIT_{kind.uppercased}` path — that would encode the value.
+fn is_boolean_leaf_kind(kind: &str) -> bool {
+    matches!(kind, "true" | "false")
 }
 
 /// `true` for a tree-sitter node kind that names a Rust type position — a bare type name
@@ -117,10 +136,17 @@ fn walk_spanned(
             let next = idents.len();
             let id = *idents.entry(leaf.to_string()).or_insert(next);
             format!("ID{id}")
+        } else if is_boolean_leaf_kind(kind) {
+            // Value-erase booleans to ONE bucket (NOT `LIT_{kind.uppercased}`): `true`/`false`
+            // collapse to `LIT_BOOL` so a true↔false-only diff is a clone (#232 #2b).
+            "LIT_BOOL".to_string()
         } else if is_literal_kind(kind) {
             format!("LIT_{}", kind.to_ascii_uppercase())
         } else {
-            // keyword / operator / punctuation — structural, kept verbatim
+            // (#232 #2c) NULL-FAMILY out of scope (low value + wrapped-node hazard): `null` /
+            // `undefined` (TS), `none` (Python), and the C/C++ `NULL`/`nullptr` leaves stay
+            // verbatim. keyword / operator / punctuation / null-family — structural,
+            // kept verbatim
             leaf.to_string()
         };
         tokens.push(token);
@@ -262,6 +288,85 @@ mod tests {
         let (t2, s2) = spanned_lang(continued, "t.py", Language::Python);
         assert_eq!(t1, t2, "line_continuation must not change the normalized stream");
         assert_eq!(t2.len(), s2.len(), "bijection broken (py line_continuation)");
+    }
+
+    // ── Task 3 (#232): multi-language literal bucketing
+    // ───────────────────────────────────
+
+    /// TS strings (`string_fragment`) and booleans (`true`/`false` → `LIT_BOOL`) bucket: two bodies
+    /// differing ONLY in string contents normalize equal, and two differing ONLY in `true` vs
+    /// `false` normalize equal (the `LIT_BOOL` value-erase, #232 #2b).
+    #[test]
+    fn ts_strings_and_booleans_bucket() {
+        // Strings — differ only in the quoted contents.
+        let s1 = "function f() { const a = log(\"hello\"); const b = log(\"world\"); return a; }";
+        let s2 = "function f() { const a = log(\"foo\"); const b = log(\"bar\"); return a; }";
+        assert_eq!(
+            norm_lang(s1, "t.ts", Language::TypeScript),
+            norm_lang(s2, "t.ts", Language::TypeScript),
+            "TS string-content-only diff must normalize equal (string_fragment bucketed)"
+        );
+
+        // Booleans — differ only in true vs false.
+        let b_true = "function f() { const x = check(); const y = x; return true; }";
+        let b_false = "function f() { const x = check(); const y = x; return false; }";
+        let nt = norm_lang(b_true, "t.ts", Language::TypeScript);
+        let nf = norm_lang(b_false, "t.ts", Language::TypeScript);
+        assert_eq!(nt, nf, "TS true/false-only diff must normalize equal (LIT_BOOL)");
+        assert!(nt.iter().any(|t| t == "LIT_BOOL"), "TS boolean must emit LIT_BOOL: {nt:?}");
+    }
+
+    /// Python booleans (`True`/`False`, leaf kinds `true`/`false`) bucket to `LIT_BOOL`; `None`
+    /// (the null-family) stays verbatim — out of scope (#232 #2c).
+    #[test]
+    fn python_booleans_bucket_null_stays_verbatim() {
+        let t = "def f():\n    x = check()\n    y = x\n    return True\n";
+        let f = "def f():\n    x = check()\n    y = x\n    return False\n";
+        let nt = norm_lang(t, "t.py", Language::Python);
+        let nf = norm_lang(f, "t.py", Language::Python);
+        assert_eq!(nt, nf, "Python True/False-only diff must normalize equal (LIT_BOOL)");
+        assert!(
+            nt.iter().any(|tok| tok == "LIT_BOOL"),
+            "Python boolean must emit LIT_BOOL: {nt:?}"
+        );
+
+        // null-family deferred: `None` stays VERBATIM (the leaf kind is `none`, but the verbatim
+        // branch pushes the leaf TEXT `None` — no LIT_ bucket, #232 #2c).
+        let n = "def f():\n    x = check()\n    y = x\n    return None\n";
+        let nn = norm_lang(n, "t.py", Language::Python);
+        assert!(
+            nn.iter().any(|tok| tok == "None"),
+            "Python None stays verbatim (null-family deferred): {nn:?}"
+        );
+        assert!(
+            !nn.iter().any(|tok| tok.starts_with("LIT_")),
+            "Python None must NOT bucket to any LIT_ token: {nn:?}"
+        );
+    }
+
+    /// Rust regression / post-#2 stream pin: `let x = true` now emits `LIT_BOOL` for the boolean
+    /// leaf (where pre-#232 the `true`/`false` leaf fell through VERBATIM). This pins the NEW
+    /// stream — exactly one `LIT_BOOL` token, no `true` token left, the wrapping
+    /// `boolean_literal` node kind still pushed before it. A true↔false-only Rust diff now
+    /// normalizes equal.
+    #[test]
+    fn rust_booleans_bucket_to_lit_bool() {
+        let t = "fn f() -> bool { let a = compute(); let b = a; let x = true; x }";
+        let f = "fn f() -> bool { let a = compute(); let b = a; let x = false; x }";
+        let nt = norm(t);
+        let nf = norm(f);
+        assert_eq!(nt, nf, "Rust true/false-only diff must normalize equal (LIT_BOOL)");
+        // Exactly one LIT_BOOL, no bare `true`/`false` survivor, wrapping node kind still present.
+        assert_eq!(
+            nt.iter().filter(|tok| *tok == "LIT_BOOL").count(),
+            1,
+            "exactly one LIT_BOOL leaf: {nt:?}"
+        );
+        assert!(!nt.iter().any(|tok| tok == "true" || tok == "false"), "no verbatim bool: {nt:?}");
+        assert!(
+            nt.iter().any(|tok| tok == "boolean_literal"),
+            "wrapping boolean_literal node kind still pushed: {nt:?}"
+        );
     }
 
     // ── Original tests (must stay green)

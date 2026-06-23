@@ -1661,29 +1661,44 @@ fn subtree_token_count(anchor: &RefineMember, root: usize) -> usize {
     count
 }
 
-/// Widen a Raw run that is a bare `string_content` LEAF to the enclosing `string_literal` node's
-/// whole span, so the hole covers the WHOLE `"hello"` (quotes included) — not just the inner text
-/// (Fix 3, #215 Plan 4b Codex round-5). A non-string run is returned unchanged.
+/// The string-BODY leaf kinds whose value the baseline normalizer erases (buckets to
+/// `LIT_STRING_CONTENT` / `LIT_STRING_FRAGMENT`): Rust/Python `string_content` and TS/JS
+/// `string_fragment` (#232 #2a). Both are the inner text leaf that needs widening to its enclosing
+/// quote-bearing node so the hole covers the WHOLE `"hello"`.
+fn is_string_body_leaf_kind(kind: &str) -> bool {
+    matches!(kind, "string_content" | "string_fragment")
+}
+
+/// The quote-bearing string-NODE kinds that wrap a string-body leaf: Rust/Python `string_literal`
+/// and TS/JS `string` (#232 #2a).
+fn is_string_node_kind(kind: &str) -> bool {
+    matches!(kind, "string_literal" | "string")
+}
+
+/// Widen a Raw run that is a bare string-body LEAF (`string_content` / `string_fragment`) to the
+/// enclosing quote-bearing string NODE's whole span, so the hole covers the WHOLE `"hello"` (quotes
+/// included) — not just the inner text (Fix 3, #215 Plan 4b Codex round-5; extended to TS/JS in
+/// #232 #2a). A non-string run is returned unchanged.
 ///
-/// Reconstructs the enclosing `string_literal` from the pre-order `node_spans` (no parent
-/// pointers): the tightest `string_literal` node whose byte span CONTAINS the content leaf, then
-/// the contiguous pre-order token range of that node (its root column through the last column
-/// inside its byte span). Falls back to the original run if no enclosing `string_literal` is found
-/// (defensive — a bare `string_content` with no wrapper, which Rust never emits).
+/// Reconstructs the enclosing string node from the pre-order `node_spans` (no parent pointers): the
+/// tightest `string_literal`/`string` node whose byte span CONTAINS the content leaf, then the
+/// contiguous pre-order token range of that node (its root column through the last column inside
+/// its byte span). Falls back to the original run if no enclosing string node is found (defensive —
+/// a bare body leaf with no wrapper, which the grammars never emit).
 fn widen_string_content_run(anchor: &RefineMember, lo: usize, hi: usize) -> (usize, usize) {
-    // Only a single `string_content` leaf needs widening — a wider run already covers its quotes.
+    // Only a single string-body leaf needs widening — a wider run already covers its quotes.
     if lo != hi {
         return (lo, hi);
     }
     let leaf = &anchor.node_spans[lo];
-    if !(leaf.is_leaf && leaf.kind == "string_content") {
+    if !(leaf.is_leaf && is_string_body_leaf_kind(leaf.kind)) {
         return (lo, hi);
     }
-    // Tightest enclosing `string_literal` (smallest byte span containing the content leaf).
+    // Tightest enclosing string node (smallest byte span containing the content leaf).
     let mut best: Option<usize> = None;
     let mut best_width = usize::MAX;
     for (c, sp) in anchor.node_spans.iter().enumerate() {
-        if sp.kind != "string_literal" {
+        if !is_string_node_kind(sp.kind) {
             continue;
         }
         if sp.start_byte <= leaf.start_byte && leaf.end_byte <= sp.end_byte {
@@ -1695,7 +1710,7 @@ fn widen_string_content_run(anchor: &RefineMember, lo: usize, hi: usize) -> (usi
         }
     }
     let Some(str_col) = best else { return (lo, hi) };
-    // The whole pre-order token range of the string_literal subtree.
+    // The whole pre-order token range of the string node subtree.
     let new_hi = str_col + subtree_token_count(anchor, str_col) - 1;
     (str_col, new_hi)
 }
@@ -2118,12 +2133,14 @@ fn classify_run(
         }
     }
 
-    // (2a) value_param — a `string_literal` run widened from a differing `string_content` leaf
-    //      (Fix 3). The run is the WHOLE `"hello"` node (quotes included), so the anchor at `lo` is
-    //      the internal `string_literal` node, not a leaf — it cannot reach the single-leaf
-    //      value_param rule (2) below. A string literal is a clean by-value `&str` parameter: emit
-    //      value_param High with the `LIT_STRING_CONTENT` bucket so the signature recovers `&str`.
-    if anchor_kind == "string_literal" {
+    // (2a) value_param — a string-node run widened from a differing string-body leaf (Fix 3;
+    //      extended to TS/JS `string` in #232 #2a). The run is the WHOLE `"hello"` node (quotes
+    //      included), so the anchor at `lo` is the internal `string_literal` (Rust/Python) or
+    //      `string` (TS/JS) node, not a leaf — it cannot reach the single-leaf value_param rule (2)
+    //      below. A string literal is a clean by-value `&str` parameter: emit value_param High with
+    //      the `LIT_STRING_CONTENT` bucket so the signature recovers `&str` (both string-body
+    // buckets      map to `&str` in `literal_bucket_to_type`).
+    if is_string_node_kind(anchor_kind) {
         return RunClass {
             kind: MetavarKind::ValueParam,
             type_hint: Some("LIT_STRING_CONTENT".to_string()),
