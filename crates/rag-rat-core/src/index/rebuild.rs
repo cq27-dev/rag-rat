@@ -121,11 +121,13 @@ impl IndexDatabase {
     /// inside the rebuild transaction so the df and the fingerprints it summarizes commit
     /// atomically.
     ///
-    /// R6 — SCOPE PARITY: this must match the old GROUP BY EXACTLY. That query had NO
-    /// `files.generated` filter, so it counted generated-file symbols too; this aggregate likewise
-    /// reads EVERY `symbol_fingerprints` row (generated included). df feeds candidate GENERATION
-    /// (the `sub_block_tokens` ordering), not just ranking, so a scope mismatch would change
-    /// recall. Each symbol's decoded bag has no duplicate `token_hash` (the codec invariant),
+    /// R6 — SCOPE PARITY: this reads EVERY `symbol_fingerprints` row (no `files.generated` filter),
+    /// matching the original GROUP BY's scope over whatever rows exist. (Since #232, generated
+    /// files are no longer fingerprinted at index time, so there are no generated-file fp rows to
+    /// count — the df scope now lines up with the `generated = 0` candidate read rather than being
+    /// deliberately wider; df is selectivity-only and drift-tolerated, so this is not load-bearing
+    /// for recall either way.) df feeds candidate GENERATION (the `sub_block_tokens` ordering), not
+    /// just ranking. Each symbol's decoded bag has no duplicate `token_hash` (the codec invariant),
     /// so counting one increment per (symbol, token) pair equals `COUNT(DISTINCT symbol_id)`.
     fn refresh_clone_token_df(&self) -> anyhow::Result<()> {
         // Phase 1 (read): decode every fingerprint's bag and accumulate df in memory, off the

@@ -22,13 +22,19 @@ fn is_literal_kind(kind: &str) -> bool {
         )
 }
 
-/// A leaf kind that is a boolean literal across the wired grammars: Rust emits `true`/`false` as
-/// leaves under an internal `boolean_literal`; TypeScript and Python emit bare `true`/`false`
-/// leaves (Python lexemes `True`/`False` map to kinds `true`/`false`). Bucketing both to ONE
-/// `LIT_BOOL` token (not `LIT_TRUE`/`LIT_FALSE`) value-ERASES the boolean: two bodies differing
-/// only in `true` vs `false` then normalize equal, and `LIT_BOOL` recovers `bool` typing in the
-/// signature contract (#232 #2b). The single bucket is why this is NOT routed through the generic
-/// `LIT_{kind.uppercased}` path — that would encode the value.
+/// A leaf kind that is a boolean literal in the grammars that expose booleans as their own leaf
+/// kind: Rust emits `true`/`false` as leaves under an internal `boolean_literal`; TypeScript,
+/// Python, C and C++ emit bare `true`/`false` leaves (Python lexemes `True`/`False` map to kinds
+/// `true`/`false`). Bucketing both to ONE `LIT_BOOL` token (not `LIT_TRUE`/`LIT_FALSE`)
+/// value-ERASES the boolean: two bodies differing only in `true` vs `false` then normalize equal,
+/// and `LIT_BOOL` recovers `bool` typing in the signature contract (#232 #2b). The single bucket
+/// is why this is NOT routed through the generic `LIT_{kind.uppercased}` path — that would encode
+/// the value.
+///
+/// NOT covered: `tree-sitter-kotlin-ng` emits `true`/`false`/`null` as plain `identifier` leaves,
+/// so Kotlin booleans are alpha-renamed (`ID<n>`) rather than value-erased. This is a deferred
+/// recall gap, not a correctness bug — the language partition guarantees Kotlin only ever
+/// clone-matches Kotlin, where identifiers and booleans are treated consistently (#232 follow-up).
 fn is_boolean_leaf_kind(kind: &str) -> bool {
     matches!(kind, "true" | "false")
 }
