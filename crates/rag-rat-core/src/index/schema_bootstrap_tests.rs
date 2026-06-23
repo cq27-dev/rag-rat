@@ -13073,6 +13073,134 @@ fn generated_files_are_not_fingerprinted_at_index_time() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// #232 multi-language integration: a Rust + TS + Python repo with WITHIN-language planted clones
+/// (Rust comment-only variant; TS function-valued declarators differing only in string contents;
+/// Python comment-only variant) — exercises #1 (comments), #2a (TS strings) and #5 (TS
+/// function-valued declarators) end-to-end through a real index. Asserts a within-language clone
+/// component forms in EACH language and NO component mixes two languages (the #3 language
+/// partition).
+#[test]
+fn multi_language_clone_integration_finds_within_language_no_cross() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("rs")).unwrap();
+    fs::create_dir_all(root.join("ts")).unwrap();
+    fs::create_dir_all(root.join("py")).unwrap();
+
+    // Rust: two functions identical EXCEPT comments (comment-only clone → #1). >= MIN_TOKENS.
+    fs::write(
+        root.join("rs/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("rs/b.rs"),
+        "pub fn load_order(s: Db) -> i32 {\n    // a different comment\n    let o = s.get(20); /* \
+         x */ validate(o); o + 1 }\n",
+    )
+    .unwrap();
+
+    // TS: two `const`-arrow function-valued declarators identical EXCEPT string contents (#5 +
+    // #2a).
+    fs::write(
+        root.join("ts/a.ts"),
+        "const load = (id) => { const row = get(id); const tag = label(\"alpha\"); send(row, \
+         tag); return row; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("ts/b.ts"),
+        "const fetch2 = (key) => { const item = get(key); const note = label(\"omega\"); \
+         send(item, note); return item; }\n",
+    )
+    .unwrap();
+
+    // Python: two functions identical EXCEPT comments (comment-only clone → #1). >= MIN_TOKENS.
+    fs::write(
+        root.join("py/a.py"),
+        "def load_user(db):\n    u = db.get(10)\n    validate(u)\n    return u + 1\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("py/b.py"),
+        "def load_order(s):\n    # a comment\n    o = s.get(20)  # trailing\n    validate(o)\n    \
+         return o + 1\n",
+    )
+    .unwrap();
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![
+            ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("rs")],
+                include: vec!["rs/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            },
+            ResolvedTarget {
+                name: "typescript".to_string(),
+                language: Language::TypeScript,
+                directories: vec![PathBuf::from("ts")],
+                include: vec!["ts/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            },
+            ResolvedTarget {
+                name: "python".to_string(),
+                language: Language::Python,
+                directories: vec![PathBuf::from("py")],
+                include: vec!["py/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            },
+        ],
+        local_ai: Default::default(),
+        watch: Default::default(),
+        version_check: Default::default(),
+        oracle: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Map each component's symbol ids → the set of languages it spans.
+    let conn = db.storage.connection();
+    let lang_of = |symbol_id: i64| -> String {
+        conn.query_row(
+            "SELECT files.language FROM symbols JOIN main.files ON main.files.id = symbols.file_id
+             WHERE symbols.id = ?1",
+            [symbol_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+
+    let components = db.candidate_clone_components().unwrap();
+    let mut langs_with_clone: std::collections::BTreeSet<String> = Default::default();
+    for component in &components {
+        let langs: std::collections::BTreeSet<String> =
+            component.iter().map(|&id| lang_of(id)).collect();
+        // No component may mix two languages (the #3 language partition).
+        assert_eq!(
+            langs.len(),
+            1,
+            "a clone component must be single-language (no cross-language pairs): {langs:?}"
+        );
+        langs_with_clone.insert(langs.into_iter().next().unwrap());
+    }
+
+    // A within-language clone was recalled in EACH of the three languages.
+    for expected in ["rust", "typescript", "python"] {
+        assert!(
+            langs_with_clone.contains(expected),
+            "expected a within-language clone in {expected}; got {langs_with_clone:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Max-denominator overlap gate regression: two structurally different functions whose
 /// token_len ratio is ≥ θ (they SURVIVE the size prune) but whose token-overlap/max_len < θ
 /// (the gate rejects them). This is distinct from the containment test

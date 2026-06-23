@@ -219,8 +219,11 @@ pub struct CloneCompleteness {
     /// contents — consumers should reindex / `rag-rat heal` before acting on these results.
     /// This is a read-only signal; Plan 2 does not heal-before-return.
     pub stale_members: usize,
-    pub known_index_gaps: Vec<String>, /* e.g. "#232: TS function-valued declarators not yet
-                                        * fingerprinted" */
+    /// Advertised-open clone-substrate gaps (a deliberately self-honest provenance signal). Empty
+    /// since #232 closed the multi-language gaps (comments skipped, string/boolean literals
+    /// bucketed, TS function-valued declarators fingerprinted); a future known limitation goes
+    /// here.
+    pub known_index_gaps: Vec<String>,
 }
 
 /// Result of [`IndexDatabase::clones_for_symbol`]. Carries eligibility flags + a completeness block
@@ -234,7 +237,9 @@ pub struct ClonesForSymbolResult {
     /// The selector matched a scoped symbol.
     pub symbol_resolved: bool,
     /// That symbol has a current-version baseline fingerprint loaded into the candidate set
-    /// (eligible: a `kind="function"` symbol ≥ `MIN_TOKENS` in a non-generated, in-scope file).
+    /// (eligible: a `kind="function"` symbol OR a function-valued declarator — `const f = () =>
+    /// …`, a class-field arrow handler, #232 #5 — ≥ `MIN_TOKENS` in a non-generated, in-scope
+    /// file).
     pub symbol_fingerprinted: bool,
     /// Same provenance block as [`FindClonesResult::completeness`].
     pub completeness: CloneCompleteness,
@@ -737,10 +742,11 @@ fn build_completeness(
         truncated,
         refine_budget_clamped,
         stale_members,
-        known_index_gaps: vec![
-            "#232: TS function-valued declarators not yet fingerprinted".into(),
-            "#232: comments/multi-language literals not yet normalized".into(),
-        ],
+        // #232 closed the previously-advertised multi-language gaps: comments are now skipped,
+        // string + boolean literals bucket multi-language (NORM_VERSION = 2), and TS
+        // function-valued declarators are fingerprinted. No clone-substrate gaps are
+        // currently advertised open.
+        known_index_gaps: Vec::new(),
     }
 }
 
