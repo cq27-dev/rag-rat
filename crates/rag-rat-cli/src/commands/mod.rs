@@ -787,11 +787,9 @@ pub(crate) fn claude_hooks(config: &Config, subcommand: &str, global: bool) -> a
 }
 pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Result<()> {
     let trigger = args.trigger.clone().unwrap_or_else(|| "manual".to_string());
-    let max_seconds = args.max_seconds.unwrap_or(DEFAULT_MAINTENANCE_SECONDS);
     let branch_checkout = args.branch_checkout.clone();
     let old_head = args.old_head.clone();
     let new_head = args.new_head.clone();
-    let started = Instant::now();
 
     if trigger == "post-checkout" && branch_checkout.as_deref() == Some("0") {
         print_output(&serde_json::json!({
@@ -804,6 +802,52 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         }))?;
         return Ok(());
     }
+
+    // Single-flight coalescing (#267): a single amend/merge/rebase fires several git hooks
+    // (post-commit + post-rewrite, post-merge + post-commit, post-rewrite + post-checkouts), each
+    // backgrounding `rag-rat maintenance`. Without coalescing they serialize on the write lock and
+    // each runs a full discover pass — doubling work and widening the SQLITE_BUSY window for MCP
+    // reads (#220). The first trigger to take the maintenance lock runs; concurrent triggers set a
+    // "rerun pending" marker and exit immediately; the runner re-checks the marker after its pass
+    // and runs once more to cover a change that arrived mid-pass. The pass still takes the write
+    // lock internally, so serialization with the watcher is unchanged.
+    let pending = rag_rat_core::locks::maintenance_pending_path(&config.database);
+    let lock_path = rag_rat_core::locks::maintenance_lock_path(&config.database);
+    let Some(_maint) = rag_rat_core::locks::FileLock::try_acquire(&lock_path)? else {
+        let _ = fs::File::create(&pending);
+        return print_output(&serde_json::json!({
+            "trigger": trigger,
+            "status": "skipped",
+            "reason": "another maintenance pass is in flight (coalesced, #267)",
+            "old_head": old_head,
+            "new_head": new_head,
+        }));
+    };
+
+    let mut report;
+    loop {
+        // This pass covers the current state, so clear any prior rerun request first; a trigger
+        // that fires after this point re-sets it and earns the rerun below.
+        let _ = fs::remove_file(&pending);
+        report = run_maintenance_pass(config, args, &trigger)?;
+        if !pending.exists() {
+            break;
+        }
+    }
+    print_output(&report)
+}
+
+/// One maintenance pass: discover-index under the write lock, refresh every live linked-worktree
+/// overlay, run the budgeted embedding reconcile, GC dead git contexts, and re-validate repo-memory
+/// anchors. Returns the report object — the caller prints it, after a coalesced rerun if one was
+/// requested mid-pass (see [`maintenance`]).
+fn run_maintenance_pass(
+    config: &Config,
+    args: &MaintenanceArgs,
+    trigger: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let max_seconds = args.max_seconds.unwrap_or(DEFAULT_MAINTENANCE_SECONDS);
+    let started = Instant::now();
 
     // Serialize with the background watcher (and other writers). The hook backgrounds this command,
     // so blocking here never holds up the git operation; busy_timeout backstops the query-path
@@ -855,12 +899,12 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // leaving stale anchors until a manual memory_validate.
     let memory_validation = db.memory_validate().ok();
     let plan = db.reconcile_plan()?;
-    print_output(&serde_json::json!({
+    Ok(serde_json::json!({
         "trigger": trigger,
         "status": "complete",
-        "old_head": old_head,
-        "new_head": new_head,
-        "branch_checkout": branch_checkout,
+        "old_head": args.old_head,
+        "new_head": args.new_head,
+        "branch_checkout": args.branch_checkout,
         "max_seconds": max_seconds,
         "elapsed_seconds": started.elapsed().as_secs_f64(),
         "reconcile": reconcile_report,
@@ -1057,6 +1101,65 @@ mod tests {
         );
 
         drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maintenance_coalesces_a_concurrent_trigger() {
+        use rag_rat_core::locks::{FileLock, maintenance_lock_path, maintenance_pending_path};
+
+        // #267: a single amend/merge/rebase fires several git hooks, each backgrounding
+        // `rag-rat maintenance`. A concurrent trigger must coalesce — skip its pass and set the
+        // rerun marker — rather than queue a redundant discover that widens the SQLITE_BUSY window.
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-maint-coalesce-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        let pending = maintenance_pending_path(&config.database);
+        let args = super::MaintenanceArgs {
+            trigger: Some("post-rewrite".to_string()),
+            max_seconds: Some(0), // skip the embedding reconcile; we only assert coalescing
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+
+        // Hold the coordination lock to simulate an in-flight maintenance pass.
+        let held =
+            FileLock::try_acquire(&maintenance_lock_path(&config.database)).unwrap().unwrap();
+        assert!(!pending.exists());
+        // A concurrent trigger coalesces: it does NOT run a pass; it sets the rerun marker.
+        super::maintenance(&config, &args).unwrap();
+        assert!(pending.exists(), "a coalesced trigger sets the rerun-pending marker");
+        drop(held);
+
+        // With the lock free, maintenance runs a pass and clears the marker (the rerun covers the
+        // change the coalesced trigger requested).
+        super::maintenance(&config, &args).unwrap();
+        assert!(!pending.exists(), "the runner clears the rerun marker after its pass");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

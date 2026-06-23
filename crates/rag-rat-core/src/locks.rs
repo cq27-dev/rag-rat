@@ -82,6 +82,21 @@ pub fn write_lock_path(database: &Path) -> PathBuf {
     database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-write.lock")
 }
 
+/// Per-DB maintenance coordination lock, held by the running `rag-rat maintenance` command for its
+/// whole pass so the multiple git hooks a single amend/merge/rebase fires coalesce into one pass
+/// instead of each running a full discover (#267). Separate from [`write_lock_path`] so it only
+/// coordinates CLI maintenance invocations — the pass itself still takes the write lock internally,
+/// serializing with the watcher as before.
+pub fn maintenance_lock_path(database: &Path) -> PathBuf {
+    database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-maintenance.lock")
+}
+
+/// Marker a coalesced `maintenance` trigger sets to ask the in-flight runner to run one more pass
+/// after the current one, so a change that arrived mid-pass is still covered (#267).
+pub fn maintenance_pending_path(database: &Path) -> PathBuf {
+    database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-maintenance.pending")
+}
+
 thread_local! {
     /// Reentrancy registry for the per-DB write lock: lock-file path → nesting depth on THIS thread.
     /// Thread-local because the only legitimate nested acquire is an `open()`-time schema migrate
