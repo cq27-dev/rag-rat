@@ -152,135 +152,46 @@ pub(crate) fn store_review_comment(
     Ok(())
 }
 pub(crate) fn rebuild_fts(conn: &Connection) -> anyhow::Result<()> {
+    // github_fts is a standalone (own-content) FTS5 table, so a DELETE + re-insert is the correct
+    // rebuild — unlike the external-content chunk_fts / commit_fts, which must rebuild via
+    // INSERT(t) VALUES('rebuild'). Each query below selects the seven FtsRow columns in order
+    // (id, owner, repo, number, url, title, body); kinds without a title (comment, review) select
+    // an empty string for that slot, and review comments surface the file path as the title.
     conn.execute("DELETE FROM github_fts", [])?;
-    insert_issue_fts(conn)?;
-    insert_comment_fts(conn)?;
-    insert_pull_fts(conn)?;
-    insert_review_fts(conn)?;
-    insert_review_comment_fts(conn)?;
-    Ok(())
-}
-pub(crate) fn insert_issue_fts(conn: &Connection) -> anyhow::Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT id, owner, repo, number, html_url, title, body FROM github_issues")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
-    for row in rows {
-        let (id, owner, repo, number, url, title, body) = row?;
-        insert_fts(conn, FtsRow {
-            owner: &owner,
-            repo: &repo,
-            number,
-            kind: "issue",
-            item_id: &id.to_string(),
-            url: &url,
-            title: &title,
-            body: &body,
-        })?;
-    }
-    Ok(())
-}
-pub(crate) fn insert_comment_fts(conn: &Connection) -> anyhow::Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT id, owner, repo, number, html_url, body FROM github_comments")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-        ))
-    })?;
-    for row in rows {
-        let (id, owner, repo, number, url, body) = row?;
-        insert_fts(conn, FtsRow {
-            owner: &owner,
-            repo: &repo,
-            number,
-            kind: "comment",
-            item_id: &id.to_string(),
-            url: &url,
-            title: "",
-            body: &body,
-        })?;
-    }
-    Ok(())
-}
-pub(crate) fn insert_pull_fts(conn: &Connection) -> anyhow::Result<()> {
-    let mut stmt = conn.prepare(
+    insert_fts_rows(
+        conn,
+        "issue",
+        "SELECT id, owner, repo, number, html_url, title, body FROM github_issues",
+    )?;
+    insert_fts_rows(
+        conn,
+        "comment",
+        "SELECT id, owner, repo, number, html_url, '', body FROM github_comments",
+    )?;
+    insert_fts_rows(
+        conn,
+        "pull",
         "SELECT id, owner, repo, number, html_url, title, body FROM github_pull_requests",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
-    for row in rows {
-        let (id, owner, repo, number, url, title, body) = row?;
-        insert_fts(conn, FtsRow {
-            owner: &owner,
-            repo: &repo,
-            number,
-            kind: "pull",
-            item_id: &id.to_string(),
-            url: &url,
-            title: &title,
-            body: &body,
-        })?;
-    }
-    Ok(())
-}
-pub(crate) fn insert_review_fts(conn: &Connection) -> anyhow::Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT id, owner, repo, number, COALESCE(html_url, ''), body FROM github_reviews",
+    insert_fts_rows(
+        conn,
+        "review",
+        "SELECT id, owner, repo, number, COALESCE(html_url, ''), '', body FROM github_reviews",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-        ))
-    })?;
-    for row in rows {
-        let (id, owner, repo, number, url, body) = row?;
-        insert_fts(conn, FtsRow {
-            owner: &owner,
-            repo: &repo,
-            number,
-            kind: "review",
-            item_id: &id.to_string(),
-            url: &url,
-            title: "",
-            body: &body,
-        })?;
-    }
-    Ok(())
-}
-pub(crate) fn insert_review_comment_fts(conn: &Connection) -> anyhow::Result<()> {
-    let mut stmt = conn.prepare(
+    insert_fts_rows(
+        conn,
+        "review_comment",
         "SELECT id, owner, repo, number, html_url, COALESCE(path, ''), body FROM \
          github_review_comments",
     )?;
+    Ok(())
+}
+/// Bulk-load one GitHub item kind into `github_fts`. `sql` must select exactly the seven `FtsRow`
+/// columns in order — `id, owner, repo, number, url, title, body` — using an empty-string literal
+/// in the title slot for kinds that carry no title. Adding a new item kind is a one-line call here,
+/// not another copy of the load loop.
+fn insert_fts_rows(conn: &Connection, kind: &str, sql: &str) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -293,15 +204,15 @@ pub(crate) fn insert_review_comment_fts(conn: &Connection) -> anyhow::Result<()>
         ))
     })?;
     for row in rows {
-        let (id, owner, repo, number, url, path, body) = row?;
+        let (id, owner, repo, number, url, title, body) = row?;
         insert_fts(conn, FtsRow {
             owner: &owner,
             repo: &repo,
             number,
-            kind: "review_comment",
+            kind,
             item_id: &id.to_string(),
             url: &url,
-            title: &path,
+            title: &title,
             body: &body,
         })?;
     }
@@ -325,4 +236,122 @@ pub(crate) fn insert_fts(conn: &Connection, row: FtsRow<'_>) -> anyhow::Result<(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod fts_rebuild_tests {
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::index::schema;
+
+    // rebuild_fts collapses five near-identical per-kind loaders into insert_fts_rows. This pins
+    // the behaviour they shared: every item kind lands in github_fts under its own item_kind, the
+    // body is tokenized/searchable, and the title slot is populated the way each old loader did —
+    // the title text for issues/pulls, the file path for review comments, empty for the rest.
+    #[test]
+    fn rebuild_fts_indexes_every_item_kind_with_the_right_title() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+
+        store_issue(&conn, &GitHubIssue {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 1,
+            html_url: "http://i".into(),
+            state: "open".into(),
+            title: "issuetitle".into(),
+            body: "issuebody".into(),
+            author: None,
+            created_at: None,
+            updated_at: None,
+            is_pull_request: false,
+        })
+        .unwrap();
+        store_comment(&conn, &GitHubComment {
+            id: 10,
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 1,
+            html_url: "http://c".into(),
+            body: "commentbody".into(),
+            author: None,
+            created_at: None,
+            updated_at: None,
+        })
+        .unwrap();
+        store_pull(&conn, &GitHubPullRequest {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 2,
+            html_url: "http://p".into(),
+            state: "open".into(),
+            title: "pulltitle".into(),
+            body: "pullbody".into(),
+            author: None,
+            created_at: None,
+            updated_at: None,
+            merged_at: None,
+        })
+        .unwrap();
+        // html_url None exercises the review loader's COALESCE(html_url, '').
+        store_review(&conn, &GitHubReview {
+            id: 20,
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 2,
+            html_url: None,
+            state: "approved".into(),
+            body: "reviewbody".into(),
+            author: None,
+            submitted_at: None,
+        })
+        .unwrap();
+        store_review_comment(&conn, &GitHubReviewComment {
+            id: 30,
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 2,
+            path: Some("src/lib.rs".into()),
+            html_url: "http://rc".into(),
+            body: "reviewcommentbody".into(),
+            author: None,
+            created_at: None,
+            updated_at: None,
+        })
+        .unwrap();
+
+        rebuild_fts(&conn).unwrap();
+
+        // One row per stored item, each keyed by its own item_kind, with the expected title slot.
+        let rows: Vec<(String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT item_kind, title FROM github_fts ORDER BY item_kind").unwrap();
+            let mapped = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .unwrap();
+            mapped.map(Result::unwrap).collect()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("comment".to_string(), String::new()),
+                ("issue".to_string(), "issuetitle".to_string()),
+                ("pull".to_string(), "pulltitle".to_string()),
+                ("review".to_string(), String::new()),
+                ("review_comment".to_string(), "src/lib.rs".to_string()),
+            ],
+            "every kind is indexed once with the title slot the old per-kind loaders produced"
+        );
+
+        // The body column is tokenized and queryable via MATCH.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM github_fts WHERE github_fts MATCH 'reviewcommentbody'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "review-comment body is tokenized and searchable after rebuild");
+    }
 }

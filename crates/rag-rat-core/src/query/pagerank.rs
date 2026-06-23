@@ -596,39 +596,12 @@ mod tests {
     }
 
     /// Insert `n` symbols (`s1..sn`, ids `1..=n`) plus `edges` as `(from_id, to_id)` calls, all in
-    /// one file. Returns the connection ready for `important_symbols`.
+    /// one file. Returns the connection ready for `important_symbols`. Thin wrapper over
+    /// [`conf_conn`] with every edge at `'exact'` confidence.
     fn graph_conn(n: usize, edges: &[(i64, i64)]) -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        schema::apply(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
-             VALUES ('a.rs', 'rust', 'source', 'h', 0, 0)",
-            [],
-        )
-        .unwrap();
-        for i in 1..=n {
-            let qname = format!("a::s{i}");
-            conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qname])
-                .unwrap();
-            conn.execute(
-                "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
-                                     end_byte, signature, docs)
-                 VALUES (1, 'rust', ?1, (SELECT id FROM name_strings WHERE value = ?2),
-                         'function', 0, 10, NULL, NULL)",
-                params![format!("s{i}"), qname],
-            )
-            .unwrap();
-        }
-        for &(from, to) in edges {
-            conn.execute(
-                "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
-                                   target_qualified_name, edge_kind, confidence)
-                 VALUES (1, ?1, ?2, 'x', 'a::x', 'calls_name', 'exact')",
-                params![from, to],
-            )
-            .unwrap();
-        }
-        conn
+        let edges: Vec<(i64, i64, &str)> =
+            edges.iter().map(|&(from, to)| (from, to, "exact")).collect();
+        conf_conn(n, &edges)
     }
 
     #[test]
@@ -658,9 +631,11 @@ mod tests {
         );
     }
 
-    /// Like [`graph_conn`] but each edge carries an explicit confidence (`EdgeConfidence::as_str`
-    /// casing, e.g. `"Exact"` / `"NameOnly"`); kind is always `calls_name`. Edge ids are `1..` in
-    /// insertion order, so a test can key an `oracle_effects` map by them.
+    /// Insert `n` symbols (`s1..sn`, ids `1..=n`) plus `edges` as `(from_id, to_id, confidence)`
+    /// calls, all in one file — the general form [`graph_conn`] delegates to. `confidence` uses
+    /// `EdgeConfidence::as_str` casing (e.g. `"Exact"` / `"NameOnly"`); kind is always
+    /// `calls_name`. Edge ids are `1..` in insertion order, so a test can key an `oracle_effects`
+    /// map by them.
     fn conf_conn(n: usize, edges: &[(i64, i64, &str)]) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn).unwrap();
