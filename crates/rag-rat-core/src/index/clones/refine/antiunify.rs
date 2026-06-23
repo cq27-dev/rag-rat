@@ -2279,6 +2279,24 @@ fn run_in_callee_position(anchor: &RefineMember, lo: usize, hi: usize) -> bool {
     if run.kind == "field_identifier" {
         return true;
     }
+    // Scoped-path callee head: for `m::foo()` the call's callee child is the `scoped_identifier`
+    // `m::foo` (an internal node beginning at the call), so the FINAL segment `foo` (a plain
+    // `identifier` ending where that `scoped_identifier` ends) is the actual callee name yet does
+    // NOT itself share the call's start byte — only the FIRST segment `m` does. Without this a
+    // differing MODULE (`m::foo` vs `n::foo`) reopened the matched column but a differing FUNCTION
+    // NAME (`m::foo` vs `m::bar`) did not — the #235 asymmetry. Gated by the SAME no-method-head
+    // check as a free callee, so a scoped RECEIVER (`m::obj.foo()`, whose head is the `.foo`
+    // `field_identifier`) is excluded — its final segment is the receiver, not the callee.
+    if run.kind == "identifier"
+        && !call_has_method_name_head(anchor, call, run_end)
+        && anchor.node_spans.iter().any(|sp| {
+            sp.kind == "scoped_identifier"
+                && sp.start_byte == call.start_byte
+                && sp.end_byte == run_end
+        })
+    {
+        return true;
+    }
     // Otherwise the run is a head candidate only if it begins at the call and the call has NO
     // separate method-name head (a free fn / macro). If the call DOES have a method-name head, a
     // start-byte run is the receiver, not the callee.
@@ -3563,6 +3581,52 @@ mod tests {
         assert!(
             template.text.contains(&format!("⟨{}⟩", callee_vp.metavar_id)),
             "the differing callee must render a hole, not a hard-coded `foo`, got {:?}",
+            template.text
+        );
+    }
+
+    #[test]
+    fn differing_scoped_path_callee_tail_at_matched_column_is_closure_param() {
+        // #235 item 18: `m::foo()` vs `m::bar()` differ only in the FINAL path segment. Both
+        // alpha-rename to the same normalized seq (`m`→ID0, `foo`/`bar`→ID1), so LCS matches the
+        // callee column. The call's callee child is the `scoped_identifier` `m::foo`, whose final
+        // segment `foo` is a plain `identifier` that does NOT share the call's start byte — only
+        // the module `m` does. Before the fix this asymmetry meant a differing module
+        // reopened but a differing function name did not (coverage 1.0, callee hard-coded);
+        // `run_in_callee_position` now recognizes the scoped-path tail, so it reopens like a free
+        // callee.
+        let a = member(1, "fn a(){ m::foo(); }");
+        let b = member(2, "fn b(){ m::bar(); }");
+        let (members, template) = run(vec![a, b]);
+
+        assert_eq!(
+            template.variation_points.len(),
+            1,
+            "the differing scoped-path callee tail is one variation point, got {:?}",
+            template.variation_points
+        );
+        let vp = &template.variation_points[0];
+        assert_eq!(
+            vp.kind,
+            MetavarKind::ClosureParam,
+            "a differing scoped-path callee tail must be closure_param, got {vp:?}"
+        );
+        assert!(
+            vp.differing_callee,
+            "the reopened scoped callee must set differing_callee=true, got {vp:?}"
+        );
+        assert_eq!(vp.per_member_values.len(), members.len());
+        let mut vals = vp.per_member_values.clone();
+        vals.sort();
+        assert_eq!(vals, vec!["bar".to_string(), "foo".to_string()]);
+        assert!(
+            template.anti_unify_coverage < 1.0,
+            "a differing scoped callee tail must drop coverage below 1.0, got {}",
+            template.anti_unify_coverage
+        );
+        assert!(
+            template.text.contains(&format!("⟨{}⟩", vp.metavar_id)),
+            "the differing callee tail must render a hole, got {:?}",
             template.text
         );
     }

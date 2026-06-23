@@ -2775,4 +2775,51 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// #235 item 12: a focused unit test for `load_source_discriminators`, the production
+    /// symbols→files SELECT that builds the per-member `{files.sha256}:{start}-{end}` discriminator
+    /// folded into `refinement_key` (the cross-file cache-poisoning fix). Previously covered only
+    /// transitively by the e2e real-index tests + cache.rs's test-local helper.
+    #[test]
+    fn load_source_discriminators_builds_sha_span_strings_and_needs_full_hydration() {
+        use rusqlite::params;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(id, path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES (1, 'a.rs', 'rust', 'source', 'shaAAA', 0, 0),
+                    (2, 'b.rs', 'rust', 'source', 'shaBBB', 0, 0)",
+            [],
+        )
+        .unwrap();
+        for (id, file_id, name, start, end) in
+            [(10i64, 1i64, "foo", 0i64, 12i64), (20, 2, "bar", 40, 73)]
+        {
+            let qn = format!("{name}.rs::{name}");
+            conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", params![qn])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO symbols(id, file_id, language, name, qualified_name_id, kind,
+                                     start_byte, end_byte, signature, docs)
+                 VALUES (?1, ?2, 'rust', ?3, (SELECT id FROM name_strings WHERE value = ?4),
+                         'function', ?5, ?6, NULL, NULL)",
+                params![id, file_id, name, qn, start, end],
+            )
+            .unwrap();
+        }
+
+        // The discriminator is `{files.sha256}:{start_byte}-{end_byte}`. The query has no ORDER BY
+        // and `refinement_key` sorts before hashing, so compare sorted (order is unspecified).
+        let mut got = super::load_source_discriminators(&conn, &[10, 20]).unwrap().unwrap();
+        got.sort();
+        assert_eq!(got, vec!["shaAAA:0-12".to_string(), "shaBBB:40-73".to_string()]);
+
+        // Empty input hydrates to an empty multiset (Some, not None).
+        assert_eq!(super::load_source_discriminators(&conn, &[]).unwrap(), Some(Vec::new()));
+
+        // A member that does not hydrate (no such symbol row) → None: a partial multiset would
+        // alias a different class, so the class is left un-refined rather than mis-keyed.
+        assert_eq!(super::load_source_discriminators(&conn, &[10, 999]).unwrap(), None);
+    }
 }
