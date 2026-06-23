@@ -243,10 +243,13 @@ impl IndexDatabase {
         symbols: &[Symbol],
         symbol_ids: &[i64],
     ) -> anyhow::Result<()> {
-        // Only `kind == "function"` symbols are fingerprinted (#215). Bail before re-parsing the
-        // file when none qualify — the parse is the expensive part of this incremental/heal
-        // wrapper.
-        if symbols.iter().all(|s| s.kind != "function") {
+        // `kind == "function"` symbols AND function-valued `const` declarators are fingerprinted
+        // (#215; #232 #5). This is a node-free PRE-PARSE early-bail, so it can only widen on the
+        // `kind` SUPERSET — a function-valued declarator is `kind == "const"` (parser.rs) — and let
+        // `fingerprint_symbols` + `symbol_is_function_valued` reject plain-value consts AFTER the
+        // parse. Bail before re-parsing only when NO `function` and NO `const` symbol exists — the
+        // parse is the expensive part of this incremental/heal wrapper.
+        if symbols.iter().all(|s| s.kind != "function" && s.kind != "const") {
             return Ok(());
         }
         let Some(parsed) = parser::parse_file(path, language, text) else {
