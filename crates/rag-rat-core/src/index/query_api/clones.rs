@@ -677,6 +677,14 @@ const COVERAGE_MILD_PENALTY: f64 = 0.70;
 /// below [`COVERAGE_STRONG_GATE`], the mild penalty in the `[0.3, 0.5)` band, and `1.0` (no
 /// penalty) at/above [`COVERAGE_MILD_GATE`]. Applied ONLY to the refined ROI in
 /// [`apply_refinement`]; the un-refined sort has no coverage to gate on.
+///
+/// This gate STACKS ON `refactorability_v2`'s own `< 0.5 → ×0.70` coverage factor — it does NOT
+/// replace it. In [`apply_refinement`] the refined ROI is `… × refactorability_v2 × coverage_gate`,
+/// and `refactorability_v2` is ALREADY coverage-penalized, so the two multipliers compound. The NET
+/// coverage multiplier is `0.70 × 0.70 = 0.49` in the `[0.3, 0.5)` band and `0.70 × 0.10 = 0.07`
+/// below `0.3`. The compounding is INTENTIONAL: `refactorability_v2`'s `×0.70` alone was too weak
+/// to sink a degenerate coverage-0.00 class beneath genuine higher-coverage clones, because raw
+/// `member_count` dominates — the extra gate is what makes the penalty bite (#256).
 fn coverage_roi_gate(anti_unify_coverage: f64) -> f64 {
     if anti_unify_coverage < COVERAGE_STRONG_GATE {
         COVERAGE_STRONG_PENALTY
