@@ -406,6 +406,10 @@ impl IndexDatabase {
         let theta = opts.min_similarity.unwrap_or(THETA);
         let pairs = candidate_pairs_from_bags(&bags, theta);
         let components = components_from_pairs(&pairs);
+        // Bucket the θ-verified candidate pairs per component (#256): the coherence split seeds its
+        // clique cover from these edges instead of an O(n²) all-pairs scan, so a giant component
+        // splits scalably. ONE O(|pairs|) pass over a node→component map.
+        let edges_by_component = bucket_edges_by_component(&pairs, &components);
 
         let min_copies = opts.min_copies.unwrap_or(2);
 
@@ -418,12 +422,13 @@ impl IndexDatabase {
         // subject.) Each built class travels with its component ids so the two-phase driver
         // can refine it.
         let mut built: Vec<(Vec<i64>, CandidateCloneClass)> = Vec::new();
-        for component in &components {
+        for (comp_idx, component) in components.iter().enumerate() {
             if component.len() < min_copies {
                 continue;
             }
             let coherent_classes = coherence_split(
                 component,
+                &edges_by_component[comp_idx],
                 |a, b| {
                     let ba = by_id[&a];
                     let bb = by_id[&b];
@@ -826,20 +831,26 @@ impl IndexDatabase {
         let pairs = candidate_pairs_from_bags(&bags, THETA);
         let components = components_from_pairs(&pairs);
 
-        // Find the component that contains this symbol_id.
-        let Some(component) = components.into_iter().find(|comp| comp.contains(&symbol_id)) else {
+        // Find the component that contains this symbol_id (with its index so we can pull its edge
+        // bucket).
+        let Some(comp_idx) = components.iter().position(|comp| comp.contains(&symbol_id)) else {
             return Ok(make_result(None, true, true, 0, freshness));
         };
+        let component = components[comp_idx].clone();
+        // The θ-verified edge subset for THIS component (#256) — feeds the scalable clique cover so
+        // a giant over-merged component the subject lands in splits instead of being returned
+        // whole.
+        let mut edges_by_component = bucket_edges_by_component(&pairs, &components);
+        let component_edges = std::mem::take(&mut edges_by_component[comp_idx]);
 
         // Plan 4a: coherence-split the component, then serve the coherent sub-class that contains
         // the subject. If the subject is a SINGLETON after the split (it cohered with no peer at
-        // θ), fall back to the full UN-refined component so the caller still sees the
-        // symbol's over-merged neighborhood — `clones_for_symbol` is a reverse lookup ABOUT
-        // a specific symbol, so an empty answer for a symbol that IS in an (over-merged)
-        // component would be less useful than the un-refined fallback. `find_clones` has no
-        // such fallback (no subject).
+        // θ), there is NO whole-component fallback (#256): serving the full over-merged component
+        // would re-expose the very giant the split exists to break. `clones_for_symbol` returns the
+        // subject's COHERENT neighborhood (the clique(s) containing it) or nothing.
         let coherent_classes = coherence_split(
             &component,
+            &component_edges,
             |a, b| {
                 let ba = by_id[&a];
                 let bb = by_id[&b];
@@ -886,9 +897,12 @@ impl IndexDatabase {
                 built
             },
             None => {
-                // Subject split to a singleton: serve the full un-refined component
-                // (refined=false).
-                build_class(&component, &by_id, conn, Some(symbol_id))?
+                // Subject split to a singleton — it cohered with no peer at θ, so there is no
+                // coherent class to serve. Return nothing (#256): the OLD behavior served the full
+                // un-refined component, which re-exposed the over-merged giant the split exists to
+                // break (the exact `clones-for`-on-a-chained-symbol regression #256 names). A
+                // reverse lookup ABOUT a symbol that has no coherent clone peer is honestly empty.
+                None
             },
         };
 
@@ -2000,6 +2014,36 @@ fn components_from_pairs(pairs: &[(i64, i64)]) -> Vec<Vec<i64>> {
             g
         })
         .collect()
+}
+
+/// Partition the θ-verified candidate `pairs` into per-component edge lists, parallel to
+/// `components` (entry `i` holds the edges whose endpoints belong to `components[i]`) (#256).
+///
+/// The coherence split seeds its clique cover from a component's edge list; supplying the
+/// precomputed edges makes seeding O(edges) instead of the old O(n²) all-pairs scan (the reason the
+/// removed `SPLIT_MAX` member cap existed). Both endpoints of a pair share a component by
+/// construction (`components_from_pairs` union-finds the same pairs), so a node→component-index map
+/// resolves every edge in ONE O(|pairs|) pass. An edge whose endpoints fall in a dropped singleton
+/// component (not in the map) is skipped — it can never appear, but the guard keeps the partition
+/// total.
+fn bucket_edges_by_component(
+    pairs: &[(i64, i64)],
+    components: &[Vec<i64>],
+) -> Vec<Vec<(i64, i64)>> {
+    let mut node_to_component: BTreeMap<i64, usize> = BTreeMap::new();
+    for (idx, component) in components.iter().enumerate() {
+        for &node in component {
+            node_to_component.insert(node, idx);
+        }
+    }
+    let mut edges_by_component: Vec<Vec<(i64, i64)>> = vec![Vec::new(); components.len()];
+    for &(a, b) in pairs {
+        if let Some(&idx) = node_to_component.get(&a) {
+            // `a` and `b` are unioned into the same component, so indexing by `a` is correct.
+            edges_by_component[idx].push((a, b));
+        }
+    }
+    edges_by_component
 }
 
 #[cfg(test)]

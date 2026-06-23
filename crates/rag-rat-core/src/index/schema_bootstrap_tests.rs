@@ -13764,6 +13764,100 @@ fn coherence_split_applied_in_find_clones() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// #256 (R5c): the full clone path is DETERMINISTic on a synthetic transitive chain. The
+/// edge-fed clique-cover split (over a bucketed edge subset) and the ROI sort must be stable so the
+/// content-addressed refinement cache stays valid and the listing order does not flap between
+/// identical rebuilds. We rebuild the SAME {A,B,C} chain fixture twice (independent indexes) and
+/// assert `find_clones` returns byte-identical class order (class_key sequence) both times, and
+/// `clones_for_symbol` agrees across runs.
+#[test]
+fn clone_split_full_path_is_deterministic() {
+    // Reuse the empirically-tuned chain shape from coherence_split_applied_in_find_clones: A~B and
+    // B~C clear θ, A/C is below θ, so the union-find component {A,B,C} is over-merged and must be
+    // coherence-split into {A,B} and {B,C}.
+    let core = "let c1 = ca(x); let c2 = cb(c1); let c3 = cc(c2);";
+    let s1 = "if x > 0 { acc = p1(x); } else { acc = p2(x); } if acc > 1 { acc = p3(acc); } else \
+              { acc = p4(acc); }";
+    let s2 = "for it in xs { match it { 0 => acc += q1(it), 1 => acc += q2(it), _ => acc -= \
+              q3(it) } } for jt in ys { match jt { 0 => acc += q4(jt), _ => acc -= q5(jt) } }";
+    let sx = "while acc > 0 { acc = r1(acc); acc = r2(acc); acc = r3(acc); } while acc < 9 { acc \
+              = r4(acc); acc = r5(acc); }";
+    let sy = "loop { acc = s1f(acc); acc = s2f(acc); acc = s3f(acc); if acc == 0 { break; } } \
+              loop { acc = s4f(acc); if acc < 0 { break; } }";
+    let a = format!("pub fn fa(x: i32) -> i32 {{ {core} {s1} {sx} 0 }}\n");
+    let b = format!("pub fn fb(x: i32) -> i32 {{ {core} {s1} {s2} 0 }}\n");
+    let c = format!("pub fn fc(x: i32) -> i32 {{ {core} {s2} {sy} 0 }}\n");
+
+    let build_and_list = || -> (Vec<String>, Option<String>) {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), a.as_str()).unwrap();
+        fs::write(root.join("src/b.rs"), b.as_str()).unwrap();
+        fs::write(root.join("src/c.rs"), c.as_str()).unwrap();
+        let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+        let res = db
+            .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+            .unwrap();
+        let keys: Vec<String> = res.classes.iter().map(|cl| cl.class_key.clone()).collect();
+        // clones_for_symbol on the chained subject B (which is in BOTH {A,B} and {B,C}).
+        let by_b = db.clones_for_symbol(CloneSymbolSelector::Ref("src/b.rs::fb".into())).unwrap();
+        let b_key = by_b.class.as_ref().map(|cl| cl.class_key.clone());
+        let _ = fs::remove_dir_all(root);
+        (keys, b_key)
+    };
+
+    let (keys1, b1) = build_and_list();
+    let (keys2, b2) = build_and_list();
+    assert_eq!(keys1, keys2, "find_clones class order must be identical across rebuilds");
+    assert_eq!(b1, b2, "clones_for_symbol(fb) must resolve to the same class across rebuilds");
+    // Sanity: the chain DID split (two coherent classes), so determinism is over a real split.
+    assert_eq!(keys1.len(), 2, "the chain must split into two coherent classes: {keys1:?}");
+}
+
+/// #256 (R3): `clones-for` on a CHAINED symbol — the path #256 names broken — must serve the
+/// subject's TIGHT coherent neighborhood, never the whole over-merged component. In the {A,B,C}
+/// chain, a reverse lookup on the bridge symbol B returns a 2-member coherent class (one of {A,B} /
+/// {B,C}), NOT a 3-member over-merged blob, and that class is internally coherent (≥ θ).
+#[test]
+fn clones_for_chained_symbol_serves_tight_neighborhood() {
+    let core = "let c1 = ca(x); let c2 = cb(c1); let c3 = cc(c2);";
+    let s1 = "if x > 0 { acc = p1(x); } else { acc = p2(x); } if acc > 1 { acc = p3(acc); } else \
+              { acc = p4(acc); }";
+    let s2 = "for it in xs { match it { 0 => acc += q1(it), 1 => acc += q2(it), _ => acc -= \
+              q3(it) } } for jt in ys { match jt { 0 => acc += q4(jt), _ => acc -= q5(jt) } }";
+    let sx = "while acc > 0 { acc = r1(acc); acc = r2(acc); acc = r3(acc); } while acc < 9 { acc \
+              = r4(acc); acc = r5(acc); }";
+    let sy = "loop { acc = s1f(acc); acc = s2f(acc); acc = s3f(acc); if acc == 0 { break; } } \
+              loop { acc = s4f(acc); if acc < 0 { break; } }";
+    let a = format!("pub fn fa(x: i32) -> i32 {{ {core} {s1} {sx} 0 }}\n");
+    let b = format!("pub fn fb(x: i32) -> i32 {{ {core} {s1} {s2} 0 }}\n");
+    let c = format!("pub fn fc(x: i32) -> i32 {{ {core} {s2} {sy} 0 }}\n");
+
+    const THETA: f64 = 0.7;
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), a.as_str()).unwrap();
+    fs::write(root.join("src/b.rs"), b.as_str()).unwrap();
+    fs::write(root.join("src/c.rs"), c.as_str()).unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let by_b = db.clones_for_symbol(CloneSymbolSelector::Ref("src/b.rs::fb".into())).unwrap();
+    let b_class = by_b.class.as_ref().expect("fb is the bridge symbol — it has coherent peers");
+    assert_eq!(
+        b_class.member_count, 2,
+        "the chained subject's class must be the TIGHT 2-member neighborhood, never the \
+         over-merged 3-member component"
+    );
+    assert!(
+        b_class.cohesion_min_pairwise >= THETA - 1e-9,
+        "the served class must be internally coherent (≥ θ): got {}",
+        b_class.cohesion_min_pairwise
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Helper: write four renamed clones (identical structure, different identifiers) across two
 /// directories into `root`, returning the rebuilt index. The four functions form ONE clean,
 /// high-fidelity clone class — the canonical refine fixture.
