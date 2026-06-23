@@ -125,7 +125,13 @@ impl IndexDatabase {
         // desync the external-content index until the next forced rebuild).
         self.insert_chunks(ChunkInsertFile { file_id, source_revision: &sha256 }, &chunks)?;
         let symbol_ids = self.insert_symbols(file_id, language, &symbols)?;
-        self.store_symbol_fingerprints(language, path, text, &symbols, &symbol_ids)?;
+        // (#232 #6) Skip generated files on the incremental/heal path too — same write-side hygiene
+        // and the same `file_is_generated` arg as the full-rebuild prepare gate (prep.rs). Catches
+        // PATH-heuristic codegen under a Source target (`src/generated/*.rs`, `*.d.ts`); the
+        // `kind=Generated` case is already symbol-empty above.
+        if !file_is_generated(kind, &path_string(path)) {
+            self.store_symbol_fingerprints(language, path, text, &symbols, &symbol_ids)?;
+        }
         if kind != TargetKind::Generated && text.len() <= edges::MAX_GRAPH_PARSE_BYTES {
             edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
         }

@@ -291,10 +291,21 @@ pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<Prepared
     // Baseline clone fingerprints walk the SAME shared tree (no re-parse, no DB). Keyed by local
     // symbol index; insert_prepared_file maps each to its DB id and writes. This is what lets the
     // full-rebuild insert stage skip the second read + second parse the fingerprints used to need.
-    let symbol_fingerprints = parsed
-        .as_ref()
-        .map(|p| clones::fingerprint_symbols(p.root(), &text, &symbols))
-        .unwrap_or_default();
+    //
+    // (#232 #6) Skip generated files at index time — write-side storage hygiene only (ZERO recall /
+    // precision effect: the candidate read already filters `files.generated = 0`). `kind=Generated`
+    // files are already symbol-empty (no parse), so this gate is what catches PATH-heuristic
+    // codegen under a SOURCE target (`src/generated/*.rs`, `*.d.ts`) — those DO get symbols and
+    // so used to get fingerprints. The arg is byte-identical to the `files.generated` INSERT
+    // (file_index.rs), so the index skip and the read filter agree.
+    let symbol_fingerprints = if file_is_generated(file.kind, &path_string(&file.relative_path)) {
+        Vec::new()
+    } else {
+        parsed
+            .as_ref()
+            .map(|p| clones::fingerprint_symbols(p.root(), &text, &symbols))
+            .unwrap_or_default()
+    };
 
     Ok(PreparedIndexContent {
         modified_at_ms,

@@ -1749,7 +1749,10 @@ fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>
 
     // Scoped baseline fingerprints + their token-bag BLOB, in one read (no per-token join).
     // `files.generated = 0` excludes generated files (e.g. `src/generated/…`, `.d.ts`) from the
-    // candidate read — they are fingerprinted on write but must not enter clone components.
+    // candidate read. As of #232 #6 generated files are NO LONGER fingerprinted at index time
+    // (`prep.rs` / `file_index.rs` gate the compute on `!file_is_generated`), so this filter is now
+    // defense-in-depth: it still guards a file that flipped to `generated = 1` AFTER its
+    // fingerprints were written (a target reclassification without a reindex of that file).
     // `token_len` comes from the COLUMN (R3); the bag itself is decoded from the BLOB.
     let mut fp_stmt = conn.prepare(
         "SELECT sf.symbol_id, symbols.language, sf.struct_hash, sf.token_len, sf.token_bag

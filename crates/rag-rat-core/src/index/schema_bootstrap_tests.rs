@@ -12997,6 +12997,82 @@ fn candidate_components_exclude_generated_files_via_read_filter() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// #232 #6: a PATH-heuristic-generated file under a SOURCE target (`src/generated/*.rs`,
+/// `is_generated_path` true, `kind = source`) gets full symbols but must NOT be fingerprinted at
+/// index time — neither on a full rebuild NOR on a single-file heal. (`kind = Generated` files are
+/// already symbol-empty, so the gate is needed only for the path-heuristic case.) This is pure
+/// write-side storage hygiene — zero recall/precision effect (the read already filters
+/// `generated = 0`); the assertion is on the absence of `symbol_fingerprints` ROWS.
+#[test]
+fn generated_files_are_not_fingerprinted_at_index_time() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src/generated")).unwrap();
+    // A normal source file (fingerprinted) and a path-heuristic-generated file under the SAME
+    // source target. Both bodies clear MIN_TOKENS so the absence of a generated fp row is the gate,
+    // not the size prune.
+    std::fs::write(
+        root.join("src/normal.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/generated/bindings.rs"),
+        "pub fn load_order(store: Db) -> i32 { let o = store.get(20); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let fp_rows_for = |db: &IndexDatabase, like: &str| -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM symbol_fingerprints sf
+                 JOIN symbols ON symbols.id = sf.symbol_id
+                 JOIN main.files ON main.files.id = symbols.file_id
+                 WHERE main.files.path LIKE ?1 AND sf.normalizer_kind = 'baseline'",
+                [like],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    // The path-heuristic-generated file got symbols but NO fingerprint rows; the normal file did.
+    assert!(fp_rows_for(&db, "%normal.rs") > 0, "normal source file must be fingerprinted");
+    assert_eq!(
+        fp_rows_for(&db, "%/generated/%"),
+        0,
+        "generated file must NOT be fingerprinted on a full rebuild"
+    );
+    // It DOES still get symbols (the gate is fingerprint-only, not symbol extraction).
+    let gen_symbols: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM symbols JOIN main.files ON main.files.id = symbols.file_id
+             WHERE main.files.path LIKE '%/generated/%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        gen_symbols > 0,
+        "generated file must still get symbols (only fingerprints are skipped)"
+    );
+
+    // Single-file heal path: re-index the generated file through heal_file → index_file →
+    // store_symbol_fingerprints (gated). It must still write NO fingerprint rows.
+    db.heal_file(std::path::Path::new("src/generated/bindings.rs")).unwrap();
+    assert_eq!(
+        fp_rows_for(&db, "%/generated/%"),
+        0,
+        "generated file must NOT be fingerprinted after a single-file heal"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Max-denominator overlap gate regression: two structurally different functions whose
 /// token_len ratio is ≥ θ (they SURVIVE the size prune) but whose token-overlap/max_len < θ
 /// (the gate rejects them). This is distinct from the containment test
