@@ -154,8 +154,16 @@ pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
     let result = db.find_clones(rag_rat_core::index::FindClonesOptions {
         min_similarity: args.min_similarity,
         min_copies: args.min_copies,
-        limit: args.limit,
+        // A recall signature must be COMPLETE (every class), so never clamp it to a class limit.
+        limit: if args.recall_signature { None } else { args.limit },
     })?;
+
+    // `--recall-signature`: a canonical, cross-build-stable recall dump for the #279 harness,
+    // instead of the listing/explain.
+    if args.recall_signature {
+        print!("{}", recall_signature(&result));
+        return Ok(());
+    }
 
     // `--explain <CLASS_KEY>`: print a human-readable refinement breakdown for one class from the
     // SAME result set (so the explained class went through the same refine pass as the listing),
@@ -169,6 +177,37 @@ pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
     }
 
     print_output(&result)
+}
+
+/// A canonical, cross-build-STABLE recall signature of the clone classes — one line per class
+/// (`<member_count>\t<comma-joined sorted member refs>`), lines sorted, after a `#`-comment
+/// summary; trailing newline included. Stable because it keys on member REFS (`path::symbol`), not
+/// rowids, so two builds (before/after a candidate-pruning change like #271's hot-token cap) diff
+/// with plain `diff`: a removed or shrunk line is a recall regression. The recall half of #279.
+/// `member_count` is the FULL class size (the returned member list may be member-capped, but the
+/// count plus the deterministic capped subset still pin the class, so a class that vanishes /
+/// splits / shrinks always changes its line). Pure (returns the text) so it is unit-testable.
+fn recall_signature(result: &rag_rat_core::index::FindClonesResult) -> String {
+    let mut lines: Vec<String> = result
+        .classes
+        .iter()
+        .map(|c| {
+            let mut refs: Vec<&str> = c.members.iter().map(|m| m.r#ref.as_str()).collect();
+            refs.sort_unstable();
+            format!("{}\t{}", c.member_count, refs.join(","))
+        })
+        .collect();
+    lines.sort_unstable();
+    let total_members: usize = result.classes.iter().map(|c| c.member_count).sum();
+    let mut out = format!(
+        "# clone recall signature — {} classes, {total_members} clone members\n",
+        result.classes.len(),
+    );
+    for line in &lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Render a human-readable explanation of a refined clone class: the anti-unification template,
@@ -1010,8 +1049,13 @@ mod tests {
         };
         IndexDatabase::rebuild(&config).unwrap();
 
-        let args =
-            ClonesArgs { min_similarity: None, min_copies: Some(2), limit: None, explain: None };
+        let args = ClonesArgs {
+            min_similarity: None,
+            min_copies: Some(2),
+            limit: None,
+            explain: None,
+            recall_signature: false,
+        };
         // The handler must not error.
         super::clones(&config, &args).unwrap_or_else(|err| panic!("clones handler failed: {err}"));
 
@@ -1028,6 +1072,26 @@ mod tests {
             result.classes.iter().any(|c| c.member_count >= 2),
             "expected at least one clone class with >=2 members for the planted pair: {:?}",
             result.classes
+        );
+
+        // #279 recall harness: the canonical signature is a sorted, ref-keyed dump — the planted
+        // 3-way clone surfaces as one `3\t<sorted refs>` line under the `#` summary header, keyed
+        // on stable `path::symbol` refs (so two builds diff with plain `diff`).
+        let sig = super::recall_signature(&result);
+        assert!(sig.starts_with("# clone recall signature —"), "signature header missing:\n{sig}");
+        let clone_line = sig
+            .lines()
+            .find(|l| l.starts_with("3\t"))
+            .unwrap_or_else(|| panic!("no 3-member class line in signature:\n{sig}"));
+        for member in
+            ["src/lib.rs::cloned_helper", "src/a.rs::cloned_helper", "src/b.rs::cloned_helper"]
+        {
+            assert!(clone_line.contains(member), "signature line missing {member}: {clone_line}");
+        }
+        // Refs are sorted WITHIN a line (a.rs < b.rs < lib.rs) — the cross-build-stable ordering.
+        assert!(
+            clone_line.find("src/a.rs") < clone_line.find("src/b.rs"),
+            "member refs must be sorted within a class line: {clone_line}"
         );
 
         let _ = std::fs::remove_dir_all(&root);

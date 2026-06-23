@@ -207,6 +207,14 @@ pub(crate) struct ClonesArgs {
     /// instead of the JSON/TOON listing.
     #[arg(long, value_name = "CLASS_KEY")]
     pub explain: Option<String>,
+    /// Print a canonical, cross-build-stable RECALL signature instead of the listing: one sorted
+    /// line per clone class (`<member_count>\t<sorted member refs>`), keyed on `path::symbol` refs
+    /// (not rowids). This is the recall half of the clone measurement harness (#279): dump it on
+    /// two builds (e.g. before/after a candidate-pruning change like #271's hot-token cap) and
+    /// `diff` them — a removed or shrunk line is a recall regression. Forces a complete pass
+    /// (ignores `--limit`).
+    #[arg(long)]
+    pub recall_signature: bool,
 }
 
 /// Selector for `clones-for`: positional `SYMBOL` (a qualified ref or `sym_<hex>` handle), or

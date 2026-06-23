@@ -74,3 +74,8 @@ harness = false
 [[bench]]
 name = "index_time"
 harness = false
+
+# criterion: wall-clock clone-query time (candidate gen, reverse lookup, cold find_clones) — #279.
+[[bench]]
+name = "clone_time"
+harness = false
