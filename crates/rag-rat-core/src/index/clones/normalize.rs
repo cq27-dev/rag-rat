@@ -133,20 +133,71 @@ mod tests {
     use crate::index::parser;
     use crate::language::Language;
 
+    /// Pick the target symbol's AST node for a normalization test: the symbol whose subtree
+    /// normalizes to the MOST tokens (the actual body under test, language-agnostic). Choosing by
+    /// token count instead of `kind == "function"` is what lets the same harness drive Rust
+    /// `function`, TS `const`/function-valued declarators, and Python `function` symbols — the
+    /// languages disagree on the symbol `kind` string but agree that the biggest normalized subtree
+    /// is the body we want to compare.
+    fn target_node_for<'a>(parsed: &'a parser::ParsedFile, src: &str) -> tree_sitter::Node<'a> {
+        parsed
+            .symbols
+            .iter()
+            .filter_map(|s| {
+                let node = parsed.root().descendant_for_byte_range(s.start_byte, s.end_byte)?;
+                let len = normalize_baseline(node, src).len();
+                Some((len, node))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, node)| node)
+            .expect("at least one symbol with a normalizable subtree")
+    }
+
+    /// Generalized normalize harness: parse `src` with `language` (under `path`, which selects the
+    /// grammar / generated heuristics), select the target symbol, return its normalized stream.
+    fn norm_lang(src: &str, path: &str, language: Language) -> Vec<String> {
+        let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
+        normalize_baseline(target_node_for(&parsed, src), src)
+    }
+
+    /// Generalized spanned-normalize harness (token stream + parallel `NodeSpan`s).
+    fn spanned_lang(src: &str, path: &str, language: Language) -> (Vec<String>, Vec<NodeSpan>) {
+        let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
+        normalize_baseline_spanned(target_node_for(&parsed, src), src)
+    }
+
+    /// Rust-only wrappers — the existing Rust tests call these unchanged.
     fn norm(src: &str) -> Vec<String> {
-        let parsed = parser::parse_file(Path::new("t.rs"), Language::Rust, src).expect("parse");
-        let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("a function symbol");
-        let node =
-            parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
-        normalize_baseline(node, src)
+        norm_lang(src, "t.rs", Language::Rust)
     }
 
     fn spanned(src: &str) -> (Vec<String>, Vec<NodeSpan>) {
-        let parsed = parser::parse_file(Path::new("t.rs"), Language::Rust, src).expect("parse");
-        let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("a function symbol");
-        let node =
-            parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
-        normalize_baseline_spanned(node, src)
+        spanned_lang(src, "t.rs", Language::Rust)
+    }
+
+    // ── Task 1 (#232): multi-language harness smoke test
+    // ───────────────────────────────────────
+
+    /// The generalized harness parses TypeScript and Python (not just Rust) and returns a non-empty
+    /// normalized stream carrying the function-body tokens. Pure harness smoke test — proves the
+    /// grammar selection + target-symbol picker work cross-language before T2/T3/T5 lean on them.
+    #[test]
+    fn harness_parses_ts_and_python() {
+        let ts = norm_lang(
+            "function f() { const a = get(1); const b = get(2); return a + b; }",
+            "t.ts",
+            Language::TypeScript,
+        );
+        assert!(!ts.is_empty(), "TS normalize stream must be non-empty");
+        assert!(ts.iter().any(|t| t == "return_statement"), "TS stream missing body: {ts:?}");
+
+        let py = norm_lang(
+            "def f():\n    a = get(1)\n    b = get(2)\n    return a + b\n",
+            "t.py",
+            Language::Python,
+        );
+        assert!(!py.is_empty(), "Python normalize stream must be non-empty");
+        assert!(py.iter().any(|t| t == "return_statement"), "Python stream missing body: {py:?}");
     }
 
     // ── Original tests (must stay green)

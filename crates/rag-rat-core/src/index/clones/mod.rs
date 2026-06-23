@@ -112,12 +112,41 @@ mod tests {
     use crate::index::parser;
     use crate::language::Language;
 
-    fn fp(src: &str) -> Option<SymbolFingerprint> {
-        let parsed = parser::parse_file(Path::new("t.rs"), Language::Rust, src).expect("parse");
-        let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("function");
-        let node =
-            parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
+    /// Generalized fingerprint harness (#232): parse `src` with `language` (under `path`), select
+    /// the target symbol — the one whose subtree normalizes to the MOST tokens, language-agnostic
+    /// so it works for Rust `function`, TS `const`/function-valued declarators, and Python
+    /// `function` alike — and return its fingerprint (`None` below `MIN_TOKENS`). Test fixtures
+    /// MUST clear `MIN_TOKENS` (20) or `fp_lang` returns `None` for the size gate, not the
+    /// property under test.
+    fn fp_lang(src: &str, path: &str, language: Language) -> Option<SymbolFingerprint> {
+        let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
+        let node = parsed
+            .symbols
+            .iter()
+            .filter_map(|s| {
+                let node = parsed.root().descendant_for_byte_range(s.start_byte, s.end_byte)?;
+                let len = normalize::normalize_baseline(node, src).len();
+                Some((len, node))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, node)| node)
+            .expect("at least one symbol with a normalizable subtree");
         fingerprint_symbol(node, src)
+    }
+
+    /// Rust-only wrapper — the existing Rust fingerprint tests call this unchanged.
+    fn fp(src: &str) -> Option<SymbolFingerprint> {
+        fp_lang(src, "t.rs", Language::Rust)
+    }
+
+    #[test]
+    fn fp_lang_fingerprints_ts_and_python() {
+        // Smoke test for the generalized fingerprint harness — both fixtures clear MIN_TOKENS (20).
+        let ts = "function f() { const a = get(1); const b = get(2); const c = get(3); return a + \
+                  b + c; }";
+        assert!(fp_lang(ts, "t.ts", Language::TypeScript).is_some(), "TS fn must fingerprint");
+        let py = "def f():\n    a = get(1)\n    b = get(2)\n    c = get(3)\n    return a + b + c\n";
+        assert!(fp_lang(py, "t.py", Language::Python).is_some(), "Python fn must fingerprint");
     }
 
     #[test]
