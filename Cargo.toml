@@ -34,7 +34,7 @@ anyhow = "1.0"
 fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 gix = { version = "0.84.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
 libc = "0.2"
-rmcp = { version = "1.7.0", features = ["transport-io"] }
+rmcp = { version = "1.8.0", features = ["transport-io"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rayon = "1.12"
 regex = "1.12"

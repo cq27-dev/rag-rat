@@ -210,7 +210,10 @@ async fn run_stdio_unix(
 
     // Arm the SIGUSR1 hot-upgrade handler only when an install target is configured.
     if let Some(install_path) = install_path {
-        let peer_info = running.peer().peer_info().cloned().unwrap_or_default();
+        // rmcp 1.8 changed `peer_info()` from `Option<&_>` to `Option<Arc<_>>`; deref-and-clone to
+        // the owned `InitializeRequestParams` the `Upgrade`/handoff want. `*p` derefs either form,
+        // so this compiles on 1.7 and 1.8 alike.
+        let peer_info = running.peer().peer_info().map(|p| (*p).clone()).unwrap_or_default();
         let negotiated_protocol_version = peer_info.protocol_version.as_str().to_string();
         let handoff_dir = config
             .database
