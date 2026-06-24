@@ -138,7 +138,7 @@ pub(crate) fn classify_text_only_hit(
     if is_import_or_declaration_text(trimmed) {
         return "declaration_text_mention";
     }
-    if is_test_like_path(path) && is_test_scaffolding_text(trimmed) {
+    if crate::index::parser::is_test_path(path) && is_test_scaffolding_text(trimmed) {
         return "test_scaffolding_text_mention";
     }
     "parser_call_extraction"
@@ -209,18 +209,6 @@ pub(crate) fn compare_pattern_match_mode(pattern: &str, symbol_name: &str) -> St
     "regex".to_string()
 }
 
-pub(crate) fn is_test_like_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("/test/")
-        || lower.contains("/tests/")
-        || lower.contains("/__tests__/")
-        || lower.ends_with("_test.rs")
-        || lower.ends_with(".test.ts")
-        || lower.ends_with(".test.tsx")
-        || lower.ends_with(".spec.ts")
-        || lower.ends_with(".spec.tsx")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,15 +266,6 @@ mod tests {
         assert!(is_test_scaffolding_text("  expect(foo()).toBe(1)"));
         assert!(is_test_scaffolding_text("describe('x', () => {"));
         assert!(!is_test_scaffolding_text("let y = bar();"));
-    }
-
-    #[test]
-    fn test_like_path_detection() {
-        assert!(is_test_like_path("crates/x/tests/foo.rs"));
-        assert!(is_test_like_path("src/widget_test.rs"));
-        assert!(is_test_like_path("app/Button.spec.tsx"));
-        assert!(is_test_like_path("web/__tests__/util.ts"));
-        assert!(!is_test_like_path("src/widget.rs"));
     }
 
     #[test]

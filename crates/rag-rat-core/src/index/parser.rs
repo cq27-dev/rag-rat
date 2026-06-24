@@ -651,7 +651,7 @@ fn detect_is_test(
     scope_path: &str,
     name: &str,
 ) -> bool {
-    if is_test_file_path(path) {
+    if is_test_path(path) {
         return true;
     }
     match language {
@@ -675,11 +675,20 @@ fn detect_is_test(
     }
 }
 
-/// Cross-language test-FILE conventions: a `tests`/`spec` directory, or a filename like
-/// `test_*` / `*_test` / `*_tests` / `*Test` / `*Tests` / `*.test.*` / `*.spec.*` / `conftest.py`.
-fn is_test_file_path(path: &Path) -> bool {
+/// The CANONICAL cross-language test-path detector (#294) — the one reused by the indexer (the
+/// `is_test` computation) AND the query layer (`staleness` test-file skip, `graph` test-callsite
+/// filter, `repo_brief` support-path down-weight). A test path is any of: a test directory segment
+/// (`tests`/`test`/`__tests__`/`__mocks__`/`spec`, case-insensitive), `conftest.py`, a `*.test.*` /
+/// `*.spec.*` filename, or a stem like `test`/`tests` / `test_*` / `*_test` / `*_tests` / `*Test` /
+/// `*Tests` / `*TestCase`. Takes `impl AsRef<Path>` so both `&Path` (parser) and `&str` (the query
+/// callers' stored path strings) pass directly.
+pub(crate) fn is_test_path(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
     if path.components().filter_map(|component| component.as_os_str().to_str()).any(|segment| {
-        matches!(segment, "tests" | "test" | "__tests__" | "__test__" | "spec" | "specs")
+        matches!(
+            segment.to_ascii_lowercase().as_str(),
+            "tests" | "test" | "__tests__" | "__test__" | "__mocks__" | "spec" | "specs"
+        )
     }) {
         return true;
     }
@@ -687,15 +696,19 @@ fn is_test_file_path(path: &Path) -> bool {
     if file == "conftest.py" {
         return true;
     }
+    let lower = file.to_ascii_lowercase();
+    if lower.contains(".test.") || lower.contains(".spec.") {
+        return true;
+    }
     let stem = file.split('.').next().unwrap_or(file);
-    stem.starts_with("test_")
+    stem == "test"
+        || stem == "tests"
+        || stem.starts_with("test_")
         || stem.ends_with("_test")
         || stem.ends_with("_tests")
         || stem.ends_with("Test")
         || stem.ends_with("Tests")
         || stem.ends_with("TestCase")
-        || file.contains(".test.")
-        || file.contains(".spec.")
 }
 
 /// A Rust attribute that marks a test function: `#[test]`, `#[tokio::test]`, `#[rstest]`,
@@ -970,5 +983,40 @@ mod is_test_detection {
             "function anything() {}\n",
             "anything"
         ));
+    }
+
+    #[test]
+    fn canonical_is_test_path_covers_the_union_of_conventions() {
+        use super::is_test_path;
+        // Directory segments (case-insensitive), incl. repo_brief's `__mocks__`.
+        for p in [
+            "crates/x/tests/foo.rs",
+            "src/test/foo.rs",
+            "web/__tests__/util.ts",
+            "web/__mocks__/api.ts",
+            "app/Spec/x.rb",
+            "pkg/Tests/Thing.cs",
+        ] {
+            assert!(is_test_path(p), "dir segment: {p}");
+        }
+        // Filenames, incl. repo_brief's `tests.rs`/`_tests.rs` and cross-language stems.
+        for p in [
+            "src/widget_test.rs",
+            "src/widget_tests.rs",
+            "pkg/foo_test.go",
+            "tests.rs",
+            "test_app.py",
+            "conftest.py",
+            "app/Button.spec.tsx",
+            "app/Button.test.tsx",
+            "FooTest.kt",
+            "FooTestCase.java",
+        ] {
+            assert!(is_test_path(p), "filename: {p}");
+        }
+        // Negatives — including near-misses that must NOT match.
+        for p in ["src/widget.rs", "src/contest.rs", "src/latest.rs", "lib/manifest.rs"] {
+            assert!(!is_test_path(p), "non-test: {p}");
+        }
     }
 }

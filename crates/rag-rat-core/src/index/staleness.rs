@@ -2,7 +2,6 @@
 //! stale, regex/line reads over current source.
 
 use super::*;
-use crate::query::text_compare::*;
 
 /// Whether `search_with_heal` may lazily re-index files whose chunks have drifted from disk.
 /// `Allow` heals once and retries; `Skip` is the recursion's base case (and the explicit
@@ -38,7 +37,7 @@ impl IndexDatabase {
             stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         let mut hits = Vec::new();
         for path in paths {
-            if !include_tests && is_test_like_path(&path) {
+            if !include_tests && crate::index::parser::is_test_path(&path) {
                 continue;
             }
             let full_path = root.join(&path);

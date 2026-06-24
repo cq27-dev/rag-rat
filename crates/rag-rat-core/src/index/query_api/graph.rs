@@ -271,7 +271,9 @@ impl IndexDatabase {
         )?;
         if !include_tests {
             graph_edges.retain(|edge| {
-                edge.callsite.as_ref().is_none_or(|callsite| !is_test_like_path(&callsite.path))
+                edge.callsite
+                    .as_ref()
+                    .is_none_or(|callsite| !crate::index::parser::is_test_path(&callsite.path))
             });
         }
         let (logical_symbol, variants) =

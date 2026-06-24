@@ -290,7 +290,7 @@ fn capped(value: f64) -> f64 {
 }
 
 fn support_path_multiplier(mode: RepoBriefMode, path: &str) -> f64 {
-    if !is_test_or_mock_path(path) {
+    if !crate::index::parser::is_test_path(path) {
         return 1.0;
     }
     match mode {
@@ -298,19 +298,6 @@ fn support_path_multiplier(mode: RepoBriefMode, path: &str) -> f64 {
         RepoBriefMode::Spine => 0.70,
         RepoBriefMode::Churn => 1.0,
     }
-}
-
-fn is_test_or_mock_path(path: &str) -> bool {
-    path.contains("/__tests__/")
-        || path.contains("/__mocks__/")
-        || path.contains("/tests/")
-        || path.ends_with("/tests.rs")
-        || path.ends_with("_test.rs")
-        || path.ends_with("_tests.rs")
-        || path.ends_with(".test.ts")
-        || path.ends_with(".test.tsx")
-        || path.ends_with(".spec.ts")
-        || path.ends_with(".spec.tsx")
 }
 
 fn category_for(
