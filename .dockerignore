@@ -1,0 +1,17 @@
+# Docker build context exclusions.
+#
+# The only repo Dockerfile is `tools/bench.Containerfile` (built by bench-release.yml and
+# oracle.yml). It is a PURE TOOLCHAIN image — it COPYs nothing from the build context; the repo is
+# bind-mounted at `docker run`. So the whole repo was being sent as context for nothing.
+#
+# Without this file, Docker scans `.git` while assembling the context, which intermittently races a
+# pack/gc and fails with `checking context: file ('.git/objects/..') not found` — that is what broke
+# the v0.9.0 Linux-kernel indexing bench (bench-release). Excluding `.git` makes the context
+# deterministic; excluding the build/state dirs shrinks a multi-GB context to ~nothing.
+.git
+target
+.rag-rat
+.claude
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
