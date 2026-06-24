@@ -24,8 +24,9 @@ mod search;
 pub use clones::of_text::{CloneCheckInput, CloneFingerprintHealth, TextCloneMatch};
 pub use clones::precompute::CloneEdgeReport;
 pub use clones::{
-    CandidateCloneClass, CloneCompleteness, CloneMember, CloneSymbolSelector,
-    ClonesForSymbolResult, FindClonesOptions, FindClonesResult, RoiFactors,
+    CandidateCloneClass, CloneCompleteness, CloneEligibility, CloneIneligibilityReason,
+    CloneMember, CloneSymbolSelector, ClonesForSymbolResult, FindClonesOptions, FindClonesResult,
+    RoiFactors,
 };
 #[cfg(test)]
 pub(crate) use clones::{MAX_MEMBERS, MEMBER_VALUE_CAP};

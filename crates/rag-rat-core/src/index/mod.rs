@@ -49,10 +49,10 @@ pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub use parser_failures::ParserFailure;
 pub(crate) use prep::*;
 pub use query_api::{
-    CandidateCloneClass, CloneCheckInput, CloneCompleteness, CloneEdgeReport,
-    CloneFingerprintHealth, CloneMember, CloneSymbolSelector, ClonesForSymbolResult,
-    FindClonesOptions, FindClonesResult, GcReport, ImportantSymbolsRequest, OracleShaSnapshots,
-    RoiFactors, SearchRequest, TextCloneMatch,
+    CandidateCloneClass, CloneCheckInput, CloneCompleteness, CloneEdgeReport, CloneEligibility,
+    CloneFingerprintHealth, CloneIneligibilityReason, CloneMember, CloneSymbolSelector,
+    ClonesForSymbolResult, FindClonesOptions, FindClonesResult, GcReport, ImportantSymbolsRequest,
+    OracleShaSnapshots, RoiFactors, SearchRequest, TextCloneMatch,
 };
 pub(crate) use util::*;
 

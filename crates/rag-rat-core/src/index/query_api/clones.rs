@@ -239,6 +239,80 @@ pub struct CloneCompleteness {
     pub known_index_gaps: Vec<String>,
 }
 
+/// Why a *resolved* symbol is not clone-eligible (#274 item 3a). The `symbol_fingerprinted = false`
+/// bool conflated several distinct causes — this names them so a consumer can tell "below
+/// `MIN_TOKENS`" (a near-miss worth nothing) from "the file is generated" (excluded by policy) from
+/// "the index is stale at this symbol" (a reindex would fix it). It is a closed, persisted-style
+/// enum: [`as_db_str`](Self::as_db_str) / [`from_db_str`](Self::from_db_str) give the stable wire
+/// token that crosses the MCP/CLI serde boundary, and `serde` emits that same snake_case token.
+///
+/// Reasons are determined in PRIORITY order (see [`classify_ineligibility_reason`]), so exactly one
+/// is reported even when several apply (a generated file ALSO has a non-function `_` symbol, etc.):
+/// `Generated` ⊃ `StaleNormalizerVersion` ⊃ `NonFunctionKind` ⊃ `BelowMinTokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneIneligibilityReason {
+    /// The symbol's file is generated (`files.generated = 1` — a `kind = generated` target or a
+    /// path-heuristic codegen file like `src/generated/…`/`.d.ts`). Generated code is excluded from
+    /// clone recall by policy; checked FIRST because a generated file's symbols are never
+    /// fingerprinted regardless of kind/size.
+    Generated,
+    /// The symbol is not a function-shaped declaration: its `kind` is neither `"function"` nor a
+    /// function-valued declarator (`const f = () => …`, a class-field arrow — #232 #5). Only
+    /// function-shaped symbols are fingerprinted, so this can never be a clone-class member.
+    NonFunctionKind,
+    /// A baseline fingerprint row EXISTS for this symbol but at a `normalizer_version` other than
+    /// the current [`NORM_VERSION`] — the index was last fingerprinted by an older binary and
+    /// the read filter excludes it. A `rag-rat index --full` with the current binary fixes it.
+    /// Distinct from `BelowMinTokens` (where NO row exists at all): here the symbol WAS
+    /// eligible, the index is just stale.
+    StaleNormalizerVersion,
+    /// The symbol is function-shaped and in a non-generated file, but no current-version
+    /// fingerprint row exists — its body normalized below [`MIN_TOKENS`](crate::index::clones)
+    /// tokens (the size floor), so it was never fingerprinted. The residual catch-all once
+    /// `Generated` / `NonFunctionKind` / `StaleNormalizerVersion` are ruled out.
+    BelowMinTokens,
+}
+
+impl CloneIneligibilityReason {
+    /// The stable wire/DB token for this reason (matches the `serde` snake_case rename).
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            CloneIneligibilityReason::Generated => "generated",
+            CloneIneligibilityReason::NonFunctionKind => "non_function_kind",
+            CloneIneligibilityReason::StaleNormalizerVersion => "stale_normalizer_version",
+            CloneIneligibilityReason::BelowMinTokens => "below_min_tokens",
+        }
+    }
+
+    /// Parse a wire/DB token back into a reason (inverse of [`as_db_str`](Self::as_db_str)).
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "generated" => Some(CloneIneligibilityReason::Generated),
+            "non_function_kind" => Some(CloneIneligibilityReason::NonFunctionKind),
+            "stale_normalizer_version" => Some(CloneIneligibilityReason::StaleNormalizerVersion),
+            "below_min_tokens" => Some(CloneIneligibilityReason::BelowMinTokens),
+            _ => None,
+        }
+    }
+}
+
+/// The clone-eligibility verdict for a [`clones_for_symbol`](IndexDatabase::clones_for_symbol)
+/// selector — the richer companion to the `symbol_resolved` / `symbol_fingerprinted` bools (#274
+/// item 3a). Serializes as an internally-tagged object (`{ "status": "eligible" }`,
+/// `{ "status": "ineligible", "reason": "below_min_tokens" }`,
+/// `{ "status": "symbol_not_resolved" }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CloneEligibility {
+    /// The selector matched no scoped symbol (`symbol_resolved = false`).
+    SymbolNotResolved,
+    /// The symbol resolved AND carries a current-version baseline fingerprint (clone-eligible).
+    Eligible,
+    /// The symbol resolved but is not clone-eligible; `reason` says why.
+    Ineligible { reason: CloneIneligibilityReason },
+}
+
 /// Result of [`IndexDatabase::clones_for_symbol`]. Carries eligibility flags + a completeness block
 /// so a caller can distinguish "selector matched nothing" from "matched a symbol that is not
 /// eligible for fingerprinting" from "eligible but unique (in no clone class)".
@@ -254,6 +328,13 @@ pub struct ClonesForSymbolResult {
     /// …`, a class-field arrow handler, #232 #5 — ≥ `MIN_TOKENS` in a non-generated, in-scope
     /// file).
     pub symbol_fingerprinted: bool,
+    /// The richer eligibility verdict (#274 item 3a): when `symbol_fingerprinted = false` this
+    /// names WHY the symbol is not clone-eligible (generated file / non-function kind / stale
+    /// normalizer_version / below `MIN_TOKENS`) instead of conflating all four into one bool.
+    /// Stays consistent with the bools: `Eligible` ⇔ `symbol_fingerprinted`,
+    /// `SymbolNotResolved` ⇔ `!symbol_resolved`, `Ineligible { .. }` ⇔ `symbol_resolved &&
+    /// !symbol_fingerprinted`.
+    pub eligibility: CloneEligibility,
     /// Same provenance block as [`FindClonesResult::completeness`].
     pub completeness: CloneCompleteness,
 }
@@ -978,11 +1059,14 @@ impl IndexDatabase {
     ) -> anyhow::Result<ClonesForSymbolResult> {
         let conn = self.storage.connection();
 
+        // `eligibility` is the single source of truth; `symbol_resolved` / `symbol_fingerprinted`
+        // are derived from it so the bool fields and the richer enum can never disagree (#274 3a).
         let make_result = |class: Option<CandidateCloneClass>,
-                           symbol_resolved: bool,
-                           symbol_fingerprinted: bool,
+                           eligibility: CloneEligibility,
                            stale_members: usize,
                            freshness: String| {
+            let symbol_resolved = !matches!(eligibility, CloneEligibility::SymbolNotResolved);
+            let symbol_fingerprinted = matches!(eligibility, CloneEligibility::Eligible);
             // A single class can only truncate by capping its own member list; there is no
             // class-limit here, so reuse the same member-cap signal as `find_clones`.
             let truncated = class.as_ref().is_some_and(|c| c.members_returned < c.total_members);
@@ -990,6 +1074,7 @@ impl IndexDatabase {
                 class,
                 symbol_resolved,
                 symbol_fingerprinted,
+                eligibility,
                 // No class limit on this path → never refine-budget-clamped.
                 completeness: build_completeness(
                     THETA,
@@ -1006,14 +1091,17 @@ impl IndexDatabase {
 
         let resolved_id = resolve_selector_to_symbol_id(conn, &selector)?;
         let Some(symbol_id) = resolved_id else {
-            return Ok(make_result(None, false, false, 0, freshness));
+            return Ok(make_result(None, CloneEligibility::SymbolNotResolved, 0, freshness));
         };
 
         let bags = load_scoped_baseline_bags(conn)?;
-        // If the resolved symbol has no fingerprint row it is not eligible — it can't be in any
-        // clone class (generated file, below MIN_TOKENS, or a non-function symbol).
+        // If the resolved symbol has no current-version fingerprint row it is not eligible — it
+        // can't be in any clone class. Classify WHY (generated file, non-function kind,
+        // stale normalizer_version, or below MIN_TOKENS) instead of collapsing all four
+        // into one bool.
         if !bags.iter().any(|b| b.symbol_id == symbol_id) {
-            return Ok(make_result(None, true, false, 0, freshness));
+            let reason = classify_ineligibility_reason(conn, symbol_id)?;
+            return Ok(make_result(None, CloneEligibility::Ineligible { reason }, 0, freshness));
         }
 
         let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
@@ -1023,7 +1111,7 @@ impl IndexDatabase {
         // Find the component that contains this symbol_id (with its index so we can pull its edge
         // bucket).
         let Some(comp_idx) = components.iter().position(|comp| comp.contains(&symbol_id)) else {
-            return Ok(make_result(None, true, true, 0, freshness));
+            return Ok(make_result(None, CloneEligibility::Eligible, 0, freshness));
         };
         let component = components[comp_idx].clone();
         // The θ-verified edge subset for THIS component (#256) — feeds the scalable clique cover so
@@ -1115,7 +1203,7 @@ impl IndexDatabase {
             },
         };
 
-        Ok(make_result(class, true, true, stale_members, freshness))
+        Ok(make_result(class, CloneEligibility::Eligible, stale_members, freshness))
     }
 }
 
@@ -1573,6 +1661,64 @@ fn resolve_selector_to_symbol_id(
             Ok(id)
         },
     }
+}
+
+/// Classify WHY a *resolved* symbol is not clone-eligible (#274 item 3a) — only called once
+/// `clones_for_symbol` has established `symbol_resolved = true` AND the symbol is absent from the
+/// candidate bags (`symbol_fingerprinted = false`). Queries the DB for the three discriminating
+/// facts — is the file generated, what is the symbol's `kind`, and does ANY baseline fingerprint
+/// row exist (at any `normalizer_version`) — and resolves them in PRIORITY order so exactly one
+/// reason is reported:
+///
+/// 1. [`Generated`](CloneIneligibilityReason::Generated) — `files.generated = 1`. Checked first
+///    because generated symbols are never fingerprinted regardless of kind/size, AND the read
+///    filter (`load_scoped_baseline_bags`) excludes them even if a stale row lingers from before a
+///    target-reclassification.
+/// 2. [`StaleNormalizerVersion`](CloneIneligibilityReason::StaleNormalizerVersion) — a baseline row
+///    EXISTS but not at the current [`NORM_VERSION`]. Checked before the kind test because a
+///    function-VALUED declarator (`const f = () => …`, #232 #5) keeps `kind = "const"` yet IS
+///    fingerprinted, so an existing row is the authoritative "this symbol was eligible" signal —
+///    the index is merely stale.
+/// 3. [`NonFunctionKind`](CloneIneligibilityReason::NonFunctionKind) — `kind != "function"` and no
+///    fingerprint row exists. (A large function-valued declarator is caught by rule 2; a tiny one
+///    with a non-`function` kind is honestly reported here — both `NonFunctionKind` and
+///    `BelowMinTokens` are true, and the literal `kind` fact is the one the DB can attest to
+///    without the AST.)
+/// 4. [`BelowMinTokens`](CloneIneligibilityReason::BelowMinTokens) — the residual: a `kind =
+///    "function"` symbol in a non-generated file with no current-version row, i.e. its normalized
+///    body fell below [`MIN_TOKENS`](crate::index::clones).
+fn classify_ineligibility_reason(
+    conn: &Connection,
+    symbol_id: i64,
+) -> anyhow::Result<CloneIneligibilityReason> {
+    // The three discriminating facts in one read: the file's generated flag, the symbol kind, and
+    // whether ANY baseline fingerprint row exists (any normalizer_version) — `EXISTS` so the kind
+    // and generated columns stay single-row.
+    let (generated, kind, has_any_baseline_fp): (bool, String, bool) = conn.query_row(
+        "SELECT files.generated,
+                symbols.kind,
+                EXISTS(
+                    SELECT 1 FROM symbol_fingerprints sf
+                    WHERE sf.symbol_id = symbols.id AND sf.normalizer_kind = 'baseline'
+                )
+         FROM symbols
+         JOIN files ON files.id = symbols.file_id
+         WHERE symbols.id = ?1",
+        rusqlite::params![symbol_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+
+    Ok(if generated {
+        CloneIneligibilityReason::Generated
+    } else if has_any_baseline_fp {
+        // A row exists but the current-version read missed it (the caller already established
+        // `symbol_fingerprinted = false`) ⇒ the only stored row is at a stale normalizer_version.
+        CloneIneligibilityReason::StaleNormalizerVersion
+    } else if kind != "function" {
+        CloneIneligibilityReason::NonFunctionKind
+    } else {
+        CloneIneligibilityReason::BelowMinTokens
+    })
 }
 
 /// Extract candidate pairs from already-loaded bags (avoids a second DB round-trip in
