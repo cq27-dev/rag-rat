@@ -414,6 +414,20 @@ pub(crate) fn version_check(config: &Config) -> anyhow::Result<()> {
 }
 #[cfg(feature = "eval")]
 pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
+    // Parent-state replay is a distinct flow: it scores each case against its own freshly-built
+    // parent index (no shared HEAD db, no static suite / oracle baseline), so it has its own entry
+    // point and report shape rather than threading through `run`.
+    if args.replay_parent_state {
+        let report = rag_rat_core::eval::run_replay_parent_state(
+            config,
+            &rag_rat_core::eval::ReplayOptions {
+                max_cases: args.replay_max_cases,
+                max_files: args.replay_max_files,
+            },
+        )?;
+        print_output(&report)?;
+        return Ok(());
+    }
     let options = rag_rat_core::eval::EvalOptions {
         queries_path: args
             .queries
@@ -427,6 +441,10 @@ pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
         scip_path: args.scip.clone().or_else(|| {
             let default = default_eval_path(config, "oracle.scip");
             default.exists().then_some(default)
+        }),
+        replay: args.replay.then_some(rag_rat_core::eval::ReplayOptions {
+            max_cases: args.replay_max_cases,
+            max_files: args.replay_max_files,
         }),
     };
     let report = rag_rat_core::eval::run(config, &options)?;

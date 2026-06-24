@@ -8,6 +8,26 @@ impl IndexDatabase {
         git_history::commit_search(self.storage.connection(), query, limit)
     }
 
+    /// Commit-replay eval cases (#120) from the indexed git history — commit message as query, the
+    /// diff's changed paths as recall gold. See [`git_history::replay_commit_cases`].
+    pub fn replay_commit_cases(
+        &self,
+        limit: u32,
+        max_files: u32,
+    ) -> anyhow::Result<Vec<git_history::ReplayCase>> {
+        git_history::replay_commit_cases(self.storage.connection(), limit, max_files)
+    }
+
+    /// Symbol-level replay gold (#120): distinct chunk `symbol_path`s overlapping `ranges` in
+    /// `path`. See [`git_history::chunk_symbol_paths_in_ranges`].
+    pub fn chunk_symbol_paths_in_ranges(
+        &self,
+        path: &str,
+        ranges: &[(i64, i64)],
+    ) -> anyhow::Result<Vec<String>> {
+        git_history::chunk_symbol_paths_in_ranges(self.storage.connection(), path, ranges)
+    }
+
     pub fn git_history_for_path(
         &self,
         path: &str,

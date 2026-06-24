@@ -225,6 +225,90 @@ pub fn status(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexS
     })
 }
 
+/// One commit-replay eval case (#120): the commit message is the QUERY and the diff's changed paths
+/// are the GOLD ("the diff is the gold"). Built from the indexed `git_commits` / `git_file_changes`
+/// so no working-tree checkout is needed to enumerate cases.
+#[derive(Debug, Clone)]
+pub struct ReplayCase {
+    pub hash: String,
+    pub subject: String,
+    pub body: String,
+    /// Paths the commit's diff touched — the recall gold for this case.
+    pub changed_paths: Vec<String>,
+}
+
+/// Build commit-replay eval cases from the indexed git history, newest first. Caveats designed in
+/// (#120): `max_files` drops BULK/mechanical commits (renames, formatting sweeps) whose path-recall
+/// is noise; merge commits are excluded (their diff is a union, not a focused change).
+pub fn replay_commit_cases(
+    conn: &Connection,
+    limit: u32,
+    max_files: u32,
+) -> anyhow::Result<Vec<ReplayCase>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT hash, subject, body
+        FROM git_commits
+        WHERE changed_file_count BETWEEN 1 AND ?2
+          AND subject NOT LIKE 'Merge %'
+        ORDER BY authored_at_s DESC
+        LIMIT ?1
+        ",
+    )?;
+    let commits: Vec<(String, String, String)> = stmt
+        .query_map(params![i64::from(limit), i64::from(max_files)], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut paths_stmt =
+        conn.prepare("SELECT path FROM git_file_changes WHERE commit_hash = ?1 ORDER BY path")?;
+    let mut cases = Vec::with_capacity(commits.len());
+    for (hash, subject, body) in commits {
+        let changed_paths: Vec<String> = paths_stmt
+            .query_map(params![hash], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if changed_paths.is_empty() {
+            continue;
+        }
+        cases.push(ReplayCase { hash, subject, body, changed_paths });
+    }
+    Ok(cases)
+}
+
+/// Distinct `chunks.symbol_path` for chunks in `path` whose line span overlaps any of `ranges`
+/// (inclusive). Commit-replay (#120) uses this to derive symbol-level gold: the symbols a commit
+/// touched, in the SAME `symbol_path` format the search results carry, so symbol-recall is
+/// measurable. `ranges` are PARENT-side diff line ranges, queried against a PARENT-state index.
+pub fn chunk_symbol_paths_in_ranges(
+    conn: &Connection,
+    path: &str,
+    ranges: &[(i64, i64)],
+) -> anyhow::Result<Vec<String>> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "
+        SELECT DISTINCT chunks.symbol_path
+        FROM chunks
+        JOIN files ON files.id = chunks.file_id
+        WHERE files.path = ?1
+          AND chunks.symbol_path IS NOT NULL
+          AND chunks.start_line <= ?3
+          AND chunks.end_line >= ?2
+        ",
+    )?;
+    let mut symbols = BTreeSet::new();
+    for &(start, end) in ranges {
+        let rows = stmt.query_map(params![path, start, end], |row| row.get::<_, String>(0))?;
+        for symbol in rows {
+            symbols.insert(symbol?);
+        }
+    }
+    Ok(symbols.into_iter().collect())
+}
+
 pub fn commit_search(
     conn: &Connection,
     query: &str,

@@ -331,6 +331,21 @@ pub(crate) struct EvalArgs {
     /// Defaults to <root>/evals/oracle.scip when present; absent → oracle metrics skipped.
     #[arg(long)]
     pub scip: Option<PathBuf>,
+    /// Commit-replay eval (#120): generate cases from indexed git history (commit message = query,
+    /// diff's changed paths = recall gold) instead of the static queries TOML.
+    #[arg(long)]
+    pub replay: bool,
+    /// Max recent commits to turn into replay cases.
+    #[arg(long, default_value_t = 200)]
+    pub replay_max_cases: u32,
+    /// Skip bulk/mechanical commits whose changed-file count exceeds this (recall noise).
+    #[arg(long, default_value_t = 20)]
+    pub replay_max_files: u32,
+    /// Leakage-free replay: score each case against an index of its commit's PARENT state (a
+    /// throwaway worktree + full reindex per case). Slower; the absolute headline number. Implies
+    /// `--replay`.
+    #[arg(long)]
+    pub replay_parent_state: bool,
 }
 
 #[derive(Debug, Args)]

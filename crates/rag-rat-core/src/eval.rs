@@ -6,7 +6,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::index::oracle::{OracleEvalMetrics, OracleTool, RecallCalls};
-use crate::index::{OracleShaSnapshots, ai};
+use crate::index::{OracleShaSnapshots, ai, git_history};
 use crate::{Config, IndexDatabase};
 
 const TOP_K: usize = 10;
@@ -84,6 +84,19 @@ pub struct EvalOptions {
     /// eval corpus. `None` (or a missing path) skips the oracle pass — `EvalReport.oracle` is then
     /// `None` and oracle metrics aren't gated.
     pub scip_path: Option<PathBuf>,
+    /// Commit-replay mode (#120): instead of the hand-authored TOML suite, generate eval cases
+    /// from the indexed git history (commit message = query, diff's changed paths = recall
+    /// gold). `None` uses the static `queries_path` suite.
+    pub replay: Option<ReplayOptions>,
+}
+
+/// Commit-replay eval knobs (#120).
+#[derive(Debug, Clone)]
+pub struct ReplayOptions {
+    /// Cap on how many recent commits become eval cases.
+    pub max_cases: u32,
+    /// Drop bulk/mechanical commits whose `changed_file_count` exceeds this (recall noise).
+    pub max_files: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,9 +209,12 @@ struct BaselineSuite {
 }
 
 pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport> {
-    let suite = load_queries(&options.queries_path)?;
-    let expected = load_expected(&options.expected_path)?;
     let db = IndexDatabase::open_config(config)?;
+    let suite = match &options.replay {
+        Some(replay) => generate_replay_suite(&db, replay)?,
+        None => load_queries(&options.queries_path)?,
+    };
+    let expected = load_expected(&options.expected_path)?;
     let mut results = Vec::new();
     let mut observed = Vec::new();
 
@@ -221,7 +237,13 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
         Some((metrics, skipped_drifted)) => (Some(metrics), skipped_drifted),
         None => (None, 0),
     };
-    let pass = metrics.stale_current_source_violations == 0 && results.iter().all(|r| r.passed);
+    // Commit-replay is a MEASUREMENT (the aggregate MRR/recall@10 IS the output), not a hard
+    // must-pass gate — a commit whose files don't all land in top-10 is exactly what recall
+    // measures, not a failure. So in replay mode the run still "passes" as long as content
+    // integrity holds (no stale-source violations); the static hand-authored suite keeps its
+    // strict all-must-include regression gate.
+    let pass = metrics.stale_current_source_violations == 0
+        && (options.replay.is_some() || results.iter().all(|r| r.passed));
     Ok(EvalReport {
         pass,
         queries: results.len(),
@@ -231,6 +253,221 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
         oracle_skipped_drifted,
         results,
     })
+}
+
+/// Map one commit-replay case to the standard `EvalQuery`: commit message = query, the diff's
+/// changed paths = recall gold. Shared by HEAD-scored ([`generate_replay_suite`]) and parent-state
+/// ([`run_replay_parent_state`]) replay so both score identically.
+fn replay_eval_query(case: &git_history::ReplayCase) -> EvalQuery {
+    let text = if case.body.trim().is_empty() {
+        case.subject.clone()
+    } else {
+        format!("{}\n{}", case.subject, case.body)
+    };
+    let short = &case.hash[..case.hash.len().min(12)];
+    EvalQuery {
+        id: format!("replay-{short}"),
+        text,
+        evidence_class: None,
+        requires_papertrail_cache: false,
+        must_include_paths: case.changed_paths.clone(),
+        must_include_symbols: Vec::new(),
+        must_include_graph_targets: Vec::new(),
+        must_include_impact_categories: Vec::new(),
+        must_include_impact_paths: Vec::new(),
+        must_include_impact_symbols: Vec::new(),
+        should_include_git_subjects: Vec::new(),
+        should_include_papertrail_kinds: Vec::new(),
+    }
+}
+
+/// Generate commit-replay eval cases (#120) from the indexed git history. Cases flow through the
+/// standard `EvalQuery` scoring path, so MRR/recall@10 are computed identically to the
+/// hand-authored suite.
+///
+/// This is the HEAD-SCORED variant: every case is scored against the currently-open (HEAD) index,
+/// not a checkout of each commit's parent — so absolute numbers carry leakage (a post-fix index can
+/// name the solution). Relative deltas (embedder A vs B, reranker on vs off) are unaffected — the
+/// immediate need for #112/#109. Use [`run_replay_parent_state`] for the leakage-free number.
+pub fn generate_replay_suite(
+    db: &IndexDatabase,
+    options: &ReplayOptions,
+) -> anyhow::Result<EvalSuite> {
+    let cases = db.replay_commit_cases(options.max_cases, options.max_files)?;
+    let query = cases.iter().map(replay_eval_query).collect();
+    Ok(EvalSuite { query })
+}
+
+/// Aggregate result of a parent-state replay run (#120) — the leakage-free MRR/recall@10 over the
+/// commits that were scorable, plus how many were skipped (root commit / pre-`rag-rat.toml`).
+#[derive(Debug, Serialize)]
+pub struct ReplayReport {
+    pub cases: usize,
+    pub skipped: u32,
+    pub parent_state: bool,
+    pub metrics: EvalMetrics,
+    pub results: Vec<EvalQueryReport>,
+}
+
+/// Leakage-free commit-replay (#120): score each commit's query against an index of its PARENT
+/// state — the code as it was BEFORE the change — so a post-fix index can't leak the answer. Each
+/// case checks out the parent in a throwaway `git worktree`, full-indexes it into a temp DB, and
+/// scores via the same `evaluate_query` path. Slower than HEAD-scoring (one full index per case),
+/// so it's a separate opt-in mode (`--replay-parent-state`), for the absolute headline number
+/// rather than the inner-loop relative dial.
+pub fn run_replay_parent_state(
+    config: &Config,
+    options: &ReplayOptions,
+) -> anyhow::Result<ReplayReport> {
+    let cases = {
+        let head_db = IndexDatabase::open_config(config)?;
+        head_db.replay_commit_cases(options.max_cases, options.max_files)?
+        // head_db dropped here — release the HEAD index before rebuilding worktree indexes.
+    };
+    let mut results = Vec::new();
+    let mut skipped = 0u32;
+    for case in &cases {
+        match score_case_at_parent(&config.root, case) {
+            Ok(Some(report)) => results.push(report),
+            Ok(None) => skipped += 1, // root commit (no parent) or pre-`rag-rat.toml` history
+            Err(err) => {
+                eprintln!("replay parent-state: skipped {} ({err})", case.hash);
+                skipped += 1;
+            },
+        }
+    }
+    let metrics = aggregate(&results);
+    Ok(ReplayReport { cases: results.len(), skipped, parent_state: true, metrics, results })
+}
+
+/// Index a single commit's PARENT state in a throwaway worktree and score its replay query there.
+/// `Ok(None)` = legitimately skippable (no parent / no `rag-rat.toml` at that commit).
+fn score_case_at_parent(
+    repo_root: &Path,
+    case: &git_history::ReplayCase,
+) -> anyhow::Result<Option<EvalQueryReport>> {
+    let short = &case.hash[..case.hash.len().min(12)];
+    // The root commit has no parent — `git worktree add <sha>^` fails; that's a skip, not an error.
+    let Ok(worktree) = ParentWorktree::create(repo_root, &format!("{}^", case.hash), short) else {
+        return Ok(None);
+    };
+    let manifest = worktree.path.join("rag-rat.toml");
+    if !manifest.exists() {
+        return Ok(None); // commit predates rag-rat.toml — nothing to index against.
+    }
+    // At the PARENT state, files the commit ADDED don't exist yet — they can't be retrieved, and
+    // requiring them would understate recall. Restrict the gold to paths that existed at the parent
+    // (modified/deleted); skip commits that were pure additions (nothing recallable to score).
+    let existing_gold: Vec<String> = case
+        .changed_paths
+        .iter()
+        .filter(|path| worktree.path.join(path).exists())
+        .cloned()
+        .collect();
+    if existing_gold.is_empty() {
+        return Ok(None);
+    }
+    let mut case_config = Config::load(&manifest)?;
+    case_config.database = std::env::temp_dir().join(format!("rag-rat-replay-{short}.sqlite"));
+    let _ = std::fs::remove_file(&case_config.database);
+    IndexDatabase::rebuild(&case_config)?;
+    let report = {
+        let case_db = IndexDatabase::open_config(&case_config)?;
+        let mut query = replay_eval_query(case);
+        // Symbol-level gold: the symbols the commit touched that existed at the parent. Derive from
+        // the PARENT-side diff line ranges → the parent index's chunk `symbol_path`s (same format
+        // the search hits carry), so symbol-recall is measured alongside path-recall.
+        let parent = format!("{}^", case.hash);
+        let mut symbol_gold = BTreeSet::new();
+        for path in &existing_gold {
+            let ranges = parent_changed_line_ranges(repo_root, &parent, &case.hash, path);
+            for symbol in case_db.chunk_symbol_paths_in_ranges(path, &ranges)? {
+                symbol_gold.insert(symbol);
+            }
+        }
+        query.must_include_paths = existing_gold;
+        query.must_include_symbols = symbol_gold.into_iter().collect();
+        evaluate_query(&case_config, &case_db, &query, SearchMode::Active)?
+    };
+    let _ = std::fs::remove_file(&case_config.database);
+    Ok(Some(report))
+}
+
+/// PARENT-side changed line ranges (inclusive) for `path` between a `commit` and its `parent`, from
+/// `git diff --unified=0`. Only hunks with parent-side lines (old-count > 0) are returned —
+/// pure-add hunks have no lines that existed at the parent. Feeds symbol-level replay gold (#120).
+fn parent_changed_line_ranges(
+    repo_root: &Path,
+    parent: &str,
+    commit: &str,
+    path: &str,
+) -> Vec<(i64, i64)> {
+    let Ok(output) = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["diff", "--unified=0", &format!("{parent}..{commit}"), "--", path])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut ranges = Vec::new();
+    for line in text.lines() {
+        // Hunk header: `@@ -OLD_START[,OLD_COUNT] +NEW_START[,NEW_COUNT] @@ ...`
+        let Some(rest) = line.strip_prefix("@@ -") else {
+            continue;
+        };
+        let old = rest.split_whitespace().next().unwrap_or("");
+        let mut parts = old.split(',');
+        let start: i64 = parts.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+        let count: i64 = parts.next().map_or(1, |value| value.parse().unwrap_or(1));
+        if start > 0 && count > 0 {
+            ranges.push((start, start + count - 1));
+        }
+    }
+    ranges
+}
+
+/// RAII throwaway `git worktree` at a commit-ish. Created detached; removed (force) on drop so a
+/// scoring error never leaks a worktree. Pruned/cleared first so a stale dir from a crashed run
+/// doesn't block re-creation.
+struct ParentWorktree {
+    path: PathBuf,
+    repo_root: PathBuf,
+}
+
+impl ParentWorktree {
+    fn create(repo_root: &Path, commitish: &str, dir_key: &str) -> anyhow::Result<Self> {
+        let path = std::env::temp_dir().join(format!("rag-rat-replay-wt-{dir_key}"));
+        let _ = std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(["worktree", "prune"])
+            .status();
+        let _ = std::fs::remove_dir_all(&path);
+        let status = std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(["worktree", "add", "--detach"])
+            .arg(&path)
+            .arg(commitish)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("git worktree add failed for {commitish}");
+        }
+        Ok(Self { path, repo_root: repo_root.to_path_buf() })
+    }
+}
+
+impl Drop for ParentWorktree {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("git")
+            .current_dir(&self.repo_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// Run the SCIP-oracle pass against the eval corpus from the supplied `.scip` fixture, returning
@@ -829,6 +1066,28 @@ mod tests {
     use crate::{Config, IndexDatabase};
 
     #[test]
+    fn replay_eval_query_maps_commit_to_query() {
+        use crate::index::git_history::ReplayCase;
+        // Body present: query is subject + body; the diff's paths are the recall gold; id is the
+        // 12-char short hash; symbols start empty (parent-state fills them in per case).
+        let with_body = ReplayCase {
+            hash: "0123456789abcdef0123".into(),
+            subject: "fix(x): handle empty input".into(),
+            body: "Closes #42".into(),
+            changed_paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+        };
+        let query = replay_eval_query(&with_body);
+        assert_eq!(query.id, "replay-0123456789ab");
+        assert_eq!(query.text, "fix(x): handle empty input\nCloses #42");
+        assert_eq!(query.must_include_paths, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+        assert!(query.must_include_symbols.is_empty());
+
+        // Empty/whitespace body: the query is the subject alone (no dangling newline).
+        let no_body = ReplayCase { body: "  ".into(), ..with_body };
+        assert_eq!(replay_eval_query(&no_body).text, "fix(x): handle empty input");
+    }
+
+    #[test]
     fn eval_suite_reports_search_quality_and_current_source_safety() {
         let root = fixture_root();
         let mut config = Config::load(root.join("rag-rat.toml")).unwrap();
@@ -869,6 +1128,7 @@ mod tests {
             expected_path: workspace_root().join("evals/expected_hits.toml"),
             update_baseline: false,
             scip_path: None,
+            replay: None,
         })
         .unwrap();
         // Safety + non-zero retrieval hold in every build shape.
@@ -959,6 +1219,7 @@ mod tests {
             expected_path: workspace_root().join("evals/expected_hits.toml"),
             update_baseline: false,
             scip_path: Some(scip_path),
+            replay: None,
         })
         .unwrap();
 
