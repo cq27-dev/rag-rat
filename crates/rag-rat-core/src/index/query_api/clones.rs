@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension};
 
 /// Pairwise metric work cap for huge components: when a component exceeds this count, the
@@ -335,6 +336,85 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         let pairs = candidate_pairs(conn)?;
         Ok(components_from_pairs(&pairs))
+    }
+
+    /// The SORTED, UNCAPPED set of symbol refs (`path::name`) that are in ANY coherent clone class
+    /// (≥ `min_copies` members) over the active scope — the symbol-level recall signal for the #279
+    /// harness. `find_clones`'s per-class member list is capped at [`MAX_MEMBERS`], so the union of
+    /// its returned members UNDERCOUNTS symbols in large classes (the #282 covering-subset yields
+    /// 100+-member families); this counts EVERY member of every coherent class. Runs the SAME
+    /// candidate → component → `coherence_split` pipeline as `find_clones`, but collects the
+    /// uncapped member ids instead of building/refining/capping classes, then resolves them to
+    /// refs. Two builds' outputs diff with plain `diff`: a removed ref is a symbol that stopped
+    /// being a clone (a real recall regression) — unlike the class-level recall signature,
+    /// which legitimately changes when clustering granularity changes.
+    pub fn clone_symbol_refs(
+        &self,
+        min_similarity: Option<f64>,
+        min_copies: Option<usize>,
+    ) -> anyhow::Result<Vec<String>> {
+        let conn = self.storage.connection();
+        // Validate θ the same way `find_clones` does (see its doc): a ratio in [0.5, 1.0].
+        if let Some(v) = min_similarity
+            && (!v.is_finite() || !(0.5..=1.0).contains(&v))
+        {
+            anyhow::bail!("min_similarity must be in [0.5, 1.0]");
+        }
+        let bags = load_scoped_baseline_bags(conn)?;
+        let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
+        let theta = min_similarity.unwrap_or(THETA);
+        let min_copies = min_copies.unwrap_or(2);
+        let pairs = candidate_pairs_from_bags(&bags, theta);
+        let components = components_from_pairs(&pairs);
+        let edges_by_component = bucket_edges_by_component(&pairs, &components);
+
+        // Union of EVERY coherent class's uncapped member ids (mirrors find_clones's split loop).
+        let mut symbol_ids: BTreeSet<i64> = BTreeSet::new();
+        for (comp_idx, component) in components.iter().enumerate() {
+            if component.len() < min_copies {
+                continue;
+            }
+            let coherent_classes = coherence_split(
+                component,
+                &edges_by_component[comp_idx],
+                |a, b| {
+                    let ba = by_id[&a];
+                    let bb = by_id[&b];
+                    let max_len = ba.token_len.max(bb.token_len);
+                    if max_len == 0 { 1.0 } else { overlap(ba, bb) as f64 / max_len as f64 }
+                },
+                theta,
+            );
+            for class in &coherent_classes {
+                if class.len() >= min_copies {
+                    symbol_ids.extend(class.iter().copied());
+                }
+            }
+        }
+
+        // Resolve ids → qualified-name refs (`path::name`) via `name_strings` — the SAME source as
+        // `CloneMember.ref`. Chunked to respect SQLite's bound-parameter limit.
+        let ids: Vec<i64> = symbol_ids.into_iter().collect();
+        let mut refs: Vec<String> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(HYDRATION_CHUNK) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT ns.value FROM symbols
+                 JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+                 WHERE symbols.id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for r in rows {
+                refs.push(r?);
+            }
+        }
+        refs.sort_unstable();
+        refs.dedup();
+        Ok(refs)
     }
 }
 
@@ -1479,11 +1559,15 @@ fn candidate_pairs_from_bags(bags: &[SymbolBag], theta: f64) -> Vec<(i64, i64)> 
     add_struct_hash_pairs(bags, &mut pairs);
     let candidate = sub_block_candidate_pairs(bags, theta);
     let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
-    for (a, b) in candidate {
-        if verified_clone(by_id[&a], by_id[&b], theta) {
-            pairs.insert((a, b));
-        }
-    }
+    // Verify candidates in parallel: `verified_clone` is pure token math (no DB, no shared
+    // mutation; `by_id` is read-only), so the candidate set — the bulk of candidate-gen cost —
+    // fans out across cores. Output stays deterministic: the verified pairs land in the sorted
+    // `pairs` BTreeSet regardless of completion order.
+    let verified: Vec<(i64, i64)> = candidate
+        .into_par_iter()
+        .filter(|&(a, b)| verified_clone(by_id[&a], by_id[&b], theta))
+        .collect();
+    pairs.extend(verified);
     pairs.into_iter().collect()
 }
 
@@ -1837,14 +1921,16 @@ fn candidate_pairs(conn: &Connection) -> anyhow::Result<Vec<(i64, i64)>> {
     //    `find_clones` threads the caller's `min_similarity` through candidate generation.
     let candidate = sub_block_candidate_pairs(&bags, THETA);
 
-    // 3. Size prune + EXACT max-denominator verify over the FULL bags.
+    // 3. Size prune + EXACT max-denominator verify over the FULL bags — in parallel
+    //    (`verified_clone`
+    // is pure, `by_id` read-only). The sorted `pairs` BTreeSet keeps output deterministic
+    // regardless of completion order.
     let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
-    for (a, b) in candidate {
-        let (ba, bb) = (by_id[&a], by_id[&b]);
-        if verified_clone(ba, bb, THETA) {
-            pairs.insert((a, b));
-        }
-    }
+    let verified: Vec<(i64, i64)> = candidate
+        .into_par_iter()
+        .filter(|&(a, b)| verified_clone(by_id[&a], by_id[&b], THETA))
+        .collect();
+    pairs.extend(verified);
 
     Ok(pairs.into_iter().collect())
 }

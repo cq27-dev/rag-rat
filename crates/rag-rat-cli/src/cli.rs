@@ -215,6 +215,14 @@ pub(crate) struct ClonesArgs {
     /// (ignores `--limit`).
     #[arg(long)]
     pub recall_signature: bool,
+    /// Print the SORTED, UNCAPPED set of clone-symbol refs (one `path::symbol` per line) — every
+    /// symbol that is in any coherent clone class. The SYMBOL-level recall signal for the #279
+    /// harness, and the one to use when a change alters clustering granularity: unlike
+    /// `--recall-signature` (class lines, capped at the per-class member limit), this counts every
+    /// member of every class, so `diff`-ing two builds catches a symbol that stopped being a clone
+    /// without false alarms from the member cap. Ignores `--limit`.
+    #[arg(long)]
+    pub recall_symbols: bool,
 }
 
 /// Selector for `clones-for`: positional `SYMBOL` (a qualified ref or `sym_<hex>` handle), or

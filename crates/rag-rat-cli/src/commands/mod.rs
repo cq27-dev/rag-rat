@@ -151,6 +151,16 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
 
 pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
+
+    // `--recall-symbols`: the UNCAPPED symbol-level recall set (#282 follow-up) — via the dedicated
+    // pipeline, NOT find_clones (whose per-class member list is capped). One ref per line, sorted.
+    if args.recall_symbols {
+        for r in db.clone_symbol_refs(args.min_similarity, args.min_copies)? {
+            println!("{r}");
+        }
+        return Ok(());
+    }
+
     let result = db.find_clones(rag_rat_core::index::FindClonesOptions {
         min_similarity: args.min_similarity,
         min_copies: args.min_copies,
@@ -1055,6 +1065,7 @@ mod tests {
             limit: None,
             explain: None,
             recall_signature: false,
+            recall_symbols: false,
         };
         // The handler must not error.
         super::clones(&config, &args).unwrap_or_else(|err| panic!("clones handler failed: {err}"));
@@ -1093,6 +1104,19 @@ mod tests {
             clone_line.find("src/a.rs") < clone_line.find("src/b.rs"),
             "member refs must be sorted within a class line: {clone_line}"
         );
+
+        // #282 follow-up: clone_symbol_refs is the UNCAPPED symbol-level recall set — the 3 planted
+        // clone-symbols, sorted, one per ref (no member cap).
+        let syms = db.clone_symbol_refs(None, Some(2)).unwrap();
+        for member in
+            ["src/a.rs::cloned_helper", "src/b.rs::cloned_helper", "src/lib.rs::cloned_helper"]
+        {
+            assert!(
+                syms.iter().any(|s| s == member),
+                "clone_symbol_refs missing {member}: {syms:?}"
+            );
+        }
+        assert!(syms.windows(2).all(|w| w[0] < w[1]), "clone_symbol_refs must be sorted+unique");
 
         let _ = std::fs::remove_dir_all(&root);
     }
