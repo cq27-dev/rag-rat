@@ -2041,10 +2041,15 @@ fn add_struct_hash_pairs(bags: &[SymbolBag], pairs: &mut std::collections::BTree
 ///
 /// Language partition: only same-language pairs are emitted — different languages have disjoint
 /// grammar token spaces, so a token-hash collision across languages is a false positive.
-fn sub_block_candidate_pairs(
-    bags: &[SymbolBag],
-    theta: f64,
-) -> std::collections::BTreeSet<(i64, i64)> {
+/// Returns the candidate pair set as a SORTED, deduplicated `Vec` (canonical `a < b`). The upper-
+/// triangle emission per posting list is the dominant candidate-gen cost (millions of pairs on a
+/// dense corpus — ~4.5M / ~11s release on cargo's `src/cargo`, vs ~0.5s to verify them), so it runs
+/// in PARALLEL: each posting list is independent, so `par_iter` over the inverted index emits each
+/// list's pairs across cores, then one `par_sort_unstable` + `dedup` canonicalizes the set.
+/// Deterministic: the sort+dedup is order-independent, so the result is byte-identical regardless
+/// of completion order (returns a sorted `Vec`, not a `BTreeSet`, to keep the merge parallel — a
+/// 4.5M-element `BTreeSet` build is sequential).
+fn sub_block_candidate_pairs(bags: &[SymbolBag], theta: f64) -> Vec<(i64, i64)> {
     // id → language for the partition guard applied at pair-emit time.
     let lang_of: BTreeMap<i64, &str> =
         bags.iter().map(|b| (b.symbol_id, b.language.as_str())).collect();
@@ -2056,18 +2061,23 @@ fn sub_block_candidate_pairs(
         }
     }
 
-    let mut candidate: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
-    for ids in inverted.values() {
-        for (i, &a) in ids.iter().enumerate() {
-            for &b in &ids[i + 1..] {
-                // Language partition: skip cross-language pairs.
-                if lang_of[&a] != lang_of[&b] {
-                    continue;
+    let mut candidate: Vec<(i64, i64)> = inverted
+        .par_iter()
+        .flat_map_iter(|(_token, ids)| {
+            let mut local: Vec<(i64, i64)> = Vec::new();
+            for (i, &a) in ids.iter().enumerate() {
+                for &b in &ids[i + 1..] {
+                    // Language partition: skip cross-language pairs.
+                    if lang_of[&a] == lang_of[&b] {
+                        local.push((a.min(b), a.max(b)));
+                    }
                 }
-                candidate.insert((a.min(b), a.max(b)));
             }
-        }
-    }
+            local
+        })
+        .collect();
+    candidate.par_sort_unstable();
+    candidate.dedup();
     candidate
 }
 
