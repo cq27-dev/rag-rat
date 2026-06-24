@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.8.0...rag-rat-core-v0.9.0) - 2026-06-24
+
+### Added
+
+- *(clones)* name why a resolved symbol is clone-ineligible (#274 item 3a) ([#300](https://github.com/cq27-dev/rag-rat/pull/300))
+- *(clones)* exclude tests from the write-time clone check + raise its precision ([#292](https://github.com/cq27-dev/rag-rat/pull/292)) ([#293](https://github.com/cq27-dev/rag-rat/pull/293))
+- *(doctor)* flag stale clone fingerprints + stop listing migrations twice ([#291](https://github.com/cq27-dev/rag-rat/pull/291))
+- *(clones)* write-time clone check — warn agents when they're duplicating existing code ([#287](https://github.com/cq27-dev/rag-rat/pull/287)) ([#289](https://github.com/cq27-dev/rag-rat/pull/289))
+- *(clones)* precompute the clone-edge graph in the background so find_clones scales ([#286](https://github.com/cq27-dev/rag-rat/pull/286)) ([#288](https://github.com/cq27-dev/rag-rat/pull/288))
+- *(clones)* global cross-class refine cell budget ([#272](https://github.com/cq27-dev/rag-rat/pull/272)) ([#281](https://github.com/cq27-dev/rag-rat/pull/281))
+- *(clones)* clone measurement infrastructure — perf microbench + recall signature ([#279](https://github.com/cq27-dev/rag-rat/pull/279)) ([#280](https://github.com/cq27-dev/rag-rat/pull/280))
+- *(dream)* deterministic memory-maintenance worklist v1 ([#122](https://github.com/cq27-dev/rag-rat/pull/122)) ([#260](https://github.com/cq27-dev/rag-rat/pull/260))
+- *(clones)* multi-language correctness — comments, literals, TS function-valued declarators, generated-skip ([#232](https://github.com/cq27-dev/rag-rat/pull/232)) ([#252](https://github.com/cq27-dev/rag-rat/pull/252))
+- *(clones)* anti-unification refine engine — template + variation points + signature + clones --explain (#215 Plan 4b) ([#243](https://github.com/cq27-dev/rag-rat/pull/243))
+- cross-platform support — macOS + Windows ([#244](https://github.com/cq27-dev/rag-rat/pull/244))
+- clone refine 4a — coherence split + LCS confidence + refactorability ROI + cache (#215 Plan 4a) ([#236](https://github.com/cq27-dev/rag-rat/pull/236))
+- clone-detection query surface — find_clones + clones_for_symbol (#215 Plan 2) ([#234](https://github.com/cq27-dev/rag-rat/pull/234))
+- *(index)* clone-detection fingerprint substrate — SourcererCC inverted index ([#215](https://github.com/cq27-dev/rag-rat/pull/215)) ([#229](https://github.com/cq27-dev/rag-rat/pull/229))
+
+### Fixed
+
+- *(clones)* drop stale theta arg from coherence_split's #259 budget test — unbreak main ([#301](https://github.com/cq27-dev/rag-rat/pull/301))
+- *(clones)* dampen un-refined member_count factor so refine-failed classes can't masquerade as high-ROI ([#259](https://github.com/cq27-dev/rag-rat/pull/259)) ([#299](https://github.com/cq27-dev/rag-rat/pull/299))
+- *(clones)* covering-subset for coherence_split's budget-tripped tail ([#282](https://github.com/cq27-dev/rag-rat/pull/282)) ([#283](https://github.com/cq27-dev/rag-rat/pull/283))
+- *(clones)* close Kotlin boolean/null + C/C++ char-value normalize recall gaps ([#253](https://github.com/cq27-dev/rag-rat/pull/253)) ([#278](https://github.com/cq27-dev/rag-rat/pull/278))
+- *(clones)* Typedness::Structural for pure-closure signatures (#274 item 10) ([#277](https://github.com/cq27-dev/rag-rat/pull/277))
+- *(clones)* widen string-hole template cosmetics (#254, #274 item 16) ([#276](https://github.com/cq27-dev/rag-rat/pull/276))
+- *(clones)* close two #235 follow-ups — discriminator test + scoped callee reopen ([#273](https://github.com/cq27-dev/rag-rat/pull/273))
+- *(clones)* #256 follow-ups — de-flake dense-clique test + seed split by similarity (R-A) ([#265](https://github.com/cq27-dev/rag-rat/pull/265))
+- *(clones)* split giant over-merged components + coverage-gated ROI ([#256](https://github.com/cq27-dev/rag-rat/pull/256)) ([#257](https://github.com/cq27-dev/rag-rat/pull/257))
+- *(oracle)* edge_oracle survives reindex (content-anchored verdicts) + enforcing regression guards ([#248](https://github.com/cq27-dev/rag-rat/pull/248)) ([#249](https://github.com/cq27-dev/rag-rat/pull/249))
+
+### Other
+
+- *(clones)* coherence_split GROW checks pre-verified edge adjacency, not recomputed similarity ([#258](https://github.com/cq27-dev/rag-rat/pull/258)) ([#298](https://github.com/cq27-dev/rag-rat/pull/298))
+- *(clones)* cap non-discriminating hot-token postings in candidate generation ([#271](https://github.com/cq27-dev/rag-rat/pull/271)) ([#297](https://github.com/cq27-dev/rag-rat/pull/297))
+- *(clones)* consolidate the three test-path detectors into one canonical helper ([#294](https://github.com/cq27-dev/rag-rat/pull/294)) ([#295](https://github.com/cq27-dev/rag-rat/pull/295))
+- *(status)* db.status no longer runs the per-chunk embedding reconcile plan (~200s → ms) ([#285](https://github.com/cq27-dev/rag-rat/pull/285))
+- *(clones)* parallelize candidate-gen (sub_block 3.8×) + uncapped --recall-symbols (#282 follow-ups) ([#284](https://github.com/cq27-dev/rag-rat/pull/284))
+- code sweep — clone/god-module cleanup + ship #251/#220/#267/#222 ([#268](https://github.com/cq27-dev/rag-rat/pull/268))
+- *(clones)* total_cmp seed sort + document greedy cover seed-order dependence (#256 adversary polish) ([#266](https://github.com/cq27-dev/rag-rat/pull/266))
+- *(clones)* BLOB-pack the token bag — drop per-token symbol_token_postings ([#231](https://github.com/cq27-dev/rag-rat/pull/231)) ([#250](https://github.com/cq27-dev/rag-rat/pull/250))
+
 ## [0.8.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.7.0...rag-rat-core-v0.8.0) - 2026-06-19
 
 ### Added
