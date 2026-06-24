@@ -520,3 +520,75 @@ fn format_digest_parser_failures_shown_when_nonzero() {
     let s = format_digest(&o, true, true);
     assert!(s.contains("parser failures: 5"), "missing parser failures note");
 }
+
+// ─── write-time clone check (#287) ────────────────────────────────────────────
+
+fn write_event(tool: &str, tool_input: serde_json::Value) -> HookInput {
+    HookInput {
+        hook_event_name: Some("PreToolUse".to_string()),
+        tool_name: tool.to_string(),
+        tool_input,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn extract_clone_inputs_write_edit_multiedit() {
+    let root = std::path::Path::new("/repo");
+
+    let write = write_event(
+        "Write",
+        serde_json::json!({"file_path": "/repo/src/a.rs", "content": "fn f() {}"}),
+    );
+    let w = super::extract_clone_inputs(&write, root);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].text, "fn f() {}");
+    assert_eq!(w[0].path, std::path::PathBuf::from("src/a.rs"), "path relativized to root");
+
+    let edit = write_event(
+        "Edit",
+        serde_json::json!({"file_path": "/repo/src/a.rs", "new_string": "fn g() {}"}),
+    );
+    assert_eq!(super::extract_clone_inputs(&edit, root)[0].text, "fn g() {}");
+
+    // MultiEdit fans out to one input per edit (the batch case).
+    let multi = write_event(
+        "MultiEdit",
+        serde_json::json!({"file_path": "/repo/src/a.rs", "edits": [{"new_string": "fn a() {}"}, {"new_string": "fn b() {}"}]}),
+    );
+    let m = super::extract_clone_inputs(&multi, root);
+    assert_eq!(m.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), vec![
+        "fn a() {}",
+        "fn b() {}"
+    ]);
+}
+
+#[test]
+fn extract_clone_inputs_skips_non_code_and_missing_path() {
+    let root = std::path::Path::new("/repo");
+    // Unknown extension → no language → nothing to check.
+    let txt =
+        write_event("Write", serde_json::json!({"file_path": "/repo/notes.txt", "content": "hi"}));
+    assert!(super::extract_clone_inputs(&txt, root).is_empty());
+    // No file_path → nothing.
+    let nofile = write_event("Write", serde_json::json!({"content": "x"}));
+    assert!(super::extract_clone_inputs(&nofile, root).is_empty());
+}
+
+#[test]
+fn format_clone_warning_renders_matches_and_is_silent_when_empty() {
+    assert!(super::format_clone_warning(&[]).is_none());
+    let m = rag_rat_core::index::TextCloneMatch {
+        in_file: "src/a.rs".to_string(),
+        name: "foo".to_string(),
+        start_line: 3,
+        kind: "exact",
+        similarity: 1.0,
+        clone_of: vec!["src/b.rs::bar".to_string()],
+    };
+    let out = super::format_clone_warning(&[m]).unwrap();
+    assert!(
+        out.contains("foo") && out.contains("identical to") && out.contains("src/b.rs::bar"),
+        "{out}"
+    );
+}

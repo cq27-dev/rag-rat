@@ -74,6 +74,19 @@ impl IndexDatabase {
         index.check(conn, text, language, path)
     }
 
+    /// Cheap count of fingerprinted baseline functions — a write-time hook reads it to BOUND its
+    /// cost: `clones_of_text(s)` loads every bag + builds an in-RAM inverted index (O(functions))
+    /// until the persisted-postings follow-up lands, so a hook skips (no-ops) above a threshold
+    /// rather than risk a perceptible delay on a very large repo.
+    pub fn clone_check_function_count(&self) -> anyhow::Result<u64> {
+        let count: i64 = self.storage.connection().query_row(
+            "SELECT COUNT(*) FROM symbol_fingerprints WHERE normalizer_kind = 'baseline'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
     /// BATCH clone-check: load + structure the index ONCE, then check every input file against it.
     /// An empty index (nothing to compare against) yields an empty result — a best-effort no-op.
     pub fn clones_of_texts(

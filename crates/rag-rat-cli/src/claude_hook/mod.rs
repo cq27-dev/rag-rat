@@ -16,11 +16,18 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use rag_rat_core::config::Config;
+use rag_rat_core::index::{CloneCheckInput, IndexDatabase, TextCloneMatch};
+use rag_rat_core::language::Language;
 use rag_rat_core::locks;
 use rag_rat_core::query::grep_augment;
 use rag_rat_core::query::orientation::Orientation;
 use rag_rat_core::storage::IndexConnection;
 use serde::Deserialize;
+
+/// Skip the write-time clone check above this many fingerprinted functions: the check builds an
+/// in-RAM inverted index over all of them (O(functions)) until the persisted-postings follow-up
+/// (#287) lands, so on a very large repo it no-ops rather than add a perceptible delay to a write.
+const MAX_CLONE_CHECK_FUNCTIONS: u64 = 40_000;
 
 // Only the unix Unix-socket listener path uses this; dead on Windows (which has no warm listener).
 #[cfg(unix)]
@@ -343,8 +350,12 @@ fn version_line(status: &rag_rat_core::version_check::VersionStatus) -> Option<S
     }
 }
 
-/// PreToolUse path (grep augmentation).
+/// PreToolUse path: the write-time clone check (#287) on the edit tools, grep augmentation
+/// otherwise.
 fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
+    if matches!(input.tool_name.as_str(), "Write" | "Edit" | "MultiEdit") {
+        return clone_check(input);
+    }
     let Some(search) = extract_search(input) else { return Ok(()) };
     let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
 
@@ -367,6 +378,111 @@ fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Write-time clone check (#287): fingerprint the just-written functions and warn if they duplicate
+/// existing indexed code. Best-effort + READ-ONLY — every "not ready" path (no config, DB absent,
+/// index owes a heal/migrate, index too large, no parseable functions) is a SILENT no-op, so it
+/// never blocks or perceptibly delays a write.
+fn clone_check(input: &HookInput) -> anyhow::Result<()> {
+    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
+    if !config.database.is_file() {
+        return Ok(()); // index not built yet
+    }
+    // `try_open_config_read_only` returns None when the index still owes a heal/migrate (NOT
+    // ready), so this is the no-op-when-not-ready guard — the same gate the MCP read tools use.
+    let Some(db) = IndexDatabase::try_open_config_read_only(&config)? else { return Ok(()) };
+    if db.clone_check_function_count().unwrap_or(u64::MAX) > MAX_CLONE_CHECK_FUNCTIONS {
+        return Ok(()); // too large for the in-RAM check — no-op until the persisted postings land
+    }
+    let inputs = extract_clone_inputs(input, &config.root);
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let matches = db.clones_of_texts(&inputs)?;
+    if let Some(context) = format_clone_warning(&matches) {
+        // PreToolUse contract: allow + additionalContext (a warning, not a block).
+        println!(
+            "{}",
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "additionalContext": context,
+                }
+            })
+        );
+    }
+    Ok(())
+}
+
+/// Pull the (relative-path, text) inputs to clone-check from a Write/Edit/MultiEdit tool call:
+/// Write → the whole `content`; Edit → the `new_string`; MultiEdit → each edit's `new_string` (a
+/// batch). A fragment that isn't a complete function simply yields no fingerprints downstream (a
+/// no-op).
+fn extract_clone_inputs(input: &HookInput, root: &Path) -> Vec<CloneCheckInput> {
+    let ti = &input.tool_input;
+    let Some(file_path) = ti.get("file_path").and_then(|v| v.as_str()) else { return Vec::new() };
+    let abs = Path::new(file_path);
+    let Some(language) = Language::from_path(abs) else { return Vec::new() };
+    // The indexed refs are root-relative, so relativize for the parse + the self-file exclusion.
+    let rel = abs.strip_prefix(root).unwrap_or(abs).to_path_buf();
+    let texts: Vec<String> = match input.tool_name.as_str() {
+        "Write" => ti
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
+        "Edit" => ti
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
+        "MultiEdit" => ti
+            .get("edits")
+            .and_then(|v| v.as_array())
+            .map(|edits| {
+                edits
+                    .iter()
+                    .filter_map(|e| {
+                        e.get("new_string").and_then(|v| v.as_str()).map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    texts.into_iter().map(|text| CloneCheckInput { text, language, path: rel.clone() }).collect()
+}
+
+/// Render clone-check findings as the `additionalContext` injected back to the agent, or `None`
+/// when there are none (stay silent).
+fn format_clone_warning(matches: &[TextCloneMatch]) -> Option<String> {
+    if matches.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "▶ rag-rat clone check — code you're writing duplicates existing functions:\n",
+    );
+    for m in matches {
+        let label = if m.kind == "exact" {
+            "identical to".to_string()
+        } else {
+            format!("~{:.0}% similar to", m.similarity * 100.0)
+        };
+        out.push_str(&format!(
+            "  • `{}` (line {}) is {} {}\n",
+            m.name,
+            m.start_line,
+            label,
+            m.clone_of.join(", ")
+        ));
+    }
+    out.push_str(
+        "Prefer reusing the existing function(s) over duplicating — impact_surface / \
+         symbol_lookup to inspect them.\n",
+    );
+    Some(out)
 }
 
 /// One-liner shown when the DB file is absent (no config directory walk — `find_config` already
