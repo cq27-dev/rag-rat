@@ -226,7 +226,7 @@ pub(crate) fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
     let total_chunks = chunk_count(conn)?;
     let active_model_id = active_embedding_model_id(conn)?;
     let embedding = capability_status(conn, "embedding", &active_model_id, total_chunks)?;
-    let fastembed = fastembed_operational_status(conn, &active_model_id)?;
+    let fastembed = fastembed_operational_status(conn, &active_model_id, total_chunks)?;
     let current = embedding.current_artifacts;
     let stale = embedding.stale_artifacts;
     let failed = embedding.failed_artifacts;

@@ -29,18 +29,39 @@ pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyh
 pub(crate) fn fastembed_operational_status(
     conn: &Connection,
     active_model_id: &str,
+    total_chunks: u64,
 ) -> anyhow::Result<FastEmbedOperationalStatus> {
     let model = model(conn, FASTEMBED_MODEL_ID)?;
-    let model_version = active_embedding_model_version(conn, FASTEMBED_MODEL_ID)?;
-    let plan = embedding_reconcile_plan(
-        conn,
-        &model,
-        &model_version,
-        FASTEMBED_EMBEDDING_DIM,
-        validate_ready_model(&model).is_ok(),
-        model.last_error.clone(),
-    )?;
-    let failed = plan.failed_retryable.saturating_add(plan.failed_waiting);
+    // PERF: report coverage from CHEAP persisted counts (the `embedding_artifacts` rows + the chunk
+    // total) rather than `embedding_reconcile_plan` — which loads EVERY chunk and rebuilds +
+    // re-hashes its embedding input (~200s on a 174k-chunk index, paid with OR without an active
+    // embedder). `db.status` runs after every `index`, so that plan made the STATUS dominate
+    // indexing on a large repo. The status now reports the last-reconciled persisted state (the
+    // same basis it uses for the generic `capability_status` counts); the exact policy-skip +
+    // live-drift breakdown is the `reconcile --plan` command's job, where the per-chunk scan
+    // belongs.
+    let current = current_artifact_count(conn, "embedding", FASTEMBED_MODEL_ID)?;
+    let stale = stale_artifact_count(conn, "embedding", FASTEMBED_MODEL_ID)?;
+    let failed =
+        status_artifact_count(conn, "embedding", FASTEMBED_MODEL_ID, ArtifactStatus::Failed)?;
+    let blocked =
+        status_artifact_count(conn, "embedding", FASTEMBED_MODEL_ID, ArtifactStatus::Blocked)?;
+    // Exact `skipped` (embedding input too large) needs the decompressed text per chunk — deferred
+    // to `reconcile --plan`. The status treats every chunk as eligible, so the invariant
+    // `eligible + skipped == total` holds with `skipped == 0`.
+    let eligible = total_chunks;
+    let missing = eligible.saturating_sub(
+        current.saturating_add(stale).saturating_add(failed).saturating_add(blocked),
+    );
+    let next = if !fastembed_build_feature_enabled() {
+        Some("cargo install rag-rat".to_string())
+    } else if validate_ready_model(&model).is_err() {
+        Some(format!("rag-rat models install {FASTEMBED_MODEL_ID}"))
+    } else if missing > 0 || stale > 0 || failed > 0 {
+        Some("rag-rat reconcile --limit 500".to_string())
+    } else {
+        None
+    };
     Ok(FastEmbedOperationalStatus {
         backend: "fastembed".to_string(),
         build_feature_enabled: fastembed_build_feature_enabled(),
@@ -51,49 +72,20 @@ pub(crate) fn fastembed_operational_status(
         installed: model.installed,
         active: active_model_id == FASTEMBED_MODEL_ID,
         status: model.status,
-        current_embeddings: plan.current,
-        eligible_embeddings: plan
-            .current
-            .saturating_add(plan.missing)
-            .saturating_add(plan.stale)
-            .saturating_add(plan.model_changed)
-            .saturating_add(plan.dim_changed)
-            .saturating_add(plan.failed_retryable)
-            .saturating_add(plan.failed_waiting)
-            .saturating_add(plan.blocked),
-        skipped_embeddings: plan.skipped_total,
-        stale_embeddings: plan
-            .stale
-            .saturating_add(plan.model_changed)
-            .saturating_add(plan.dim_changed),
-        missing_embeddings: plan.missing,
+        current_embeddings: current,
+        eligible_embeddings: eligible,
+        skipped_embeddings: 0,
+        stale_embeddings: stale,
+        missing_embeddings: missing,
         failed_embeddings: failed,
-        failed_retryable_embeddings: plan.failed_retryable,
-        failed_waiting_embeddings: plan.failed_waiting,
+        // The retryable/waiting split needs the per-row next-retry timestamp; the status reports
+        // the aggregate failed count (treated as retryable) and leaves the precise split to
+        // `reconcile --plan`.
+        failed_retryable_embeddings: failed,
+        failed_waiting_embeddings: 0,
         message: model.last_error,
-        next: fastembed_next_command(&plan),
+        next,
     })
-}
-
-pub(crate) fn fastembed_next_command(plan: &EmbeddingReconcilePlan) -> Option<String> {
-    if !fastembed_build_feature_enabled() {
-        return Some("cargo install rag-rat".to_string());
-    }
-    if !plan.available {
-        return Some(format!("rag-rat models install {}", FASTEMBED_MODEL_ID));
-    }
-    if plan.missing > 0
-        || plan.stale > 0
-        || plan.model_changed > 0
-        || plan.dim_changed > 0
-        || plan.failed_retryable > 0
-    {
-        return Some("rag-rat reconcile --limit 500".to_string());
-    }
-    if plan.failed_waiting > 0 {
-        return Some("rag-rat reconcile --plan".to_string());
-    }
-    None
 }
 
 pub(crate) fn fastembed_build_feature_enabled() -> bool {
