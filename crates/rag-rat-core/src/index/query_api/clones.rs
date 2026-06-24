@@ -320,6 +320,20 @@ fn min_pairwise_cohesion(class: &[i64], by_id: &BTreeMap<i64, &SymbolBag>) -> f6
 /// order + exact verify, never on df accuracy (design rev-4 §2).
 const DF_FALLBACK: i64 = i64::MAX;
 
+/// #271: a sub-block token whose postings list exceeds this is treated as NON-DISCRIMINATING and
+/// emits NO candidate pairs. The inverted index emits a token's full upper triangle (K postings →
+/// K²/2 pairs); `df` only HINTS rarity (`DF_FALLBACK` for missing-df tokens, and a short symbol
+/// near `MIN_TOKENS` puts its whole bag in the sub-block), so a hot token can still land in
+/// thousands of sub-blocks and blow up candidate generation (measured: drivers/net, 5.67M pairs
+/// from 2,874 fns). Recall-safe: a pair sharing ONLY a hot token is low-similarity and fails the
+/// exact overlap verify anyway, and any GENUINE clone pair also shares rarer tokens (each well
+/// under this cap) so it is still generated via those. The cap is far above any realistic
+/// clone-family size, so a real repeated-block family is never silently dropped. ABSOLUTE (not a
+/// fraction of the corpus): a token in this many functions' rarest-token sets is non-discriminating
+/// regardless of corpus size, and an absolute bound keeps per-token emission O(cap²) instead of
+/// growing with N².
+const HOT_TOKEN_POSTINGS_CAP: usize = 256;
+
 /// One scoped baseline symbol's fingerprint, loaded for the candidate read.
 pub(super) struct SymbolBag {
     pub(super) symbol_id: i64,
@@ -2074,6 +2088,10 @@ fn sub_block_candidate_pairs(bags: &[SymbolBag], theta: f64) -> Vec<(i64, i64)> 
 
     let mut candidate: Vec<(i64, i64)> = inverted
         .par_iter()
+        // #271: a token in more than HOT_TOKEN_POSTINGS_CAP sub-blocks is non-discriminating — its
+        // K²/2 pairs are noise that fails verify, and real clones are still found via their rarer
+        // shared tokens. Skip it to bound candidate generation on dense corpora.
+        .filter(|(_token, ids)| ids.len() <= HOT_TOKEN_POSTINGS_CAP)
         .flat_map_iter(|(_token, ids)| {
             let mut local: Vec<(i64, i64)> = Vec::new();
             for (i, &a) in ids.iter().enumerate() {
@@ -2422,6 +2440,35 @@ mod tests {
             token_len: postings.iter().map(|t| t.freq).sum(),
             tokens: postings,
         }
+    }
+
+    /// #271: a hot (non-discriminating) token in > `HOT_TOKEN_POSTINGS_CAP` sub-blocks emits NO
+    /// candidate pairs — its K²/2 pairs are noise — but a GENUINE clone pair sharing a rarer token
+    /// still survives. Without the cap this fixture would emit ~45k pairs (the hot token's full
+    /// upper triangle); with it, only the one real pair.
+    #[test]
+    fn hot_token_postings_are_capped_but_real_clones_survive() {
+        let hot = 0; // lowest token_hash → sorts first → always in the sub-block
+        let mut bags = Vec::new();
+        // Noise: each shares ONLY the hot token in its sub-block (token_len 2 → p=1 → just `hot`).
+        let noise = super::HOT_TOKEN_POSTINGS_CAP + 4;
+        for i in 0..noise as i64 {
+            bags.push(make_bag_with_tokens(i, vec![(hot, 1), (10_000 + i, 1)]));
+        }
+        // Two genuine clones: token_len 4 → p=2 → sub-block is [hot, 1], so they ALSO share the
+        // rarer token `1` (present in only these two bags).
+        bags.push(make_bag_with_tokens(1_000, vec![(hot, 1), (1, 1), (2, 1), (3, 1)]));
+        bags.push(make_bag_with_tokens(1_001, vec![(hot, 1), (1, 1), (2, 1), (3, 1)]));
+
+        let pairs = super::sub_block_candidate_pairs(&bags, 0.7);
+
+        assert!(pairs.contains(&(1_000, 1_001)), "the real clone pair must survive the cap");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "only the real pair — the hot token's {} postings are capped, not its upper triangle",
+            noise + 2
+        );
     }
 
     /// The two-pointer `overlap` must return the same value as the naive map-based version for
