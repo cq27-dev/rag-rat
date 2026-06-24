@@ -26,7 +26,7 @@ use super::{
     DF_FALLBACK, HYDRATION_CHUNK, SymbolBag, THETA, TokenPosting, load_scoped_baseline_bags,
     overlap, sub_block_tokens, verified_clone,
 };
-use crate::index::clones::{SymbolFingerprint, fingerprint_symbols};
+use crate::index::clones::{NORM_VERSION, SymbolFingerprint, fingerprint_symbols};
 use crate::index::{IndexDatabase, parser, symbols};
 use crate::language::Language;
 
@@ -58,6 +58,28 @@ pub struct TextCloneMatch {
     pub clone_of: Vec<String>,
 }
 
+/// Whether the index's baseline clone fingerprints are usable by clone detection. The clone read
+/// path filters `normalizer_version = NORM_VERSION`, so an index last fingerprinted by an OLDER
+/// binary (one built before a NORM_VERSION bump) has ZERO usable bags and every clone feature
+/// (`find_clones`, `clones_of_text`, the precompute) silently returns empty. `doctor` surfaces this
+/// so the fix — a reindex — is obvious rather than a mysterious "no clones found".
+#[derive(Debug, Clone, Serialize)]
+pub struct CloneFingerprintHealth {
+    /// The `NORM_VERSION` the clone read path requires.
+    pub required_norm_version: i64,
+    /// Baseline fingerprints AT the required version — the functions clone detection can actually
+    /// use. Zero here (with `total > 0`) means clone detection is disabled.
+    pub usable: u64,
+    /// Total baseline fingerprints across ALL normalizer versions. Stale rows from older binaries
+    /// or other git contexts inflate this above `usable`.
+    pub total: u64,
+    /// True when fingerprints exist but NONE are at the required version: clone detection is fully
+    /// disabled until a reindex recomputes them.
+    pub needs_reindex: bool,
+    /// Actionable note (the exact command) when `needs_reindex`; `None` otherwise.
+    pub message: Option<String>,
+}
+
 impl IndexDatabase {
     /// Find EXACT + NEAR clones of every fingerprintable function in `text` among the indexed
     /// symbols (single-file convenience over [`Self::clones_of_texts`]).
@@ -85,6 +107,40 @@ impl IndexDatabase {
             |r| r.get(0),
         )?;
         Ok(count.max(0) as u64)
+    }
+
+    /// Report whether the baseline clone fingerprints are at the [`NORM_VERSION`] the clone read
+    /// path requires. Cheap (two COUNTs). `doctor` surfaces it so the silent-empty failure mode
+    /// after a NORM_VERSION bump (an index maintained by an older binary) is diagnosable —
+    /// the fix is `rag-rat index --full`.
+    pub fn clone_fingerprint_health(&self) -> anyhow::Result<CloneFingerprintHealth> {
+        let conn = self.storage.connection();
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM symbol_fingerprints WHERE normalizer_kind = 'baseline'",
+            [],
+            |r| r.get(0),
+        )?;
+        let usable: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM symbol_fingerprints WHERE normalizer_kind = 'baseline' AND \
+             normalizer_version = ?1",
+            [NORM_VERSION],
+            |r| r.get(0),
+        )?;
+        let needs_reindex = total > 0 && usable == 0;
+        let message = needs_reindex.then(|| {
+            format!(
+                "Clone fingerprints predate NORM_VERSION {NORM_VERSION}; clone detection \
+                 (find_clones, the write-time clone check) sees 0 functions. Run `rag-rat index \
+                 --full` to recompute them."
+            )
+        });
+        Ok(CloneFingerprintHealth {
+            required_norm_version: NORM_VERSION,
+            usable: usable.max(0) as u64,
+            total: total.max(0) as u64,
+            needs_reindex,
+            message,
+        })
     }
 
     /// BATCH clone-check: load + structure the index ONCE, then check every input file against it.
@@ -423,5 +479,64 @@ mod tests {
             )
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn clone_fingerprint_health_flags_stale_normalizer_version_for_reindex() {
+        // Self-contained build (not `fixture_db`) so we keep the db path for the downgrade step.
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-of-text-health-{}-{}",
+            std::process::id(),
+            crate::index::util::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
+        )
+        .unwrap();
+        let db_path = root.join(".rag-rat/index.sqlite");
+        let config = crate::Config {
+            root: root.clone(),
+            database: db_path.clone(),
+            targets: vec![crate::config::ResolvedTarget {
+                name: "rust".to_string(),
+                language: crate::language::Language::Rust,
+                directories: vec![std::path::PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: crate::config::TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+
+        // Fresh index: fingerprints land at the current NORM_VERSION → healthy, no reindex prompt.
+        let healthy = db.clone_fingerprint_health().unwrap();
+        assert_eq!(healthy.required_norm_version, crate::index::clones::NORM_VERSION);
+        assert!(healthy.usable > 0 && healthy.total > 0, "{healthy:?}");
+        assert!(!healthy.needs_reindex && healthy.message.is_none(), "{healthy:?}");
+
+        // Simulate an index last fingerprinted by an OLDER binary (pre-NORM_VERSION bump): every
+        // baseline row drops a version, so the clone read path's `= NORM_VERSION` filter matches
+        // none — exactly the silent-empty state `doctor` must surface. (2nd WAL connection; the
+        // index handle is idle.)
+        {
+            let c = rusqlite::Connection::open(&db_path).unwrap();
+            c.execute(
+                "UPDATE symbol_fingerprints SET normalizer_version = ?1 WHERE normalizer_kind = \
+                 'baseline'",
+                [crate::index::clones::NORM_VERSION - 1],
+            )
+            .unwrap();
+        }
+        let stale = db.clone_fingerprint_health().unwrap();
+        assert!(stale.total > 0 && stale.usable == 0, "{stale:?}");
+        assert!(stale.needs_reindex, "{stale:?}");
+        assert!(stale.message.unwrap().contains("index --full"), "actionable command");
     }
 }

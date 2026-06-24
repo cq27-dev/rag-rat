@@ -525,16 +525,24 @@ pub(crate) fn set_env_if_absent(key: &str, value: Option<u32>) {
 }
 pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
     let schema = IndexDatabase::migration_check(&config.database)?;
-    let (index, discovery, storage) =
+    let (index, discovery, storage, clone_fingerprints) =
         if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
             let db = IndexDatabase::open_config(config)?;
+            let mut index_status = serde_json::to_value(db.status(&config.database)?)?;
+            // Schema (incl. the migrations list) is reported once at the top level from
+            // `migration_check`; drop the duplicate copy nested in `index` so `doctor` doesn't list
+            // migrations twice.
+            if let Some(object) = index_status.as_object_mut() {
+                object.remove("schema");
+            }
             (
-                Some(serde_json::to_value(db.status(&config.database)?)?),
+                Some(index_status),
                 Some(serde_json::to_value(db.discovery_status(config)?)?),
                 Some(serde_json::to_value(db.storage_status()?)?),
+                Some(serde_json::to_value(db.clone_fingerprint_health()?)?),
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
     print_output(&serde_json::json!({
         "config_root": config.root,
@@ -542,6 +550,7 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
         "schema": schema,
         "storage": storage,
         "discovery": discovery,
+        "clone_fingerprints": clone_fingerprints,
         "targets": config.targets.iter().map(|target| serde_json::json!({
             "name": target.name,
             "language": target.language.as_str(),
