@@ -400,17 +400,13 @@ impl IndexDatabase {
             if component.len() < min_copies {
                 continue;
             }
-            let coherent_classes = coherence_split(
-                component,
-                &edges_by_component[comp_idx],
-                |a, b| {
+            let coherent_classes =
+                coherence_split(component, &edges_by_component[comp_idx], |a, b| {
                     let ba = by_id[&a];
                     let bb = by_id[&b];
                     let max_len = ba.token_len.max(bb.token_len);
                     if max_len == 0 { 1.0 } else { overlap(ba, bb) as f64 / max_len as f64 }
-                },
-                theta,
-            );
+                });
             for class in &coherent_classes {
                 if class.len() >= min_copies {
                     symbol_ids.extend(class.iter().copied());
@@ -532,17 +528,13 @@ impl IndexDatabase {
             if component.len() < min_copies {
                 continue;
             }
-            let coherent_classes = coherence_split(
-                component,
-                &edges_by_component[comp_idx],
-                |a, b| {
+            let coherent_classes =
+                coherence_split(component, &edges_by_component[comp_idx], |a, b| {
                     let ba = by_id[&a];
                     let bb = by_id[&b];
                     let max_len = ba.token_len.max(bb.token_len);
                     if max_len == 0 { 1.0 } else { overlap(ba, bb) as f64 / max_len as f64 }
-                },
-                theta,
-            );
+                });
             for class_ids in &coherent_classes {
                 if class_ids.len() < min_copies {
                     continue;
@@ -1037,17 +1029,12 @@ impl IndexDatabase {
         // θ), there is NO whole-component fallback (#256): serving the full over-merged component
         // would re-expose the very giant the split exists to break. `clones_for_symbol` returns the
         // subject's COHERENT neighborhood (the clique(s) containing it) or nothing.
-        let coherent_classes = coherence_split(
-            &component,
-            &component_edges,
-            |a, b| {
-                let ba = by_id[&a];
-                let bb = by_id[&b];
-                let max_len = ba.token_len.max(bb.token_len);
-                if max_len == 0 { 1.0 } else { overlap(ba, bb) as f64 / max_len as f64 }
-            },
-            THETA,
-        );
+        let coherent_classes = coherence_split(&component, &component_edges, |a, b| {
+            let ba = by_id[&a];
+            let bb = by_id[&b];
+            let max_len = ba.token_len.max(bb.token_len);
+            if max_len == 0 { 1.0 } else { overlap(ba, bb) as f64 / max_len as f64 }
+        });
         // Pick the largest coherent group containing the subject (tie → highest min-pairwise
         // cohesion → lowest member id). The greedy clique-cover split can return MULTIPLE
         // overlapping groups containing the subject (e.g. B is in both {A,B} and {B,C} for chain

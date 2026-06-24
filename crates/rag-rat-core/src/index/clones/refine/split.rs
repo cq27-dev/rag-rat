@@ -65,9 +65,15 @@ const MAX_SPLIT_GROUPS: usize = 256;
 /// order/orientation — the caller bucketed `candidate_pairs_from_bags` per component, #256). Every
 /// edge endpoint must be a member of `component`. The clique cover seeds a group from each edge, so
 /// feeding the precomputed edges makes seeding O(edges) instead of the old O(n²) all-pairs scan
-/// (the reason the now-removed `SPLIT_MAX` member cap existed). `similarity(a, b)` returns the
-/// pairwise overlap/max similarity in \[0,1\]; it is consulted only while GROWING a clique (a
-/// candidate member against the current group), bounded by group size, never all-pairs.
+/// (the reason the now-removed `SPLIT_MAX` member cap existed). The GROW step decides whether a
+/// candidate member coheres with a group member by EDGE ADJACENCY against `edges` (an O(1) HashSet
+/// lookup, #258), since every edge IS a ≥ θ pair (the forward direction is unconditional) and on a
+/// recall-safe corpus `edges` IS exactly the ≥ θ pair set for this component — no overlap
+/// recompute. θ itself is therefore no longer a parameter: the edge set fully encodes the
+/// threshold the caller verified at, so the split needs only the edges (coherence) and `similarity`
+/// (seed ranking). `similarity(a, b)` returns the pairwise overlap/max similarity in \[0,1\]; it is
+/// consulted ONLY to rank the seed order (descending similarity, O(edges)), never per-(m, g) in the
+/// grow — so a dense (near-)clique component is O(n²) lookups, not O(n² · token_len) recomputes.
 ///
 /// Deterministic: edges are canonicalized to `a < b` and sorted, members are processed in
 /// ascending-id order, group members are sorted ascending, and returned classes are in stable order
@@ -79,12 +85,15 @@ const MAX_SPLIT_GROUPS: usize = 256;
 /// 2. Canonicalize + dedup `edges`, then order the seed list by DESCENDING pairwise similarity
 ///    (tie-break `(a, b)`) so tight real cliques grow before `MAX_SPLIT_GROUPS` trips (#256 R-A).
 /// 3. For each coherent edge not already fully contained in an emitted group, grow a maximal
-///    coherent group from `{a, b}` by adding any remaining member (in id order) that is ≥ θ to
-///    every current group member. (The grow scans members in id order; only the SEED order is
-///    similarity-ranked.) The cover is greedy and therefore seed-order-dependent, but: no member is
-///    ever dropped (the union of classes is order-invariant — post-budget endpoints become bare
-///    pairs), and on a single connected component (the only shape this receives — callers iterate
-///    per union-find component) descending-sim cover quality is ≥ id-order, never worse.
+///    coherent group from `{a, b}` by adding any remaining member (in id order) that has a θ-edge
+///    to every current group member (an edge-adjacency check against `edges`, #258 —
+///    output-identical to the old `≥ θ` recompute when `edges` is exactly the ≥ θ set; see the
+///    parity caveat on the `adjacency` block re: #271's hot-token cap). (The grow scans members in
+///    id order; only the SEED order is similarity-ranked.) The cover is greedy and therefore
+///    seed-order-dependent, but: no member is ever dropped (the union of classes is order-invariant
+///    — post-budget endpoints become bare pairs), and on a single connected component (the only
+///    shape this receives — callers iterate per union-find component) descending-sim cover quality
+///    is ≥ id-order, never worse.
 /// 4. Drop groups that are a strict subset of another (keep only maximal cliques), de-duplicate
 ///    identical groups, drop singletons, and sort by lowest member id.
 ///
@@ -97,7 +106,6 @@ pub(crate) fn coherence_split(
     component: &[i64],
     edges: &[(i64, i64)],
     similarity: impl Fn(i64, i64) -> f64,
-    theta: f64,
 ) -> Vec<Vec<i64>> {
     // 1. Sort ascending (determinism).
     let mut members: Vec<i64> = component.to_vec();
@@ -125,6 +133,40 @@ pub(crate) fn coherence_split(
         .collect();
     coherent_edges.sort_unstable();
     coherent_edges.dedup();
+
+    // 2a. Adjacency set over the canonical θ-edges, for the O(1) GROW coherence check (#258).
+    //
+    // The GROW step below adds a candidate member `m` to a group only when `m` coheres with EVERY
+    // current group member `g`. The pre-#258 check RE-CALLED `similarity(m, g) >= theta` per (m,
+    // g), recomputing `overlap`/`max_len` (an O(token_len) token-bag merge) — so on a dense
+    // (near-)clique component the grow cost was O(n² · token_len). But `coherent_edges` ALREADY
+    // IS the set of pairs with similarity ≥ θ for this component: the caller threads in
+    // `candidate_pairs_from_bags` restricted to the component, i.e. every `verified_clone(a, b,
+    // θ)` pair (`overlap ≥ ceil(θ·max_len)`) plus every struct-hash pair (identical bags ⇒
+    // similarity 1.0). So "`m` coheres with `g`" ⟺ "the canonical edge `(min, max)` is in
+    // `coherent_edges`" — an O(1) HashSet lookup with NO overlap recompute. Seeding (step 2b)
+    // still consults `similarity` once per edge (O(edges)) to rank tight cliques first; only the
+    // per-(m, g) GROW recompute is eliminated.
+    //
+    // PARITY (when this is output-identical to the old per-(m, g) `similarity >= θ` grow):
+    //   FORWARD (edge ⟹ similarity ≥ θ) is UNCONDITIONAL — `verified_clone` gates `overlap ≥
+    //   ceil(θ·max_len)`, which is bit-for-bit `overlap/max_len ≥ θ` (`overlap` is a non-negative
+    //   integer, so the smallest integer ≥ θ·max_len is `ceil(θ·max_len)`, and both sites compute
+    //   the identical f64 `(θ·max_len).ceil()`); struct-hash edges have `overlap == max_len` ⇒
+    //   similarity 1.0. So every edge in `adjacency` is genuinely a ≥ θ pair: the grow NEVER
+    //   admits a member the old code would have rejected.
+    //   REVERSE (similarity ≥ θ ⟹ edge) is SourcererCC sub-block admissibility, valid EXCEPT
+    //   where #271's `HOT_TOKEN_POSTINGS_CAP` drops a θ-pair whose only shared sub-block tokens are
+    //   all hot-capped (> cap postings): that pair is never generated as a candidate, so it is not
+    //   an edge even though similarity ≥ θ. In that (recall-unsafe) case the OLD grow would admit
+    //   the member and this edge-adjacency grow rejects it — i.e. the output diverges. But that
+    //   scenario means #271 has ALREADY altered which pairs exist, so #258 does NOT introduce a new
+    //   behavior class: it inherits exactly #271's accepted recall approximation, which is gated
+    //   separately by `clones --recall-symbols`. On a recall-safe corpus (#271 drops no θ-pair) the
+    //   two grows are byte-identical — the production invariant the issue assumed, and what the
+    //   `coherence_split_edge_adjacency_equals_similarity_recompute_when_edges_are_theta_set` test
+    //   pins on `edges == exactly the ≥ θ set`.
+    let adjacency: std::collections::HashSet<(i64, i64)> = coherent_edges.iter().copied().collect();
 
     // 2b. Seed high-similarity edges FIRST so tight real cliques grow WITHIN the MAX_SPLIT_GROUPS
     // budget instead of falling into the bare-pair tail (#256 R-A). On the dogfood a true 7-member
@@ -216,8 +258,14 @@ pub(crate) fn coherence_split(
             if group_set.contains(&m) {
                 continue;
             }
-            // m is coherent with every current group member?
-            if group.iter().all(|&g| similarity(m, g) >= theta) {
+            // m is coherent with every current group member? Check EDGE ADJACENCY against the
+            // pre-verified θ-edge set (#258) — an O(1) HashSet lookup per (m, g) — instead of
+            // recomputing `similarity(m, g) >= theta` (an O(token_len) overlap recompute). The two
+            // are output-identical: `(min, max)` is in `adjacency` iff the pair is a θ-edge iff
+            // `similarity(m, g) >= theta` (see the `adjacency` construction above). This removes
+            // the O(token_len) factor from the grow, making a dense (near-)clique
+            // component O(n²) lookups instead of O(n² · token_len) overlap recomputes.
+            if group.iter().all(|&g| adjacency.contains(&(m.min(g), m.max(g)))) {
                 group.push(m);
                 group_set.insert(m);
             }
@@ -277,6 +325,10 @@ pub(crate) fn coherence_split(
 mod tests {
     use super::*;
 
+    /// One parity fixture for `coherence_split_edge_adjacency_equals_similarity_recompute_*`:
+    /// `(shape_name, component members, explicit symmetric similarity pairs)`.
+    type ParityCase = (&'static str, Vec<i64>, Vec<((i64, i64), f64)>);
+
     /// Verify that every pair within `class` has similarity ≥ theta via `sim`.
     fn all_pairs_meet_theta(class: &[i64], sim: impl Fn(i64, i64) -> f64, theta: f64) -> bool {
         for (i, &a) in class.iter().enumerate() {
@@ -326,7 +378,7 @@ mod tests {
         let sim = sim_from_pairs(&pairs);
         let edges = edges_from_pairs(&pairs, theta);
 
-        let split = coherence_split(&[a, b, c], &edges, &sim, theta);
+        let split = coherence_split(&[a, b, c], &edges, &sim);
 
         // Chain A~B, B~C, A!~C → both {A,B} and {B,C} are returned (B in both — overlap is
         // correct).
@@ -363,7 +415,7 @@ mod tests {
         let sim = sim_from_pairs(&pairs);
         let edges = edges_from_pairs(&pairs, theta);
 
-        let split = coherence_split(&[a, b, c, d], &edges, &sim, theta);
+        let split = coherence_split(&[a, b, c, d], &edges, &sim);
 
         assert_eq!(split.len(), 1, "expected one class, got {:?}", split);
         let mut returned = split[0].clone();
@@ -380,7 +432,7 @@ mod tests {
         let sim = sim_from_pairs(&pairs);
         let edges = edges_from_pairs(&pairs, theta); // below θ → no edge
 
-        let split = coherence_split(&[a, b], &edges, &sim, theta);
+        let split = coherence_split(&[a, b], &edges, &sim);
 
         assert!(split.is_empty(), "expected no class (both singletons), got {:?}", split);
     }
@@ -389,16 +441,15 @@ mod tests {
     #[test]
     fn coherence_split_is_deterministic() {
         let (a, b, c) = (10_i64, 20_i64, 30_i64);
-        let theta = 0.70;
         let pairs = [((a, b), 0.74), ((b, c), 0.86), ((a, c), 0.67)];
         let sim = sim_from_pairs(&pairs);
         // Supply the edges in a scrambled order too — the split canonicalizes + sorts them.
         let edges = vec![(b, c), (a, b)];
 
         // Supply in three different orderings.
-        let r1 = coherence_split(&[a, b, c], &edges, &sim, theta);
-        let r2 = coherence_split(&[c, b, a], &[(c, b), (b, a)], &sim, theta);
-        let r3 = coherence_split(&[b, a, c], &[(a, b), (c, b)], &sim, theta);
+        let r1 = coherence_split(&[a, b, c], &edges, &sim);
+        let r2 = coherence_split(&[c, b, a], &[(c, b), (b, a)], &sim);
+        let r3 = coherence_split(&[b, a, c], &[(a, b), (c, b)], &sim);
 
         assert_eq!(r1, r2, "result differs between [a,b,c] and [c,b,a]");
         assert_eq!(r1, r3, "result differs between [a,b,c] and [b,a,c]");
@@ -424,7 +475,6 @@ mod tests {
     /// an O(n³) reintroduction without flaking on scheduler noise.
     #[test]
     fn coherence_split_dense_clique_scales() {
-        let theta = 0.70;
         let count: i64 = 1500; // O(n³) regression ~40-60s+ under load; O(edges) cover ~10s.
         let members: Vec<i64> = (0..count).collect();
         // Every pair is coherent at 0.90 — a genuinely dense full clique above θ.
@@ -439,7 +489,7 @@ mod tests {
         }
 
         let start = std::time::Instant::now();
-        let split = coherence_split(&members, &edges, sim, theta);
+        let split = coherence_split(&members, &edges, sim);
         let elapsed = start.elapsed();
 
         // ONE coherent class with all n members — zero member loss.
@@ -467,7 +517,6 @@ mod tests {
     /// Seeding by descending similarity grows the tight clique first.
     #[test]
     fn coherence_split_grows_tight_clique_before_budget_trips() {
-        let theta = 0.70;
         // A 7-member tight clique (high ids, sim 1.0) connected to a 300-leaf star hub (sim 0.70);
         // the star's 301 disjoint 2-cliques trip MAX_SPLIT_GROUPS (256) before any id-ordered pass
         // would reach the high-id clique edges.
@@ -500,7 +549,7 @@ mod tests {
             }
         }
 
-        let split = coherence_split(&members, &edges, sim, theta);
+        let split = coherence_split(&members, &edges, sim);
 
         // The tight 7-clique is GROWN as ONE group (descending-sim seed), not 21 bare pairs.
         assert!(
@@ -524,7 +573,6 @@ mod tests {
     /// genuinely dense large clone class must NOT be fragmented.
     #[test]
     fn coherence_split_keeps_loose_clique() {
-        let theta = 0.70;
         let count: i64 = 250; // > the old SPLIT_MAX (200)
         let members: Vec<i64> = (0..count).collect();
         // Every pair is coherent at 0.80 — a full clique above θ.
@@ -537,7 +585,7 @@ mod tests {
             }
         }
 
-        let split = coherence_split(&members, &edges, sim, theta);
+        let split = coherence_split(&members, &edges, sim);
 
         // One coherent class with all 250 members — none dropped.
         assert_eq!(split.len(), 1, "a full clique stays ONE class, got {} classes", split.len());
@@ -561,7 +609,7 @@ mod tests {
         // θ-verified edges = the chain edges only.
         let edges: Vec<(i64, i64)> = (0..count - 1).map(|i| (i, i + 1)).collect();
 
-        let split = coherence_split(&members, &edges, sim, theta);
+        let split = coherence_split(&members, &edges, sim);
 
         // Must NOT be one giant class — the chain breaks into its adjacent cliques.
         assert!(
@@ -617,13 +665,22 @@ mod tests {
         }
 
         let start = std::time::Instant::now();
-        let result = coherence_split(&members, &edges, sim, theta);
+        let result = coherence_split(&members, &edges, sim);
         let elapsed = start.elapsed();
 
-        // Must complete FAST (well under 1 second even in debug builds).
+        // COARSE hang-detector, NOT a microbenchmark — the durable guards are the correctness
+        // asserts below (no member dropped, every class coherent, O(members) output). A wall-clock
+        // ceiling under nextest's per-core parallelism is inherently noisy: in isolation this case
+        // runs ~1.0s, but under full-suite CPU saturation it was observed at ~2.03s against the old
+        // `< 2` ceiling (a scheduler-noise flake, not a regression — the #258 edge-adjacency grow
+        // is strictly FASTER than the old per-(m, g) similarity recompute). The generous `<
+        // 10` ceiling mirrors the `coherence_split_dense_clique_scales` rationale: it sits
+        // well clear of the pass case so it never flakes on contention, yet still reddens
+        // on an O(n³) reintroduction (which would be tens of seconds on this n=200
+        // dense-minus-matching worst case).
         assert!(
-            elapsed.as_secs() < 2,
-            "coherence_split must not time out on n=200 pathological input: took {elapsed:?}"
+            elapsed.as_secs() < 10,
+            "coherence_split must not hang on n=200 pathological input: took {elapsed:?}"
         );
 
         // Budget tripped (or resolved) → no member dropped. In a dense graph every member appears
@@ -685,7 +742,7 @@ mod tests {
         let members: Vec<i64> = (0..900).chain(1000..1010).collect();
         let sim = sim_from_pairs(&hi);
 
-        let result = coherence_split(&members, &edges, &sim, theta);
+        let result = coherence_split(&members, &edges, &sim);
 
         // #256 invariant: NO member with a θ-edge is dropped (every triangle member + every chain
         // member appears in some class).
@@ -697,6 +754,248 @@ mod tests {
         // subset), and every emitted class is internally coherent.
         for class in &result {
             assert!(all_pairs_meet_theta(class, &sim, theta), "incoherent class {class:?}");
+        }
+    }
+
+    /// #258 pin: the GROW step decides coherence by EDGE ADJACENCY against the passed-in `edges`, not
+    /// by recomputing `similarity(m, g) >= theta`. In production the two are equivalent (`edges` IS
+    /// the set of `similarity >= theta` pairs — `candidate_pairs_from_bags` restricted to the
+    /// component), so the output is byte-identical to the pre-#258 similarity-recompute version.
+    /// This test asserts the grow follows `edges`: a fully-coherent 4-clique whose `edges` set
+    /// is missing ONE pair (a,d) must NOT grow into a single 4-member group — d cannot join
+    /// {a,b,c} because (a,d) is not an edge — so the output reflects edge adjacency, exactly as
+    /// the candidate verify would have produced. (If the grow still recomputed `similarity`, it
+    /// would IGNORE the missing edge and wrongly emit one 4-clique.) The seed `similarity`
+    /// closure still returns the true values; only the EDGE SET drives grow membership.
+    #[test]
+    fn coherence_split_grows_by_edge_adjacency_not_recomputed_similarity() {
+        let (a, b, c, d) = (1_i64, 2_i64, 3_i64, 4_i64);
+        // All six pairs are ABOVE theta by similarity …
+        let pairs = [
+            ((a, b), 0.90),
+            ((a, c), 0.90),
+            ((a, d), 0.90),
+            ((b, c), 0.90),
+            ((b, d), 0.90),
+            ((c, d), 0.90),
+        ];
+        let sim = sim_from_pairs(&pairs);
+        // … but the θ-verified EDGE SET omits (a, d) (e.g. the candidate verify rejected it). The
+        // grow must honor the edge set, so d cannot join a group containing a.
+        let edges: Vec<(i64, i64)> = vec![(a, b), (a, c), (b, c), (b, d), (c, d)];
+
+        let split = coherence_split(&[a, b, c, d], &edges, &sim);
+
+        // No returned class may contain BOTH a and d — there is no (a, d) edge, so they are not
+        // mutually coherent under the edge-adjacency grow.
+        for class in &split {
+            assert!(
+                !(class.contains(&a) && class.contains(&d)),
+                "a and d share no edge; the edge-adjacency grow must not co-class them: {split:?}"
+            );
+        }
+        // {b, c, d} IS a clique in the edge set → grown as one group; {a, b, c} likewise.
+        let has_bcd = split.iter().any(|g| {
+            let s: std::collections::HashSet<i64> = g.iter().copied().collect();
+            s == std::collections::HashSet::from([b, c, d])
+        });
+        let has_abc = split.iter().any(|g| {
+            let s: std::collections::HashSet<i64> = g.iter().copied().collect();
+            s == std::collections::HashSet::from([a, b, c])
+        });
+        assert!(has_bcd, "{{b,c,d}} is an edge-clique and must be one grown group: {split:?}");
+        assert!(has_abc, "{{a,b,c}} is an edge-clique and must be one grown group: {split:?}");
+    }
+
+    /// Reference reimplementation of `coherence_split` that reproduces the PRE-#258 grow exactly:
+    /// the per-(m, g) coherence check recomputes `similarity(m, g) >= theta` instead of the O(1)
+    /// edge-adjacency lookup. Every OTHER step (member sort, canonicalize+dedup edges,
+    /// descending-sim seed order with `(a, b)` tie-break, the `member_groups` already-covered
+    /// skip, the budget trip + covering-subset tail, subset removal, dedup, singleton drop,
+    /// final sort) is byte-for-byte the shipped algorithm. The ONLY divergence point is the
+    /// grow predicate, so when this and the shipped `coherence_split` are run on the SAME
+    /// fixture and `edges == exactly {(a,b): sim>=θ}`, any output difference is attributable
+    /// solely to the #258 substitution — which is what the parity test below asserts CANNOT
+    /// happen. (Kept in lockstep with the production body above.)
+    fn reference_split_by_similarity_recompute(
+        component: &[i64],
+        edges: &[(i64, i64)],
+        similarity: impl Fn(i64, i64) -> f64,
+        theta: f64,
+    ) -> Vec<Vec<i64>> {
+        let mut members: Vec<i64> = component.to_vec();
+        members.sort_unstable();
+        let member_set: std::collections::HashSet<i64> = members.iter().copied().collect();
+
+        let mut coherent_edges: Vec<(i64, i64)> = edges
+            .iter()
+            .filter_map(|&(a, b)| {
+                if a == b || !member_set.contains(&a) || !member_set.contains(&b) {
+                    return None;
+                }
+                Some((a.min(b), a.max(b)))
+            })
+            .collect();
+        coherent_edges.sort_unstable();
+        coherent_edges.dedup();
+
+        let mut seeds: Vec<(f64, i64, i64)> =
+            coherent_edges.iter().map(|&(a, b)| (similarity(a, b), a, b)).collect();
+        seeds.sort_by(|x, y| y.0.total_cmp(&x.0).then_with(|| (x.1, x.2).cmp(&(y.1, y.2))));
+
+        let mut groups: Vec<Vec<i64>> = Vec::new();
+        let mut member_groups: std::collections::HashMap<i64, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut covered: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut budget_tripped = false;
+
+        for &(_sim, a, b) in &seeds {
+            if budget_tripped {
+                if !covered.contains(&a) || !covered.contains(&b) {
+                    groups.push(vec![a, b]);
+                    covered.insert(a);
+                    covered.insert(b);
+                }
+                continue;
+            }
+            if let (Some(ga), Some(gb)) = (member_groups.get(&a), member_groups.get(&b))
+                && ga.iter().any(|gi| gb.contains(gi))
+            {
+                continue;
+            }
+            let mut group: Vec<i64> = vec![a, b];
+            let mut group_set: std::collections::HashSet<i64> = group.iter().copied().collect();
+            for &m in &members {
+                if group_set.contains(&m) {
+                    continue;
+                }
+                // The PRE-#258 grow predicate: recompute similarity per (m, g).
+                if group.iter().all(|&g| similarity(m, g) >= theta) {
+                    group.push(m);
+                    group_set.insert(m);
+                }
+            }
+            group.sort_unstable();
+            let gi = groups.len();
+            for &m in &group {
+                member_groups.entry(m).or_default().push(gi);
+                covered.insert(m);
+            }
+            groups.push(group);
+            if groups.len() > MAX_SPLIT_GROUPS {
+                budget_tripped = true;
+            }
+        }
+
+        let mut maximal: Vec<Vec<i64>> = if budget_tripped {
+            groups
+        } else {
+            let mut kept: Vec<Vec<i64>> = Vec::new();
+            for g in &groups {
+                let is_subset = groups
+                    .iter()
+                    .any(|other| other.len() > g.len() && g.iter().all(|x| other.contains(x)));
+                if !is_subset {
+                    kept.push(g.clone());
+                }
+            }
+            kept
+        };
+        maximal.sort_unstable();
+        maximal.dedup();
+        maximal.retain(|g| g.len() >= 2);
+        maximal.sort_by_key(|g| g[0]);
+        maximal
+    }
+
+    /// #258 PARITY PIN (the byte-identical bar the perf change must clear): when `edges` is EXACTLY
+    /// the ≥ θ pair set (the production invariant on a recall-safe corpus), the shipped
+    /// edge-adjacency grow must produce output IDENTICAL to the old per-(m, g) `similarity >=
+    /// theta` recompute. The salvage's `..._not_recomputed_similarity` test only pins the
+    /// DIVERGENT direction (edges omit a pair sim calls ≥ θ → honor edges); this pins the
+    /// production direction. Several component shapes (chain, dense clique, loose clique,
+    /// dense-minus-matching) are each built with `edges = edges_from_pairs(pairs, θ) = {(a,b):
+    /// sim(a,b) >= θ}` and asserted to give `coherence_split(...) ==
+    /// reference_split_by_similarity_recompute(...)`.
+    #[test]
+    fn coherence_split_edge_adjacency_equals_similarity_recompute_when_edges_are_theta_set() {
+        let theta = 0.70;
+
+        // Build (component, pairs) for each shape, with the FULL symmetric pair list so
+        // `edges_from_pairs` yields exactly the ≥ θ edge set.
+        let mut cases: Vec<ParityCase> = Vec::new();
+
+        // (1) Chain 0-1-2-3-4: adjacent pairs ≥ θ, non-adjacent below θ (default 0.0 via
+        // sim_from_pairs).
+        {
+            let members: Vec<i64> = (0..5).collect();
+            let pairs: Vec<((i64, i64), f64)> =
+                (0..4).map(|i| ((i, i + 1), 0.80 + 0.01 * i as f64)).collect();
+            cases.push(("chain", members, pairs));
+        }
+
+        // (2) Dense clique of 8: every pair ≥ θ.
+        {
+            let members: Vec<i64> = (0..8).collect();
+            let mut pairs: Vec<((i64, i64), f64)> = Vec::new();
+            for a in 0..8 {
+                for b in (a + 1)..8 {
+                    pairs.push(((a, b), 0.95));
+                }
+            }
+            cases.push(("dense_clique", members, pairs));
+        }
+
+        // (3) Loose clique of 12: every pair ≥ θ but only just (0.71), distinct values to exercise
+        // the descending-sim seed order with ties broken by id.
+        {
+            let members: Vec<i64> = (0..12).collect();
+            let mut pairs: Vec<((i64, i64), f64)> = Vec::new();
+            for a in 0..12 {
+                for b in (a + 1)..12 {
+                    // Spread similarities across [0.71, 0.79] deterministically so the seed sort
+                    // is exercised (every value is still ≥ θ → every pair an edge).
+                    let v = 0.71 + (((a * 7 + b) % 9) as f64) * 0.01;
+                    pairs.push(((a, b), v));
+                }
+            }
+            cases.push(("loose_clique", members, pairs));
+        }
+
+        // (4) Dense-minus-perfect-matching at small n=10: all pairs ≥ θ EXCEPT the matching
+        // (2k, 2k+1), which is below θ (and so NOT an edge). The worst-case maximal-clique shape.
+        {
+            let n: i64 = 10;
+            let members: Vec<i64> = (0..n).collect();
+            let mut pairs: Vec<((i64, i64), f64)> = Vec::new();
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    let matched = (a / 2 == b / 2) && (a % 2 != b % 2);
+                    pairs.push(((a, b), if matched { 0.50 } else { 0.90 }));
+                }
+            }
+            cases.push(("dense_minus_matching", members, pairs));
+        }
+
+        for (name, members, pairs) in &cases {
+            let sim = sim_from_pairs(pairs);
+            // edges == exactly {(a,b): sim(a,b) >= θ} — the production invariant.
+            let edges = edges_from_pairs(pairs, theta);
+
+            let shipped = coherence_split(members, &edges, &sim);
+            let reference = reference_split_by_similarity_recompute(members, &edges, &sim, theta);
+
+            assert_eq!(
+                shipped, reference,
+                "#258 parity: shape `{name}` — edge-adjacency grow must equal the old \
+                 similarity-recompute grow when edges are exactly the ≥ θ set.\n  shipped:   \
+                 {shipped:?}\n  reference: {reference:?}"
+            );
+            // Sanity: the equivalence is non-trivial — at least one real (≥ 2-member) class.
+            assert!(
+                !shipped.is_empty(),
+                "shape `{name}` should produce at least one coherent class"
+            );
         }
     }
 }
