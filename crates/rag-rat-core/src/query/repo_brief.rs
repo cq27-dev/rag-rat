@@ -625,29 +625,32 @@ pub(crate) fn enrich_symbol_kinds(
     conn: &Connection,
     rows: &mut [FileBriefRow],
 ) -> anyhow::Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let paths = rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>();
-    let symbol_kinds = symbol_kind_counts_by_path(conn, &paths)?;
-
-    for row in rows {
-        row.symbol_kinds = symbol_kinds.get(&row.path).cloned().unwrap_or_default();
-    }
-    Ok(())
+    enrich_rows(conn, rows, symbol_kind_counts_by_path, |row, value| row.symbol_kinds = value)
 }
 
 pub(crate) fn enrich_memory_counts(
     conn: &Connection,
     rows: &mut [FileBriefRow],
 ) -> anyhow::Result<()> {
+    enrich_rows(conn, rows, memory_counts_by_path, |row, value| row.memories = value)
+}
+
+/// Shared per-path enrichment: build the `path -> T` map (via `counts_by_path`) once, then `assign`
+/// each row its value (defaulting when the path is absent). `enrich_symbol_kinds` /
+/// `enrich_memory_counts` were ~identical but for the lookup fn and the target field (#294 dedup).
+fn enrich_rows<T: Clone + Default>(
+    conn: &Connection,
+    rows: &mut [FileBriefRow],
+    counts_by_path: impl Fn(&Connection, &[String]) -> anyhow::Result<BTreeMap<String, T>>,
+    assign: impl Fn(&mut FileBriefRow, T),
+) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
     let paths = rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>();
-    let memory_counts = memory_counts_by_path(conn, &paths)?;
+    let counts = counts_by_path(conn, &paths)?;
     for row in rows {
-        row.memories = memory_counts.get(&row.path).cloned().unwrap_or_default();
+        assign(row, counts.get(&row.path).cloned().unwrap_or_default());
     }
     Ok(())
 }
