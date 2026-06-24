@@ -953,6 +953,18 @@ fn run_maintenance_pass(
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
     let gc_report = db.garbage_collect().ok();
+    // Clone-edge graph (#286): refresh the persisted graph when absent/stale with whatever budget
+    // the embedding reconcile left (shared so the pass can't overrun), so the git-hook
+    // maintenance keeps the graph warm too — not just the foreground watcher. Best-effort +
+    // resumable across passes.
+    let clone_graph_report = if db.pending_clone_graph().unwrap_or(false) {
+        match budget.as_ref().and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
+            Some(options) => db.reconcile_clone_edges_with_budget(options.max_seconds).ok(),
+            None => None,
+        }
+    } else {
+        None
+    };
     // Re-anchor repo memories: post-checkout/merge/rewrite/commit are exactly when files move,
     // rename, or change, so relocate symbol/chunk bindings (or flag them) here rather than
     // leaving stale anchors until a manual memory_validate.
@@ -967,6 +979,7 @@ fn run_maintenance_pass(
         "max_seconds": max_seconds,
         "elapsed_seconds": started.elapsed().as_secs_f64(),
         "reconcile": reconcile_report,
+        "clone_graph": clone_graph_report,
         "gc": gc_report,
         "memory_validation": memory_validation,
         "remaining_backlog": {

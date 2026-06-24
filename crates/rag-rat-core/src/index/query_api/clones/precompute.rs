@@ -108,12 +108,22 @@ impl IndexDatabase {
         }
     }
 
+    /// One budgeted clone-graph pass for the watcher / `maintenance` tail (#286): a single
+    /// resumable pass bounded by the remaining shared pass budget. A thin wrapper over
+    /// [`Self::reconcile_clone_edges_pass`] so those callers needn't name `CloneEdgeOptions`.
+    pub fn reconcile_clone_edges_with_budget(
+        &self,
+        max_seconds: Option<u64>,
+    ) -> anyhow::Result<CloneEdgeReport> {
+        self.reconcile_clone_edges_pass(&CloneEdgeOptions {
+            max_seconds,
+            ..CloneEdgeOptions::default()
+        })
+    }
+
     /// True when the precomputed graph is ABSENT or STALE vs the current content — the gate the
     /// watcher / maintenance pass uses to decide whether to spend budget on a recompute.
-    // Wired into the watcher/maintenance pass in Phase D (#286); built now so the gate ships with
-    // the pass it guards.
-    #[allow(dead_code)]
-    pub(crate) fn pending_clone_graph(&self) -> anyhow::Result<bool> {
+    pub fn pending_clone_graph(&self) -> anyhow::Result<bool> {
         let conn = self.storage.connection();
         let Some(live) = live_generation_row(conn)? else {
             return Ok(true); // no completed generation yet
