@@ -39,12 +39,20 @@
 /// group made a DENSE clique O(n³), #256).
 ///
 /// CRUCIAL (#256): tripping the budget does NOT drop members and does NOT return the over-merged
-/// component (the old behavior that resurrected the giant). Once the budget trips, every remaining
-/// uncovered θ-edge is emitted as its own 2-member clique — so EVERY member that has a θ-edge still
-/// lands in at least one coherent class. A long transitive CHAIN (n−1 edges, far more than 256
-/// grown cliques) therefore keeps all members: the tail edges become 2-member pairs instead of
-/// being dropped. Only the (rare) GROWN-clique expansion is bounded, never coverage. For the normal
-/// case (all existing tests) far fewer than 256 grown cliques are ever produced.
+/// component (the old behavior that resurrected the giant). Once the budget trips, the tail emits a
+/// COVERING SUBSET of the remaining θ-edges — a 2-member clique only for an edge that covers a
+/// still-uncovered member (#282) — so EVERY member that has a θ-edge still lands in at least one
+/// coherent class. A long transitive CHAIN (n−1 edges, far more than 256 grown cliques) therefore
+/// keeps all members: each member is covered by a grown clique or by the first tail edge that
+/// reaches it. Only the (rare) GROWN-clique expansion is bounded, never coverage.
+///
+/// #282: the OLD tail emitted EVERY remaining edge, so a dense over-merged giant (cargo's 3.1k-node
+/// component: ~92k edges) shattered into O(edges) ≈ 87k bare 2-member classes — `build_class`-ing
+/// all of them was the dominant cold `find_clones` cost. The covering subset emits ≤ O(uncovered
+/// members) pairs (each one covers ≥1 new member), bounding the tail to the component size while
+/// keeping symbol-level recall identical: a skipped edge has BOTH endpoints already in a class, so
+/// it is a redundant clone PAIR, never a lost member. For the normal case (all existing tests) far
+/// fewer than 256 grown cliques are ever produced and the tail is empty.
 const MAX_SPLIT_GROUPS: usize = 256;
 
 /// Split an over-merged union-find component into internally-coherent clone classes: every pair
@@ -164,14 +172,31 @@ pub(crate) fn coherence_split(
     let mut groups: Vec<Vec<i64>> = Vec::new();
     let mut member_groups: std::collections::HashMap<i64, Vec<usize>> =
         std::collections::HashMap::new();
+    // Members already in some emitted group (a grown clique or a bare pair). Drives the
+    // covering-subset emission below (#282): the over-budget tail only needs to COVER each
+    // still-uncovered member, not emit every edge.
+    let mut covered: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut budget_tripped = false;
 
     for &(_sim, a, b) in &seeds {
         if budget_tripped {
-            // Over budget: emit the edge directly as a 2-member clique (still internally coherent —
-            // it is a θ-edge). No grow, no containment bookkeeping. The later dedup/subset pass is
-            // skipped too (see below), so this stays O(remaining edges).
-            groups.push(vec![a, b]);
+            // Over budget: emit this θ-edge as a 2-member clique ONLY if it covers a
+            // still-uncovered member (#282). Emitting EVERY remaining edge (the old
+            // behavior) shattered a dense giant into O(edges) bare pairs — ~87k classes
+            // on cargo's 3.1k-node giant, the dominant `find_clones` cost (building
+            // them all). A covering subset emits ≤ O(uncovered members) pairs and KEEPS
+            // the #256 invariant: every member with a θ-edge that isn't in a grown
+            // clique gets a bare pair the first time one of its edges is reached here (it is
+            // uncovered then), so no member is dropped and symbol-level recall is unchanged. An
+            // edge whose endpoints are BOTH already covered is a redundant clone PAIR,
+            // not a lost member, so skipping it cannot drop recall — it only removes a
+            // duplicate 2-member class. Still internally coherent (it is a θ-edge); the
+            // later dedup/subset pass stays skipped.
+            if !covered.contains(&a) || !covered.contains(&b) {
+                groups.push(vec![a, b]);
+                covered.insert(a);
+                covered.insert(b);
+            }
             continue;
         }
         // Skip this edge if some existing group already contains BOTH endpoints — i.e. `a` and `b`
@@ -204,6 +229,9 @@ pub(crate) fn coherence_split(
         let gi = groups.len();
         for &m in &group {
             member_groups.entry(m).or_default().push(gi);
+            // A grown-clique member is covered → the over-budget tail won't re-emit a bare pair
+            // for it (#282 covering-subset).
+            covered.insert(m);
         }
         groups.push(group);
         // Budget guard (#256): bound the superlinear passes. From here on, remaining edges are
@@ -617,6 +645,58 @@ mod tests {
                 all_pairs_meet_theta(class, sim, theta),
                 "class {class:?} contains a pair below theta={theta}"
             );
+        }
+        // #282 covering subset: the dense giant's grown cliques already cover every member, so the
+        // over-budget tail emits ~no redundant pairs — the output is O(grown cliques), NOT
+        // O(edges). The OLD "emit every remaining edge" behavior produced ~n²/2 ≈ 20k bare
+        // 2-member classes here (build_class-ing all of them was the dominant cold
+        // find_clones cost, #282).
+        assert!(
+            result.len() <= 2 * n as usize,
+            "#282: covering-subset tail must bound output to O(members), not O(edges) — got {} \
+             classes for {} edges",
+            result.len(),
+            edges.len(),
+        );
+    }
+
+    #[test]
+    fn coherence_split_covering_subset_keeps_all_members_when_budget_trips() {
+        // A graph that TRIPS the budget AND leaves members for the tail to cover: many disjoint
+        // tight triangles (each grows one clique) plus a long sparse chain whose members are NOT in
+        // any triangle. With > MAX_SPLIT_GROUPS triangles the budget trips, and the chain members
+        // must still be covered by the tail — by a COVERING SUBSET, not every chain edge.
+        let theta = 0.70;
+        let mut edges: Vec<(i64, i64)> = Vec::new();
+        let mut hi: Vec<((i64, i64), f64)> = Vec::new();
+        // 300 disjoint triangles (ids 0..900): trips MAX_SPLIT_GROUPS=256.
+        for t in 0..300i64 {
+            let (a, b, c) = (t * 3, t * 3 + 1, t * 3 + 2);
+            for &(x, y) in &[(a, b), (b, c), (a, c)] {
+                edges.push((x, y));
+                hi.push(((x, y), 0.9));
+            }
+        }
+        // A sparse chain 1000-1001-1002-…-1009 (each adjacent pair a θ-edge; non-adjacent below θ).
+        for k in 0..9i64 {
+            edges.push((1000 + k, 1000 + k + 1));
+            hi.push(((1000 + k, 1000 + k + 1), 0.8));
+        }
+        let members: Vec<i64> = (0..900).chain(1000..1010).collect();
+        let sim = sim_from_pairs(&hi);
+
+        let result = coherence_split(&members, &edges, &sim, theta);
+
+        // #256 invariant: NO member with a θ-edge is dropped (every triangle member + every chain
+        // member appears in some class).
+        let returned: std::collections::BTreeSet<i64> = result.iter().flatten().copied().collect();
+        for &m in &members {
+            assert!(returned.contains(&m), "#256: member {m} was dropped after the budget tripped");
+        }
+        // #282: the chain's 10 members are covered by ≤ their count of tail pairs (a covering
+        // subset), and every emitted class is internally coherent.
+        for class in &result {
+            assert!(all_pairs_meet_theta(class, &sim, theta), "incoherent class {class:?}");
         }
     }
 }
