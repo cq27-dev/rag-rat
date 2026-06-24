@@ -889,6 +889,25 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         return Ok(());
     }
 
+    // If an MCP watcher is already live for this worktree, it runs the identical pass
+    // (`watch::run_pass`) on its own schedule whenever a tracked FILE changes — so for the
+    // file-changing triggers (checkout/merge) the eager hook pass here is redundant and just
+    // doubles the work + memory pressure. Defer to the watcher; the query-path heal covers the
+    // brief staleness gap. post-commit / post-rewrite touch only git metadata, which the
+    // file-watcher can't see, so those still run (and are cheap — no file content changed).
+    if matches!(trigger.as_str(), "post-checkout" | "post-merge")
+        && crate::claude_hook::watcher_state(config).0
+    {
+        print_output(&serde_json::json!({
+            "trigger": trigger,
+            "status": "skipped",
+            "reason": "watcher live — deferring to the watcher's pass",
+            "old_head": old_head,
+            "new_head": new_head,
+        }))?;
+        return Ok(());
+    }
+
     // Single-flight coalescing (#267): a single amend/merge/rebase fires several git hooks
     // (post-commit + post-rewrite, post-merge + post-commit, post-rewrite + post-checkouts), each
     // backgrounding `rag-rat maintenance`. Without coalescing they serialize on the write lock and
