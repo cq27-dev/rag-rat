@@ -31,6 +31,14 @@ tokio.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Idle-RSS fix: glibc malloc never returns freed pages to the OS, so a long-lived `rag-rat mcp`
+# server retains its peak RSS (~625 MB observed) after the watcher's heavy index/graph passes.
+# jemalloc + a background purge thread gives dirty/muzzy pages back shortly after they go idle.
+# Gated off msvc (jemalloc has no msvc support); the `#[global_allocator]` cfg matches.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+tikv-jemalloc-ctl = "0.6"
+
 [dev-dependencies]
 # MCP tool results render as TOON; integration tests decode them back to JSON Values to assert.
 toon-format.workspace = true

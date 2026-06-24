@@ -24,7 +24,40 @@ mod claude_hook;
 mod claude_settings;
 mod init;
 
+// Idle-RSS fix: glibc malloc never hands freed pages back to the OS, so a long-lived `rag-rat mcp`
+// server keeps its peak RSS (~625 MB observed) after the watcher's heavy index/graph passes.
+// jemalloc with a background purge thread returns idle dirty/muzzy pages to the OS instead.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Tune jemalloc to give idle heap back to the OS: enable its background purge thread (otherwise
+/// decayed pages are only reclaimed on later alloc calls, which a quiet server rarely makes) and
+/// tighten the decay window from the 10s default so an idle server releases memory within ~1s.
+/// Best-effort — a server that holds slightly more RAM is better than one that won't boot.
+#[cfg(not(target_env = "msvc"))]
+fn configure_jemalloc() {
+    use tikv_jemalloc_ctl::{background_thread, raw};
+    // Purge decayed pages on a background thread; a quiet server makes few alloc calls, which is
+    // otherwise the only time jemalloc reclaims.
+    let _ = background_thread::write(true);
+    // SAFETY: stable mallctl names with ssize_t (isize) values; the writes are best-effort.
+    unsafe {
+        // `arena.4096.*` is MALLCTL_ARENAS_ALL — retune EVERY arena that already exists (the main
+        // thread's arena is created before `main` runs). `arenas.*` alone only sets the default for
+        // arenas created LATER, so the already-live arenas keep the 10s default. Measured: with the
+        // all-arenas retune a freed ~490 MB heap returns to ~baseline in ~15s idle; without it, it
+        // lingers. Set both so existing and future arenas decay fast.
+        let _ = raw::write(b"arena.4096.dirty_decay_ms\0", 1000_isize);
+        let _ = raw::write(b"arena.4096.muzzy_decay_ms\0", 1000_isize);
+        let _ = raw::write(b"arenas.dirty_decay_ms\0", 1000_isize);
+        let _ = raw::write(b"arenas.muzzy_decay_ms\0", 1000_isize);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    #[cfg(not(target_env = "msvc"))]
+    configure_jemalloc();
     let cli = Cli::parse();
 
     // Pin the process-wide output format from the global flag before any command runs, so
