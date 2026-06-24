@@ -435,16 +435,23 @@ struct ParentWorktree {
     repo_root: PathBuf,
 }
 
+/// `git` invocation with rag-rat's own git hooks suppressed (`RAG_RAT_HOOK_DISABLE=1`). The
+/// parent-state replay creates and tears down a throwaway worktree PER CASE; without this each
+/// `git worktree add` fires the post-checkout hook → a `rag-rat maintenance` pass on the throwaway
+/// worktree, i.e. N redundant heavy index passes per replay run (real memory pressure). The replay
+/// indexes the worktree explicitly anyway, so the hook has nothing useful to add.
+fn git_without_hooks(repo_root: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command.current_dir(repo_root).env("RAG_RAT_HOOK_DISABLE", "1");
+    command
+}
+
 impl ParentWorktree {
     fn create(repo_root: &Path, commitish: &str, dir_key: &str) -> anyhow::Result<Self> {
         let path = std::env::temp_dir().join(format!("rag-rat-replay-wt-{dir_key}"));
-        let _ = std::process::Command::new("git")
-            .current_dir(repo_root)
-            .args(["worktree", "prune"])
-            .status();
+        let _ = git_without_hooks(repo_root).args(["worktree", "prune"]).status();
         let _ = std::fs::remove_dir_all(&path);
-        let status = std::process::Command::new("git")
-            .current_dir(repo_root)
+        let status = git_without_hooks(repo_root)
             .args(["worktree", "add", "--detach"])
             .arg(&path)
             .arg(commitish)
@@ -460,8 +467,7 @@ impl ParentWorktree {
 
 impl Drop for ParentWorktree {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("git")
-            .current_dir(&self.repo_root)
+        let _ = git_without_hooks(&self.repo_root)
             .args(["worktree", "remove", "--force"])
             .arg(&self.path)
             .stdout(std::process::Stdio::null())
