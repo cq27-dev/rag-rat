@@ -57,6 +57,7 @@ pub(crate) fn default_model_version(model_id: &str) -> &'static str {
     match model_id {
         HASH_MODEL_ID => "hash-v1",
         FASTEMBED_MODEL_ID => "fastembed-all-minilm-l6-v2-v1",
+        BGE_SMALL_MODEL_ID => "fastembed-bge-small-en-v1.5-v1",
         MODEL2VEC_MODEL_ID => "model2vec-potion-retrieval-32m-v1",
         _ => "v1",
     }
@@ -98,6 +99,7 @@ pub(crate) fn active_embedder(
     match model.model_id.as_str() {
         HASH_MODEL_ID => Ok(Box::new(HashEmbedder)),
         FASTEMBED_MODEL_ID => fastembed_embedder(intra_threads),
+        BGE_SMALL_MODEL_ID => bge_small_embedder(intra_threads),
         MODEL2VEC_MODEL_ID => model2vec_embedder(),
         other => anyhow::bail!("unknown active embedding model `{other}`"),
     }
@@ -150,6 +152,7 @@ pub(crate) fn expected_dim(model_id: &str) -> Option<usize> {
     match model_id {
         HASH_MODEL_ID => Some(HASH_EMBEDDING_DIM),
         FASTEMBED_MODEL_ID => Some(FASTEMBED_EMBEDDING_DIM),
+        BGE_SMALL_MODEL_ID => Some(BGE_SMALL_EMBEDDING_DIM),
         MODEL2VEC_MODEL_ID => Some(MODEL2VEC_EMBEDDING_DIM),
         _ => None,
     }
@@ -161,6 +164,20 @@ pub(crate) fn fastembed_embedder(
     #[cfg(feature = "fastembed")]
     {
         Ok(Box::new(FastEmbedEmbedder::new(intra_threads)?))
+    }
+    #[cfg(not(feature = "fastembed"))]
+    {
+        let _ = intra_threads;
+        anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
+    }
+}
+
+pub(crate) fn bge_small_embedder(
+    intra_threads: Option<usize>,
+) -> anyhow::Result<Box<dyn Embedder>> {
+    #[cfg(feature = "fastembed")]
+    {
+        Ok(Box::new(FastEmbedEmbedder::new_bge_small(intra_threads)?))
     }
     #[cfg(not(feature = "fastembed"))]
     {

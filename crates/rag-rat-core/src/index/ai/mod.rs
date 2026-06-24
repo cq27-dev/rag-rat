@@ -25,6 +25,14 @@ pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
 pub const FASTEMBED_DISPLAY_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
 pub const HASH_EMBEDDING_DIM: usize = 384;
 pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
+
+/// BGE-small-en-v1.5 (#112): a stronger general-retrieval embedder than all-MiniLM at the SAME
+/// 384-dim — switching to it is a re-embed, not a schema/dim change. MIT-licensed; ships via
+/// fastembed (downloads on first use). Measured against `FASTEMBED_MODEL_ID` on the replay eval.
+pub const BGE_SMALL_MODEL_ID: &str = "fastembed-bge-small-en-v1.5";
+pub const BGE_SMALL_DISPLAY_MODEL: &str = "BAAI/bge-small-en-v1.5";
+pub const BGE_SMALL_EMBEDDING_DIM: usize = 384;
+
 /// Model2Vec static-embedding backend: a token→vector lookup + mean-pool (no transformer forward
 /// pass), ~100-500× faster than FastEmbed on CPU at some retrieval-quality cost. The right choice
 /// for very large repos where the FastEmbed backfill is infeasible. See `EmbeddingBackend`.
@@ -103,13 +111,41 @@ impl Embedder for MockEmbedder {
 #[cfg(feature = "fastembed")]
 pub struct FastEmbedEmbedder {
     model: std::sync::Mutex<fastembed::TextEmbedding>,
+    model_id: &'static str,
+    dim: usize,
 }
 
 #[cfg(feature = "fastembed")]
 impl FastEmbedEmbedder {
+    /// all-MiniLM-L6-v2 (384-dim) — the default general-purpose backend.
     pub fn new(intra_threads: Option<usize>) -> anyhow::Result<Self> {
-        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-        let mut options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+        Self::with_model(
+            fastembed::EmbeddingModel::AllMiniLML6V2,
+            FASTEMBED_MODEL_ID,
+            FASTEMBED_EMBEDDING_DIM,
+            intra_threads,
+        )
+    }
+
+    /// BGE-small-en-v1.5 (384-dim, #112) — a stronger general-retrieval embedder, same dimension as
+    /// all-MiniLM so swapping it is a re-embed rather than a schema/dim change.
+    pub fn new_bge_small(intra_threads: Option<usize>) -> anyhow::Result<Self> {
+        Self::with_model(
+            fastembed::EmbeddingModel::BGESmallENV15,
+            BGE_SMALL_MODEL_ID,
+            BGE_SMALL_EMBEDDING_DIM,
+            intra_threads,
+        )
+    }
+
+    fn with_model(
+        model: fastembed::EmbeddingModel,
+        model_id: &'static str,
+        dim: usize,
+        intra_threads: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        use fastembed::{InitOptions, TextEmbedding};
+        let mut options = InitOptions::new(model)
             .with_cache_dir(fastembed_cache_dir())
             .with_show_download_progress(true);
         // `ort_threads` caps the ONNX Runtime intra-op thread pool. Microsoft's prebuilt ORT
@@ -119,18 +155,18 @@ impl FastEmbedEmbedder {
         if let Some(threads) = intra_threads.filter(|threads| *threads > 0) {
             options = options.with_intra_threads(threads);
         }
-        Ok(Self { model: std::sync::Mutex::new(TextEmbedding::try_new(options)?) })
+        Ok(Self { model: std::sync::Mutex::new(TextEmbedding::try_new(options)?), model_id, dim })
     }
 }
 
 #[cfg(feature = "fastembed")]
 impl Embedder for FastEmbedEmbedder {
     fn model_id(&self) -> &str {
-        FASTEMBED_MODEL_ID
+        self.model_id
     }
 
     fn dim(&self) -> usize {
-        FASTEMBED_EMBEDDING_DIM
+        self.dim
     }
 
     fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {

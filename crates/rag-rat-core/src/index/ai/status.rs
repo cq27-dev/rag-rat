@@ -3,8 +3,13 @@ use super::*;
 pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
     #[cfg(feature = "fastembed")]
     {
-        let embedder = FastEmbedEmbedder::new(None)
-            .map_err(|err| anyhow::anyhow!("failed to initialize fastembed model: {err}"))?;
+        // Init the model that matches `model_id` (triggers its download + yields the right dim),
+        // not always all-MiniLM — both are 384-dim, but BGE-small (#112) must pull its own weights.
+        let embedder = match model_id {
+            BGE_SMALL_MODEL_ID => FastEmbedEmbedder::new_bge_small(None),
+            _ => FastEmbedEmbedder::new(None),
+        }
+        .map_err(|err| anyhow::anyhow!("failed to initialize fastembed model: {err}"))?;
         conn.execute(
             "UPDATE ai_models
              SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
