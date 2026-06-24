@@ -755,7 +755,7 @@ mod tests {
                     }
                 }
             }
-            let result = coherence_split(&members, &edges, sim, theta);
+            let result = coherence_split(&members, &edges, sim);
             // The class count is bounded by the budget, independent of n / edge count — it does NOT
             // grow with the component size the way the pre-#282 bare-pair tail did.
             assert!(
