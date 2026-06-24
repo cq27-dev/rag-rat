@@ -41,6 +41,10 @@ sequenceDiagram
   rationale, all queryable.
 - **Rides your existing grep.** A [PreToolUse hook](docs/grep-augmentation.md) injects the memories
   and symbols behind whatever you just searched for.
+- **Flags clones as you write them.** A PreToolUse hook on Write/Edit/MultiEdit fingerprints the
+  functions you're writing and warns when they're exact or near-duplicates of code already in the
+  repo — so an agent reuses instead of re-implementing. Read-only, and a silent no-op when the index
+  isn't ready, so it never blocks a write.
 
 ## Install
 
