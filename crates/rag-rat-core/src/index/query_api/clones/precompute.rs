@@ -14,7 +14,7 @@
 //! on `(path, start_byte, file_sha)` (the #248 rule — no `symbol_id` FK); reads resolve back to
 //! live symbols.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, params};
@@ -325,42 +325,91 @@ pub(super) fn precomputed_pairs_if_eligible(
         return Ok(None);
     }
 
+    // Resolve each stored edge's content-anchored endpoints to LIVE symbol ids IN RAM. A per-edge
+    // 4-way SQL join (files×symbols, twice) is catastrophically slow at scale — measured SLOWER
+    // than a full live recompute on net/ipv4 (the whole point is to be faster). Instead build a
+    // `(path, start_byte) -> (symbol_id, live_sha)` index once from the scoped symbols, then look
+    // up each endpoint: a `file_sha` mismatch (file edited since the build) or a missing key
+    // (file deleted) drops the now-stale edge — the #248 read discipline, done in memory.
+    let by_anchor = build_anchor_index(conn)?;
+
     let mut stmt = conn.prepare(
-        "SELECT sa.id, sb.id, e.overlap, e.a_token_len, e.b_token_len
-           FROM clone_edges e
-           JOIN files fa   ON fa.path = e.a_path AND fa.sha256 = e.a_file_sha
-           JOIN symbols sa ON sa.file_id = fa.id AND sa.start_byte = e.a_start_byte
-           JOIN files fb   ON fb.path = e.b_path AND fb.sha256 = e.b_file_sha
-           JOIN symbols sb ON sb.file_id = fb.id AND sb.start_byte = e.b_start_byte
-          WHERE e.build_generation = ?1",
+        "SELECT a_path, a_start_byte, a_file_sha, b_path, b_start_byte, b_file_sha,
+                overlap, a_token_len, b_token_len
+           FROM clone_edges WHERE build_generation = ?1",
     )?;
     let rows = stmt.query_map(params![live.generation], |r| {
         Ok((
-            r.get::<_, i64>(0)?,
+            r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, i64>(3)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
             r.get::<_, i64>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, i64>(8)?,
         ))
     })?;
 
     let mut pairs: Vec<(i64, i64)> = Vec::new();
     for row in rows {
-        let (a, b, overlap, a_token_len, b_token_len) = row?;
-        // Scope guard: keep only pairs whose BOTH resolved endpoints are in the active bag set (so
-        // a multi-worktree `files` row resolving to an out-of-scope symbol can't leak in).
-        if !by_id.contains_key(&a) || !by_id.contains_key(&b) {
+        let (
+            a_path,
+            a_start_byte,
+            a_file_sha,
+            b_path,
+            b_start_byte,
+            b_file_sha,
+            overlap,
+            a_len,
+            b_len,
+        ) = row?;
+        let Some((sa, live_sha_a)) = by_anchor.get(&(a_path, a_start_byte)) else { continue };
+        if *live_sha_a != a_file_sha {
+            continue; // endpoint's file edited since the build → stale edge drops
+        }
+        let Some((sb, live_sha_b)) = by_anchor.get(&(b_path, b_start_byte)) else { continue };
+        if *live_sha_b != b_file_sha {
             continue;
         }
-        let max_len = a_token_len.max(b_token_len);
-        let threshold = (theta * max_len as f64).ceil() as i64;
-        if overlap >= threshold {
-            pairs.push((a.min(b), a.max(b)));
+        let (sa, sb) = (*sa, *sb);
+        // Scope guard: both endpoints must be in the active bag set (a multi-worktree `files` row
+        // can't leak an out-of-scope symbol in).
+        if !by_id.contains_key(&sa) || !by_id.contains_key(&sb) {
+            continue;
+        }
+        let max_len = a_len.max(b_len);
+        if overlap >= (theta * max_len as f64).ceil() as i64 {
+            pairs.push((sa.min(sb), sa.max(sb)));
         }
     }
     pairs.sort_unstable();
     pairs.dedup();
     Ok(Some(pairs))
+}
+
+/// `(path, start_byte) -> (symbol_id, file_sha)` over the scoped non-generated symbols — the
+/// inverse of [`resolve_symbol_anchors`], used by the read fast path to resolve content-anchored
+/// edges in RAM (one scan + hash lookups) instead of a per-edge SQL join.
+fn build_anchor_index(conn: &Connection) -> anyhow::Result<HashMap<(String, i64), (i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, f.path, s.start_byte, f.sha256
+           FROM symbols s JOIN files f ON f.id = s.file_id
+          WHERE f.generated = 0",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            (r.get::<_, String>(1)?, r.get::<_, i64>(2)?),
+            (r.get::<_, i64>(0)?, r.get::<_, String>(3)?),
+        ))
+    })?;
+    let mut map: HashMap<(String, i64), (i64, String)> = HashMap::new();
+    for row in rows {
+        let (key, value) = row?;
+        map.insert(key, value);
+    }
+    Ok(map)
 }
 
 /// The `(struct_hash, language) -> [symbol_id]` buckets — the exact key `add_struct_hash_pairs`
