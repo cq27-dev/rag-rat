@@ -1168,6 +1168,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_031_ID => Some(31),
             MIGRATION_032_ID => Some(32),
             MIGRATION_033_ID => Some(33),
+            MIGRATION_034_ID => Some(34),
             _ => None,
         })
         .max()
@@ -1210,6 +1211,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_031_ID
             | MIGRATION_032_ID
             | MIGRATION_033_ID
+            | MIGRATION_034_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1249,6 +1251,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_031_ID => migration.checksum != MIGRATION_031_CHECKSUM,
         MIGRATION_032_ID => migration.checksum != MIGRATION_032_CHECKSUM,
         MIGRATION_033_ID => migration.checksum != MIGRATION_033_CHECKSUM,
+        MIGRATION_034_ID => migration.checksum != MIGRATION_034_CHECKSUM,
         _ => false,
     }
 }
@@ -1410,6 +1413,83 @@ pub(crate) const CLONE_FINGERPRINT_DDL: &str = "
 /// require parsing the entire repo inside a migration.
 pub(crate) fn apply_clone_fingerprint_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CLONE_FINGERPRINT_DDL)?;
+    Ok(())
+}
+
+/// V034: the precomputed clone-edge graph, so `find_clones` reads a persisted graph instead of
+/// recomputing the super-linear SourcererCC candidate pairs every query (it does not finish in 240s
+/// on a 118k-function index). Computed at θ = `CLONE_PRECOMPUTE_THETA` (0.7).
+///
+/// Generation-staged: the resumable background recompute writes a new `build_generation`; reads
+/// serve the latest `Complete` generation (the `clone_graph_live_generation` meta key); the pointer
+/// flips atomically on completion so a half-built generation is never served. GC of a superseded
+/// generation CASCADEs its edges — `clone_graph_generations` is DURABLE precompute metadata, not a
+/// `REINDEX_VOLATILE_PARENT`, so that CASCADE FK is allowed.
+///
+/// CONTENT-ANCHORED endpoints (the #248 bug-class rule, enforced by
+/// `no_table_has_a_reindex_cascading_fk_to_a_volatile_parent`): this is durable output that MUST
+/// survive reindex, so it carries NO `ON DELETE CASCADE` FK to `symbols` (a
+/// `REINDEX_VOLATILE_PARENT` whose ids are reassigned on reindex — keying on `symbol_id` is the
+/// exact #248 bug that wiped `edge_oracle` verdicts). Each endpoint is the reindex-stable `(path,
+/// start_byte)` of a symbol plus the `file_sha` (`files.sha256`) at compute time — the same
+/// content-key/staleness pattern as `edge_oracle`. Reads resolve an endpoint by joining live
+/// `symbols`/`files` on `(path, start_byte)` AND `files.sha256 = *_file_sha`; a deleted or edited
+/// endpoint simply does not resolve, so a dangling/stale edge is dropped at read (never a ghost
+/// member).
+///
+/// `overlap` + both `token_len`s are the exact `verified_clone` gate inputs, so any query θ ≥ 0.7
+/// reproduces `overlap >= ceil(θ * max_len)` precisely by filtering stored rows. Struct-hash exact
+/// pairs carry `similarity = 1.0` so they survive every θ.
+///
+/// Population gap (as with the V029 clone tables): this migration only CREATEs the tables. They
+/// populate when a precompute pass runs (watcher maintenance / `rag-rat clones --precompute`);
+/// there is no backfill at migration time. Until then `find_clones` uses its live path unchanged.
+/// The sub-block inverted index the resumable build streams against is rebuilt in RAM from
+/// `symbol_fingerprints.token_bag` each pass (cheap relative to pair emission); a PERSISTED
+/// postings table is deferred to the incremental-maintenance follow-up, where it would itself be
+/// content-anchored.
+pub(crate) const CLONE_GRAPH_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS clone_graph_generations(
+        generation         INTEGER PRIMARY KEY,
+        status             TEXT    NOT NULL CHECK (status IN ('Building', 'Complete')),
+        theta_floor        REAL    NOT NULL,
+        normalizer_kind    TEXT    NOT NULL,            -- baseline
+        normalizer_version INTEGER NOT NULL,            -- NORM_VERSION at build
+        source_revision    TEXT    NOT NULL,            -- content_revision() this generation \
+                                          builds toward
+        cursor_symbol_id   INTEGER NOT NULL DEFAULT 0,  -- build-local resume point (last \
+                                          symbol_id emitted)
+        edges_written      INTEGER NOT NULL DEFAULT 0,
+        started_at_ms      INTEGER NOT NULL,
+        finished_at_ms     INTEGER
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS clone_edges(
+        build_generation INTEGER NOT NULL REFERENCES clone_graph_generations(generation) ON DELETE \
+                                          CASCADE,
+        -- Content-anchored endpoints: NO symbol_id FK (#248 rule). Canonical a < b by (path, \
+                                          start_byte).
+        a_path           TEXT    NOT NULL,
+        a_start_byte     INTEGER NOT NULL,
+        a_file_sha       TEXT    NOT NULL,              -- files.sha256 at compute; read-time \
+                                          staleness filter
+        b_path           TEXT    NOT NULL,
+        b_start_byte     INTEGER NOT NULL,
+        b_file_sha       TEXT    NOT NULL,
+        overlap          INTEGER NOT NULL,              -- Σ min(freq) = verified_clone overlap
+        a_token_len      INTEGER NOT NULL,
+        b_token_len      INTEGER NOT NULL,
+        similarity       REAL    NOT NULL,              -- overlap/max_len; 1.0 for \
+                                          struct-hash-exact pairs
+        edge_source      TEXT    NOT NULL,              -- 'struct_hash' | 'sub_block'
+        PRIMARY KEY (build_generation, a_path, a_start_byte, b_path, b_start_byte)
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS idx_clone_edges_b
+        ON clone_edges(build_generation, b_path, b_start_byte);
+";
+
+/// V034: create the precomputed clone-graph tables (see [`CLONE_GRAPH_DDL`]).
+pub(crate) fn apply_clone_graph_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(CLONE_GRAPH_DDL)?;
     Ok(())
 }
 

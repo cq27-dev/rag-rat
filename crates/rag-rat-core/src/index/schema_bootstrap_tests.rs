@@ -12339,6 +12339,87 @@ fn migration_032_adds_token_bag_drops_postings() {
     ));
 }
 
+/// V034 (#286): the precomputed clone-graph tables exist after a forward migration from V033, are
+/// CONTENT-ANCHORED (no `symbol_id` FK — the #248 rule the volatile-FK trip-wire enforces), and are
+/// usable. A V033 index migrates forward to LATEST and gains `clone_graph_generations` +
+/// `clone_edges` with the content-key endpoints; the deferred postings table is NOT created.
+#[test]
+fn migration_034_adds_content_anchored_clone_graph_tables() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply");
+
+    // --- Simulate a V033-era index: clone-graph tables absent, schema rolled back to V033 ---
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS clone_edges; DROP TABLE IF EXISTS clone_graph_generations;",
+    )
+    .expect("revert to V033 shape");
+    truncate_schema_to(&conn, 33);
+    assert!(!conn_table_exists(&conn, "clone_edges"), "clone_edges absent at V033");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Older,
+        "schema is Older after removing the V034 ledger row"
+    );
+
+    // --- Run the forward migration ---
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    assert!(
+        conn_table_exists(&conn, "clone_graph_generations"),
+        "V034 adds clone_graph_generations"
+    );
+    assert!(conn_table_exists(&conn, "clone_edges"), "V034 adds clone_edges");
+    assert!(
+        !conn_table_exists(&conn, "clone_subblock_postings"),
+        "the persisted postings table is deferred to the incremental follow-up — not created in \
+         V034"
+    );
+
+    // Content-anchored: clone_edges must carry NO foreign key to a reindex-volatile parent
+    // (symbols). Its only FK is to clone_graph_generations (durable). This is the #248
+    // invariant in situ.
+    let edge_fk_parents: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT \"table\" FROM pragma_foreign_key_list('clone_edges')").unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert!(
+        !edge_fk_parents.iter().any(|p| p == "symbols"),
+        "clone_edges must NOT FK symbols (content-anchored, #248); FKs = {edge_fk_parents:?}"
+    );
+    let cols = conn_table_columns(&conn, "clone_edges");
+    for endpoint_col in
+        ["a_path", "a_start_byte", "a_file_sha", "b_path", "b_start_byte", "b_file_sha"]
+    {
+        assert!(
+            cols.contains(&endpoint_col.to_string()),
+            "clone_edges has content-key {endpoint_col}"
+        );
+    }
+
+    // The tables are usable: a generation + an edge round-trips.
+    conn.execute_batch(
+        "INSERT INTO clone_graph_generations
+             (generation, status, theta_floor, normalizer_kind, normalizer_version, \
+         source_revision,
+              started_at_ms)
+         VALUES (1, 'Building', 0.7, 'baseline', 3, 'rev', 0);
+         INSERT INTO clone_edges
+             (build_generation, a_path, a_start_byte, a_file_sha, b_path, b_start_byte, b_file_sha,
+              overlap, a_token_len, b_token_len, similarity, edge_source)
+         VALUES (1, 'a.rs', 10, 'sha_a', 'b.rs', 20, 'sha_b', 8, 10, 9, 0.9, 'sub_block');",
+    )
+    .expect("clone-graph tables are usable");
+    let edges: i64 =
+        conn.query_row("SELECT COUNT(*) FROM clone_edges", [], |r| r.get(0)).expect("count edges");
+    assert_eq!(edges, 1, "round-tripped one edge");
+
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().current_version,
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST_SCHEMA_VERSION after V034"
+    );
+}
+
 /// Regression test for the P1 schema bug (#215 Plan 4a): an index recorded at V029 WITHOUT
 /// `clone_refinements.lcs_sampled` (because V029 was applied before the column landed) must have
 /// the column added by the V030 forward migration. Simulates the bug by building a full schema,
@@ -12400,8 +12481,8 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     );
     assert_eq!(
         crate::index::schema::LATEST_SCHEMA_VERSION,
-        33,
-        "LATEST_SCHEMA_VERSION is 33 after V033"
+        34,
+        "LATEST_SCHEMA_VERSION is 34 after V034"
     );
     // Idempotency: running migrate_forward again must not error.
     crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
