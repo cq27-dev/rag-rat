@@ -371,7 +371,7 @@ impl IndexDatabase {
         let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
         let theta = min_similarity.unwrap_or(THETA);
         let min_copies = min_copies.unwrap_or(2);
-        let pairs = candidate_pairs_from_bags(&bags, theta);
+        let pairs = pairs_for_query(conn, &bags, theta)?;
         let components = components_from_pairs(&pairs);
         let edges_by_component = bucket_edges_by_component(&pairs, &components);
 
@@ -491,7 +491,7 @@ impl IndexDatabase {
         // actually widens the candidate set instead of being clamped by the const-θ sub-block /
         // verify, and a θ above [`THETA`] narrows it.
         let theta = opts.min_similarity.unwrap_or(THETA);
-        let pairs = candidate_pairs_from_bags(&bags, theta);
+        let pairs = pairs_for_query(conn, &bags, theta)?;
         let components = components_from_pairs(&pairs);
         // Bucket the θ-verified candidate pairs per component (#256): the coherence split seeds its
         // clique cover from these edges instead of an O(n²) all-pairs scan, so a giant component
@@ -998,7 +998,7 @@ impl IndexDatabase {
         }
 
         let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
-        let pairs = candidate_pairs_from_bags(&bags, THETA);
+        let pairs = pairs_for_query(conn, &bags, THETA)?;
         let components = components_from_pairs(&pairs);
 
         // Find the component that contains this symbol_id (with its index so we can pull its edge
@@ -1578,6 +1578,24 @@ fn candidate_pairs_from_bags(bags: &[SymbolBag], theta: f64) -> Vec<(i64, i64)> 
     pairs.into_iter().collect()
 }
 
+/// Candidate pairs for a query: the persisted clone-graph FAST PATH (#286) when one is eligible
+/// (present, fresh-enough, θ≥0.7, base scope), else the live [`candidate_pairs_from_bags`]
+/// recompute. The fast path is a pure optimization — it returns the SAME pair set the live path
+/// would (the parity test pins this), so every downstream stage (`components_from_pairs` →
+/// `coherence_split` → `build_class` → refine) is identical regardless of which source produced the
+/// pairs.
+fn pairs_for_query(
+    conn: &Connection,
+    bags: &[SymbolBag],
+    theta: f64,
+) -> anyhow::Result<Vec<(i64, i64)>> {
+    let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
+    if let Some(pairs) = precompute::precomputed_pairs_if_eligible(conn, &by_id, theta)? {
+        return Ok(pairs);
+    }
+    Ok(candidate_pairs_from_bags(bags, theta))
+}
+
 /// Build a [`CandidateCloneClass`] from a component (a slice of symbol ids). Returns `None` if
 /// any id is missing from `by_id` (shouldn't happen for a well-formed component derived from the
 /// same bag set), or if member hydration yields nothing (TOCTOU: fingerprint rows vanished
@@ -1916,30 +1934,11 @@ pub(crate) fn build_class(
 /// Combines the `struct_hash` exact fast path with the sub-block + exact-verify candidate read
 /// (design rev 4 §3b). Returns deduplicated `(a, b)` pairs with `a < b` for the union-find.
 fn candidate_pairs(conn: &Connection) -> anyhow::Result<Vec<(i64, i64)>> {
+    // `candidate_clone_components` keeps the const THETA; the persisted-graph fast path serves it
+    // when eligible, else the live SourcererCC recompute (struct-hash + sub-block@THETA + exact
+    // verify) runs in `candidate_pairs_from_bags`.
     let bags = load_scoped_baseline_bags(conn)?;
-
-    let mut pairs: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
-
-    // 1. Exact fast path: every same-struct_hash set contributes all its pairwise pairs.
-    add_struct_hash_pairs(&bags, &mut pairs);
-
-    // 2. Sub-block candidate pairs via the inverted index over sub-block tokens only.
-    //    `candidate_clone_components` keeps the const THETA (behavior unchanged) — only
-    //    `find_clones` threads the caller's `min_similarity` through candidate generation.
-    let candidate = sub_block_candidate_pairs(&bags, THETA);
-
-    // 3. Size prune + EXACT max-denominator verify over the FULL bags — in parallel
-    //    (`verified_clone`
-    // is pure, `by_id` read-only). The sorted `pairs` BTreeSet keeps output deterministic
-    // regardless of completion order.
-    let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
-    let verified: Vec<(i64, i64)> = candidate
-        .into_par_iter()
-        .filter(|&(a, b)| verified_clone(by_id[&a], by_id[&b], THETA))
-        .collect();
-    pairs.extend(verified);
-
-    Ok(pairs.into_iter().collect())
+    pairs_for_query(conn, &bags, THETA)
 }
 
 /// Load every scoped baseline symbol's fingerprint + full token bag with LEFT-JOINed df. Both the

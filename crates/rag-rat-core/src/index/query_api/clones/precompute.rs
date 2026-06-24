@@ -293,6 +293,76 @@ impl IndexDatabase {
     }
 }
 
+/// The `find_clones` / `clones_for_symbol` READ fast path (Phase C): the verified candidate pairs
+/// for the active scope, read from the persisted graph instead of recomputed — when one is
+/// eligible. Returns `None` (→ caller falls back to the live `candidate_pairs_from_bags`) when:
+/// - `theta < CLONE_PRECOMPUTE_THETA` (the persisted θ=0.7 set is a SUPERSET of any θ≥0.7 set, but
+///   not of a wider θ<0.7 set), or
+/// - no `Complete` generation is published, or
+/// - the live generation was built under a different `NORM_VERSION`.
+///
+/// Otherwise it resolves every stored edge's content-anchored endpoints back to LIVE `symbol_id`s
+/// by joining `files`/`symbols` on `(path, start_byte)` AND `files.sha256 = *_file_sha` — so a
+/// deleted or edited endpoint does not resolve and its (now-stale) edge drops (the #248 read
+/// discipline). It then SCOPE-filters to pairs whose both endpoints are in the active `by_id` bag
+/// set, and θ-FILTERS with the exact `verified_clone` gate (`overlap >= ceil(theta * max_len)`) so
+/// θ>0.7 reproduces the live result precisely (struct-hash edges carry `similarity = 1.0` /
+/// `overlap = token_len`, so they survive every θ). A present-but-STALE generation
+/// (content_revision drifted) is still served — the "mildly stale OK" contract; per-edge staleness
+/// is dropped by the `file_sha` join.
+pub(super) fn precomputed_pairs_if_eligible(
+    conn: &Connection,
+    by_id: &BTreeMap<i64, &SymbolBag>,
+    theta: f64,
+) -> anyhow::Result<Option<Vec<(i64, i64)>>> {
+    if theta < CLONE_PRECOMPUTE_THETA {
+        return Ok(None);
+    }
+    let Some(live) = live_generation_row(conn)? else {
+        return Ok(None);
+    };
+    if live.normalizer_version != NORM_VERSION {
+        return Ok(None);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT sa.id, sb.id, e.overlap, e.a_token_len, e.b_token_len
+           FROM clone_edges e
+           JOIN files fa   ON fa.path = e.a_path AND fa.sha256 = e.a_file_sha
+           JOIN symbols sa ON sa.file_id = fa.id AND sa.start_byte = e.a_start_byte
+           JOIN files fb   ON fb.path = e.b_path AND fb.sha256 = e.b_file_sha
+           JOIN symbols sb ON sb.file_id = fb.id AND sb.start_byte = e.b_start_byte
+          WHERE e.build_generation = ?1",
+    )?;
+    let rows = stmt.query_map(params![live.generation], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })?;
+
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    for row in rows {
+        let (a, b, overlap, a_token_len, b_token_len) = row?;
+        // Scope guard: keep only pairs whose BOTH resolved endpoints are in the active bag set (so
+        // a multi-worktree `files` row resolving to an out-of-scope symbol can't leak in).
+        if !by_id.contains_key(&a) || !by_id.contains_key(&b) {
+            continue;
+        }
+        let max_len = a_token_len.max(b_token_len);
+        let threshold = (theta * max_len as f64).ceil() as i64;
+        if overlap >= threshold {
+            pairs.push((a.min(b), a.max(b)));
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    Ok(Some(pairs))
+}
+
 /// The `(struct_hash, language) -> [symbol_id]` buckets — the exact key `add_struct_hash_pairs`
 /// uses, so the emitted struct-hash pairs match the live path.
 fn build_struct_hash_buckets(bags: &[SymbolBag]) -> BTreeMap<(&str, &str), Vec<i64>> {
@@ -656,5 +726,47 @@ mod tests {
             "the resumed (checkpointed) graph equals the single-pass graph — the smaller-endpoint \
              partition is correct across checkpoints"
         );
+    }
+
+    /// A stable, symbol-id-independent projection of a `find_clones` result: each class as its
+    /// sorted member refs, classes sorted. Equal projections ⇒ the same clone classes.
+    fn class_projection(result: &crate::index::FindClonesResult) -> Vec<Vec<String>> {
+        let mut classes: Vec<Vec<String>> = result
+            .classes
+            .iter()
+            .map(|c| {
+                let mut refs: Vec<String> = c.members.iter().map(|m| m.r#ref.clone()).collect();
+                refs.sort();
+                refs
+            })
+            .collect();
+        classes.sort();
+        classes
+    }
+
+    /// THE CORNERSTONE (#286 Phase C): `find_clones` served from the persisted graph is IDENTICAL
+    /// to `find_clones` recomputed live, at θ = 0.7 (the precompute floor) and above (where the
+    /// stored edges are θ-filtered). Proven on the same index: capture live first (no graph →
+    /// live path), precompute, capture again (graph present → fast path), assert equal. This is
+    /// what makes the fast path a pure optimization rather than a behavior change.
+    #[test]
+    fn find_clones_precomputed_matches_live() {
+        use crate::index::FindClonesOptions;
+
+        for theta in [0.7_f64, 0.8, 0.9] {
+            let db = build_clone_fixture(&format!("parity-{}", (theta * 100.0) as i64));
+            let opts =
+                || FindClonesOptions { min_similarity: Some(theta), min_copies: None, limit: None };
+
+            // No graph yet → live path.
+            let live = class_projection(&db.find_clones(opts()).unwrap());
+            assert!(!live.is_empty(), "renamed-clone fixture has classes at θ={theta}");
+
+            // Build the graph → subsequent find_clones takes the fast path.
+            assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+            let fast = class_projection(&db.find_clones(opts()).unwrap());
+
+            assert_eq!(fast, live, "precomputed find_clones must equal live at θ={theta}");
+        }
     }
 }
