@@ -14713,6 +14713,107 @@ fn faithfulness_pin_still_drops_drifted_member() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// #259 (Adversary C) — END-TO-END through the real `find_clones` driver: a refine-FAILED class (a
+/// clone class whose on-disk source drifted post-index, so `refine_class_in_place` no-ops and the
+/// class stays un-refined with its member_count-LINEAR Plan-2 ROI) has its `member_count` size
+/// factor DAMPENED in the returned result. The dampen (applied to every still-un-refined class
+/// post-refine, pre-sort in BOTH `find_clones` branches) replaces the linear `member_count` factor
+/// with `1 + ln(1 + member_count)`, so a refine-failed component can no longer masquerade as
+/// high-ROI purely on size. This exercises the dampen through the REAL driver, not just the helper
+/// unit — it proves `find_clones` rewrites a returned un-refined class's `roi` to the dampened
+/// formula.
+///
+/// Fixture: a clone class of THREE rename-clones with a substantial body. We DRIFT one member on
+/// disk (structurally different re-parse → struct_hash mismatch → the all-or-nothing faithfulness
+/// pin makes the refinement a no-op on a COLD cache), so the class comes back un-refined. The
+/// returned `roi` must equal the DAMPENED Plan-2 product (size factor `1 + ln(1 + member_count)`),
+/// which is strictly below the raw LINEAR product (`member_count` factor) the class would carry
+/// without the fix — the masquerade is closed.
+#[test]
+fn refine_failed_class_member_count_dampened_end_to_end() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // A clone class of THREE rename-clones with a substantial body — would refine cleanly if the
+    // source stayed faithful.
+    let body = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(db: Db) -> i32 {{ let {v}1 = db.get(1); let {v}2 = db.get(2); let {v}3 \
+             = db.get(3); validate({v}1); validate({v}2); validate({v}3); {v}1 + {v}2 + {v}3 }}\n"
+        )
+    };
+    fs::write(root.join("src/a.rs"), body("load_a", "u")).unwrap();
+    fs::write(root.join("src/b.rs"), body("load_b", "o")).unwrap();
+    fs::write(root.join("src/c.rs"), body("load_c", "p")).unwrap();
+
+    // Build the index clean (so the 3-member class forms from faithful fingerprints) with a COLD
+    // refine cache, then DRIFT one member BEFORE the first find_clones. A warm cache hit would
+    // serve the cached refinement and never re-read the drifted source (the cache key is over
+    // the PERSISTED struct_hash + the PERSISTED file sha256, both unchanged by an on-disk
+    // edit), so the drift MUST land before the very first refine attempt.
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // DRIFT one member: overwrite c.rs with a structurally DIFFERENT body. The index keeps the old
+    // fingerprint (the class is still BUILT with member_count 3 from the persisted tables), but the
+    // FIRST find_clones below takes the cold refine path → `load_refine_members` re-parses the
+    // drifted source → struct_hash mismatch → the all-or-nothing faithfulness pin returns Ok(None)
+    // → the class stays UN-refined.
+    fs::write(
+        root.join("src/c.rs"),
+        "pub fn load_c(db: Db) -> i32 { let mut n = 0; while n < 9 { n += 1; } n }\n",
+    )
+    .unwrap();
+
+    let result = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        result.classes.len(),
+        1,
+        "the three rename-clones form one class: {:?}",
+        result.classes
+    );
+    let class = &result.classes[0];
+    assert_eq!(
+        class.member_count, 3,
+        "the class is built with all 3 members from persisted tables"
+    );
+
+    // The class FAILED refinement (one member drifted → all-or-nothing) and is un-refined.
+    assert!(
+        !class.refined,
+        "the drifted class fails the all-or-nothing refine and stays un-refined"
+    );
+
+    // THE #259 PROPERTY: the returned `roi` is the DAMPENED Plan-2 product — the `member_count`
+    // factor replaced by `1 + ln(1 + member_count)`. Reconstruct both the raw (linear) and the
+    // dampened product from the surfaced factors and confirm find_clones returned the dampened one.
+    let mc = class.member_count as f64;
+    let raw_roi = class.cross_module_spread as f64
+        * mc
+        * class.body_token_len_medoid as f64
+        * class.roi_factors.load_bearing_factor
+        * class.cohesion_min_pairwise;
+    let dampened_roi = raw_roi / mc * (1.0 + mc.ln_1p());
+    assert!(
+        (class.roi - dampened_roi).abs() < 1e-6,
+        "#259: find_clones must return the DAMPENED roi {} for the un-refined class, got {}",
+        dampened_roi,
+        class.roi
+    );
+    // The dampen STRICTLY reduces the rank signal versus the raw linear Plan-2 ROI (3 members →
+    // 1 + ln(4) ≈ 2.39 < 3), so a large refine-failed component can no longer dominate on size.
+    assert!(
+        class.roi < raw_roi,
+        "#259: the dampened roi {} must be strictly below the raw linear Plan-2 roi {}",
+        class.roi,
+        raw_roi
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Fix 3 (#215): `clones_for_symbol` carries eligibility flags. A below-`MIN_TOKENS` function
 /// RESOLVES (`symbol_resolved=true`) but is not fingerprinted (`symbol_fingerprinted=false`,
 /// `class=None`); an eligible-but-unique function is fingerprinted with no class; an eligible

@@ -53,6 +53,18 @@
 /// keeping symbol-level recall identical: a skipped edge has BOTH endpoints already in a class, so
 /// it is a redundant clone PAIR, never a lost member. For the normal case (all existing tests) far
 /// fewer than 256 grown cliques are ever produced and the tail is empty.
+///
+/// #259 (Adversary A): the TOTAL emitted-class count is now bounded by `MAX_SPLIT_GROUPS + 1`,
+/// regardless of input shape. The #282 covering-subset already eliminated the bare-2-member fan-out
+/// the issue feared (a dense-minus-perfect-matching component at n=300 emitted ~44k bare pairs
+/// PRE-#282; POST-#282 it emits 0 bare pairs because the first ~2 grown ~150-member cliques already
+/// cover every member). What remains is the GROWN cliques: once tripped, the cover stops seeding
+/// and the subset-removal pass is skipped, so a pathological component can emit up to
+/// `MAX_SPLIT_GROUPS` large, heavily-overlapping near-duplicate cliques (≤ 257 classes total — see
+/// the pin `coherence_split_class_count_bounded_by_split_groups`). That is BOUNDED and
+/// member-loss-free, so it is left as-is: dropping/coalescing those near-duplicates would risk
+/// recall (they are distinct maximal cliques, not redundant pairs), and 257 `build_class`/refine
+/// calls is well within budget.
 const MAX_SPLIT_GROUPS: usize = 256;
 
 /// Split an over-merged union-find component into internally-coherent clone classes: every pair
@@ -658,6 +670,55 @@ mod tests {
             result.len(),
             edges.len(),
         );
+    }
+
+    /// #259 (Adversary A): the TOTAL emitted-class count is bounded by `MAX_SPLIT_GROUPS + 1` on the
+    /// pathological dense-minus-perfect-matching shape, at every size — NOT O(n) or O(edges). This
+    /// is the durable bound on the budget-tripped fan-out: pre-#282 this shape emitted ~44k bare
+    /// 2-member classes at n=300; post-#282 the covering subset emits ZERO bare pairs (the early
+    /// grown cliques cover every member), and the GROWN cliques themselves are capped by the
+    /// budget. The pin guards against a regression that re-introduces an unbounded (O(n) /
+    /// O(edges)) tail.
+    #[test]
+    fn coherence_split_class_count_bounded_by_split_groups() {
+        let theta = 0.70;
+        // The matched pair (2k, 2k+1) is below θ; every other pair is above — the worst case for
+        // maximal-clique enumeration (O(n²) maximal cliques), which trips MAX_SPLIT_GROUPS.
+        let sim = |a: i64, b: i64| -> f64 {
+            let matched = (a / 2 == b / 2) && (a % 2 != b % 2);
+            if matched { 0.5 } else { 0.9 }
+        };
+        for n in [200i64, 300, 400] {
+            let members: Vec<i64> = (0..n).collect();
+            let mut edges: Vec<(i64, i64)> = Vec::new();
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    if sim(a, b) >= theta {
+                        edges.push((a, b));
+                    }
+                }
+            }
+            let result = coherence_split(&members, &edges, sim, theta);
+            // The class count is bounded by the budget, independent of n / edge count — it does NOT
+            // grow with the component size the way the pre-#282 bare-pair tail did.
+            assert!(
+                result.len() <= MAX_SPLIT_GROUPS + 1,
+                "#259: budget-tripped fan-out must be ≤ MAX_SPLIT_GROUPS+1 ({}), got {} classes \
+                 at n={n} ({} edges)",
+                MAX_SPLIT_GROUPS + 1,
+                result.len(),
+                edges.len(),
+            );
+            // And it does NOT degenerate into a bare-2-member explosion: the budget-tripped tail is
+            // empty on this dense shape (every member is covered by an early grown clique), so the
+            // emitted classes are the large grown cliques, not O(edges) pairs (#282 + #259).
+            let bare_pairs = result.iter().filter(|g| g.len() == 2).count();
+            assert!(
+                bare_pairs <= n as usize,
+                "#259: the budget-tripped tail must not fan out into O(edges) bare pairs — got \
+                 {bare_pairs} two-member classes at n={n}",
+            );
+        }
     }
 
     #[test]

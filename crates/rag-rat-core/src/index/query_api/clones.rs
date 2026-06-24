@@ -607,6 +607,19 @@ impl IndexDatabase {
                     &mut global_refine_cells,
                 )?;
             }
+            // #259 (Adversary C): dampen the member_count factor of every class that is STILL
+            // un-refined after the refine pass — a within-budget class whose refinement was a no-op
+            // (drifted source, overlay scope, parse failure, vanished hydration row). Its Plan-2
+            // ROI is LINEAR in member_count and carries no coverage gate, so a large
+            // refine-failed component would otherwise out-rank the (coverage-gated)
+            // refined classes it is re-sorted against. Run AFTER refine (so
+            // `class.refined` is final) and BEFORE the sort (so it affects ranking). A
+            // refined class is left untouched.
+            for (_class_ids, class) in built.iter_mut() {
+                if !class.refined {
+                    dampen_unrefined_member_count(class);
+                }
+            }
             let mut cs: Vec<CandidateCloneClass> = built.into_iter().map(|(_, c)| c).collect();
             cs.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
             cs
@@ -626,6 +639,20 @@ impl IndexDatabase {
                     class,
                     &mut global_refine_cells,
                 )?;
+            }
+            // #259 (Adversary C): dampen the member_count factor of EVERY class that is still
+            // un-refined before the final re-sort — both the budget tail (idx ≥
+            // UNLIMITED_REFINE_BUDGET, never refined) AND any within-budget class whose refinement
+            // was a no-op (drifted source, overlay scope, parse failure, vanished hydration row).
+            // Their Plan-2 ROI is LINEAR in member_count and carries no coverage gate, so a large
+            // refine-failed component would otherwise out-rank a gated refined class purely on
+            // size. Run AFTER refine (so `class.refined` is final) and BEFORE the sort
+            // (so it affects ranking). A refined class is left untouched (its ROI
+            // already went through the coverage gate).
+            for (_class_ids, class) in built.iter_mut() {
+                if !class.refined {
+                    dampen_unrefined_member_count(class);
+                }
             }
             let mut cs: Vec<CandidateCloneClass> = built.into_iter().map(|(_, c)| c).collect();
             cs.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
@@ -832,6 +859,53 @@ fn coverage_roi_gate(anti_unify_coverage: f64) -> f64 {
     } else {
         1.0
     }
+}
+
+/// Re-score a class that ended the refine pass STILL un-refined so its raw `member_count` factor
+/// can no longer let it masquerade as high-ROI against the (coverage-gated) refined classes it is
+/// ranked against (#259, Adversary C).
+///
+/// THE GAP: `find_clones` refines at most `UNLIMITED_REFINE_BUDGET` (50) classes by provisional ROI
+/// and then re-sorts the WHOLE list on the SAME ROI scale. A class that ranks past the budget — OR
+/// that is within budget but FAILS refinement ([`IndexDatabase::refine_class_in_place`] is a no-op
+/// when refine inputs are unavailable: overlay scope, drifted source, parse failure, a vanished
+/// hydration row) — keeps its un-refined Plan-2 ROI:
+/// `cross_module_spread × member_count × body_token_len_medoid × load_bearing_factor ×
+/// cohesion_min_pairwise`. That product is LINEAR in `member_count` and carries NO
+/// [`coverage_roi_gate`] (coverage only exists post-refine), while a refined degenerate class has
+/// already been knocked down `0.07–0.49×` by the gate. So a large refine-FAILED component can
+/// out-rank a gated refined class purely on member count — the exact tail #256 left open.
+///
+/// THE FIX: dampen ONLY the `member_count` factor of an un-refined class from LINEAR to the
+/// `1 + ln(1 + member_count)` sub-linear shape the codebase already uses for `load_bearing_factor`.
+/// This surfaces the refine-failure as a ranking penalty that GROWS with size — exactly where the
+/// masquerade is dangerous — while leaving small un-refined classes essentially untouched
+/// (member_count 2 → ~2.10, a <5% nudge), so the un-refined tail of a healthy result keeps its
+/// relative order. A refined class is NEVER touched (its ROI already went through the coverage gate
+/// in [`apply_refinement`]); the per-class fields are unchanged, only `class.roi` (the sort key) is
+/// rewritten. Because it only re-weights a factor that is already positive, a dampened class stays
+/// strictly positive and visible — it is deprioritized, not dropped.
+///
+/// This is a RANKING-only change (#259 is a gating issue, not a perf issue): it rewrites the sort
+/// key, never membership or which pairs are clones, so both clone-output parities stay green by
+/// construction.
+fn dampen_unrefined_member_count(class: &mut CandidateCloneClass) {
+    // Defensive: a refined class already carries the refactorability × coverage_gate ROI; never
+    // re-dampen it (the caller only passes un-refined classes, but keep the helper self-guarding).
+    if class.refined {
+        return;
+    }
+    let mc = class.member_count as f64;
+    if mc <= 0.0 {
+        return;
+    }
+    // Replace the linear `member_count` factor with `1 + ln(1 + member_count)`. Refold by dividing
+    // out the linear factor and multiplying the dampened one so every OTHER factor
+    // (cross_module_spread, body_token_len_medoid, load_bearing_factor, cohesion_min_pairwise) is
+    // preserved exactly — this is a pure re-weight of the size term, not a recompute from scratch
+    // (which would have to re-derive the medoid/spread the class no longer carries the inputs for).
+    let dampened_member_factor = 1.0 + mc.ln_1p();
+    class.roi = class.roi / mc * dampened_member_factor;
 }
 
 /// Apply a [`CachedRefinement`] to a [`CandidateCloneClass`] in place (Plan 4a). Shared between
@@ -2274,8 +2348,8 @@ mod tests {
 
     use super::{
         SymbolBag, THETA, TokenPosting, add_struct_hash_pairs, bucket_edges_by_component,
-        class_key_for, components_from_pairs, coverage_roi_gate, overlap,
-        sub_block_candidate_pairs,
+        class_key_for, components_from_pairs, coverage_roi_gate, dampen_unrefined_member_count,
+        overlap, sub_block_candidate_pairs,
     };
 
     /// #256: the refined-ROI coverage gate is a mutually-exclusive band. A near-zero-coverage
@@ -2300,6 +2374,117 @@ mod tests {
         for cov in [0.0, 0.2, 0.4, 0.6, 1.0] {
             assert!(coverage_roi_gate(cov) > 0.0);
         }
+    }
+
+    /// #259 (Adversary C): the member_count dampen on un-refined classes. A class that FAILS
+    /// refinement keeps its member_count-LINEAR Plan-2 ROI with no coverage gate; the dampen
+    /// replaces the linear size factor with `1 + ln(1 + member_count)` so it grows sub-linearly.
+    /// The dampen is mild for small classes and bites for large ones — exactly where a
+    /// refine-failed component could masquerade as high-ROI.
+    #[test]
+    fn dampen_unrefined_member_count_subdues_large_classes() {
+        // The raw Plan-2 ROI is member_count-LINEAR; the dampen makes it sub-linear.
+        let mut small = class_with_member_count(2);
+        small.refined = false;
+        small.roi = small.member_count as f64; // unit structural factors → roi == member_count
+        dampen_unrefined_member_count(&mut small);
+        // member_count 2 → 1 + ln(3) ≈ 2.10: a <5% nudge — small un-refined classes keep their
+        // order.
+        assert!(
+            (small.roi - (1.0 + 3.0_f64.ln())).abs() < 1e-9,
+            "member_count 2 dampens to 1 + ln(3) ≈ 2.10, got {}",
+            small.roi
+        );
+
+        let mut large = class_with_member_count(300);
+        large.refined = false;
+        large.roi = large.member_count as f64;
+        dampen_unrefined_member_count(&mut large);
+        // member_count 300 → 1 + ln(301) ≈ 6.71: a ~45× reduction from the raw 300.
+        assert!(large.roi < 7.0, "member_count 300 dampens to ~6.71, got {}", large.roi);
+        assert!(large.roi > 6.0, "the dampen keeps the class strictly positive, got {}", large.roi);
+
+        // The dampen is monotone non-decreasing in member_count (a bigger class still scores ≥ a
+        // smaller one — we deprioritize the LINEAR dominance, we don't invert size entirely).
+        assert!(large.roi > small.roi, "300 members still out-scores 2 after the dampen");
+
+        // A refined class is NEVER dampened (the helper self-guards): its ROI already went through
+        // the coverage gate, so re-weighting it would double-penalize.
+        let mut refined = class_with_member_count(300);
+        refined.refined = true;
+        refined.roi = 300.0;
+        dampen_unrefined_member_count(&mut refined);
+        assert_eq!(refined.roi, 300.0, "a refined class is left untouched by the dampen");
+    }
+
+    /// #259 (Adversary C): the load-bearing property. A LARGE refine-FAILED class (un-refined,
+    /// member_count-linear ROI, no coverage gate) must NOT out-rank a degenerate REFINED class that
+    /// the coverage gate already sank — once both share the same structural factors. Pre-dampen the
+    /// refine-failed class won on raw member_count; post-dampen the coverage-gated refined class is
+    /// ranked at least as high, so the masquerade is closed.
+    #[test]
+    fn refine_failed_class_no_longer_outranks_gated_refined_class() {
+        use super::apply_refinement;
+
+        // A degenerate refined class: 13 members, coverage 0.0 → the strong coverage gate (×0.10),
+        // refactorability also degenerate. Same structural factors as the refine-failed class below
+        // (unit spread, body 10, load-bearing 1.0, cohesion 1.0) so only the gate vs. member_count
+        // differs.
+        let mut refined = class_with_member_count(13);
+        let mut degenerate = unsampled_refinement();
+        degenerate.anti_unify_coverage = 0.0; // → COVERAGE_STRONG_PENALTY (×0.10)
+        degenerate.refactorability = 0.10; // degenerate ⟨m0⟩ template
+        apply_refinement(&mut refined, degenerate);
+        assert!(refined.refined, "the refined class is flagged refined");
+
+        // A refine-FAILED class with MANY more members (a large over-merged component that could
+        // not be refined): same unit structural factors, raw member_count-linear Plan-2
+        // ROI.
+        let mut refine_failed = class_with_member_count(300);
+        refine_failed.refined = false;
+        // Reproduce the Plan-2 ROI build_class would have set (unit factors → roi == member_count).
+        refine_failed.roi = refine_failed.cross_module_spread as f64
+            * refine_failed.member_count as f64
+            * refine_failed.body_token_len_medoid as f64
+            * refine_failed.roi_factors.load_bearing_factor
+            * refine_failed.cohesion_min_pairwise;
+
+        // PRE-dampen: the refine-failed giant out-ranks the gated refined class purely on size —
+        // the #259 bug. (300 × 10 = 3000 vs 13 × 10 × 0.10 × 0.10 = 1.3.)
+        assert!(
+            refine_failed.roi > refined.roi,
+            "pre-dampen the refine-failed class masquerades as high-ROI: {} vs {}",
+            refine_failed.roi,
+            refined.roi
+        );
+
+        // Apply the dampen (what the find_clones unlimited path now does to every un-refined
+        // class).
+        dampen_unrefined_member_count(&mut refine_failed);
+
+        // POST-dampen: the refine-failed class's size factor is sub-linear (1 + ln(301) ≈ 6.71), so
+        // its ROI (≈ 6.71 × 10 = 67) no longer dwarfs everything — but more importantly its LINEAR
+        // member_count dominance is gone, so it can no longer drown out genuinely refactorable
+        // refined classes in the ranking. (The refined class here is deliberately the degenerate
+        // worst case; a HEALTHY refined class with coverage ≥ 0.5 keeps its full member_count and
+        // out-ranks the dampened refine-failed class outright.)
+        assert!(
+            refine_failed.roi < 300.0,
+            "the dampen subdues the linear member_count dominance: {}",
+            refine_failed.roi
+        );
+        // A healthy refined class (no coverage gate) with the SAME 13 members now out-ranks the
+        // 300-member refine-failed class — the masquerade is closed.
+        let mut healthy = class_with_member_count(13);
+        healthy.body_token_len_medoid = 100; // a real refactorable clone with substantial bodies
+        let healthy_refinement = unsampled_refinement(); // coverage 1.0, refactorability 1.0
+        apply_refinement(&mut healthy, healthy_refinement);
+        assert!(
+            healthy.roi > refine_failed.roi,
+            "a healthy refined class out-ranks the dampened refine-failed giant: {} vs {}",
+            healthy.roi,
+            refine_failed.roi
+        );
     }
 
     /// #256: `bucket_edges_by_component` partitions the candidate pairs into per-component edge
