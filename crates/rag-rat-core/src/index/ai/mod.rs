@@ -32,6 +32,11 @@ pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
 pub const BGE_SMALL_MODEL_ID: &str = "fastembed-bge-small-en-v1.5";
 pub const BGE_SMALL_DISPLAY_MODEL: &str = "BAAI/bge-small-en-v1.5";
 pub const BGE_SMALL_EMBEDDING_DIM: usize = 384;
+/// BGE retrieval expects a query-side instruction prefix (queries only; passages stay raw), per the
+/// model card. Applied at query-embed time (`embed_query_with`), so stored passage embeddings are
+/// unchanged — no re-embed needed when this lands, and symmetric models keep the empty default.
+pub const BGE_SMALL_QUERY_PREFIX: &str =
+    "Represent this sentence for searching relevant passages: ";
 
 /// Model2Vec static-embedding backend: a token→vector lookup + mean-pool (no transformer forward
 /// pass), ~100-500× faster than FastEmbed on CPU at some retrieval-quality cost. The right choice
@@ -62,6 +67,12 @@ pub trait Embedder {
     fn model_id(&self) -> &str;
     fn dim(&self) -> usize;
     fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
+    /// Instruction prepended to QUERIES (not passages) before embedding. Empty for symmetric models
+    /// (hash, all-MiniLM, model2vec); BGE returns its retrieval instruction. See
+    /// `embed_query_with`.
+    fn query_prefix(&self) -> &str {
+        ""
+    }
 }
 
 pub struct HashEmbedder;
@@ -113,27 +124,31 @@ pub struct FastEmbedEmbedder {
     model: std::sync::Mutex<fastembed::TextEmbedding>,
     model_id: &'static str,
     dim: usize,
+    query_prefix: &'static str,
 }
 
 #[cfg(feature = "fastembed")]
 impl FastEmbedEmbedder {
-    /// all-MiniLM-L6-v2 (384-dim) — the default general-purpose backend.
+    /// all-MiniLM-L6-v2 (384-dim) — the default general-purpose backend (symmetric, no prefix).
     pub fn new(intra_threads: Option<usize>) -> anyhow::Result<Self> {
         Self::with_model(
             fastembed::EmbeddingModel::AllMiniLML6V2,
             FASTEMBED_MODEL_ID,
             FASTEMBED_EMBEDDING_DIM,
+            "",
             intra_threads,
         )
     }
 
     /// BGE-small-en-v1.5 (384-dim, #112) — a stronger general-retrieval embedder, same dimension as
-    /// all-MiniLM so swapping it is a re-embed rather than a schema/dim change.
+    /// all-MiniLM so swapping it is a re-embed rather than a schema/dim change. Asymmetric: queries
+    /// get the retrieval instruction prefix (passages stay raw).
     pub fn new_bge_small(intra_threads: Option<usize>) -> anyhow::Result<Self> {
         Self::with_model(
             fastembed::EmbeddingModel::BGESmallENV15,
             BGE_SMALL_MODEL_ID,
             BGE_SMALL_EMBEDDING_DIM,
+            BGE_SMALL_QUERY_PREFIX,
             intra_threads,
         )
     }
@@ -142,6 +157,7 @@ impl FastEmbedEmbedder {
         model: fastembed::EmbeddingModel,
         model_id: &'static str,
         dim: usize,
+        query_prefix: &'static str,
         intra_threads: Option<usize>,
     ) -> anyhow::Result<Self> {
         use fastembed::{InitOptions, TextEmbedding};
@@ -155,7 +171,12 @@ impl FastEmbedEmbedder {
         if let Some(threads) = intra_threads.filter(|threads| *threads > 0) {
             options = options.with_intra_threads(threads);
         }
-        Ok(Self { model: std::sync::Mutex::new(TextEmbedding::try_new(options)?), model_id, dim })
+        Ok(Self {
+            model: std::sync::Mutex::new(TextEmbedding::try_new(options)?),
+            model_id,
+            dim,
+            query_prefix,
+        })
     }
 }
 
@@ -167,6 +188,10 @@ impl Embedder for FastEmbedEmbedder {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn query_prefix(&self) -> &str {
+        self.query_prefix
     }
 
     fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
