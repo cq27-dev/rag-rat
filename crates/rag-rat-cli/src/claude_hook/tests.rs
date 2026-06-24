@@ -592,3 +592,25 @@ fn format_clone_warning_renders_matches_and_is_silent_when_empty() {
         "{out}"
     );
 }
+
+#[test]
+fn format_clone_warning_caps_the_ref_list() {
+    // #292: a single near match can resemble many indexed fns — the hook shows only the first few
+    // plus a "+N more" count instead of a wall of refs.
+    let clone_of: Vec<String> = (0..12).map(|i| format!("src/m{i}.rs::f{i}")).collect();
+    let m = rag_rat_core::index::TextCloneMatch {
+        in_file: "src/a.rs".to_string(),
+        name: "wide".to_string(),
+        start_line: 1,
+        kind: "near",
+        similarity: 0.9,
+        clone_of,
+    };
+    let out = super::format_clone_warning(&[m]).unwrap();
+    assert!(out.contains("src/m0.rs::f0"), "shows the first ref: {out}");
+    assert!(
+        out.contains(&format!("(+{} more)", 12 - super::MAX_CLONE_REFS)),
+        "caps with a count: {out}"
+    );
+    assert!(!out.contains("src/m11.rs::f11"), "doesn't list every ref: {out}");
+}

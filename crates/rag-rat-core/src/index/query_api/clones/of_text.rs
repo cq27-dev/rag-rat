@@ -16,7 +16,7 @@
 //! Self-matches are filtered: a function is never reported as a clone of code in its OWN file
 //! (`in_file`), so editing a function in place doesn't flag it against its own indexed copy.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
@@ -88,12 +88,13 @@ impl IndexDatabase {
         text: &str,
         language: Language,
         path: &Path,
+        min_similarity: f64,
     ) -> anyhow::Result<Vec<TextCloneMatch>> {
         let conn = self.storage.connection();
         let Some(index) = CheckIndex::load(conn)? else {
             return Ok(Vec::new());
         };
-        index.check(conn, text, language, path)
+        index.check(conn, text, language, path, min_similarity)
     }
 
     /// Cheap count of fingerprinted baseline functions — a write-time hook reads it to BOUND its
@@ -148,6 +149,7 @@ impl IndexDatabase {
     pub fn clones_of_texts(
         &self,
         inputs: &[CloneCheckInput],
+        min_similarity: f64,
     ) -> anyhow::Result<Vec<TextCloneMatch>> {
         let conn = self.storage.connection();
         let Some(index) = CheckIndex::load(conn)? else {
@@ -155,7 +157,13 @@ impl IndexDatabase {
         };
         let mut all = Vec::new();
         for input in inputs {
-            all.extend(index.check(conn, &input.text, input.language, &input.path)?);
+            all.extend(index.check(
+                conn,
+                &input.text,
+                input.language,
+                &input.path,
+                min_similarity,
+            )?);
         }
         Ok(all)
     }
@@ -176,7 +184,14 @@ struct CheckIndex {
 
 impl CheckIndex {
     fn load(conn: &Connection) -> anyhow::Result<Option<Self>> {
-        let indexed = load_scoped_baseline_bags(conn)?;
+        let mut indexed = load_scoped_baseline_bags(conn)?;
+        // #292: keep test code out of the corpus. Tests are repetitive by construction (fixture →
+        // call → assert), so they otherwise dominate near-clone results — a function the agent
+        // writes would match dozens of unrelated test fns. `is_test` is computed at index time
+        // (cross-language: test-file path, Rust `#[test]`/`#[cfg(test)]`, Kotlin `@Test`, Python
+        // `test_*`/`TestCase`) — see `parser::detect_is_test`.
+        let test_ids = load_test_symbol_ids(conn)?;
+        indexed.retain(|bag| !test_ids.contains(&bag.symbol_id));
         if indexed.is_empty() {
             return Ok(None);
         }
@@ -209,6 +224,7 @@ impl CheckIndex {
         text: &str,
         language: Language,
         path: &Path,
+        min_similarity: f64,
     ) -> anyhow::Result<Vec<TextCloneMatch>> {
         let syms = symbols::symbols_for_file(path, language, text);
         let Some(parsed) = parser::parse_file(path, language, text) else {
@@ -228,6 +244,11 @@ impl CheckIndex {
 
         for (local, fp) in &new_fps {
             let symbol = &syms[*local];
+            // #292: don't clone-check test code the agent is writing — a new test is expected to
+            // resemble existing tests, and flagging it is pure noise.
+            if symbol.is_test {
+                continue;
+            }
             let new_bag = bag_from_fingerprint(fp, lang, &self.df_by_token);
 
             // EXACT: identical structure (same struct_hash + language) → similarity 1.0.
@@ -257,7 +278,10 @@ impl CheckIndex {
                     continue;
                 }
                 let other = self.bag(id);
-                if other.language != lang || !verified_clone(&new_bag, other, THETA) {
+                // Candidate generation stays at THETA (generous recall); the NEAR match is kept
+                // only at `min_similarity` (the write-time hook raises this to cut boilerplate
+                // near-noise). Exact (struct_hash) matches are unaffected — they're similarity 1.0.
+                if other.language != lang || !verified_clone(&new_bag, other, min_similarity) {
                     continue;
                 }
                 let max_len = new_bag.token_len.max(other.token_len);
@@ -307,6 +331,15 @@ impl CheckIndex {
         });
         Ok(matches)
     }
+}
+
+/// Symbol ids the index marked as test code (`symbols.is_test`), across all git contexts — the
+/// clone-check corpus drops these (#292). A bag's `symbol_id` is a row id, so membership is exact.
+fn load_test_symbol_ids(conn: &Connection) -> anyhow::Result<HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM symbols WHERE is_test = 1")?;
+    let ids =
+        stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<HashSet<i64>>>()?;
+    Ok(ids)
 }
 
 /// `token_hash -> df` over the baseline normalizer — the selectivity source for a NEW bag's
@@ -421,6 +454,7 @@ mod tests {
                 exact_text,
                 crate::language::Language::Rust,
                 std::path::Path::new("new.rs"),
+                super::THETA,
             )
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -445,7 +479,7 @@ mod tests {
                 path: std::path::PathBuf::from("b.rs"),
             },
         ];
-        let hits = db.clones_of_texts(&inputs).unwrap();
+        let hits = db.clones_of_texts(&inputs, super::THETA).unwrap();
         // a.rs's clone is flagged; b.rs's trivial fn is below MIN_TOKENS / not a clone.
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].in_file, "a.rs");
@@ -463,6 +497,7 @@ mod tests {
                 edited,
                 crate::language::Language::Rust,
                 std::path::Path::new("src/lib.rs"),
+                super::THETA,
             )
             .unwrap();
         assert!(hits.is_empty(), "self-file match must be excluded, got {hits:?}");
@@ -476,6 +511,7 @@ mod tests {
                 "not real code !!!",
                 crate::language::Language::Rust,
                 std::path::Path::new("x.rs"),
+                super::THETA,
             )
             .unwrap();
         assert!(none.is_empty());
@@ -538,5 +574,74 @@ mod tests {
         assert!(stale.total > 0 && stale.usable == 0, "{stale:?}");
         assert!(stale.needs_reindex, "{stale:?}");
         assert!(stale.message.unwrap().contains("index --full"), "actionable command");
+    }
+
+    #[test]
+    fn excludes_indexed_tests_from_corpus_and_skips_new_test_code() {
+        // #292: a real function PLUS a structurally identical helper inside a `#[cfg(test)]` module
+        // (so the helper is `is_test` though it shares the real fn's body).
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-of-text-exclude-{}-{}",
+            std::process::id(),
+            crate::index::util::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/scoring.rs"),
+            "pub fn compute_score(items: Vec<i32>) -> i32 { let mut total = 0; for item in items \
+             { total += item * 2; } total }\n#[cfg(test)]\nmod tests { fn scoring_helper(items: \
+             Vec<i32>) -> i32 { let mut total = 0; for item in items { total += item * 2; } total \
+             } }\n",
+        )
+        .unwrap();
+        let config = crate::Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![crate::config::ResolvedTarget {
+                name: "rust".to_string(),
+                language: crate::language::Language::Rust,
+                directories: vec![std::path::PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: crate::config::TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+
+        // New code that is an exact clone of BOTH `compute_score` and the `#[cfg(test)]` helper.
+        let new_code = "pub fn tally(items: Vec<i32>) -> i32 { let mut total = 0; for item in \
+                        items { total += item * 2; } total }\n";
+        let hits = db
+            .clones_of_text(
+                new_code,
+                crate::language::Language::Rust,
+                std::path::Path::new("src/other.rs"),
+                super::THETA,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the one new function is checked: {hits:?}");
+        let refs = &hits[0].clone_of;
+        assert!(refs.iter().any(|r| r.contains("compute_score")), "matches the real fn: {refs:?}");
+        assert!(
+            !refs.iter().any(|r| r.contains("scoring_helper")),
+            "the #[cfg(test)] clone is EXCLUDED from the corpus: {refs:?}"
+        );
+
+        // The SAME code written to a test file is skipped entirely — the agent writing a test is
+        // expected to resemble other tests, so flagging it is noise.
+        let test_hits = db
+            .clones_of_text(
+                new_code,
+                crate::language::Language::Rust,
+                std::path::Path::new("tests/it.rs"),
+                super::THETA,
+            )
+            .unwrap();
+        assert!(test_hits.is_empty(), "new test code is not clone-checked: {test_hits:?}");
     }
 }

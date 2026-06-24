@@ -179,6 +179,12 @@ pub struct ParsedSymbol {
     pub end_line: usize,
     pub signature: Option<String>,
     pub docs: Option<String>,
+    /// Test code — a test FILE (cross-language path conventions) or a language-specific test
+    /// marker (Rust `#[test]`/`#[cfg(test)]`, Kotlin `@Test`, Python `test_*` / `*Test*` class
+    /// / conftest). Persisted as `symbols.is_test` so clone detection can keep tests out of
+    /// the corpus (tests are repetitive by construction, so they otherwise dominate near-clone
+    /// results with noise).
+    pub is_test: bool,
     pub facts: Vec<ParsedSymbolFact>,
 }
 
@@ -616,6 +622,7 @@ fn make_symbol(
     let start_line = node.start_position().row + 1;
     let end_line = node.end_position().row + 1;
     let scope_path = scope_path(language, node, text, &name);
+    let is_test = detect_is_test(path, language, text, node, &scope_path, &name);
     ParsedSymbol {
         qualified_name: format!("{}::{name}", path.to_string_lossy().replace('\\', "/")),
         scope_path,
@@ -627,8 +634,125 @@ fn make_symbol(
         end_line,
         signature: signature_for(text, signature_node.start_byte(), signature_node.end_byte()),
         docs: docs_before(text, start_byte),
+        is_test,
         facts: symbol_facts(language, text, node),
     }
+}
+
+/// Whether a symbol is test code — persisted as `symbols.is_test` so clone detection can exclude
+/// it. Cross-language: a test FILE path (every language) OR a language-specific in-source marker.
+/// Tests are repetitive by construction (fixture → call → assert), so leaving them in the clone
+/// corpus floods near-clone results — the write-time clone check is the main consumer.
+fn detect_is_test(
+    path: &Path,
+    language: Language,
+    text: &str,
+    node: Node<'_>,
+    scope_path: &str,
+    name: &str,
+) -> bool {
+    if is_test_file_path(path) {
+        return true;
+    }
+    match language {
+        // Rust unit tests live INLINE in source files, so the path check misses them: a `#[test]`
+        // (or `#[tokio::test]`/`#[rstest]`/…) on the fn, or any ancestor `#[cfg(test)]` module
+        // (catches test helpers too).
+        Language::Rust =>
+            rust_attribute_items(text, node)
+                .iter()
+                .any(|attribute| rust_attribute_is_test(attribute))
+                || rust_in_cfg_test_module(node, text),
+        // Kotlin: a JUnit `@Test`-family annotation on the fn (path catches `*Test.kt` /
+        // `src/test/`).
+        Language::Kotlin => kotlin_has_test_annotation(text, node),
+        // Python: pytest/unittest by convention — `test_*` functions, methods of a `*Test*`/
+        // `*TestCase` class (via scope_path), or anything in `conftest.py` (path).
+        Language::Python => name.starts_with("test_") || scope_path_has_test_class(scope_path),
+        // C / C++ / TypeScript: test bodies aren't named symbols (macros / closures), so the file
+        // path conventions above carry these.
+        _ => false,
+    }
+}
+
+/// Cross-language test-FILE conventions: a `tests`/`spec` directory, or a filename like
+/// `test_*` / `*_test` / `*_tests` / `*Test` / `*Tests` / `*.test.*` / `*.spec.*` / `conftest.py`.
+fn is_test_file_path(path: &Path) -> bool {
+    if path.components().filter_map(|component| component.as_os_str().to_str()).any(|segment| {
+        matches!(segment, "tests" | "test" | "__tests__" | "__test__" | "spec" | "specs")
+    }) {
+        return true;
+    }
+    let file = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    if file == "conftest.py" {
+        return true;
+    }
+    let stem = file.split('.').next().unwrap_or(file);
+    stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with("_tests")
+        || stem.ends_with("Test")
+        || stem.ends_with("Tests")
+        || stem.ends_with("TestCase")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+}
+
+/// A Rust attribute that marks a test function: `#[test]`, `#[tokio::test]`, `#[rstest]`,
+/// `#[test_case(..)]`, etc. (a `#[cfg(test)]` is the MODULE marker — handled separately so it
+/// doesn't read as a per-fn test attribute).
+fn rust_attribute_is_test(attribute: &str) -> bool {
+    let inner = attribute
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches('!')
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let head = inner.split(['(', '[']).next().unwrap_or_default().trim();
+    let last = head.rsplit("::").next().unwrap_or(head).trim();
+    last == "test" || last == "rstest" || last.starts_with("test_case")
+}
+
+/// Whether `node` is nested in any `#[cfg(test)]` module — catches inline unit tests AND their
+/// helpers (a fixture fn in `#[cfg(test)] mod tests` has no `#[test]` of its own).
+fn rust_in_cfg_test_module(node: Node<'_>, text: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "mod_item"
+            && rust_attribute_items(text, ancestor)
+                .iter()
+                .any(|attribute| attribute.contains("cfg") && attribute.contains("test"))
+        {
+            return true;
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
+/// Whether a Kotlin function carries a JUnit `@Test`-family annotation (in its `modifiers`).
+fn kotlin_has_test_annotation(text: &str, node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).any(|child| {
+        child.kind() == "modifiers"
+            && node_text(child, text).as_deref().map(kotlin_modifiers_have_test).unwrap_or(false)
+    })
+}
+
+fn kotlin_modifiers_have_test(modifiers: &str) -> bool {
+    modifiers.split('@').skip(1).any(|annotation| {
+        let name = annotation.split(['(', ' ', '\n', '\t', '\r']).next().unwrap_or_default();
+        let last = name.rsplit('.').next().unwrap_or(name);
+        matches!(last, "Test" | "ParameterizedTest" | "RepeatedTest" | "TestFactory")
+    })
+}
+
+/// Whether a Python symbol's enclosing scope is a test class (`Test*` / `*Test` / `*TestCase`),
+/// e.g. a `unittest.TestCase` subclass. `scope_path` is `Class::method`-style.
+fn scope_path_has_test_class(scope_path: &str) -> bool {
+    scope_path.split("::").any(|segment| {
+        segment.starts_with("Test") || segment.ends_with("Test") || segment.ends_with("TestCase")
+    })
 }
 
 /// The node a symbol's signature is read from. For a decorated Python def this is the inner
@@ -770,5 +894,81 @@ mod budget_tests {
             parse_within_budget(grammar, src, PARSE_BUDGET).is_none(),
             "memoized-as-timed-out content must short-circuit to a parser failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod is_test_detection {
+    use std::path::Path;
+
+    use super::parse_symbols;
+    use crate::language::Language;
+
+    fn is_test(path: &str, language: Language, text: &str, name: &str) -> bool {
+        parse_symbols(Path::new(path), language, text)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("symbol `{name}` not parsed"))
+            .is_test
+    }
+
+    #[test]
+    fn rust_test_attribute_and_cfg_test_module() {
+        let src = "pub fn real(a: i32) -> i32 { a + 1 }\n#[cfg(test)]\nmod tests {\nfn helper() \
+                   -> i32 { 1 }\n#[test]\nfn checks_things() { assert_eq!(helper(), 1); }\n}\n";
+        assert!(!is_test("src/lib.rs", Language::Rust, src, "real"), "plain fn is not a test");
+        assert!(is_test("src/lib.rs", Language::Rust, src, "checks_things"), "#[test] fn");
+        assert!(
+            is_test("src/lib.rs", Language::Rust, src, "helper"),
+            "a helper in a #[cfg(test)] module is test code too"
+        );
+    }
+
+    #[test]
+    fn rust_tokio_test_attribute() {
+        let src = "#[tokio::test]\nasync fn runs() {}\n";
+        assert!(is_test("src/lib.rs", Language::Rust, src, "runs"));
+    }
+
+    #[test]
+    fn python_test_function_and_test_class() {
+        let src = "def real():\n    return 1\n\ndef test_thing():\n    assert real() == \
+                   1\n\nclass TestSuite:\n    def checks(self):\n        assert True\n";
+        assert!(!is_test("src/app.py", Language::Python, src, "real"));
+        assert!(is_test("src/app.py", Language::Python, src, "test_thing"), "test_* function");
+        assert!(is_test("src/app.py", Language::Python, src, "checks"), "method of a Test* class");
+    }
+
+    #[test]
+    fn kotlin_test_annotation() {
+        let src = "class Thing {\n    @Test\n    fun verifies() {}\n    fun real() {}\n}\n";
+        assert!(is_test("src/Main.kt", Language::Kotlin, src, "verifies"), "@Test fun");
+        assert!(!is_test("src/Main.kt", Language::Kotlin, src, "real"), "plain fun");
+    }
+
+    #[test]
+    fn test_file_paths_across_languages() {
+        // A plain function in a conventional test FILE is test code regardless of markers/language.
+        assert!(is_test("tests/integration.rs", Language::Rust, "fn anything() {}\n", "anything"));
+        assert!(is_test(
+            "test_app.py",
+            Language::Python,
+            "def anything():\n    pass\n",
+            "anything"
+        ));
+        assert!(is_test(
+            "src/__tests__/util.ts",
+            Language::TypeScript,
+            "function anything() {}\n",
+            "anything"
+        ));
+        assert!(is_test("FooTest.kt", Language::Kotlin, "fun anything() {}\n", "anything"));
+        assert!(is_test(
+            "widget.test.ts",
+            Language::TypeScript,
+            "function anything() {}\n",
+            "anything"
+        ));
     }
 }

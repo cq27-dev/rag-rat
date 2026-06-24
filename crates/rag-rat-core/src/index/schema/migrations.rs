@@ -1169,6 +1169,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_032_ID => Some(32),
             MIGRATION_033_ID => Some(33),
             MIGRATION_034_ID => Some(34),
+            MIGRATION_035_ID => Some(35),
             _ => None,
         })
         .max()
@@ -1212,6 +1213,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_032_ID
             | MIGRATION_033_ID
             | MIGRATION_034_ID
+            | MIGRATION_035_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1252,6 +1254,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_032_ID => migration.checksum != MIGRATION_032_CHECKSUM,
         MIGRATION_033_ID => migration.checksum != MIGRATION_033_CHECKSUM,
         MIGRATION_034_ID => migration.checksum != MIGRATION_034_CHECKSUM,
+        MIGRATION_035_ID => migration.checksum != MIGRATION_035_CHECKSUM,
         _ => false,
     }
 }
@@ -1490,6 +1493,15 @@ pub(crate) const CLONE_GRAPH_DDL: &str = "
 /// V034: create the precomputed clone-graph tables (see [`CLONE_GRAPH_DDL`]).
 pub(crate) fn apply_clone_graph_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CLONE_GRAPH_DDL)?;
+    Ok(())
+}
+
+/// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see
+/// `parser::detect_is_test`) so clone detection can keep tests out of the corpus. Idempotent via
+/// `add_column_if_missing`. Existing rows default to 0 (non-test) until the next reindex
+/// repopulates them — accurate `is_test` needs a reindex with this binary.
+pub(crate) fn apply_symbols_is_test(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "symbols", "is_test", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(())
 }
 

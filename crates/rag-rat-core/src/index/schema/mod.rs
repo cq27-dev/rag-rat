@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 34;
+pub const LATEST_SCHEMA_VERSION: u32 = 35;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -218,6 +218,12 @@ const MIGRATION_034_CHECKSUM: &str = "sha256:rag-rat-clone-graph-precompute-v34"
 const MIGRATION_034_DESCRIPTION: &str =
     "Add clone_graph_generations + clone_edges (content-anchored precomputed clone-edge graph so \
      find_clones reads a persisted graph instead of recomputing candidate pairs every query)";
+const MIGRATION_035_ID: &str = "035_symbols_is_test";
+const MIGRATION_035_CHECKSUM: &str = "sha256:rag-rat-symbols-is-test-v35";
+const MIGRATION_035_DESCRIPTION: &str = "Add symbols.is_test (cross-language test-code marker: \
+                                         test-file path, Rust #[test]/#[cfg(test)], Kotlin @Test, \
+                                         Python test_*/TestCase) so clone detection can exclude \
+                                         tests from the corpus";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -521,6 +527,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_034_CHECKSUM,
         description: MIGRATION_034_DESCRIPTION,
         apply: apply_clone_graph_tables,
+    },
+    Migration {
+        id: MIGRATION_035_ID,
+        checksum: MIGRATION_035_CHECKSUM,
+        description: MIGRATION_035_DESCRIPTION,
+        apply: apply_symbols_is_test,
     },
 ];
 

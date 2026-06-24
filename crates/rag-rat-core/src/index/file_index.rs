@@ -448,8 +448,8 @@ impl IndexDatabase {
                 crate::index::edges::intern_edge_string(conn, &symbol.qualified_name)?;
             conn.prepare_cached(
                 "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, \
-                 kind, start_byte, end_byte, start_line, end_line, signature, docs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 kind, start_byte, end_byte, start_line, end_line, signature, docs, is_test)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?
             .execute(params![
                 file_id,
@@ -464,6 +464,7 @@ impl IndexDatabase {
                 i64::try_from(symbol.end_line)?,
                 symbol.signature,
                 symbol.docs,
+                symbol.is_test,
             ])?;
             let symbol_id = conn.last_insert_rowid();
             symbol_ids.push(symbol_id);

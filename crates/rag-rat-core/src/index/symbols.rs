@@ -23,6 +23,9 @@ pub struct Symbol {
     pub end_line: usize,
     pub signature: Option<String>,
     pub docs: Option<String>,
+    /// Test code (see [`parser::ParsedSymbol::is_test`]) — persisted so clone detection can keep
+    /// tests out of the corpus.
+    pub is_test: bool,
     pub facts: Vec<SymbolFact>,
 }
 
@@ -46,6 +49,7 @@ pub fn from_parsed(parsed: &[parser::ParsedSymbol]) -> Vec<Symbol> {
             end_line: symbol.end_line,
             signature: symbol.signature.clone(),
             docs: symbol.docs.clone(),
+            is_test: symbol.is_test,
             facts: symbol
                 .facts
                 .iter()

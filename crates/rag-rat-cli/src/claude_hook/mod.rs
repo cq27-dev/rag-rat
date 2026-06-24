@@ -29,6 +29,16 @@ use serde::Deserialize;
 /// (#287) lands, so on a very large repo it no-ops rather than add a perceptible delay to a write.
 const MAX_CLONE_CHECK_FUNCTIONS: u64 = 40_000;
 
+/// Minimum similarity for a NEAR clone to be surfaced by the WRITE-TIME hook (#292). Higher than
+/// `find_clones`' 0.7: boilerplate-heavy code (esp. across a whole repo) pushes unrelated functions
+/// to ~0.7-0.8 token overlap, so a lower bar floods the agent with non-actionable matches. Exact
+/// (struct_hash) matches are always surfaced regardless of this.
+const HOOK_NEAR_THRESHOLD: f64 = 0.85;
+
+/// Cap the existing-function refs listed per clone match in the hook output — a single new function
+/// can be similar to many indexed ones; listing them all is noise. Show the first few + a count.
+const MAX_CLONE_REFS: usize = 5;
+
 // Only the unix Unix-socket listener path uses this; dead on Windows (which has no warm listener).
 #[cfg(unix)]
 const SOCKET_BUDGET: Duration = Duration::from_millis(250);
@@ -399,7 +409,7 @@ fn clone_check(input: &HookInput) -> anyhow::Result<()> {
     if inputs.is_empty() {
         return Ok(());
     }
-    let matches = db.clones_of_texts(&inputs)?;
+    let matches = db.clones_of_texts(&inputs, HOOK_NEAR_THRESHOLD)?;
     if let Some(context) = format_clone_warning(&matches) {
         // PreToolUse contract: allow + additionalContext (a warning, not a block).
         println!(
@@ -470,12 +480,12 @@ fn format_clone_warning(matches: &[TextCloneMatch]) -> Option<String> {
         } else {
             format!("~{:.0}% similar to", m.similarity * 100.0)
         };
+        let shown = m.clone_of.iter().take(MAX_CLONE_REFS).cloned().collect::<Vec<_>>().join(", ");
+        let extra = m.clone_of.len().saturating_sub(MAX_CLONE_REFS);
+        let more = if extra > 0 { format!(" (+{extra} more)") } else { String::new() };
         out.push_str(&format!(
-            "  • `{}` (line {}) is {} {}\n",
-            m.name,
-            m.start_line,
-            label,
-            m.clone_of.join(", ")
+            "  • `{}` (line {}) is {} {shown}{more}\n",
+            m.name, m.start_line, label,
         ));
     }
     out.push_str(

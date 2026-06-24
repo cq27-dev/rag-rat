@@ -12420,6 +12420,43 @@ fn migration_034_adds_content_anchored_clone_graph_tables() {
     );
 }
 
+/// V035 (#292): `symbols.is_test` exists after a forward migration from V034 and is queryable. A
+/// V034 index migrates forward to LATEST and gains the column (default 0 — accurate values need a
+/// reindex with this binary). Simulates a V034 index by dropping the column + rolling the ledger
+/// back one step, then asserts `migrate_forward` re-adds it.
+#[test]
+fn migration_035_adds_symbols_is_test() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply");
+
+    conn.execute_batch("ALTER TABLE symbols DROP COLUMN is_test;").expect("revert to V034 shape");
+    truncate_schema_to(&conn, 34);
+    assert!(
+        !conn_table_columns(&conn, "symbols").contains(&"is_test".to_string()),
+        "is_test absent at V034"
+    );
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Older,
+        "schema is Older after removing the V035 ledger row"
+    );
+
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    assert!(
+        conn_table_columns(&conn, "symbols").contains(&"is_test".to_string()),
+        "V035 adds symbols.is_test"
+    );
+    // The column is queryable + defaults to 0 (non-test) on existing rows.
+    let _: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbols WHERE is_test = 0", [], |r| r.get(0))
+        .expect("SELECT is_test must succeed after V035");
+    assert_eq!(
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        35,
+        "LATEST_SCHEMA_VERSION is 35 after V035"
+    );
+}
+
 /// Regression test for the P1 schema bug (#215 Plan 4a): an index recorded at V029 WITHOUT
 /// `clone_refinements.lcs_sampled` (because V029 was applied before the column landed) must have
 /// the column added by the V030 forward migration. Simulates the bug by building a full schema,
@@ -12481,8 +12518,8 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     );
     assert_eq!(
         crate::index::schema::LATEST_SCHEMA_VERSION,
-        34,
-        "LATEST_SCHEMA_VERSION is 34 after V034"
+        35,
+        "LATEST_SCHEMA_VERSION is 35 after V035"
     );
     // Idempotency: running migrate_forward again must not error.
     crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
