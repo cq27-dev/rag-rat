@@ -135,6 +135,17 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
     if let Some(options) = budget.next_options() {
         db.reconcile_with_options_progress(options, |_| {})?;
     }
+    // Clone-edge graph (#286): refresh the persisted graph when it's ABSENT or STALE, with whatever
+    // budget the embedding reconcile left — sharing the same PASS_RECONCILE_MAX_SECONDS so a pass
+    // can't overrun. Best-effort + resumable: a bounded pass makes partial progress and the next
+    // pass continues, so a large/dense repo's graph converges over several passes, entirely off
+    // the query path. `None` budget → skip (rides the next pass), exactly like the base
+    // reconcile.
+    if db.pending_clone_graph().unwrap_or(false)
+        && let Some(options) = budget.next_options()
+    {
+        let _ = db.reconcile_clone_edges_with_budget(options.max_seconds);
+    }
     if run_gc {
         let _ = db.garbage_collect();
     }

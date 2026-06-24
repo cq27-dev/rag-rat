@@ -22,6 +22,7 @@ mod search;
 // private so `build_class`'s reachability stays narrow (no `private_interfaces` widening of
 // `SymbolBag`).
 pub use clones::of_text::{CloneCheckInput, TextCloneMatch};
+pub use clones::precompute::CloneEdgeReport;
 pub use clones::{
     CandidateCloneClass, CloneCompleteness, CloneMember, CloneSymbolSelector,
     ClonesForSymbolResult, FindClonesOptions, FindClonesResult, RoiFactors,

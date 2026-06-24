@@ -147,6 +147,8 @@ The highest-leverage ones (full catalog + JSON schemas in [`docs/mcp-tools.md`](
 - **`important_symbols`** — load-bearing symbols by (SCIP-aware) PageRank; see
   [`docs/oracle.md`](docs/oracle.md).
 - **`repo_brief` / `repo_clusters`** — orientation: spine / churn / god-modules / ownership clusters.
+- **`find_clones` / `clones_for_symbol`** — exact + near-miss duplicate functions ranked by refactor
+  ROI; the candidate graph is precomputed in the background so it scales to large repos.
 - **`read_chunk`** — current text for a chunk with anchor validation.
 - Git/GitHub: `commit_search`, `git_history_for_path|symbol`, `git_blame_chunk`,
   `papertrail_for_*`, `rationale_search`.

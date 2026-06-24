@@ -223,6 +223,18 @@ pub(crate) struct ClonesArgs {
     /// without false alarms from the member cap. Ignores `--limit`.
     #[arg(long)]
     pub recall_symbols: bool,
+    /// Precompute + persist the clone-edge graph (a background-style writer pass), so subsequent
+    /// `find_clones` / `clones-for` queries read the persisted graph instead of recomputing the
+    /// super-linear candidate pairs every call — the way the graph scales to large repos (#286).
+    /// Runs to completion under a write lock; re-running on unchanged content is a no-op. Prints a
+    /// build report instead of the clone listing.
+    #[arg(long)]
+    pub precompute: bool,
+    /// Soft per-pass time budget (seconds) for `--precompute`; the build checkpoints and resumes,
+    /// so a bound leaves a partial graph that the next pass continues. Omit to run
+    /// uninterrupted.
+    #[arg(long, value_name = "SECONDS")]
+    pub max_seconds: Option<u64>,
 }
 
 /// Selector for `clones-for`: positional `SYMBOL` (a qualified ref or `sym_<hex>` handle), or

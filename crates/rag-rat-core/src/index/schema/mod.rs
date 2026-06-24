@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 33;
+pub const LATEST_SCHEMA_VERSION: u32 = 34;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -213,6 +213,11 @@ const MIGRATION_033_CHECKSUM: &str = "sha256:rag-rat-dream-findings-v33";
 const MIGRATION_033_DESCRIPTION: &str = "Add dream_findings (dream-mode worklist: findings ABOUT \
                                          memories, identity-keyed supersede/decay, never mutate \
                                          memories) (#122)";
+const MIGRATION_034_ID: &str = "034_clone_graph_precompute";
+const MIGRATION_034_CHECKSUM: &str = "sha256:rag-rat-clone-graph-precompute-v34";
+const MIGRATION_034_DESCRIPTION: &str =
+    "Add clone_graph_generations + clone_edges (content-anchored precomputed clone-edge graph so \
+     find_clones reads a persisted graph instead of recomputing candidate pairs every query)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -510,6 +515,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_033_CHECKSUM,
         description: MIGRATION_033_DESCRIPTION,
         apply: apply_dream_findings,
+    },
+    Migration {
+        id: MIGRATION_034_ID,
+        checksum: MIGRATION_034_CHECKSUM,
+        description: MIGRATION_034_DESCRIPTION,
+        apply: apply_clone_graph_tables,
     },
 ];
 
