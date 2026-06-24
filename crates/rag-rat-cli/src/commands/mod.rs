@@ -150,6 +150,16 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
 }
 
 pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
+    // `--precompute`: the WRITER path — build/refresh the persisted clone-edge graph (#286) under a
+    // write lock (mirroring `maintenance`), then print the build report instead of a clone listing.
+    if args.precompute {
+        let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
+        let db = open_index(config)?;
+        let report: rag_rat_core::index::CloneEdgeReport =
+            db.precompute_clone_graph(args.max_seconds)?;
+        return print_output(&report);
+    }
+
     let db = open_index(config)?;
 
     // `--recall-symbols`: the UNCAPPED symbol-level recall set (#282 follow-up) — via the dedicated
@@ -1066,6 +1076,8 @@ mod tests {
             explain: None,
             recall_signature: false,
             recall_symbols: false,
+            precompute: false,
+            max_seconds: None,
         };
         // The handler must not error.
         super::clones(&config, &args).unwrap_or_else(|err| panic!("clones handler failed: {err}"));

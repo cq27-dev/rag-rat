@@ -13,6 +13,13 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension};
 
+/// The background clone-edge-graph precompute (#286): the resumable, generation-staged build that
+/// persists `clone_edges`, plus (Phase C) the `find_clones` fast path that reads it. A child module
+/// so it can reuse this module's private candidate-gen primitives (`load_scoped_baseline_bags`,
+/// `sub_block_tokens`, `overlap`, `verified_clone`) — guaranteeing the persisted set equals the
+/// live `candidate_pairs_from_bags` set.
+pub(crate) mod precompute;
+
 /// Pairwise metric work cap for huge components: when a component exceeds this count, the
 /// O(n²) pairwise metric loop (`similarity_min`, medoid, `similarity_medoid_min`,
 /// `containment_max`) runs over ONLY the first `METRIC_SAMPLE_CAP` members instead of the full
