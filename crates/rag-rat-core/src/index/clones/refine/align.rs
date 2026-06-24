@@ -197,6 +197,29 @@ pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> (f64, bool) {
     (ratio, sampled)
 }
 
+/// Like [`class_lcs_ratio`] but draws its exact-DP allowance from a SHARED CROSS-CLASS budget
+/// (`*remaining_cells`) instead of a fresh per-class [`LCS_AGGREGATE_CELLS_BUDGET`]. The per-class
+/// cap is `min(LCS_AGGREGATE_CELLS_BUDGET, *remaining_cells)` — so the fidelity lane stays bounded
+/// per class AND the WHOLE `find_clones` refine pass is bounded by the global allowance the driver
+/// seeds. `*remaining_cells` is decremented by the exact-DP cells this call actually charged (it
+/// never goes negative — `saturating_sub`). Once the global allowance is exhausted, subsequent
+/// classes get a `0` per-class budget → every pair takes the [`multiset_dice`] proxy and
+/// `lcs_sampled` latches, so a globally-degraded class is never reported as exact.
+///
+/// DETERMINISM: the per-class budget is a pure function of `*remaining_cells` at entry, and the
+/// classes are refined in a fixed provisional-ROI order, so the same input always truncates at the
+/// same class and the same pair — byte-identical output. With a generous (or default
+/// `LCS_AGGREGATE_CELLS_BUDGET`-sized) allowance this is byte-identical to [`class_lcs_ratio`].
+pub(crate) fn class_lcs_ratio_global(
+    seqs: &[Vec<String>],
+    remaining_cells: &mut u64,
+) -> (f64, bool) {
+    let per_class = LCS_AGGREGATE_CELLS_BUDGET.min(*remaining_cells);
+    let (ratio, sampled, cells_spent) = class_lcs_ratio_counted_with_cells(seqs, per_class);
+    *remaining_cells = remaining_cells.saturating_sub(cells_spent);
+    (ratio, sampled)
+}
+
 /// The body of [`class_lcs_ratio`], additionally returning how many pairs actually ran the exact
 /// O(n·m) DP (the rest took the [`multiset_dice`] proxy). The count is what the aggregate-budget
 /// test asserts is BOUNDED — it is otherwise an implementation detail, so the public wrapper drops
@@ -212,8 +235,22 @@ fn class_lcs_ratio_counted(seqs: &[Vec<String>]) -> (f64, bool, u64) {
 /// s). The cutover logic is byte-identical regardless of the budget value, so the fast test
 /// exercises the same code path as production.
 fn class_lcs_ratio_counted_with_budget(seqs: &[Vec<String>], budget: u64) -> (f64, bool, u64) {
+    let (ratio, sampled, pairs, _cells) = class_lcs_ratio_full(seqs, budget);
+    (ratio, sampled, pairs)
+}
+
+/// [`class_lcs_ratio_counted_with_budget`] but additionally returning the exact-DP CELLS charged
+/// (not just the pair count). The cross-class global driver ([`class_lcs_ratio_global`]) decrements
+/// its shared allowance by this so the WHOLE refine pass — not just each class — is cell-bounded.
+fn class_lcs_ratio_counted_with_cells(seqs: &[Vec<String>], budget: u64) -> (f64, bool, u64) {
+    let (ratio, sampled, _pairs, cells) = class_lcs_ratio_full(seqs, budget);
+    (ratio, sampled, cells)
+}
+
+/// Shared body: returns `(min_ratio, lcs_sampled, exact_dp_pairs, exact_dp_cells)`.
+fn class_lcs_ratio_full(seqs: &[Vec<String>], budget: u64) -> (f64, bool, u64, u64) {
     if seqs.len() < 2 {
-        return (1.0, false, 0);
+        return (1.0, false, 0, 0);
     }
 
     // Member-count cap: use at most LCS_MEMBER_SAMPLE members. The slice is already in canonical
@@ -272,7 +309,7 @@ fn class_lcs_ratio_counted_with_budget(seqs: &[Vec<String>], budget: u64) -> (f6
     // loop body (i=0, j=1) executes at least once and `min_ratio` is updated from `f64::INFINITY`.
     // The `f64::INFINITY` fallback is therefore unreachable — assert it in debug, return min_ratio.
     debug_assert!(min_ratio.is_finite(), "min_ratio must be set: effective.len() >= 2");
-    (min_ratio, lcs_sampled, exact_dp_pairs)
+    (min_ratio, lcs_sampled, exact_dp_pairs, exact_dp_cells)
 }
 
 #[cfg(test)]
@@ -610,6 +647,70 @@ mod tests {
         assert!(
             (ratio - expected).abs() < 1e-12,
             "small-class ratio unchanged by the budget: expected {expected}, got {ratio}"
+        );
+    }
+
+    /// #272 GLOBAL (cross-class) refine budget: a tiny shared allowance threaded across SEVERAL
+    /// classes caps the AGGREGATE exact-DP work of the WHOLE pass, not just each class. Once the
+    /// shared counter is drained, later classes get a `0` per-class budget → every pair takes the
+    /// proxy and `lcs_sampled` latches, so the global truncation is honest. This is the
+    /// fidelity-lane mechanism the driver (`find_clones`) threads through
+    /// `class_lcs_ratio_global`.
+    #[test]
+    fn class_lcs_ratio_global_budget_caps_aggregate_across_classes() {
+        // Each "class" is 4 members × 10 tokens → 6 pairs × 100 cells = 600 cells of exact DP if
+        // fully run. With a 250-cell GLOBAL allowance shared across THREE classes, only the first
+        // class can run any exact DP at all; by the time class 2 starts the counter is drained, so
+        // classes 2 and 3 are fully proxied (sampled) and charge nothing.
+        let mk_class = |salt: usize| -> Vec<Vec<String>> {
+            (0..4).map(|m| (0..10).map(|i| format!("c{salt}m{m}t{i}")).collect()).collect()
+        };
+        let classes = [mk_class(0), mk_class(1), mk_class(2)];
+
+        let mut remaining: u64 = 250;
+        let mut sampled_flags = Vec::new();
+        for seqs in &classes {
+            let (_ratio, sampled) = class_lcs_ratio_global(seqs, &mut remaining);
+            sampled_flags.push(sampled);
+        }
+
+        // The global allowance is fully drained (saturating_sub clamps at 0).
+        assert_eq!(remaining, 0, "the shared allowance must be fully consumed");
+        // Every class that ran out of allowance is sampled — the later classes are honestly
+        // degraded, never reported exact.
+        assert!(sampled_flags[0], "class 1 trips its share of the budget → sampled");
+        assert!(sampled_flags[1], "class 2 sees a drained allowance → fully proxied → sampled");
+        assert!(sampled_flags[2], "class 3 sees a drained allowance → fully proxied → sampled");
+    }
+
+    /// #272 UNDER-budget determinism: a GLOBAL run with a generous allowance is BYTE-IDENTICAL to
+    /// the per-class `class_lcs_ratio` path (same ratio, same not-sampled flag) — the global
+    /// counter only changes behavior PAST the allowance. This is the "under-budget runs stay
+    /// byte-identical" guarantee the #272 fix must preserve.
+    #[test]
+    fn class_lcs_ratio_global_under_budget_is_byte_identical() {
+        let a = strs(&["fn", "foo", "(", ")", "{", "x", "}"]);
+        let b = strs(&["fn", "bar", "(", ")", "{", "x", "}"]);
+        let c = a.clone();
+        let seqs = [a, b, c];
+
+        let (ratio_ref, sampled_ref) = class_lcs_ratio(&seqs);
+
+        // A generous global allowance → the per-class budget is the full lane const → identical.
+        let mut remaining: u64 = LCS_AGGREGATE_CELLS_BUDGET * 8;
+        let before = remaining;
+        let (ratio_global, sampled_global) = class_lcs_ratio_global(&seqs, &mut remaining);
+
+        assert_eq!(ratio_ref, ratio_global, "under-budget ratio must be byte-identical");
+        assert_eq!(sampled_ref, sampled_global, "under-budget sampled flag must match");
+        assert!(!sampled_global, "a small class under a generous global budget is not sampled");
+        assert!(
+            remaining < before,
+            "the global counter is decremented by the exact-DP cells spent"
+        );
+        assert!(
+            remaining > LCS_AGGREGATE_CELLS_BUDGET,
+            "a tiny exact-DP charge leaves the generous allowance largely intact"
         );
     }
 

@@ -513,6 +513,38 @@ pub(crate) fn anti_unify(members: &[RefineMember], alignment: &ClassAlignment) -
     anti_unify_with_budget(members, alignment, &mut budget)
 }
 
+/// Star-align + anti-unify the class drawing the WHOLE template lane (parent star-align + every
+/// matched-statement re-descent) from a SHARED CROSS-CLASS allowance (`*remaining_cells`), rather
+/// than a fresh per-class [`ALIGN_AGGREGATE_CELLS_BUDGET`]. The per-class cap is
+/// `min(ALIGN_AGGREGATE_CELLS_BUDGET, *remaining_cells)`, so the template lane stays bounded per
+/// class AND the whole `find_clones` refine pass is bounded by the global allowance. `*remaining`
+/// is decremented (`saturating_sub`) by the cells this class's whole anti-unify actually charged.
+///
+/// Returns the `(ClassAlignment, Template)` pair so the caller persists both. DETERMINISM + the
+/// `sampled` honesty chain are preserved exactly as the per-class budget path: the cutover is a
+/// pure function of `*remaining` at entry, consumed in deterministic member/statement order, and
+/// any budget-degraded member/statement latches `alignment.sampled` / `template.sampled`. With a
+/// generous (or `ALIGN_AGGREGATE_CELLS_BUDGET`-sized) allowance the output is byte-identical to the
+/// `align_to_anchor` + `anti_unify` pair.
+pub(crate) fn anti_unify_global(
+    members: &[RefineMember],
+    anchor_idx: usize,
+    remaining_cells: &mut u64,
+) -> (ClassAlignment, Template) {
+    let per_class = ALIGN_AGGREGATE_CELLS_BUDGET.min(*remaining_cells);
+    let mut budget = CellBudget::new(per_class);
+    let alignment = align_to_anchor_with_budget(members, anchor_idx, &mut budget);
+    // The same budget rides into the anti-unify: `spent` already carries the star-align charge, so
+    // the re-descent continues from where the parent left off (one per-class budget across both
+    // sub-lanes), exactly as `anti_unify` seeds itself from `alignment.spent_cells`.
+    let template = anti_unify_with_budget(members, &alignment, &mut budget);
+    // Decrement the shared allowance by everything this class charged. `spent` can exceed
+    // `per_class` by at most "one pair" (charge-then-check), but never the global remaining beyond
+    // saturation, so subsequent classes correctly see a smaller (or zero) allowance.
+    *remaining_cells = remaining_cells.saturating_sub(budget.spent);
+    (alignment, template)
+}
+
 /// [`anti_unify`] drawing from a CALLER-OWNED [`CellBudget`]. The budget bounds the exact
 /// `lcs_align` work the matched-statement re-descent ([`emit_matched_statement_redescent`]) adds:
 /// once it is exhausted, remaining matched statements are left whole-fixed (no further exact DP)

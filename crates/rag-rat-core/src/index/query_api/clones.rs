@@ -26,7 +26,7 @@ const METRIC_SAMPLE_CAP: usize = 200;
 use crate::index::IndexDatabase;
 use crate::index::clones::NORM_VERSION;
 use crate::index::clones::refine::cache::{
-    refine_compute_and_store, refine_lookup, refinement_key,
+    refine_compute_and_store_budgeted, refine_lookup, refinement_key,
 };
 use crate::index::clones::refine::split::coherence_split;
 
@@ -464,6 +464,22 @@ impl IndexDatabase {
         // the top-budget classes and returns all (with unrefined tail).
         const UNLIMITED_REFINE_BUDGET: usize = 50;
 
+        // GLOBAL (cross-class) refine cost budget (#272). The per-class
+        // `LCS_AGGREGATE_CELLS_BUDGET` / `ALIGN_AGGREGATE_CELLS_BUDGET` (~100M cells each)
+        // bound ONE class's exact-DP work, but 50 classes each near their per-class cap
+        // summed to ~48–52 s cold (paid TWICE under the RW busy-retry dispatcher). This
+        // shared allowance bounds the WHOLE refine pass: each cold class draws its
+        // per-class budget from `min(<lane const>, remaining)` and decrements the
+        // counter, so once it is exhausted later classes degrade-and-sample (their
+        // `metrics_sampled` latches) instead of running full exact DP. Warm cache hits
+        // never touch it (they bypass the compute path). DETERMINISM: classes refine in a
+        // fixed provisional-ROI order and each lane consumes deterministically, so the same
+        // input truncates at the same class/pair. The allowance is sized so an all-cold
+        // pass stays well under the MCP timeout; a single class can still spend up to its
+        // full per-class budget when the global counter is fresh.
+        const GLOBAL_REFINE_CELLS_BUDGET: u64 = 600_000_000;
+        let mut global_refine_cells: u64 = GLOBAL_REFINE_CELLS_BUDGET;
+
         let classes: Vec<CandidateCloneClass> = if let Some(limit) = opts.limit {
             // Limited result: truncate to min(limit, UNLIMITED_REFINE_BUDGET) so a huge `limit`
             // doesn't queue unbounded re-parse work. The all-refined-limited invariant (Fix 2
@@ -477,7 +493,13 @@ impl IndexDatabase {
             let effective_limit = limit.min(UNLIMITED_REFINE_BUDGET);
             built.truncate(effective_limit);
             for (class_ids, class) in built.iter_mut() {
-                self.refine_class_in_place(conn, class_ids, &by_id, class)?;
+                self.refine_class_in_place(
+                    conn,
+                    class_ids,
+                    &by_id,
+                    class,
+                    &mut global_refine_cells,
+                )?;
             }
             let mut cs: Vec<CandidateCloneClass> = built.into_iter().map(|(_, c)| c).collect();
             cs.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
@@ -491,7 +513,13 @@ impl IndexDatabase {
                 if idx >= UNLIMITED_REFINE_BUDGET {
                     break;
                 }
-                self.refine_class_in_place(conn, class_ids, &by_id, class)?;
+                self.refine_class_in_place(
+                    conn,
+                    class_ids,
+                    &by_id,
+                    class,
+                    &mut global_refine_cells,
+                )?;
             }
             let mut cs: Vec<CandidateCloneClass> = built.into_iter().map(|(_, c)| c).collect();
             cs.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
@@ -548,6 +576,10 @@ impl IndexDatabase {
         class_ids: &[i64],
         by_id: &BTreeMap<i64, &SymbolBag>,
         class: &mut CandidateCloneClass,
+        // SHARED cross-class cell allowance (#272): the cold compute path draws each lane's
+        // per-class budget from this and decrements it, so the WHOLE `find_clones` refine pass is
+        // cell-bounded. Warm cache hits return BEFORE the compute, so they never consume it.
+        global_refine_cells: &mut u64,
     ) -> anyhow::Result<()> {
         // ── Phase 0 (CHEAP, NO RE-PARSE): build the content-addressed key from each member's
         // persisted struct_hash already in `by_id` — no file I/O, no tree-sitter parse.
@@ -644,13 +676,14 @@ impl IndexDatabase {
 
         // Thread the bag-overlap medoid (Plan 4b §1.1) as the anti-unify spine anchor; the compute
         // half falls back to the canonical-first member when it is `None`.
-        let refinement = refine_compute_and_store(
+        let refinement = refine_compute_and_store_budgeted(
             conn,
             &key,
             &class.language,
             &members,
             class.similarity_min,
             class.medoid_symbol_id,
+            Some(global_refine_cells),
         )?;
         apply_refinement(class, refinement);
 
@@ -941,8 +974,19 @@ impl IndexDatabase {
             Some(subclass) => {
                 let mut built = build_class(&subclass, &by_id, conn, Some(symbol_id))?;
                 // Always refine the subject's one class when refine inputs are available.
+                // `clones_for_symbol` refines exactly ONE class, so it is not subject to the
+                // cross-class throttle (#272): seed a fresh full per-class allowance so its single
+                // class always gets the whole `min(<lane const>, remaining)` = the lane const,
+                // identical to the pre-#272 single-class behavior.
+                let mut single_class_cells: u64 = u64::MAX;
                 if let Some(c) = built.as_mut() {
-                    self.refine_class_in_place(conn, &subclass, &by_id, c)?;
+                    self.refine_class_in_place(
+                        conn,
+                        &subclass,
+                        &by_id,
+                        c,
+                        &mut single_class_cells,
+                    )?;
                 }
                 built
             },

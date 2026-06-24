@@ -16,8 +16,8 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::align::class_lcs_ratio;
-use super::antiunify::{align_to_anchor, anti_unify, resolve_anchor_idx};
+use super::align::{class_lcs_ratio, class_lcs_ratio_global};
+use super::antiunify::{align_to_anchor, anti_unify, anti_unify_global, resolve_anchor_idx};
 use super::score::{Confidence, confidence_v2, metavar_profile, refactorability_v2};
 use super::signature::propose_signature;
 use crate::index::clones::refine::RefineMember;
@@ -206,22 +206,63 @@ pub(crate) fn refine_compute_and_store(
     similarity_min: f64,
     medoid_symbol_id: Option<i64>,
 ) -> anyhow::Result<CachedRefinement> {
+    refine_compute_and_store_budgeted(
+        conn,
+        refinement_key,
+        language,
+        members,
+        similarity_min,
+        medoid_symbol_id,
+        None,
+    )
+}
+
+/// [`refine_compute_and_store`] with an OPTIONAL shared CROSS-CLASS cell allowance
+/// (`global_remaining`). When `Some`, both LCS lanes (fidelity + template) draw their per-class
+/// exact-DP budget from `min(<lane const>, *remaining)` and decrement the shared counter, so the
+/// WHOLE `find_clones` refine pass — not just each class — is cell-bounded (#272). When `None`,
+/// each lane gets a fresh full per-class budget (the pre-#272 behavior; used by
+/// `clones_for_symbol`, which refines exactly one class, and by direct callers/tests).
+///
+/// Only the COLD compute path charges the allowance; a warm `refine_lookup` hit never reaches here,
+/// so cached classes don't consume the global budget. DETERMINISM: the per-class budget is a pure
+/// function of `*remaining` at entry and the driver refines classes in a fixed provisional-ROI
+/// order, so the same input always truncates at the same class/pair — byte-identical output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refine_compute_and_store_budgeted(
+    conn: &Connection,
+    refinement_key: &str,
+    language: &str,
+    members: &[RefineMember],
+    similarity_min: f64,
+    medoid_symbol_id: Option<i64>,
+    mut global_remaining: Option<&mut u64>,
+) -> anyhow::Result<CachedRefinement> {
     // `lcs_ratio` stays the NiCad class fidelity (min pairwise 2·LCS/(|a|+|b|)) + its sampling bit.
     let seqs: Vec<Vec<String>> = members.iter().map(|m| m.seq.clone()).collect();
-    let (lcs_ratio, lcs_sampled) = class_lcs_ratio(&seqs);
+    let (lcs_ratio, lcs_sampled) = match global_remaining.as_deref_mut() {
+        Some(remaining) => class_lcs_ratio_global(&seqs, remaining),
+        None => class_lcs_ratio(&seqs),
+    };
 
     // ── Anti-unification (Plan 4b §1.1-§1.10): medoid-anchored star LCS → template + VPs
     // ──────────
     let anchor_idx = resolve_anchor_idx(members, medoid_symbol_id);
-    let alignment = align_to_anchor(members, anchor_idx);
     // The anti-unify alignment has its own cost guards (P1 + the aggregate cell budget): a member
-    // or anchor seq past `LCS_MAX_SEQ_TOKENS`, OR a member past the per-class
+    // or anchor seq past `LCS_MAX_SEQ_TOKENS`, OR a member past the (per-class OR global)
     // `ALIGN_AGGREGATE_CELLS_BUDGET`, is skipped/degraded rather than allocating/running the huge
     // DP. `alignment.sampled` covers the parent star-align; `template.sampled` (below) covers a
     // budget-degraded matched-statement re-descent. Fold BOTH into `lcs_sampled` so the persisted
     // sampling bit reflects the fidelity-metric cap AND the whole template lane — a
     // degraded/skipped template is never reported as exact.
-    let template = anti_unify(members, &alignment);
+    let (alignment, template) = match global_remaining {
+        Some(remaining) => anti_unify_global(members, anchor_idx, remaining),
+        None => {
+            let alignment = align_to_anchor(members, anchor_idx);
+            let template = anti_unify(members, &alignment);
+            (alignment, template)
+        },
+    };
     let lcs_sampled = lcs_sampled || alignment.sampled || template.sampled;
 
     // ── Proposed signature (Plan 4b §1.11) ───────────────────────────────────────────────────────
