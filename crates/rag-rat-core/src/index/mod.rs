@@ -51,7 +51,7 @@ pub(crate) use prep::*;
 pub use query_api::{
     CandidateCloneClass, CloneCompleteness, CloneMember, CloneSymbolSelector,
     ClonesForSymbolResult, FindClonesOptions, FindClonesResult, GcReport, ImportantSymbolsRequest,
-    OracleShaSnapshots, RoiFactors, SearchRequest,
+    OracleShaSnapshots, RoiFactors, SearchRequest, TextCloneMatch,
 };
 pub(crate) use util::*;
 

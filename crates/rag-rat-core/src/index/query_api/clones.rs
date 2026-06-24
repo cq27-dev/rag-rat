@@ -13,6 +13,11 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension};
 
+/// Clone-check of arbitrary not-yet-indexed text (#287): `clones_of_text` fingerprints the
+/// functions in a string and finds their exact + near clones among the indexed symbols — a child
+/// module so it can reuse this module's private candidate-gen primitives.
+pub(crate) mod of_text;
+
 /// Pairwise metric work cap for huge components: when a component exceeds this count, the
 /// O(n²) pairwise metric loop (`similarity_min`, medoid, `similarity_medoid_min`,
 /// `containment_max`) runs over ONLY the first `METRIC_SAMPLE_CAP` members instead of the full
