@@ -1,5 +1,6 @@
-//! Claude Code settings.json management for the grep-augment PreToolUse hook and the
-//! SessionStart orientation hook (`rag-rat hooks install|uninstall|status --claude [--global]`).
+//! Claude Code settings.json management for the PreToolUse hooks (grep-augmentation on Grep/Bash +
+//! the write-time clone check on Write/Edit/MultiEdit, #287) and the SessionStart orientation hook
+//! (`rag-rat hooks install|uninstall|status --claude [--global]`).
 //!
 //! Edits are additive and marker-aware: our entries are recognized by `HOOK_COMMAND`;
 //! everything else in the file is preserved byte-for-byte at the JSON level (read → modify
@@ -10,7 +11,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 pub const HOOK_COMMAND: &str = "rag-rat claude-hook";
-const MATCHERS: &[&str] = &["Grep", "Bash"];
+// `Grep`/`Bash` drive the grep-augmentation; `Write`/`Edit`/`MultiEdit` drive the write-time clone
+// check (#287). All five fire the one `rag-rat claude-hook` command, which dispatches on tool name.
+const MATCHERS: &[&str] = &["Grep", "Bash", "Write", "Edit", "MultiEdit"];
 const SESSION_START_MATCHER: &str = "startup|clear|compact";
 const SESSION_START_TIMEOUT: u64 = 5;
 
@@ -224,13 +227,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn install_into_empty_settings_creates_both_matchers() {
+    fn install_into_empty_settings_creates_all_matchers() {
         let mut settings = serde_json::json!({});
         let changed = merge_hook_entries(&mut settings);
         assert!(changed);
         let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
         let matchers: Vec<&str> = entries.iter().map(|e| e["matcher"].as_str().unwrap()).collect();
-        assert!(matchers.contains(&"Grep") && matchers.contains(&"Bash"));
+        // Grep/Bash (grep-augment) + Write/Edit/MultiEdit (clone check, #287).
+        for expected in ["Grep", "Bash", "Write", "Edit", "MultiEdit"] {
+            assert!(matchers.contains(&expected), "missing {expected} matcher");
+        }
         for entry in entries {
             let hook = &entry["hooks"][0];
             assert_eq!(hook["command"], HOOK_COMMAND);
@@ -249,7 +255,15 @@ mod tests {
         assert!(merge_hook_entries(&mut settings));
         assert!(!merge_hook_entries(&mut settings), "second install is a no-op");
         let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 3, "foreign Edit entry preserved alongside Grep+Bash");
+        // The foreign `Edit` (other-tool) is preserved, and our 5 matchers are added alongside it —
+        // our `Edit` entry (is-ours) coexists with the foreign one.
+        assert_eq!(entries.len(), 6, "foreign Edit preserved alongside our 5 matchers");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["matcher"] == "Edit" && e["hooks"][0]["command"] == "other-tool"),
+            "foreign Edit entry preserved"
+        );
         assert_eq!(settings["permissions"]["allow"][0], "Bash(ls:*)");
     }
 
