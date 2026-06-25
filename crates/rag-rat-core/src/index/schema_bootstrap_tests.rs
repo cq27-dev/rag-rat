@@ -880,7 +880,9 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(embedding_bytes, (HASH_EMBEDDING_DIM * 4) as i64);
+    // int8-quantized blob (#112): a 4-byte f32 scale + one signed byte per dim — ~4x smaller than
+    // the old 4*dim f32 blob.
+    assert_eq!(embedding_bytes, (4 + HASH_EMBEDDING_DIM) as i64);
 
     let hits = db.search("alpha", 10, false).unwrap();
     assert!(hits[0].summary.contains("alpha token"));
