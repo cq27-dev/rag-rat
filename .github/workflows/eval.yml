@@ -6,14 +6,16 @@ name: eval
 # (lexical + semantic) path the product ships (MiniLM, model download cached).
 on:
   # Targeted: the eval suite exercises core's search/eval path + the cli's eval-feature surface
-  # (the `--features eval` clippy runs ONLY here), plus the evals/ query data. mcp-only and
-  # docs-only changes can't move it, so they skip.
+  # (the `--features eval` clippy runs ONLY here), the evals/ query data, AND the tests/fixtures
+  # the eval_suite loads via fixture_root() (main CI runs core --no-default-features, so it never
+  # compiles the eval module — this is the only gate on those fixtures). mcp/docs-only changes skip.
   push:
     branches: [main]
     paths:
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'
       - 'evals/**'
+      - 'tests/fixtures/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.config/nextest.toml'
@@ -23,6 +25,7 @@ on:
       - 'crates/rag-rat-core/**'
       - 'crates/rag-rat-cli/**'
       - 'evals/**'
+      - 'tests/fixtures/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.config/nextest.toml'
