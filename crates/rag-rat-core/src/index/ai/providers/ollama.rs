@@ -31,8 +31,8 @@ struct EmbedResponse {
 }
 
 /// A native HTTP embedder that offloads embedding work to an Ollama server's `/api/embed`. The dim
-/// is the registry spec's dim (the parity contract); the server's first response vector is checked
-/// against it on every batch.
+/// is the registry spec's dim (the parity contract); every response vector is checked against it on
+/// each batch.
 #[derive(Debug)]
 pub struct OllamaEmbedder {
     agent: ureq::Agent,
@@ -65,26 +65,20 @@ impl OllamaEmbedder {
             })?;
         let embed_url = format!("{}/api/embed", endpoint.trim_end_matches('/'));
 
-        let auth_header = match cfg.auth_env.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-            Some(var) => {
-                let token =
-                    std::env::var(var).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-                let token = token.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "remote embedding auth env var `{var}` is set in config but missing or \
-                         empty in the environment"
-                    )
-                })?;
-                Some(format!("Bearer {token}"))
-            },
-            None => None,
-        };
+        let auth_header =
+            resolve_auth_header(cfg.auth_env.as_deref(), |var| std::env::var(var).ok())?;
 
-        let agent: ureq::Agent = ureq::Agent::config_builder()
+        let mut builder = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(cfg.request_timeout_s)))
-            .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (ollama-embed)"))
-            .build()
-            .into();
+            .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (ollama-embed)"));
+        // ureq's default config inherits `HTTP_PROXY`/`HTTPS_PROXY` from the env. A local Ollama
+        // (`http://127.0.0.1:11434`) routed through a corporate proxy 403s, so disable the proxy for
+        // loopback endpoints only — a non-loopback (truly remote) endpoint may legitimately need
+        // it.
+        if endpoint_is_loopback(endpoint) {
+            builder = builder.proxy(None);
+        }
+        let agent: ureq::Agent = builder.build().into();
 
         Ok(Self {
             agent,
@@ -94,6 +88,46 @@ impl OllamaEmbedder {
             auth_header,
         })
     }
+}
+
+/// Resolve the `Authorization` header from the configured `auth_env` name, looking the value up
+/// through `lookup` (the env in production; a fake closure in tests). `None`/empty `auth_env` → no
+/// auth (`Ok(None)`); a named-but-missing/empty value → `Err` (the operator asked for auth but the
+/// token isn't there). Closure-injected so the env-mutation footgun (unsafe + flaky under nextest's
+/// parallel runner in Rust 2024) never enters the test path.
+fn resolve_auth_header(
+    auth_env: Option<&str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(var) = auth_env.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let token =
+        lookup(var).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "remote embedding auth env var `{var}` is set in config but missing or empty in \
+                 the environment"
+            )
+        })?;
+    Ok(Some(format!("Bearer {token}")))
+}
+
+/// Whether the endpoint's host is loopback (`127.0.0.1`, `localhost`, `::1`). Loopback endpoints
+/// bypass the ambient HTTP proxy; everything else inherits it. Parses the host out of the URL by
+/// stripping the scheme then the path/port, tolerating a bracketed IPv6 literal.
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    let after_scheme = endpoint.split_once("://").map_or(endpoint, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
+    // Strip userinfo (`user:pass@host`) if present.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host_port.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[::1]:11434` → `::1`.
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        // Bare host or IPv4: take everything before the first `:` (the port).
+        None => host_port.split(':').next().unwrap_or(host_port),
+    };
+    matches!(host.trim().to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
+        || host.starts_with("127.")
 }
 
 impl Embedder for OllamaEmbedder {
@@ -151,18 +185,21 @@ impl Embedder for OllamaEmbedder {
         // Dim contract (LOUD): the int8 encoding, per-family centroids, and the linked-entries rail
         // all assume a fixed dim. A server returning a different-width vector means the configured
         // model and the server model disagree — naming both dims makes the misconfiguration
-        // obvious.
-        if let Some(first) = embeddings.first()
-            && first.len() != self.dim
-        {
-            anyhow::bail!(
-                "ollama embed dim mismatch: server returned {}-dim vectors but this model is \
-                 configured for {} dims (model `{}`). The configured registry model and the \
-                 Ollama server model must match.",
-                first.len(),
-                self.dim,
-                self.model
-            );
+        // obvious. EVERY vector is checked, not just the first: a late wrong-width vector that
+        // slipped through would make `store_embedding` bail and ABORT the whole reconcile instead
+        // of failing just that chunk, so we name the offending index and reject here.
+        for (i, vector) in embeddings.iter().enumerate() {
+            if vector.len() != self.dim {
+                anyhow::bail!(
+                    "ollama embed dim mismatch: server returned a {}-dim vector at index {} but \
+                     this model is configured for {} dims (model `{}`). The configured registry \
+                     model and the Ollama server model must match.",
+                    vector.len(),
+                    i,
+                    self.dim,
+                    self.model
+                );
+            }
         }
 
         Ok(embeddings)
@@ -276,6 +313,24 @@ mod tests {
     }
 
     #[test]
+    fn embed_batch_errors_when_a_later_vector_has_the_wrong_dim() {
+        // First vector is correct width; the SECOND is wrong. A first-only check would return Ok
+        // and let store_embedding abort the whole reconcile — every vector must be
+        // validated here.
+        let want = vec![vec![1.0f32; DIM], vec![2.0f32; DIM + 1], vec![3.0f32; DIM]];
+        let (url, handle) = spawn_stub("200 OK", embeddings_json(&want), None);
+        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 5), DIM).unwrap();
+
+        let err = embedder.embed_batch(&texts(3)).expect_err("late wrong-width vector must error");
+        handle.join().unwrap();
+
+        let msg = err.to_string();
+        assert!(msg.contains(&(DIM + 1).to_string()), "names the offending vector's dim: {msg}");
+        assert!(msg.contains("384"), "names the configured dim: {msg}");
+        assert!(msg.contains("index 1"), "names the offending vector's index: {msg}");
+    }
+
+    #[test]
     fn embed_batch_errors_on_count_mismatch() {
         // 2 vectors returned for 3 inputs.
         let want = vec![vec![1.0f32; DIM], vec![2.0f32; DIM]];
@@ -347,24 +402,55 @@ mod tests {
     }
 
     #[test]
-    fn from_remote_config_errors_when_auth_env_unset() {
-        let mut cfg = config_for("http://127.0.0.1:1", 5);
-        cfg.auth_env = Some("RAG_RAT_OLLAMA_TEST_TOKEN_DEFINITELY_UNSET".to_string());
-        let err =
-            OllamaEmbedder::from_remote_config(&cfg, DIM).expect_err("missing auth env errors");
+    fn resolve_auth_header_none_when_auth_env_absent_or_empty() {
+        // Lookup must never run when there's no var name to resolve.
+        let lookup = |_: &str| -> Option<String> { panic!("lookup should not be called") };
+        assert_eq!(resolve_auth_header(None, lookup).unwrap(), None);
+        assert_eq!(resolve_auth_header(Some("  "), lookup).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_auth_header_errors_when_named_var_unset() {
+        // Closure-injected lookup — no process-env mutation, safe under nextest's parallel runner.
+        let err = resolve_auth_header(Some("OLLAMA_TOKEN"), |_| None)
+            .expect_err("named-but-unset var errors");
         assert!(err.to_string().contains("auth env"), "{err}");
     }
 
     #[test]
-    fn from_remote_config_sets_bearer_header_from_auth_env() {
-        // SAFETY: single-threaded test; sets then reads its own scoped var.
-        let var = "RAG_RAT_OLLAMA_TEST_TOKEN_SET";
-        unsafe { std::env::set_var(var, "sekret") };
-        let mut cfg = config_for("http://127.0.0.1:1", 5);
-        cfg.auth_env = Some(var.to_string());
-        let embedder = OllamaEmbedder::from_remote_config(&cfg, DIM).unwrap();
-        assert_eq!(embedder.auth_header.as_deref(), Some("Bearer sekret"));
-        unsafe { std::env::remove_var(var) };
+    fn resolve_auth_header_errors_when_named_var_empty() {
+        let err = resolve_auth_header(Some("OLLAMA_TOKEN"), |_| Some("   ".to_string()))
+            .expect_err("named-but-empty var errors");
+        assert!(err.to_string().contains("auth env"), "{err}");
+    }
+
+    #[test]
+    fn resolve_auth_header_builds_bearer_from_looked_up_token() {
+        let header =
+            resolve_auth_header(Some("OLLAMA_TOKEN"), |_| Some("sekret".to_string())).unwrap();
+        assert_eq!(header.as_deref(), Some("Bearer sekret"));
+    }
+
+    #[test]
+    fn endpoint_is_loopback_classifies_hosts() {
+        for ep in [
+            "http://127.0.0.1:11434",
+            "http://localhost:11434",
+            "http://LOCALHOST",
+            "http://127.0.0.5:11434",
+            "http://[::1]:11434",
+            "http://127.0.0.1",
+        ] {
+            assert!(endpoint_is_loopback(ep), "should be loopback: {ep}");
+        }
+        for ep in [
+            "https://ollama.example.com:11434",
+            "http://10.0.0.5:11434",
+            "https://user:pass@remote.host/path",
+            "http://192.168.1.10",
+        ] {
+            assert!(!endpoint_is_loopback(ep), "should NOT be loopback: {ep}");
+        }
     }
 
     #[test]
