@@ -19,11 +19,7 @@ pub(crate) fn embed_query_with(
     embedder: &dyn Embedder,
     query: &str,
 ) -> anyhow::Result<QueryEmbedding> {
-    // Apply the model's query-side instruction prefix (BGE asymmetric retrieval); empty for
-    // symmetric models, so this is a no-op for hash / all-MiniLM / model2vec (#112 review).
-    let prefix = embedder.query_prefix();
-    let text = if prefix.is_empty() { query.to_string() } else { format!("{prefix}{query}") };
-    let texts = vec![text];
+    let texts = vec![query.to_string()];
     let mut vectors = embedder.embed_batch(&texts)?;
     let Some(vector) = vectors.pop() else {
         anyhow::bail!("embedder {} returned no query vector", embedder.model_id());
