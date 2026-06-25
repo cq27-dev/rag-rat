@@ -93,6 +93,13 @@ pub struct EvalOptions {
     /// hash-vector-baseline search so the delta block compares reranked-vs-reranked (same axis),
     /// never reranked-vs-unreranked. Default false → today's fuse.
     pub rerank: bool,
+    /// How many hits each `db.search` returns — the width of the candidate pool the eval scores
+    /// (#109, `--search-limit`). Default [`TOP_K`] (=10), so a plain run is unchanged. The fixed
+    /// `recall_at_3`/`recall_at_10` cutoffs are independent of this (they slice the first 3/10
+    /// hits); widening it only grows `recall_at_returned`. At 100 it measures recall@100 ≈ the
+    /// candidate-generation ceiling (of the gold, what fraction appears ANYWHERE in a wide set),
+    /// which separates the ranking lever from the generation lever — no search behavior change.
+    pub search_limit: usize,
 }
 
 /// Commit-replay eval knobs (#120).
@@ -136,6 +143,7 @@ pub struct EvalBaselineReport {
     pub delta_mrr_at_10: f64,
     pub delta_recall_at_10: f64,
     pub delta_recall_at_3: f64,
+    pub delta_recall_at_returned: f64,
     pub delta_path_hit_rate: f64,
     pub delta_symbol_hit_rate: f64,
 }
@@ -145,6 +153,11 @@ pub struct EvalMetrics {
     pub mrr_at_10: f64,
     pub recall_at_10: f64,
     pub recall_at_3: f64,
+    /// Path/symbol recall membership (same predicates as `recall_at_10`) measured over the ENTIRE
+    /// returned `hits` slice rather than a fixed cutoff — the candidate-recall ceiling for the
+    /// configured `search_limit`. `recall_at_10 <= recall_at_returned` always (top-10 ⊆ returned);
+    /// at `--search-limit 100` this is recall@100 ≈ the generation ceiling (#109).
+    pub recall_at_returned: f64,
     pub path_hit_rate: f64,
     pub symbol_hit_rate: f64,
     pub graph_evidence_hit_rate: f64,
@@ -170,6 +183,10 @@ pub struct EvalQueryReport {
     pub reciprocal_rank_at_10: f64,
     pub recall_at_10: f64,
     pub recall_at_3: f64,
+    /// Same path/symbol recall membership as `recall_at_10`, but over the WHOLE returned `hits`
+    /// slice (no fixed cutoff). `recall_at_10 <= recall_at_returned`; the ceiling at a wide
+    /// `search_limit` (#109).
+    pub recall_at_returned: f64,
     pub path_hits: Vec<String>,
     pub missing_paths: Vec<String>,
     pub symbol_hits: Vec<String>,
@@ -229,7 +246,14 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
     for query in &suite.query {
         let expected_query = expected.get(&query.id);
         let merged = merge_expected(query.clone(), expected_query);
-        let report = evaluate_query(config, &db, &merged, SearchMode::Active, options.rerank)?;
+        let report = evaluate_query(
+            config,
+            &db,
+            &merged,
+            SearchMode::Active,
+            options.rerank,
+            options.search_limit,
+        )?;
         observed.push(observed_expected(&report));
         results.push(report);
     }
@@ -239,8 +263,15 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
     }
 
     let metrics = aggregate(&results);
-    let baseline =
-        hash_vector_baseline(config, &db, &suite.query, &expected, &metrics, options.rerank)?;
+    let baseline = hash_vector_baseline(
+        config,
+        &db,
+        &suite.query,
+        &expected,
+        &metrics,
+        options.rerank,
+        options.search_limit,
+    )?;
     let oracle_eval = run_oracle_eval(&db, options)?;
     let (oracle, oracle_skipped_drifted) = match oracle_eval {
         Some((metrics, skipped_drifted)) => (Some(metrics), skipped_drifted),
@@ -397,8 +428,9 @@ fn score_case_at_parent(
         query.must_include_paths = existing_gold;
         query.must_include_symbols = symbol_gold.into_iter().collect();
         // Parent-state replay is the leakage-free HEADLINE number, not the reranker A/B dial (that
-        // is HEAD-scored `--replay --rerank`); score it with the default fuse (rerank off).
-        evaluate_query(&case_config, &case_db, &query, SearchMode::Active, false)?
+        // is HEAD-scored `--replay --rerank`); score it with the default fuse (rerank off) and the
+        // default `TOP_K` candidate width (the candidate-ceiling dial is HEAD-scored).
+        evaluate_query(&case_config, &case_db, &query, SearchMode::Active, false, TOP_K)?
     };
     let _ = std::fs::remove_file(&case_config.database);
     Ok(Some(report))
@@ -595,6 +627,7 @@ fn evaluate_query(
     query: &EvalQuery,
     mode: SearchMode,
     rerank: bool,
+    search_limit: usize,
 ) -> anyhow::Result<EvalQueryReport> {
     if query.requires_papertrail_cache && !papertrail_cache_available(db)? {
         return Ok(skipped_report(
@@ -604,12 +637,12 @@ fn evaluate_query(
     }
 
     let started = Instant::now();
-    let mut hits = search(db, mode, &query.text, rerank)?;
+    let mut hits = search(db, mode, &query.text, rerank, search_limit)?;
     let mut latency_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut current_source_violations = find_current_source_violations(config, db, &hits)?;
     if !current_source_violations.is_empty() {
         let retry_started = Instant::now();
-        hits = search(db, mode, &query.text, rerank)?;
+        hits = search(db, mode, &query.text, rerank, search_limit)?;
         latency_ms += retry_started.elapsed().as_secs_f64() * 1000.0;
         current_source_violations = find_current_source_violations(config, db, &hits)?;
     }
@@ -724,9 +757,36 @@ fn evaluate_query(
     let relevant_rank = hits.iter().position(|hit| relevant(hit, query)).map(|rank| rank + 1);
     let reciprocal_rank_at_10 = relevant_rank.map(|rank| 1.0 / rank as f64).unwrap_or(0.0);
     let expected_relevant = query.must_include_paths.len() + query.must_include_symbols.len();
+    // `path_hits`/`symbol_hits` test membership over the WHOLE returned `hits` slice, so this is
+    // the candidate-recall ceiling for the configured `search_limit` (recall over the full
+    // returned list, no fixed cutoff). At `search_limit = TOP_K` it equals `recall_at_10`
+    // below; widening the limit can only grow it, so `recall_at_10 <= recall_at_returned`
+    // always holds.
     let found_relevant = path_hits.len() + symbol_hits.len();
-    let recall_at_10 =
+    let recall_at_returned =
         if expected_relevant == 0 { 1.0 } else { found_relevant as f64 / expected_relevant as f64 };
+    // recall@10 fixes the cutoff at the first 10 hits regardless of `search_limit` — slicing the
+    // SAME membership predicates over `hits[..10]` keeps its meaning stable even at a wide limit.
+    let top10 = &hits[..TOP_K.min(hits.len())];
+    let found_relevant_at_10 = query
+        .must_include_paths
+        .iter()
+        .filter(|expected| top10.iter().any(|hit| hit.path == **expected))
+        .count()
+        + query
+            .must_include_symbols
+            .iter()
+            .filter(|expected| {
+                top10.iter().filter_map(|hit| hit.symbol_path.as_deref()).any(|symbol| {
+                    symbol == expected.as_str() || symbol.ends_with(expected.as_str())
+                })
+            })
+            .count();
+    let recall_at_10 = if expected_relevant == 0 {
+        1.0
+    } else {
+        found_relevant_at_10 as f64 / expected_relevant as f64
+    };
     // recall@3 reuses the identical path/symbol membership predicates as recall@10 above; the only
     // difference is the slice — membership is tested over the first 3 hits, not the full top-10.
     // A within-top-10 reorder (the reranker A/B target) moves this but not recall@10.
@@ -769,6 +829,7 @@ fn evaluate_query(
         reciprocal_rank_at_10,
         recall_at_10,
         recall_at_3,
+        recall_at_returned,
         path_hits,
         missing_paths,
         symbol_hits,
@@ -803,6 +864,7 @@ fn skipped_report(query: &EvalQuery, reason: impl Into<String>) -> EvalQueryRepo
         reciprocal_rank_at_10: 0.0,
         recall_at_10: 1.0,
         recall_at_3: 1.0,
+        recall_at_returned: 1.0,
         path_hits: Vec::new(),
         missing_paths: Vec::new(),
         symbol_hits: Vec::new(),
@@ -843,10 +905,14 @@ fn search(
     mode: SearchMode,
     query: &str,
     rerank: bool,
+    search_limit: usize,
 ) -> anyhow::Result<Vec<crate::search::lexical::SearchHit>> {
     // `rerank` flows identically into BOTH search modes so the active-vs-baseline delta compares
     // the same reranker axis (#109). The active path threads it through
-    // `SearchRequest.options`; the hash baseline takes it directly.
+    // `SearchRequest.options`; the hash baseline takes it directly. `search_limit` is the width of
+    // the candidate pool both modes return (default `TOP_K`); it never changes the fixed
+    // `recall_at_3`/`recall_at_10` cutoffs — only the `recall_at_returned` ceiling.
+    let limit = u32::try_from(search_limit).unwrap_or(u32::MAX);
     match mode {
         SearchMode::Active => db.search_with_graph_meta(crate::index::SearchRequest {
             include_generated: false,
@@ -854,9 +920,9 @@ fn search(
                 graded_history: rerank,
                 ..crate::search::lexical::SearchOptions::default()
             },
-            ..crate::index::SearchRequest::new(query, TOP_K as u32)
+            ..crate::index::SearchRequest::new(query, limit)
         }),
-        SearchMode::HashBaseline => db.search_hash_baseline(query, TOP_K as u32, false, rerank),
+        SearchMode::HashBaseline => db.search_hash_baseline(query, limit, false, rerank),
     }
 }
 
@@ -867,12 +933,21 @@ fn hash_vector_baseline(
     expected: &BTreeMap<String, ExpectedQuery>,
     active_metrics: &EvalMetrics,
     rerank: bool,
+    search_limit: usize,
 ) -> anyhow::Result<EvalBaselineReport> {
     let mut results = Vec::new();
     for query in queries {
         let merged = merge_expected(query.clone(), expected.get(&query.id));
-        // SAME `rerank` value as the active pass so the delta block compares the same axis (#109).
-        results.push(evaluate_query(config, db, &merged, SearchMode::HashBaseline, rerank)?);
+        // SAME `rerank` value AND `search_limit` as the active pass so the delta block compares the
+        // same axes (#109).
+        results.push(evaluate_query(
+            config,
+            db,
+            &merged,
+            SearchMode::HashBaseline,
+            rerank,
+            search_limit,
+        )?);
     }
     let metrics = aggregate(&results);
     let current_artifacts = db.current_embedding_count(crate::embedding_models::HASH_MODEL_ID)?;
@@ -883,6 +958,7 @@ fn hash_vector_baseline(
         delta_mrr_at_10: active_metrics.mrr_at_10 - metrics.mrr_at_10,
         delta_recall_at_10: active_metrics.recall_at_10 - metrics.recall_at_10,
         delta_recall_at_3: active_metrics.recall_at_3 - metrics.recall_at_3,
+        delta_recall_at_returned: active_metrics.recall_at_returned - metrics.recall_at_returned,
         delta_path_hit_rate: active_metrics.path_hit_rate - metrics.path_hit_rate,
         delta_symbol_hit_rate: active_metrics.symbol_hit_rate - metrics.symbol_hit_rate,
         metrics,
@@ -1019,6 +1095,8 @@ fn aggregate(results: &[EvalQueryReport]) -> EvalMetrics {
         mrr_at_10: measured.iter().map(|r| r.reciprocal_rank_at_10).sum::<f64>() / query_count,
         recall_at_10: measured.iter().map(|r| r.recall_at_10).sum::<f64>() / query_count,
         recall_at_3: measured.iter().map(|r| r.recall_at_3).sum::<f64>() / query_count,
+        recall_at_returned: measured.iter().map(|r| r.recall_at_returned).sum::<f64>()
+            / query_count,
         path_hit_rate: hit_rate(&measured, |r| r.missing_paths.is_empty()),
         symbol_hit_rate: hit_rate(&measured, |r| r.missing_symbols.is_empty()),
         graph_evidence_hit_rate: expected_hit_rate(&measured, |r| {
@@ -1188,6 +1266,7 @@ mod tests {
             scip_path: None,
             replay: None,
             rerank: false,
+            search_limit: TOP_K,
         })
         .unwrap();
         // Safety + non-zero retrieval hold in every build shape.
@@ -1195,9 +1274,11 @@ mod tests {
         assert!(report.metrics.mrr_at_10 > 0.0);
         assert!(report.metrics.recall_at_10 > 0.0);
 
-        // recall@3 measures membership over the first 3 hits, recall@10 over all 10; the top-3 is a
-        // subset of the top-10, so recall@3 can never exceed recall@10 — neither per query nor in
-        // the aggregate mean. A regression here means recall@3 stopped slicing the same hit list.
+        // recall@3 measures membership over the first 3 hits, recall@10 over all 10, and
+        // recall_at_returned over the WHOLE returned list; top-3 ⊆ top-10 ⊆ returned, so the chain
+        // recall@3 <= recall@10 <= recall_at_returned can never invert — neither per query nor in
+        // the aggregate mean. A regression here means a recall metric stopped slicing the same hit
+        // list (or the limit leaked into a fixed cutoff's meaning).
         for result in report.results.iter().filter(|result| !result.skipped) {
             assert!(
                 result.recall_at_3 <= result.recall_at_10,
@@ -1206,8 +1287,16 @@ mod tests {
                 result.recall_at_3,
                 result.recall_at_10,
             );
+            assert!(
+                result.recall_at_10 <= result.recall_at_returned,
+                "{}: recall@10 ({}) exceeded recall_at_returned ({})",
+                result.id,
+                result.recall_at_10,
+                result.recall_at_returned,
+            );
         }
         assert!(report.metrics.recall_at_3 <= report.metrics.recall_at_10);
+        assert!(report.metrics.recall_at_10 <= report.metrics.recall_at_returned);
 
         // The full hand-authored `must_include_*` baseline is the hard gate ONLY with an embedding
         // backend. Some expectations (the const-arrow hook by name, the graph-neighbor query)
@@ -1294,6 +1383,7 @@ mod tests {
             scip_path: Some(scip_path),
             replay: None,
             rerank: false,
+            search_limit: TOP_K,
         })
         .unwrap();
 

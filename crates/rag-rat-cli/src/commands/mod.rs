@@ -447,6 +447,7 @@ pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
             max_files: args.replay_max_files,
         }),
         rerank: args.rerank,
+        search_limit: args.search_limit,
     };
     let report = rag_rat_core::eval::run(config, &options)?;
     // `eval` prints a greppable human summary by default; the global `--json` (or a baseline
