@@ -192,21 +192,55 @@ pub(crate) fn fastembed_cache_dir() -> PathBuf {
     PathBuf::from(".rag-rat").join("models")
 }
 
+/// Symmetric int8 scalar-quantization range: codes span [-127, 127] (not 128) so a value and its
+/// negation map to opposite codes. The largest-magnitude component maps to ±127; the rest round
+/// proportionally.
+const INT8_QUANT_LEVELS: f32 = 127.0;
+
+/// Decode a stored embedding blob back to f32. TWO on-disk formats coexist, distinguished purely by
+/// length (they never collide: `4*dim != dim+4` for any `dim >= 1`):
+/// - **legacy f32**: `dim` little-endian f32 (`4*dim` bytes).
+/// - **int8 (#112)**: a leading f32 `scale` then `dim` signed-int8 codes (`4 + dim` bytes),
+///   dequantized as `v[i] = code[i] * scale`. ~4x smaller on disk/in memory.
+///
+/// Keeping the f32 reader means an index written before int8 (or a half-reconciled one) still
+/// decodes — the formats can be mixed per-row during migration.
 pub(crate) fn decode_vector(blob: &[u8], dim: usize) -> Option<Vec<f32>> {
-    if blob.len() != dim.checked_mul(4)? {
-        return None;
+    if blob.len() == dim.checked_mul(4)? {
+        let mut out = Vec::with_capacity(dim);
+        for bytes in blob.chunks_exact(4) {
+            out.push(f32::from_le_bytes(bytes.try_into().ok()?));
+        }
+        return Some(out);
     }
-    let mut out = Vec::with_capacity(dim);
-    for bytes in blob.chunks_exact(4) {
-        out.push(f32::from_le_bytes(bytes.try_into().ok()?));
+    if blob.len() == dim.checked_add(4)? {
+        let scale = f32::from_le_bytes(blob.get(..4)?.try_into().ok()?);
+        let mut out = Vec::with_capacity(dim);
+        for &code in &blob[4..] {
+            out.push(f32::from(code as i8) * scale);
+        }
+        return Some(out);
     }
-    Some(out)
+    None
 }
 
+/// Encode an embedding as a symmetric int8-quantized blob (#112): one f32 `scale` + one signed byte
+/// per dim, ~4x smaller than the f32 blob. `scale = max|v| / 127`; an all-zero vector encodes
+/// `scale = 0` + zero codes. The quantization costs well under 1% recall on the L2-normalized
+/// embeddings rag-rat stores (measured on the #120 replay eval). [`decode_vector`] reads it back.
 pub(crate) fn encode_vector(vector: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vector.len() * 4);
-    for value in vector {
-        out.extend_from_slice(&value.to_le_bytes());
+    let max_abs = vector.iter().fold(0.0_f32, |max, value| max.max(value.abs()));
+    let scale = if max_abs > 0.0 { max_abs / INT8_QUANT_LEVELS } else { 0.0 };
+    let mut out = Vec::with_capacity(4 + vector.len());
+    out.extend_from_slice(&scale.to_le_bytes());
+    if scale > 0.0 {
+        let inv = 1.0 / scale;
+        for &value in vector {
+            let code = (value * inv).round().clamp(-INT8_QUANT_LEVELS, INT8_QUANT_LEVELS) as i8;
+            out.push(code as u8);
+        }
+    } else {
+        out.resize(4 + vector.len(), 0);
     }
     out
 }
@@ -438,6 +472,59 @@ pub(crate) fn find_existing_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unit(v: &[f32]) -> Vec<f32> {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / norm).collect()
+    }
+    fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    #[test]
+    fn encode_vector_uses_the_compact_int8_format() {
+        // int8 blob = 4-byte scale + one byte per dim — 4x smaller than the 4*dim f32 blob (#112).
+        let v = vec![0.1_f32, -0.5, 0.9, -0.2, 0.0, 0.33];
+        assert_eq!(encode_vector(&v).len(), 4 + v.len());
+    }
+
+    #[test]
+    fn int8_round_trip_is_within_one_quantization_step() {
+        let v = vec![0.12_f32, -0.5, 0.97, -0.2, 0.0, 0.33, -0.81];
+        let decoded = decode_vector(&encode_vector(&v), v.len()).unwrap();
+        let step = 0.97 / 127.0; // max|v| / 127
+        for (a, b) in v.iter().zip(&decoded) {
+            assert!((a - b).abs() <= step + 1e-6, "{a} vs {b} (step {step})");
+        }
+    }
+
+    #[test]
+    fn decode_vector_still_reads_legacy_f32_blobs() {
+        // A pre-int8 (or half-reconciled, mixed-format) index stores 4*dim f32 bytes per row; the
+        // length-based format detection must still decode those exactly.
+        let v = vec![0.1_f32, -0.5, 0.9];
+        let f32_blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert_eq!(f32_blob.len(), 4 * v.len());
+        assert_eq!(decode_vector(&f32_blob, v.len()), Some(v));
+    }
+
+    #[test]
+    fn int8_preserves_cosine_within_tolerance() {
+        // The quality-relevant property: dot(query, dequant(chunk)) ≈ dot(query, chunk) for the
+        // L2-normalized vectors rag-rat stores. This is why int8 costs <1% recall.
+        let chunk = unit(&[0.2, 0.5, -0.3, 0.7, -0.1, 0.4]);
+        let query = unit(&[0.3, 0.4, -0.2, 0.6, 0.1, 0.5]);
+        let exact = dot_f32(&query, &chunk);
+        let dequant = decode_vector(&encode_vector(&chunk), chunk.len()).unwrap();
+        let approx = dot_f32(&query, &dequant);
+        assert!((exact - approx).abs() < 0.01, "exact {exact} vs int8 {approx}");
+    }
+
+    #[test]
+    fn encode_vector_handles_all_zero_vector() {
+        let v = vec![0.0_f32; 4];
+        assert_eq!(decode_vector(&encode_vector(&v), v.len()), Some(v));
+    }
 
     #[test]
     fn registered_embedding_models_have_consistent_dim_and_version() {
