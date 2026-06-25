@@ -1,5 +1,6 @@
 mod helpers;
 mod policy;
+mod providers;
 mod reconcile;
 mod reencode;
 mod status;
@@ -10,6 +11,25 @@ use std::time::Instant;
 
 pub(crate) use helpers::*;
 pub(crate) use policy::*;
+#[cfg(feature = "fastembed")]
+pub use providers::FastEmbedEmbedder;
+#[cfg(test)]
+pub use providers::MockEmbedder;
+#[cfg(feature = "model2vec")]
+pub use providers::Model2VecEmbedder;
+pub(crate) use providers::active_embedder;
+// Curate the provider surface onto the `index::ai` path so existing `super::*` callers
+// (`reconcile`, `status`, `helpers`) and the external `ai::Embedder` /
+// `ai::FASTEMBED_MISSING_*` references keep resolving after the move into `providers/`. mod.rs
+// is the index, not a shim. The types/consts re-export with their pre-move `pub` visibility:
+// before the move they were `pub` items directly in this (`pub mod ai`) module, i.e. reachable
+// as the crate-public path `crate::index::ai::*`, which exempts them from dead-code/unused
+// analysis even when a given feature build has no live caller (`MockEmbedder`, the
+// `#[cfg(not(...))]`-only consts). A `pub(crate)` re-export would narrow that and redden `-D
+// warnings`.
+pub use providers::{
+    Embedder, FASTEMBED_MISSING_FEATURE_MESSAGE, HashEmbedder, MODEL2VEC_MISSING_FEATURE_MESSAGE,
+};
 pub(crate) use reconcile::*;
 pub(crate) use reencode::*;
 use rusqlite::types::Value;
@@ -19,23 +39,9 @@ use sha2::{Digest, Sha256};
 pub(crate) use status::*;
 pub(crate) use store::*;
 
-#[cfg(feature = "fastembed")]
-use crate::embedding_models::{BGE_SMALL_MODEL_ID, JINA_CODE_MODEL_ID};
-use crate::embedding_models::{HASH_EMBEDDING_DIM, HASH_MODEL_ID};
-#[cfg(feature = "model2vec")]
-use crate::embedding_models::{MODEL2VEC_EMBEDDING_DIM, MODEL2VEC_MODEL_ID};
 use crate::index::now_ms;
 use crate::language::Language;
 
-/// The Model2Vec HF repo to pull weights from. Not a registry field — it is a construction detail
-/// of `Model2VecEmbedder`, not part of the model's index identity.
-pub const MODEL2VEC_HF_REPO: &str = "minishlab/potion-retrieval-32M";
-pub const MODEL2VEC_MISSING_FEATURE_MESSAGE: &str =
-    "Model2Vec backend requested, but this binary was built without Model2Vec support.\nRebuild \
-     with default features enabled:\n  cargo install rag-rat";
-pub const FASTEMBED_MISSING_FEATURE_MESSAGE: &str =
-    "FastEmbed backend requested, but this binary was built without default FastEmbed \
-     support.\nRebuild with default features enabled:\n  cargo install rag-rat";
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
 const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";
 const LAST_EMBEDDING_RECONCILE_STARTED_META: &str = "last_embedding_reconcile_started_at_ms";
@@ -47,162 +53,6 @@ pub const EMBEDDING_TEXT_VERSION: &str = "embedding-text-v2";
 const LEGACY_MODEL_IDS: &[&str] = &["embedding-small"];
 #[cfg(feature = "fastembed")]
 const FASTEMBED_HF_CACHE_REPO_DIR: &str = "models--Qdrant--all-MiniLM-L6-v2-onnx";
-
-pub trait Embedder {
-    fn model_id(&self) -> &str;
-    fn dim(&self) -> usize;
-    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
-}
-
-pub struct HashEmbedder;
-
-impl Embedder for HashEmbedder {
-    fn model_id(&self) -> &str {
-        HASH_MODEL_ID
-    }
-
-    fn dim(&self) -> usize {
-        HASH_EMBEDDING_DIM
-    }
-
-    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|text| hash_embed_text(text, HASH_EMBEDDING_DIM)).collect())
-    }
-}
-
-#[cfg(test)]
-pub struct MockEmbedder {
-    model_id: String,
-    dim: usize,
-}
-
-#[cfg(test)]
-impl MockEmbedder {
-    pub fn new(model_id: impl Into<String>, dim: usize) -> Self {
-        Self { model_id: model_id.into(), dim }
-    }
-}
-
-#[cfg(test)]
-impl Embedder for MockEmbedder {
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|text| hash_embed_text(text, self.dim)).collect())
-    }
-}
-
-#[cfg(feature = "fastembed")]
-pub struct FastEmbedEmbedder {
-    model: std::sync::Mutex<fastembed::TextEmbedding>,
-    model_id: &'static str,
-    dim: usize,
-}
-
-#[cfg(feature = "fastembed")]
-impl FastEmbedEmbedder {
-    /// Construct the FastEmbed embedder for a registered model id. This is the ONLY place that maps
-    /// a `model_id` to a `fastembed::EmbeddingModel` enum — every fastembed model the registry
-    /// knows about is selected here, defaulting to all-MiniLM for the (registry-guaranteed)
-    /// MiniLM id. The `dim` comes from the registry spec so the embedder reports the right
-    /// dimension without a second source of truth.
-    ///
-    /// All current fastembed models are SYMMETRIC (queries and code embed raw); fastembed applies
-    /// each model's Mean pooling + L2-normalize internally, so nothing is overridden here. See the
-    /// BGE instruction-collapse note in `embedding_models`.
-    pub fn for_model_id(
-        model_id: &'static str,
-        dim: usize,
-        intra_threads: Option<usize>,
-    ) -> anyhow::Result<Self> {
-        let model = match model_id {
-            BGE_SMALL_MODEL_ID => fastembed::EmbeddingModel::BGESmallENV15,
-            JINA_CODE_MODEL_ID => fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode,
-            _ => fastembed::EmbeddingModel::AllMiniLML6V2,
-        };
-        Self::with_model(model, model_id, dim, intra_threads)
-    }
-
-    fn with_model(
-        model: fastembed::EmbeddingModel,
-        model_id: &'static str,
-        dim: usize,
-        intra_threads: Option<usize>,
-    ) -> anyhow::Result<Self> {
-        use fastembed::{InitOptions, TextEmbedding};
-        let mut options = InitOptions::new(model)
-            .with_cache_dir(fastembed_cache_dir())
-            .with_show_download_progress(true);
-        // `ort_threads` caps the ONNX Runtime intra-op thread pool. Microsoft's prebuilt ORT
-        // binaries (what fastembed downloads) are OpenMP-based, where this has no effect and
-        // OMP_NUM_THREADS (set from `omp_threads`) is the lever instead — see docs/config.md.
-        // We still apply it so non-OpenMP builds honor the configured cap.
-        if let Some(threads) = intra_threads.filter(|threads| *threads > 0) {
-            options = options.with_intra_threads(threads);
-        }
-        Ok(Self { model: std::sync::Mutex::new(TextEmbedding::try_new(options)?), model_id, dim })
-    }
-}
-
-#[cfg(feature = "fastembed")]
-impl Embedder for FastEmbedEmbedder {
-    fn model_id(&self) -> &str {
-        self.model_id
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let documents = texts.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut model =
-            self.model.lock().map_err(|_| anyhow::anyhow!("fastembed model lock poisoned"))?;
-        model.embed(documents, None)
-    }
-}
-
-#[cfg(feature = "model2vec")]
-pub struct Model2VecEmbedder {
-    model: model2vec_rs::model::StaticModel,
-}
-
-#[cfg(feature = "model2vec")]
-impl Model2VecEmbedder {
-    pub fn new() -> anyhow::Result<Self> {
-        // Downloads (and caches) the static model from the Hugging Face hub on first use; L2-
-        // normalize so cosine similarity matches the FastEmbed path's expectations.
-        let model = model2vec_rs::model::StaticModel::from_pretrained(
-            MODEL2VEC_HF_REPO,
-            None,
-            Some(true),
-            None,
-        )
-        .map_err(|err| anyhow::anyhow!("failed to load Model2Vec model: {err}"))?;
-        Ok(Self { model })
-    }
-}
-
-#[cfg(feature = "model2vec")]
-impl Embedder for Model2VecEmbedder {
-    fn model_id(&self) -> &str {
-        MODEL2VEC_MODEL_ID
-    }
-
-    fn dim(&self) -> usize {
-        MODEL2VEC_EMBEDDING_DIM
-    }
-
-    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(self.model.encode(texts))
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ArtifactStatus {

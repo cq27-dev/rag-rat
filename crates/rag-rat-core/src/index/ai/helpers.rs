@@ -1,5 +1,5 @@
 use super::*;
-use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
+use crate::embedding_models::{HASH_MODEL_ID, spec};
 
 pub(crate) fn embed_query(
     conn: &Connection,
@@ -82,59 +82,6 @@ pub(crate) fn current_embedding_count(conn: &Connection, model_id: &str) -> anyh
         |row| row.get(0),
     )?;
     Ok(u64::try_from(count).unwrap_or(0))
-}
-
-pub(crate) fn active_embedder(
-    conn: &Connection,
-    intra_threads: Option<usize>,
-) -> anyhow::Result<Box<dyn Embedder>> {
-    let model_id = active_embedding_model_id(conn)?;
-    let model = model(conn, &model_id)?;
-    validate_ready_model(&model)?;
-    let spec = spec(&model.model_id)
-        .ok_or_else(|| anyhow::anyhow!("unknown active embedding model `{}`", model.model_id))?;
-    embedder_for_spec(spec, intra_threads)
-}
-
-/// Build the embedder for a registry spec, dispatching on its `backend`. The single construction
-/// site for every model — the per-model factory fns this replaced (`fastembed_embedder`,
-/// `bge_small_embedder`, `jina_code_embedder`, `model2vec_embedder`) collapsed into this dispatch.
-/// The `#[cfg]` gating + missing-feature bails for builds without `fastembed` / `model2vec` are
-/// preserved here.
-pub(crate) fn embedder_for_spec(
-    spec: &'static EmbeddingModelSpec,
-    intra_threads: Option<usize>,
-) -> anyhow::Result<Box<dyn Embedder>> {
-    match spec.backend {
-        Backend::Hash => Ok(Box::new(HashEmbedder)),
-        Backend::FastEmbed => {
-            #[cfg(feature = "fastembed")]
-            {
-                Ok(Box::new(FastEmbedEmbedder::for_model_id(
-                    spec.model_id,
-                    spec.dim,
-                    intra_threads,
-                )?))
-            }
-            #[cfg(not(feature = "fastembed"))]
-            {
-                let _ = intra_threads;
-                anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
-            }
-        },
-        Backend::Model2Vec => {
-            #[cfg(feature = "model2vec")]
-            {
-                let _ = intra_threads;
-                Ok(Box::new(Model2VecEmbedder::new()?))
-            }
-            #[cfg(not(feature = "model2vec"))]
-            {
-                let _ = intra_threads;
-                anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
-            }
-        },
-    }
 }
 
 pub(crate) fn validate_ready_model(model: &ModelInfo) -> anyhow::Result<()> {
