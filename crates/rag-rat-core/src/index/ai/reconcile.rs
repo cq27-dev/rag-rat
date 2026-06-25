@@ -190,6 +190,8 @@ pub(crate) fn install_model(conn: &Connection, model_id: &str) -> anyhow::Result
         },
         Backend::FastEmbed => install_fastembed_model(conn, model_id)?,
         Backend::Model2Vec => install_model2vec_model(conn, model_id)?,
+        // Ollama install (a reachability + dim probe, no download) is #317 task 6; bail until then.
+        Backend::Ollama => anyhow::bail!("ollama embedding backend not yet wired (#317 task 6)"),
     }
     set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
     model(conn, model_id)

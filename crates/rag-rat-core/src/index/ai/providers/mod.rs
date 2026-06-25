@@ -82,6 +82,10 @@ pub(crate) fn embedder_for_spec(
                 anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
             }
         },
+        // The Ollama HTTP backend is wired in #317 task 5 (dispatch + role split). The registry
+        // row + enum variant exist as of task 2 so the table is complete; constructing one bails
+        // until then.
+        Backend::Ollama => anyhow::bail!("ollama embedding backend not yet wired (#317 task 5)"),
     }
 }
 

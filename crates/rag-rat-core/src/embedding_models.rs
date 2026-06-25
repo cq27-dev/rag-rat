@@ -23,6 +23,10 @@ pub enum Backend {
     FastEmbed,
     /// A Model2Vec static token→vector lookup; gated behind the `model2vec` feature.
     Model2Vec,
+    /// A remote Ollama server (`POST /api/embed`); gated behind the `remote-embed` feature. The
+    /// endpoint/auth/timeout come from the `[embedding.remote]` config block, not the static
+    /// registry — the row carries only identity + dim (#317).
+    Ollama,
 }
 
 impl Backend {
@@ -33,6 +37,7 @@ impl Backend {
             Self::Hash => "hash",
             Self::FastEmbed => "fastembed",
             Self::Model2Vec => "model2vec",
+            Self::Ollama => "ollama",
         }
     }
 }
@@ -96,6 +101,14 @@ pub const MODEL2VEC_MODEL_ID: &str = "model2vec-potion-retrieval-32m";
 pub const MODEL2VEC_DISPLAY_MODEL: &str = "minishlab/potion-retrieval-32M";
 pub const MODEL2VEC_EMBEDDING_DIM: usize = 512;
 
+/// all-MiniLM-L6-v2 served by Ollama (#317): the remote/GPU mirror of the local FastEmbed default.
+/// Same 384-dim model family, so chunks can embed remotely while a query embeds locally in the SAME
+/// vector space. Endpoint/auth/timeout come from the `[embedding.remote]` config block, never this
+/// `&'static` registry — the row carries only the model's identity + dim.
+pub const OLLAMA_ALL_MINILM_MODEL_ID: &str = "ollama-all-minilm";
+pub const OLLAMA_ALL_MINILM_DISPLAY_MODEL: &str = "all-MiniLM-L6-v2 (Ollama)";
+pub const OLLAMA_ALL_MINILM_EMBEDDING_DIM: usize = 384;
+
 /// The embedding-model registry. ONE row per model — adding a model is adding a row here. Pure
 /// data, no feature gates; the embedder construction is gated in `index::ai`.
 pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
@@ -142,6 +155,15 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         version: "model2vec-potion-retrieval-32m-v1",
         backend: Backend::Model2Vec,
         aliases: &["model2vec", "potion", "static"],
+        query_prefix: "",
+    },
+    EmbeddingModelSpec {
+        model_id: OLLAMA_ALL_MINILM_MODEL_ID,
+        display: OLLAMA_ALL_MINILM_DISPLAY_MODEL,
+        dim: OLLAMA_ALL_MINILM_EMBEDDING_DIM,
+        version: "ollama-all-minilm-v1",
+        backend: Backend::Ollama,
+        aliases: &["ollama", "ollama-minilm"],
         query_prefix: "",
     },
 ];
