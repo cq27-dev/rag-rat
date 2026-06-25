@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.9.0...rag-rat-core-v0.10.0) - 2026-06-25
+
+### Added
+
+- *(eval)* track commit-replay search recall in Bencher on main ([#315](https://github.com/cq27-dev/rag-rat/pull/315))
+- *(embed)* re-encode existing f32 embedding blobs to int8 ([#312](https://github.com/cq27-dev/rag-rat/pull/312)) ([#313](https://github.com/cq27-dev/rag-rat/pull/313))
+- *(embed)* int8 scalar quantization for chunk_embeddings — ~4x smaller, neutral quality ([#112](https://github.com/cq27-dev/rag-rat/pull/112)) ([#311](https://github.com/cq27-dev/rag-rat/pull/311))
+- *(eval)* recall@3 + recall@returned ceiling metrics; graded-git rerank (off) — #109 spike ([#310](https://github.com/cq27-dev/rag-rat/pull/310))
+- *(eval)* commit-replay retrieval eval harness ([#120](https://github.com/cq27-dev/rag-rat/pull/120)) ([#303](https://github.com/cq27-dev/rag-rat/pull/303))
+
+### Fixed
+
+- *(eval)* suppress git hooks on the replay's throwaway worktrees ([#306](https://github.com/cq27-dev/rag-rat/pull/306))
+
+### Other
+
+- *(embed)* centralize the embedding-model registry; BGE + jina as selectable options ([#112](https://github.com/cq27-dev/rag-rat/pull/112)) ([#309](https://github.com/cq27-dev/rag-rat/pull/309))
+
 ## [0.9.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.8.0...rag-rat-core-v0.9.0) - 2026-06-24
 
 ### Added
