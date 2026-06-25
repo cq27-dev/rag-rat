@@ -6,7 +6,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::embedding_models::{EmbeddingModelSpec, spec_for_alias};
+use crate::embedding_models::{Backend, EmbeddingModelSpec, spec_for_alias};
 use crate::language::{Language, LanguageError};
 
 #[derive(Debug, Clone)]
@@ -163,6 +163,14 @@ impl EmbeddingBackend {
     /// embeddings-off choice.
     pub fn model_id(self) -> Option<&'static str> {
         self.0.map(|spec| spec.model_id)
+    }
+
+    /// The registry [`Backend`] this selector resolves to (`None` for the embeddings-off choice).
+    /// Lets `config` reason about which runtime a `model = "..."` picks — e.g. the
+    /// `[embedding.remote]` coherence check that pairs an Ollama backend with a remote block —
+    /// without re-deriving the mapping the registry already owns.
+    pub fn registry_backend(self) -> Option<Backend> {
+        self.0.map(|spec| spec.backend)
     }
 }
 
@@ -728,6 +736,18 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
             None => EmbeddingBackend::default(),
         };
         let remote = raw.remote.map(RemoteEmbeddingConfig::try_from).transpose()?;
+        // Cross-field coherence: the `[embedding.remote]` block and the `model = "..."` selector
+        // must AGREE on whether embedding is remote. Run AFTER `RemoteEmbeddingConfig::try_from`
+        // (above) so a malformed block fails with its own specific error first. We REJECT
+        // incoherent configs rather than auto-selecting a backend — silently running the LOCAL
+        // model while the user believes remote offload is on (a remote block but a fastembed
+        // `model`) is the trap this guards.
+        let selects_ollama = backend.registry_backend() == Some(Backend::Ollama);
+        match (selects_ollama, remote.is_some()) {
+            (false, true) => return Err(ConfigError::RemoteEmbeddingBackendMismatch),
+            (true, false) => return Err(ConfigError::RemoteEmbeddingMissingConfig),
+            _ => {},
+        }
         Ok(Self { backend, runtime: raw.runtime.into(), remote })
     }
 }
@@ -841,6 +861,16 @@ pub enum ConfigError {
          provisioning cookbook, #318); use mode = \"connect\" for now"
     )]
     RemoteEmbeddingEphemeralUnsupported,
+    #[error(
+        "an [local_ai.embedding.remote] block is set but `model` doesn't select an Ollama model; \
+         set `model = \"ollama\"` or remove the remote block"
+    )]
+    RemoteEmbeddingBackendMismatch,
+    #[error(
+        "the Ollama embedding backend (`model = \"ollama\"`) requires an \
+         [local_ai.embedding.remote] block with `endpoint` + `model`"
+    )]
+    RemoteEmbeddingMissingConfig,
     #[error("duplicate target name `{0}`")]
     DuplicateTarget(String),
     #[error("configured directory does not exist: {0}")]
@@ -1190,6 +1220,9 @@ mod tests {
             [index]
             root = "."
 
+            [local_ai.embedding]
+            model = "ollama"
+
             [local_ai.embedding.remote]
             mode = "connect"
             model = "all-minilm"
@@ -1219,6 +1252,9 @@ mod tests {
             [index]
             root = "."
 
+            [local_ai.embedding]
+            model = "ollama"
+
             [local_ai.embedding.remote]
             model = "all-minilm"
             endpoint = "http://localhost:11434"
@@ -1236,6 +1272,9 @@ mod tests {
             r#"
             [index]
             root = "."
+
+            [local_ai.embedding]
+            model = "ollama"
 
             [local_ai.embedding.remote]
             model = "all-minilm"
@@ -1262,10 +1301,16 @@ mod tests {
 
     #[test]
     fn remote_embedding_connect_without_endpoint_is_rejected() {
+        // `model = "ollama"` keeps the config coherent on the cross-field axis, so the block's own
+        // missing-endpoint error (which fires first, in RemoteEmbeddingConfig::try_from) is the
+        // ONLY error in play — not the mismatch guard.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
+
+            [local_ai.embedding]
+            model = "ollama"
 
             [local_ai.embedding.remote]
             mode = "connect"
@@ -1287,6 +1332,9 @@ mod tests {
             [index]
             root = "."
 
+            [local_ai.embedding]
+            model = "ollama"
+
             [local_ai.embedding.remote]
             mode = "ephemeral"
             model = "all-minilm"
@@ -1302,11 +1350,18 @@ mod tests {
 
     #[test]
     fn remote_embedding_missing_model_is_rejected() {
-        // Block present (so it parses to Some) but `model` omitted → missing-model error.
+        // `model = "ollama"` (the backend selector) keeps the config coherent so the block's own
+        // missing-model error is the only one in play. NOTE the two `model` keys are distinct: the
+        // `[local_ai.embedding] model` is the registry SELECTOR; the `[remote] model` is the Ollama
+        // API model name — it's the latter that's missing here.
+        // Block present (so it parses to Some) but `[remote] model` omitted → missing-model error.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
+
+            [local_ai.embedding]
+            model = "ollama"
 
             [local_ai.embedding.remote]
             endpoint = "http://localhost:11434"
@@ -1319,11 +1374,14 @@ mod tests {
             "omitted model → RemoteEmbeddingMissingModel, got {err:?}",
         );
 
-        // A whitespace-only `model` trims to empty and is rejected the same way.
+        // A whitespace-only `[remote] model` trims to empty and is rejected the same way.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
+
+            [local_ai.embedding]
+            model = "ollama"
 
             [local_ai.embedding.remote]
             model = "   "
@@ -1335,6 +1393,50 @@ mod tests {
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingMissingModel),
             "whitespace-only model → RemoteEmbeddingMissingModel, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn remote_block_without_ollama_backend_is_a_mismatch() {
+        // A fully-valid [remote] block but `model` selects (defaults to) fastembed — the trap: the
+        // user believes remote offload is on, but the LOCAL model would run. Rejected, not
+        // auto-selected.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding.remote]
+            model = "all-minilm"
+            endpoint = "http://localhost:11434"
+            "#,
+        )
+        .unwrap();
+        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RemoteEmbeddingBackendMismatch),
+            "remote block + non-ollama model → RemoteEmbeddingBackendMismatch, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn ollama_backend_without_remote_block_is_missing_config() {
+        // `model = "ollama"` selects the Ollama backend, but there's no [remote] block to tell it
+        // where/how to reach the server → incoherent, rejected.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding]
+            model = "ollama"
+            "#,
+        )
+        .unwrap();
+        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RemoteEmbeddingMissingConfig),
+            "ollama backend without remote block → RemoteEmbeddingMissingConfig, got {err:?}",
         );
     }
 
