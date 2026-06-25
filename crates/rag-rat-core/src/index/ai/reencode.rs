@@ -6,10 +6,25 @@ use super::*;
 /// so no fresh f32 rows ever appear after the conversion.
 const VECTOR_INT8_REENCODE_DONE_META: &str = "vector_int8_reencode_done";
 
+/// Reconcile-meta key persisting the keyset cursor (the last converted `(chunk_id, model_id)`)
+/// across maintenance passes, so a deadline-stopped conversion RESUMES from where it left off
+/// instead of rescanning from the table head. Serialized as `"<chunk_id>\n<model_id>"`. Only
+/// meaningful while the done-gate ([`VECTOR_INT8_REENCODE_DONE_META`]) is unset.
+const VECTOR_INT8_REENCODE_CURSOR_META: &str = "vector_int8_reencode_cursor";
+
 /// Rows converted per transaction. Bounded so a huge index (millions of embeddings) never builds
 /// one giant transaction or holds the write lock for the whole table — each batch reads, converts,
 /// and writes a chunk, then commits and loops.
 const REENCODE_BATCH_SIZE: usize = 4_000;
+
+/// Outcome of a conversion run: how many rows it re-encoded, and whether it ran to the NATURAL end
+/// (`completed == true` — a batch came back short, so no f32 rows remain past the cursor) versus
+/// being cut short by the deadline (`completed == false`). The wrapper sets the run-once done-gate
+/// only when `completed`.
+struct ReencodeOutcome {
+    converted: usize,
+    completed: bool,
+}
 
 /// One legacy f32 row to re-encode: its compound key plus the stored vector bytes. `(chunk_id,
 /// model_id)` is the `chunk_embeddings` PK and doubles as the keyset cursor.
@@ -31,13 +46,11 @@ struct LegacyVectorRow {
 /// length-based format dispatch.
 ///
 /// Works in bounded batches inside per-batch transactions and is IDEMPOTENT + resumable: re-running
-/// converts only the rows still in f32. Returns the total number of rows converted.
-pub(crate) fn reencode_legacy_f32_blobs(conn: &Connection) -> anyhow::Result<usize> {
-    reencode_legacy_f32_blobs_batched(conn, REENCODE_BATCH_SIZE)
-}
-
-/// The conversion loop, parameterized by `batch_size` so tests can drive multi-batch behavior with
-/// a tiny size. The public wrapper passes [`REENCODE_BATCH_SIZE`].
+/// converts only the rows still in f32.
+///
+/// The conversion loop, parameterized by `batch_size` (so tests can drive multi-batch behavior with
+/// a tiny size; the public wrapper passes [`REENCODE_BATCH_SIZE`]) and a `deadline` (so the
+/// budgeted maintenance path can stop mid-conversion).
 ///
 /// Termination is CURSOR-driven, not "did this batch convert anything"-driven: a `(chunk_id,
 /// model_id)` keyset cursor walks the f32 rows in PK order, advancing past every row it reads
@@ -46,32 +59,75 @@ pub(crate) fn reencode_legacy_f32_blobs(conn: &Connection) -> anyhow::Result<usi
 /// loop ends when a batch comes back short of `batch_size`. The cursor also avoids the quadratic
 /// rescan a bare `LIMIT` would cause (each batch would otherwise re-scan from the table start past
 /// every already-converted row).
+///
+/// The cursor is PERSISTED (`VECTOR_INT8_REENCODE_CURSOR_META`) after each committed batch and
+/// LOADED at the start, so a deadline-stopped run resumes from where it left off on the next call
+/// rather than rescanning. `completed` is `true` only when the loop reached the natural end (a
+/// short batch = no f32 rows remain); a deadline stop returns `completed == false` with the cursor
+/// left persisted.
 fn reencode_legacy_f32_blobs_batched(
     conn: &Connection,
     batch_size: usize,
-) -> anyhow::Result<usize> {
+    deadline: Option<Instant>,
+) -> anyhow::Result<ReencodeOutcome> {
     let mut total = 0usize;
-    // Cursor starts before every real row: `chunk_id >= ` any actual id, and the empty model_id
-    // sorts first, so `(chunk_id, model_id) > (i64::MIN, "")` matches all rows.
-    let mut cursor = (i64::MIN, String::new());
+    // Resume from the persisted cursor if one is stored (a prior deadline-stopped run); otherwise
+    // start before every real row — `chunk_id >= ` any actual id, and the empty model_id sorts
+    // first, so `(chunk_id, model_id) > (i64::MIN, "")` matches all rows.
+    let mut cursor = load_cursor(conn)?;
     loop {
         // Collect a whole batch BEFORE writing — the SELECT statement must be finalized (its borrow
         // of `conn` dropped) before the per-row UPDATE takes the connection.
         let batch = collect_legacy_f32_batch(conn, &cursor, batch_size)?;
         let Some(last) = batch.last() else {
-            break;
+            // No rows past the cursor → conversion is complete.
+            return Ok(ReencodeOutcome { converted: total, completed: true });
         };
         // Advance the cursor to the batch's LAST key, so the next SELECT resumes via the PK index
-        // instead of rescanning. Done before the UPDATE (which mutates the rows) using the read
+        // instead of rescanning. Computed before the UPDATE (which mutates the rows) from the read
         // values.
         cursor = (last.chunk_id, last.model_id.clone());
         let exhausted = batch.len() < batch_size;
         total += convert_batch(conn, &batch)?;
+        // Persist the cursor only after the batch's transaction has committed, so a crash never
+        // leaves the cursor ahead of the durably-converted rows (it can lag — those rows are simply
+        // re-checked and skipped — but must never skip an unconverted row).
+        save_cursor(conn, &cursor)?;
         if exhausted {
-            break;
+            return Ok(ReencodeOutcome { converted: total, completed: true });
+        }
+        // Deadline check AFTER a committed batch (never mid-batch): stop without marking complete
+        // so the next pass resumes from the just-persisted cursor.
+        if deadline.is_some_and(|dl| Instant::now() >= dl) {
+            return Ok(ReencodeOutcome { converted: total, completed: false });
         }
     }
-    Ok(total)
+}
+
+/// Load the persisted keyset cursor, or the start-of-table sentinel `(i64::MIN, "")` when none is
+/// stored (first run, or after a completed conversion cleared it). A malformed stored value falls
+/// back to the sentinel — re-walking from the head is correct (already-int8 rows are skipped),
+/// never wrong.
+fn load_cursor(conn: &Connection) -> anyhow::Result<(i64, String)> {
+    let Some(raw) = reconcile_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)? else {
+        return Ok((i64::MIN, String::new()));
+    };
+    let Some((chunk_id, model_id)) = raw.split_once('\n') else {
+        return Ok((i64::MIN, String::new()));
+    };
+    match chunk_id.parse::<i64>() {
+        Ok(chunk_id) => Ok((chunk_id, model_id.to_string())),
+        Err(_) => Ok((i64::MIN, String::new())),
+    }
+}
+
+/// Persist the keyset cursor as `"<chunk_id>\n<model_id>"` (model ids never contain a newline).
+fn save_cursor(conn: &Connection, cursor: &(i64, String)) -> anyhow::Result<()> {
+    set_reconcile_meta(
+        conn,
+        VECTOR_INT8_REENCODE_CURSOR_META,
+        &format!("{}\n{}", cursor.0, cursor.1),
+    )
 }
 
 /// Read up to `limit` legacy f32 rows past `cursor`, in PK order. The blob-length predicate is the
@@ -152,26 +208,53 @@ fn convert_batch(conn: &Connection, batch: &[LegacyVectorRow]) -> anyhow::Result
 /// `chunk_embeddings` every pass). Returns the number of rows converted this call (`0` once the
 /// gate is set). Safe to call repeatedly and from the base index only — the meta gate AND the
 /// f32-detect query both make a stray double-call a no-op.
-pub(crate) fn reencode_legacy_vectors_if_needed(conn: &Connection) -> anyhow::Result<usize> {
+///
+/// `deadline` bounds the work so the conversion honors the maintenance time budget: when the
+/// deadline passes mid-conversion the run STOPS, leaves the done-gate UNSET, and persists its
+/// keyset cursor — so the next maintenance pass resumes from there (no rescan) rather than redoing
+/// the whole table. `None` runs to completion. The gate is set ONLY when the conversion fully
+/// completes.
+pub(crate) fn reencode_legacy_vectors_if_needed(
+    conn: &Connection,
+    deadline: Option<Instant>,
+) -> anyhow::Result<usize> {
     if meta(conn, VECTOR_INT8_REENCODE_DONE_META)?.is_some() {
         return Ok(0);
     }
-    reencode_and_mark_done(conn)
+    reencode_and_mark_if_complete(conn, deadline)
 }
 
 /// FORCE the conversion, IGNORING the run-once gate at the start (the `--reencode-vectors` path) —
-/// but still SET the gate on success, so the next maintenance pass doesn't do a pointless full
-/// table scan it would otherwise skip. Returns the number of rows converted.
+/// runs to completion (no deadline) and SETS the gate on success, so the next maintenance pass
+/// doesn't do a pointless full table scan it would otherwise skip. May resume from a persisted
+/// cursor left by a prior deadline-stopped maintenance run. Returns the number of rows converted.
 pub(crate) fn reencode_legacy_vectors_now(conn: &Connection) -> anyhow::Result<usize> {
-    reencode_and_mark_done(conn)
+    reencode_and_mark_if_complete(conn, None)
 }
 
-/// Run the conversion then mark the run-once gate done. Shared by the gated and forced entry points
-/// (the only difference is whether the gate is CHECKED first).
-fn reencode_and_mark_done(conn: &Connection) -> anyhow::Result<usize> {
-    let converted = reencode_legacy_f32_blobs(conn)?;
-    set_meta(conn, VECTOR_INT8_REENCODE_DONE_META, "1")?;
-    Ok(converted)
+/// Run the conversion (resuming from / persisting the keyset cursor) and mark the run-once gate
+/// done ONLY when it ran to the natural end. On a deadline stop the gate stays unset and the cursor
+/// remains persisted, so the next call resumes. On completion the cursor key is cleared (it is no
+/// longer meaningful, and a future stray re-run starts clean). Shared by the gated and forced entry
+/// points — they differ only in whether the gate is CHECKED first and whether a deadline is passed.
+fn reencode_and_mark_if_complete(
+    conn: &Connection,
+    deadline: Option<Instant>,
+) -> anyhow::Result<usize> {
+    let outcome = reencode_legacy_f32_blobs_batched(conn, REENCODE_BATCH_SIZE, deadline)?;
+    if outcome.completed {
+        set_meta(conn, VECTOR_INT8_REENCODE_DONE_META, "1")?;
+        clear_cursor(conn)?;
+    }
+    Ok(outcome.converted)
+}
+
+/// Drop the persisted keyset cursor once the conversion is complete (it is no longer meaningful).
+fn clear_cursor(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM reconcile_meta WHERE key = ?1", params![
+        VECTOR_INT8_REENCODE_CURSOR_META
+    ])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -179,7 +262,8 @@ mod tests {
     use super::*;
 
     /// Minimal `chunk_embeddings` shape — only the columns the re-encode touches, so the test does
-    /// not depend on the full schema/bootstrap. `index_meta` is the gate store.
+    /// not depend on the full schema/bootstrap. `index_meta` is the done-gate store;
+    /// `reconcile_meta` is the keyset-cursor store.
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -190,7 +274,8 @@ mod tests {
                  vector_blob BLOB NOT NULL,
                  PRIMARY KEY(chunk_id, model_id)
              );
-             CREATE TABLE index_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+             CREATE TABLE index_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE reconcile_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .unwrap();
         conn
@@ -218,6 +303,14 @@ mod tests {
         .unwrap()
     }
 
+    /// Run the full conversion (production batch size, no deadline) and return the converted count
+    /// — the common shape the basic round-trip/idempotency tests want.
+    fn run_to_completion(conn: &Connection) -> usize {
+        let outcome = reencode_legacy_f32_blobs_batched(conn, REENCODE_BATCH_SIZE, None).unwrap();
+        assert!(outcome.completed, "a no-deadline run must reach the natural end");
+        outcome.converted
+    }
+
     #[test]
     fn reencode_converts_f32_row_to_int8_and_is_idempotent() {
         let conn = setup_conn();
@@ -227,7 +320,7 @@ mod tests {
         assert_eq!(original.len(), 4 * dim, "fixture must be the 4*dim f32 format");
         insert_row(&conn, 1, "model-a", &original, dim);
 
-        let converted = reencode_legacy_f32_blobs(&conn).unwrap();
+        let converted = run_to_completion(&conn);
         assert_eq!(converted, 1);
 
         // (a) the stored blob is now the compact int8 format (4-byte scale + one byte per dim).
@@ -242,7 +335,7 @@ mod tests {
         }
 
         // (c) a second run converts nothing — once int8, the row no longer matches the detector.
-        assert_eq!(reencode_legacy_f32_blobs(&conn).unwrap(), 0);
+        assert_eq!(run_to_completion(&conn), 0);
     }
 
     #[test]
@@ -254,7 +347,7 @@ mod tests {
         insert_row(&conn, 1, "model-a", &int8, 4);
         insert_row(&conn, 2, "model-a", b"", 4);
 
-        assert_eq!(reencode_legacy_f32_blobs(&conn).unwrap(), 0);
+        assert_eq!(run_to_completion(&conn), 0);
         assert_eq!(stored_blob(&conn, 1), int8, "int8 row must be byte-identical");
         assert_eq!(stored_blob(&conn, 2), b"", "empty failed-row blob untouched");
     }
@@ -278,7 +371,7 @@ mod tests {
         for id in 0..total {
             insert_row(&conn, id as i64, "model-a", &blob, vector.len());
         }
-        assert_eq!(reencode_legacy_f32_blobs(&conn).unwrap(), total);
+        assert_eq!(run_to_completion(&conn), total);
         // Every row is now int8.
         assert_eq!(count_remaining_f32(&conn), 0);
     }
@@ -300,8 +393,9 @@ mod tests {
                 insert_row(&conn, chunk_id, model, &blob, vector.len());
             }
         }
-        let converted = reencode_legacy_f32_blobs_batched(&conn, 2).unwrap();
-        assert_eq!(converted, 10, "every (chunk_id, model_id) row must convert");
+        let outcome = reencode_legacy_f32_blobs_batched(&conn, 2, None).unwrap();
+        assert_eq!(outcome.converted, 10, "every (chunk_id, model_id) row must convert");
+        assert!(outcome.completed, "a no-deadline run reaches the natural end");
         assert_eq!(count_remaining_f32(&conn), 0);
     }
 
@@ -337,14 +431,14 @@ mod tests {
         insert_row(&conn, 1, "model-a", &f32_blob(&vector), vector.len());
 
         // First call converts and sets the gate.
-        assert_eq!(reencode_legacy_vectors_if_needed(&conn).unwrap(), 1);
+        assert_eq!(reencode_legacy_vectors_if_needed(&conn, None).unwrap(), 1);
         assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
 
         // Insert a fresh f32 row AFTER the gate is set — the second call must be a no-op (it does
         // not even run the detect query), so the new row stays f32. This models the invariant that
         // no new f32 rows ever appear in practice (writes are always int8), so the gate is safe.
         insert_row(&conn, 2, "model-a", &f32_blob(&vector), vector.len());
-        assert_eq!(reencode_legacy_vectors_if_needed(&conn).unwrap(), 0);
+        assert_eq!(reencode_legacy_vectors_if_needed(&conn, None).unwrap(), 0);
         assert_eq!(stored_blob(&conn, 2).len(), 4 * vector.len());
     }
 
@@ -359,6 +453,57 @@ mod tests {
         assert_eq!(reencode_legacy_vectors_now(&conn).unwrap(), 1);
         // ... and it leaves the gate set, so a later maintenance pass skips the full scan.
         assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
-        assert_eq!(reencode_legacy_vectors_if_needed(&conn).unwrap(), 0);
+        assert_eq!(reencode_legacy_vectors_if_needed(&conn, None).unwrap(), 0);
+    }
+
+    fn stored_cursor(conn: &Connection) -> Option<String> {
+        reconcile_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META).unwrap()
+    }
+
+    #[test]
+    fn deadline_stop_leaves_gate_unset_and_persists_cursor_then_resumes_to_completion() {
+        let conn = setup_conn();
+        let vector = vec![0.5_f32, -0.5, 0.25, -0.25];
+        let blob = f32_blob(&vector);
+        for chunk_id in 0..6 {
+            insert_row(&conn, chunk_id, "model-a", &blob, vector.len());
+        }
+
+        // An ALREADY-ELAPSED deadline: the loop converts its first batch (the deadline is only
+        // checked AFTER a committed batch, so progress is always made), then stops because
+        // `Instant::now() >= deadline`. With batch_size 2 over 6 rows it converts exactly 2, leaves
+        // the done-gate UNSET, and persists the cursor at the 2nd row's key.
+        let past = Instant::now() - std::time::Duration::from_secs(1);
+        let outcome = reencode_legacy_f32_blobs_batched(&conn, 2, Some(past)).unwrap();
+        assert_eq!(outcome.converted, 2, "one batch runs before the deadline halts the loop");
+        assert!(!outcome.completed, "a deadline stop is not a completion");
+        assert_eq!(count_remaining_f32(&conn), 4, "the rest are still f32");
+        assert_eq!(stored_cursor(&conn).as_deref(), Some("1\nmodel-a"), "cursor at the 2nd row");
+
+        // The gated entry point STOPPED here would NOT set the done-gate (verified via the loop
+        // above returning completed=false). A follow-up call with NO deadline resumes FROM THE
+        // PERSISTED CURSOR (not a rescan) and finishes the remaining 4 rows, sets the gate, and
+        // clears the cursor.
+        let converted = reencode_legacy_vectors_if_needed(&conn, None).unwrap();
+        assert_eq!(converted, 4, "resumes the remaining rows, not all 6");
+        assert_eq!(count_remaining_f32(&conn), 0, "all rows now int8");
+        assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
+        assert_eq!(stored_cursor(&conn), None, "cursor cleared on completion");
+    }
+
+    #[test]
+    fn if_needed_with_deadline_completes_and_sets_gate_when_work_fits() {
+        // A normal (deadline far in the future) run via the gated entry point still fully converts
+        // and sets the done-gate — the deadline plumbing doesn't change the happy path.
+        let conn = setup_conn();
+        let vector = vec![0.3_f32, -0.6, 0.9, -0.1];
+        for chunk_id in 0..3 {
+            insert_row(&conn, chunk_id, "model-a", &f32_blob(&vector), vector.len());
+        }
+        let far = Instant::now() + std::time::Duration::from_secs(3600);
+        assert_eq!(reencode_legacy_vectors_if_needed(&conn, Some(far)).unwrap(), 3);
+        assert_eq!(count_remaining_f32(&conn), 0);
+        assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
+        assert_eq!(stored_cursor(&conn), None);
     }
 }

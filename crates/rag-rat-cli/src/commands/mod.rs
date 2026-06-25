@@ -480,12 +480,8 @@ pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
 }
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
-    // Force the legacy-f32 → int8 vector re-encode (#312) when asked, ignoring the run-once gate —
-    // for users who want it now on a huge index. Format-only, idempotent.
-    if args.reencode_vectors {
-        let converted = db.reencode_legacy_vectors_now()?;
-        eprintln!("rag-rat: re-encoded {converted} legacy f32 vector blobs to int8");
-    }
+    // `--plan` is a READ-ONLY dry run: it must return before any mutation, so it stays read-only
+    // even when combined with a mutating flag like `--reencode-vectors` (#312).
     if args.plan {
         let plan = db.reconcile_plan()?;
         // `--plan` prints a human summary by default; the global `--json` switches to the
@@ -496,6 +492,13 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
             print_reconcile_plan(&plan);
         }
         return Ok(());
+    }
+    // Force the legacy-f32 → int8 vector re-encode (#312) when asked, ignoring the run-once gate —
+    // for users who want it now on a huge index. Format-only, idempotent. Runs only on a real
+    // (non-`--plan`) reconcile.
+    if args.reencode_vectors {
+        let converted = db.reencode_legacy_vectors_now()?;
+        eprintln!("rag-rat: re-encoded {converted} legacy f32 vector blobs to int8");
     }
     let options = rag_rat_core::index::ai::ReconcileOptions {
         limit: args.limit,
@@ -971,8 +974,15 @@ fn run_maintenance_pass(
     // One-time on upgrade: re-encode any legacy f32 vector blobs to the compact int8 format (#312).
     // Meta-gated, so this runs once and then skips the table scan cheaply on every later pass; run
     // on the BASE index (not per-overlay) before the worktree refresh re-scopes the connection.
-    // Format-only (decode f32 → encode int8), so it's cheap — no model inference.
-    let _ = db.reencode_legacy_vectors_if_needed();
+    // Format-only (decode f32 → encode int8), so it's cheap — no model inference. BUDGETED: skipped
+    // entirely when `max_seconds == 0` (the "no embedding work" cap, mirroring `budget` below), and
+    // otherwise bounded by the same shared `started + max_seconds` deadline so a huge index can't
+    // hold the write lock for a full-table conversion past the cap — it stops at the deadline and
+    // resumes from a persisted cursor on the next pass.
+    if max_seconds > 0 {
+        let deadline = started + std::time::Duration::from_secs(max_seconds);
+        let _ = db.reencode_legacy_vectors_if_needed(Some(deadline));
+    }
     // ONE time budget for the whole pass — the per-overlay embedding reconciles AND the base
     // reconcile below — measured from `started` so discovery already counts against it. Without a
     // shared budget each overlay (each call starts its own `max_seconds` timer) plus the base could

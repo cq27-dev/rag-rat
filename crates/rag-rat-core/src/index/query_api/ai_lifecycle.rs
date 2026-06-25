@@ -61,10 +61,17 @@ impl IndexDatabase {
     /// One-time upgrade: re-encode any `chunk_embeddings` row still stored in the legacy f32 format
     /// to the compact int8 format (#312), gated by a meta key so later maintenance passes skip the
     /// table scan. A format-only conversion (decode f32 → encode int8), no model inference. Returns
-    /// the number of rows converted this call (`0` once the gate is set). See
+    /// the number of rows converted this call (`0` once the gate is set).
+    ///
+    /// `deadline` bounds the conversion so it honors the maintenance time budget: a deadline stop
+    /// leaves the gate unset and persists a keyset cursor, so the next pass resumes without a
+    /// rescan (the gate is set only on full completion). `None` runs to completion. See
     /// [`ai::reencode_legacy_vectors_if_needed`].
-    pub fn reencode_legacy_vectors_if_needed(&self) -> anyhow::Result<usize> {
-        ai::reencode_legacy_vectors_if_needed(self.storage.connection())
+    pub fn reencode_legacy_vectors_if_needed(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<usize> {
+        ai::reencode_legacy_vectors_if_needed(self.storage.connection(), deadline)
     }
 
     /// FORCE the legacy-f32 → int8 re-encode (#312), ignoring the run-once meta gate at the start —
