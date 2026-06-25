@@ -58,6 +58,7 @@ pub(crate) fn default_model_version(model_id: &str) -> &'static str {
         HASH_MODEL_ID => "hash-v1",
         FASTEMBED_MODEL_ID => "fastembed-all-minilm-l6-v2-v1",
         BGE_SMALL_MODEL_ID => "fastembed-bge-small-en-v1.5-v1",
+        JINA_CODE_MODEL_ID => "fastembed-jina-v2-base-code-v1",
         MODEL2VEC_MODEL_ID => "model2vec-potion-retrieval-32m-v1",
         _ => "v1",
     }
@@ -100,6 +101,7 @@ pub(crate) fn active_embedder(
         HASH_MODEL_ID => Ok(Box::new(HashEmbedder)),
         FASTEMBED_MODEL_ID => fastembed_embedder(intra_threads),
         BGE_SMALL_MODEL_ID => bge_small_embedder(intra_threads),
+        JINA_CODE_MODEL_ID => jina_code_embedder(intra_threads),
         MODEL2VEC_MODEL_ID => model2vec_embedder(),
         other => anyhow::bail!("unknown active embedding model `{other}`"),
     }
@@ -153,6 +155,7 @@ pub(crate) fn expected_dim(model_id: &str) -> Option<usize> {
         HASH_MODEL_ID => Some(HASH_EMBEDDING_DIM),
         FASTEMBED_MODEL_ID => Some(FASTEMBED_EMBEDDING_DIM),
         BGE_SMALL_MODEL_ID => Some(BGE_SMALL_EMBEDDING_DIM),
+        JINA_CODE_MODEL_ID => Some(JINA_CODE_EMBEDDING_DIM),
         MODEL2VEC_MODEL_ID => Some(MODEL2VEC_EMBEDDING_DIM),
         _ => None,
     }
@@ -178,6 +181,20 @@ pub(crate) fn bge_small_embedder(
     #[cfg(feature = "fastembed")]
     {
         Ok(Box::new(FastEmbedEmbedder::new_bge_small(intra_threads)?))
+    }
+    #[cfg(not(feature = "fastembed"))]
+    {
+        let _ = intra_threads;
+        anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
+    }
+}
+
+pub(crate) fn jina_code_embedder(
+    intra_threads: Option<usize>,
+) -> anyhow::Result<Box<dyn Embedder>> {
+    #[cfg(feature = "fastembed")]
+    {
+        Ok(Box::new(FastEmbedEmbedder::new_jina_code(intra_threads)?))
     }
     #[cfg(not(feature = "fastembed"))]
     {
@@ -446,4 +463,34 @@ pub(crate) fn find_existing_embedding(
         )
         .optional()?;
     if let Some(blob) = vector { Ok(decode_vector(&blob, dim)) } else { Ok(None) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_embedding_models_have_consistent_dim_and_version() {
+        // Every registered model id must resolve a dim and a NON-fallback version string — else the
+        // reconcile freshness key (model_version) is wrong and embeddings silently mis-track.
+        // Regression guard for the model-id match arms in expected_dim / default_model_version
+        // (#112).
+        for (id, dim) in [
+            (HASH_MODEL_ID, HASH_EMBEDDING_DIM),
+            (FASTEMBED_MODEL_ID, FASTEMBED_EMBEDDING_DIM),
+            (BGE_SMALL_MODEL_ID, BGE_SMALL_EMBEDDING_DIM),
+            (JINA_CODE_MODEL_ID, JINA_CODE_EMBEDDING_DIM),
+            (MODEL2VEC_MODEL_ID, MODEL2VEC_EMBEDDING_DIM),
+        ] {
+            assert_eq!(expected_dim(id), Some(dim), "expected_dim missing/wrong for {id}");
+            assert_ne!(
+                default_model_version(id),
+                "v1",
+                "version fell back to the default for {id}"
+            );
+        }
+        // jina-v2-base-code is the 768-dim code tier; pin its identity explicitly.
+        assert_eq!(expected_dim(JINA_CODE_MODEL_ID), Some(768));
+        assert_eq!(default_model_version(JINA_CODE_MODEL_ID), "fastembed-jina-v2-base-code-v1");
+    }
 }

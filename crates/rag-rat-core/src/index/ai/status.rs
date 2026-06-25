@@ -3,10 +3,12 @@ use super::*;
 pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
     #[cfg(feature = "fastembed")]
     {
-        // Init the model that matches `model_id` (triggers its download + yields the right dim),
-        // not always all-MiniLM — both are 384-dim, but BGE-small (#112) must pull its own weights.
+        // Init the model that matches `model_id` (triggers its download + yields the right dim) —
+        // each fastembed model pulls its own weights and reports its own dim (#112). jina-v2-code
+        // is 768-dim, not 384.
         let embedder = match model_id {
             BGE_SMALL_MODEL_ID => FastEmbedEmbedder::new_bge_small(None),
+            JINA_CODE_MODEL_ID => FastEmbedEmbedder::new_jina_code(None),
             _ => FastEmbedEmbedder::new(None),
         }
         .map_err(|err| anyhow::anyhow!("failed to initialize fastembed model: {err}"))?;
@@ -38,15 +40,18 @@ pub(crate) fn fastembed_operational_status(
 ) -> anyhow::Result<FastEmbedOperationalStatus> {
     // Report the ACTIVE fastembed model (all-MiniLM or BGE-small), not always all-MiniLM — else
     // installing BGE makes status/doctor flag MiniLM as missing or needing reconcile (#112 review).
-    let report_model_id = if matches!(active_model_id, FASTEMBED_MODEL_ID | BGE_SMALL_MODEL_ID) {
+    let report_model_id = if matches!(
+        active_model_id,
+        FASTEMBED_MODEL_ID | BGE_SMALL_MODEL_ID | JINA_CODE_MODEL_ID
+    ) {
         active_model_id
     } else {
         FASTEMBED_MODEL_ID
     };
-    let report_display = if report_model_id == BGE_SMALL_MODEL_ID {
-        BGE_SMALL_DISPLAY_MODEL
-    } else {
-        FASTEMBED_DISPLAY_MODEL
+    let report_display = match report_model_id {
+        BGE_SMALL_MODEL_ID => BGE_SMALL_DISPLAY_MODEL,
+        JINA_CODE_MODEL_ID => JINA_CODE_DISPLAY_MODEL,
+        _ => FASTEMBED_DISPLAY_MODEL,
     };
     let model = model(conn, report_model_id)?;
     // PERF: report coverage from CHEAP persisted counts (the `embedding_artifacts` rows + the chunk
@@ -83,10 +88,13 @@ pub(crate) fn fastembed_operational_status(
         build_feature_enabled: fastembed_build_feature_enabled(),
         model_id: report_model_id.to_string(),
         model: report_display.to_string(),
-        dim: FASTEMBED_EMBEDDING_DIM,
+        dim: expected_dim(report_model_id).unwrap_or(FASTEMBED_EMBEDDING_DIM),
         cache: fastembed_cache_dir().display().to_string(),
         installed: model.installed,
-        active: matches!(active_model_id, FASTEMBED_MODEL_ID | BGE_SMALL_MODEL_ID),
+        active: matches!(
+            active_model_id,
+            FASTEMBED_MODEL_ID | BGE_SMALL_MODEL_ID | JINA_CODE_MODEL_ID
+        ),
         status: model.status,
         current_embeddings: current,
         eligible_embeddings: eligible,

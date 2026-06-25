@@ -38,6 +38,15 @@ pub const BGE_SMALL_EMBEDDING_DIM: usize = 384;
 // — it collapsed every query together and tanked replay recall 0.562 → 0.000. Passages never take
 // it either. So queries embed raw, same as all-MiniLM.
 
+/// jina-embeddings-v2-base-code (#112): a CODE-specific embedder — 768-dim, Apache-2.0, a built-in
+/// fastembed model. SYMMETRIC: queries and code both embed RAW (no query instruction, unlike
+/// CodeRankEmbed), so it slots into the raw embed path with no prefix, dodging the BGE
+/// instruction-collapse footgun above. 768-dim → a re-embed, not a schema change. Measured against
+/// all-MiniLM / BGE on the commit-replay eval before it ships as the code tier.
+pub const JINA_CODE_MODEL_ID: &str = "fastembed-jina-v2-base-code";
+pub const JINA_CODE_DISPLAY_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
+pub const JINA_CODE_EMBEDDING_DIM: usize = 768;
+
 /// Model2Vec static-embedding backend: a token→vector lookup + mean-pool (no transformer forward
 /// pass), ~100-500× faster than FastEmbed on CPU at some retrieval-quality cost. The right choice
 /// for very large repos where the FastEmbed backfill is infeasible. See `EmbeddingBackend`.
@@ -140,6 +149,18 @@ impl FastEmbedEmbedder {
             fastembed::EmbeddingModel::BGESmallENV15,
             BGE_SMALL_MODEL_ID,
             BGE_SMALL_EMBEDDING_DIM,
+            intra_threads,
+        )
+    }
+
+    /// jina-embeddings-v2-base-code (768-dim, #112) — a CODE-specific embedder. Symmetric, so
+    /// queries and code both embed raw (no instruction). fastembed applies its Mean pooling +
+    /// L2-normalize internally; nothing to override here.
+    pub fn new_jina_code(intra_threads: Option<usize>) -> anyhow::Result<Self> {
+        Self::with_model(
+            fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode,
+            JINA_CODE_MODEL_ID,
+            JINA_CODE_EMBEDDING_DIM,
             intra_threads,
         )
     }

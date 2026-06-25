@@ -30,6 +30,14 @@ pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
     )?;
     upsert_model(
         conn,
+        JINA_CODE_MODEL_ID,
+        "embedding",
+        Some(JINA_CODE_EMBEDDING_DIM),
+        "fastembed",
+        false,
+    )?;
+    upsert_model(
+        conn,
         MODEL2VEC_MODEL_ID,
         "embedding",
         Some(MODEL2VEC_EMBEDDING_DIM),
@@ -60,7 +68,13 @@ pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<boo
             return Ok(false);
         }
     }
-    for model_id in [HASH_MODEL_ID, FASTEMBED_MODEL_ID, BGE_SMALL_MODEL_ID, MODEL2VEC_MODEL_ID] {
+    for model_id in [
+        HASH_MODEL_ID,
+        FASTEMBED_MODEL_ID,
+        BGE_SMALL_MODEL_ID,
+        JINA_CODE_MODEL_ID,
+        MODEL2VEC_MODEL_ID,
+    ] {
         let present: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM ai_models WHERE model_id = ?1)",
             params![model_id],
@@ -202,7 +216,7 @@ pub(crate) fn install_model(conn: &Connection, model_id: &str) -> anyhow::Result
             )?;
             set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
         },
-        FASTEMBED_MODEL_ID | BGE_SMALL_MODEL_ID => {
+        FASTEMBED_MODEL_ID | BGE_SMALL_MODEL_ID | JINA_CODE_MODEL_ID => {
             install_fastembed_model(conn, model_id)?;
             set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
         },
