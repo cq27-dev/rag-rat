@@ -23,9 +23,10 @@ pub enum Backend {
     FastEmbed,
     /// A Model2Vec static token→vector lookup; gated behind the `model2vec` feature.
     Model2Vec,
-    /// A remote Ollama server (`POST /api/embed`); gated behind the `remote-embed` feature. The
-    /// endpoint/auth/timeout come from the `[embedding.remote]` config block, not the static
-    /// registry — the row carries only identity + dim (#317).
+    /// A remote Ollama server (`POST /api/embed`); always compiled in (the embedder uses `ureq`,
+    /// already a non-optional workspace dep, so there is no heavy optional dependency to gate — no
+    /// `remote-embed` feature). The endpoint/auth/timeout come from the `[embedding.remote]` config
+    /// block, not the static registry — the row carries only identity + dim (#317).
     Ollama,
 }
 

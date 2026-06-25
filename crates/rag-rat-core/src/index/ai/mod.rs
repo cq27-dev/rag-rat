@@ -29,7 +29,7 @@ pub(crate) use providers::active_embedder;
 // warnings`.
 pub use providers::{
     Embedder, FASTEMBED_MISSING_FEATURE_MESSAGE, HashEmbedder, MODEL2VEC_HF_REPO,
-    MODEL2VEC_MISSING_FEATURE_MESSAGE,
+    MODEL2VEC_MISSING_FEATURE_MESSAGE, OllamaEmbedder,
 };
 pub(crate) use reconcile::*;
 pub(crate) use reencode::*;

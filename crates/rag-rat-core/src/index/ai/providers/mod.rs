@@ -9,6 +9,9 @@ mod hash;
 // Ungated: the module compiles in all builds so its dep-free `MODEL2VEC_HF_REPO` const stays
 // available; only `Model2VecEmbedder` (which needs `model2vec-rs`) is feature-gated inside it.
 mod model2vec;
+// Ungated: the Ollama backend uses `ureq` (already a non-optional workspace dep — see the crates.io
+// version check), so there is no heavy optional dependency to gate. No `remote-embed` feature.
+mod ollama;
 
 use rusqlite::Connection;
 
@@ -18,6 +21,11 @@ pub use self::hash::HashEmbedder;
 pub use self::model2vec::MODEL2VEC_HF_REPO;
 #[cfg(feature = "model2vec")]
 pub use self::model2vec::Model2VecEmbedder;
+// Ungated `pub` re-export (crate-public path `crate::index::ai::providers::OllamaEmbedder`):
+// wired into `embedder_for_spec` in #317 task 5, so nothing constructs it yet. The `pub`
+// visibility (same pattern as the other backends) exempts it from dead-code/unused-import
+// analysis under `-D warnings` until the dispatch arm lands.
+pub use self::ollama::OllamaEmbedder;
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
 use crate::index::ai::{active_embedding_model_id, model, validate_ready_model};
 
