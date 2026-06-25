@@ -15,8 +15,6 @@ pub(crate) use policy::*;
 pub use providers::FastEmbedEmbedder;
 #[cfg(test)]
 pub use providers::MockEmbedder;
-#[cfg(feature = "model2vec")]
-pub use providers::Model2VecEmbedder;
 pub(crate) use providers::active_embedder;
 // Curate the provider surface onto the `index::ai` path so existing `super::*` callers
 // (`reconcile`, `status`, `helpers`) and the external `ai::Embedder` /
@@ -30,6 +28,8 @@ pub(crate) use providers::active_embedder;
 pub use providers::{
     Embedder, FASTEMBED_MISSING_FEATURE_MESSAGE, HashEmbedder, MODEL2VEC_MISSING_FEATURE_MESSAGE,
 };
+#[cfg(feature = "model2vec")]
+pub use providers::{MODEL2VEC_HF_REPO, Model2VecEmbedder};
 pub(crate) use reconcile::*;
 pub(crate) use reencode::*;
 use rusqlite::types::Value;

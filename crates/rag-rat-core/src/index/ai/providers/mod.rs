@@ -15,7 +15,7 @@ use rusqlite::Connection;
 pub use self::fastembed::FastEmbedEmbedder;
 pub use self::hash::HashEmbedder;
 #[cfg(feature = "model2vec")]
-pub use self::model2vec::Model2VecEmbedder;
+pub use self::model2vec::{MODEL2VEC_HF_REPO, Model2VecEmbedder};
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
 use crate::index::ai::{active_embedding_model_id, model, validate_ready_model};
 
