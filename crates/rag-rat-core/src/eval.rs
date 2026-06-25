@@ -6,7 +6,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::index::oracle::{OracleEvalMetrics, OracleTool, RecallCalls};
-use crate::index::{OracleShaSnapshots, ai, git_history};
+use crate::index::{OracleShaSnapshots, git_history};
 use crate::{Config, IndexDatabase};
 
 const TOP_K: usize = 10;
