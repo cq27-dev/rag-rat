@@ -1,9 +1,17 @@
 name: CI
 
 on:
+  # The workspace fmt/clippy/test/build/coverage gate — stays broad over ALL code (it's the only
+  # --workspace lint+test pass), but a docs-only change can't break it, so skip pure-docs changes.
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
 
 # Least privilege: CI only reads the repo (codecov uploads use its own token, not GITHUB_TOKEN).
 permissions:

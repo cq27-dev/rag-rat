@@ -6,8 +6,16 @@ name: bench-pr-run
 # Pattern mirrors Bencher's "Track Benchmarks with GitHub Actions" (fork PRs) docs.
 
 on:
+  # The criterion + iai benches live in crates/rag-rat-core/benches and exercise only core's
+  # index/query/clone paths — cli/mcp/docs changes can't move the numbers, so they skip (and the
+  # paired bench-pr-track tracker, gated on this workflow_run, then skips too).
   pull_request:
     types: [opened, reopened, edited, synchronize]
+    paths:
+      - 'crates/rag-rat-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/bench-pr-run.yml'
 
 # Fork-safe by construction: no secrets are used here, and the token is read-only.
 permissions:

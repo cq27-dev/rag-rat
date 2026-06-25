@@ -5,9 +5,28 @@ name: eval
 # network-free baseline (hash embedder → lexical retrieval) and the real gate over the hybrid
 # (lexical + semantic) path the product ships (MiniLM, model download cached).
 on:
+  # Targeted: the eval suite exercises core's search/eval path + the cli's eval-feature surface
+  # (the `--features eval` clippy runs ONLY here), plus the evals/ query data. mcp-only and
+  # docs-only changes can't move it, so they skip.
   push:
     branches: [main]
+    paths:
+      - 'crates/rag-rat-core/**'
+      - 'crates/rag-rat-cli/**'
+      - 'evals/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.config/nextest.toml'
+      - '.github/workflows/eval.yml'
   pull_request:
+    paths:
+      - 'crates/rag-rat-core/**'
+      - 'crates/rag-rat-cli/**'
+      - 'evals/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.config/nextest.toml'
+      - '.github/workflows/eval.yml'
 
 # Read-only: this job only checks out the repo and runs cargo. No write scopes (CodeQL hardening).
 permissions:
