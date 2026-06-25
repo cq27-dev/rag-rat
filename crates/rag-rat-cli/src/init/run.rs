@@ -162,7 +162,7 @@ pub(crate) fn prompt_backend(scan: &RepoScan) -> anyhow::Result<EmbeddingBackend
     );
     println!("  recommended: {}", backend_label(recommended));
     let choices =
-        [EmbeddingBackend::FastEmbed, EmbeddingBackend::Model2Vec, EmbeddingBackend::None];
+        [EmbeddingBackend::fast_embed(), EmbeddingBackend::model2vec(), EmbeddingBackend::NONE];
     let default_index = choices.iter().position(|backend| *backend == recommended).unwrap_or(0);
     let items = choices.iter().map(|backend| backend_label(*backend)).collect::<Vec<_>>();
     let selected = Select::new()

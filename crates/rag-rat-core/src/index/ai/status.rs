@@ -1,17 +1,18 @@
 use super::*;
+use crate::embedding_models::{
+    Backend, FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID, spec,
+};
 
 pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
     #[cfg(feature = "fastembed")]
     {
         // Init the model that matches `model_id` (triggers its download + yields the right dim) —
-        // each fastembed model pulls its own weights and reports its own dim (#112). jina-v2-code
-        // is 768-dim, not 384.
-        let embedder = match model_id {
-            BGE_SMALL_MODEL_ID => FastEmbedEmbedder::new_bge_small(None),
-            JINA_CODE_MODEL_ID => FastEmbedEmbedder::new_jina_code(None),
-            _ => FastEmbedEmbedder::new(None),
-        }
-        .map_err(|err| anyhow::anyhow!("failed to initialize fastembed model: {err}"))?;
+        // each fastembed model pulls its own weights and reports its own dim (#112). The dim comes
+        // from the registry spec; jina-v2-code is 768-dim, not 384.
+        let spec = spec(model_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown fastembed model `{model_id}`"))?;
+        let embedder = FastEmbedEmbedder::for_model_id(spec.model_id, spec.dim, None)
+            .map_err(|err| anyhow::anyhow!("failed to initialize fastembed model: {err}"))?;
         conn.execute(
             "UPDATE ai_models
              SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
@@ -38,21 +39,13 @@ pub(crate) fn fastembed_operational_status(
     active_model_id: &str,
     total_chunks: u64,
 ) -> anyhow::Result<FastEmbedOperationalStatus> {
-    // Report the ACTIVE fastembed model (all-MiniLM or BGE-small), not always all-MiniLM — else
-    // installing BGE makes status/doctor flag MiniLM as missing or needing reconcile (#112 review).
-    let report_model_id = if matches!(
-        active_model_id,
-        FASTEMBED_MODEL_ID | BGE_SMALL_MODEL_ID | JINA_CODE_MODEL_ID
-    ) {
-        active_model_id
-    } else {
-        FASTEMBED_MODEL_ID
-    };
-    let report_display = match report_model_id {
-        BGE_SMALL_MODEL_ID => BGE_SMALL_DISPLAY_MODEL,
-        JINA_CODE_MODEL_ID => JINA_CODE_DISPLAY_MODEL,
-        _ => FASTEMBED_DISPLAY_MODEL,
-    };
+    // Report the ACTIVE fastembed model (all-MiniLM / BGE-small / jina-code), not always all-MiniLM
+    // — else installing another fastembed model makes status/doctor flag MiniLM as missing or
+    // needing reconcile (#112 review). A model is "a fastembed model" iff its registry backend is
+    // FastEmbed; everything non-fastembed falls back to the MiniLM report identity.
+    let active_is_fastembed = spec(active_model_id).map(|s| s.backend) == Some(Backend::FastEmbed);
+    let report_model_id = if active_is_fastembed { active_model_id } else { FASTEMBED_MODEL_ID };
+    let report_display = spec(report_model_id).map_or(FASTEMBED_DISPLAY_MODEL, |s| s.display);
     let model = model(conn, report_model_id)?;
     // PERF: report coverage from CHEAP persisted counts (the `embedding_artifacts` rows + the chunk
     // total) rather than `embedding_reconcile_plan` — which loads EVERY chunk and rebuilds +
@@ -88,13 +81,12 @@ pub(crate) fn fastembed_operational_status(
         build_feature_enabled: fastembed_build_feature_enabled(),
         model_id: report_model_id.to_string(),
         model: report_display.to_string(),
-        dim: expected_dim(report_model_id).unwrap_or(FASTEMBED_EMBEDDING_DIM),
+        // The reported dim must reflect the ACTIVE model (jina-code is 768, not 384) — driven off
+        // the registry spec so it never regresses to the MiniLM default for a 768-dim active model.
+        dim: spec(report_model_id).map_or(FASTEMBED_EMBEDDING_DIM, |s| s.dim),
         cache: fastembed_cache_dir().display().to_string(),
         installed: model.installed,
-        active: matches!(
-            active_model_id,
-            FASTEMBED_MODEL_ID | BGE_SMALL_MODEL_ID | JINA_CODE_MODEL_ID
-        ),
+        active: active_is_fastembed,
         status: model.status,
         current_embeddings: current,
         eligible_embeddings: eligible,

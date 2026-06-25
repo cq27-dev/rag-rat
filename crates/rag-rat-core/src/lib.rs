@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dream;
+pub mod embedding_models;
 #[cfg(feature = "eval")]
 pub mod eval;
 pub mod fleet;

@@ -8,9 +8,8 @@ use std::{env, fs, io};
 
 use dialoguer::{Confirm, MultiSelect, Select};
 use rag_rat_core::config::EmbeddingBackend;
-use rag_rat_core::index::ai::{
-    FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID, ReconcileOptions,
-};
+use rag_rat_core::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID};
+use rag_rat_core::index::ai::ReconcileOptions;
 use rag_rat_core::index::ignore_rules::{IgnoreMatcher, is_virtualenv_dir};
 use rag_rat_core::language::Language;
 use rag_rat_core::{Config, IndexDatabase};
@@ -248,7 +247,7 @@ mod tests {
                 (Language::Rust, vec![PathBuf::from("crates/app/src")]),
                 (Language::TypeScript, vec![PathBuf::from("web/src"), PathBuf::from("app/src")]),
             ]),
-            backend: EmbeddingBackend::Model2Vec,
+            backend: EmbeddingBackend::model2vec(),
             oracle_auto_run: false,
         };
 
@@ -271,7 +270,7 @@ mod tests {
             root_value: ".".to_string(),
             languages: vec![Language::Rust],
             bindings: BTreeMap::from([(Language::Rust, vec![PathBuf::from("src")])]),
-            backend: EmbeddingBackend::FastEmbed,
+            backend: EmbeddingBackend::fast_embed(),
             oracle_auto_run: true,
         };
         assert!(render_config(&plan).contains("auto_run = true"));
@@ -293,7 +292,7 @@ mod tests {
                 PathBuf::from("include"),
                 PathBuf::from("src"),
             ])]),
-            backend: EmbeddingBackend::FastEmbed,
+            backend: EmbeddingBackend::fast_embed(),
             oracle_auto_run: false,
         };
         let text = render_config(&plan);
@@ -315,8 +314,8 @@ mod tests {
 
     #[test]
     fn recommend_backend_scales_with_repo_size() {
-        assert_eq!(recommend_backend(estimated_chunks(500_000)), EmbeddingBackend::FastEmbed);
-        assert_eq!(recommend_backend(estimated_chunks(50_000_000)), EmbeddingBackend::Model2Vec);
+        assert_eq!(recommend_backend(estimated_chunks(500_000)), EmbeddingBackend::fast_embed());
+        assert_eq!(recommend_backend(estimated_chunks(50_000_000)), EmbeddingBackend::model2vec());
     }
 
     #[test]

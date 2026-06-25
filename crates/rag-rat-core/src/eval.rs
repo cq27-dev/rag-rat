@@ -825,9 +825,9 @@ fn hash_vector_baseline(
         results.push(evaluate_query(config, db, &merged, SearchMode::HashBaseline)?);
     }
     let metrics = aggregate(&results);
-    let current_artifacts = db.current_embedding_count(ai::HASH_MODEL_ID)?;
+    let current_artifacts = db.current_embedding_count(crate::embedding_models::HASH_MODEL_ID)?;
     Ok(EvalBaselineReport {
-        model_id: ai::HASH_MODEL_ID.to_string(),
+        model_id: crate::embedding_models::HASH_MODEL_ID.to_string(),
         available: current_artifacts > 0,
         current_artifacts,
         delta_mrr_at_10: active_metrics.mrr_at_10 - metrics.mrr_at_10,

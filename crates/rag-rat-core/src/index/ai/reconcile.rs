@@ -1,4 +1,7 @@
 use super::*;
+#[cfg(feature = "fastembed")]
+use crate::embedding_models::FASTEMBED_EMBEDDING_DIM;
+use crate::embedding_models::{Backend, EMBEDDING_MODELS, FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
 
 pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
     // Read-first: skip the (write-locking) DML entirely when the manifest already matches what we
@@ -11,39 +14,13 @@ pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
         return Ok(());
     }
     remove_legacy_models(conn)?;
-    upsert_model(conn, HASH_MODEL_ID, "embedding", Some(HASH_EMBEDDING_DIM), "hash", false)?;
-    upsert_model(
-        conn,
-        FASTEMBED_MODEL_ID,
-        "embedding",
-        Some(FASTEMBED_EMBEDDING_DIM),
-        "fastembed",
-        false,
-    )?;
-    upsert_model(
-        conn,
-        BGE_SMALL_MODEL_ID,
-        "embedding",
-        Some(BGE_SMALL_EMBEDDING_DIM),
-        "fastembed",
-        false,
-    )?;
-    upsert_model(
-        conn,
-        JINA_CODE_MODEL_ID,
-        "embedding",
-        Some(JINA_CODE_EMBEDDING_DIM),
-        "fastembed",
-        false,
-    )?;
-    upsert_model(
-        conn,
-        MODEL2VEC_MODEL_ID,
-        "embedding",
-        Some(MODEL2VEC_EMBEDDING_DIM),
-        "model2vec",
-        false,
-    )?;
+    // One row per registered model, straight from the registry — adding a model needs no edit here.
+    // `installed_by_default` is false for EVERY model (including hash): a model is installed only
+    // on explicit `install_model`. `upsert_model` is `ON CONFLICT DO NOTHING`, so this only
+    // seeds rows.
+    for s in EMBEDDING_MODELS {
+        upsert_model(conn, s.model_id, "embedding", Some(s.dim), s.backend.runtime(), false)?;
+    }
     normalize_embedding_model_versions(conn)?;
     Ok(())
 }
@@ -68,16 +45,10 @@ pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<boo
             return Ok(false);
         }
     }
-    for model_id in [
-        HASH_MODEL_ID,
-        FASTEMBED_MODEL_ID,
-        BGE_SMALL_MODEL_ID,
-        JINA_CODE_MODEL_ID,
-        MODEL2VEC_MODEL_ID,
-    ] {
+    for s in EMBEDDING_MODELS {
         let present: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM ai_models WHERE model_id = ?1)",
-            params![model_id],
+            params![s.model_id],
             |row| row.get(0),
         )?;
         if !present {
@@ -205,27 +176,22 @@ pub(crate) fn fastembed_cache_ready(cache_dir: &Path) -> bool {
 
 pub(crate) fn install_model(conn: &Connection, model_id: &str) -> anyhow::Result<ModelInfo> {
     ensure_model_manifest(conn)?;
-    match model_id {
-        HASH_MODEL_ID => {
+    let spec =
+        spec(model_id).ok_or_else(|| anyhow::anyhow!("unknown local AI model `{model_id}`"))?;
+    match spec.backend {
+        Backend::Hash => {
             conn.execute(
                 "UPDATE ai_models
                  SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
                      embedding_dim = ?3, runtime = 'hash', last_error = NULL
                  WHERE model_id = ?1",
-                params![model_id, now_ms(), i64::try_from(HASH_EMBEDDING_DIM).unwrap_or(i64::MAX)],
+                params![model_id, now_ms(), i64::try_from(spec.dim).unwrap_or(i64::MAX)],
             )?;
-            set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
         },
-        FASTEMBED_MODEL_ID | BGE_SMALL_MODEL_ID | JINA_CODE_MODEL_ID => {
-            install_fastembed_model(conn, model_id)?;
-            set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
-        },
-        MODEL2VEC_MODEL_ID => {
-            install_model2vec_model(conn, model_id)?;
-            set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
-        },
-        other => anyhow::bail!("unknown local AI model `{other}`"),
+        Backend::FastEmbed => install_fastembed_model(conn, model_id)?,
+        Backend::Model2Vec => install_model2vec_model(conn, model_id)?,
     }
+    set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
     model(conn, model_id)
 }
 

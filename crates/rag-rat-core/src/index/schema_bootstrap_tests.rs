@@ -3,6 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
 use crate::config::ResolvedTarget;
+// The embedding-model constants moved from `index::ai` to the crate-root registry (#112).
+// Import them here so the existing `HASH_MODEL_ID` / `FASTEMBED_*` references resolve to the
+// new path.
+use crate::embedding_models::{
+    FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID, HASH_EMBEDDING_DIM,
+    HASH_MODEL_ID,
+};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -458,16 +465,16 @@ fn full_rebuild_preserves_github_papertrail_cache() {
 fn full_rebuild_preserves_installed_model_manifest() {
     let (root, config) = markdown_config("alpha token with enough detail for embeddings\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
     let before = db.local_ai_status().unwrap();
-    assert_eq!(before.embedding.model_id, ai::HASH_MODEL_ID);
+    assert_eq!(before.embedding.model_id, HASH_MODEL_ID);
     assert!(before.embedding.installed);
     drop(db);
 
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let after = db.local_ai_status().unwrap();
-    assert_eq!(after.embedding.model_id, ai::HASH_MODEL_ID);
+    assert_eq!(after.embedding.model_id, HASH_MODEL_ID);
     assert!(after.embedding.installed);
     assert_eq!(after.embedding.state, "Ready");
 
@@ -777,8 +784,8 @@ fn rebuild_populates_revision_metadata_and_fresh_fts_state() {
     assert_eq!(status.git_history.commit_count, 0);
     assert_eq!(status.local_ai.embedding.state, "MissingModel");
     assert_eq!(status.local_ai.fastembed.backend, "fastembed");
-    assert_eq!(status.local_ai.fastembed.model, ai::FASTEMBED_DISPLAY_MODEL);
-    assert_eq!(status.local_ai.fastembed.dim, ai::FASTEMBED_EMBEDDING_DIM);
+    assert_eq!(status.local_ai.fastembed.model, FASTEMBED_DISPLAY_MODEL);
+    assert_eq!(status.local_ai.fastembed.dim, FASTEMBED_EMBEDDING_DIM);
     assert!(!status.local_ai.fastembed.cache.is_empty());
     assert_eq!(status.local_ai.fastembed.build_feature_enabled, cfg!(feature = "fastembed"));
     assert_eq!(status.local_ai.artifacts.total_chunks, 1);
@@ -803,7 +810,7 @@ fn fastembed_missing_feature_reports_rebuild_command() {
     let (root, config) = markdown_config("alpha token\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let err = db.install_model(ai::FASTEMBED_MODEL_ID).unwrap_err();
+    let err = db.install_model(FASTEMBED_MODEL_ID).unwrap_err();
     assert!(err.to_string().contains(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
 
     let status = db.local_ai_status().unwrap();
@@ -825,7 +832,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     let chunk_id = first_chunk_id(&db);
 
     let models = db.list_models().unwrap();
-    let embedding = models.iter().find(|model| model.model_id == ai::HASH_MODEL_ID).unwrap();
+    let embedding = models.iter().find(|model| model.model_id == HASH_MODEL_ID).unwrap();
     assert!(!embedding.installed);
     assert_eq!(embedding.status, "MissingModel");
 
@@ -837,7 +844,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     assert_eq!(blocked.processed_chunks, 0);
     assert_eq!(blocked.embeddings_written, 0);
     assert_eq!(blocked.blocked_chunks, 0);
-    assert_eq!(blocked.model_id, ai::HASH_MODEL_ID);
+    assert_eq!(blocked.model_id, HASH_MODEL_ID);
     assert_eq!(blocked.batch_size, 8);
     assert_eq!(blocked.status, "Blocked");
 
@@ -845,15 +852,15 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     assert_eq!(status.embedding.state, "MissingModel");
     assert_eq!(status.embedding.blocked_artifacts, 0);
 
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
     let plan = db.reconcile_plan().unwrap();
     assert_eq!(plan.embeddings.missing, 1);
     assert_eq!(plan.embeddings.current, 0);
     let current = db.reconcile(Some(1), Some(8)).unwrap();
     assert_eq!(current.embeddings_written, 1);
-    assert_eq!(current.model_id, ai::HASH_MODEL_ID);
+    assert_eq!(current.model_id, HASH_MODEL_ID);
     assert_eq!(current.model_version, "hash-v1");
-    assert_eq!(current.embedding_dim, ai::HASH_EMBEDDING_DIM);
+    assert_eq!(current.embedding_dim, HASH_EMBEDDING_DIM);
     assert_eq!(current.status, "Current");
     assert_eq!(current.work_reasons.get("Missing"), Some(&1));
     let noop = db.reconcile(None, Some(8)).unwrap();
@@ -872,7 +879,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(embedding_bytes, (ai::HASH_EMBEDDING_DIM * 4) as i64);
+    assert_eq!(embedding_bytes, (HASH_EMBEDDING_DIM * 4) as i64);
 
     let hits = db.search("alpha", 10, false).unwrap();
     assert!(hits[0].summary.contains("alpha token"));
@@ -894,7 +901,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     let refreshed = db.reconcile(None, Some(8)).unwrap();
     assert_eq!(refreshed.processed_chunks, 1);
     assert_eq!(refreshed.work_reasons.get("SourceChanged"), Some(&1));
-    assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 1);
+    assert_eq!(db.current_embedding_count(HASH_MODEL_ID).unwrap(), 1);
     let stale_embedding_hits = db.search("alpha", 10, false).unwrap();
     assert_eq!(stale_embedding_hits.len(), 1);
 
@@ -916,7 +923,7 @@ fn cached_fastembed_model_recovers_ready_state() {
     ai::recover_cached_fastembed_model_at(db.storage.connection(), &cache_dir).unwrap();
 
     let models = db.list_models().unwrap();
-    let fastembed = models.iter().find(|model| model.model_id == ai::FASTEMBED_MODEL_ID).unwrap();
+    let fastembed = models.iter().find(|model| model.model_id == FASTEMBED_MODEL_ID).unwrap();
     assert!(fastembed.installed);
     assert_eq!(fastembed.status, "Ready");
     let status = db.local_ai_status().unwrap();
@@ -943,7 +950,7 @@ fn compatible_migrate_recovers_cached_fastembed_model() {
             "UPDATE ai_models
                  SET installed = 0, status = 'MissingModel', installed_at_ms = NULL
                  WHERE model_id = ?1",
-            [ai::FASTEMBED_MODEL_ID],
+            [FASTEMBED_MODEL_ID],
         )
         .unwrap();
 
@@ -965,14 +972,14 @@ fn reconcile_without_limit_processes_all_chunks() {
          eligibility and useful semantic context\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
 
     let report = db.reconcile(None, Some(2)).unwrap();
 
     assert_eq!(report.processed_chunks, 2);
     assert_eq!(report.embeddings_written, 2);
     assert_eq!(report.batch_size, 2);
-    assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 2);
+    assert_eq!(db.current_embedding_count(HASH_MODEL_ID).unwrap(), 2);
     let second = db.reconcile(None, Some(2)).unwrap();
     assert_eq!(second.processed_chunks, 0);
 
@@ -991,7 +998,7 @@ fn force_reconcile_processes_each_chunk_once_and_terminates() {
          eligibility and useful semantic context\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
 
     // Two eligible chunks; force with a limit far above the chunk count.
     let report = db.reconcile_with_progress(Some(50), Some(2), true, |_| {}).unwrap();
@@ -1010,7 +1017,7 @@ fn force_reconcile_progress_is_honest_and_terminates_without_limit() {
          eligibility and useful semantic context\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
 
     // No --limit. max_seconds is only a safety net: if the force loop regressed to
     // re-embedding forever it would trip max_seconds and report "Partial" rather than
@@ -1057,7 +1064,7 @@ fn status_counts_only_active_context_chunks() {
          eligibility and useful semantic context\n",
     );
     let mut db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
 
     let active = db.local_ai_status().unwrap().artifacts.total_chunks;
     assert!(active > 0, "expected active chunks, got {active}");
@@ -1156,7 +1163,7 @@ fn gc_prunes_dead_context_rows_and_keeps_live_ones() {
          eligibility and useful semantic context\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
     db.reconcile(None, Some(8)).unwrap();
 
     let live_files = table_row_count(db.storage.connection(), "files").unwrap();
@@ -1236,7 +1243,7 @@ int main(void)
     .unwrap();
     let config = source_config(root.clone(), Language::C);
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
 
     let plan = db.reconcile_plan().unwrap();
 
@@ -1253,7 +1260,7 @@ int main(void)
 fn reconcile_policy_skips_tiny_chunks_before_embedding() {
     let (root, config) = markdown_config("tiny\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
 
     let plan = db.reconcile_plan().unwrap();
     assert_eq!(plan.embeddings.missing, 0);
@@ -1262,7 +1269,7 @@ fn reconcile_policy_skips_tiny_chunks_before_embedding() {
     let report = db.reconcile(None, Some(8)).unwrap();
     assert_eq!(report.embeddings_written, 0);
     assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
-    assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 0);
+    assert_eq!(db.current_embedding_count(HASH_MODEL_ID).unwrap(), 0);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1277,7 +1284,7 @@ fn reconcile_plan_reports_policy_skips_for_fastembed_model() {
             "UPDATE ai_models
                  SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2
                  WHERE model_id = ?1",
-            params![ai::FASTEMBED_MODEL_ID, i64::try_from(ai::FASTEMBED_EMBEDDING_DIM).unwrap()],
+            params![FASTEMBED_MODEL_ID, i64::try_from(FASTEMBED_EMBEDDING_DIM).unwrap()],
         )
         .unwrap();
     db.storage
@@ -1285,13 +1292,13 @@ fn reconcile_plan_reports_policy_skips_for_fastembed_model() {
         .execute(
             "INSERT INTO index_meta(key, value) VALUES ('active_embedding_model', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [ai::FASTEMBED_MODEL_ID],
+            [FASTEMBED_MODEL_ID],
         )
         .unwrap();
 
     let plan = db.reconcile_plan().unwrap();
 
-    assert_eq!(plan.embeddings.model_id, ai::FASTEMBED_MODEL_ID);
+    assert_eq!(plan.embeddings.model_id, FASTEMBED_MODEL_ID);
     assert_eq!(plan.embeddings.missing, 0);
     assert_eq!(plan.embeddings.skipped_by_policy.get("SkipTooSmall"), Some(&1));
 
@@ -1308,7 +1315,7 @@ fn blocked_fastembed_reconcile_still_reports_policy_skips() {
         .execute(
             "INSERT INTO index_meta(key, value) VALUES ('active_embedding_model', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [ai::FASTEMBED_MODEL_ID],
+            [FASTEMBED_MODEL_ID],
         )
         .unwrap();
 
@@ -1327,7 +1334,7 @@ fn search_explain_reports_weighted_score_components() {
          semantic vector scoring\nthird line\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
     db.reconcile(None, Some(8)).unwrap();
 
     let hits = db.search_explain("runtime shutdown", 10, false).unwrap();
@@ -8200,7 +8207,7 @@ fn refresh_worktree_overlays_reconciles_overlay_scope_embeddings() {
     run_git(&main, &["commit", "-q", "-m", "base"]);
     let config = source_config(main.clone(), Language::Rust);
     let mut db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
     db.reconcile(None, Some(8)).unwrap();
 
     let linked = unique_temp_root();
@@ -8741,7 +8748,7 @@ fn worktree_overlay_pending_embeddings_are_detectable_for_retry() {
     run_git(&main, &["commit", "-q", "-m", "base"]);
     let config = source_config(main.clone(), Language::Rust);
     let mut db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID).unwrap();
     // The base has at least one embeddable chunk before reconcile (so the test isn't vacuous)...
     set_base_scope(&mut db, &main);
     assert!(db.pending_embedding_jobs().unwrap() > 0, "base has an embeddable chunk to begin with");

@@ -17,43 +17,17 @@ use sha2::{Digest, Sha256};
 pub(crate) use status::*;
 pub(crate) use store::*;
 
+#[cfg(feature = "fastembed")]
+use crate::embedding_models::{BGE_SMALL_MODEL_ID, JINA_CODE_MODEL_ID};
+use crate::embedding_models::{HASH_EMBEDDING_DIM, HASH_MODEL_ID};
+#[cfg(feature = "model2vec")]
+use crate::embedding_models::{MODEL2VEC_EMBEDDING_DIM, MODEL2VEC_MODEL_ID};
 use crate::index::now_ms;
 use crate::language::Language;
 
-pub const HASH_MODEL_ID: &str = "embedding-hash";
-pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
-pub const FASTEMBED_DISPLAY_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
-pub const HASH_EMBEDDING_DIM: usize = 384;
-pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
-
-/// BGE-small-en-v1.5 (#112): a stronger general-retrieval embedder than all-MiniLM at the SAME
-/// 384-dim — switching to it is a re-embed, not a schema/dim change. MIT-licensed; ships via
-/// fastembed (downloads on first use). Measured against `FASTEMBED_MODEL_ID` on the replay eval.
-pub const BGE_SMALL_MODEL_ID: &str = "fastembed-bge-small-en-v1.5";
-pub const BGE_SMALL_DISPLAY_MODEL: &str = "BAAI/bge-small-en-v1.5";
-pub const BGE_SMALL_EMBEDDING_DIM: usize = 384;
-// NB (#308 review): BGE-small-en-v1.5 does NOT take a query instruction prefix here. v1.5 needs no
-// instruction (BAAI: "no instruction only [a] slight degradation… without instruction in all cases
-// for convenience"), and on SHORT CODE queries the 9-word NL instruction dominates the query vector
-// — it collapsed every query together and tanked replay recall 0.562 → 0.000. Passages never take
-// it either. So queries embed raw, same as all-MiniLM.
-
-/// jina-embeddings-v2-base-code (#112): a CODE-specific embedder — 768-dim, Apache-2.0, a built-in
-/// fastembed model. SYMMETRIC: queries and code both embed RAW (no query instruction, unlike
-/// CodeRankEmbed), so it slots into the raw embed path with no prefix, dodging the BGE
-/// instruction-collapse footgun above. 768-dim → a re-embed, not a schema change. Measured against
-/// all-MiniLM / BGE on the commit-replay eval before it ships as the code tier.
-pub const JINA_CODE_MODEL_ID: &str = "fastembed-jina-v2-base-code";
-pub const JINA_CODE_DISPLAY_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
-pub const JINA_CODE_EMBEDDING_DIM: usize = 768;
-
-/// Model2Vec static-embedding backend: a token→vector lookup + mean-pool (no transformer forward
-/// pass), ~100-500× faster than FastEmbed on CPU at some retrieval-quality cost. The right choice
-/// for very large repos where the FastEmbed backfill is infeasible. See `EmbeddingBackend`.
-pub const MODEL2VEC_MODEL_ID: &str = "model2vec-potion-retrieval-32m";
-pub const MODEL2VEC_DISPLAY_MODEL: &str = "minishlab/potion-retrieval-32M";
+/// The Model2Vec HF repo to pull weights from. Not a registry field — it is a construction detail
+/// of `Model2VecEmbedder`, not part of the model's index identity.
 pub const MODEL2VEC_HF_REPO: &str = "minishlab/potion-retrieval-32M";
-pub const MODEL2VEC_EMBEDDING_DIM: usize = 512;
 pub const MODEL2VEC_MISSING_FEATURE_MESSAGE: &str =
     "Model2Vec backend requested, but this binary was built without Model2Vec support.\nRebuild \
      with default features enabled:\n  cargo install rag-rat";
@@ -131,38 +105,26 @@ pub struct FastEmbedEmbedder {
 
 #[cfg(feature = "fastembed")]
 impl FastEmbedEmbedder {
-    /// all-MiniLM-L6-v2 (384-dim) — the default general-purpose backend.
-    pub fn new(intra_threads: Option<usize>) -> anyhow::Result<Self> {
-        Self::with_model(
-            fastembed::EmbeddingModel::AllMiniLML6V2,
-            FASTEMBED_MODEL_ID,
-            FASTEMBED_EMBEDDING_DIM,
-            intra_threads,
-        )
-    }
-
-    /// BGE-small-en-v1.5 (384-dim, #112) — a stronger general-retrieval embedder, same dimension as
-    /// all-MiniLM so swapping it is a re-embed rather than a schema/dim change. v1.5 needs no query
-    /// instruction (see the const note above), so queries embed raw, like all-MiniLM.
-    pub fn new_bge_small(intra_threads: Option<usize>) -> anyhow::Result<Self> {
-        Self::with_model(
-            fastembed::EmbeddingModel::BGESmallENV15,
-            BGE_SMALL_MODEL_ID,
-            BGE_SMALL_EMBEDDING_DIM,
-            intra_threads,
-        )
-    }
-
-    /// jina-embeddings-v2-base-code (768-dim, #112) — a CODE-specific embedder. Symmetric, so
-    /// queries and code both embed raw (no instruction). fastembed applies its Mean pooling +
-    /// L2-normalize internally; nothing to override here.
-    pub fn new_jina_code(intra_threads: Option<usize>) -> anyhow::Result<Self> {
-        Self::with_model(
-            fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode,
-            JINA_CODE_MODEL_ID,
-            JINA_CODE_EMBEDDING_DIM,
-            intra_threads,
-        )
+    /// Construct the FastEmbed embedder for a registered model id. This is the ONLY place that maps
+    /// a `model_id` to a `fastembed::EmbeddingModel` enum — every fastembed model the registry
+    /// knows about is selected here, defaulting to all-MiniLM for the (registry-guaranteed)
+    /// MiniLM id. The `dim` comes from the registry spec so the embedder reports the right
+    /// dimension without a second source of truth.
+    ///
+    /// All current fastembed models are SYMMETRIC (queries and code embed raw); fastembed applies
+    /// each model's Mean pooling + L2-normalize internally, so nothing is overridden here. See the
+    /// BGE instruction-collapse note in `embedding_models`.
+    pub fn for_model_id(
+        model_id: &'static str,
+        dim: usize,
+        intra_threads: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        let model = match model_id {
+            BGE_SMALL_MODEL_ID => fastembed::EmbeddingModel::BGESmallENV15,
+            JINA_CODE_MODEL_ID => fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode,
+            _ => fastembed::EmbeddingModel::AllMiniLML6V2,
+        };
+        Self::with_model(model, model_id, dim, intra_threads)
     }
 
     fn with_model(

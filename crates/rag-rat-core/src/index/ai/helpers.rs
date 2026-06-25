@@ -1,4 +1,5 @@
 use super::*;
+use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
 
 pub(crate) fn embed_query(
     conn: &Connection,
@@ -54,14 +55,7 @@ pub(crate) fn active_embedding_model_version(
 }
 
 pub(crate) fn default_model_version(model_id: &str) -> &'static str {
-    match model_id {
-        HASH_MODEL_ID => "hash-v1",
-        FASTEMBED_MODEL_ID => "fastembed-all-minilm-l6-v2-v1",
-        BGE_SMALL_MODEL_ID => "fastembed-bge-small-en-v1.5-v1",
-        JINA_CODE_MODEL_ID => "fastembed-jina-v2-base-code-v1",
-        MODEL2VEC_MODEL_ID => "model2vec-potion-retrieval-32m-v1",
-        _ => "v1",
-    }
+    spec(model_id).map_or("v1", |s| s.version)
 }
 
 pub(crate) fn current_embedding_count(conn: &Connection, model_id: &str) -> anyhow::Result<u64> {
@@ -97,24 +91,49 @@ pub(crate) fn active_embedder(
     let model_id = active_embedding_model_id(conn)?;
     let model = model(conn, &model_id)?;
     validate_ready_model(&model)?;
-    match model.model_id.as_str() {
-        HASH_MODEL_ID => Ok(Box::new(HashEmbedder)),
-        FASTEMBED_MODEL_ID => fastembed_embedder(intra_threads),
-        BGE_SMALL_MODEL_ID => bge_small_embedder(intra_threads),
-        JINA_CODE_MODEL_ID => jina_code_embedder(intra_threads),
-        MODEL2VEC_MODEL_ID => model2vec_embedder(),
-        other => anyhow::bail!("unknown active embedding model `{other}`"),
-    }
+    let spec = spec(&model.model_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown active embedding model `{}`", model.model_id))?;
+    embedder_for_spec(spec, intra_threads)
 }
 
-pub(crate) fn model2vec_embedder() -> anyhow::Result<Box<dyn Embedder>> {
-    #[cfg(feature = "model2vec")]
-    {
-        Ok(Box::new(Model2VecEmbedder::new()?))
-    }
-    #[cfg(not(feature = "model2vec"))]
-    {
-        anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
+/// Build the embedder for a registry spec, dispatching on its `backend`. The single construction
+/// site for every model — the per-model factory fns this replaced (`fastembed_embedder`,
+/// `bge_small_embedder`, `jina_code_embedder`, `model2vec_embedder`) collapsed into this dispatch.
+/// The `#[cfg]` gating + missing-feature bails for builds without `fastembed` / `model2vec` are
+/// preserved here.
+pub(crate) fn embedder_for_spec(
+    spec: &'static EmbeddingModelSpec,
+    intra_threads: Option<usize>,
+) -> anyhow::Result<Box<dyn Embedder>> {
+    match spec.backend {
+        Backend::Hash => Ok(Box::new(HashEmbedder)),
+        Backend::FastEmbed => {
+            #[cfg(feature = "fastembed")]
+            {
+                Ok(Box::new(FastEmbedEmbedder::for_model_id(
+                    spec.model_id,
+                    spec.dim,
+                    intra_threads,
+                )?))
+            }
+            #[cfg(not(feature = "fastembed"))]
+            {
+                let _ = intra_threads;
+                anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
+            }
+        },
+        Backend::Model2Vec => {
+            #[cfg(feature = "model2vec")]
+            {
+                let _ = intra_threads;
+                Ok(Box::new(Model2VecEmbedder::new()?))
+            }
+            #[cfg(not(feature = "model2vec"))]
+            {
+                let _ = intra_threads;
+                anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
+            }
+        },
     }
 }
 
@@ -151,56 +170,7 @@ pub(crate) fn model_not_ready_reason(model: &ModelInfo) -> String {
 }
 
 pub(crate) fn expected_dim(model_id: &str) -> Option<usize> {
-    match model_id {
-        HASH_MODEL_ID => Some(HASH_EMBEDDING_DIM),
-        FASTEMBED_MODEL_ID => Some(FASTEMBED_EMBEDDING_DIM),
-        BGE_SMALL_MODEL_ID => Some(BGE_SMALL_EMBEDDING_DIM),
-        JINA_CODE_MODEL_ID => Some(JINA_CODE_EMBEDDING_DIM),
-        MODEL2VEC_MODEL_ID => Some(MODEL2VEC_EMBEDDING_DIM),
-        _ => None,
-    }
-}
-
-pub(crate) fn fastembed_embedder(
-    intra_threads: Option<usize>,
-) -> anyhow::Result<Box<dyn Embedder>> {
-    #[cfg(feature = "fastembed")]
-    {
-        Ok(Box::new(FastEmbedEmbedder::new(intra_threads)?))
-    }
-    #[cfg(not(feature = "fastembed"))]
-    {
-        let _ = intra_threads;
-        anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
-    }
-}
-
-pub(crate) fn bge_small_embedder(
-    intra_threads: Option<usize>,
-) -> anyhow::Result<Box<dyn Embedder>> {
-    #[cfg(feature = "fastembed")]
-    {
-        Ok(Box::new(FastEmbedEmbedder::new_bge_small(intra_threads)?))
-    }
-    #[cfg(not(feature = "fastembed"))]
-    {
-        let _ = intra_threads;
-        anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
-    }
-}
-
-pub(crate) fn jina_code_embedder(
-    intra_threads: Option<usize>,
-) -> anyhow::Result<Box<dyn Embedder>> {
-    #[cfg(feature = "fastembed")]
-    {
-        Ok(Box::new(FastEmbedEmbedder::new_jina_code(intra_threads)?))
-    }
-    #[cfg(not(feature = "fastembed"))]
-    {
-        let _ = intra_threads;
-        anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
-    }
+    spec(model_id).map(|s| s.dim)
 }
 
 pub(crate) fn fastembed_cache_dir() -> PathBuf {
@@ -471,25 +441,26 @@ mod tests {
 
     #[test]
     fn registered_embedding_models_have_consistent_dim_and_version() {
-        // Every registered model id must resolve a dim and a NON-fallback version string — else the
-        // reconcile freshness key (model_version) is wrong and embeddings silently mis-track.
-        // Regression guard for the model-id match arms in expected_dim / default_model_version
-        // (#112).
-        for (id, dim) in [
-            (HASH_MODEL_ID, HASH_EMBEDDING_DIM),
-            (FASTEMBED_MODEL_ID, FASTEMBED_EMBEDDING_DIM),
-            (BGE_SMALL_MODEL_ID, BGE_SMALL_EMBEDDING_DIM),
-            (JINA_CODE_MODEL_ID, JINA_CODE_EMBEDDING_DIM),
-            (MODEL2VEC_MODEL_ID, MODEL2VEC_EMBEDDING_DIM),
-        ] {
-            assert_eq!(expected_dim(id), Some(dim), "expected_dim missing/wrong for {id}");
+        // Every registered model id must resolve a dim and a NON-fallback version string through
+        // the table-driven helpers — else the reconcile freshness key (model_version) is
+        // wrong and embeddings silently mis-track. Regression guard for `expected_dim` /
+        // `default_model_version` now reading the `EMBEDDING_MODELS` registry (#112).
+        for spec in crate::embedding_models::EMBEDDING_MODELS {
+            assert_eq!(
+                expected_dim(spec.model_id),
+                Some(spec.dim),
+                "expected_dim missing/wrong for {}",
+                spec.model_id
+            );
             assert_ne!(
-                default_model_version(id),
+                default_model_version(spec.model_id),
                 "v1",
-                "version fell back to the default for {id}"
+                "version fell back to the default for {}",
+                spec.model_id
             );
         }
         // jina-v2-base-code is the 768-dim code tier; pin its identity explicitly.
+        use crate::embedding_models::JINA_CODE_MODEL_ID;
         assert_eq!(expected_dim(JINA_CODE_MODEL_ID), Some(768));
         assert_eq!(default_model_version(JINA_CODE_MODEL_ID), "fastembed-jina-v2-base-code-v1");
     }

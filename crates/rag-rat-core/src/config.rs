@@ -6,6 +6,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::embedding_models::{EmbeddingModelSpec, spec_for_alias};
 use crate::language::{Language, LanguageError};
 
 #[derive(Debug, Clone)]
@@ -98,39 +99,58 @@ pub struct EmbeddingConfig {
 
 /// The embedding backend selector (`[local_ai.embedding] model = "..."`).
 ///
-/// - `FastEmbed` (default): MiniLM transformer — best quality, but the cold backfill is CPU-bound
-///   (~10-100 chunks/sec), so impractical for very large repos.
-/// - `Model2Vec`: static token-vector lookup + mean-pool — ~100-500× faster on CPU at some
+/// Resolves the toml `model = "..."` string through the [`crate::embedding_models`] registry, so
+/// ANY registered model (`minilm` / `bge` / `jina` / `model2vec` / `hash`, or any of their aliases)
+/// is selectable — adding a model to the registry makes it selectable here with no edit. The
+/// embeddings-off choice (`none` / `off`) carries `None`. Kept a thin wrapper over a registry spec
+/// reference so `config` resolves model identity without depending on `index`
+/// (`crate::embedding_models` has no `index` dependency, so there is no cycle).
+///
+/// The common tiers, for reference:
+/// - `minilm` (the `EmbeddingBackend::default`): MiniLM transformer — best general quality, but the
+///   cold backfill is CPU-bound (~10-100 chunks/sec), so impractical for very large repos.
+/// - `model2vec`: static token-vector lookup + mean-pool — ~100-500× faster on CPU at some
 ///   retrieval-quality cost (no context/word-order). The choice for huge repos that still want
 ///   vectors.
-/// - `None`: structural + BM25 only; no dense vectors. `semantic_search` degrades to BM25. The
+/// - `none`: structural + BM25 only; no dense vectors. `semantic_search` degrades to BM25. The
 ///   cheapest option for enormous codebases where any embedding backfill is too slow.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum EmbeddingBackend {
-    #[default]
-    FastEmbed,
-    Model2Vec,
-    None,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingBackend(Option<&'static EmbeddingModelSpec>);
 
 impl EmbeddingBackend {
+    /// Embeddings off — structural + BM25 only.
+    pub const NONE: Self = Self(None);
+
+    /// The FastEmbed MiniLM tier — the default backend (`init` recommends it for smaller repos).
+    /// Resolved from the registry; the `minilm` alias is guaranteed present by the registry test.
+    pub fn fast_embed() -> Self {
+        Self(spec_for_alias("minilm"))
+    }
+
+    /// The Model2Vec static tier (`init` recommends it for very large repos).
+    pub fn model2vec() -> Self {
+        Self(spec_for_alias("model2vec"))
+    }
+
+    /// The canonical toml selector for this backend — the spec's FIRST alias (`init` renders this
+    /// back into `rag-rat.toml`), or `"none"` for the embeddings-off choice.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::FastEmbed => "minilm",
-            Self::Model2Vec => "model2vec",
-            Self::None => "none",
+        match self.0 {
+            Some(spec) => spec.aliases.first().copied().unwrap_or(spec.model_id),
+            None => "none",
         }
     }
 
     /// The persisted embedding-model id this backend installs/activates, or `None` for the
-    /// embeddings-off choice. Kept as a string so `rag-rat-core::index::ai` model ids stay the
-    /// single source of truth without `config` depending on `index`.
+    /// embeddings-off choice.
     pub fn model_id(self) -> Option<&'static str> {
-        match self {
-            Self::FastEmbed => Some("fastembed-all-minilm-l6-v2"),
-            Self::Model2Vec => Some("model2vec-potion-retrieval-32m"),
-            Self::None => None,
-        }
+        self.0.map(|spec| spec.model_id)
+    }
+}
+
+impl Default for EmbeddingBackend {
+    fn default() -> Self {
+        Self::fast_embed()
     }
 }
 
@@ -138,11 +158,12 @@ impl FromStr for EmbeddingBackend {
     type Err = ConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "minilm" | "fastembed" | "minilm-l6" => Ok(Self::FastEmbed),
-            "model2vec" | "potion" | "static" => Ok(Self::Model2Vec),
-            "none" | "off" | "bm25" => Ok(Self::None),
-            other => Err(ConfigError::UnknownEmbeddingBackend(other.to_string())),
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "none" | "off" | "bm25" => Ok(Self::NONE),
+            other => spec_for_alias(other)
+                .map(|spec| Self(Some(spec)))
+                .ok_or_else(|| ConfigError::UnknownEmbeddingBackend(other.to_string())),
         }
     }
 }
@@ -575,7 +596,8 @@ impl TryFrom<RawLocalAi> for LocalAiConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawEmbedding {
-    /// `model = "minilm" | "model2vec" | "none"` — the embedding backend selector.
+    /// `model = "<registered alias>" | "none"` — the embedding backend selector (`minilm`, `bge`,
+    /// `jina`, `model2vec`, … resolve through the embedding-model registry).
     model: Option<String>,
     #[serde(default)]
     runtime: RawEmbeddingRuntime,
@@ -633,7 +655,10 @@ pub enum ConfigError {
     Language(#[from] LanguageError),
     #[error("unknown target kind `{0}`")]
     UnknownTargetKind(String),
-    #[error("unknown embedding backend `{0}` (expected `minilm`, `model2vec`, or `none`)")]
+    #[error(
+        "unknown embedding backend `{0}` (expected a registered model alias such as `minilm`, \
+         `bge`, `jina`, `model2vec`, or `none`)"
+    )]
     UnknownEmbeddingBackend(String),
     #[error("duplicate target name `{0}`")]
     DuplicateTarget(String),

@@ -10,18 +10,18 @@ pub(crate) fn estimated_chunks(total_source_bytes: u64) -> u64 {
 /// repos default to the static Model2Vec backend (orders of magnitude faster, some quality cost).
 pub(crate) fn recommend_backend(estimated_chunks: u64) -> EmbeddingBackend {
     if estimated_chunks <= 5_000 {
-        EmbeddingBackend::FastEmbed
+        EmbeddingBackend::fast_embed()
     } else {
-        EmbeddingBackend::Model2Vec
+        EmbeddingBackend::model2vec()
     }
 }
 pub(crate) fn backend_label(backend: EmbeddingBackend) -> &'static str {
-    match backend {
-        EmbeddingBackend::FastEmbed =>
-            "minilm — MiniLM transformer; best quality, CPU backfill ~10-100 chunks/sec",
-        EmbeddingBackend::Model2Vec =>
-            "model2vec — static embeddings; ~100-500x faster on CPU, some quality cost",
-        EmbeddingBackend::None => "none — BM25 + structure only, no dense vectors",
+    if backend == EmbeddingBackend::NONE {
+        "none — BM25 + structure only, no dense vectors"
+    } else if backend == EmbeddingBackend::model2vec() {
+        "model2vec — static embeddings; ~100-500x faster on CPU, some quality cost"
+    } else {
+        "minilm — MiniLM transformer; best quality, CPU backfill ~10-100 chunks/sec"
     }
 }
 pub(crate) fn scan_repo(root: &Path) -> anyhow::Result<RepoScan> {
