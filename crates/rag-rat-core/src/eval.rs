@@ -130,6 +130,7 @@ pub struct EvalBaselineReport {
     pub metrics: EvalMetrics,
     pub delta_mrr_at_10: f64,
     pub delta_recall_at_10: f64,
+    pub delta_recall_at_3: f64,
     pub delta_path_hit_rate: f64,
     pub delta_symbol_hit_rate: f64,
 }
@@ -138,6 +139,7 @@ pub struct EvalBaselineReport {
 pub struct EvalMetrics {
     pub mrr_at_10: f64,
     pub recall_at_10: f64,
+    pub recall_at_3: f64,
     pub path_hit_rate: f64,
     pub symbol_hit_rate: f64,
     pub graph_evidence_hit_rate: f64,
@@ -162,6 +164,7 @@ pub struct EvalQueryReport {
     pub skip_reason: Option<String>,
     pub reciprocal_rank_at_10: f64,
     pub recall_at_10: f64,
+    pub recall_at_3: f64,
     pub path_hits: Vec<String>,
     pub missing_paths: Vec<String>,
     pub symbol_hits: Vec<String>,
@@ -715,6 +718,29 @@ fn evaluate_query(
     let found_relevant = path_hits.len() + symbol_hits.len();
     let recall_at_10 =
         if expected_relevant == 0 { 1.0 } else { found_relevant as f64 / expected_relevant as f64 };
+    // recall@3 reuses the identical path/symbol membership predicates as recall@10 above; the only
+    // difference is the slice — membership is tested over the first 3 hits, not the full top-10.
+    // A within-top-10 reorder (the reranker A/B target) moves this but not recall@10.
+    let top3 = &hits[..3.min(hits.len())];
+    let found_relevant_at_3 = query
+        .must_include_paths
+        .iter()
+        .filter(|expected| top3.iter().any(|hit| hit.path == **expected))
+        .count()
+        + query
+            .must_include_symbols
+            .iter()
+            .filter(|expected| {
+                top3.iter().filter_map(|hit| hit.symbol_path.as_deref()).any(|symbol| {
+                    symbol == expected.as_str() || symbol.ends_with(expected.as_str())
+                })
+            })
+            .count();
+    let recall_at_3 = if expected_relevant == 0 {
+        1.0
+    } else {
+        found_relevant_at_3 as f64 / expected_relevant as f64
+    };
     let passed = stale_current_source_violations == 0
         && missing_paths.is_empty()
         && missing_symbols.is_empty()
@@ -733,6 +759,7 @@ fn evaluate_query(
         skip_reason: None,
         reciprocal_rank_at_10,
         recall_at_10,
+        recall_at_3,
         path_hits,
         missing_paths,
         symbol_hits,
@@ -766,6 +793,7 @@ fn skipped_report(query: &EvalQuery, reason: impl Into<String>) -> EvalQueryRepo
         skip_reason: Some(reason.into()),
         reciprocal_rank_at_10: 0.0,
         recall_at_10: 1.0,
+        recall_at_3: 1.0,
         path_hits: Vec::new(),
         missing_paths: Vec::new(),
         symbol_hits: Vec::new(),
@@ -832,6 +860,7 @@ fn hash_vector_baseline(
         current_artifacts,
         delta_mrr_at_10: active_metrics.mrr_at_10 - metrics.mrr_at_10,
         delta_recall_at_10: active_metrics.recall_at_10 - metrics.recall_at_10,
+        delta_recall_at_3: active_metrics.recall_at_3 - metrics.recall_at_3,
         delta_path_hit_rate: active_metrics.path_hit_rate - metrics.path_hit_rate,
         delta_symbol_hit_rate: active_metrics.symbol_hit_rate - metrics.symbol_hit_rate,
         metrics,
@@ -967,6 +996,7 @@ fn aggregate(results: &[EvalQueryReport]) -> EvalMetrics {
     EvalMetrics {
         mrr_at_10: measured.iter().map(|r| r.reciprocal_rank_at_10).sum::<f64>() / query_count,
         recall_at_10: measured.iter().map(|r| r.recall_at_10).sum::<f64>() / query_count,
+        recall_at_3: measured.iter().map(|r| r.recall_at_3).sum::<f64>() / query_count,
         path_hit_rate: hit_rate(&measured, |r| r.missing_paths.is_empty()),
         symbol_hit_rate: hit_rate(&measured, |r| r.missing_symbols.is_empty()),
         graph_evidence_hit_rate: expected_hit_rate(&measured, |r| {
@@ -1141,6 +1171,20 @@ mod tests {
         assert_eq!(report.metrics.stale_current_source_violations, 0);
         assert!(report.metrics.mrr_at_10 > 0.0);
         assert!(report.metrics.recall_at_10 > 0.0);
+
+        // recall@3 measures membership over the first 3 hits, recall@10 over all 10; the top-3 is a
+        // subset of the top-10, so recall@3 can never exceed recall@10 — neither per query nor in
+        // the aggregate mean. A regression here means recall@3 stopped slicing the same hit list.
+        for result in report.results.iter().filter(|result| !result.skipped) {
+            assert!(
+                result.recall_at_3 <= result.recall_at_10,
+                "{}: recall@3 ({}) exceeded recall@10 ({})",
+                result.id,
+                result.recall_at_3,
+                result.recall_at_10,
+            );
+        }
+        assert!(report.metrics.recall_at_3 <= report.metrics.recall_at_10);
 
         // The full hand-authored `must_include_*` baseline is the hard gate ONLY with an embedding
         // backend. Some expectations (the const-arrow hook by name, the graph-neighbor query)

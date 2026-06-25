@@ -3,13 +3,14 @@ use super::*;
 #[cfg(feature = "eval")]
 pub(crate) fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
     println!(
-        "eval: pass={} queries={} skipped={} mrr@10={:.3} recall@10={:.3} path_hit_rate={:.3} \
-         symbol_hit_rate={:.3}",
+        "eval: pass={} queries={} skipped={} mrr@10={:.3} recall@10={:.3} recall@3={:.3} \
+         path_hit_rate={:.3} symbol_hit_rate={:.3}",
         report.pass,
         report.queries,
         report.results.iter().filter(|result| result.skipped).count(),
         report.metrics.mrr_at_10,
         report.metrics.recall_at_10,
+        report.metrics.recall_at_3,
         report.metrics.path_hit_rate,
         report.metrics.symbol_hit_rate
     );
@@ -44,14 +45,17 @@ pub(crate) fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
     }
     println!(
         "eval: hash_vector_baseline model={} available={} current_artifacts={} mrr@10={:.3} \
-         recall@10={:.3} delta_mrr@10={:+.3} delta_recall@10={:+.3}",
+         recall@10={:.3} recall@3={:.3} delta_mrr@10={:+.3} delta_recall@10={:+.3} \
+         delta_recall@3={:+.3}",
         report.hash_vector_baseline.model_id,
         report.hash_vector_baseline.available,
         report.hash_vector_baseline.current_artifacts,
         report.hash_vector_baseline.metrics.mrr_at_10,
         report.hash_vector_baseline.metrics.recall_at_10,
+        report.hash_vector_baseline.metrics.recall_at_3,
         report.hash_vector_baseline.delta_mrr_at_10,
-        report.hash_vector_baseline.delta_recall_at_10
+        report.hash_vector_baseline.delta_recall_at_10,
+        report.hash_vector_baseline.delta_recall_at_3
     );
     for result in report.results.iter().filter(|result| !result.passed) {
         println!(
