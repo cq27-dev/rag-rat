@@ -107,6 +107,12 @@ pub struct EmbeddingConfig {
     /// on repo size; see [`EmbeddingBackend`].
     pub backend: EmbeddingBackend,
     pub runtime: EmbeddingRuntimeConfig,
+    /// Optional remote-embedding offload (`[local_ai.embedding.remote]`). When present, the
+    /// indexer can hand embedding work to an HTTP server (Ollama's `/api/embed`) instead of
+    /// running the model in-process — see [`RemoteEmbeddingConfig`]. Absent → `None` → in-process
+    /// embedding only. Parsed + validated here; the dispatch that consumes it lands in #317 task
+    /// 5.
+    pub remote: Option<RemoteEmbeddingConfig>,
 }
 
 /// The embedding backend selector (`[local_ai.embedding] model = "..."`).
@@ -195,6 +201,84 @@ impl Default for EmbeddingRuntimeConfig {
             ort_threads: Some(4),
             omp_threads: Some(1),
             max_embedding_chars: 4000,
+        }
+    }
+}
+
+/// Remote-embedding offload (`[local_ai.embedding.remote]`). Hands embedding work to an HTTP
+/// server (Ollama's `/api/embed`) instead of running the model in-process — the lever for huge
+/// repos whose in-process backfill is too slow on the indexing box. Optional: absent → in-process
+/// embedding only.
+///
+/// Deliberately carries NO `dim` or `backend` field. The vector dimension comes from the registry
+/// spec of the selected model (the `ollama-all-minilm` row, dim 384) and is validated against the
+/// server's first response at runtime by the embedder (#317 task 4); the backend is implied by the
+/// selected registry model. Duplicating either here would be redundant and drift-prone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEmbeddingConfig {
+    /// How the remote server is reached. `Connect` (the v1 default) talks to an
+    /// already-running server at `endpoint`; `Ephemeral` (provision-on-demand) is not yet
+    /// supported — see [`RemoteMode`].
+    pub mode: RemoteMode,
+    /// The Ollama API model name sent to `/api/embed` (e.g. `"all-minilm"`). This is the server's
+    /// own model identifier, NOT a `rag-rat` registry alias — the registry only supplies the dim
+    /// parity contract.
+    pub model: String,
+    /// Base URL of the remote server (e.g. `"http://localhost:11434"`). Required in `Connect`
+    /// mode; `/api/embed` is appended by the embedder.
+    pub endpoint: Option<String>,
+    /// Name of the environment variable holding the bearer token, if the server needs auth. Local
+    /// Ollama needs none, so this is optional; the embedder reads the var once at construction.
+    pub auth_env: Option<String>,
+    /// How many texts to send per `/api/embed` request.
+    pub batch_size: u32,
+    /// Per-request HTTP timeout, in seconds.
+    pub request_timeout_s: u64,
+}
+
+impl Default for RemoteEmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            mode: RemoteMode::Connect,
+            model: String::new(),
+            endpoint: None,
+            auth_env: None,
+            batch_size: 256,
+            request_timeout_s: 60,
+        }
+    }
+}
+
+/// How the remote-embedding server is obtained (`[local_ai.embedding.remote] mode = "..."`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemoteMode {
+    /// Connect to an already-running server at the configured `endpoint`. The v1 default and the
+    /// only supported mode today.
+    #[default]
+    Connect,
+    /// Provision an ephemeral server on demand. Not yet supported — needs the provisioning
+    /// cookbook (#318); selecting it is a [`ConfigError::RemoteEmbeddingEphemeralUnsupported`].
+    Ephemeral,
+}
+
+impl RemoteMode {
+    /// The canonical toml selector for this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+}
+
+impl FromStr for RemoteMode {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "connect" => Ok(Self::Connect),
+            "ephemeral" => Ok(Self::Ephemeral),
+            other => Err(ConfigError::UnknownRemoteMode(other.to_string())),
         }
     }
 }
@@ -631,6 +715,8 @@ struct RawEmbedding {
     model: Option<String>,
     #[serde(default)]
     runtime: RawEmbeddingRuntime,
+    /// `[local_ai.embedding.remote]` — absent → no remote offload (`remote: None`).
+    remote: Option<RawRemoteEmbedding>,
 }
 
 impl TryFrom<RawEmbedding> for EmbeddingConfig {
@@ -641,7 +727,55 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
             Some(value) => value.parse()?,
             None => EmbeddingBackend::default(),
         };
-        Ok(Self { backend, runtime: raw.runtime.into() })
+        let remote = raw.remote.map(RemoteEmbeddingConfig::try_from).transpose()?;
+        Ok(Self { backend, runtime: raw.runtime.into(), remote })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawRemoteEmbedding {
+    mode: Option<String>,
+    model: Option<String>,
+    endpoint: Option<String>,
+    auth_env: Option<String>,
+    batch_size: Option<u32>,
+    request_timeout_s: Option<u64>,
+}
+
+impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawRemoteEmbedding) -> Result<Self, Self::Error> {
+        let default = RemoteEmbeddingConfig::default();
+        // `mode` absent → `Connect` (the v1 default). `Ephemeral` parses but isn't wired yet.
+        let mode = match raw.mode.as_deref() {
+            Some(value) => value.parse()?,
+            None => default.mode,
+        };
+        if mode == RemoteMode::Ephemeral {
+            return Err(ConfigError::RemoteEmbeddingEphemeralUnsupported);
+        }
+        // The Ollama API model name (e.g. `all-minilm`) — required, non-empty.
+        let model = raw.model.unwrap_or_default();
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(ConfigError::RemoteEmbeddingMissingModel);
+        }
+        // `Connect` mode needs a non-empty server URL to reach.
+        let endpoint = raw.endpoint.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        if mode == RemoteMode::Connect && endpoint.is_none() {
+            return Err(ConfigError::RemoteEmbeddingMissingEndpoint);
+        }
+        // Optional — local Ollama needs no auth; trim if present.
+        let auth_env = raw.auth_env.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+        Ok(Self {
+            mode,
+            model: model.to_string(),
+            endpoint,
+            auth_env,
+            batch_size: raw.batch_size.unwrap_or(default.batch_size),
+            request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
+        })
     }
 }
 
@@ -690,6 +824,23 @@ pub enum ConfigError {
          `bge`, `jina`, `model2vec`, or `none`)"
     )]
     UnknownEmbeddingBackend(String),
+    #[error("unknown remote embedding mode `{0}` (expected `connect` or `ephemeral`)")]
+    UnknownRemoteMode(String),
+    #[error(
+        "[local_ai.embedding.remote] requires a non-empty `model` (the Ollama API model name, \
+         such as `all-minilm`)"
+    )]
+    RemoteEmbeddingMissingModel,
+    #[error(
+        "[local_ai.embedding.remote] mode = \"connect\" requires a non-empty `endpoint` (the \
+         remote server URL, such as `http://localhost:11434`)"
+    )]
+    RemoteEmbeddingMissingEndpoint,
+    #[error(
+        "[local_ai.embedding.remote] mode = \"ephemeral\" is not yet supported (needs the \
+         provisioning cookbook, #318); use mode = \"connect\" for now"
+    )]
+    RemoteEmbeddingEphemeralUnsupported,
     #[error("duplicate target name `{0}`")]
     DuplicateTarget(String),
     #[error("configured directory does not exist: {0}")]
@@ -1014,6 +1165,177 @@ mod tests {
             omp_threads: Some(1),
             max_embedding_chars: 5000,
         });
+    }
+
+    #[test]
+    fn remote_embedding_absent_is_none() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding]
+            model = "minilm"
+            "#,
+        )
+        .unwrap();
+        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        assert_eq!(local_ai.embedding.remote, None, "no [remote] block → remote: None");
+    }
+
+    #[test]
+    fn remote_embedding_connect_happy_path_applies_defaults() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding.remote]
+            mode = "connect"
+            model = "all-minilm"
+            endpoint = "http://localhost:11434"
+            "#,
+        )
+        .unwrap();
+        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        assert_eq!(
+            local_ai.embedding.remote,
+            Some(RemoteEmbeddingConfig {
+                mode: RemoteMode::Connect,
+                model: "all-minilm".to_string(),
+                endpoint: Some("http://localhost:11434".to_string()),
+                auth_env: None,
+                // defaults applied when omitted
+                batch_size: 256,
+                request_timeout_s: 60,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_embedding_mode_omitted_defaults_to_connect() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding.remote]
+            model = "all-minilm"
+            endpoint = "http://localhost:11434"
+            "#,
+        )
+        .unwrap();
+        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        let remote = local_ai.embedding.remote.expect("remote block present");
+        assert_eq!(remote.mode, RemoteMode::Connect, "absent mode → Connect (the v1 default)");
+    }
+
+    #[test]
+    fn remote_embedding_overrides_batch_and_timeout() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding.remote]
+            model = "all-minilm"
+            endpoint = "http://localhost:11434"
+            auth_env = "OLLAMA_TOKEN"
+            batch_size = 512
+            request_timeout_s = 120
+            "#,
+        )
+        .unwrap();
+        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        assert_eq!(
+            local_ai.embedding.remote,
+            Some(RemoteEmbeddingConfig {
+                mode: RemoteMode::Connect,
+                model: "all-minilm".to_string(),
+                endpoint: Some("http://localhost:11434".to_string()),
+                auth_env: Some("OLLAMA_TOKEN".to_string()),
+                batch_size: 512,
+                request_timeout_s: 120,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_embedding_connect_without_endpoint_is_rejected() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding.remote]
+            mode = "connect"
+            model = "all-minilm"
+            "#,
+        )
+        .unwrap();
+        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RemoteEmbeddingMissingEndpoint),
+            "connect mode without endpoint → RemoteEmbeddingMissingEndpoint, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn remote_embedding_ephemeral_mode_is_unsupported() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding.remote]
+            mode = "ephemeral"
+            model = "all-minilm"
+            "#,
+        )
+        .unwrap();
+        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RemoteEmbeddingEphemeralUnsupported),
+            "ephemeral mode → RemoteEmbeddingEphemeralUnsupported, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn remote_embedding_missing_model_is_rejected() {
+        // Block present (so it parses to Some) but `model` omitted → missing-model error.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding.remote]
+            endpoint = "http://localhost:11434"
+            "#,
+        )
+        .unwrap();
+        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RemoteEmbeddingMissingModel),
+            "omitted model → RemoteEmbeddingMissingModel, got {err:?}",
+        );
+
+        // A whitespace-only `model` trims to empty and is rejected the same way.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding.remote]
+            model = "   "
+            endpoint = "http://localhost:11434"
+            "#,
+        )
+        .unwrap();
+        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RemoteEmbeddingMissingModel),
+            "whitespace-only model → RemoteEmbeddingMissingModel, got {err:?}",
+        );
     }
 
     #[test]
