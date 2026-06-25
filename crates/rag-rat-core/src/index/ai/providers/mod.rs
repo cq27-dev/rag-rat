@@ -6,7 +6,8 @@
 #[cfg(feature = "fastembed")]
 mod fastembed;
 mod hash;
-#[cfg(feature = "model2vec")]
+// Ungated: the module compiles in all builds so its dep-free `MODEL2VEC_HF_REPO` const stays
+// available; only `Model2VecEmbedder` (which needs `model2vec-rs`) is feature-gated inside it.
 mod model2vec;
 
 use rusqlite::Connection;
@@ -14,8 +15,9 @@ use rusqlite::Connection;
 #[cfg(feature = "fastembed")]
 pub use self::fastembed::FastEmbedEmbedder;
 pub use self::hash::HashEmbedder;
+pub use self::model2vec::MODEL2VEC_HF_REPO;
 #[cfg(feature = "model2vec")]
-pub use self::model2vec::{MODEL2VEC_HF_REPO, Model2VecEmbedder};
+pub use self::model2vec::Model2VecEmbedder;
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
 use crate::index::ai::{active_embedding_model_id, model, validate_ready_model};
 
