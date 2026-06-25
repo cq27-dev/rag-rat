@@ -446,6 +446,7 @@ pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
             max_cases: args.replay_max_cases,
             max_files: args.replay_max_files,
         }),
+        rerank: args.rerank,
     };
     let report = rag_rat_core::eval::run(config, &options)?;
     // `eval` prints a greppable human summary by default; the global `--json` (or a baseline
@@ -1125,6 +1126,7 @@ mod tests {
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1230,6 +1232,7 @@ mod tests {
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1293,6 +1296,7 @@ mod tests {
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
 

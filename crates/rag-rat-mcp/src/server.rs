@@ -281,6 +281,7 @@ mod tests {
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
         (root, config)

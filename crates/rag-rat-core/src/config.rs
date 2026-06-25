@@ -18,6 +18,18 @@ pub struct Config {
     pub watch: WatchConfig,
     pub version_check: VersionCheckConfig,
     pub oracle: OracleConfig,
+    pub search: SearchConfig,
+}
+
+/// Search-ranking knobs (`[search]`). Default OFF so the shipped fuse is byte-identical to today;
+/// opt in per-repo via `rag-rat.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchConfig {
+    /// Replace the binary git has-history boost with a graded recency+churn magnitude and add the
+    /// generated/test demotion at the wide-pool rerank site (default false — opt in explicitly).
+    /// A/B-swept on the commit-replay eval (`rag-rat eval --replay --rerank`); see
+    /// [`crate::search::lexical::SearchOptions::graded_history`].
+    pub graded_git_rerank: bool,
 }
 
 /// Background auto-fresh oracle (`[oracle]`). Opt-in; default OFF. When `auto_run` is enabled, the
@@ -357,8 +369,9 @@ impl Config {
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();
+        let search = raw.search.into();
 
-        Ok(Self { root, database, targets, local_ai, watch, version_check, oracle })
+        Ok(Self { root, database, targets, local_ai, watch, version_check, oracle, search })
     }
 }
 
@@ -516,6 +529,8 @@ struct RawConfig {
     #[serde(default)]
     oracle: RawOracle,
     #[serde(default)]
+    search: RawSearch,
+    #[serde(default)]
     target_bindings: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "target")]
     target: Vec<RawTarget>,
@@ -570,6 +585,21 @@ impl From<RawOracle> for OracleConfig {
             auto_run_min_interval_secs: raw
                 .auto_run_min_interval_secs
                 .unwrap_or(default.auto_run_min_interval_secs),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawSearch {
+    graded_git_rerank: Option<bool>,
+}
+
+impl From<RawSearch> for SearchConfig {
+    fn from(raw: RawSearch) -> Self {
+        Self {
+            graded_git_rerank: raw
+                .graded_git_rerank
+                .unwrap_or(SearchConfig::default().graded_git_rerank),
         }
     }
 }
@@ -1025,6 +1055,18 @@ mod tests {
             toml::from_str("[index]\nroot = \".\"\n\n[version_check]\nenabled = false\n").unwrap();
         let version_check: VersionCheckConfig = raw.version_check.into();
         assert!(!version_check.enabled, "[version_check] enabled = false opts out");
+    }
+
+    #[test]
+    fn search_defaults_off_and_parses_opt_in() {
+        let default: SearchConfig = RawSearch::default().into();
+        assert!(!default.graded_git_rerank, "graded git rerank is OFF by default");
+
+        let raw: RawConfig =
+            toml::from_str("[index]\nroot = \".\"\n\n[search]\ngraded_git_rerank = true\n")
+                .unwrap();
+        let search: SearchConfig = raw.search.into();
+        assert!(search.graded_git_rerank, "[search] graded_git_rerank = true opts in");
     }
 
     #[test]

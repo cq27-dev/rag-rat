@@ -346,6 +346,12 @@ pub(crate) struct EvalArgs {
     /// `--replay`.
     #[arg(long)]
     pub replay_parent_state: bool,
+    /// Run searches with the graded-git rerank ON (#109): scores the SAME at-head index with
+    /// `[search] graded_git_rerank` forced true, for an A/B against the default fuse. Applies to
+    /// both the active and the hash-vector-baseline pass. Pair with `--replay` for the inner-loop
+    /// dial (`rag-rat eval --replay --rerank`).
+    #[arg(long)]
+    pub rerank: bool,
 }
 
 #[derive(Debug, Args)]

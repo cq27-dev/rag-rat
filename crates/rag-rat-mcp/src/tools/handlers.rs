@@ -4,6 +4,7 @@ pub(crate) fn call_tool_with_db(
     db: &IndexDatabase,
     name: &str,
     arguments: Value,
+    graded_history: bool,
 ) -> anyhow::Result<Value> {
     let result = match name {
         "semantic_search" => {
@@ -18,6 +19,10 @@ pub(crate) fn call_tool_with_db(
                 options: SearchOptions {
                     include_git: included(&args.include, SearchInclude::Git, true),
                     include_papertrail: included(&args.include, SearchInclude::Papertrail, true),
+                    // Sourced from `[search] graded_git_rerank` (default false) by the caller;
+                    // every other tool ignores it. OFF → the semantic_search
+                    // fuse is byte-identical.
+                    graded_history,
                 },
             })?)
         },

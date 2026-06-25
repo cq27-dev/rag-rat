@@ -67,6 +67,7 @@ pub fn bench_config(subdir: &str) -> Config {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     }
 }
 

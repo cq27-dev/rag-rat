@@ -43,6 +43,7 @@ fn rust_config(root: PathBuf) -> Config {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     }
 }
 
@@ -1161,6 +1162,7 @@ fn deleted_and_generated_paths_counted_in_skipped() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     git(&root, &["init", "-q"]);
     git(&root, &["add", "-A"]);

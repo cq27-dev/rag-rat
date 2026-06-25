@@ -440,6 +440,7 @@ mod tests {
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         crate::IndexDatabase::rebuild(&config).unwrap()
     }
@@ -548,6 +549,7 @@ mod tests {
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
 
@@ -610,6 +612,7 @@ mod tests {
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
 

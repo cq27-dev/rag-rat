@@ -90,6 +90,7 @@ impl IndexDatabase {
         query: &str,
         limit: u32,
         include_generated: bool,
+        graded_history: bool,
     ) -> anyhow::Result<Vec<SearchHit>> {
         self.ensure_fts_fresh()?;
         crate::search::lexical::search_hash_baseline(
@@ -97,6 +98,7 @@ impl IndexDatabase {
             query,
             limit,
             include_generated,
+            graded_history,
         )
     }
 

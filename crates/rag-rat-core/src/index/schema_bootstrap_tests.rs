@@ -35,6 +35,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -1429,6 +1430,7 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let status = db.status(&config.database).unwrap();
@@ -1544,6 +1546,7 @@ fn rag_rat_config(root: &Path) -> Config {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     }
 }
 
@@ -4127,6 +4130,7 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -4907,6 +4911,7 @@ where
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let symbol = db.symbols("spawn_blocking", Some(Language::Rust), 10).unwrap().remove(0);
@@ -5672,6 +5677,7 @@ fn parser_failures_report_paths() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -7744,6 +7750,7 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -7824,6 +7831,7 @@ fn repo_clusters_groups_cotouched_files() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -7914,6 +7922,7 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     }
 }
 
@@ -9317,6 +9326,7 @@ fn source_config(root: PathBuf, language: Language) -> Config {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     }
 }
 
@@ -9724,6 +9734,7 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -9949,6 +9960,7 @@ fn dir_tree_truncates_at_max_nodes() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -10091,6 +10103,7 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -11439,6 +11452,7 @@ fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     (root, config)
 }
@@ -11600,6 +11614,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -13271,6 +13286,7 @@ fn multi_language_clone_integration_finds_within_language_no_cross() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -13461,6 +13477,7 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -14064,6 +14081,7 @@ fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
+        search: Default::default(),
     };
     IndexDatabase::rebuild(&config).unwrap()
 }

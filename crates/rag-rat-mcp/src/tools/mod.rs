@@ -36,7 +36,9 @@ fn included<T: PartialEq>(include: &Option<Vec<T>>, flag: T, default: bool) -> b
 
 pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Result<Value> {
     let db = IndexDatabase::open(database)?;
-    call_tool_with_db(&db, name, arguments)
+    // The bare-path entry point has no `Config`, so the graded-git rerank is OFF here — it is a
+    // config-gated knob (`[search] graded_git_rerank`) only the `call_tool_for_config` path reads.
+    call_tool_with_db(&db, name, arguments, false)
 }
 
 /// Tools that only read the index. They open a read-only connection so a concurrent writer can
@@ -93,7 +95,7 @@ pub fn call_tool_for_config(
         && let Some(mut db) = IndexDatabase::try_open_config_read_only(config)?
     {
         db.use_worktree_scope(&config.root, scope_worktree.as_deref())?;
-        match call_tool_with_db(&db, name, arguments.clone()) {
+        match call_tool_with_db(&db, name, arguments.clone(), config.search.graded_git_rerank) {
             Ok(result) => return finalize_tool_result(config, name, result),
             Err(err) if rag_rat_core::storage::is_readonly_violation(&err) => {
                 // A lazy write hit the read-only connection — fall through to the read-write open.
@@ -120,7 +122,7 @@ pub fn call_tool_for_config(
         if is_read_only_tool(name) {
             db.use_worktree_scope(&config.root, scope_worktree.as_deref())?;
         }
-        call_tool_with_db(&db, name, arguments.clone())
+        call_tool_with_db(&db, name, arguments.clone(), config.search.graded_git_rerank)
     })?;
     finalize_tool_result(config, name, result)
 }

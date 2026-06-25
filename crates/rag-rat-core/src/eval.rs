@@ -88,6 +88,11 @@ pub struct EvalOptions {
     /// from the indexed git history (commit message = query, diff's changed paths = recall
     /// gold). `None` uses the static `queries_path` suite.
     pub replay: Option<ReplayOptions>,
+    /// Run searches with the graded-git rerank ON (#109, `--rerank`): scores the SAME at-head
+    /// index with `SearchOptions::graded_history = true`. Applied to BOTH the active AND the
+    /// hash-vector-baseline search so the delta block compares reranked-vs-reranked (same axis),
+    /// never reranked-vs-unreranked. Default false → today's fuse.
+    pub rerank: bool,
 }
 
 /// Commit-replay eval knobs (#120).
@@ -224,7 +229,7 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
     for query in &suite.query {
         let expected_query = expected.get(&query.id);
         let merged = merge_expected(query.clone(), expected_query);
-        let report = evaluate_query(config, &db, &merged, SearchMode::Active)?;
+        let report = evaluate_query(config, &db, &merged, SearchMode::Active, options.rerank)?;
         observed.push(observed_expected(&report));
         results.push(report);
     }
@@ -234,7 +239,8 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
     }
 
     let metrics = aggregate(&results);
-    let baseline = hash_vector_baseline(config, &db, &suite.query, &expected, &metrics)?;
+    let baseline =
+        hash_vector_baseline(config, &db, &suite.query, &expected, &metrics, options.rerank)?;
     let oracle_eval = run_oracle_eval(&db, options)?;
     let (oracle, oracle_skipped_drifted) = match oracle_eval {
         Some((metrics, skipped_drifted)) => (Some(metrics), skipped_drifted),
@@ -390,7 +396,9 @@ fn score_case_at_parent(
         }
         query.must_include_paths = existing_gold;
         query.must_include_symbols = symbol_gold.into_iter().collect();
-        evaluate_query(&case_config, &case_db, &query, SearchMode::Active)?
+        // Parent-state replay is the leakage-free HEADLINE number, not the reranker A/B dial (that
+        // is HEAD-scored `--replay --rerank`); score it with the default fuse (rerank off).
+        evaluate_query(&case_config, &case_db, &query, SearchMode::Active, false)?
     };
     let _ = std::fs::remove_file(&case_config.database);
     Ok(Some(report))
@@ -586,6 +594,7 @@ fn evaluate_query(
     db: &IndexDatabase,
     query: &EvalQuery,
     mode: SearchMode,
+    rerank: bool,
 ) -> anyhow::Result<EvalQueryReport> {
     if query.requires_papertrail_cache && !papertrail_cache_available(db)? {
         return Ok(skipped_report(
@@ -595,12 +604,12 @@ fn evaluate_query(
     }
 
     let started = Instant::now();
-    let mut hits = search(db, mode, &query.text)?;
+    let mut hits = search(db, mode, &query.text, rerank)?;
     let mut latency_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut current_source_violations = find_current_source_violations(config, db, &hits)?;
     if !current_source_violations.is_empty() {
         let retry_started = Instant::now();
-        hits = search(db, mode, &query.text)?;
+        hits = search(db, mode, &query.text, rerank)?;
         latency_ms += retry_started.elapsed().as_secs_f64() * 1000.0;
         current_source_violations = find_current_source_violations(config, db, &hits)?;
     }
@@ -833,10 +842,21 @@ fn search(
     db: &IndexDatabase,
     mode: SearchMode,
     query: &str,
+    rerank: bool,
 ) -> anyhow::Result<Vec<crate::search::lexical::SearchHit>> {
+    // `rerank` flows identically into BOTH search modes so the active-vs-baseline delta compares
+    // the same reranker axis (#109). The active path threads it through
+    // `SearchRequest.options`; the hash baseline takes it directly.
     match mode {
-        SearchMode::Active => db.search(query, TOP_K as u32, false),
-        SearchMode::HashBaseline => db.search_hash_baseline(query, TOP_K as u32, false),
+        SearchMode::Active => db.search_with_graph_meta(crate::index::SearchRequest {
+            include_generated: false,
+            options: crate::search::lexical::SearchOptions {
+                graded_history: rerank,
+                ..crate::search::lexical::SearchOptions::default()
+            },
+            ..crate::index::SearchRequest::new(query, TOP_K as u32)
+        }),
+        SearchMode::HashBaseline => db.search_hash_baseline(query, TOP_K as u32, false, rerank),
     }
 }
 
@@ -846,11 +866,13 @@ fn hash_vector_baseline(
     queries: &[EvalQuery],
     expected: &BTreeMap<String, ExpectedQuery>,
     active_metrics: &EvalMetrics,
+    rerank: bool,
 ) -> anyhow::Result<EvalBaselineReport> {
     let mut results = Vec::new();
     for query in queries {
         let merged = merge_expected(query.clone(), expected.get(&query.id));
-        results.push(evaluate_query(config, db, &merged, SearchMode::HashBaseline)?);
+        // SAME `rerank` value as the active pass so the delta block compares the same axis (#109).
+        results.push(evaluate_query(config, db, &merged, SearchMode::HashBaseline, rerank)?);
     }
     let metrics = aggregate(&results);
     let current_artifacts = db.current_embedding_count(crate::embedding_models::HASH_MODEL_ID)?;
@@ -1165,6 +1187,7 @@ mod tests {
             update_baseline: false,
             scip_path: None,
             replay: None,
+            rerank: false,
         })
         .unwrap();
         // Safety + non-zero retrieval hold in every build shape.
@@ -1270,6 +1293,7 @@ mod tests {
             update_baseline: false,
             scip_path: Some(scip_path),
             replay: None,
+            rerank: false,
         })
         .unwrap();
 

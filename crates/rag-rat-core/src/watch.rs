@@ -706,6 +706,7 @@ mod tests {
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         let worktree = PathBuf::from("/wt/feat");
         let registry = PathBuf::from("/main/.git/worktrees");
@@ -801,6 +802,7 @@ mod tests {
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         // A linked checkout mirrors the layout: `<checkout>/crate/src/a.rs`.
         let checkout =
@@ -843,6 +845,7 @@ mod tests {
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         let ignore = IgnoreMatcher::compile(&root, &[]);
 
@@ -903,6 +906,7 @@ mod tests {
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
 
         let ignore = IgnoreMatcher::compile(&root, &[]);
@@ -974,6 +978,7 @@ mod tests {
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
 
         // Before: a source file under the subdir fires.
@@ -1117,6 +1122,7 @@ mod tests {
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
 
         let (roots, _registry) = worktree_watch_targets(&config);

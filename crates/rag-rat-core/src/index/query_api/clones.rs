@@ -2676,6 +2676,7 @@ mod tests {
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         crate::IndexDatabase::rebuild(&config).unwrap();
         let db = crate::IndexDatabase::open_config(&config).unwrap();
@@ -3207,6 +3208,7 @@ mod tests {
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
+            search: Default::default(),
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         let conn = db.storage.connection();
