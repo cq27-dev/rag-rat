@@ -67,10 +67,11 @@ impl IndexDatabase {
         ai::reencode_legacy_vectors_if_needed(self.storage.connection())
     }
 
-    /// FORCE the legacy-f32 → int8 re-encode (#312), ignoring the run-once meta gate — for users
-    /// who want it now on a huge index without waiting for the next maintenance pass.
+    /// FORCE the legacy-f32 → int8 re-encode (#312), ignoring the run-once meta gate at the start —
+    /// for users who want it now on a huge index without waiting for the next maintenance pass.
+    /// Sets the gate on success so a later maintenance pass doesn't redo the table scan.
     /// Idempotent: converts only rows still in f32. Returns the number of rows converted.
     pub fn reencode_legacy_vectors_now(&self) -> anyhow::Result<usize> {
-        ai::reencode_legacy_f32_blobs(self.storage.connection())
+        ai::reencode_legacy_vectors_now(self.storage.connection())
     }
 }

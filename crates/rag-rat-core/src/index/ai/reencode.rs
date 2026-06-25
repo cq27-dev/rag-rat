@@ -11,7 +11,8 @@ const VECTOR_INT8_REENCODE_DONE_META: &str = "vector_int8_reencode_done";
 /// and writes a chunk, then commits and loops.
 const REENCODE_BATCH_SIZE: usize = 4_000;
 
-/// One legacy f32 row to re-encode: its compound key plus the stored vector bytes.
+/// One legacy f32 row to re-encode: its compound key plus the stored vector bytes. `(chunk_id,
+/// model_id)` is the `chunk_embeddings` PK and doubles as the keyset cursor.
 struct LegacyVectorRow {
     chunk_id: i64,
     model_id: String,
@@ -30,62 +31,93 @@ struct LegacyVectorRow {
 /// length-based format dispatch.
 ///
 /// Works in bounded batches inside per-batch transactions and is IDEMPOTENT + resumable: re-running
-/// converts only the rows still in f32; once every row is int8 the detect query returns nothing and
-/// it returns `Ok(0)`. Returns the total number of rows converted.
+/// converts only the rows still in f32. Returns the total number of rows converted.
 pub(crate) fn reencode_legacy_f32_blobs(conn: &Connection) -> anyhow::Result<usize> {
+    reencode_legacy_f32_blobs_batched(conn, REENCODE_BATCH_SIZE)
+}
+
+/// The conversion loop, parameterized by `batch_size` so tests can drive multi-batch behavior with
+/// a tiny size. The public wrapper passes [`REENCODE_BATCH_SIZE`].
+///
+/// Termination is CURSOR-driven, not "did this batch convert anything"-driven: a `(chunk_id,
+/// model_id)` keyset cursor walks the f32 rows in PK order, advancing past every row it reads
+/// (whether or not that row was actually converted). So a row skipped by the concurrent-rewrite
+/// guard or by a decode failure is simply passed over — never re-selected, never looped — and the
+/// loop ends when a batch comes back short of `batch_size`. The cursor also avoids the quadratic
+/// rescan a bare `LIMIT` would cause (each batch would otherwise re-scan from the table start past
+/// every already-converted row).
+fn reencode_legacy_f32_blobs_batched(
+    conn: &Connection,
+    batch_size: usize,
+) -> anyhow::Result<usize> {
     let mut total = 0usize;
+    // Cursor starts before every real row: `chunk_id >= ` any actual id, and the empty model_id
+    // sorts first, so `(chunk_id, model_id) > (i64::MIN, "")` matches all rows.
+    let mut cursor = (i64::MIN, String::new());
     loop {
         // Collect a whole batch BEFORE writing — the SELECT statement must be finalized (its borrow
-        // of `conn` dropped) before the per-row UPDATE takes the connection. `LIMIT` keeps each
-        // batch bounded; the `length(vector_blob) = 4 * embedding_dim` predicate is self-clearing
-        // (a converted row stops matching), so the same LIMIT walks the remaining f32 rows each
-        // pass.
-        let batch = collect_legacy_f32_batch(conn, REENCODE_BATCH_SIZE)?;
-        if batch.is_empty() {
+        // of `conn` dropped) before the per-row UPDATE takes the connection.
+        let batch = collect_legacy_f32_batch(conn, &cursor, batch_size)?;
+        let Some(last) = batch.last() else {
             break;
-        }
-        let converted = convert_batch(conn, &batch)?;
-        total += converted;
-        // Defensive termination: a non-empty batch that converted nothing means every row in it was
-        // un-decodable. That can't happen today — a length-selected row always decodes — but
-        // breaking (rather than re-selecting the same stuck rows forever) keeps the loop
-        // provably terminating regardless of `decode_vector`'s behavior. Un-convertible
-        // rows stay f32; they already decode-fail in search too, so leaving them is
-        // correct.
-        if converted == 0 {
+        };
+        // Advance the cursor to the batch's LAST key, so the next SELECT resumes via the PK index
+        // instead of rescanning. Done before the UPDATE (which mutates the rows) using the read
+        // values.
+        cursor = (last.chunk_id, last.model_id.clone());
+        let exhausted = batch.len() < batch_size;
+        total += convert_batch(conn, &batch)?;
+        if exhausted {
             break;
         }
     }
     Ok(total)
 }
 
-/// Read up to `limit` legacy f32 rows. The blob-length predicate is the format detector: f32 is
-/// `4 * embedding_dim` bytes, int8 is `embedding_dim + 4` — disjoint for `dim >= 1`.
+/// Read up to `limit` legacy f32 rows past `cursor`, in PK order. The blob-length predicate is the
+/// format detector (f32 is `4 * embedding_dim` bytes, int8 is `embedding_dim + 4` — disjoint for
+/// `dim >= 1`); the `(chunk_id, model_id) > cursor` keyset resumes past already-walked rows without
+/// rescanning, and ORDER BY makes "the batch's last row is the new cursor" well-defined.
 fn collect_legacy_f32_batch(
     conn: &Connection,
+    cursor: &(i64, String),
     limit: usize,
 ) -> anyhow::Result<Vec<LegacyVectorRow>> {
     let mut stmt = conn.prepare(
         "SELECT chunk_id, model_id, embedding_dim, vector_blob
          FROM chunk_embeddings
          WHERE length(vector_blob) = 4 * embedding_dim
-         LIMIT ?1",
+           AND (chunk_id, model_id) > (?1, ?2)
+         ORDER BY chunk_id, model_id
+         LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-        let dim: i64 = row.get(2)?;
-        Ok(LegacyVectorRow {
-            chunk_id: row.get(0)?,
-            model_id: row.get(1)?,
-            dim: usize::try_from(dim).unwrap_or(0),
-            blob: row.get(3)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![cursor.0, cursor.1, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| {
+            let dim: i64 = row.get(2)?;
+            Ok(LegacyVectorRow {
+                chunk_id: row.get(0)?,
+                model_id: row.get(1)?,
+                dim: usize::try_from(dim).unwrap_or(0),
+                blob: row.get(3)?,
+            })
+        },
+    )?;
     collect_rows(rows)
 }
 
-/// Convert one already-collected batch inside a single transaction. Returns the count successfully
-/// re-encoded (a row whose f32 blob fails to decode — e.g. a corrupt length/`dim` mismatch — is
-/// skipped, not aborted, so one bad row can't wedge the whole conversion).
+/// Convert one already-collected batch inside a single transaction. Returns the count actually
+/// re-encoded.
+///
+/// CONCURRENT-REWRITE GUARD: another writer (a reconcile re-embedding this chunk) can replace the
+/// row's `vector_blob` — and its `source_text_hash`/`input_hash` — between
+/// [`collect_legacy_f32_batch`] (the read) and this UPDATE. So the UPDATE is guarded on the
+/// ORIGINAL blob (`vector_blob = ?4`): if the row changed concurrently it no longer matches (new
+/// writes are always int8), the UPDATE is a no-op, and the row is left in its valid,
+/// freshly-embedded state instead of being clobbered with the stale f32 vector. Only rows whose
+/// UPDATE affected exactly one row count as converted; a row skipped by the guard, or one whose f32
+/// blob fails to decode (corrupt length/`dim` mismatch), is passed over — not an error, so one
+/// bad/raced row can't wedge the conversion.
 fn convert_batch(conn: &Connection, batch: &[LegacyVectorRow]) -> anyhow::Result<usize> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
@@ -94,12 +126,12 @@ fn convert_batch(conn: &Connection, batch: &[LegacyVectorRow]) -> anyhow::Result
             let Some(vector) = decode_vector(&row.blob, row.dim) else {
                 continue;
             };
-            conn.execute(
+            let changed = conn.execute(
                 "UPDATE chunk_embeddings SET vector_blob = ?1
-                 WHERE chunk_id = ?2 AND model_id = ?3",
-                params![encode_vector(&vector), row.chunk_id, row.model_id],
+                 WHERE chunk_id = ?2 AND model_id = ?3 AND vector_blob = ?4",
+                params![encode_vector(&vector), row.chunk_id, row.model_id, row.blob],
             )?;
-            converted += 1;
+            converted += changed;
         }
         Ok(converted)
     })();
@@ -124,6 +156,19 @@ pub(crate) fn reencode_legacy_vectors_if_needed(conn: &Connection) -> anyhow::Re
     if meta(conn, VECTOR_INT8_REENCODE_DONE_META)?.is_some() {
         return Ok(0);
     }
+    reencode_and_mark_done(conn)
+}
+
+/// FORCE the conversion, IGNORING the run-once gate at the start (the `--reencode-vectors` path) —
+/// but still SET the gate on success, so the next maintenance pass doesn't do a pointless full
+/// table scan it would otherwise skip. Returns the number of rows converted.
+pub(crate) fn reencode_legacy_vectors_now(conn: &Connection) -> anyhow::Result<usize> {
+    reencode_and_mark_done(conn)
+}
+
+/// Run the conversion then mark the run-once gate done. Shared by the gated and forced entry points
+/// (the only difference is whether the gate is CHECKED first).
+fn reencode_and_mark_done(conn: &Connection) -> anyhow::Result<usize> {
     let converted = reencode_legacy_f32_blobs(conn)?;
     set_meta(conn, VECTOR_INT8_REENCODE_DONE_META, "1")?;
     Ok(converted)
@@ -214,6 +259,15 @@ mod tests {
         assert_eq!(stored_blob(&conn, 2), b"", "empty failed-row blob untouched");
     }
 
+    fn count_remaining_f32(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM chunk_embeddings WHERE length(vector_blob) = 4 * embedding_dim",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn reencode_walks_multiple_batches() {
         let conn = setup_conn();
@@ -226,15 +280,54 @@ mod tests {
         }
         assert_eq!(reencode_legacy_f32_blobs(&conn).unwrap(), total);
         // Every row is now int8.
-        let remaining: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM chunk_embeddings WHERE length(vector_blob) = 4 * \
-                 embedding_dim",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(remaining, 0);
+        assert_eq!(count_remaining_f32(&conn), 0);
+    }
+
+    #[test]
+    fn keyset_cursor_walks_every_row_across_chunk_ids_and_models_with_tiny_batches() {
+        // The keyset cursor is `(chunk_id, model_id)`, so a chunk_id with multiple models and many
+        // chunk_ids must ALL convert even when the batch boundary splits a chunk_id's models. Drive
+        // a tiny batch_size so the loop iterates many times over a handful of rows: any cursor bug
+        // (skipping the rest of a chunk_id's models, or re-selecting + looping) shows here.
+        let conn = setup_conn();
+        let vector = vec![0.5_f32, -0.5, 0.25, -0.25];
+        let blob = f32_blob(&vector);
+        // 5 chunk_ids, each with 2 model_ids (model-a, model-b) = 10 rows; batch_size 2 ⇒ ≥5
+        // passes, and the (chunk_id, model_id) ordering means a batch boundary lands
+        // mid-chunk_id.
+        for chunk_id in 0..5 {
+            for model in ["model-a", "model-b"] {
+                insert_row(&conn, chunk_id, model, &blob, vector.len());
+            }
+        }
+        let converted = reencode_legacy_f32_blobs_batched(&conn, 2).unwrap();
+        assert_eq!(converted, 10, "every (chunk_id, model_id) row must convert");
+        assert_eq!(count_remaining_f32(&conn), 0);
+    }
+
+    #[test]
+    fn concurrent_rewrite_guard_leaves_a_changed_row_untouched() {
+        // Simulate the race: the row was re-embedded (now a different blob) between the read and
+        // the UPDATE. We model it by passing a `LegacyVectorRow` whose `blob` (the f32
+        // bytes we "read") differs from what is now stored. The blob-guarded UPDATE must
+        // NOT match, so the stored row is left exactly as the concurrent writer left it,
+        // and it is NOT counted.
+        let conn = setup_conn();
+        let dim = 4;
+        // What the concurrent writer left in place: a valid int8 blob (new writes are always int8).
+        let current_int8 = encode_vector(&[0.1_f32, -0.4, 0.9, -0.2]);
+        insert_row(&conn, 1, "model-a", &current_int8, dim);
+
+        // The row WE think we read, with a STALE f32 blob that no longer matches what is stored.
+        let stale = LegacyVectorRow {
+            chunk_id: 1,
+            model_id: "model-a".to_string(),
+            dim,
+            blob: f32_blob(&[0.9_f32, 0.9, 0.9, 0.9]),
+        };
+        let converted = convert_batch(&conn, std::slice::from_ref(&stale)).unwrap();
+        assert_eq!(converted, 0, "guarded UPDATE must not touch a concurrently-changed row");
+        assert_eq!(stored_blob(&conn, 1), current_int8, "stored row left as the writer left it");
     }
 
     #[test]
@@ -253,5 +346,19 @@ mod tests {
         insert_row(&conn, 2, "model-a", &f32_blob(&vector), vector.len());
         assert_eq!(reencode_legacy_vectors_if_needed(&conn).unwrap(), 0);
         assert_eq!(stored_blob(&conn, 2).len(), 4 * vector.len());
+    }
+
+    #[test]
+    fn forced_path_converts_ignoring_gate_then_sets_it() {
+        let conn = setup_conn();
+        let vector = vec![0.3_f32, -0.6, 0.9, -0.1];
+        insert_row(&conn, 1, "model-a", &f32_blob(&vector), vector.len());
+        // Pre-set the gate: the forced path must IGNORE it at the start and still convert.
+        set_meta(&conn, VECTOR_INT8_REENCODE_DONE_META, "1").unwrap();
+
+        assert_eq!(reencode_legacy_vectors_now(&conn).unwrap(), 1);
+        // ... and it leaves the gate set, so a later maintenance pass skips the full scan.
+        assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
+        assert_eq!(reencode_legacy_vectors_if_needed(&conn).unwrap(), 0);
     }
 }
