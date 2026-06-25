@@ -77,8 +77,15 @@ impl IndexDatabase {
     /// FORCE the legacy-f32 → int8 re-encode (#312), ignoring the run-once meta gate at the start —
     /// for users who want it now on a huge index without waiting for the next maintenance pass.
     /// Sets the gate on success so a later maintenance pass doesn't redo the table scan.
-    /// Idempotent: converts only rows still in f32. Returns the number of rows converted.
-    pub fn reencode_legacy_vectors_now(&self) -> anyhow::Result<usize> {
-        ai::reencode_legacy_vectors_now(self.storage.connection())
+    /// Idempotent: converts only rows still in f32.
+    ///
+    /// `deadline` bounds the work so `reconcile --reencode-vectors --max-seconds N` can cap it; a
+    /// deadline stop leaves the gate unset and persists a keyset cursor, so a follow-up run resumes
+    /// from there. `None` runs to completion. Returns the number of rows converted.
+    pub fn reencode_legacy_vectors_now(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<usize> {
+        ai::reencode_legacy_vectors_now_within(self.storage.connection(), deadline)
     }
 }

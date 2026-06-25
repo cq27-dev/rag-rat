@@ -480,8 +480,10 @@ pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
 }
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
-    // `--plan` is a READ-ONLY dry run: it must return before any mutation, so it stays read-only
-    // even when combined with a mutating flag like `--reencode-vectors` (#312).
+    // INVARIANT (#312): this `--plan` early-return MUST stay ABOVE the `--reencode-vectors`
+    // mutation below. `--plan` is a READ-ONLY dry run; returning here first is what keeps
+    // `reconcile --plan --reencode-vectors` from mutating the index during a dry run. Do not
+    // reorder.
     if args.plan {
         let plan = db.reconcile_plan()?;
         // `--plan` prints a human summary by default; the global `--json` switches to the
@@ -494,11 +496,20 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
         return Ok(());
     }
     // Force the legacy-f32 → int8 vector re-encode (#312) when asked, ignoring the run-once gate —
-    // for users who want it now on a huge index. Format-only, idempotent. Runs only on a real
-    // (non-`--plan`) reconcile.
+    // for users who want it now on a huge index. Format-only, idempotent. This SHORT-CIRCUITS: it
+    // re-encodes and RETURNS, ignoring the other reconcile flags (no embedding inference runs), so
+    // `--reencode-vectors` is a re-encode-only action. Bounded by `--max-seconds` (resumable via
+    // the persisted cursor) when given. Runs only on a real (non-`--plan`) reconcile.
     if args.reencode_vectors {
-        let converted = db.reencode_legacy_vectors_now()?;
-        eprintln!("rag-rat: re-encoded {converted} legacy f32 vector blobs to int8");
+        let deadline = args.max_seconds.map(|s| Instant::now() + std::time::Duration::from_secs(s));
+        let converted = db.reencode_legacy_vectors_now(deadline)?;
+        let report = serde_json::json!({ "reencoded_vectors": converted });
+        if output_format() == OutputFormat::Json {
+            print_output(&report)?;
+        } else {
+            eprintln!("rag-rat: re-encoded {converted} legacy f32 vector blobs to int8");
+        }
+        return Ok(());
     }
     let options = rag_rat_core::index::ai::ReconcileOptions {
         limit: args.limit,
@@ -974,15 +985,30 @@ fn run_maintenance_pass(
     // One-time on upgrade: re-encode any legacy f32 vector blobs to the compact int8 format (#312).
     // Meta-gated, so this runs once and then skips the table scan cheaply on every later pass; run
     // on the BASE index (not per-overlay) before the worktree refresh re-scopes the connection.
-    // Format-only (decode f32 → encode int8), so it's cheap — no model inference. BUDGETED: skipped
-    // entirely when `max_seconds == 0` (the "no embedding work" cap, mirroring `budget` below), and
-    // otherwise bounded by the same shared `started + max_seconds` deadline so a huge index can't
-    // hold the write lock for a full-table conversion past the cap — it stops at the deadline and
-    // resumes from a persisted cursor on the next pass.
-    if max_seconds > 0 {
-        let deadline = started + std::time::Duration::from_secs(max_seconds);
-        let _ = db.reencode_legacy_vectors_if_needed(Some(deadline));
-    }
+    // Format-only (decode f32 → encode int8), so it's cheap — no model inference.
+    //
+    // BUDGETED, and only gets a SHARE of the budget: skipped entirely when `max_seconds == 0` (the
+    // "no embedding work" cap, mirroring `budget` below), and otherwise bounded by `started +
+    // max_seconds/2` — only HALF the window. Giving it the full window would let a multi-pass
+    // conversion consume the whole budget every pass, so `budget.next_options()` returns None and
+    // new/changed chunks go un-embedded (BM25-only) for the whole window. With the half cap the
+    // embedding reconcile always gets the rest; and `max_seconds == 1` → `max_seconds/2 == 0` → an
+    // already-expired deadline → the re-encode does nothing this pass (the embedding reconcile
+    // wins), which is correct. Resumes from the persisted cursor across passes until complete.
+    let vector_reencode = if max_seconds > 0 {
+        let deadline = started + std::time::Duration::from_secs(max_seconds / 2);
+        match db.reencode_legacy_vectors_if_needed(Some(deadline)) {
+            Ok(converted) => Some(converted),
+            Err(e) => {
+                // Don't swallow it: the gate is set only on success, so a persistent error
+                // (SQLITE_BUSY, disk full) would otherwise retry-and-fail invisibly every pass.
+                eprintln!("rag-rat: vector re-encode pass failed (will retry): {e}");
+                None
+            },
+        }
+    } else {
+        None
+    };
     // ONE time budget for the whole pass — the per-overlay embedding reconciles AND the base
     // reconcile below — measured from `started` so discovery already counts against it. Without a
     // shared budget each overlay (each call starts its own `max_seconds` timer) plus the base could
@@ -1048,6 +1074,10 @@ fn run_maintenance_pass(
         "max_seconds": max_seconds,
         "elapsed_seconds": started.elapsed().as_secs_f64(),
         "reconcile": reconcile_report,
+        // #312: rows the legacy-f32 → int8 re-encode converted this pass, or null when it was
+        // skipped (max_seconds == 0, or already done/the gate was set so the call returned 0 — note
+        // a gate-skip also reports {"converted": 0}) or errored. Lets a --json consumer see progress.
+        "vector_reencode": vector_reencode.map(|n| serde_json::json!({ "converted": n })),
         "clone_graph": clone_graph_report,
         "gc": gc_report,
         "memory_validation": memory_validation,

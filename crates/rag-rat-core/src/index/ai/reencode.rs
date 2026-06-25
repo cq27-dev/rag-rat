@@ -27,7 +27,8 @@ struct ReencodeOutcome {
 }
 
 /// One legacy f32 row to re-encode: its compound key plus the stored vector bytes. `(chunk_id,
-/// model_id)` is the `chunk_embeddings` PK and doubles as the keyset cursor.
+/// model_id)` is the `chunk_embeddings` UNIQUE secondary index (the table's PK is the surrogate
+/// `id`) and doubles as the keyset cursor.
 struct LegacyVectorRow {
     chunk_id: i64,
     model_id: String,
@@ -40,10 +41,14 @@ struct LegacyVectorRow {
 /// [`encode_vector`] (now int8); NO model inference runs, so it is cheap and quality-identical to a
 /// fresh int8 reconcile.
 ///
-/// The f32 rows are detected purely by blob length: an f32 blob is `4 * embedding_dim` bytes, an
-/// int8 blob is `embedding_dim + 4`, and the two never collide for `dim >= 1` (so a freshly-int8
-/// row, or a `Failed` row's empty `x''` blob, is never selected). Matches [`decode_vector`]'s
-/// length-based format dispatch.
+/// The f32 rows are detected by blob length AND a positive `embedding_dim`: an f32 blob is
+/// `4 * embedding_dim` bytes and an int8 blob is `embedding_dim + 4`, disjoint for `dim >= 1`. The
+/// `embedding_dim > 0` guard is what excludes the `Failed` row's empty `x''` blob — by length alone
+/// `length(x'') = 0 = 4 * 0` would COLLIDE with an `embedding_dim = 0` row (Failed rows store
+/// `x''`, and a row written before migration 002 added `embedding_dim DEFAULT 0` keeps `0`, never
+/// backfilled), so the guard is REQUIRED to keep the Failed-row empty-blob invariant intact (see
+/// the [`collect_legacy_f32_batch`] / `count_remaining_f32` SQL). Otherwise this matches
+/// [`decode_vector`]'s length-based format dispatch.
 ///
 /// Works in bounded batches inside per-batch transactions and is IDEMPOTENT + resumable: re-running
 /// converts only the rows still in f32.
@@ -53,12 +58,12 @@ struct LegacyVectorRow {
 /// budgeted maintenance path can stop mid-conversion).
 ///
 /// Termination is CURSOR-driven, not "did this batch convert anything"-driven: a `(chunk_id,
-/// model_id)` keyset cursor walks the f32 rows in PK order, advancing past every row it reads
-/// (whether or not that row was actually converted). So a row skipped by the concurrent-rewrite
-/// guard or by a decode failure is simply passed over — never re-selected, never looped — and the
-/// loop ends when a batch comes back short of `batch_size`. The cursor also avoids the quadratic
-/// rescan a bare `LIMIT` would cause (each batch would otherwise re-scan from the table start past
-/// every already-converted row).
+/// model_id)` keyset cursor walks the f32 rows in `(chunk_id, model_id)` order (the table's UNIQUE
+/// secondary index), advancing past every row it reads (whether or not that row was actually
+/// converted). So a row skipped by the concurrent-rewrite guard or by a decode failure is simply
+/// passed over — never re-selected, never looped — and the loop ends when a batch comes back short
+/// of `batch_size`. The cursor also avoids the quadratic rescan a bare `LIMIT` would cause (each
+/// batch would otherwise re-scan from the table start past every already-converted row).
 ///
 /// The cursor is PERSISTED (`VECTOR_INT8_REENCODE_CURSOR_META`) after each committed batch and
 /// LOADED at the start, so a deadline-stopped run resumes from where it left off on the next call
@@ -76,6 +81,13 @@ fn reencode_legacy_f32_blobs_batched(
     // first, so `(chunk_id, model_id) > (i64::MIN, "")` matches all rows.
     let mut cursor = load_cursor(conn)?;
     loop {
+        // Deadline check at the TOP of the loop, BEFORE collecting/writing a batch — an
+        // already-expired deadline (e.g. `max_seconds / 2 == 0`, or no budget left when this runs)
+        // must do ZERO work, not one 4000-row write. Returns `completed == false` so the gate stays
+        // unset; the persisted cursor (if any) is untouched, so a later pass resumes.
+        if deadline.is_some_and(|dl| Instant::now() >= dl) {
+            return Ok(ReencodeOutcome { converted: total, completed: false });
+        }
         // Collect a whole batch BEFORE writing — the SELECT statement must be finalized (its borrow
         // of `conn` dropped) before the per-row UPDATE takes the connection.
         let batch = collect_legacy_f32_batch(conn, &cursor, batch_size)?;
@@ -83,9 +95,9 @@ fn reencode_legacy_f32_blobs_batched(
             // No rows past the cursor → conversion is complete.
             return Ok(ReencodeOutcome { converted: total, completed: true });
         };
-        // Advance the cursor to the batch's LAST key, so the next SELECT resumes via the PK index
-        // instead of rescanning. Computed before the UPDATE (which mutates the rows) from the read
-        // values.
+        // Advance the cursor to the batch's LAST key, so the next SELECT resumes via the UNIQUE
+        // `(chunk_id, model_id)` index instead of rescanning. Computed before the UPDATE (which
+        // mutates the rows) from the read values.
         cursor = (last.chunk_id, last.model_id.clone());
         let exhausted = batch.len() < batch_size;
         total += convert_batch(conn, &batch)?;
@@ -96,11 +108,8 @@ fn reencode_legacy_f32_blobs_batched(
         if exhausted {
             return Ok(ReencodeOutcome { converted: total, completed: true });
         }
-        // Deadline check AFTER a committed batch (never mid-batch): stop without marking complete
-        // so the next pass resumes from the just-persisted cursor.
-        if deadline.is_some_and(|dl| Instant::now() >= dl) {
-            return Ok(ReencodeOutcome { converted: total, completed: false });
-        }
+        // The next iteration's top-of-loop check re-tests the deadline before doing more work; the
+        // loop only continues here when there is a full batch still to walk.
     }
 }
 
@@ -130,10 +139,14 @@ fn save_cursor(conn: &Connection, cursor: &(i64, String)) -> anyhow::Result<()> 
     )
 }
 
-/// Read up to `limit` legacy f32 rows past `cursor`, in PK order. The blob-length predicate is the
-/// format detector (f32 is `4 * embedding_dim` bytes, int8 is `embedding_dim + 4` — disjoint for
-/// `dim >= 1`); the `(chunk_id, model_id) > cursor` keyset resumes past already-walked rows without
-/// rescanning, and ORDER BY makes "the batch's last row is the new cursor" well-defined.
+/// Read up to `limit` legacy f32 rows past `cursor`, in `(chunk_id, model_id)` order (the UNIQUE
+/// secondary index). The detector is `length(vector_blob) = 4 * embedding_dim AND embedding_dim >
+/// 0`: f32 is `4 * embedding_dim` bytes, int8 is `embedding_dim + 4` — disjoint for `dim >= 1` —
+/// and the `embedding_dim > 0` guard is LOAD-BEARING, excluding `Failed` rows that store `x''` with
+/// `embedding_dim` possibly `0` (which `length(x'') = 0 = 4 * 0` would otherwise match, corrupting
+/// the empty-blob invariant). The `(chunk_id, model_id) > cursor` keyset resumes past
+/// already-walked rows without rescanning, and ORDER BY makes "the batch's last row is the new
+/// cursor" well-defined.
 fn collect_legacy_f32_batch(
     conn: &Connection,
     cursor: &(i64, String),
@@ -143,6 +156,7 @@ fn collect_legacy_f32_batch(
         "SELECT chunk_id, model_id, embedding_dim, vector_blob
          FROM chunk_embeddings
          WHERE length(vector_blob) = 4 * embedding_dim
+           AND embedding_dim > 0
            AND (chunk_id, model_id) > (?1, ?2)
          ORDER BY chunk_id, model_id
          LIMIT ?3",
@@ -224,12 +238,17 @@ pub(crate) fn reencode_legacy_vectors_if_needed(
     reencode_and_mark_if_complete(conn, deadline)
 }
 
-/// FORCE the conversion, IGNORING the run-once gate at the start (the `--reencode-vectors` path) —
-/// runs to completion (no deadline) and SETS the gate on success, so the next maintenance pass
-/// doesn't do a pointless full table scan it would otherwise skip. May resume from a persisted
-/// cursor left by a prior deadline-stopped maintenance run. Returns the number of rows converted.
-pub(crate) fn reencode_legacy_vectors_now(conn: &Connection) -> anyhow::Result<usize> {
-    reencode_and_mark_if_complete(conn, None)
+/// FORCE the conversion, IGNORING the run-once gate at the start (the `--reencode-vectors` path),
+/// bounded by `deadline` so `--reencode-vectors --max-seconds N` can cap the work. SETS the gate on
+/// success (so the next maintenance pass doesn't do a pointless full table scan it would otherwise
+/// skip); a deadline stop leaves the gate unset and the keyset cursor persisted, so a later forced
+/// run (or maintenance pass) resumes from there. `None` runs to completion. Returns the number of
+/// rows converted.
+pub(crate) fn reencode_legacy_vectors_now_within(
+    conn: &Connection,
+    deadline: Option<Instant>,
+) -> anyhow::Result<usize> {
+    reencode_and_mark_if_complete(conn, deadline)
 }
 
 /// Run the conversion (resuming from / persisting the keyset cursor) and mark the run-once gate
@@ -261,18 +280,21 @@ fn clear_cursor(conn: &Connection) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Minimal `chunk_embeddings` shape — only the columns the re-encode touches, so the test does
-    /// not depend on the full schema/bootstrap. `index_meta` is the done-gate store;
-    /// `reconcile_meta` is the keyset-cursor store.
+    /// `chunk_embeddings` with the columns the re-encode touches, matching the PROD shape from
+    /// `schema/baseline.rs`: a surrogate `id INTEGER PRIMARY KEY AUTOINCREMENT` plus a
+    /// `UNIQUE(chunk_id, model_id)` secondary index — so the keyset `ORDER BY chunk_id, model_id`
+    /// exercises that UNIQUE index (not a clustered PK), as in production. `index_meta` is the
+    /// done-gate store; `reconcile_meta` is the keyset-cursor store.
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE chunk_embeddings(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                  chunk_id INTEGER NOT NULL,
                  model_id TEXT NOT NULL,
-                 embedding_dim INTEGER NOT NULL,
+                 embedding_dim INTEGER NOT NULL DEFAULT 0,
                  vector_blob BLOB NOT NULL,
-                 PRIMARY KEY(chunk_id, model_id)
+                 UNIQUE(chunk_id, model_id)
              );
              CREATE TABLE index_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE reconcile_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -341,20 +363,31 @@ mod tests {
     #[test]
     fn reencode_leaves_existing_int8_and_empty_blobs_untouched() {
         let conn = setup_conn();
-        // An already-int8 row (4 + dim bytes) and a Failed row's empty blob must NOT be selected:
-        // `4*dim` collides with neither `dim+4` (dim>=1) nor `0`.
+        // Rows that must NOT be selected:
+        // (1) an already-int8 row (4 + dim bytes) — `dim + 4` never equals `4 * dim` for dim>=1.
         let int8 = encode_vector(&[0.1_f32, -0.4, 0.9, -0.2]);
         insert_row(&conn, 1, "model-a", &int8, 4);
+        // (2) a Failed row with a non-zero dim and an empty `x''` blob — `length('') = 0` never
+        //     equals `4 * 4`.
         insert_row(&conn, 2, "model-a", b"", 4);
+        // (3) THE FIX-1 CASE: a Failed (or pre-migration-002) row with `embedding_dim = 0` and the
+        //     empty `x''` blob. By LENGTH alone `length('') = 0 = 4 * 0` would MATCH — only the
+        //     `embedding_dim > 0` guard keeps the re-encode from rewriting `x''` into a bogus
+        //     4-byte scale-only blob and breaking the Failed-row empty-blob invariant.
+        insert_row(&conn, 3, "model-a", b"", 0);
 
         assert_eq!(run_to_completion(&conn), 0);
         assert_eq!(stored_blob(&conn, 1), int8, "int8 row must be byte-identical");
         assert_eq!(stored_blob(&conn, 2), b"", "empty failed-row blob untouched");
+        assert_eq!(stored_blob(&conn, 3), b"", "empty dim=0 failed-row blob untouched (FIX 1)");
     }
 
     fn count_remaining_f32(conn: &Connection) -> i64 {
+        // Mirror the detector exactly — including the load-bearing `embedding_dim > 0` guard, so a
+        // Failed `x''`/`embedding_dim = 0` row is not miscounted as a remaining f32 row.
         conn.query_row(
-            "SELECT COUNT(*) FROM chunk_embeddings WHERE length(vector_blob) = 4 * embedding_dim",
+            "SELECT COUNT(*) FROM chunk_embeddings
+             WHERE length(vector_blob) = 4 * embedding_dim AND embedding_dim > 0",
             [],
             |row| row.get(0),
         )
@@ -450,7 +483,7 @@ mod tests {
         // Pre-set the gate: the forced path must IGNORE it at the start and still convert.
         set_meta(&conn, VECTOR_INT8_REENCODE_DONE_META, "1").unwrap();
 
-        assert_eq!(reencode_legacy_vectors_now(&conn).unwrap(), 1);
+        assert_eq!(reencode_legacy_vectors_now_within(&conn, None).unwrap(), 1);
         // ... and it leaves the gate set, so a later maintenance pass skips the full scan.
         assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
         assert_eq!(reencode_legacy_vectors_if_needed(&conn, None).unwrap(), 0);
@@ -461,7 +494,10 @@ mod tests {
     }
 
     #[test]
-    fn deadline_stop_leaves_gate_unset_and_persists_cursor_then_resumes_to_completion() {
+    fn already_expired_deadline_does_no_work_and_leaves_gate_unset() {
+        // FIX 2: an ALREADY-ELAPSED deadline must do ZERO work — the top-of-loop check fires before
+        // the first collect/write, so no row is converted, no cursor is persisted, the gate stays
+        // unset, and every f32 row remains.
         let conn = setup_conn();
         let vector = vec![0.5_f32, -0.5, 0.25, -0.25];
         let blob = f32_blob(&vector);
@@ -469,21 +505,41 @@ mod tests {
             insert_row(&conn, chunk_id, "model-a", &blob, vector.len());
         }
 
-        // An ALREADY-ELAPSED deadline: the loop converts its first batch (the deadline is only
-        // checked AFTER a committed batch, so progress is always made), then stops because
-        // `Instant::now() >= deadline`. With batch_size 2 over 6 rows it converts exactly 2, leaves
-        // the done-gate UNSET, and persists the cursor at the 2nd row's key.
         let past = Instant::now() - std::time::Duration::from_secs(1);
-        let outcome = reencode_legacy_f32_blobs_batched(&conn, 2, Some(past)).unwrap();
-        assert_eq!(outcome.converted, 2, "one batch runs before the deadline halts the loop");
-        assert!(!outcome.completed, "a deadline stop is not a completion");
-        assert_eq!(count_remaining_f32(&conn), 4, "the rest are still f32");
-        assert_eq!(stored_cursor(&conn).as_deref(), Some("1\nmodel-a"), "cursor at the 2nd row");
+        let converted = reencode_legacy_vectors_if_needed(&conn, Some(past)).unwrap();
+        assert_eq!(converted, 0, "an expired deadline converts nothing");
+        assert_eq!(count_remaining_f32(&conn), 6, "all rows still f32");
+        assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap(), None, "gate unset");
+        assert_eq!(stored_cursor(&conn), None, "no cursor persisted (no batch ran)");
+    }
 
-        // The gated entry point STOPPED here would NOT set the done-gate (verified via the loop
-        // above returning completed=false). A follow-up call with NO deadline resumes FROM THE
-        // PERSISTED CURSOR (not a rescan) and finishes the remaining 4 rows, sets the gate, and
-        // clears the cursor.
+    #[test]
+    fn deadline_stop_persists_cursor_then_a_follow_up_resumes_to_completion() {
+        // The resume path: a run that stops AFTER >=1 batch persists its cursor; a later call
+        // resumes FROM THAT CURSOR (not a rescan) and finishes only the remaining rows. We model
+        // the "stopped after one batch" state deterministically by persisting a cursor by
+        // hand (the same value `save_cursor` would have written), avoiding timing
+        // flakiness.
+        let conn = setup_conn();
+        let vector = vec![0.5_f32, -0.5, 0.25, -0.25];
+        let blob = f32_blob(&vector);
+        for chunk_id in 0..6 {
+            insert_row(&conn, chunk_id, "model-a", &blob, vector.len());
+        }
+        // Pretend a prior deadline-stopped pass converted chunk_ids 0 and 1, then stopped with the
+        // cursor at (1, "model-a"). Reflect that: those two are already int8, the cursor is stored.
+        for chunk_id in [0, 1] {
+            conn.execute(
+                "UPDATE chunk_embeddings SET vector_blob = ?1 WHERE chunk_id = ?2",
+                params![encode_vector(&vector), chunk_id],
+            )
+            .unwrap();
+        }
+        set_reconcile_meta(&conn, VECTOR_INT8_REENCODE_CURSOR_META, "1\nmodel-a").unwrap();
+        assert_eq!(count_remaining_f32(&conn), 4, "4 f32 rows remain past the cursor");
+
+        // A follow-up call with NO deadline resumes from the persisted cursor and finishes the
+        // remaining 4 rows — NOT all 6 — then sets the gate and clears the cursor.
         let converted = reencode_legacy_vectors_if_needed(&conn, None).unwrap();
         assert_eq!(converted, 4, "resumes the remaining rows, not all 6");
         assert_eq!(count_remaining_f32(&conn), 0, "all rows now int8");
