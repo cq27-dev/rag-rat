@@ -1,6 +1,7 @@
 mod helpers;
 mod policy;
 mod reconcile;
+mod reencode;
 mod status;
 mod store;
 use std::collections::{BTreeMap, HashSet};
@@ -10,6 +11,7 @@ use std::time::Instant;
 pub(crate) use helpers::*;
 pub(crate) use policy::*;
 pub(crate) use reconcile::*;
+pub(crate) use reencode::*;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;

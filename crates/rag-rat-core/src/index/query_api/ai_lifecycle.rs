@@ -57,4 +57,20 @@ impl IndexDatabase {
     pub fn pending_embedding_jobs(&self) -> anyhow::Result<u64> {
         ai::pending_embedding_jobs(self.storage.connection())
     }
+
+    /// One-time upgrade: re-encode any `chunk_embeddings` row still stored in the legacy f32 format
+    /// to the compact int8 format (#312), gated by a meta key so later maintenance passes skip the
+    /// table scan. A format-only conversion (decode f32 → encode int8), no model inference. Returns
+    /// the number of rows converted this call (`0` once the gate is set). See
+    /// [`ai::reencode_legacy_vectors_if_needed`].
+    pub fn reencode_legacy_vectors_if_needed(&self) -> anyhow::Result<usize> {
+        ai::reencode_legacy_vectors_if_needed(self.storage.connection())
+    }
+
+    /// FORCE the legacy-f32 → int8 re-encode (#312), ignoring the run-once meta gate — for users
+    /// who want it now on a huge index without waiting for the next maintenance pass.
+    /// Idempotent: converts only rows still in f32. Returns the number of rows converted.
+    pub fn reencode_legacy_vectors_now(&self) -> anyhow::Result<usize> {
+        ai::reencode_legacy_f32_blobs(self.storage.connection())
+    }
 }

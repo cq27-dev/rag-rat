@@ -480,6 +480,12 @@ pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
 }
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
+    // Force the legacy-f32 → int8 vector re-encode (#312) when asked, ignoring the run-once gate —
+    // for users who want it now on a huge index. Format-only, idempotent.
+    if args.reencode_vectors {
+        let converted = db.reencode_legacy_vectors_now()?;
+        eprintln!("rag-rat: re-encoded {converted} legacy f32 vector blobs to int8");
+    }
     if args.plan {
         let plan = db.reconcile_plan()?;
         // `--plan` prints a human summary by default; the global `--json` switches to the
@@ -962,6 +968,11 @@ fn run_maintenance_pass(
     let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
 
     let mut db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
+    // One-time on upgrade: re-encode any legacy f32 vector blobs to the compact int8 format (#312).
+    // Meta-gated, so this runs once and then skips the table scan cheaply on every later pass; run
+    // on the BASE index (not per-overlay) before the worktree refresh re-scopes the connection.
+    // Format-only (decode f32 → encode int8), so it's cheap — no model inference.
+    let _ = db.reencode_legacy_vectors_if_needed();
     // ONE time budget for the whole pass — the per-overlay embedding reconciles AND the base
     // reconcile below — measured from `started` so discovery already counts against it. Without a
     // shared budget each overlay (each call starts its own `max_seconds` timer) plus the base could
