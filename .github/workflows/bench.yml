@@ -86,3 +86,76 @@ jobs:
             --threshold-upper-boundary 0.95 \
             --thresholds-reset \
             "cargo bench --no-default-features --bench index_time"
+
+  # Search-quality headline (#19): commit-replay recall over the self-index at HEAD, tracked in
+  # Bencher. recall@3 is the metric an agent actually feels — "did the right chunk land in the first
+  # 3 reads". The 200-case replay is ~8-10 min, so it lives HERE on main (post-merge), never on the
+  # PR path: it would be both too slow to gate and too noisy to gate (the replay gold is each
+  # commit's changed paths, so a single PR's recall delta is usually below the per-case noise floor).
+  # Tracking only, NO `--err` — a real regression ALERTS via the statistical lower boundary on
+  # recall@3; a noisy dip doesn't hard-fail the run. Same stance as the iai/criterion series above.
+  eval_recall:
+    name: search recall (commit-replay)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    env:
+      # Stable, cacheable location for the MiniLM ONNX download (fastembed honours this env var;
+      # mirrors eval.yml). The model is immutable, so the cache key is static.
+      RAG_RAT_MODEL_CACHE: ${{ github.workspace }}/.rag-rat-models
+    steps:
+      - uses: actions/checkout@v5
+        # FULL history: the commit-replay derives its cases from git history (commit message = query,
+        # changed paths = recall gold), so the default depth-1 shallow checkout would leave it with
+        # only HEAD and zero cases. fetch-depth: 0 fetches every commit for `index` to ingest.
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache embedding model (MiniLM)
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.rag-rat-models
+          key: rag-rat-models-minilm-v1
+      - uses: bencherdev/bencher@main
+
+      - name: Build the eval-feature binary
+        run: cargo build --release -p rag-rat --features eval --locked
+
+      # Build + embed the index AT HEAD. The replay scores commit-message queries against the hybrid
+      # (lexical + semantic) path, so the chunks must be embedded — and reconcile only embeds at-head
+      # chunks, so a fresh checkout must index -> install the model -> reconcile first. The off-head
+      # footgun: a stale/absent index makes EVERY recall read a bogus 0.000.
+      - name: Index + embed at HEAD
+        run: |
+          ./target/release/rag-rat index --discover
+          ./target/release/rag-rat models install fastembed-all-minilm-l6-v2
+          ./target/release/rag-rat reconcile
+
+      - name: Run commit-replay eval -> JSON -> BMF
+        run: |
+          ./target/release/rag-rat --json eval --replay --replay-max-cases 200 > eval.json
+          python3 tools/eval-report-bmf.py eval.json > eval_bmf.json
+          cat eval_bmf.json
+
+      # recall@3 carries the statistical lower-boundary threshold; recall@10 + mrr@10 are tracked
+      # without one (`--thresholds-reset` clears any boundary not re-set here). No `--err`.
+      - name: Track search recall (Bencher)
+        run: |
+          bencher run \
+            --branch main \
+            --adapter json \
+            --file eval_bmf.json \
+            --threshold-measure recall_at_3 \
+            --threshold-test t_test \
+            --threshold-lower-boundary 0.95 \
+            --thresholds-reset
+
+      - name: Upload eval report + BMF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-recall
+          path: |
+            eval.json
+            eval_bmf.json
+          if-no-files-found: warn

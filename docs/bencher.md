@@ -1,13 +1,15 @@
 # Continuous benchmarking (Bencher)
 
-rag-rat tracks performance over time with [Bencher](https://bencher.dev). Two lightweight signals
-are recorded on every push to `main` and gated on every pull request; a third, heavyweight signal
-runs only on a published release:
+rag-rat tracks performance over time with [Bencher](https://bencher.dev). Two lightweight
+*performance* signals are recorded on every push to `main` and gated on every pull request; a
+*search-quality* signal (commit-replay recall) is tracked on `main` only; and a heavyweight
+Linux-kernel indexing signal runs only on a published release:
 
 | Signal | Harness | When | What it measures | Why |
 |---|---|---|---|---|
 | `rag_pipeline` | [iai-callgrind](https://github.com/iai-callgrind/iai-callgrind) | push + PR | CPU **instruction counts** for index rebuild + cold/warm query | Deterministic — immune to CI runner noise, so it catches small *relative* regressions a wall-clock bench would drown out. |
 | `index_time` | [criterion](https://github.com/bheisler/criterion.rs) | push + PR | **Wall-clock** time for a full index rebuild (whole cargo checkout) | The number users actually feel. Noisy, so it's gated statistically (t-test), not on a tight percentage. |
+| `search_replay` | commit-replay eval → [`tools/eval-report-bmf.py`](../tools/eval-report-bmf.py) | **push to `main` only** | **recall@3 / recall@10 / mrr@10** of hybrid search over the self-index at HEAD | The retrieval quality an agent actually feels ("did the right chunk land in the first 3 reads"). ~8–10 min + noisy (the replay gold is recent commit paths), so it's tracked + alerted on `main`, never a PR gate. |
 | `linux-kernel-v7.0/full-index` | single-shot ([`tools/bench-kernel.sh`](../tools/bench-kernel.sh)) | **release only** | **Wall-clock + throughput + peak memory** to index the whole Linux kernel | The headline "indexes the Linux kernel in X seconds" number on a huge real C codebase. Too slow (~tens of minutes) for per-push. |
 
 The push/PR harnesses run on different corpus sizes on purpose — see "Corpus" below.
@@ -66,13 +68,54 @@ reports the indexed `file_count_by_language` and files/sec throughput so the out
 If you bump the pinned SHA, update the cache key (`bench-corpus-cargo-<version>`) in all three
 workflow files too.
 
+## Search-quality: commit-replay recall
+
+`bench.yml`'s `eval_recall` job tracks how well search retrieves the right code over time, using the
+commit-replay eval (#120): each recent commit becomes a case (commit message = query, the commit's
+changed paths = recall gold), scored against the hybrid (lexical + semantic) index at HEAD. Three
+measures go to Bencher under the `search_replay` benchmark:
+
+- `recall_at_3` — the headline: |gold ∩ top-3| / |gold|, "did the right chunk land in the first 3
+  reads". It carries a statistical **lower**-boundary t-test threshold (a recall regression is a
+  *drop*, unlike the latency/instruction signals, which alert on an *increase*).
+- `recall_at_10`, `mrr_at_10` — tracked without a threshold (context for a recall@3 move).
+
+Values are fractions in [0, 1] — the same numbers `eval` prints — so a Bencher plot reads identically
+to a local run.
+
+The job builds an embedded index at HEAD (`index --discover` → `models install
+fastembed-all-minilm-l6-v2` → `reconcile`), then `rag-rat --json eval --replay --replay-max-cases
+200` → [`tools/eval-report-bmf.py`](../tools/eval-report-bmf.py) → `bencher run --adapter json`. Two
+footguns it has to handle:
+
+- **Off-head ⇒ bogus 0.000.** `reconcile` only embeds *at-head* chunks, so the index must be built +
+  embedded at HEAD before scoring; a stale/absent index makes every recall read 0.000.
+- **Shallow checkout ⇒ no cases.** The replay walks git history, so the job checks out with
+  `fetch-depth: 0` — the default depth-1 checkout would leave it with only HEAD and zero cases.
+
+**Main-only, no `--err`, by design.** At ~8–10 min over 200 cases it's too slow for the PR critical
+path, and the metric is noisy — the gold is recent commit paths, so a single PR's recall delta is
+usually below the per-case noise floor (≥200 cases are needed for signal). So it's tracked +
+*alerted* on `main` (the statistical threshold flags a real regression in Bencher) rather than
+hard-failing a run — the same "headline signal, not a gate" stance as the iai/criterion series. Reset
+the baseline after an embedder or replay-parameter change with **Actions → bench → Run workflow** (the
+`workflow_dispatch` reruns `--thresholds-reset`).
+
+Run it locally (needs the `eval` feature + an embedded at-head index):
+
+```bash
+cargo build --release -p rag-rat --features eval
+target/release/rag-rat --json eval --replay --replay-max-cases 200 > eval.json
+python3 tools/eval-report-bmf.py eval.json > eval_bmf.json
+```
+
 ## CI workflows
 
 Four workflows under `.github/workflows/`:
 
 | Workflow | Trigger | Has the token? | Role |
 |---|---|---|---|
-| `bench.yml` | push to `main` | yes | Records both lightweight signals against the `main` branch; sets/refreshes the thresholds new PRs are compared against. |
+| `bench.yml` | push to `main` | yes | Records the lightweight perf signals **and** the `search_replay` recall signal (a separate `eval_recall` job) against `main`; sets/refreshes the thresholds new PRs are compared against. |
 | `bench-pr-run.yml` | `pull_request` (incl. forks) | **no** | Runs the benches, uploads raw output + the PR event as an artifact. Never sees secrets, so a fork PR can't exfiltrate the token. |
 | `bench-pr-track.yml` | `workflow_run` of bench-pr-run | yes | Runs in the base-repo context: downloads the artifact, uploads results to Bencher, comments the comparison on the PR. |
 | `bench-release.yml` | `release: published` + manual `workflow_dispatch` | yes | The heavyweight Linux-kernel headline bench (below). Not a gate — tracks latency/throughput/memory over releases. |
