@@ -18,6 +18,12 @@ impl IndexDatabase {
         git_history::replay_commit_cases(self.storage.connection(), limit, max_files)
     }
 
+    /// The indexed-path set the commit-replay eval filters its gold against, so recall counts only
+    /// retrievable paths (#315). See [`git_history::indexed_path_set`].
+    pub fn indexed_path_set(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        git_history::indexed_path_set(self.storage.connection())
+    }
+
     /// Symbol-level replay gold (#120): distinct chunk `symbol_path`s overlapping `ranges` in
     /// `path`. See [`git_history::chunk_symbol_paths_in_ranges`].
     pub fn chunk_symbol_paths_in_ranges(

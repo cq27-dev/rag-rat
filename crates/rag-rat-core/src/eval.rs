@@ -334,8 +334,27 @@ pub fn generate_replay_suite(
     options: &ReplayOptions,
 ) -> anyhow::Result<EvalSuite> {
     let cases = db.replay_commit_cases(options.max_cases, options.max_files)?;
-    let query = cases.iter().map(replay_eval_query).collect();
-    Ok(EvalSuite { query })
+    let indexed = db.indexed_path_set()?;
+    Ok(EvalSuite { query: replay_queries_with_indexed_gold(&cases, &indexed) })
+}
+
+/// Turn replay cases into eval queries, restricting each case's path gold to paths the index
+/// actually contains. The repo config indexes only a subset of the tree, so a commit touching
+/// `.github/**`, `tools/**`, or a root manifest contributes gold that can never be retrieved;
+/// counting it as a miss would make recall track the file mix of recent commits, not search quality
+/// (#315). Cases left with no indexed gold are dropped — nothing measurable remains.
+fn replay_queries_with_indexed_gold(
+    cases: &[git_history::ReplayCase],
+    indexed: &BTreeSet<String>,
+) -> Vec<EvalQuery> {
+    cases
+        .iter()
+        .filter_map(|case| {
+            let mut query = replay_eval_query(case);
+            query.must_include_paths.retain(|path| indexed.contains(path));
+            (!query.must_include_paths.is_empty()).then_some(query)
+        })
+        .collect()
 }
 
 /// Aggregate result of a parent-state replay run (#120) — the leakage-free MRR/recall@10 over the
@@ -1221,6 +1240,36 @@ mod tests {
         // Empty/whitespace body: the query is the subject alone (no dangling newline).
         let no_body = ReplayCase { body: "  ".into(), ..with_body };
         assert_eq!(replay_eval_query(&no_body).text, "fix(x): handle empty input");
+    }
+
+    #[test]
+    fn replay_gold_is_filtered_to_indexed_paths() {
+        use crate::index::git_history::ReplayCase;
+        let case = |paths: &[&str]| ReplayCase {
+            hash: "0123456789abcdef0123".into(),
+            subject: "fix something".into(),
+            body: String::new(),
+            changed_paths: paths.iter().map(|path| (*path).to_string()).collect(),
+        };
+        // The repo config indexes crates/** only; .github/**, tools/**, and root manifests are not.
+        let indexed: BTreeSet<String> =
+            ["crates/a.rs".to_string(), "crates/b.rs".to_string()].into_iter().collect();
+        let cases = vec![
+            case(&["crates/a.rs", ".github/workflows/ci.yml", "tools/x.sh"]), /* mixed -> keep
+                                                                               * crates/a.rs */
+            case(&[".github/only.yml", "Cargo.toml"]), // all non-indexed -> dropped
+        ];
+        let queries = replay_queries_with_indexed_gold(&cases, &indexed);
+        assert_eq!(
+            queries.len(),
+            1,
+            "the all-non-indexed case is dropped (no measurable gold left)"
+        );
+        assert_eq!(
+            queries[0].must_include_paths,
+            vec!["crates/a.rs".to_string()],
+            "non-indexed gold (.github/**, tools/**, manifests) is filtered out of the denominator",
+        );
     }
 
     #[test]

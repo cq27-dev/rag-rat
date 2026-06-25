@@ -276,6 +276,19 @@ pub fn replay_commit_cases(
     Ok(cases)
 }
 
+/// The set of paths the repo config currently indexes (live `files` rows, excluding deletion
+/// tombstones). The commit-replay eval (#120) restricts its gold to this set: a path the config
+/// doesn't index (`.github/**`, `tools/**`, a root manifest, …) can never be retrieved, so counting
+/// it as missing gold would make recall@k track the file mix of recent commits rather than search
+/// quality (#315).
+pub fn indexed_path_set(conn: &Connection) -> anyhow::Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM files WHERE kind != 'deleted'")?;
+    let paths = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<String>>>()?;
+    Ok(paths)
+}
+
 /// Distinct `chunks.symbol_path` for chunks in `path` whose line span overlaps any of `ranges`
 /// (inclusive). Commit-replay (#120) uses this to derive symbol-level gold: the symbols a commit
 /// touched, in the SAME `symbol_path` format the search results carry, so symbol-recall is

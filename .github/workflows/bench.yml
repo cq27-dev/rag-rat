@@ -138,7 +138,12 @@ jobs:
           cat eval_bmf.json
 
       # recall@3 carries the statistical lower-boundary threshold; recall@10 + mrr@10 are tracked
-      # without one (`--thresholds-reset` clears any boundary not re-set here). No `--err`.
+      # without one. NO --thresholds-reset here: it removes every threshold NOT named in this run,
+      # and the `bench` job above publishes its instruction/latency thresholds to the SAME
+      # main/ubuntu-latest branch+testbed — resetting here could wipe those (and vice versa). Each
+      # job owns only its own measure's threshold and resets nothing; recall@3 is created/updated in
+      # place. No `--err` (tracking, not a gate) — a real drop alerts via the boundary; a noisy dip
+      # doesn't fail the run.
       - name: Track search recall (Bencher)
         run: |
           bencher run \
@@ -147,8 +152,7 @@ jobs:
             --file eval_bmf.json \
             --threshold-measure recall_at_3 \
             --threshold-test t_test \
-            --threshold-lower-boundary 0.95 \
-            --thresholds-reset
+            --threshold-lower-boundary 0.95
 
       - name: Upload eval report + BMF
         if: always()
