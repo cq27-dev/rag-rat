@@ -190,6 +190,15 @@ pub struct ProvisionedBox {
     pgid: i32,
 }
 
+#[cfg(all(test, unix))]
+impl ProvisionedBox {
+    /// The process-GROUP id, for the leak-safety harness (#334) to probe `group_alive(pgid)` AFTER
+    /// `Drop`, asserting no fault leaves a leaked group. Test-only — production teardown owns it.
+    pub(crate) fn pgid(&self) -> i32 {
+        self.pgid
+    }
+}
+
 /// Spawns the cookbook subprocess and provisions an ephemeral box, returning once it is serving.
 pub struct CookbookProvisioner;
 
@@ -631,16 +640,23 @@ impl Drop for ProvisionedBox {
 ///
 /// We poll the WHOLE GROUP (`killpg(pgid, 0)`), NOT just the leader's `waitpid`. The `npx` leader
 /// is the group leader, but the recipe GRANDCHILD is what holds the paid box and runs the SIGTERM
-/// teardown. The leader can exit while the grandchild is still mid-teardown — if we returned the
-/// instant the leader was reaped (the old bug), we'd skip the SIGKILL backstop and a STUCK
-/// grandchild teardown would orphan the box. So we reap the leader (no zombie) but keep waiting on
-/// the group: the grace ends early only when EVERY member is gone (`ESRCH`), and a group still
-/// alive at the deadline gets `killpg(SIGKILL)`.
+/// teardown. The leader can exit while the grandchild is still alive — at the START (the wrapper
+/// exits right after `ready`, the #330-7 early-return edge) or mid-teardown (a stuck grandchild).
+/// In BOTH cases trusting `waitpid` on the leader would skip the group teardown and orphan the box.
+/// So we never trust the wrapper's exit: we reap it (no zombie) but always PROBE the group, and
+/// only return once EVERY member is gone (`ESRCH`); a group still alive at the deadline gets
+/// `killpg(SIGKILL)`.
 #[cfg(unix)]
 fn teardown_group(pgid: i32, child: &mut Child) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        // Already reaped (e.g. a failure path already killed the group). Now that it's gone,
-        // release the pgid so a later signal doesn't act on a recycled pid.
+    // Reap the immediate child if it already exited (avoid a zombie) — but DO NOT trust the
+    // WRAPPER's exit as proof the GROUP is gone (#330-7): `npx`/Node is the wrapper, and the recipe
+    // GRANDCHILD holding the paid box can OUTLIVE it (the wrapper exits/crashes right after `ready`
+    // while the recipe keeps running). So always PROBE the group below; only return early when no
+    // member survives.
+    let _ = child.try_wait();
+    if !group_alive(pgid) {
+        // The whole group is genuinely gone (e.g. a failure path already killed it). Release the
+        // pgid so a later signal doesn't act on a recycled pid.
         ACTIVE_PGID.store(0, Ordering::SeqCst);
         return;
     }
@@ -849,6 +865,7 @@ extern "C" fn handle_terminating_signal(signo: libc::c_int) {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1277,5 +1294,331 @@ mod tests {
         .expect("handshake parses despite a giant pre-ready line");
         assert_eq!(provisioned.endpoint, "http://127.0.0.1:7");
         drop(provisioned);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────────
+    // Leak-safety harness (#334): one parameterized table pinning the MONEY-LEAK invariant — "no
+    // fault leaves a leaked cookbook process group". Every scenario drives a fault, then asserts
+    // the group is GONE via `killpg(pgid, 0) == Err(ESRCH)` (i.e. `!group_alive(pgid)`). The
+    // point is a single source of truth: a future teardown edge fails its case HERE instead of
+    // reaching a reviewer (and a leaked GPU box). When the leak-class regresses, the failing
+    // scenario names the gap. The standalone `drop_*`/`provision_*` tests above remain as
+    // focused per-behavior probes; these harness cases pin the GROUP-level invariant uniformly
+    // across the fault matrix.
+    // ───────────────────────────────────────────────────────────────────────────────────────────
+
+    /// A group-member pid (the box-holding grandchild) recorded by a stub, plus the group id. After
+    /// the fault the harness asserts BOTH: the group probe is `ESRCH` AND the recorded member is
+    /// reaped — restating the one invariant at the group and at a concrete member.
+    struct GroupProbe {
+        pgid: i32,
+        /// The grandchild pid the stub wrote to its pidfile, if the scenario uses a grandchild
+        /// stub.
+        member: Option<i32>,
+    }
+
+    /// Wait (bounded) for the stub's grandchild to record its pid, then confirm it's alive — proof
+    /// the box is "up" before we trigger the fault. Returns the grandchild pid.
+    fn wait_for_grandchild(pidfile: &std::path::Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(pidfile)
+                && let Ok(pid) = s.trim().parse::<i32>()
+            {
+                assert!(pid_alive(pid), "grandchild should be alive while the box is up");
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "grandchild never recorded its pid");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// THE invariant assertion: after the fault, the whole process GROUP must be gone. We poll
+    /// briefly because some teardown paths (a lingering grandchild, the timeout's grace) complete
+    /// asynchronously, but the group must be reaped well within the bound — a TRUE leak never
+    /// clears.
+    fn assert_group_reaped(probe: &GroupProbe, scenario: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while group_alive(probe.pgid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !group_alive(probe.pgid),
+            "[{scenario}] LEAK: process group {} is still alive — a fault orphaned the box \
+             (killpg(pgid,0) must be ESRCH)",
+            probe.pgid,
+        );
+        if let Some(member) = probe.member {
+            assert!(
+                !pid_alive(member),
+                "[{scenario}] LEAK: the box-holding grandchild {member} survived the teardown",
+            );
+        }
+    }
+
+    #[test]
+    fn leak_safety_normal_serve_then_drop() {
+        // Case 1 — the happy path: the box serves, then `Drop` (SIGTERM → the stub exits) reaps it.
+        // The baseline the leak invariant must hold on, not just the fault paths.
+        let cmd = stub_command("stub_ok.sh", &[("STUB_ENDPOINT", "http://127.0.0.1:1")]);
+        let provisioned = CookbookProvisioner::provision_with_command(
+            cmd,
+            "stub_ok.sh",
+            &input(),
+            Duration::from_secs(10),
+        )
+        .expect("handshake parsed");
+        let pgid = provisioned.pgid();
+        assert!(group_alive(pgid), "the group is alive while serving");
+        drop(provisioned);
+        assert_group_reaped(&GroupProbe { pgid, member: None }, "normal_serve_then_drop");
+    }
+
+    #[test]
+    fn leak_safety_wrapper_exits_early_grandchild_lingers() {
+        // Case 2 — THE Part-1 edge (#330-7). The WRAPPER (leader) exits RIGHT AFTER `ready` while
+        // the box-holding grandchild lingers and IGNORES a direct SIGTERM. So by the time
+        // `Drop` runs, `child.try_wait()` ALREADY reports the leader exited. The buggy
+        // early-return trusted that as "the group is gone" → `store(0)` + return with NO
+        // group probe / NO killpg → the grandchild (the paid box) is orphaned. This case
+        // FAILS before the Part-1 fix and PASSES after it: the fix always probes the GROUP
+        // and runs the full SIGTERM→grace→SIGKILL teardown.
+        let pidfile = tmp("wrapper-early-gc-pid");
+        let _ = std::fs::remove_file(&pidfile);
+        let cmd = stub_command("stub_wrapper_exits_early.sh", &[
+            ("STUB_ENDPOINT", "http://127.0.0.1:1"),
+            ("STUB_GRANDCHILD_PIDFILE", pidfile.to_str().unwrap()),
+        ]);
+        let provisioned = CookbookProvisioner::provision_with_command(
+            cmd,
+            "stub_wrapper_exits_early.sh",
+            &input(),
+            Duration::from_secs(10),
+        )
+        .expect("handshake parsed (wrapper emits ready, then exits)");
+        let pgid = provisioned.pgid();
+        let gc = wait_for_grandchild(&pidfile);
+
+        drop(provisioned);
+        assert_group_reaped(&GroupProbe { pgid, member: Some(gc) }, "wrapper_exits_early");
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[test]
+    fn leak_safety_hung_grandchild_teardown_hits_the_sigkill_backstop() {
+        // Case 3 — a STUCK grandchild teardown. The leader exits promptly on SIGTERM; the
+        // grandchild ignores SIGTERM and lingers. Teardown must NOT return on the leader's
+        // `waitpid` — it polls the GROUP and (for a long-enough hang) SIGKILLs at the grace
+        // deadline. `stub_grandchild`'s grandchild ignores TERM and sleeps long, so only
+        // the group SIGKILL backstop reaps it.
+        let pidfile = tmp("hung-gc-pid");
+        let _ = std::fs::remove_file(&pidfile);
+        let cmd = stub_command("stub_grandchild.sh", &[
+            ("STUB_ENDPOINT", "http://127.0.0.1:1"),
+            ("STUB_GRANDCHILD_PIDFILE", pidfile.to_str().unwrap()),
+        ]);
+        let provisioned = CookbookProvisioner::provision_with_command(
+            cmd,
+            "stub_grandchild.sh",
+            &input(),
+            Duration::from_secs(10),
+        )
+        .expect("handshake parsed");
+        let pgid = provisioned.pgid();
+        let gc = wait_for_grandchild(&pidfile);
+
+        drop(provisioned);
+        assert_group_reaped(&GroupProbe { pgid, member: Some(gc) }, "hung_grandchild_teardown");
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[test]
+    fn leak_safety_provision_timeout_tears_down_a_live_box() {
+        // Case 4 — a PROVISION_TIMEOUT while a box is LIVE. The stub never emits `ready` but spawns
+        // a SIGTERM-ignoring grandchild, so the Rust provision deadline fires with the box
+        // up. The timeout path must run the full `teardown_group` (R1: grace, not a hard
+        // SIGKILL-only) and reap the group — NOT return the timeout error while leaking the
+        // grandchild.
+        let pidfile = tmp("timeout-live-gc-pid");
+        let _ = std::fs::remove_file(&pidfile);
+        // The box is never returned (it never serves), so the grandchild's pidfile is our handle on
+        // the group. Run provisioning on a thread so we can read the pidfile while it blocks on the
+        // (short, test-only) timeout, then resolve the group and assert it was reaped.
+        let pf = pidfile.clone();
+        let handle = std::thread::spawn(move || {
+            CookbookProvisioner::provision_with_command(
+                stub_command("stub_hang_grandchild.sh", &[(
+                    "STUB_GRANDCHILD_PIDFILE",
+                    pf.to_str().unwrap(),
+                )]),
+                "stub_hang_grandchild.sh",
+                &input(),
+                // A short test-only provision timeout (vs. the 5-min production ceiling).
+                Duration::from_millis(600),
+            )
+        });
+        let gc = wait_for_grandchild(&pidfile);
+        // The grandchild is the group leader's child → its pgid is the group we tear down.
+        let pgid = unsafe { libc::getpgid(gc) };
+        assert!(pgid > 1, "resolved the grandchild's process group");
+
+        let result = handle.join().expect("provision thread");
+        let err = result.expect_err("a cookbook that never serves must time out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_group_reaped(&GroupProbe { pgid, member: Some(gc) }, "provision_timeout_live_box");
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[test]
+    fn leak_safety_huge_unterminated_line_is_bounded_and_still_reaped() {
+        // Case 5 — a huge newline-less stdout line before `ready`. Two invariants in one: the drain
+        // stays BOUNDED (no OOM — covered byte-exactly by the `read_capped_line` unit test), AND
+        // the box is still torn down cleanly afterward (no leak from the odd I/O shape).
+        // The stub emits ~4 MiB with no newline, then `ready`, then parks until SIGTERM.
+        let cmd = stub_command("stub_huge_line.sh", &[("STUB_ENDPOINT", "http://127.0.0.1:7")]);
+        let provisioned = CookbookProvisioner::provision_with_command(
+            cmd,
+            "stub_huge_line.sh",
+            &input(),
+            Duration::from_secs(10),
+        )
+        .expect("handshake parses despite a giant pre-ready line");
+        let pgid = provisioned.pgid();
+        drop(provisioned);
+        assert_group_reaped(&GroupProbe { pgid, member: None }, "huge_unterminated_line");
+    }
+
+    // ── Case 6 — a signal arriving MID-TEARDOWN: the SIGNAL HANDLER's backstop must reap the
+    // group.
+    //
+    // The handler ends in `_exit(128 + signo)` and never returns, so it can't run in-process (it
+    // would kill the test runner). We RE-EXEC the test binary into an env-gated child harness
+    // (`RAGRAT_LEAK_CASE6=1`): the child installs the signal handler, provisions a lingering-
+    // grandchild stub (so `ACTIVE_PGID` is set to a live group), hands the grandchild pid back to
+    // the parent via a file, and parks. The parent sends SIGTERM to the child, waits for it to
+    // exit (through the handler's reap → restore → re-raise → `_exit`), then asserts the
+    // grandchild — the only surviving group member after the leader-child exits — is GONE. That
+    // proves the handler's backstop reaped the WHOLE group on the way out, not just the leader.
+
+    #[test]
+    fn leak_safety_mid_teardown_signal_handler_reaps_the_group() {
+        // The PARENT side. If we're the re-exec'd child, run the child body instead and exit.
+        if std::env::var_os("RAGRAT_LEAK_CASE6_CHILD").is_some() {
+            case6_child_body();
+            // case6_child_body parks until the parent's SIGTERM; the handler `_exit`s us. If it
+            // ever returns (it shouldn't), fail loudly so the parent's wait sees a
+            // non-handler exit.
+            std::process::exit(97);
+        }
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let gc_pidfile = tmp("case6-grandchild-pid");
+        let ready_file = tmp("case6-ready");
+        let _ = std::fs::remove_file(&gc_pidfile);
+        let _ = std::fs::remove_file(&ready_file);
+
+        // Re-exec THIS exact test, single-threaded, into the child harness. The libtest filter is
+        // the FULLY-QUALIFIED test path WITHOUT the crate-name segment: `module_path!()` is
+        // `rag_rat_core::index::…::tests`, but libtest registers tests as `index::…::tests::<fn>`
+        // (no crate prefix). `--exact` on the bare fn name (or the crate-prefixed path) selects
+        // ZERO tests and the child never arms — strip the leading `<crate>::` so the filter
+        // matches.
+        let module =
+            module_path!().split_once("::").map(|(_, rest)| rest).unwrap_or(module_path!());
+        let test_path =
+            format!("{module}::leak_safety_mid_teardown_signal_handler_reaps_the_group");
+        let mut child = Command::new(&exe)
+            .args(["--exact", &test_path, "--nocapture", "--test-threads=1"])
+            .env("RAGRAT_LEAK_CASE6_CHILD", "1")
+            .env("RAGRAT_LEAK_CASE6_GC_PIDFILE", &gc_pidfile)
+            .env("RAGRAT_LEAK_CASE6_READY_FILE", &ready_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("re-exec the test binary as the case-6 child harness");
+
+        // Wait for the child to signal "handler installed, box provisioned, parked".
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let gc = loop {
+            if ready_file.exists()
+                && let Ok(s) = std::fs::read_to_string(&gc_pidfile)
+                && let Ok(pid) = s.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("case-6 child never became ready");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(pid_alive(gc), "the child's box-holding grandchild is up before we signal");
+
+        // Send SIGTERM to the CHILD (the leader of the cookbook group lives inside it). This lands
+        // in the child's installed handler, which must SIGTERM→grace→SIGKILL the cookbook
+        // group before exiting. We send to the child process directly (not its group) to
+        // model a terminating signal delivered to rag-rat itself mid-run.
+        unsafe {
+            assert_eq!(libc::kill(child.id() as i32, libc::SIGTERM), 0, "SIGTERM to the child");
+        }
+        let status = child.wait().expect("child harness exits");
+        // The handler re-raises SIGTERM after restoring the default disposition → death by signal
+        // 15. (If the child returned 97/anything else, the handler path didn't run as
+        // designed.)
+        assert!(
+            status.signal() == Some(libc::SIGTERM) || status.code() == Some(128 + libc::SIGTERM),
+            "child should die via the re-raised SIGTERM, got {status:?}",
+        );
+
+        // THE assertion: the box-holding grandchild — the surviving group member after the child
+        // process (the leader) is gone — must be reaped by the handler's backstop. Poll briefly for
+        // the SIGKILL to land, then require it.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while pid_alive(gc) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !pid_alive(gc),
+            "LEAK: a mid-teardown SIGTERM left the grandchild {gc} alive — the signal handler's \
+             backstop must reap the WHOLE group on the way out",
+        );
+        let _ = std::fs::remove_file(&gc_pidfile);
+        let _ = std::fs::remove_file(&ready_file);
+    }
+
+    /// The CHILD side of case 6 (runs only under `RAGRAT_LEAK_CASE6_CHILD`). Installs the real
+    /// signal handler, provisions a lingering-grandchild stub (so `ACTIVE_PGID` points at a
+    /// live group), records the grandchild pid + a readiness marker for the parent, then parks
+    /// forever waiting for the parent's SIGTERM. The handler — not this code — terminates us,
+    /// reaping the group on exit.
+    fn case6_child_body() {
+        let gc_pidfile = std::env::var("RAGRAT_LEAK_CASE6_GC_PIDFILE").expect("gc pidfile env");
+        let ready_file = std::env::var("RAGRAT_LEAK_CASE6_READY_FILE").expect("ready file env");
+
+        let cmd = stub_command("stub_grandchild.sh", &[
+            ("STUB_ENDPOINT", "http://127.0.0.1:1"),
+            ("STUB_GRANDCHILD_PIDFILE", gc_pidfile.as_str()),
+        ]);
+        // provision_with_command installs the signal handler and sets ACTIVE_PGID. We deliberately
+        // LEAK the box (forget it) so `Drop` doesn't tear it down — the SIGNAL HANDLER must be what
+        // reaps the group when the parent's SIGTERM arrives.
+        let provisioned = CookbookProvisioner::provision_with_command(
+            cmd,
+            "stub_grandchild.sh",
+            &input(),
+            Duration::from_secs(10),
+        )
+        .expect("child: handshake parsed");
+        std::mem::forget(provisioned);
+
+        // Tell the parent we're armed (handler installed, group live, grandchild pid recorded).
+        std::fs::write(&ready_file, b"ready").expect("write ready marker");
+
+        // Park forever; the parent's SIGTERM drives the handler, which `_exit`s us.
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 }
