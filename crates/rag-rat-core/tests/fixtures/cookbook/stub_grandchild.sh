@@ -21,8 +21,8 @@ grandchild &
 GC_PID=$!
 
 # The parent forwards a group teardown implicitly (it dies with the group); it doesn't need to relay
-# anything. Print the handshake so rag-rat considers the box "serving".
-printf '{"endpoint":"%s","auth_token":null}\n' "$STUB_ENDPOINT"
+# anything. Emit the `ready` event so rag-rat considers the box "serving".
+printf '{"type":"ready","endpoint":"%s","auth_token":null,"ts":1}\n' "$STUB_ENDPOINT"
 
 # Park until the group is torn down.
 wait "$GC_PID"

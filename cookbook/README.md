@@ -2,8 +2,8 @@
 
 Ephemeral remote-runtime provisioning recipes for [rag-rat](../). A **recipe** is a standalone
 Node program that rag-rat spawns as a subprocess: it provisions a remote box (e.g. an Ollama
-embedding server), hands rag-rat the endpoint over a one-line stdout handshake, holds the box
-while rag-rat works, then tears it down on signal.
+embedding server), streams typed JSONL events to stdout (handing rag-rat the endpoint via a
+`ready` event), holds the box while rag-rat works, then tears it down on signal.
 
 This is the JS/TS half of rag-rat's remote-runtime rework (#317/#318). rag-rat (Rust) owns the
 lifecycle and the embedding traffic; the cookbook owns provider provisioning.
@@ -17,27 +17,29 @@ lifecycle and the embedding traffic; the cookbook owns provider provisioning.
 
 ## The process contract
 
-rag-rat and a recipe communicate over a tiny, strict process protocol. Implement it exactly — the
-Rust side is built against it.
+rag-rat and a recipe communicate over a strict process protocol. **stdout is a typed JSONL event
+stream** — one JSON object per line — which a future ratatui `log` view (#329) renders live. The
+Rust parser is built against the exact event shapes below; implement them precisely.
 
 | Stage | rag-rat | recipe |
 |---|---|---|
 | spawn | runs `node recipe.mjs` (or `npx tsx recipe.mts`), with `RAG_RAT_COOKBOOK_INPUT` set in env | starts up |
 | input | sets `RAG_RAT_COOKBOOK_INPUT` = JSON `CookbookInput`; provider creds already in env / `~/.modal.toml` | reads + parses that env var |
-| handshake | reads **one line** from the recipe's **stdout** | once the box is up **and serving**, prints exactly one line to stdout: `{"endpoint":"https://…","auth_token":"…"}` |
+| progress | reads `status` / `log` events from **stdout** | emits `status` (provisioning → pulling → verifying) and `log` events as it works |
+| ready | reads the `ready` event → uses `endpoint` | once the box is up **and serving**, emits one `ready` event |
 | liveness | uses the endpoint | stays running, holding the box |
-| teardown | sends `SIGTERM` (or `SIGINT`) | destroys the box, exits `0` |
-| failure | sees non-zero exit, no handshake | on provisioning failure: error to **stderr**, exit non-zero, **before** any handshake |
+| teardown | sends `SIGTERM` (or `SIGINT`) | emits a `tearing_down` status, destroys the box, exits `0` |
+| failure | sees an `error` event + non-zero exit, no `ready` | on provisioning failure: emits an `error` event, exits non-zero, **before** any `ready` |
 
 Hard rules:
 
-- **stdout carries exactly one line** — the handshake JSON object. Everything else (logs,
-  progress, errors) goes to **stderr**. Use the `log()` helper or `console.error`, never
-  `console.log`.
-- **Handshake only after serving.** Don't print the endpoint until the box answers a real request
-  (the Modal recipe probes `/api/embed` and waits for a vector).
-- **Stay alive after the handshake** until signaled.
-- **Tear down on `SIGTERM`/`SIGINT`**, then `exit(0)`.
+- **stdout carries ONLY JSONL events** — one `CookbookEvent` per line, nothing else. Use `log(level,
+  message)` / `ctx.status(phase, detail)` / the `emit()` helper; never `console.log`. **stderr is
+  for genuine crashes only** (an uncaught throw).
+- **`ready` only after serving.** Don't emit `ready` until the box answers a real request (the
+  recipes probe `/api/embed` and wait for a vector).
+- **Stay alive after `ready`** until signaled.
+- **Tear down on `SIGTERM`/`SIGINT`** (a `tearing_down` status precedes it), then `exit(0)`.
 - **Bound every network call.** A stalled fetch that hangs past the Rust-side grace gets SIGKILLed
   with the box still up → a leaked, billed box. Use `pollUntil` / `fetchWithTimeout` (both carry an
   `AbortSignal.timeout`); never call bare `fetch` on a path that could stall.
@@ -67,20 +69,32 @@ Hard rules:
 The provisioning budget is **`provision_timeout_s`**, never `request_timeout_s` — conflating the
 two (using the ~30–60s per-request timeout as the boot budget) is what made the first live e2e time
 out before the box finished booting. `readInput` validates each field up front (a string timeout
-would otherwise become `NaN` and break the poll loops); a malformed input is a clean `exit(1)` with
-no handshake.
+would otherwise become `NaN` and break the poll loops); a malformed input emits an `error` event and
+`exit(1)`, no `ready`.
 
-### `Handshake` (the one stdout line)
+### The stdout event stream (`CookbookEvent`)
+
+stdout is JSONL — one of these objects per line. Every event carries `ts` (epoch ms).
 
 ```jsonc
-{
-  "endpoint": "https://abc123.modal.host",  // base HTTPS endpoint of the model server
-  "auth_token": null                         // bearer token, or null/omitted for an open tunnel
-}
+// progress: lifecycle phase. provider ∈ {"modal","runpod"}; phase ∈
+//   {"provisioning","pulling","verifying","tearing_down"}
+{"type":"status","phase":"pulling","provider":"runpod","detail":"pulling model …","ts":1782489011404}
+
+// diagnostics: level ∈ {"info","warn","error"}
+{"type":"log","level":"info","message":"pod deployed: abc123","ts":1782489011405}
+
+// the box is serving — REPLACES the old bare handshake line
+{"type":"ready","endpoint":"https://abc123.modal.host","auth_token":null,"ts":1782489011405}
+
+// provisioning failed before `ready`
+{"type":"error","message":"provisioning failed: …","ts":1782489025078}
 ```
 
-`auth_token` is `null` (or omitted) when the tunnel is open. rag-rat treats a missing field and an
-explicit `null` identically.
+`auth_token` on `ready` is `null` when the tunnel is open (no token needed); a missing token is
+normalized to explicit `null`. A run emits zero-or-more `status`/`log` events, then **either** one
+`ready` (success — followed later by a `tearing_down` status on signal) **or** one `error` (failure,
+with exit 1 and no `ready`).
 
 ## Invoking — provider as a subcommand
 
@@ -93,9 +107,9 @@ npx @rag-rat/cookbook runpod    # provision on RunPod
 
 The bin (`dist/cli.mjs`) reads the provider from `argv[2]` and dynamically imports the matching
 recipe (`recipes/<provider>-ollama.mjs`). Recipes self-run on import, so the dispatcher adds only
-routing — no contract logic. An unknown or missing provider prints the available providers to
-stderr and exits `1` (no handshake). The recipe files stay **directly runnable** too, which is what
-rag-rat actually spawns:
+routing — no contract logic. An unknown or missing provider emits an `error` event listing the
+available providers and exits `1` (no `ready`). The recipe files stay **directly runnable** too,
+which is what rag-rat actually spawns:
 
 ```bash
 node dist/recipes/modal-ollama.mjs     # equivalent to `cookbook modal`
@@ -148,7 +162,7 @@ Provider gotchas baked into the recipe:
   `OLLAMA_HOST=0.0.0.0:11434` in the pod env.
 - There is **no in-pod exec** in `podFindAndDeployOnDemand`, so the model is pulled **client-side**
   over the proxy URL (`POST /api/pull`, non-streaming, retried until the pod finishes booting),
-  then `/api/embed` is probed before the handshake.
+  then `/api/embed` is probed before the `ready` event.
 - **No provider-side backstop.** RunPod's `podFindAndDeployOnDemand` has **no** field that
   auto-stops or auto-terminates an on-demand GPU pod after a duration or after idle (`idleTimeout`
   is a serverless/flex-worker concept, not an on-demand-pod control — verified against the RunPod
@@ -157,8 +171,8 @@ Provider gotchas baked into the recipe:
   Rust-side grace.
 - Default GPU is a cheap `NVIDIA RTX A4000`; `input.gpu` is a `gpuTypeId` override.
 
-Auth: `RUNPOD_API_KEY` in the process env — the recipe errors and exits `1` (no handshake) if it's
-unset. rag-rat does not pass it through `RAG_RAT_COOKBOOK_INPUT`.
+Auth: `RUNPOD_API_KEY` in the process env — the recipe emits an `error` event and exits `1` (no
+`ready`) if it's unset. rag-rat does not pass it through `RAG_RAT_COOKBOOK_INPUT`.
 
 ## Build & run
 
@@ -184,8 +198,8 @@ The recipe runs until you `SIGTERM`/`SIGINT` it (Ctrl-C), at which point it tear
 
 A recipe is a `.mts` file that hands a `Recipe<H>` to `runRecipe` from `@rag-rat/cookbook`. The
 harness owns all the contract plumbing **and** the terminate-on-error wrapper and the
-request-timeout clamp, so a recipe is just: provision, report the box via `ctx.onBox`, verify, and
-return.
+provision-timeout clamp, so a recipe is just: provision, report the box via `ctx.onBox`, emit
+progress via `ctx.status`, verify, and return.
 
 ```ts
 import {
@@ -195,9 +209,11 @@ import {
 
 async function provision(ctx: ProvisionContext<MyBox>): Promise<Provisioned<MyBox>> {
   const { input, provisionTimeoutMs } = ctx;       // already clamped from provision_timeout_s
-  log("provisioning", input.model);
+  ctx.status("provisioning", "creating box");      // status events tag the recipe's provider
   const box = await myProvider.spawn(/* … */);
   ctx.onBox(box);                                  // report NOW → runRecipe tears down if we throw
+  log("info", `box ${box.id} created`);            // log(level, message) → a `log` event
+  ctx.status("verifying", "probing /api/embed");
   await verifyEmbed(box.url, { model: input.model, budgetMs: provisionTimeoutMs });
   return { handle: box, endpoint: box.url, auth_token: null };
 }
@@ -207,6 +223,7 @@ async function teardown(box: MyBox) {
 }
 
 const recipe: Recipe<MyBox> = {
+  provider: "modal",              // tags every status event (and the tearing_down one)
   defaultProvisionTimeoutS: 600,  // budget when input.provision_timeout_s is omitted/null
   provision,
   teardown,
@@ -220,12 +237,15 @@ What the harness guarantees so you don't have to:
 - reads + validates `RAG_RAT_COOKBOOK_INPUT`, resolves `provisionTimeoutMs` (clamp + default);
 - installs `SIGTERM`/`SIGINT` handlers;
 - runs **exactly one** teardown on every path — provision throws (after `onBox`), or the box serves
-  and a signal arrives later — via an idempotent latch. You no longer write `try { … } catch {
-  terminate; throw }` in the recipe;
-- prints the single handshake line on success, parks the process, exits `0` on signal.
+  and a signal arrives later — via an idempotent latch (a `tearing_down` status precedes it). You no
+  longer write `try { … } catch { terminate; throw }` in the recipe;
+- emits the `ready` event on success and an `error` event on failure; parks the process; exits `0`
+  on signal.
 
-Call `ctx.onBox(handle)` the instant the box exists (before it's verified serving) — that is what
-lets the harness clean up a half-provisioned box.
+Emit your own progress with **`ctx.status(phase, detail)`** (provider pre-bound) and diagnostics
+with **`log(level, message)`** — both go out as JSONL events. Never `console.log` (it corrupts the
+stdout stream). Call `ctx.onBox(handle)` the instant the box exists (before it's verified serving) —
+that is what lets the harness clean up a half-provisioned box.
 
 The contract module also exports the shared network helpers — call these instead of bare `fetch`:
 
@@ -248,7 +268,7 @@ cookbook/
   package.json                 @rag-rat/cookbook — bin → dist/cli.mjs; deps: modal; dev: typescript, tsx
   tsconfig.json                strict, ESM (NodeNext)
   cli.mts                      the bin dispatcher: `cookbook <provider>` → imports the recipe (→ dist/cli.mjs)
-  src/contract.ts              the published contract: types + runRecipe() + pollUntil/verifyEmbed/fetchWithTimeout (→ dist/src/contract.js)
+  src/contract.ts              the published contract: CookbookEvent + emit/log/status + runRecipe() + pollUntil/verifyEmbed/fetchWithTimeout (→ dist/src/contract.js)
   recipes/modal-ollama.mts     the Modal + Ollama recipe       (→ dist/recipes/modal-ollama.mjs)
   recipes/runpod-ollama.mts    the RunPod + Ollama recipe       (→ dist/recipes/runpod-ollama.mjs)
   README.md                    this file

@@ -96,7 +96,7 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
   const apiKey = rawKey.trim();
   const gpuTypeId = input.gpu ?? DEFAULT_GPU_TYPE_ID;
 
-  log(`provisioning runpod pod: model=${input.model} gpu=${gpuTypeId}`);
+  ctx.status("provisioning", `deploying RunPod pod (model=${input.model}, gpu=${gpuTypeId})`);
 
   // Deploy the pod. dockerArgs="serve" → `ollama serve`; OLLAMA_HOST binds all interfaces;
   // ports "11434/http" exposes the proxy. No persistent volume (ephemeral box).
@@ -129,19 +129,21 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
   // Report the pod NOW so runRecipe terminates it if anything below throws — critical, since
   // RunPod has no idle/lifetime backstop and a leaked pod bills indefinitely.
   ctx.onBox(handle);
-  log(`pod deployed: ${handle.podId}`);
+  log("info", `pod deployed: ${handle.podId}`);
 
   // RunPod proxies the HTTP container port at this stable host. Known immediately from the id.
   const endpoint = `https://${handle.podId}-${OLLAMA_PORT}.proxy.runpod.net`;
-  log(`proxy endpoint: ${endpoint}`);
+  log("info", `proxy endpoint: ${endpoint}`);
 
   // Pull the model CLIENT-SIDE over the proxy (no in-pod exec). Retries cover pod boot time.
+  ctx.status("pulling", `pulling model "${input.model}" over the proxy (covers pod boot)`);
   await pullModel(endpoint, input.model, provisionTimeoutMs);
-  log(`model "${input.model}" pulled`);
+  log("info", `model "${input.model}" pulled`);
 
-  // Confirm the server actually embeds before handing rag-rat the endpoint.
+  // Confirm the server actually embeds before we emit `ready`.
+  ctx.status("verifying", "probing /api/embed for a real vector");
   await verifyEmbed(endpoint, { model: input.model, budgetMs: provisionTimeoutMs });
-  log("embed verification passed; pod is serving");
+  log("info", "embed verification passed; pod is serving");
 
   // RunPod's HTTP proxy is open (no per-request token for proxied ports) → auth_token null.
   return { handle, endpoint, auth_token: null };
@@ -233,6 +235,7 @@ async function graphql<T>(
 }
 
 const recipe: Recipe<PodHandle> = {
+  provider: "runpod",
   defaultProvisionTimeoutS: DEFAULT_PROVISION_TIMEOUT_S,
   provision,
   teardown,

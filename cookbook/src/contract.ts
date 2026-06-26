@@ -3,17 +3,20 @@
  *
  * rag-rat spawns a recipe as a subprocess (`node recipe.mjs` or `npx tsx recipe.mts`),
  * passing its request as the JSON env var `RAG_RAT_COOKBOOK_INPUT`. The recipe provisions
- * an ephemeral remote box, prints exactly one handshake line to stdout once the box is up
- * and serving, then stays alive holding the box until it receives SIGTERM/SIGINT, at which
- * point it tears the box down and exits 0.
+ * an ephemeral remote box, streams TYPED JSONL EVENTS to stdout (status/log/ready/error),
+ * then stays alive holding the box until it receives SIGTERM/SIGINT, at which point it tears
+ * the box down and exits 0. The `ready` event means the box is serving; an `error` event means
+ * provisioning failed before it ever served.
  *
  * Invariants (the Rust side is built against these — do not change without changing rag-rat):
- *   - stdout carries EXACTLY ONE line: the handshake JSON object. Nothing else, ever.
- *   - all logs/diagnostics go to stderr (use `log()` / console.error), never stdout.
- *   - the handshake is printed only AFTER the box is up and verified serving.
- *   - after the handshake the process STAYS RUNNING until signaled.
- *   - on SIGTERM/SIGINT: teardown the box, then exit 0.
- *   - on provision failure: error to stderr, exit non-zero, BEFORE any handshake.
+ *   - stdout carries ONLY JSONL events — one `CookbookEvent` JSON object per line, nothing else.
+ *     A future ratatui `log` view (#329) renders this stream live, so non-JSON on stdout is a bug.
+ *   - all recipe diagnostics go out as `log` EVENTS (via `log()`), not to stderr. stderr is for
+ *     genuine crashes only (an uncaught throw, a native abort).
+ *   - the `ready` event is emitted only AFTER the box is up and verified serving.
+ *   - after `ready` the process STAYS RUNNING until signaled.
+ *   - on SIGTERM/SIGINT: emit a `tearing_down` status, teardown the box, then exit 0.
+ *   - on provision failure: emit an `error` event, exit non-zero, BEFORE any `ready`.
  *
  * SECURITY: a cookbook recipe runs with the spawning user's full privileges and credentials
  * (Modal/RunPod tokens in the env, the shell, the network). rag-rat invokes it via `npx`, which
@@ -24,6 +27,40 @@
 
 /** Env var rag-rat sets to the JSON-encoded {@link CookbookInput}. */
 export const COOKBOOK_INPUT_ENV = "RAG_RAT_COOKBOOK_INPUT";
+
+/** The providers a recipe can target. Tags every `status` event. */
+export type Provider = "modal" | "runpod";
+
+/** Provisioning lifecycle phases reported by a `status` event. */
+export type Phase = "provisioning" | "pulling" | "verifying" | "tearing_down";
+
+/** Severity for a `log` event. */
+export type LogLevel = "info" | "warn" | "error";
+
+/**
+ * One line of the stdout JSONL stream. Exactly one of these per line; the `type` discriminant tells
+ * rag-rat (and the #329 log view) which it is. Every event carries `ts` (epoch ms).
+ *
+ * THE WIRE SCHEMA — the Rust parser is built against these exact shapes; do not reorder/rename
+ * fields without changing rag-rat:
+ *   {"type":"status","phase":<Phase>,"provider":<Provider>,"detail":<string>,"ts":<ms>}
+ *   {"type":"log","level":<LogLevel>,"message":<string>,"ts":<ms>}
+ *   {"type":"ready","endpoint":<string>,"auth_token":<string|null>,"ts":<ms>}
+ *   {"type":"error","message":<string>,"ts":<ms>}
+ */
+export type CookbookEvent =
+  | { readonly type: "status"; readonly phase: Phase; readonly provider: Provider; readonly detail: string; readonly ts: number }
+  | { readonly type: "log"; readonly level: LogLevel; readonly message: string; readonly ts: number }
+  | { readonly type: "ready"; readonly endpoint: string; readonly auth_token: string | null; readonly ts: number }
+  | { readonly type: "error"; readonly message: string; readonly ts: number };
+
+/**
+ * Write one {@link CookbookEvent} as a JSONL line to stdout — the ONLY thing that writes to stdout.
+ * Stamps nothing itself; callers build the full event (each helper stamps `ts`).
+ */
+export function emit(event: CookbookEvent): void {
+  process.stdout.write(JSON.stringify(event) + "\n");
+}
 
 /**
  * The request rag-rat passes to a recipe via {@link COOKBOOK_INPUT_ENV}.
@@ -58,23 +95,13 @@ export interface CookbookInput {
 }
 
 /**
- * The single line a recipe prints to stdout once the box is up and serving.
+ * What a recipe's `provision` returns: an opaque `handle` (passed back to `teardown`), plus the
+ * serving endpoint. `runRecipe` turns this into the `ready` event. Keeping `handle` separate means
+ * teardown can carry provider state (the sandbox object) that never crosses the stdout boundary.
  *
- * `auth_token` is the bearer/connect token a caller must present to reach `endpoint`; it is
- * `null` (or omitted) when the tunnel is open (reachable with no token). rag-rat treats a
- * missing field and an explicit null identically.
- */
-export interface Handshake {
-  /** Base HTTPS endpoint of the running model server, e.g. "https://abc123.modal.host". */
-  readonly endpoint: string;
-  /** Bearer token required to reach `endpoint`, or null/omitted for an open tunnel. */
-  readonly auth_token?: string | null;
-}
-
-/**
- * What a recipe's `provision` returns: an opaque `handle` (passed back to `teardown`), plus
- * the handshake fields. Keeping `handle` separate from the handshake means teardown can carry
- * provider state (the sandbox object) that never crosses the stdout boundary.
+ * `auth_token` is the bearer token a caller must present to reach `endpoint`; `null` (or omitted)
+ * when the tunnel is open (reachable with no token). The `ready` event normalizes a missing token
+ * to an explicit `null`.
  *
  * @typeParam H - the recipe's opaque box handle (e.g. a Modal `Sandbox`).
  */
@@ -109,25 +136,41 @@ export interface ProvisionContext<H> {
    * after the provider returns the box id/handle.
    */
   readonly onBox: (handle: H) => void;
+  /**
+   * Emit a `status` event tagged with this recipe's provider. Call it at each lifecycle phase:
+   * `provisioning` when creating the box, `pulling` around the model pull, `verifying` around the
+   * embed probe. (`tearing_down` is emitted by `runRecipe`, not the recipe.)
+   */
+  readonly status: (phase: Phase, detail: string) => void;
 }
 
-/** Provisions the box for `ctx`. Throws to signal failure (no handshake is printed). */
+/** Provisions the box for `ctx`. Throws to signal failure (an `error` event is emitted). */
 export type ProvisionFn<H> = (ctx: ProvisionContext<H>) => Promise<Provisioned<H>>;
 
 /** Destroys the box identified by `handle`. Must be idempotent (may be called once). */
 export type TeardownFn<H> = (handle: H) => Promise<void>;
 
-/** A recipe = a provision step, its teardown step, and a default provisioning budget. */
+/** A recipe = its provider tag, a provision step, a teardown step, and a default provisioning budget. */
 export interface Recipe<H> {
+  /** Which provider this recipe targets — tags every `status` event it (and `runRecipe`) emits. */
+  readonly provider: Provider;
   /** Fallback provisioning budget (seconds) when the input omits `provision_timeout_s`. */
   readonly defaultProvisionTimeoutS: number;
   readonly provision: ProvisionFn<H>;
   readonly teardown: TeardownFn<H>;
 }
 
-/** Structured log to stderr. Never writes to stdout (which is reserved for the handshake). */
-export function log(...args: unknown[]): void {
-  console.error("[cookbook]", ...args);
+/**
+ * Emit a `log` event to stdout (the JSONL stream). This is how ALL recipe diagnostics travel — the
+ * #329 log view renders them. Never writes to stderr (reserved for genuine crashes).
+ */
+export function log(level: LogLevel, message: string): void {
+  emit({ type: "log", level, message, ts: Date.now() });
+}
+
+/** Emit a `status` event for `provider` at `phase`. Recipes use `ctx.status` (provider pre-bound). */
+export function status(provider: Provider, phase: Phase, detail: string): void {
+  emit({ type: "status", phase, provider, detail, ts: Date.now() });
 }
 
 /** Renders an unknown thrown value as a message string without assuming it's an `Error`. */
@@ -278,7 +321,7 @@ export async function pollUntil<T>(url: string, options: PollUntilOptions<T>): P
       // early; keep retrying until the budget runs out.
       lastError = errorMessage(cause);
     }
-    log(`${options.label} attempt ${attempt} not ready (${lastError}); retrying…`);
+    log("info", `${options.label} attempt ${attempt} not ready (${lastError}); retrying…`);
     await sleep(pollIntervalMs);
   }
   throw new Error(
@@ -343,26 +386,22 @@ export function verifyEmbed(endpoint: string, options: VerifyEmbedOptions): Prom
   });
 }
 
-/** Serializes the handshake to its canonical one-line wire form (omitting an undefined token). */
-export function encodeHandshake(h: Handshake): string {
-  const wire: Handshake =
-    h.auth_token === undefined
-      ? { endpoint: h.endpoint }
-      : { endpoint: h.endpoint, auth_token: h.auth_token };
-  return JSON.stringify(wire);
+/** Emit an `error` event (provisioning failed before `ready`). */
+function emitError(message: string): void {
+  emit({ type: "error", message, ts: Date.now() });
 }
 
 /**
- * Runs a recipe end-to-end against the rag-rat process contract.
+ * Runs a recipe end-to-end against the rag-rat process contract (typed JSONL event stream).
  *
  * Flow:
- *   1. read+parse+validate {@link COOKBOOK_INPUT_ENV}; resolve the request-timeout budget;
+ *   1. read+parse+validate {@link COOKBOOK_INPUT_ENV}; resolve the provisioning budget;
  *   2. install SIGTERM/SIGINT handlers (so a signal during provisioning still tears down);
- *   3. `provision(ctx)` — on throw: tear down any box it reported via `onBox`, log to stderr,
- *      exit 1, no handshake;
- *   4. print the handshake JSON as the single stdout line;
+ *   3. `provision(ctx)` — the recipe emits `status`/`log` events as it works; on throw: emit an
+ *      `error` event, tear down any box it reported via `onBox`, exit 1, no `ready`;
+ *   4. emit the `ready` event (box is serving);
  *   5. keep the process alive until a signal arrives;
- *   6. on signal: `teardown(handle)`, then exit 0.
+ *   6. on signal: emit a `tearing_down` status, `teardown(handle)`, then exit 0.
  *
  * The harness owns the terminate-on-error wrapper and the timeout clamp so recipes stay thin: a
  * recipe reports its box via `ctx.onBox(handle)` the instant it exists, and `runRecipe` guarantees
@@ -375,8 +414,8 @@ export async function runRecipe<H>(recipe: Recipe<H>): Promise<void> {
   try {
     input = readInput();
   } catch (cause) {
-    // Bad/absent input is a pre-handshake failure: clean stderr message, non-zero exit, no stdout.
-    log("invalid input:", errorMessage(cause));
+    // Bad/absent input is a pre-ready failure: emit an `error` event, exit 1, no `ready`.
+    emitError(`invalid input: ${errorMessage(cause)}`);
     process.exit(1);
   }
 
@@ -394,12 +433,12 @@ export async function runRecipe<H>(recipe: Recipe<H>): Promise<void> {
     if (tornDown) return;
     tornDown = true;
     if (box === null) {
-      log(`nothing to tear down (${reason}; no box was provisioned)`);
+      log("info", `nothing to tear down (${reason}; no box was provisioned)`);
       return;
     }
-    log(`tearing down (${reason})`);
+    status(recipe.provider, "tearing_down", reason);
     await recipe.teardown(box.value);
-    log("teardown complete");
+    log("info", "teardown complete");
   };
 
   const onSignal = (signal: NodeJS.Signals): void => {
@@ -408,7 +447,7 @@ export async function runRecipe<H>(recipe: Recipe<H>): Promise<void> {
         await tearDownOnce(`received ${signal}`);
         process.exit(0);
       } catch (cause) {
-        log("teardown FAILED:", errorMessage(cause));
+        log("error", `teardown FAILED: ${errorMessage(cause)}`);
         // Exit non-zero so rag-rat knows the box may be leaked. RunPod has no provider backstop;
         // reliable teardown is the only net, so a failed teardown is a money-leak signal.
         process.exit(1);
@@ -427,23 +466,29 @@ export async function runRecipe<H>(recipe: Recipe<H>): Promise<void> {
       onBox: (handle) => {
         box = { value: handle };
       },
+      status: (phase, detail) => {
+        status(recipe.provider, phase, detail);
+      },
     });
   } catch (cause) {
-    log("provisioning FAILED:", cause instanceof Error ? (cause.stack ?? cause.message) : String(cause));
+    emitError(`provisioning failed: ${errorMessage(cause)}`);
     // If a box was created before the failure, tear it down — recipes no longer do this themselves.
     await tearDownOnce("provisioning failed").catch((e) =>
-      log("terminate-on-error FAILED (box may be leaked):", errorMessage(e)),
+      log("error", `terminate-on-error FAILED (box may be leaked): ${errorMessage(e)}`),
     );
     process.exit(1);
   }
   // Happy path: ensure the handle is captured even if the recipe didn't call onBox.
   box = { value: result.handle };
 
-  // THE handshake line — the only thing ever written to stdout.
-  process.stdout.write(
-    encodeHandshake({ endpoint: result.endpoint, auth_token: result.auth_token ?? null }) + "\n",
-  );
-  log("handshake emitted; holding box until signaled");
+  // THE `ready` event — the box is serving. Normalizes a missing token to explicit null.
+  emit({
+    type: "ready",
+    endpoint: result.endpoint,
+    auth_token: result.auth_token ?? null,
+    ts: Date.now(),
+  });
+  log("info", "box serving; holding until signaled");
 
   // Park forever. Node keeps the loop alive on the signal listeners; this timer is belt-and-braces
   // (and gives liveness even if listeners are detached by exotic runtimes). The process exits via

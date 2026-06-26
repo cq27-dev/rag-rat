@@ -42,7 +42,7 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   const { input, provisionTimeoutMs } = ctx;
   const gpu = input.gpu ?? null;
 
-  log(`provisioning ollama box: model=${input.model} gpu=${gpu ?? "cpu"}`);
+  ctx.status("provisioning", `creating Modal sandbox (model=${input.model}, gpu=${gpu ?? "cpu"})`);
 
   // Creds resolve from env (MODAL_TOKEN_ID/MODAL_TOKEN_SECRET) or ~/.modal.toml.
   const modal = new ModalClient();
@@ -61,11 +61,11 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   });
   // Report the box NOW so runRecipe tears it down if anything below throws.
   ctx.onBox(sb);
-  log(`sandbox created: ${sb.sandboxId ?? "(id unavailable)"}`);
+  log("info", `sandbox created: ${sb.sandboxId ?? "(id unavailable)"}`);
 
   // Pull the model. The server (`serve`) is the box's main process; pull runs as an exec
   // against the same ollama install, populating the model store the server reads.
-  log(`pulling model "${input.model}" (this is the cold-start cost)…`);
+  ctx.status("pulling", `pulling model "${input.model}" (cold-start cost)`);
   const pull = await sb.exec(["ollama", "pull", input.model], {
     mode: "text",
     stdout: "pipe",
@@ -76,7 +76,7 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
     const err = await pull.stderr.readText();
     throw new Error(`"ollama pull ${input.model}" exited ${pullCode}: ${err.trim()}`);
   }
-  log(`model "${input.model}" pulled`);
+  log("info", `model "${input.model}" pulled`);
 
   // Resolve the public tunnel URL for the served port.
   const tunnels = await sb.tunnels();
@@ -85,12 +85,13 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
     throw new Error(`no tunnel for port ${OLLAMA_PORT}; got ports [${Object.keys(tunnels).join(", ")}]`);
   }
   const endpoint = tunnel.url;
-  log(`tunnel up: ${endpoint}`);
+  log("info", `tunnel up: ${endpoint}`);
 
-  // Verify the server actually embeds before we hand rag-rat the endpoint. This catches a
-  // box that booted but isn't serving (the whole point of waiting to handshake).
+  // Verify the server actually embeds before we emit `ready`. This catches a box that booted but
+  // isn't serving (the whole point of waiting before the ready event).
+  ctx.status("verifying", "probing /api/embed for a real vector");
   await verifyEmbed(endpoint, { model: input.model, budgetMs: provisionTimeoutMs });
-  log("embed verification passed; box is serving");
+  log("info", "embed verification passed; box is serving");
 
   // Open tunnel via encryptedPorts → no per-request token needed. auth_token stays null.
   return { handle: sb, endpoint, auth_token: null };
@@ -102,6 +103,7 @@ async function teardown(sb: Sandbox): Promise<void> {
 }
 
 const recipe: Recipe<Sandbox> = {
+  provider: "modal",
   defaultProvisionTimeoutS: DEFAULT_PROVISION_TIMEOUT_S,
   provision,
   teardown,

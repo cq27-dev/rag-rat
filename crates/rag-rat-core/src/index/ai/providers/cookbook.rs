@@ -4,11 +4,20 @@
 //! reconcile.
 //!
 //! THE PROCESS CONTRACT (rag-rat ⇄ cookbook — both sides build to this exact shape):
-//! - INPUT via env `RAG_RAT_COOKBOOK_INPUT` = JSON `{"model","request_timeout_s","gpu"}`.
-//! - The cookbook prints ONE stdout line — the handshake `{"endpoint","auth_token"}` — when the box
-//!   is serving, then stays alive. All other cookbook output goes to stderr.
+//! - INPUT via env `RAG_RAT_COOKBOOK_INPUT` = JSON
+//!   `{"model","request_timeout_s","provision_timeout_s","gpu"}`.
+//! - The cookbook's STDOUT is a TYPED JSONL event stream — one JSON object per line, each with a
+//!   `"type"` tag and a `"ts"` (epoch-ms) field (see [`CookbookEvent`]). The four `type`s are
+//!   `status` (a provisioning-phase update: `provisioning`/`pulling`/`verifying`/`tearing_down`),
+//!   `log` (a free-form `info`/`warn`/`error` message), `ready` (the box is SERVING: `{endpoint,
+//!   auth_token}` — this is the handshake), and `error` (provisioning failed before `ready`). A
+//!   line that does NOT parse as a typed event is forwarded raw to stderr (npx/npm install noise
+//!   that precedes the cookbook's own output). All `status`/`log`/`error` events route through the
+//!   ONE [`handle_event`] seam (the #329 status-bus hook); for now it renders a prefixed stderr
+//!   line.
 //! - On SIGTERM the cookbook tears the box down and exits 0.
-//! - If the cookbook exits BEFORE the handshake → provisioning failed (we capture its stderr).
+//! - If the cookbook exits BEFORE a `ready` event → provisioning failed (we surface the last
+//!   `error` event + the captured stderr tail).
 //!
 //! Teardown is GUARANTEED on unix by THREE mechanisms working together (a single one is not enough
 //! — an adversarial review found the naive `kill(child.id())` is FALSE on the `npx` path):
@@ -84,13 +93,58 @@ pub struct CookbookInput {
     pub gpu: Option<String>,
 }
 
-/// The one-line handshake the cookbook prints on stdout once its box is serving.
+/// One line of the cookbook's typed JSONL stdout stream. Tagged on `"type"`; the `"ts"` field and
+/// any unknown fields are tolerated/ignored (forward-compatible). A line that doesn't match any
+/// variant is NOT a `CookbookEvent` (serde returns `Err`) and is forwarded raw to stderr.
+///
+/// `phase`/`level` are kept as plain `String`s rather than enums so a future recipe can add a phase
+/// or level without breaking the parse — [`handle_event`] just renders them.
 #[derive(Debug, Clone, Deserialize)]
-struct Handshake {
-    endpoint: String,
-    /// A direct bearer token (NOT an env-var name) — the provisioned box's per-run credential, or
-    /// `null` for an unauthenticated box.
-    auth_token: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CookbookEvent {
+    /// A provisioning-phase update (e.g. `provisioning`/`pulling`/`verifying`/`tearing_down`).
+    Status {
+        phase: String,
+        #[serde(default)]
+        provider: String,
+        #[serde(default)]
+        detail: String,
+    },
+    /// A free-form log line at `info`/`warn`/`error`.
+    Log {
+        #[serde(default)]
+        level: String,
+        message: String,
+    },
+    /// The box is SERVING — the handshake. `auth_token` is a DIRECT bearer token (NOT an env-var
+    /// name), or `null` for an unauthenticated box.
+    Ready { endpoint: String, auth_token: Option<String> },
+    /// Provisioning failed before `ready`.
+    Error { message: String },
+}
+
+/// THE SEAM (#329): every non-`ready` cookbook event (`status`/`log`/`error`) is routed through
+/// this ONE function. For NOW it renders a clean, prefixed line to rag-rat's stderr (the crate's
+/// logging convention). When the ratatui `log` view (#329) lands, this is where the typed event is
+/// pushed onto the status bus INSTEAD of (or in addition to) the stderr render — keep all event
+/// presentation here so that change is a single edit. `ready` is NOT routed here (it's the
+/// handshake the caller consumes); `error`'s message is ALSO retained by the caller for the
+/// provision-failed context.
+fn handle_event(event: &CookbookEvent) {
+    match event {
+        CookbookEvent::Status { phase, provider, detail } => {
+            let provider = if provider.is_empty() { String::new() } else { format!("{provider} ") };
+            let detail = if detail.is_empty() { String::new() } else { format!(": {detail}") };
+            eprintln!("[cookbook] {provider}{phase}{detail}");
+        },
+        CookbookEvent::Log { level, message } => {
+            let level = if level.is_empty() { "info" } else { level.as_str() };
+            eprintln!("[cookbook] {level}: {message}");
+        },
+        CookbookEvent::Error { message } => eprintln!("[cookbook] error: {message}"),
+        // `Ready` is the handshake, consumed by the caller — never routed here.
+        CookbookEvent::Ready { .. } => {},
+    }
 }
 
 /// A live provisioned box: the parsed handshake + the running child. Holding this keeps the box
@@ -187,19 +241,32 @@ impl CookbookProvisioner {
             let _ = err_tx.send(captured.into_iter().collect());
         });
 
-        // Read stdout on a thread: the FIRST line that parses as a handshake is the signal; forward
-        // every other (length-capped) stdout line to our stderr (it's diagnostic, not the
-        // handshake). The handshake itself is parsed from the raw line before capping.
-        let (hs_tx, hs_rx) = mpsc::channel::<Handshake>();
+        // Read stdout on a thread: parse each line as a typed `CookbookEvent`.
+        //  - `Ready`  → the handshake signal `(endpoint, auth_token)` (sent ONCE).
+        //  - `Status`/`Log`/`Error` → routed through the ONE `handle_event` seam (#329 status bus);
+        //    `Error.message` is retained in `last_error` for the provision-failed context.
+        //  - a line that does NOT parse as an event → forwarded raw to stderr (npx/npm noise).
+        let (hs_tx, hs_rx) = mpsc::channel::<(String, Option<String>)>();
+        let last_error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let last_error_reader = std::sync::Arc::clone(&last_error);
         let stdout_handle = std::thread::spawn(move || {
             let mut sent = false;
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if !sent && let Ok(handshake) = serde_json::from_str::<Handshake>(line.trim()) {
-                    let _ = hs_tx.send(handshake);
-                    sent = true;
-                    continue;
+                match serde_json::from_str::<CookbookEvent>(line.trim()) {
+                    Ok(CookbookEvent::Ready { endpoint, auth_token }) =>
+                        if !sent {
+                            let _ = hs_tx.send((endpoint, auth_token));
+                            sent = true;
+                        },
+                    Ok(event) => {
+                        if let CookbookEvent::Error { message } = &event {
+                            *last_error_reader.lock().unwrap() = Some(message.clone());
+                        }
+                        handle_event(&event);
+                    },
+                    // Not a typed event (e.g. npx install noise) → forward raw (length-capped).
+                    Err(_) => eprintln!("cookbook: {}", cap_line(line)),
                 }
-                eprintln!("cookbook: {}", cap_line(line));
             }
         });
 
@@ -209,22 +276,34 @@ impl CookbookProvisioner {
         // On ANY provisioning-failure exit below, the group is reclaimed and `ACTIVE_PGID` cleared
         // (so a later signal can't killpg a recycled pid). `reap_group` does both.
         let deadline = Instant::now() + timeout;
-        let handshake = loop {
+        let (endpoint, auth_token) = loop {
             match hs_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(handshake) => break handshake,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // The stdout thread ended without a handshake → the child closed stdout
+                    // The stdout thread ended without a `ready` event → the child closed stdout
                     // (exited).
                     #[cfg(unix)]
                     reap_group(pgid);
-                    return Err(provision_failed(label, &mut child, stderr_handle, err_rx));
+                    return Err(provision_failed(
+                        label,
+                        &mut child,
+                        stderr_handle,
+                        err_rx,
+                        &last_error,
+                    ));
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Ok(Some(_status)) = child.try_wait() {
-                        // Child exited before the handshake.
+                        // Child exited before a `ready` event.
                         #[cfg(unix)]
                         reap_group(pgid);
-                        return Err(provision_failed(label, &mut child, stderr_handle, err_rx));
+                        return Err(provision_failed(
+                            label,
+                            &mut child,
+                            stderr_handle,
+                            err_rx,
+                            &last_error,
+                        ));
                     }
                     if Instant::now() >= deadline {
                         // Timed out: kill the WHOLE group (it never served) and report.
@@ -238,7 +317,7 @@ impl CookbookProvisioner {
                         let _ = stdout_handle.join();
                         let _ = stderr_handle.join();
                         anyhow::bail!(
-                            "cookbook `{label}` did not print a handshake within {}s — \
+                            "cookbook `{label}` did not emit a `ready` event within {}s — \
                              provisioning timed out",
                             timeout.as_secs()
                         );
@@ -247,13 +326,13 @@ impl CookbookProvisioner {
             }
         };
 
-        // The box is serving. The stdout thread keeps forwarding diagnostic lines until teardown;
+        // The box is serving. The stdout thread keeps routing `status`/`log` events until teardown;
         // detach it (the child closing stdout on SIGTERM ends it). The stderr thread likewise.
         drop(stdout_handle);
         drop(stderr_handle);
         Ok(ProvisionedBox {
-            endpoint: handshake.endpoint,
-            auth_token: handshake.auth_token,
+            endpoint,
+            auth_token,
             child,
             #[cfg(unix)]
             pgid,
@@ -344,13 +423,15 @@ fn cap_line(mut line: String) -> String {
     line
 }
 
-/// Build the "provisioning failed" error after the child exited before a handshake: reap it, join
-/// the stderr drain, and include the captured stderr (the recipe's own diagnostics) in the message.
+/// Build the "provisioning failed" error after the child exited before a `ready` event: reap it,
+/// join the stderr drain, and include the last `error` event message (the cookbook's own diagnosis)
+/// + the captured raw stderr tail in the message.
 fn provision_failed(
     cookbook: &str,
     child: &mut Child,
     stderr_handle: std::thread::JoinHandle<()>,
     err_rx: mpsc::Receiver<Vec<String>>,
+    last_error: &std::sync::Mutex<Option<String>>,
 ) -> anyhow::Error {
     let status = child.wait().ok();
     let _ = stderr_handle.join();
@@ -361,9 +442,16 @@ fn provision_failed(
         acc.push('\n');
         acc
     });
+    // The cookbook's OWN diagnosis (the last `error` event) is the most actionable line; lead with
+    // it, then the raw stderr tail for context.
+    let reported = last_error.lock().unwrap().clone();
     anyhow::anyhow!(
-        "cookbook `{cookbook}` exited (status {status:?}) before printing a handshake — \
-         provisioning failed.\ncookbook stderr:\n{}",
+        "cookbook `{cookbook}` exited (status {status:?}) before a `ready` event — provisioning \
+         failed.{}\ncookbook stderr:\n{}",
+        match reported {
+            Some(msg) => format!("\ncookbook error: {msg}"),
+            None => String::new(),
+        },
         if tail.is_empty() { "<none>".to_string() } else { tail }
     )
 }
@@ -586,7 +674,9 @@ mod tests {
     }
 
     #[test]
-    fn provision_errors_when_the_cookbook_exits_before_the_handshake() {
+    fn provision_errors_when_the_cookbook_exits_before_the_ready_event() {
+        // `stub_fail.sh` exits non-zero with only STDERR output (no typed `error` event) — the raw
+        // stderr tail must still be captured in the failure.
         let cmd = stub_command("stub_fail.sh", &[]);
         let err = CookbookProvisioner::provision_with_command(
             cmd,
@@ -594,11 +684,102 @@ mod tests {
             &input(),
             Duration::from_secs(10),
         )
-        .expect_err("a cookbook that exits before the handshake must error");
+        .expect_err("a cookbook that exits before `ready` must error");
         let msg = err.to_string();
-        assert!(msg.contains("before printing a handshake"), "{msg}");
+        assert!(msg.contains("before a `ready` event"), "{msg}");
         // The captured stderr (the recipe's own failure message) is included for diagnosis.
         assert!(msg.contains("could not reach the cloud provider"), "stderr captured: {msg}");
+    }
+
+    #[test]
+    fn provision_surfaces_the_last_error_event_message() {
+        // `stub_error_event.sh` emits a typed `error` event before exiting — its message is the
+        // cookbook's OWN diagnosis and must be surfaced (more actionable than the raw stderr tail).
+        let cmd = stub_command("stub_error_event.sh", &[]);
+        let err = CookbookProvisioner::provision_with_command(
+            cmd,
+            "stub_error_event.sh",
+            &input(),
+            Duration::from_secs(10),
+        )
+        .expect_err("an error event before `ready` must fail provisioning");
+        let msg = err.to_string();
+        assert!(msg.contains("cookbook error:"), "leads with the error event: {msg}");
+        assert!(msg.contains("no GPU capacity in region"), "surfaces the event message: {msg}");
+    }
+
+    #[test]
+    fn provision_routes_status_log_events_and_still_parses_ready() {
+        // `stub_events.sh` emits `status`/`log` events + a non-JSON noise line BEFORE `ready`. The
+        // events must NOT be mistaken for the handshake, the noise line must be tolerated, and the
+        // `ready` event must still yield the handshake (`endpoint`/`auth_token`).
+        let cmd = stub_command("stub_events.sh", &[("STUB_ENDPOINT", "http://127.0.0.1:9")]);
+        let provisioned = CookbookProvisioner::provision_with_command(
+            cmd,
+            "stub_events.sh",
+            &input(),
+            Duration::from_secs(10),
+        )
+        .expect("status/log events before ready must not break handshake parsing");
+        assert_eq!(provisioned.endpoint, "http://127.0.0.1:9");
+        assert_eq!(provisioned.auth_token, None);
+        drop(provisioned);
+    }
+
+    #[test]
+    fn handle_event_renders_each_variant() {
+        // The seam itself: exercise every non-ready variant (the #329 status bus will hook here).
+        // No panic; the render goes to stderr. Defaults (empty provider/level) are tolerated.
+        handle_event(&CookbookEvent::Status {
+            phase: "pulling".to_string(),
+            provider: "modal".to_string(),
+            detail: "all-minilm".to_string(),
+        });
+        handle_event(&CookbookEvent::Status {
+            phase: "verifying".to_string(),
+            provider: String::new(),
+            detail: String::new(),
+        });
+        handle_event(&CookbookEvent::Log {
+            level: "warn".to_string(),
+            message: "slow pull".to_string(),
+        });
+        handle_event(&CookbookEvent::Log {
+            level: String::new(),
+            message: "default level".to_string(),
+        });
+        handle_event(&CookbookEvent::Error { message: "boom".to_string() });
+    }
+
+    #[test]
+    fn cookbook_event_parses_the_typed_variants_tolerating_ts_and_unknown_fields() {
+        let parse = |s: &str| serde_json::from_str::<CookbookEvent>(s).unwrap();
+        assert!(matches!(
+            parse(r#"{"type":"ready","endpoint":"http://x","auth_token":null,"ts":1}"#),
+            CookbookEvent::Ready { auth_token: None, .. }
+        ));
+        assert!(matches!(
+            parse(r#"{"type":"ready","endpoint":"http://x","auth_token":"tok","ts":1}"#),
+            CookbookEvent::Ready { auth_token: Some(_), .. }
+        ));
+        // Unknown extra field is tolerated.
+        assert!(matches!(
+            parse(
+                r#"{"type":"status","phase":"pulling","provider":"modal","detail":"d","ts":2,"extra":true}"#
+            ),
+            CookbookEvent::Status { .. }
+        ));
+        assert!(matches!(
+            parse(r#"{"type":"log","level":"info","message":"hi"}"#),
+            CookbookEvent::Log { .. }
+        ));
+        assert!(matches!(
+            parse(r#"{"type":"error","message":"x","ts":3}"#),
+            CookbookEvent::Error { .. }
+        ));
+        // A line that is NOT a typed event must FAIL to parse (→ forwarded raw at runtime).
+        assert!(serde_json::from_str::<CookbookEvent>("npm warn deprecated foo").is_err());
+        assert!(serde_json::from_str::<CookbookEvent>(r#"{"endpoint":"http://x"}"#).is_err());
     }
 
     #[test]
