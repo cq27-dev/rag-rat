@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec_for_alias};
@@ -222,7 +222,13 @@ impl Default for EmbeddingRuntimeConfig {
 /// spec of the selected model (the `ollama-all-minilm` row, dim 384) and is validated against the
 /// server's first response at runtime by the embedder (#317 task 4); the backend is implied by the
 /// selected registry model. Duplicating either here would be redundant and drift-prone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` (#317 task 5) lets the install step persist this verbatim into the secret-free
+/// `active_embedding_remote_config` meta, so the `conn`-based `active_embedder` can reconstruct the
+/// remote embedder for both chunk-embed (reconcile) and query-embed (search) without threading
+/// config through the search path. SECRET-FREE: `auth_env` is the env-var NAME, never a token, so
+/// the serialized JSON holds no secret. `Deserialize` is the read side of that meta round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEmbeddingConfig {
     /// How the remote server is reached. `Connect` (the v1 default) talks to an
     /// already-running server at `endpoint`; `Ephemeral` (provision-on-demand) is not yet
@@ -258,7 +264,7 @@ impl Default for RemoteEmbeddingConfig {
 }
 
 /// How the remote-embedding server is obtained (`[local_ai.embedding.remote] mode = "..."`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RemoteMode {
     /// Connect to an already-running server at the configured `endpoint`. The v1 default and the
     /// only supported mode today.

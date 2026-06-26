@@ -1,6 +1,8 @@
 use super::*;
+use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::{
-    Backend, FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID, spec,
+    Backend, EmbeddingModelSpec, FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM,
+    FASTEMBED_MODEL_ID, spec,
 };
 
 pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
@@ -32,6 +34,81 @@ pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyh
         )?;
         anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
     }
+}
+
+/// Install (activate) an Ollama-backed embedding model (#317 task 6). Unlike fastembed/model2vec
+/// there is NO download: the "install" is a reachability + dim-parity PROBE. We construct the real
+/// [`OllamaEmbedder`] from the remote config and embed a single `"ping"` — that one call validates
+/// the endpoint is reachable, auth resolves, AND the server's vector width matches the registry
+/// spec's dim (the embedder's per-batch dim contract), reusing the exact connection the reconcile
+/// loop will use. A probe failure REFUSES the install loudly (the row is left not-installed); we do
+/// not write a half-ready model that would then fail every reconcile batch.
+///
+/// On success: write the `ai_models` row Ready, persist the remote config to the secret-free meta
+/// so `active_embedder` can reconstruct the embedder, and stamp the freshness version
+/// ([`remote_freshness_version`]) — which folds in the endpoint + model so switching either forces
+/// a clean re-embed instead of silently reusing vectors from a different server.
+pub(crate) fn install_ollama_model(
+    conn: &Connection,
+    model_id: &str,
+    remote: &RemoteEmbeddingConfig,
+) -> anyhow::Result<()> {
+    let spec =
+        spec(model_id).ok_or_else(|| anyhow::anyhow!("unknown ollama model `{model_id}`"))?;
+    // Probe: construct + one-shot embed. Reachability, auth, AND the dim contract are validated in
+    // this single call (the embedder checks every returned vector against `spec.dim`).
+    let embedder = OllamaEmbedder::from_remote_config(remote, spec.dim).map_err(|err| {
+        anyhow::anyhow!("failed to construct ollama embedder for `{model_id}`: {err}")
+    })?;
+    embedder.embed_batch(&["ping".to_string()]).map_err(|err| {
+        anyhow::anyhow!(
+            "ollama reachability/dim probe failed for `{model_id}` (endpoint `{}`, model `{}`): \
+             {err}",
+            remote.endpoint.as_deref().unwrap_or("<none>"),
+            remote.model
+        )
+    })?;
+    conn.execute(
+        "UPDATE ai_models
+         SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
+             embedding_dim = ?3, runtime = 'ollama', last_error = NULL
+         WHERE model_id = ?1",
+        params![model_id, now_ms(), i64::try_from(spec.dim).unwrap_or(i64::MAX)],
+    )?;
+    set_active_remote_config(conn, remote)?;
+    set_reconcile_meta(
+        conn,
+        ACTIVE_EMBEDDING_MODEL_VERSION_META,
+        &remote_freshness_version(spec, remote),
+    )?;
+    Ok(())
+}
+
+/// The reconcile freshness key for a remote (Ollama) model. Distinct from the static `spec.version`
+/// (which only identifies the registry model, never bare `"v1"`): it folds in the endpoint host +
+/// the Ollama API model name, so re-pointing the endpoint or switching the server-side model bumps
+/// the version → every chunk's `model_version` mismatches → a clean re-embed against the new
+/// server. Without this, vectors produced by endpoint A would be silently reused after switching to
+/// endpoint B (a different model behind the same registry id).
+pub(crate) fn remote_freshness_version(
+    spec: &EmbeddingModelSpec,
+    remote: &RemoteEmbeddingConfig,
+) -> String {
+    // Host (scheme+authority, path/query stripped) is enough to distinguish endpoints without
+    // baking the full URL — and never carries auth material. Empty endpoint (shouldn't happen in
+    // connect mode) folds in as the empty string, still distinct from a real host.
+    let endpoint = remote.endpoint.as_deref().unwrap_or("").trim();
+    let mut hasher = Sha256::new();
+    hasher.update(spec.version.as_bytes());
+    hasher.update([0]);
+    hasher.update(endpoint.as_bytes());
+    hasher.update([0]);
+    hasher.update(remote.model.trim().as_bytes());
+    let digest = hasher.finalize();
+    // 8 hex bytes (16 chars) of the digest is ample to separate endpoint/model combinations; keep
+    // the human-legible `spec.version` prefix so the persisted value still reads as this model.
+    let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{}-{short}", spec.version)
 }
 
 pub(crate) fn fastembed_operational_status(
@@ -168,4 +245,126 @@ pub(crate) fn model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelInfo> 
         installed_at_ms: row.get(7)?,
         last_error: row.get(8)?,
     })
+}
+
+#[cfg(test)]
+mod ollama_install_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    use super::*;
+    use crate::config::RemoteMode;
+    use crate::embedding_models::{OLLAMA_ALL_MINILM_EMBEDDING_DIM, OLLAMA_ALL_MINILM_MODEL_ID};
+
+    /// One-shot HTTP/1.1 stub on an ephemeral port that replies to the probe's single `/api/embed`
+    /// POST with `{"embeddings":[[<dim floats>]]}`. Returns the base URL + the server join handle.
+    fn spawn_embed_stub(dim: usize) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let nums = vec!["0.1"; dim].join(",");
+                let body = format!("{{\"embeddings\":[[{nums}]]}}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    fn schema_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+        ensure_model_manifest(&conn).unwrap();
+        conn
+    }
+
+    fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
+        RemoteEmbeddingConfig {
+            mode: RemoteMode::Connect,
+            model: "all-minilm".to_string(),
+            endpoint: Some(endpoint.to_string()),
+            auth_env: None,
+            batch_size: 256,
+            request_timeout_s: 5,
+        }
+    }
+
+    #[test]
+    fn install_ollama_model_writes_the_row_and_metas_on_a_successful_probe() {
+        let (url, handle) = spawn_embed_stub(OLLAMA_ALL_MINILM_EMBEDDING_DIM);
+        let conn = schema_conn();
+        let remote = remote_at(&url);
+
+        install_ollama_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID, &remote).expect("probe succeeds");
+        handle.join().unwrap();
+
+        // ai_models row is Ready with the ollama runtime + the registry dim.
+        let model = model(&conn, OLLAMA_ALL_MINILM_MODEL_ID).unwrap();
+        assert!(model.installed);
+        assert_eq!(model.status, "Ready");
+        assert_eq!(model.runtime, "ollama");
+        assert_eq!(model.embedding_dim, Some(OLLAMA_ALL_MINILM_EMBEDDING_DIM as i64));
+        assert_eq!(model.last_error, None);
+
+        // The remote config is persisted so active_embedder can reconstruct the embedder.
+        assert_eq!(active_remote_config(&conn).unwrap(), Some(remote.clone()));
+
+        // The freshness version is the endpoint-folded one, NOT the static spec version.
+        let spec = spec(OLLAMA_ALL_MINILM_MODEL_ID).unwrap();
+        let persisted =
+            reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap().unwrap();
+        assert_eq!(persisted, remote_freshness_version(spec, &remote));
+        assert_ne!(persisted, spec.version, "must not persist the bare static version");
+    }
+
+    #[test]
+    fn install_ollama_model_refuses_on_a_dim_mismatch() {
+        // The server returns a 512-dim vector; the registry spec is 384 — the probe's per-batch dim
+        // contract rejects it, so the install must refuse and leave the model not-installed.
+        let (url, handle) = spawn_embed_stub(512);
+        let conn = schema_conn();
+
+        let err = install_ollama_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID, &remote_at(&url))
+            .expect_err("dim mismatch must refuse the install");
+        handle.join().unwrap();
+        assert!(err.to_string().contains("384") || err.to_string().contains("512"), "{err}");
+
+        // The row was NOT flipped to Ready, and no remote config was persisted.
+        let model = model(&conn, OLLAMA_ALL_MINILM_MODEL_ID).unwrap();
+        assert!(!model.installed, "a failed probe must not mark the model installed");
+        assert_eq!(active_remote_config(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn remote_freshness_version_differs_by_endpoint_and_is_not_the_bare_version() {
+        let spec = spec(OLLAMA_ALL_MINILM_MODEL_ID).unwrap();
+        let a = remote_freshness_version(spec, &remote_at("http://a.example:11434"));
+        let b = remote_freshness_version(spec, &remote_at("http://b.example:11434"));
+        assert_ne!(a, b, "switching endpoint must bump the freshness version");
+        assert_ne!(a, spec.version, "freshness version must not be the bare static version");
+        assert!(a.starts_with(spec.version), "keeps the legible model prefix: {a}");
+    }
+
+    #[test]
+    fn remote_freshness_version_differs_by_model() {
+        let spec = spec(OLLAMA_ALL_MINILM_MODEL_ID).unwrap();
+        let mut a = remote_at("http://localhost:11434");
+        let mut b = a.clone();
+        a.model = "all-minilm".to_string();
+        b.model = "nomic-embed-text".to_string();
+        assert_ne!(
+            remote_freshness_version(spec, &a),
+            remote_freshness_version(spec, &b),
+            "switching the server-side model must bump the freshness version",
+        );
+    }
 }

@@ -26,8 +26,11 @@ pub use self::model2vec::Model2VecEmbedder;
 // visibility (same pattern as the other backends) exempts it from dead-code/unused-import
 // analysis under `-D warnings` until the dispatch arm lands.
 pub use self::ollama::OllamaEmbedder;
+use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
-use crate::index::ai::{active_embedding_model_id, model, validate_ready_model};
+use crate::index::ai::{
+    active_embedding_model_id, active_remote_config, model, validate_ready_model,
+};
 
 pub const MODEL2VEC_MISSING_FEATURE_MESSAGE: &str =
     "Model2Vec backend requested, but this binary was built without Model2Vec support.\nRebuild \
@@ -51,7 +54,16 @@ pub(crate) fn active_embedder(
     validate_ready_model(&model)?;
     let spec = spec(&model.model_id)
         .ok_or_else(|| anyhow::anyhow!("unknown active embedding model `{}`", model.model_id))?;
-    embedder_for_spec(spec, intra_threads)
+    // The remote config is read from the DB meta (persisted at install) ONLY for an Ollama-backed
+    // active model — every other backend ignores it. This is the single construction site, so both
+    // callers (reconcile's chunk-embed and `embed_query`'s query-embed) transparently get an
+    // `OllamaEmbedder` pointed at the same endpoint + model: connect mode has no chunk/query split
+    // (the mirror is deferred to ephemeral, #318).
+    let remote = match spec.backend {
+        Backend::Ollama => active_remote_config(conn)?,
+        _ => None,
+    };
+    embedder_for_spec(spec, intra_threads, remote.as_ref())
 }
 
 /// Build the embedder for a registry spec, dispatching on its `backend`. The single construction
@@ -62,6 +74,7 @@ pub(crate) fn active_embedder(
 pub(crate) fn embedder_for_spec(
     spec: &'static EmbeddingModelSpec,
     intra_threads: Option<usize>,
+    remote: Option<&RemoteEmbeddingConfig>,
 ) -> anyhow::Result<Box<dyn Embedder>> {
     match spec.backend {
         Backend::Hash => Ok(Box::new(HashEmbedder)),
@@ -92,10 +105,21 @@ pub(crate) fn embedder_for_spec(
                 anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
             }
         },
-        // The Ollama HTTP backend is wired in #317 task 5 (dispatch + role split). The registry
-        // row + enum variant exist as of task 2 so the table is complete; constructing one bails
-        // until then.
-        Backend::Ollama => anyhow::bail!("ollama embedding backend not yet wired (#317 task 5)"),
+        // The Ollama HTTP backend (#317 task 5). `registry_dim` is `spec.dim` — the dim parity
+        // contract the embedder checks every batch against. The remote connection params come from
+        // the persisted meta (read in `active_embedder`), not from config threading; absence means
+        // an Ollama model was activated without its config being written — a corrupted/half-done
+        // install — so bail with the recovery hint rather than constructing a half-formed embedder.
+        Backend::Ollama => {
+            let _ = intra_threads;
+            let remote = remote.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ollama backend active but no remote config persisted — run `rag-rat \
+                     reconcile`/install to re-activate the model"
+                )
+            })?;
+            Ok(Box::new(OllamaEmbedder::from_remote_config(remote, spec.dim)?))
+        },
     }
 }
 
@@ -124,5 +148,80 @@ impl Embedder for MockEmbedder {
 
     fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|text| crate::index::ai::hash_embed_text(text, self.dim)).collect())
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use crate::config::RemoteMode;
+    use crate::embedding_models::{OLLAMA_ALL_MINILM_EMBEDDING_DIM, OLLAMA_ALL_MINILM_MODEL_ID};
+    use crate::index::ai::set_active_remote_config;
+
+    /// An in-memory index with the schema applied + the manifest seeded, with `model_id` forced
+    /// Ready and made the active embedding model. Mirrors how a real install leaves the DB, so
+    /// `active_embedder` resolves the active spec exactly as in production.
+    fn conn_with_active_model(model_id: &str) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+        crate::index::ai::ensure_model_manifest(&conn).unwrap();
+        let spec = spec(model_id).unwrap();
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2
+             WHERE model_id = ?1",
+            rusqlite::params![model_id, i64::try_from(spec.dim).unwrap()],
+        )
+        .unwrap();
+        crate::index::ai::set_meta(&conn, "active_embedding_model", model_id).unwrap();
+        conn
+    }
+
+    fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
+        RemoteEmbeddingConfig {
+            mode: RemoteMode::Connect,
+            model: "all-minilm".to_string(),
+            endpoint: Some(endpoint.to_string()),
+            auth_env: None,
+            batch_size: 256,
+            request_timeout_s: 5,
+        }
+    }
+
+    #[test]
+    fn active_embedder_yields_an_ollama_embedder_when_remote_config_is_persisted() {
+        // Construction does not connect (from_remote_config only parses the endpoint), so a closed
+        // port is fine — we assert the resolved embedder's identity + dim, the construction path.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let conn = conn_with_active_model(OLLAMA_ALL_MINILM_MODEL_ID);
+        set_active_remote_config(&conn, &remote_at(&format!("http://127.0.0.1:{port}"))).unwrap();
+
+        let embedder = active_embedder(&conn, None).expect("ollama embedder constructs");
+        assert_eq!(embedder.model_id(), OLLAMA_ALL_MINILM_MODEL_ID);
+        assert_eq!(embedder.dim(), OLLAMA_ALL_MINILM_EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn active_embedder_bails_with_a_clear_message_when_remote_config_is_missing() {
+        // Ollama active but NO remote-config meta → the dispatch must refuse with the recovery
+        // hint, not panic or silently construct a half-formed embedder.
+        let conn = conn_with_active_model(OLLAMA_ALL_MINILM_MODEL_ID);
+        // `Box<dyn Embedder>` is not `Debug`, so `expect_err` won't compile — match the result.
+        let msg = match active_embedder(&conn, None) {
+            Ok(_) => panic!("must bail without persisted remote cfg"),
+            Err(err) => err.to_string(),
+        };
+        assert!(msg.contains("no remote config persisted"), "clear message: {msg}");
+    }
+
+    #[test]
+    fn embedder_for_spec_ignores_remote_for_the_hash_backend() {
+        // A non-ollama backend ignores `remote` entirely — passing Some or None is identical.
+        let spec = spec(crate::embedding_models::HASH_MODEL_ID).unwrap();
+        let with_none = embedder_for_spec(spec, None, None).unwrap();
+        assert_eq!(with_none.model_id(), crate::embedding_models::HASH_MODEL_ID);
     }
 }

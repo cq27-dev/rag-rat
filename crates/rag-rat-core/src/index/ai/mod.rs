@@ -45,6 +45,11 @@ use crate::language::Language;
 
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
 const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";
+/// Secret-free JSON of the active [`RemoteEmbeddingConfig`] (#317 task 5). Written at install when
+/// an Ollama model is activated; read by `active_embedder` to reconstruct the remote embedder for
+/// BOTH chunk-embed (reconcile) and query-embed (search), so the `conn`-based construction path
+/// needs no config threading. SECRET-FREE: `auth_env` is the env-var NAME, never the token.
+const ACTIVE_EMBEDDING_REMOTE_CONFIG_META: &str = "active_embedding_remote_config";
 const LAST_EMBEDDING_RECONCILE_STARTED_META: &str = "last_embedding_reconcile_started_at_ms";
 const LAST_EMBEDDING_RECONCILE_FINISHED_META: &str = "last_embedding_reconcile_finished_at_ms";
 const DEFAULT_BATCH_SIZE: usize = 64;

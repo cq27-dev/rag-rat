@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::{HASH_MODEL_ID, spec};
 
 pub(crate) fn embed_query(
@@ -373,6 +374,41 @@ pub(crate) fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String
         .optional()?)
 }
 
+/// Persist the active remote-embedding connection params as secret-free JSON in the
+/// [`ACTIVE_EMBEDDING_REMOTE_CONFIG_META`] meta (#317 task 5). Written at install when an Ollama
+/// model is activated; the `conn`-based `active_embedder` reads it back via
+/// [`active_remote_config`] so reconcile (chunk-embed) and search (query-embed) reconstruct the
+/// SAME remote embedder without threading config through the search path. SECRET-FREE:
+/// `RemoteEmbeddingConfig::auth_env` is the env-var NAME, never the token, so the stored JSON
+/// contains no secret.
+pub(crate) fn set_active_remote_config(
+    conn: &Connection,
+    remote: &RemoteEmbeddingConfig,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_string(remote)
+        .map_err(|e| anyhow::anyhow!("failed to serialize remote embedding config: {e}"))?;
+    set_meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, &json)
+}
+
+/// Read the persisted active remote-embedding config (the inverse of [`set_active_remote_config`]).
+/// `None` when no remote config has been written (the common local-embedder case). A present-but-
+/// malformed value is a hard error — a corrupted meta must surface loudly, not silently fall back
+/// to "no remote config" and then bail with the wrong message in the dispatch.
+pub(crate) fn active_remote_config(
+    conn: &Connection,
+) -> anyhow::Result<Option<RemoteEmbeddingConfig>> {
+    let Some(json) = meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META)? else {
+        return Ok(None);
+    };
+    let remote = serde_json::from_str(&json).map_err(|e| {
+        anyhow::anyhow!(
+            "stored remote embedding config (`{ACTIVE_EMBEDDING_REMOTE_CONFIG_META}`) is \
+             malformed: {e}"
+        )
+    })?;
+    Ok(Some(remote))
+}
+
 pub(crate) fn set_reconcile_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
     conn.execute(
         "INSERT INTO reconcile_meta(key, value) VALUES (?1, ?2)
@@ -419,6 +455,7 @@ pub(crate) fn find_existing_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RemoteMode;
 
     fn unit(v: &[f32]) -> Vec<f32> {
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -426,6 +463,57 @@ mod tests {
     }
     fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    fn schema_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+        conn
+    }
+
+    fn sample_remote() -> RemoteEmbeddingConfig {
+        RemoteEmbeddingConfig {
+            mode: RemoteMode::Connect,
+            model: "all-minilm".to_string(),
+            endpoint: Some("http://localhost:11434".to_string()),
+            // The NAME of an env var — never a token. The round-trip test asserts this name is
+            // present and no token is.
+            auth_env: Some("OLLAMA_TOKEN".to_string()),
+            batch_size: 256,
+            request_timeout_s: 60,
+        }
+    }
+
+    #[test]
+    fn active_remote_config_is_none_when_unset() {
+        let conn = schema_conn();
+        assert_eq!(active_remote_config(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn remote_config_meta_round_trips_without_storing_a_token() {
+        let conn = schema_conn();
+        let remote = sample_remote();
+        set_active_remote_config(&conn, &remote).unwrap();
+
+        // Read-back equals what we wrote.
+        assert_eq!(active_remote_config(&conn).unwrap(), Some(remote));
+
+        // SECRET-FREE: the serialized JSON carries the auth_env NAME but no token value.
+        let json = meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META).unwrap().unwrap();
+        assert!(json.contains("OLLAMA_TOKEN"), "stores the env-var name: {json}");
+        // Belt-and-suspenders: no bearer/token-shaped material leaks into the meta.
+        assert!(!json.to_lowercase().contains("bearer"), "no bearer token in meta: {json}");
+        assert!(!json.to_lowercase().contains("secret"), "no secret material in meta: {json}");
+    }
+
+    #[test]
+    fn active_remote_config_errors_on_malformed_meta() {
+        // A corrupted meta must surface loudly, not silently degrade to "no remote config".
+        let conn = schema_conn();
+        set_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
+        let err = active_remote_config(&conn).expect_err("malformed meta must error");
+        assert!(err.to_string().contains("malformed"), "{err}");
     }
 
     #[test]

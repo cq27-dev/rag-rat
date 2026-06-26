@@ -252,12 +252,14 @@ pub(crate) fn setup_model_and_reconcile(
         return Ok(());
     }
     eprintln!("init: installing model {model_id}");
-    match db.install_model(model_id) {
+    let remote = config.local_ai.embedding.remote.as_ref();
+    match db.install_model(model_id, remote) {
         Ok(model) => eprintln!("init: model status {} {}", model.model_id, model.status),
         Err(err) if model_id == FASTEMBED_MODEL_ID || model_id == MODEL2VEC_MODEL_ID => {
             eprintln!("init: {} install failed: {err}", backend.as_str());
             eprintln!("init: falling back to {HASH_MODEL_ID}");
-            db.install_model(HASH_MODEL_ID)?;
+            // Hash is a local backend — no remote config needed for the fallback.
+            db.install_model(HASH_MODEL_ID, None)?;
         },
         Err(err) => return Err(err),
     }

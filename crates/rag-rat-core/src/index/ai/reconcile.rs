@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::RemoteEmbeddingConfig;
 #[cfg(feature = "fastembed")]
 use crate::embedding_models::FASTEMBED_EMBEDDING_DIM;
 use crate::embedding_models::{Backend, EMBEDDING_MODELS, FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
@@ -174,7 +175,11 @@ pub(crate) fn fastembed_cache_ready(cache_dir: &Path) -> bool {
     !revision.is_empty() && repo.join("snapshots").join(revision).is_dir()
 }
 
-pub(crate) fn install_model(conn: &Connection, model_id: &str) -> anyhow::Result<ModelInfo> {
+pub(crate) fn install_model(
+    conn: &Connection,
+    model_id: &str,
+    remote: Option<&RemoteEmbeddingConfig>,
+) -> anyhow::Result<ModelInfo> {
     ensure_model_manifest(conn)?;
     let spec =
         spec(model_id).ok_or_else(|| anyhow::anyhow!("unknown local AI model `{model_id}`"))?;
@@ -190,8 +195,19 @@ pub(crate) fn install_model(conn: &Connection, model_id: &str) -> anyhow::Result
         },
         Backend::FastEmbed => install_fastembed_model(conn, model_id)?,
         Backend::Model2Vec => install_model2vec_model(conn, model_id)?,
-        // Ollama install (a reachability + dim probe, no download) is #317 task 6; bail until then.
-        Backend::Ollama => anyhow::bail!("ollama embedding backend not yet wired (#317 task 6)"),
+        // Ollama install is a reachability + dim probe (no download), #317 task 6. It REQUIRES the
+        // remote config — `model = "ollama"` without a `[remote]` block can't reach a server. The
+        // config layer already rejects that incoherence (`RemoteEmbeddingMissingConfig`), so a
+        // `None` here means a caller forgot to thread `config.local_ai.embedding.remote`.
+        Backend::Ollama => {
+            let remote = remote.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "installing the ollama model requires a [local_ai.embedding.remote] config \
+                     (endpoint + model)"
+                )
+            })?;
+            install_ollama_model(conn, model_id, remote)?;
+        },
     }
     set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
     model(conn, model_id)

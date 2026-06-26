@@ -475,7 +475,8 @@ pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     match &args.command {
         None | Some(ModelsCommand::List) => print_output(&db.list_models()?),
-        Some(ModelsCommand::Install { model_id }) => print_output(&db.install_model(model_id)?),
+        Some(ModelsCommand::Install { model_id }) =>
+            print_output(&db.install_model(model_id, config.local_ai.embedding.remote.as_ref())?),
     }
 }
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {

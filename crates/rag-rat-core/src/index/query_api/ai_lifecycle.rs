@@ -13,8 +13,16 @@ impl IndexDatabase {
         ai::models(self.storage.connection())
     }
 
-    pub fn install_model(&self, model_id: &str) -> anyhow::Result<ModelInfo> {
-        ai::install_model(self.storage.connection(), model_id)
+    /// Install/activate an embedding model. `remote` carries the `[local_ai.embedding.remote]`
+    /// connection params and is REQUIRED for the Ollama backend (the install is a reachability +
+    /// dim probe against that endpoint); every other backend ignores it. Callers pass
+    /// `config.local_ai.embedding.remote.as_ref()` — `None` for the local backends.
+    pub fn install_model(
+        &self,
+        model_id: &str,
+        remote: Option<&crate::config::RemoteEmbeddingConfig>,
+    ) -> anyhow::Result<ModelInfo> {
+        ai::install_model(self.storage.connection(), model_id, remote)
     }
 
     pub fn reconcile(

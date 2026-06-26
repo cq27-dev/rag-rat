@@ -466,7 +466,7 @@ fn full_rebuild_preserves_github_papertrail_cache() {
 fn full_rebuild_preserves_installed_model_manifest() {
     let (root, config) = markdown_config("alpha token with enough detail for embeddings\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
     let before = db.local_ai_status().unwrap();
     assert_eq!(before.embedding.model_id, HASH_MODEL_ID);
     assert!(before.embedding.installed);
@@ -811,7 +811,7 @@ fn fastembed_missing_feature_reports_rebuild_command() {
     let (root, config) = markdown_config("alpha token\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let err = db.install_model(FASTEMBED_MODEL_ID).unwrap_err();
+    let err = db.install_model(FASTEMBED_MODEL_ID, None).unwrap_err();
     assert!(err.to_string().contains(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
 
     let status = db.local_ai_status().unwrap();
@@ -853,7 +853,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     assert_eq!(status.embedding.state, "MissingModel");
     assert_eq!(status.embedding.blocked_artifacts, 0);
 
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
     let plan = db.reconcile_plan().unwrap();
     assert_eq!(plan.embeddings.missing, 1);
     assert_eq!(plan.embeddings.current, 0);
@@ -975,7 +975,7 @@ fn reconcile_without_limit_processes_all_chunks() {
          eligibility and useful semantic context\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
 
     let report = db.reconcile(None, Some(2)).unwrap();
 
@@ -1001,7 +1001,7 @@ fn force_reconcile_processes_each_chunk_once_and_terminates() {
          eligibility and useful semantic context\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
 
     // Two eligible chunks; force with a limit far above the chunk count.
     let report = db.reconcile_with_progress(Some(50), Some(2), true, |_| {}).unwrap();
@@ -1020,7 +1020,7 @@ fn force_reconcile_progress_is_honest_and_terminates_without_limit() {
          eligibility and useful semantic context\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
 
     // No --limit. max_seconds is only a safety net: if the force loop regressed to
     // re-embedding forever it would trip max_seconds and report "Partial" rather than
@@ -1067,7 +1067,7 @@ fn status_counts_only_active_context_chunks() {
          eligibility and useful semantic context\n",
     );
     let mut db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
 
     let active = db.local_ai_status().unwrap().artifacts.total_chunks;
     assert!(active > 0, "expected active chunks, got {active}");
@@ -1166,7 +1166,7 @@ fn gc_prunes_dead_context_rows_and_keeps_live_ones() {
          eligibility and useful semantic context\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
     db.reconcile(None, Some(8)).unwrap();
 
     let live_files = table_row_count(db.storage.connection(), "files").unwrap();
@@ -1246,7 +1246,7 @@ int main(void)
     .unwrap();
     let config = source_config(root.clone(), Language::C);
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
 
     let plan = db.reconcile_plan().unwrap();
 
@@ -1263,7 +1263,7 @@ int main(void)
 fn reconcile_policy_skips_tiny_chunks_before_embedding() {
     let (root, config) = markdown_config("tiny\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
 
     let plan = db.reconcile_plan().unwrap();
     assert_eq!(plan.embeddings.missing, 0);
@@ -1337,7 +1337,7 @@ fn search_explain_reports_weighted_score_components() {
          semantic vector scoring\nthird line\n",
     );
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
     db.reconcile(None, Some(8)).unwrap();
 
     let hits = db.search_explain("runtime shutdown", 10, false).unwrap();
@@ -8218,7 +8218,7 @@ fn refresh_worktree_overlays_reconciles_overlay_scope_embeddings() {
     run_git(&main, &["commit", "-q", "-m", "base"]);
     let config = source_config(main.clone(), Language::Rust);
     let mut db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
     db.reconcile(None, Some(8)).unwrap();
 
     let linked = unique_temp_root();
@@ -8759,7 +8759,7 @@ fn worktree_overlay_pending_embeddings_are_detectable_for_retry() {
     run_git(&main, &["commit", "-q", "-m", "base"]);
     let config = source_config(main.clone(), Language::Rust);
     let mut db = IndexDatabase::rebuild(&config).unwrap();
-    db.install_model(HASH_MODEL_ID).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
     // The base has at least one embeddable chunk before reconcile (so the test isn't vacuous)...
     set_base_scope(&mut db, &main);
     assert!(db.pending_embedding_jobs().unwrap() > 0, "base has an embeddable chunk to begin with");
