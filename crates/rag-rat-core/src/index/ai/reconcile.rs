@@ -78,10 +78,19 @@ pub(crate) fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
     for model_id in LEGACY_MODEL_IDS {
         conn.execute("DELETE FROM chunk_embeddings WHERE model_id = ?1", params![model_id])?;
         conn.execute("DELETE FROM ai_models WHERE model_id = ?1", params![model_id])?;
-        conn.execute("DELETE FROM index_meta WHERE key = ?1 AND value = ?2", params![
-            ACTIVE_EMBEDDING_MODEL_META,
-            model_id
-        ])?;
+        // If this legacy id was the ACTIVE model, its active-model meta AND any persisted
+        // remote-config meta (a legacy `ollama-*` id was a remote install — #317) must both go.
+        // Leaving the remote config behind would let `active_embedder` keep reconstructing an
+        // `OllamaEmbedder` against a now-removed endpoint after the active model fell back to hash,
+        // so clear it whenever we delete the matching active-model meta.
+        let was_active =
+            conn.execute("DELETE FROM index_meta WHERE key = ?1 AND value = ?2", params![
+                ACTIVE_EMBEDDING_MODEL_META,
+                model_id
+            ])?;
+        if was_active > 0 {
+            clear_active_remote_config(conn)?;
+        }
     }
     Ok(())
 }
@@ -485,7 +494,71 @@ pub(crate) fn reconcile_with_options_progress(
     // PROVISIONS a cookbook box (held by `_provisioned` for the whole loop — its `Drop` tears the
     // box down on success/error/panic). Otherwise it's `active_embedder` (connect/local). The
     // `acquire_chunk_embedder` result distinguishes ready / skip-ephemeral / not-ready.
+    //
+    // Acquire FIRST, then decide whether to do any work — `embedding_policy_skip_summary` streams +
+    // decompresses EVERY chunk (O(repo)). The skip/not-ready paths embed nothing, so they must NOT
+    // pay that scan: a watcher pass with an ephemeral active model + `provision_remote=false` fires
+    // on every file change, and running a full-repo scan per pass just to return "Blocked" is pure
+    // waste. Only the Ready path (which actually walks the candidates) runs the policy summary.
     let acquired = acquire_chunk_embedder(conn, options.intra_threads, options.provision_remote);
+
+    // SkipEphemeral is the ONLY path that returns BEFORE the policy scan. It's the watcher/
+    // maintenance pass with an ephemeral active model + `provision_remote=false`: it fires on every
+    // file change and embeds nothing, so paying the O(repo) `embedding_policy_skip_summary` (every
+    // chunk streamed + decompressed) just to return "Blocked" is pure per-edit waste. Its report
+    // carries an empty `skipped_by_policy` — that path reports no policy counts. (The NotReady path
+    // below DOES report policy skips — `blocked_fastembed_reconcile_still_reports_policy_skips`
+    // pins that — so it runs the scan like the Ready path.)
+    let acquired = match acquired {
+        ChunkEmbedder::SkipEphemeral => {
+            let report = ReconcileReport {
+                processed_chunks: 0,
+                embeddings_written: 0,
+                skipped_chunks: 0,
+                failed_chunks: 0,
+                blocked_chunks: 0,
+                model_id: active_model_id.clone(),
+                model_version: model_version.clone(),
+                embedding_dim,
+                batch_size,
+                max_embedding_chars,
+                forced: options.force,
+                changed_first: options.changed_first,
+                until_clean: options.until_clean,
+                max_seconds: options.max_seconds,
+                work_reasons: BTreeMap::new(),
+                skipped_by_policy: BTreeMap::new(),
+                input_chars: 0,
+                truncated_inputs: 0,
+                elapsed_ms: 0,
+                chunks_per_sec: 0.0,
+                chars_per_sec: 0.0,
+                avg_chars_per_chunk: 0.0,
+                status: "Blocked".to_string(),
+                message: Some(
+                    "ephemeral remote embedding needs an explicit `rag-rat reconcile` (the \
+                     watcher does not provision a GPU box for incremental edits)"
+                        .to_string(),
+                ),
+            };
+            finish_reconcile_attempt(conn, attempt_id, &report)?;
+            progress(ReconcileProgress::Started {
+                model_id: active_model_id,
+                total_chunks: 0,
+                batch_size,
+            });
+            progress(ReconcileProgress::Finished {
+                processed_chunks: 0,
+                embeddings_written: 0,
+                blocked_chunks: 0,
+            });
+            return Ok(report);
+        },
+        other => other,
+    };
+
+    // Ready / NotReady: BOTH report the per-policy skip counts, so run the O(repo) policy summary
+    // now. (SkipEphemeral already returned above without paying it.)
     let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let skipped_chunks = skipped_by_policy.values().sum();
     let mut report = ReconcileReport {
@@ -519,38 +592,15 @@ pub(crate) fn reconcile_with_options_progress(
     // scope here (not inside the match) so it lives until the function returns.
     let (embedder, _provisioned) = match acquired {
         ChunkEmbedder::Ready { embedder, provisioned } => (embedder, provisioned),
-        ChunkEmbedder::SkipEphemeral => {
-            // Ephemeral active model on a non-provisioning (watcher) pass: do NOT cold-start a GPU
-            // box for incremental work. Leave chunks pending; an explicit `rag-rat reconcile` does
-            // the bulk embed. Lexical search still works, and query embedding uses the local box.
-            report.status = "Blocked".to_string();
-            report.message = Some(
-                "ephemeral remote embedding needs an explicit `rag-rat reconcile` (the watcher \
-                 does not provision a GPU box for incremental edits)"
-                    .to_string(),
-            );
-            finish_reconcile_attempt(conn, attempt_id, &report)?;
-            progress(ReconcileProgress::Started {
-                model_id: active_model_id,
-                total_chunks: 0,
-                batch_size,
-            });
-            progress(ReconcileProgress::Finished {
-                processed_chunks: 0,
-                embeddings_written: 0,
-                blocked_chunks: 0,
-            });
-            return Ok(report);
-        },
         ChunkEmbedder::NotReady(err) => {
             // Surface the cause (e.g. a cookbook provisioning failure with its captured stderr) so
-            // a remote outage isn't swallowed; the report keeps the actionable
-            // "install" hint.
+            // a remote outage isn't swallowed; the report keeps the actionable "install" hint AND
+            // the policy-skip counts already computed above.
             eprintln!("rag-rat: chunk embedder unavailable: {err:#}");
             report.status = "Blocked".to_string();
             report.message = Some(format!(
-                "{} model is not ready; run `rag-rat models install {}`",
-                active_model_id, active_model_id
+                "{active_model_id} model is not ready; run `rag-rat models install \
+                 {active_model_id}`"
             ));
             finish_reconcile_attempt(conn, attempt_id, &report)?;
             progress(ReconcileProgress::Started {
@@ -565,6 +615,9 @@ pub(crate) fn reconcile_with_options_progress(
             });
             return Ok(report);
         },
+        // SkipEphemeral already returned above.
+        ChunkEmbedder::SkipEphemeral =>
+            unreachable!("SkipEphemeral handled before the policy scan"),
     };
 
     let scan = EmbeddingScan {
@@ -1114,6 +1167,59 @@ mod freshness_version_tests {
             active_remote_config(&conn).unwrap().is_none(),
             "a local install must clear the stale remote-config meta",
         );
+    }
+
+    #[test]
+    fn legacy_active_ollama_model_is_cleaned_on_manifest_ensure() {
+        // An index that had the pre-#317 REMOTE id `ollama-all-minilm` installed + active keeps its
+        // `ai_models` row + active-model meta + remote-config meta. That id is gone from the
+        // registry (Ollama is now a transport), so without legacy cleanup `active_embedder` bails
+        // with "unknown active embedding model" — breaking search/reconcile.
+        // `ensure_model_manifest` must drop ALL THREE (row, active meta, remote config) and
+        // fall back to hash. Feature-free: the legacy row is seeded by raw SQL (no
+        // fastembed/model2vec install), and the fallback is the always-available hash
+        // embedder.
+        const LEGACY_OLLAMA_ID: &str = "ollama-all-minilm";
+        let conn = schema_conn();
+
+        // Mirror a real pre-#317 remote install's DB state: a Ready, active `ai_models` row for the
+        // removed id, the active-model meta, and a persisted (secret-free) remote config.
+        conn.execute(
+            "INSERT INTO ai_models(model_id, capability, embedding_dim, runtime, installed, \
+             disabled, status, installed_at_ms) VALUES (?1, 'embedding', 384, 'ollama', 1, 0, \
+             'Ready', 1)",
+            params![LEGACY_OLLAMA_ID],
+        )
+        .unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, LEGACY_OLLAMA_ID).unwrap();
+        set_active_remote_config(&conn, &remote_at("http://box:11434")).unwrap();
+        assert!(!model_manifest_is_current(&conn).unwrap(), "a lingering legacy active id is work");
+
+        ensure_model_manifest(&conn).unwrap();
+
+        // The row, the active-model meta, and the remote config are all gone.
+        let row_present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ai_models WHERE model_id = ?1)",
+                params![LEGACY_OLLAMA_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!row_present, "the legacy ai_models row is removed");
+        assert_eq!(meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap(), None, "active meta cleared");
+        assert!(
+            active_remote_config(&conn).unwrap().is_none(),
+            "the stale remote config is cleared so no OllamaEmbedder is reconstructed",
+        );
+
+        // With no active model + no remote config, the active model falls back to hash. Mark the
+        // (always-feature-free) hash row Ready as a normal index would, and assert
+        // `active_embedder` resolves it WITHOUT the "unknown active embedding model" error
+        // the stale legacy row caused.
+        install_model(&conn, HASH_MODEL_ID, None).expect("hash installs");
+        let embedder =
+            active_embedder(&conn, None).expect("falls back to hash, no unknown-model err");
+        assert_eq!(embedder.model_id(), HASH_MODEL_ID, "active embedder falls back to hash");
     }
 
     // Needs a real fastembed install (the no-default-features CI build bails without the feature);

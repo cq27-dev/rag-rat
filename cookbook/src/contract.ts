@@ -242,6 +242,37 @@ export function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * The wall-clock budget left until `deadline` (epoch ms), floored at 0. A recipe computes ONE
+ * `deadline = Date.now() + provisionTimeoutMs` at the start, then passes `remainingBudgetMs(deadline)`
+ * as the `budgetMs` of EACH provisioning step. This keeps the whole sequence (deploy + pull + verify)
+ * inside the SINGLE provisioning budget — without it, a step that already burned most of the budget
+ * would hand the NEXT step a fresh full budget, and the total could blow past the Rust provisioner's
+ * hard timeout, which SIGKILLs the process group before the recipe runs its SIGTERM teardown → a
+ * leaked, billed box (RunPod has no provider backstop). Pair with {@link assertBudgetRemaining} to
+ * THROW (so `runRecipe` tears the box down) once the budget is effectively exhausted.
+ */
+export function remainingBudgetMs(deadline: number): number {
+  return Math.max(0, deadline - Date.now());
+}
+
+/**
+ * Throw if fewer than `minMs` of the provisioning budget remain (default 1s). Call it before each
+ * step so an exhausted budget aborts into `runRecipe`'s error path — which tears the box down
+ * (SIGTERM) — rather than starting a step that can only run past the deadline and get SIGKILLed with
+ * the box still up. `label` names the step in the error.
+ */
+export function assertBudgetRemaining(deadline: number, label: string, minMs = 1_000): number {
+  const remaining = remainingBudgetMs(deadline);
+  if (remaining < minMs) {
+    throw new Error(
+      `provisioning budget exhausted before "${label}" (${remaining}ms left); aborting so the box ` +
+        `is torn down before the hard timeout kills us`,
+    );
+  }
+  return remaining;
+}
+
+/**
  * `fetch` with a hard per-call timeout via `AbortSignal.timeout`. Use this instead of a bare
  * `fetch` anywhere a stall would let the box leak: a hung connection must abort and surface as an
  * error, never hang past the caller's budget.

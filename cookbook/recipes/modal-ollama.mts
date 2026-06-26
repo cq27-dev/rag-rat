@@ -26,7 +26,15 @@
 import { ModalClient } from "modal";
 import type { Sandbox } from "modal";
 
-import { type ProvisionContext, type Provisioned, type Recipe, log, runRecipe, verifyEmbed } from "../src/contract.js";
+import {
+  type ProvisionContext,
+  type Provisioned,
+  type Recipe,
+  assertBudgetRemaining,
+  log,
+  runRecipe,
+  verifyEmbed,
+} from "../src/contract.js";
 
 /** Port ollama serves on inside the box; the one port we tunnel out. */
 const OLLAMA_PORT = 11434;
@@ -40,6 +48,11 @@ const APP_NAME = "rag-rat-cookbook";
 /** Provision an Ollama box serving `input.model` and return its tunnel endpoint. */
 async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sandbox>> {
   const { input, provisionTimeoutMs } = ctx;
+  // ONE deadline for the WHOLE sequence (create + pull + verify); each budgeted step below uses the
+  // REMAINING time until it, never a fresh full budget, so the total stays inside the provisioning
+  // budget and aborts (→ teardown) before the Rust provisioner's hard timeout. (Modal also has the
+  // `timeoutMs` provider backstop, but a leaked box still bills until then — keep us inside budget.)
+  const deadline = Date.now() + provisionTimeoutMs;
   const gpu = input.gpu ?? null;
 
   ctx.status("provisioning", `creating Modal sandbox (model=${input.model}, gpu=${gpu ?? "cpu"})`);
@@ -88,9 +101,13 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   log("info", `tunnel up: ${endpoint}`);
 
   // Verify the server actually embeds before we emit `ready`. This catches a box that booted but
-  // isn't serving (the whole point of waiting before the ready event).
+  // isn't serving (the whole point of waiting before the ready event). Budget = the time REMAINING
+  // until the shared deadline (create + pull already consumed some); throws if it's spent.
   ctx.status("verifying", "probing /api/embed for a real vector");
-  await verifyEmbed(endpoint, { model: input.model, budgetMs: provisionTimeoutMs });
+  await verifyEmbed(endpoint, {
+    model: input.model,
+    budgetMs: assertBudgetRemaining(deadline, "embed verification"),
+  });
   log("info", "embed verification passed; box is serving");
 
   // Open tunnel via encryptedPorts → no per-request token needed. auth_token stays null.

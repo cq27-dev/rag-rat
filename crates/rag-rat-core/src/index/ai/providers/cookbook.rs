@@ -475,6 +475,14 @@ impl Drop for ProvisionedBox {
 /// reclaim the remote box. We signal the GROUP (not `child.id()`) because `npx` makes the recipe
 /// holding the box a grandchild. `ACTIVE_PGID` is cleared first so the signal handler won't also
 /// act on a pgid we're already reclaiming.
+///
+/// We poll the WHOLE GROUP (`killpg(pgid, 0)`), NOT just the leader's `waitpid`. The `npx` leader
+/// is the group leader, but the recipe GRANDCHILD is what holds the paid box and runs the SIGTERM
+/// teardown. The leader can exit while the grandchild is still mid-teardown — if we returned the
+/// instant the leader was reaped (the old bug), we'd skip the SIGKILL backstop and a STUCK
+/// grandchild teardown would orphan the box. So we reap the leader (no zombie) but keep waiting on
+/// the group: the grace period ends early only when EVERY member is gone (`ESRCH`), and a group
+/// still alive at the deadline gets `killpg(SIGKILL)`.
 #[cfg(unix)]
 fn teardown_group(pgid: i32, child: &mut Child) {
     ACTIVE_PGID.store(0, Ordering::SeqCst);
@@ -484,15 +492,40 @@ fn teardown_group(pgid: i32, child: &mut Child) {
     killpg(pgid, libc::SIGTERM);
     let deadline = Instant::now() + TEARDOWN_GRACE;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return, // the leader exited (the group's recipe tore down)
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-            _ => break,
+        // Reap the leader as soon as it exits so it doesn't linger as a zombie, but DO NOT treat
+        // that as "the group is gone" — the box-holding grandchild may still be tearing down.
+        let _ = child.try_wait();
+        if !group_alive(pgid) {
+            return; // every member of the group is gone (the recipe finished its teardown)
         }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    // Still alive past the grace period → force the whole group, then reap the leader.
+    // The group is STILL alive past the grace period (a stuck grandchild teardown) → force the
+    // whole group, then reap the leader so it isn't left a zombie.
     killpg(pgid, libc::SIGKILL);
     let _ = child.wait();
+}
+
+/// `true` while ANY member of the process group `pgid` is still alive. `killpg(pgid, 0)` sends no
+/// signal but performs the existence/permission check: success (or any errno other than `ESRCH`,
+/// e.g. `EPERM`) means at least one member exists; `ESRCH` means the whole group is gone. This is
+/// what lets teardown wait on the box-holding GRANDCHILD, not just the leader's `waitpid`. SAFETY:
+/// `killpg(2)` with signal 0 touches no memory and only probes the group.
+#[cfg(unix)]
+fn group_alive(pgid: i32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 only probes the group; no memory is touched.
+    if unsafe { libc::killpg(pgid, 0) } == 0 {
+        return true;
+    }
+    // Portable errno read (works on every unix, unlike a glibc-specific `__errno_location`): only
+    // ESRCH ("no such process group") means fully gone; EPERM etc. means a member is still around.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Reap a process group on a provisioning-FAILURE path (early exit / timeout): SIGKILL the group
@@ -670,6 +703,51 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!pid_alive(gc_pid), "Drop must killpg the GROUP → the grandchild is reaped");
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[test]
+    fn drop_waits_for_the_group_when_the_leader_exits_before_the_grandchild() {
+        // THE STUCK-TEARDOWN LEAK-FIX TEST (#318 2b): the leader (`npx` role) exits PROMPTLY on
+        // SIGTERM while the box-holding GRANDCHILD is still tearing down. The OLD teardown returned
+        // the instant the leader's `waitpid` succeeded → it skipped the SIGKILL backstop and `Drop`
+        // returned with the grandchild (the paid box) still alive — a leak. The fix polls the whole
+        // GROUP (`killpg(pgid, 0)`), so `Drop` must NOT return until the grandchild is gone too.
+        let pidfile = tmp("lingering-grandchild-pid");
+        let _ = std::fs::remove_file(&pidfile);
+        let cmd = stub_command("stub_grandchild_lingers.sh", &[
+            ("STUB_ENDPOINT", "http://127.0.0.1:1"),
+            ("STUB_GRANDCHILD_PIDFILE", pidfile.to_str().unwrap()),
+        ]);
+        let provisioned = CookbookProvisioner::provision_with_command(
+            cmd,
+            "stub_grandchild_lingers.sh",
+            &input(),
+            Duration::from_secs(10),
+        )
+        .expect("handshake parsed");
+
+        // Wait for the grandchild to record its pid and confirm it's alive while the box is up.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let gc_pid = loop {
+            if let Ok(s) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = s.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "grandchild never recorded its pid");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(pid_alive(gc_pid), "grandchild should be alive while the box is up");
+
+        // `Drop` must SUPERVISE THE GROUP: it returns only once the lingering grandchild is also
+        // gone (the old leader-only teardown would have returned while it was still alive).
+        drop(provisioned);
+        assert!(
+            !pid_alive(gc_pid),
+            "Drop must wait on the whole GROUP — the box-holding grandchild must be gone when it \
+             returns, not just the leader",
+        );
         let _ = std::fs::remove_file(&pidfile);
     }
 

@@ -40,6 +40,7 @@ import {
   type ProvisionContext,
   type Provisioned,
   type Recipe,
+  assertBudgetRemaining,
   fetchWithTimeout,
   log,
   pollUntil,
@@ -89,6 +90,11 @@ interface DeployedPod {
 /** Provision a RunPod GPU pod serving `input.model` via Ollama and return its proxy endpoint. */
 async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<PodHandle>> {
   const { input, provisionTimeoutMs } = ctx;
+  // ONE deadline for the WHOLE sequence (deploy + pull + verify). Each step below uses the budget
+  // REMAINING until this deadline — never a fresh full budget — so the total stays inside the
+  // provisioning budget and we abort (→ teardown) before the Rust provisioner's hard timeout
+  // SIGKILLs us with the pod still billing. See `assertBudgetRemaining`.
+  const deadline = Date.now() + provisionTimeoutMs;
   const rawKey = process.env["RUNPOD_API_KEY"];
   if (rawKey === undefined || rawKey.trim() === "") {
     throw new Error("RUNPOD_API_KEY is not set; rag-rat must pass the RunPod API key in the env.");
@@ -135,14 +141,19 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
   const endpoint = `https://${handle.podId}-${OLLAMA_PORT}.proxy.runpod.net`;
   log("info", `proxy endpoint: ${endpoint}`);
 
-  // Pull the model CLIENT-SIDE over the proxy (no in-pod exec). Retries cover pod boot time.
+  // Pull the model CLIENT-SIDE over the proxy (no in-pod exec). Retries cover pod boot time. Budget
+  // = whatever is LEFT until the shared deadline (deploy already consumed some); throws if spent.
   ctx.status("pulling", `pulling model "${input.model}" over the proxy (covers pod boot)`);
-  await pullModel(endpoint, input.model, provisionTimeoutMs);
+  await pullModel(endpoint, input.model, assertBudgetRemaining(deadline, "model pull"));
   log("info", `model "${input.model}" pulled`);
 
-  // Confirm the server actually embeds before we emit `ready`.
+  // Confirm the server actually embeds before we emit `ready`. Budget = the REMAINING time after the
+  // pull, so deploy+pull+verify together stay inside the single provisioning budget.
   ctx.status("verifying", "probing /api/embed for a real vector");
-  await verifyEmbed(endpoint, { model: input.model, budgetMs: provisionTimeoutMs });
+  await verifyEmbed(endpoint, {
+    model: input.model,
+    budgetMs: assertBudgetRemaining(deadline, "embed verification"),
+  });
   log("info", "embed verification passed; pod is serving");
 
   // RunPod's HTTP proxy is open (no per-request token for proxied ports) → auth_token null.

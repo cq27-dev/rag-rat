@@ -97,6 +97,11 @@ rag-rat init
 offers to install the local embedding model, and can register the MCP server and git hooks. Preview
 without writing anything with `rag-rat init --dry-run`; `--yes` runs the non-interactive defaults.
 
+For a large repo where the local embedder is too slow, a `[llm.embedding.remote]` block can serve a
+stronger transformer model over Ollama instead — either connect to a server you already run, or have
+rag-rat provision an ephemeral GPU box for the backfill via the bundled cookbook (Modal / RunPod).
+See [`docs/config.md`](docs/config.md) for the setup.
+
 Manual setup and every config knob live in [`docs/config.md`](docs/config.md).
 
 ## Connect it to your agent (MCP)
