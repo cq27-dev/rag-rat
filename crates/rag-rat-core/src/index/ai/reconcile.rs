@@ -197,6 +197,20 @@ pub(crate) fn install_model(
     // `runtime` local↔ollama. Remote present → reachability + dim probe (no download); else → the
     // local install for the model's backend.
     if let Some(remote) = remote {
+        // A remote block serves the model over Ollama, which can only serve TRANSFORMER models. The
+        // CLI passes the config's remote block for WHATEVER model id the user typed, so guard HERE
+        // too — the config-layer guard only checks `config.model`, not an explicit
+        // `models install <other-id>`. Without this, `models install embedding-hash` against a
+        // 384-dim Ollama would mark the hash row `runtime='ollama'` and store the served model's
+        // vectors under the hash id.
+        if spec.backend != Backend::FastEmbed {
+            anyhow::bail!(
+                "remote embedding requires a transformer model, but `{model_id}` is a {} model — \
+                 remove the [llm.embedding.remote] block to install it locally, or install a \
+                 transformer model over Ollama",
+                spec.backend.runtime()
+            );
+        }
         install_ollama_model(conn, model_id, spec, remote)?;
     } else {
         match spec.backend {
@@ -217,6 +231,11 @@ pub(crate) fn install_model(
                 "internal error: Backend::Ollama is a transport, not a local install target"
             ),
         }
+        // A LOCAL install must drop any remote-config meta a PRIOR Ollama install of this model
+        // left behind — otherwise `active_embedder` reads it back unconditionally and keeps
+        // building an OllamaEmbedder against the now-removed endpoint instead of the local
+        // model.
+        clear_active_remote_config(conn)?;
     }
     set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
     // SINGLE WRITER of the active freshness version — for EVERY runtime, AFTER activation.
@@ -1068,6 +1087,33 @@ mod freshness_version_tests {
         let conn = schema_conn();
         let err = install_model(&conn, "minilm", None).expect_err("alias is no longer accepted");
         assert!(err.to_string().contains("unknown embedding model"), "{err}");
+    }
+
+    #[test]
+    fn install_rejects_a_remote_block_for_a_non_transformer_target() {
+        // A remote block serves the model over Ollama (transformers only). `models install
+        // embedding-hash` with a remote block present must be rejected BEFORE any probe — else the
+        // hash row would be marked runtime='ollama' with the served model's vectors under its id.
+        let conn = schema_conn();
+        let remote = remote_at("http://127.0.0.1:1"); // guard fires before any connection attempt
+        let err =
+            install_model(&conn, HASH_MODEL_ID, Some(&remote)).expect_err("hash + remote rejected");
+        assert!(err.to_string().contains("requires a transformer model"), "{err}");
+    }
+
+    #[test]
+    fn local_install_clears_a_stale_remote_config_meta() {
+        // After an Ollama install persists a remote config, re-installing the model LOCALLY must
+        // DELETE that meta — otherwise active_embedder keeps building an OllamaEmbedder against the
+        // dead endpoint. Uses the hash model so the local install is feature-free.
+        let conn = schema_conn();
+        set_active_remote_config(&conn, &remote_at("http://box:11434")).unwrap();
+        assert!(active_remote_config(&conn).unwrap().is_some(), "precondition: remote meta set");
+        install_model(&conn, HASH_MODEL_ID, None).unwrap();
+        assert!(
+            active_remote_config(&conn).unwrap().is_none(),
+            "a local install must clear the stale remote-config meta",
+        );
     }
 
     // Needs a real fastembed install (the no-default-features CI build bails without the feature);

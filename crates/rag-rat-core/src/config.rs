@@ -420,6 +420,11 @@ impl Config {
         let path = path.as_ref();
         let text = fs::read_to_string(path)?;
         let raw: RawConfig = toml::from_str(&text)?;
+        // Reject the renamed `[local_ai]` table loudly (#317) — a silently-ignored old table would
+        // drop the user's embedding settings on upgrade. See `RawConfig::local_ai`.
+        if raw.local_ai.is_some() {
+            return Err(ConfigError::LocalAiTableRenamed);
+        }
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let root = config_dir.join(raw.index.root.unwrap_or_else(|| ".".to_string()));
         // The root of the checkout the config was actually READ from (a linked worktree has its own
@@ -621,6 +626,13 @@ struct RawConfig {
     index: RawIndex,
     #[serde(default)]
     llm: RawLlm,
+    /// Presence-capture for the OLD `[local_ai]` table (renamed to `[llm]` in #317). Serde would
+    /// otherwise SILENTLY DROP this now-unknown table, loading every embedding setting as a
+    /// default (re-enabling FastEmbed, dropping a configured remote/runtime) on upgrade. We
+    /// capture it so `load` can reject it loudly with a migration instruction instead of
+    /// misconfiguring silently.
+    #[serde(default)]
+    local_ai: Option<toml::Value>,
     #[serde(default)]
     watch: RawWatch,
     #[serde(default)]
@@ -750,10 +762,12 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
         // serve TRANSFORMER models, so a `[remote]` block on a static/hash model is a
         // misconfiguration the dim probe couldn't usefully explain — reject it here with a
         // clear message.
-        if remote.is_some()
-            && let Some(spec_backend) = backend.registry_backend()
-            && !matches!(spec_backend, Backend::FastEmbed)
-        {
+        // A `[remote]` block REQUIRES a transformer (FastEmbed) selected model — Ollama can only
+        // serve those. Reject when the selected backend is NOT FastEmbed: that covers static/hash
+        // (`registry_backend()` is `Some(Hash | Model2Vec)`) AND `model = "none"` (embeddings
+        // disabled → `registry_backend()` is `None`), which would otherwise slip through and leave
+        // a remote block that never installs or provisions anything.
+        if remote.is_some() && !matches!(backend.registry_backend(), Some(Backend::FastEmbed)) {
             return Err(ConfigError::RemoteEmbeddingNonTransformerModel(
                 backend.as_str().to_string(),
             ));
@@ -900,10 +914,18 @@ pub enum ConfigError {
     RemoteEmbeddingEndpointHasCredentials,
     #[error(
         "[llm.embedding.remote] can only serve a transformer model over Ollama, but `model = \
-         \"{0}\"` selects a non-transformer backend (static/hash) — remove the remote block, or \
-         pick a transformer model such as `minilm` / `bge` / `jina`"
+         \"{0}\"` is not a transformer (it is a static/hash model, or `none`/disabled) — remove \
+         the remote block, or select a transformer model (e.g. \
+         `sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`, \
+         `jinaai/jina-embeddings-v2-base-code`)"
     )]
     RemoteEmbeddingNonTransformerModel(String),
+    #[error(
+        "the `[local_ai]` table was renamed to `[llm]` (#317). Update your rag-rat.toml: rename \
+         `[local_ai.embedding]` → `[llm.embedding]` (and any `[local_ai.embedding.remote]` / \
+         `[local_ai.embedding.runtime]` → `[llm.embedding.remote]` / `[llm.embedding.runtime]`)"
+    )]
+    LocalAiTableRenamed,
     #[error("duplicate target name `{0}`")]
     DuplicateTarget(String),
     #[error("configured directory does not exist: {0}")]
@@ -1537,9 +1559,10 @@ mod tests {
     #[test]
     fn remote_block_on_a_non_transformer_model_is_rejected() {
         // #317 rework guardrail: Ollama can only serve transformer models. A [remote] block on the
-        // static model2vec or the hash model is a misconfiguration the dim probe couldn't usefully
-        // explain — reject at parse with a clear message. Selectors are the HF-path model_ids now.
-        for model in ["minishlab/potion-retrieval-32M", "embedding-hash"] {
+        // static model2vec, the hash model, or `none` (embeddings disabled) is a misconfiguration —
+        // reject at parse with a clear message rather than leaving a remote block that never
+        // installs/provisions anything. Selectors are the HF-path model_ids now.
+        for model in ["minishlab/potion-retrieval-32M", "embedding-hash", "none"] {
             let raw: RawConfig = toml::from_str(&format!(
                 "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \
                  \"{model}\"\n\n[llm.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
@@ -1552,6 +1575,26 @@ mod tests {
                 "remote block + {model} → RemoteEmbeddingNonTransformerModel, got {err:?}",
             );
         }
+    }
+
+    #[test]
+    fn the_renamed_local_ai_table_is_rejected_with_a_migration_message() {
+        // #317 renamed [local_ai] → [llm]. An old config's [local_ai] table must error LOUDLY:
+        // serde would otherwise silently DROP it, reverting embedding settings to defaults on
+        // upgrade. The error fires in Config::load before any directory resolution.
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-localai-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[local_ai.embedding]\nmodel = \"none\"\n",
+        )
+        .unwrap();
+        let err = Config::load(tmp.join("rag-rat.toml")).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::LocalAiTableRenamed),
+            "[local_ai] table → LocalAiTableRenamed, got {err:?}",
+        );
     }
 
     #[test]
