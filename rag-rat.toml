@@ -3,25 +3,20 @@ root = "."
 database = ".rag-rat/index.sqlite"
 
 [llm.embedding]
-# the MODEL by its full id (the HF path); minishlab/potion-retrieval-32M is the static model2vec
-# tier — ~100-500x faster on CPU, some quality cost. "none" disables embeddings.
-model = "minishlab/potion-retrieval-32M"
+# The MODEL by its full id (the HF path). all-MiniLM-L6-v2 (384-dim) — served over this box's local
+# Ollama below (CONNECT mode) instead of in-process. "none" disables embeddings; the static
+# model2vec tier (minishlab/potion-retrieval-32M) is the no-Ollama-dependency alternative.
+model = "sentence-transformers/all-MiniLM-L6-v2"
 
-# Optional: serve a TRANSFORMER model (not model2vec/hash) over Ollama instead of in-process. The
-# mode is INFERRED — set EXACTLY ONE of `endpoint` (connect to a running box) or `cookbook`
-# (provision an ephemeral box for the bulk `reconcile`). See docs/config.md "Remote embedding over
-# Ollama".
-#   CONNECT:
-# [llm.embedding.remote]
-# endpoint = "http://box:11434"  # the Ollama server URL
-# model = "all-minilm"           # the Ollama-side model name
-# auth_env = "OLLAMA_TOKEN"      # NAME of an env var with a bearer token (never the token)
-#   EPHEMERAL (provision-on-demand; queries use a local ollama):
-# [llm.embedding.remote]
-# cookbook = "@rag-rat/cookbook modal"        # npm package + provider subcommand (modal/runpod),
-                                              # or a recipe path + args (.mjs/.js/.ts/.mts)
-# model = "all-minilm"
-# query_endpoint = "http://localhost:11434"   # local ollama for query embedding (this is the default)
+# Serve that model over the local Ollama (`ollama pull all-minilm`) — see docs/config.md "Remote
+# embedding over Ollama". CONNECT = a fixed endpoint; reconcile + queries both embed against it. If
+# the Ollama is unreachable, reconcile leaves embeddings pending and semantic_search degrades to
+# BM25 (so a contributor without Ollama still gets a working lexical index). The mode is INFERRED:
+# set EXACTLY ONE of `endpoint` (connect) or `cookbook` (provision an ephemeral box).
+[llm.embedding.remote]
+endpoint = "http://localhost:11434"   # this box's Ollama server
+model = "all-minilm"                  # the Ollama-side model name
+batch_size = 256                      # texts per /api/embed request
 
 [llm.embedding.runtime]
 batch_size = 64
