@@ -40,6 +40,11 @@ pub struct OllamaEmbedder {
     embed_url: String,
     model: String,
     dim: usize,
+    /// Max texts per `/api/embed` request (`[local_ai.embedding.remote] batch_size`).
+    /// `embed_batch` splits its input into sub-batches of at most this, so a request never
+    /// exceeds the configured cap regardless of the reconcile/runtime batch size. Clamped to
+    /// `>= 1` at construction so the `chunks()` split can't panic on a misconfigured `0`.
+    batch_size: usize,
     /// `Some("Bearer <token>")` when the server needs auth, read from `auth_env` at construction.
     auth_header: Option<String>,
 }
@@ -85,8 +90,75 @@ impl OllamaEmbedder {
             embed_url,
             model: cfg.model.trim().to_string(),
             dim: registry_dim,
+            // Clamp to >= 1: a configured 0 would panic `slice::chunks`; treat it as "one per
+            // request" rather than failing construction.
+            batch_size: (cfg.batch_size as usize).max(1),
             auth_header,
         })
+    }
+
+    /// Send ONE `/api/embed` request for `texts` (already sized to `<= self.batch_size` by the
+    /// caller) and return the parsed vectors, enforcing the count + per-vector dim contracts.
+    /// Factored out of `embed_batch` so the sub-batch loop reuses the exact request/validation
+    /// logic.
+    fn embed_one_request(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let payload = EmbedRequest { model: &self.model, input: texts };
+        // The `json` ureq feature is not enabled (workspace ureq is rustls-only), so serialize the
+        // body ourselves and send it with an explicit content-type.
+        let body = serde_json::to_vec(&payload)
+            .map_err(|e| anyhow::anyhow!("failed to serialize ollama embed request: {e}"))?;
+
+        let mut request = self.agent.post(&self.embed_url).content_type("application/json");
+        if let Some(header) = &self.auth_header {
+            request = request.header("Authorization", header);
+        }
+
+        // `http_status_as_error` defaults to true in ureq 3, so a non-2xx status, a connection
+        // refusal, or a timeout all surface as `Err` here — all retryable by the reconcile loop.
+        let raw = request
+            .send(body)
+            .map_err(|e| {
+                anyhow::anyhow!("ollama embed request to `{}` failed: {e}", self.embed_url)
+            })?
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| anyhow::anyhow!("reading ollama embed response failed: {e}"))?;
+
+        let parsed: EmbedResponse = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("malformed ollama embed response: {e}"))?;
+        let embeddings = parsed.embeddings;
+
+        // Count contract: one vector per input, retryable on violation (a transient server fault
+        // can drop rows).
+        if embeddings.len() != texts.len() {
+            anyhow::bail!(
+                "ollama embed count mismatch: requested {} texts but server returned {} vectors",
+                texts.len(),
+                embeddings.len()
+            );
+        }
+
+        // Dim contract (LOUD): the int8 encoding, per-family centroids, and the linked-entries rail
+        // all assume a fixed dim. A server returning a different-width vector means the configured
+        // model and the server model disagree — naming both dims makes the misconfiguration
+        // obvious. EVERY vector is checked, not just the first: a late wrong-width vector that
+        // slipped through would make `store_embedding` bail and ABORT the whole reconcile instead
+        // of failing just that chunk, so we name the offending index and reject here.
+        for (i, vector) in embeddings.iter().enumerate() {
+            if vector.len() != self.dim {
+                anyhow::bail!(
+                    "ollama embed dim mismatch: server returned a {}-dim vector at index {} but \
+                     this model is configured for {} dims (model `{}`). The configured registry \
+                     model and the Ollama server model must match.",
+                    vector.len(),
+                    i,
+                    self.dim,
+                    self.model
+                );
+            }
+        }
+
+        Ok(embeddings)
     }
 }
 
@@ -146,63 +218,16 @@ impl Embedder for OllamaEmbedder {
             return Ok(Vec::new());
         }
 
-        let payload = EmbedRequest { model: &self.model, input: texts };
-        // The `json` ureq feature is not enabled (workspace ureq is rustls-only), so serialize the
-        // body ourselves and send it with an explicit content-type.
-        let body = serde_json::to_vec(&payload)
-            .map_err(|e| anyhow::anyhow!("failed to serialize ollama embed request: {e}"))?;
-
-        let mut request = self.agent.post(&self.embed_url).content_type("application/json");
-        if let Some(header) = &self.auth_header {
-            request = request.header("Authorization", header);
+        // Split into sub-batches of at most the configured `batch_size` and send one `/api/embed`
+        // per sub-batch, concatenating the results IN ORDER. This honors `[remote] batch_size`
+        // regardless of the (larger) reconcile/runtime batch the loop hands us — a user capping it
+        // for a server/proxy request-size limit is respected. The count + per-vector dim checks run
+        // per sub-batch (in `embed_one_request`).
+        let mut out = Vec::with_capacity(texts.len());
+        for sub_batch in texts.chunks(self.batch_size) {
+            out.extend(self.embed_one_request(sub_batch)?);
         }
-
-        // `http_status_as_error` defaults to true in ureq 3, so a non-2xx status, a connection
-        // refusal, or a timeout all surface as `Err` here — all retryable by the reconcile loop.
-        let raw = request
-            .send(body)
-            .map_err(|e| {
-                anyhow::anyhow!("ollama embed request to `{}` failed: {e}", self.embed_url)
-            })?
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| anyhow::anyhow!("reading ollama embed response failed: {e}"))?;
-
-        let parsed: EmbedResponse = serde_json::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("malformed ollama embed response: {e}"))?;
-        let embeddings = parsed.embeddings;
-
-        // Count contract: one vector per input, retryable on violation (a transient server fault
-        // can drop rows).
-        if embeddings.len() != texts.len() {
-            anyhow::bail!(
-                "ollama embed count mismatch: requested {} texts but server returned {} vectors",
-                texts.len(),
-                embeddings.len()
-            );
-        }
-
-        // Dim contract (LOUD): the int8 encoding, per-family centroids, and the linked-entries rail
-        // all assume a fixed dim. A server returning a different-width vector means the configured
-        // model and the server model disagree — naming both dims makes the misconfiguration
-        // obvious. EVERY vector is checked, not just the first: a late wrong-width vector that
-        // slipped through would make `store_embedding` bail and ABORT the whole reconcile instead
-        // of failing just that chunk, so we name the offending index and reject here.
-        for (i, vector) in embeddings.iter().enumerate() {
-            if vector.len() != self.dim {
-                anyhow::bail!(
-                    "ollama embed dim mismatch: server returned a {}-dim vector at index {} but \
-                     this model is configured for {} dims (model `{}`). The configured registry \
-                     model and the Ollama server model must match.",
-                    vector.len(),
-                    i,
-                    self.dim,
-                    self.model
-                );
-            }
-        }
-
-        Ok(embeddings)
+        Ok(out)
     }
 }
 
@@ -294,6 +319,141 @@ mod tests {
         assert_eq!(got[1][0], 2.0);
         assert_eq!(got[2][0], 3.0);
         assert!(got.iter().all(|v| v.len() == DIM));
+    }
+
+    /// A multi-request HTTP stub: accepts `max_conns` connections, and for each request replies
+    /// with one DIM-wide vector PER input text in that request's body (so the per-sub-batch
+    /// count check passes). Each returned vector's first component is a monotonically
+    /// increasing global counter, so the concatenated `embed_batch` output reads `[0.0, 1.0,
+    /// 2.0, ...]` IFF the sub-batches are stitched back in order. Returns the URL, the join
+    /// handle, and the shared request COUNT so the test can assert the configured cap produced
+    /// the expected number of requests.
+    fn spawn_counting_stub(
+        max_conns: usize,
+    ) -> (String, thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            let mut next_value = 0u32;
+            for _ in 0..max_conns {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                // Read headers, parse Content-Length, then read EXACTLY that many body bytes. A
+                // single `read()` can return just the headers before the body arrives, so reading a
+                // fixed-size buffer once undercounts the inputs; this reads the whole request.
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                let body = loop {
+                    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n");
+                    if let Some(end) = header_end {
+                        let headers = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                        let content_len = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let body_start = end + 4;
+                        while raw.len() < body_start + content_len {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                                Err(_) => break,
+                            }
+                        }
+                        break String::from_utf8_lossy(&raw[body_start..]).to_string();
+                    }
+                    match stream.read(&mut buf) {
+                        Ok(0) => break String::new(),
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                        Err(_) => break String::new(),
+                    }
+                };
+                // Count inputs in THIS request by the `"text N"` markers the test sends.
+                let inputs = body.matches("text ").count().max(1);
+                counter.fetch_add(1, Ordering::SeqCst);
+                let vectors: Vec<Vec<f32>> = (0..inputs)
+                    .map(|_| {
+                        let v = vec![next_value as f32; DIM];
+                        // Encode the global order in the FIRST component only.
+                        let mut v = v;
+                        v[0] = next_value as f32;
+                        next_value += 1;
+                        v
+                    })
+                    .collect();
+                let json = embeddings_json(&vectors);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle, requests)
+    }
+
+    #[test]
+    fn embed_batch_splits_into_sub_batches_of_at_most_the_configured_batch_size() {
+        // batch_size = 2, 5 texts → 3 requests (2 + 2 + 1), all 5 vectors returned IN ORDER. This
+        // is the P2 fix: `[remote] batch_size` caps the per-request size regardless of the
+        // larger batch the reconcile loop hands the embedder.
+        use std::sync::atomic::Ordering;
+
+        let (url, handle, requests) = spawn_counting_stub(3);
+        let mut cfg = config_for(&url, 5);
+        cfg.batch_size = 2;
+        let embedder = OllamaEmbedder::from_remote_config(&cfg, DIM).unwrap();
+
+        let got = embedder.embed_batch(&texts(5)).expect("sub-batched embed");
+        handle.join().unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 3, "5 texts at batch_size 2 → 3 requests");
+        assert_eq!(got.len(), 5, "all 5 vectors returned");
+        // The global counter encodes order: sub-batch boundaries must not reorder the output.
+        for (i, v) in got.iter().enumerate() {
+            assert_eq!(v[0], i as f32, "vector {i} out of order: {}", v[0]);
+            assert_eq!(v.len(), DIM);
+        }
+    }
+
+    #[test]
+    fn embed_batch_with_a_large_batch_size_sends_a_single_request() {
+        // batch_size default (256) >> 3 texts → exactly one request (no needless fan-out).
+        use std::sync::atomic::Ordering;
+
+        let (url, handle, requests) = spawn_counting_stub(1);
+        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 5), DIM).unwrap();
+
+        let got = embedder.embed_batch(&texts(3)).expect("single-request embed");
+        handle.join().unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "3 texts under the cap → one request");
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn batch_size_zero_is_clamped_to_one_per_request() {
+        // A misconfigured `batch_size = 0` must NOT panic `chunks(0)`; it degrades to one text per
+        // request.
+        use std::sync::atomic::Ordering;
+
+        let (url, handle, requests) = spawn_counting_stub(3);
+        let mut cfg = config_for(&url, 5);
+        cfg.batch_size = 0;
+        let embedder = OllamaEmbedder::from_remote_config(&cfg, DIM).unwrap();
+
+        let got = embedder.embed_batch(&texts(3)).expect("clamped embed");
+        handle.join().unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 3, "batch_size 0 → one text per request");
+        assert_eq!(got.len(), 3);
     }
 
     #[test]

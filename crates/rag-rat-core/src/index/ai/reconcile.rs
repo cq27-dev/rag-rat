@@ -210,6 +210,18 @@ pub(crate) fn install_model(
         },
     }
     set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
+    // SINGLE WRITER of the active freshness version — for EVERY backend, AFTER activation. It must
+    // run for the local backends too, not just ollama: `active_embedding_model_version` reads this
+    // meta UNCONDITIONALLY for whatever model is active, so switching back from ollama to a
+    // hash/fastembed model would otherwise leave the stale ollama endpoint-hash as the freshness
+    // key — reconciling/searching the local model under the wrong key (worst case reusing vectors
+    // across models). Ollama folds the endpoint+model into the key (so re-pointing forces a clean
+    // re-embed); every other backend uses its static `spec.version`.
+    let freshness = match (spec.backend, remote) {
+        (Backend::Ollama, Some(remote)) => remote_freshness_version(spec, remote),
+        _ => spec.version.to_string(),
+    };
+    set_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, &freshness)?;
     model(conn, model_id)
 }
 
@@ -924,5 +936,113 @@ mod manifest_idempotence_tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod freshness_version_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    use super::*;
+    use crate::config::RemoteMode;
+    use crate::embedding_models::{
+        HASH_MODEL_ID, OLLAMA_ALL_MINILM_EMBEDDING_DIM, OLLAMA_ALL_MINILM_MODEL_ID,
+    };
+
+    /// One-shot HTTP/1.1 stub replying to the install probe's `/api/embed` with a `dim`-wide
+    /// vector.
+    fn spawn_embed_stub(dim: usize) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let nums = vec!["0.1"; dim].join(",");
+                let body = format!("{{\"embeddings\":[[{nums}]]}}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    fn schema_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+        ensure_model_manifest(&conn).unwrap();
+        conn
+    }
+
+    fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
+        RemoteEmbeddingConfig {
+            mode: RemoteMode::Connect,
+            model: "all-minilm".to_string(),
+            endpoint: Some(endpoint.to_string()),
+            auth_env: None,
+            batch_size: 256,
+            request_timeout_s: 5,
+        }
+    }
+
+    fn active_version(conn: &Connection) -> String {
+        reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap().unwrap()
+    }
+
+    #[test]
+    fn install_model_stamps_the_endpoint_hash_for_ollama() {
+        let (url, handle) = spawn_embed_stub(OLLAMA_ALL_MINILM_EMBEDDING_DIM);
+        let conn = schema_conn();
+        let remote = remote_at(&url);
+
+        install_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID, Some(&remote)).expect("ollama installs");
+        handle.join().unwrap();
+
+        let spec = spec(OLLAMA_ALL_MINILM_MODEL_ID).unwrap();
+        assert_eq!(active_version(&conn), remote_freshness_version(spec, &remote));
+        assert_ne!(active_version(&conn), spec.version, "ollama folds the endpoint, not bare ver");
+    }
+
+    #[test]
+    fn switching_from_ollama_to_a_local_model_resets_the_freshness_version() {
+        // THE P2-1 REGRESSION: install ollama (meta = endpoint hash), then install the local hash
+        // model. `active_embedding_model_version` reads this meta unconditionally for the active
+        // model, so it MUST become the hash model's static `spec.version` — not the stale ollama
+        // endpoint-hash. A stale key would reconcile/search the local model under the wrong
+        // freshness and could reuse vectors across models.
+        let (url, handle) = spawn_embed_stub(OLLAMA_ALL_MINILM_EMBEDDING_DIM);
+        let conn = schema_conn();
+        let remote = remote_at(&url);
+
+        install_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID, Some(&remote)).expect("ollama installs");
+        handle.join().unwrap();
+        let ollama_version = active_version(&conn);
+
+        // Now switch back to the local hash model — no remote config.
+        install_model(&conn, HASH_MODEL_ID, None).expect("hash installs");
+
+        let hash_spec = spec(HASH_MODEL_ID).unwrap();
+        assert_eq!(
+            active_version(&conn),
+            hash_spec.version,
+            "switching to a local model must reset the freshness key to its static spec.version",
+        );
+        assert_ne!(active_version(&conn), ollama_version, "must NOT keep the stale ollama hash");
+    }
+
+    #[test]
+    fn installing_a_local_model_stamps_its_static_version() {
+        // Even with no prior ollama install, a local-model install writes its static version (the
+        // meta is no longer ollama-only).
+        let conn = schema_conn();
+        install_model(&conn, HASH_MODEL_ID, None).expect("hash installs");
+        assert_eq!(active_version(&conn), spec(HASH_MODEL_ID).unwrap().version);
     }
 }

@@ -44,10 +44,11 @@ pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyh
 /// loop will use. A probe failure REFUSES the install loudly (the row is left not-installed); we do
 /// not write a half-ready model that would then fail every reconcile batch.
 ///
-/// On success: write the `ai_models` row Ready, persist the remote config to the secret-free meta
-/// so `active_embedder` can reconstruct the embedder, and stamp the freshness version
-/// ([`remote_freshness_version`]) — which folds in the endpoint + model so switching either forces
-/// a clean re-embed instead of silently reusing vectors from a different server.
+/// On success: write the `ai_models` row Ready and persist the remote config to the secret-free
+/// meta so `active_embedder` can reconstruct the embedder. The freshness version is NOT written
+/// here — it is stamped centrally by the caller (`install_model`) for EVERY backend, so switching
+/// away from ollama can't leave a stale ollama endpoint-hash as the active freshness key (see
+/// [`remote_freshness_version`] + the `install_model` single-writer comment).
 pub(crate) fn install_ollama_model(
     conn: &Connection,
     model_id: &str,
@@ -76,11 +77,6 @@ pub(crate) fn install_ollama_model(
         params![model_id, now_ms(), i64::try_from(spec.dim).unwrap_or(i64::MAX)],
     )?;
     set_active_remote_config(conn, remote)?;
-    set_reconcile_meta(
-        conn,
-        ACTIVE_EMBEDDING_MODEL_VERSION_META,
-        &remote_freshness_version(spec, remote),
-    )?;
     Ok(())
 }
 
@@ -318,12 +314,10 @@ mod ollama_install_tests {
         // The remote config is persisted so active_embedder can reconstruct the embedder.
         assert_eq!(active_remote_config(&conn).unwrap(), Some(remote.clone()));
 
-        // The freshness version is the endpoint-folded one, NOT the static spec version.
-        let spec = spec(OLLAMA_ALL_MINILM_MODEL_ID).unwrap();
-        let persisted =
-            reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap().unwrap();
-        assert_eq!(persisted, remote_freshness_version(spec, &remote));
-        assert_ne!(persisted, spec.version, "must not persist the bare static version");
+        // NOTE: the freshness version meta is NOT written by `install_ollama_model` — it is stamped
+        // centrally by `install_model` for every backend (so switching away can't leave a stale
+        // ollama hash). That single-writer behavior is covered by the `install_model` tests in
+        // reconcile.rs (`install_model_*_freshness_version`).
     }
 
     #[test]
