@@ -467,14 +467,14 @@ fn full_rebuild_preserves_installed_model_manifest() {
     let (root, config) = markdown_config("alpha token with enough detail for embeddings\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
     db.install_model(HASH_MODEL_ID, None).unwrap();
-    let before = db.local_ai_status().unwrap();
+    let before = db.llm_status().unwrap();
     assert_eq!(before.embedding.model_id, HASH_MODEL_ID);
     assert!(before.embedding.installed);
     drop(db);
 
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    let after = db.local_ai_status().unwrap();
+    let after = db.llm_status().unwrap();
     assert_eq!(after.embedding.model_id, HASH_MODEL_ID);
     assert!(after.embedding.installed);
     assert_eq!(after.embedding.state, "Ready");
@@ -813,7 +813,7 @@ fn fastembed_missing_feature_reports_rebuild_command() {
     let err = db.install_model(FASTEMBED_MODEL_ID, None).unwrap_err();
     assert!(err.to_string().contains(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
 
-    let status = db.local_ai_status().unwrap();
+    let status = db.llm_status().unwrap();
     assert!(!status.fastembed.build_feature_enabled);
     assert_eq!(status.fastembed.status, "MissingRuntime");
     assert_eq!(status.fastembed.message.as_deref(), Some(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
@@ -848,7 +848,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     assert_eq!(blocked.batch_size, 8);
     assert_eq!(blocked.status, "Blocked");
 
-    let status = db.local_ai_status().unwrap();
+    let status = db.llm_status().unwrap();
     assert_eq!(status.embedding.state, "MissingModel");
     assert_eq!(status.embedding.blocked_artifacts, 0);
 
@@ -866,7 +866,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     let noop = db.reconcile(None, Some(8)).unwrap();
     assert_eq!(noop.processed_chunks, 0);
     assert_eq!(noop.embeddings_written, 0);
-    let status = db.local_ai_status().unwrap();
+    let status = db.llm_status().unwrap();
     assert_eq!(status.embedding.state, "Ready");
     assert_eq!(status.embedding.current_artifacts, 1);
     let embedding_bytes: i64 = db
@@ -928,7 +928,7 @@ fn cached_fastembed_model_recovers_ready_state() {
     let fastembed = models.iter().find(|model| model.model_id == FASTEMBED_MODEL_ID).unwrap();
     assert!(fastembed.installed);
     assert_eq!(fastembed.status, "Ready");
-    let status = db.local_ai_status().unwrap();
+    let status = db.llm_status().unwrap();
     assert_eq!(status.fastembed.status, "Ready");
     assert!(status.fastembed.active);
 
@@ -959,7 +959,7 @@ fn compatible_migrate_recovers_cached_fastembed_model() {
     IndexDatabase::migrate_with_fastembed_cache(&config.database, Some(&cache_dir)).unwrap();
 
     let db = IndexDatabase::open(&config.database).unwrap();
-    let status = db.local_ai_status().unwrap();
+    let status = db.llm_status().unwrap();
     assert_eq!(status.fastembed.status, "Ready");
     assert!(status.fastembed.active);
 
@@ -1068,14 +1068,14 @@ fn status_counts_only_active_context_chunks() {
     let mut db = IndexDatabase::rebuild(&config).unwrap();
     db.install_model(HASH_MODEL_ID, None).unwrap();
 
-    let active = db.local_ai_status().unwrap().artifacts.total_chunks;
+    let active = db.llm_status().unwrap().artifacts.total_chunks;
     assert!(active > 0, "expected active chunks, got {active}");
 
     // Point the connection at a context that matches no indexed rows. The active set
     // (temp.files) is now empty, so status must report 0 chunks. Pre-fix the counts ran
     // over main.chunks (every indexed commit) and ignored the active context entirely.
     db.set_context("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "ghost-worktree").unwrap();
-    let scoped = db.local_ai_status().unwrap().artifacts;
+    let scoped = db.llm_status().unwrap().artifacts;
     assert_eq!(scoped.total_chunks, 0, "status ignored active context scope");
     assert_eq!(scoped.current, 0);
 

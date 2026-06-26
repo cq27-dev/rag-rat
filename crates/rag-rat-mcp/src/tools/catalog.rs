@@ -27,7 +27,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "github_issue_search",
     "github_refs_for_path",
     "rationale_search",
-    "local_ai_status",
+    "llm_status",
     "heal_index",
     "github_sync_status",
     "index_status",
@@ -162,9 +162,9 @@ pub fn description(name: &str) -> &'static str {
         "rationale_search" =>
             "Search cached GitHub rationale snippets (review comments, PR/issue discussion) by \
              keyword.",
-        "local_ai_status" =>
-            "On-device embedding status: model, install state, and how many chunks are embedded / \
-             missing / skipped.",
+        "llm_status" =>
+            "Embedding status (local or remote/Ollama-served): model, install state, and how many \
+             chunks are embedded / missing / skipped.",
         "heal_index" =>
             "Re-index stale already-indexed files and refresh FTS — repair when reads report \
              drift. Writes only to the index, never to source.",
@@ -240,7 +240,7 @@ pub fn schema(name: &str) -> Value {
         "memory_for_path" => schema_for::<MemoryForPathArgs>(),
         "memory_for_call_path" => schema_for::<MemoryForCallPathArgs>(),
         "memory_mark_obsolete" => schema_for::<MemoryIdArgs>(),
-        "local_ai_status" | "github_sync_status" | "index_status" | "memory_validate"
+        "llm_status" | "github_sync_status" | "index_status" | "memory_validate"
         | "memory_doctor" => schema_for::<EmptyArgs>(),
         _ => json!({"type": "object"}),
     }

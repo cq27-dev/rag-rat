@@ -81,7 +81,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::{Config, TargetKind};
-use crate::index::ai::{LocalAiStatus, ModelInfo, ReconcilePlan, ReconcileReport};
+use crate::index::ai::{LlmStatus, ModelInfo, ReconcilePlan, ReconcileReport};
 use crate::index::anchors::{AnchorStatus, ChunkAnchor};
 use crate::index::chunker::Chunk;
 use crate::index::git_history::{
@@ -182,7 +182,7 @@ pub struct IndexStatus {
     pub parser_failure_paths: Vec<ParserFailure>,
     pub git_history: GitHistoryIndexStatus,
     pub github: GitHubStatus,
-    pub llm: LocalAiStatus,
+    pub llm: LlmStatus,
     pub anchor_health: AnchorHealth,
 }
 

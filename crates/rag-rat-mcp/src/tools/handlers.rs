@@ -142,8 +142,8 @@ pub(crate) fn call_tool_with_db(
             }
             value
         },
-        "local_ai_status" => {
-            let mut value = json!(db.local_ai_status()?);
+        "llm_status" => {
+            let mut value = json!(db.llm_status()?);
             // `fastembed` re-states the same counts as `embedding` plus backend diagnostics; keep
             // the canonical `embedding` capability/state block and the `artifacts` coverage block.
             remove_object_key(&mut value, "fastembed");
@@ -157,7 +157,7 @@ pub(crate) fn call_tool_with_db(
         "index_status" => {
             let mut value = json!(db.status(db.database_path())?);
             // The full migration ledger is static detail (use the CLI `doctor`/`migrate` for it),
-            // and the embedded llm block duplicates the `local_ai_status` tool.
+            // and the embedded llm block duplicates the `llm_status` tool.
             if let Some(schema) = value.get_mut("schema") {
                 remove_object_key(schema, "migrations");
             }

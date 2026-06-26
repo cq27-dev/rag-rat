@@ -148,7 +148,7 @@ fn list_tools_exposes_complete_typed_schemas() {
         "github_issue_search",
         "github_refs_for_path",
         "rationale_search",
-        "local_ai_status",
+        "llm_status",
         "heal_index",
         "github_sync_status",
         "memory_create",
@@ -290,7 +290,7 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_requires(tools, "memory_for_call_path", "edge_sequence_hash");
     assert_schema_requires(tools, "memory_mark_obsolete", "memory_id");
     assert_eq!(tool_schema(tools, "memory_validate")["type"], "object");
-    assert_eq!(tool_schema(tools, "local_ai_status")["type"], "object");
+    assert_eq!(tool_schema(tools, "llm_status")["type"], "object");
     assert_schema_has_property(tools, "find_clones", "min_similarity");
     assert_schema_has_property(tools, "find_clones", "min_copies");
     assert_schema_has_property(tools, "find_clones", "limit");
@@ -368,7 +368,7 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
     let status = call_tool(&config.database, "index_status", json!({})).unwrap();
     assert!(status["database"].as_str().unwrap().ends_with("index.sqlite"));
     assert_eq!(status["fts_fresh"], true);
-    // index_status trims the embedded llm block (use local_ai_status) and the static
+    // index_status trims the embedded llm block (use llm_status) and the static
     // migration ledger (use the CLI doctor/migrate).
     assert!(status.get("llm").is_none(), "llm should not be embedded in index_status");
     assert!(
@@ -388,7 +388,7 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
     let github_status = call_tool(&config.database, "github_sync_status", json!({})).unwrap();
     assert!(github_status["capability"].is_string());
 
-    let llm = call_tool(&config.database, "local_ai_status", json!({})).unwrap();
+    let llm = call_tool(&config.database, "llm_status", json!({})).unwrap();
     assert_eq!(llm["embedding"]["state"], "MissingModel");
 
     let _ = fs::remove_dir_all(root);

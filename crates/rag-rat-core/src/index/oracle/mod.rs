@@ -15,7 +15,7 @@
 //!   maps.
 //! - `join.rs`  — occurrence → edge join (identifier-token containment, not line equality).
 //! - `run.rs`   — the pass over edge candidates, producing an [`OracleReport`].
-//! - `status.rs`— status type surfaced like `local_ai_status`.
+//! - `status.rs`— status type surfaced like `llm_status`.
 //! - `store.rs` — `oracle_runs` / `edge_oracle` read + write helpers.
 
 mod auto_run;

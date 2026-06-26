@@ -246,7 +246,7 @@ pub(crate) fn models(conn: &Connection) -> anyhow::Result<Vec<ModelInfo>> {
     collect_rows(rows)
 }
 
-pub(crate) fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
+pub(crate) fn status(conn: &Connection) -> anyhow::Result<LlmStatus> {
     ensure_model_manifest(conn)?;
     let total_chunks = chunk_count(conn)?;
     let active_model_id = active_embedding_model_id(conn)?;
@@ -259,7 +259,7 @@ pub(crate) fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
     let missing = total_chunks.saturating_sub(current + stale + failed + blocked);
     let skipped_chunks = fastembed.skipped_embeddings;
     let eligible_chunks = total_chunks.saturating_sub(skipped_chunks);
-    Ok(LocalAiStatus {
+    Ok(LlmStatus {
         embedding,
         artifacts: ArtifactCounts {
             total_chunks,

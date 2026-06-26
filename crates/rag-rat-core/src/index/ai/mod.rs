@@ -95,7 +95,7 @@ impl ArtifactStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct LocalAiStatus {
+pub struct LlmStatus {
     pub embedding: CapabilityStatus,
     pub artifacts: ArtifactCounts,
     pub fastembed: FastEmbedOperationalStatus,

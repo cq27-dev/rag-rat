@@ -5,7 +5,7 @@
 use super::*;
 
 impl IndexDatabase {
-    pub fn local_ai_status(&self) -> anyhow::Result<LocalAiStatus> {
+    pub fn llm_status(&self) -> anyhow::Result<LlmStatus> {
         ai::status(self.storage.connection())
     }
 

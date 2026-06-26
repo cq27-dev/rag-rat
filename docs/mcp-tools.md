@@ -73,7 +73,7 @@ To run from a checkout without installing, use a project-scoped server whose com
 - `github_issue_search`: `{ "query": string, "limit"?: number }`
 - `github_refs_for_path`: `{ "path": string, "limit"?: number }`
 - `rationale_search`: `{ "query": string, "limit"?: number, "include"?: ("fallback")[] }`
-- `local_ai_status`: `{}`
+- `llm_status`: `{}`
 - `heal_index`: `{ "limit"?: number }`
 - `github_sync_status`: `{}`
 - `index_status`: `{}`
@@ -347,7 +347,7 @@ last sync time, and whether the `gh` CLI capability is available.
 already-indexed files whose current source no longer matches the stored SQLite index, then refreshes
 SQLite FTS. It does not discover brand-new files; run `rag-rat index` for discovery.
 
-Local AI artifacts are explicit and current-only. `local_ai_status` reports embedding model state,
+Embedding artifacts are explicit and current-only. `llm_status` reports embedding model state,
 artifact counts, FastEmbed build/cache/model details, and the last reconcile throughput summary when
 available. The CLI-only `models install embedding-hash` command selects the deterministic baseline
 embedder. Building with `--features fastembed` enables the real local

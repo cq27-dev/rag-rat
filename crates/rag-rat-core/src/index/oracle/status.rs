@@ -1,5 +1,5 @@
-//! Oracle status — the serializable summary surfaced like `local_ai_status` (phase 2 wires it into
-//! the MCP `local_ai_status`-style view; phase 1 just exposes the type + builder).
+//! Oracle status — the serializable summary surfaced like `llm_status` (phase 2 wires it into
+//! the MCP `llm_status`-style view; phase 1 just exposes the type + builder).
 
 use rusqlite::Connection;
 use serde::Serialize;
