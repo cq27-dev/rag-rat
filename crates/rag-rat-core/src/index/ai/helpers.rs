@@ -10,7 +10,22 @@ pub(crate) fn embed_query(
     let Ok(embedder) = active_embedder(conn, None) else {
         return Ok(None);
     };
-    embed_query_with(&*embedder, query).map(Some)
+    // A RUNTIME embed failure on the QUERY path degrades to lexical (BM25), exactly like an
+    // unavailable model — `None` means "no query vector, fall back". This matters for the remote
+    // (Ollama) backend: a transient endpoint outage (timeout / connection refused / 5xx) must not
+    // make EVERY `search` call error; the user still gets BM25 results. This is the QUERY path ONLY
+    // — the reconcile/chunk path keeps propagating the error so chunks are marked failed/retryable
+    // and re-embedded once the endpoint recovers.
+    match embed_query_with(&*embedder, query) {
+        Ok(embedding) => Ok(Some(embedding)),
+        Err(err) => {
+            eprintln!(
+                "rag-rat: query embedding failed ({}), falling back to lexical search: {err}",
+                embedder.model_id()
+            );
+            Ok(None)
+        },
+    }
 }
 
 pub(crate) fn hash_query_embedding(query: &str) -> anyhow::Result<QueryEmbedding> {
@@ -49,7 +64,16 @@ pub(crate) fn active_embedding_model_version(
     conn: &Connection,
     model_id: &str,
 ) -> anyhow::Result<String> {
-    if let Some(version) = reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)? {
+    // The `embedding_active_model_version` meta is the freshness key of the ACTIVE model ONLY (it
+    // carries the ollama endpoint hash when ollama is active). It must NOT be returned for a
+    // non-active model: `fastembed_operational_status` asks for FASTEMBED_MODEL_ID's version even
+    // when FastEmbed is inactive, and comparing existing FastEmbed rows against `hash-v1` (or the
+    // ollama endpoint hash) would spuriously report them stale/missing. For a non-active model,
+    // return its OWN static `spec.version`. The reconcile/active path always queries the active
+    // model, so it still gets the dynamic meta.
+    if model_id == active_embedding_model_id(conn)?
+        && let Some(version) = reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?
+    {
         return Ok(version);
     }
     Ok(default_model_version(model_id).to_string())
@@ -514,6 +538,73 @@ mod tests {
         set_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
         let err = active_remote_config(&conn).expect_err("malformed meta must error");
         assert!(err.to_string().contains("malformed"), "{err}");
+    }
+
+    /// Mark `model_id` Ready + active in a manifest-seeded conn (mirrors a real install's DB
+    /// state).
+    fn activate_model(conn: &Connection, model_id: &str) {
+        ensure_model_manifest(conn).unwrap();
+        let dim = spec(model_id).unwrap().dim;
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2
+             WHERE model_id = ?1",
+            params![model_id, i64::try_from(dim).unwrap()],
+        )
+        .unwrap();
+        set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id).unwrap();
+    }
+
+    #[test]
+    fn active_embedding_model_version_is_scoped_to_the_active_model() {
+        use crate::embedding_models::{FASTEMBED_MODEL_ID, OLLAMA_ALL_MINILM_MODEL_ID};
+
+        // Ollama is active with a dynamic endpoint-hash freshness key in the global meta.
+        let conn = schema_conn();
+        activate_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID);
+        let endpoint_hash = "ollama-all-minilm-v1-deadbeefcafef00d";
+        set_reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, endpoint_hash).unwrap();
+
+        // The ACTIVE model gets the dynamic meta...
+        assert_eq!(
+            active_embedding_model_version(&conn, OLLAMA_ALL_MINILM_MODEL_ID).unwrap(),
+            endpoint_hash,
+        );
+        // ...but a NON-active model gets its OWN static spec.version, NOT the ollama hash — so
+        // fastembed_operational_status doesn't report existing FastEmbed rows stale against the
+        // active model's key.
+        let fastembed_version = active_embedding_model_version(&conn, FASTEMBED_MODEL_ID).unwrap();
+        assert_eq!(fastembed_version, spec(FASTEMBED_MODEL_ID).unwrap().version);
+        assert_ne!(fastembed_version, endpoint_hash, "must not leak the ollama hash to fastembed");
+    }
+
+    #[test]
+    fn embed_query_falls_back_to_lexical_when_the_remote_query_embed_fails() {
+        use crate::embedding_models::OLLAMA_ALL_MINILM_MODEL_ID;
+
+        // An ollama-active conn whose persisted endpoint points at a CLOSED port: construction
+        // succeeds (from_remote_config doesn't connect), but embed_batch fails (connection
+        // refused). The QUERY path must degrade to lexical — Ok(None), not Err — so search
+        // still returns BM25.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let conn = schema_conn();
+        activate_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID);
+        let remote = RemoteEmbeddingConfig {
+            mode: RemoteMode::Connect,
+            model: "all-minilm".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{port}")),
+            auth_env: None,
+            batch_size: 256,
+            request_timeout_s: 2,
+        };
+        set_active_remote_config(&conn, &remote).unwrap();
+
+        let result =
+            embed_query(&conn, "some query").expect("must NOT propagate the runtime error");
+        assert!(result.is_none(), "a failed remote query embed degrades to lexical (None)");
     }
 
     #[test]
