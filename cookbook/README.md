@@ -40,7 +40,8 @@ Hard rules:
 {
   "model": "all-minilm",     // required: embedding model to pull + serve
   "request_timeout_s": 600,  // optional: budget for pull+boot+first response (advisory)
-  "gpu": null                // optional: provider GPU spec ("A10G", …) or null for CPU
+  "gpu": null                // optional: provider GPU spec or null. For Modal this is "A10G"/"T4"
+                             //   (CPU default); for RunPod a gpuTypeId like "NVIDIA RTX A4000".
 }
 ```
 
@@ -56,11 +57,32 @@ Hard rules:
 `auth_token` is `null` (or omitted) when the tunnel is open. rag-rat treats a missing field and an
 explicit `null` identically.
 
+## Invoking — provider as a subcommand
+
+The published form is **one package, provider as a subcommand**, via the package bin:
+
+```bash
+npx @rag-rat/cookbook modal     # provision on Modal
+npx @rag-rat/cookbook runpod    # provision on RunPod
+```
+
+The bin (`dist/cli.mjs`) reads the provider from `argv[2]` and dynamically imports the matching
+recipe (`recipes/<provider>-ollama.mjs`). Recipes self-run on import, so the dispatcher adds only
+routing — no contract logic. An unknown or missing provider prints the available providers to
+stderr and exits `1` (no handshake). The recipe files stay **directly runnable** too, which is what
+rag-rat actually spawns:
+
+```bash
+node dist/recipes/modal-ollama.mjs     # equivalent to `cookbook modal`
+node dist/recipes/runpod-ollama.mjs    # equivalent to `cookbook runpod`
+```
+
 ## Recipes
 
-| Recipe | Provider | Entry (post-build) |
-|---|---|---|
-| `recipes/modal-ollama.mts` | [Modal](https://modal.com) Sandboxes | `dist/recipes/modal-ollama.mjs` |
+| Recipe | Provider | Subcommand | Entry (post-build) |
+|---|---|---|---|
+| `recipes/modal-ollama.mts` | [Modal](https://modal.com) Sandboxes | `modal` | `dist/recipes/modal-ollama.mjs` |
+| `recipes/runpod-ollama.mts` | [RunPod](https://runpod.io) GPU pods | `runpod` | `dist/recipes/runpod-ollama.mjs` |
 
 ### modal-ollama
 
@@ -81,21 +103,53 @@ Provider gotchas baked into the recipe (each one cost real time to find):
 Auth comes from the ambient env (`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`) or `~/.modal.toml` —
 rag-rat does not pass Modal creds through `RAG_RAT_COOKBOOK_INPUT`.
 
+### runpod-ollama
+
+Provisions an ephemeral **GPU pod** on [RunPod](https://runpod.io) from the `ollama/ollama:latest`
+image and serves an embedding model on port `11434`. RunPod proxies that HTTP port at
+`https://<podId>-11434.proxy.runpod.net` — that proxy URL is the endpoint.
+
+It talks to RunPod's **GraphQL API directly over `fetch`** (`podFindAndDeployOnDemand` to deploy,
+`podTerminate` to tear down). The `runpod-sdk` npm package is deliberately **not** a dependency: it
+only covers serverless endpoints (`run`/`runSync`/`status`/`stream`/`health`) and has no
+pod-management surface.
+
+Provider gotchas baked into the recipe:
+
+- The ollama image **entrypoint is `/bin/ollama`**, so `dockerArgs: "serve"` runs `ollama serve`
+  (`"ollama serve"` would exec `ollama ollama serve`). `dockerArgs` sets the container CMD,
+  appended to the entrypoint.
+- ollama defaults to `127.0.0.1:11434`, unreachable through the proxy — the recipe sets
+  `OLLAMA_HOST=0.0.0.0:11434` in the pod env.
+- There is **no in-pod exec** in `podFindAndDeployOnDemand`, so the model is pulled **client-side**
+  over the proxy URL (`POST /api/pull`, non-streaming, retried until the pod finishes booting),
+  then `/api/embed` is probed before the handshake.
+- A pod **idle-timeout** (no proxy traffic) is the leaked-pod backstop: a pod that rag-rat never
+  tears down self-stops instead of billing forever.
+- Default GPU is a cheap `NVIDIA RTX A4000`; `input.gpu` is a `gpuTypeId` override.
+
+Auth: `RUNPOD_API_KEY` in the process env — the recipe errors and exits `1` (no handshake) if it's
+unset. rag-rat does not pass it through `RAG_RAT_COOKBOOK_INPUT`.
+
 ## Build & run
 
 ```bash
 npm install
-npm run build        # tsc → dist/ (recipes emit .mjs, the contract lib emits .js)
+npm run build        # tsc → dist/ (bin → dist/cli.mjs, recipes → dist/recipes/*.mjs, lib → dist/src/contract.js)
 npm run typecheck    # tsc --noEmit
 
-# invoke a recipe the way rag-rat does:
+# via the bin dispatcher (the published form):
+RAG_RAT_COOKBOOK_INPUT='{"model":"all-minilm"}' node dist/cli.mjs modal
+RUNPOD_API_KEY=… RAG_RAT_COOKBOOK_INPUT='{"model":"all-minilm"}' node dist/cli.mjs runpod
+
+# or a recipe directly (what rag-rat spawns):
 RAG_RAT_COOKBOOK_INPUT='{"model":"all-minilm"}' node dist/recipes/modal-ollama.mjs
 
 # dev (no build step), via tsx:
-RAG_RAT_COOKBOOK_INPUT='{"model":"all-minilm"}' npx tsx recipes/modal-ollama.mts
+RAG_RAT_COOKBOOK_INPUT='{"model":"all-minilm"}' npx tsx recipes/runpod-ollama.mts
 ```
 
-The recipe runs until you `SIGTERM`/`SIGINT` it (Ctrl-C), at which point it terminates the box.
+The recipe runs until you `SIGTERM`/`SIGINT` it (Ctrl-C), at which point it tears down the box.
 
 ## Writing your own recipe
 
@@ -123,13 +177,21 @@ handlers (so a signal mid-provision still tears down), prints the single handsha
 parks the process, and tears down + exits on signal. Your `provision` throws to fail (the helper
 logs to stderr and exits non-zero before any handshake). Keep all of your own logging on stderr.
 
+The contract module also exports the shared readiness helper **`verifyEmbed(endpoint, { model,
+budgetMs, headers? })`** — poll `<endpoint>/api/embed` until a real vector comes back, or the
+budget elapses. Call it before returning from `provision` (a reachable box is not a serving box).
+To add a provider, drop a `recipes/<name>-ollama.mts` and register it in the `PROVIDERS` map in
+`cli.mts`.
+
 ## Layout
 
 ```
 cookbook/
-  package.json                 @rag-rat/cookbook — deps: modal; dev: typescript, tsx
+  package.json                 @rag-rat/cookbook — bin → dist/cli.mjs; deps: modal; dev: typescript, tsx
   tsconfig.json                strict, ESM (NodeNext)
-  src/contract.ts              the published contract: types + runRecipe() helper
-  recipes/modal-ollama.mts     the Modal + Ollama recipe (compiles to dist/recipes/modal-ollama.mjs)
+  cli.mts                      the bin dispatcher: `cookbook <provider>` → imports the recipe (→ dist/cli.mjs)
+  src/contract.ts              the published contract: types + runRecipe() + verifyEmbed() (→ dist/src/contract.js)
+  recipes/modal-ollama.mts     the Modal + Ollama recipe       (→ dist/recipes/modal-ollama.mjs)
+  recipes/runpod-ollama.mts    the RunPod + Ollama recipe       (→ dist/recipes/runpod-ollama.mjs)
   README.md                    this file
 ```

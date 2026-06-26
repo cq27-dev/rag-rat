@@ -175,24 +175,36 @@ impl CookbookProvisioner {
     }
 }
 
-/// Build the `Command` for a cookbook spec by its shape: a `.mjs`/`.js` file → `node`; a `.ts` file
-/// → `npx tsx`; anything else → `npx -y <spec>` (an npm package). `-y` auto-confirms the npx
-/// install.
+/// Build the `Command` for a cookbook spec. The spec is split on whitespace into tokens (a package
+/// or recipe path FOLLOWED by provider subcommand/args, e.g. `@rag-rat/cookbook modal`). The FIRST
+/// token decides the runner; the first token + the rest are passed as SEPARATE process args:
+/// - first token ends `.mjs`/`.js` → `node <first> <rest...>`
+/// - first token ends `.ts`/`.mts` → `npx tsx <first> <rest...>` (recipes are `.mts`)
+/// - else (a package spec) → `npx -y <first> <rest...>` (`-y` auto-confirms the npx install)
+///
+/// Whitespace splitting is SIMPLE (no shell quoting): a recipe path containing spaces is NOT
+/// supported — point `cookbook` at a space-free path (or an npm spec) instead. Empty tokens are
+/// dropped. An all-empty spec degrades to a bare `npx -y` (which fails to spawn → a clear error).
 fn cookbook_command(cookbook: &str) -> Command {
-    let lower = cookbook.to_ascii_lowercase();
-    if lower.ends_with(".mjs") || lower.ends_with(".js") {
+    let tokens: Vec<&str> = cookbook.split_whitespace().collect();
+    let first = tokens.first().copied().unwrap_or("");
+    let rest = &tokens[tokens.len().min(1)..];
+    let lower = first.to_ascii_lowercase();
+    let mut c = if lower.ends_with(".mjs") || lower.ends_with(".js") {
         let mut c = Command::new("node");
-        c.arg(cookbook);
+        c.arg(first);
         c
-    } else if lower.ends_with(".ts") {
+    } else if lower.ends_with(".ts") || lower.ends_with(".mts") {
         let mut c = Command::new("npx");
-        c.args(["tsx", cookbook]);
+        c.args(["tsx", first]);
         c
     } else {
         let mut c = Command::new("npx");
-        c.args(["-y", cookbook]);
+        c.args(["-y", first]);
         c
-    }
+    };
+    c.args(rest);
+    c
 }
 
 /// Build the "provisioning failed" error after the child exited before a handshake: reap it, join
@@ -391,11 +403,14 @@ mod tests {
 
     #[test]
     fn cookbook_command_resolves_recipe_shapes() {
-        // The resolver routes by shape: .mjs/.js → node; .ts → npx tsx; else → npx -y <spec>.
+        // The resolver routes by the FIRST token's shape: .mjs/.js → node; .ts/.mts → npx tsx; else
+        // → npx -y <spec>. The rest of the whitespace-split tokens (provider subcommand/args) are
+        // passed through as SEPARATE args.
         let prog = |c: &Command| c.get_program().to_string_lossy().to_string();
         let args =
             |c: &Command| c.get_args().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>();
 
+        // Single-token forms.
         let mjs = cookbook_command("./recipe.mjs");
         assert_eq!(prog(&mjs), "node");
         assert_eq!(args(&mjs), vec!["./recipe.mjs"]);
@@ -404,8 +419,28 @@ mod tests {
         assert_eq!(prog(&ts), "npx");
         assert_eq!(args(&ts), vec!["tsx", "./recipe.ts"]);
 
+        // `.mts` (the recipes' actual extension) routes through npx tsx too.
+        let mts = cookbook_command("./recipe.mts");
+        assert_eq!(prog(&mts), "npx");
+        assert_eq!(args(&mts), vec!["tsx", "./recipe.mts"]);
+
         let pkg = cookbook_command("@rag-rat/cookbook/modal");
         assert_eq!(prog(&pkg), "npx");
         assert_eq!(args(&pkg), vec!["-y", "@rag-rat/cookbook/modal"]);
+
+        // Multi-token: package + provider subcommand → `npx -y <pkg> <subcommand>`.
+        let pkg_sub = cookbook_command("@rag-rat/cookbook modal");
+        assert_eq!(prog(&pkg_sub), "npx");
+        assert_eq!(args(&pkg_sub), vec!["-y", "@rag-rat/cookbook", "modal"]);
+
+        // Multi-token: a recipe path + an arg → `node <path> <arg>`.
+        let path_arg = cookbook_command("/abs/cli.mjs runpod");
+        assert_eq!(prog(&path_arg), "node");
+        assert_eq!(args(&path_arg), vec!["/abs/cli.mjs", "runpod"]);
+
+        // Extra whitespace + empty tokens are trimmed.
+        let spaced = cookbook_command("  @rag-rat/cookbook   modal  ");
+        assert_eq!(prog(&spaced), "npx");
+        assert_eq!(args(&spaced), vec!["-y", "@rag-rat/cookbook", "modal"]);
     }
 }

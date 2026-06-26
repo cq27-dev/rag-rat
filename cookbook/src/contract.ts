@@ -118,6 +118,74 @@ function describe(v: unknown): string {
   return typeof v;
 }
 
+/** Resolves after `ms` milliseconds. */
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Options for {@link verifyEmbed}. */
+export interface VerifyEmbedOptions {
+  /** Embedding model name to probe with (the value the server keys on). */
+  readonly model: string;
+  /** Wall-clock budget in ms to keep retrying before giving up. */
+  readonly budgetMs: number;
+  /** Extra headers (e.g. an auth bearer) to send with each probe. Defaults to none. */
+  readonly headers?: Record<string, string>;
+  /** Delay between retries in ms. Defaults to 2000. */
+  readonly pollIntervalMs?: number;
+}
+
+/**
+ * Polls `<endpoint>/api/embed` until it returns a real embedding vector, or the budget runs out.
+ *
+ * Every recipe must call this BEFORE handing rag-rat the endpoint: a box can be reachable (tunnel
+ * up) while ollama is still loading the model, so "box created" is not "box serving". A non-empty
+ * `embeddings[0]` vector is the readiness signal. Throws if the budget elapses with no vector.
+ *
+ * Shared by every recipe so the readiness contract (Ollama `/api/embed`, retry-until-ready) lives
+ * in exactly one place rather than copy-pasted per provider.
+ */
+export async function verifyEmbed(endpoint: string, options: VerifyEmbedOptions): Promise<void> {
+  const url = `${endpoint.replace(/\/+$/, "")}/api/embed`;
+  const pollIntervalMs = options.pollIntervalMs ?? 2000;
+  const deadline = Date.now() + options.budgetMs;
+  let lastError = "(no attempt made)";
+  let attempt = 0;
+
+  while (Date.now() < deadline) {
+    attempt += 1;
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...options.headers },
+        body: JSON.stringify({ model: options.model, input: "rag-rat embed readiness probe" }),
+      });
+      if (!res.ok) {
+        lastError = `HTTP ${res.status} ${res.statusText}`;
+      } else {
+        const body = (await res.json()) as { embeddings?: unknown };
+        const embeddings = body.embeddings;
+        if (
+          Array.isArray(embeddings) &&
+          embeddings.length > 0 &&
+          Array.isArray(embeddings[0]) &&
+          embeddings[0].length > 0
+        ) {
+          return;
+        }
+        lastError = `200 OK but no embedding vector in response: ${JSON.stringify(body).slice(0, 200)}`;
+      }
+    } catch (cause) {
+      lastError = (cause as Error).message;
+    }
+    log(`embed probe attempt ${attempt} not ready (${lastError}); retrying…`);
+    await sleep(pollIntervalMs);
+  }
+  throw new Error(
+    `/api/embed never returned a vector within ${options.budgetMs}ms; last error: ${lastError}`,
+  );
+}
+
 /** Serializes the handshake to its canonical one-line wire form (omitting an undefined token). */
 export function encodeHandshake(h: Handshake): string {
   const wire: Handshake =

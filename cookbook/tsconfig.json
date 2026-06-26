@@ -23,6 +23,6 @@
     "verbatimModuleSyntax": true,
     "isolatedModules": true
   },
-  "include": ["src/**/*.ts", "recipes/**/*.mts"],
+  "include": ["src/**/*.ts", "recipes/**/*.mts", "cli.mts"],
   "exclude": ["dist", "node_modules"]
 }

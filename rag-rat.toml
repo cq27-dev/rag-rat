@@ -18,7 +18,8 @@ model = "minishlab/potion-retrieval-32M"
 # auth_env = "OLLAMA_TOKEN"      # NAME of an env var with a bearer token (never the token)
 #   EPHEMERAL (provision-on-demand; queries use a local ollama):
 # [local_ai.embedding.remote]
-# cookbook = "@rag-rat/cookbook/modal"        # npm spec, or a recipe path (.mjs/.ts)
+# cookbook = "@rag-rat/cookbook modal"        # npm package + provider subcommand (modal/runpod),
+                                              # or a recipe path + args (.mjs/.js/.ts/.mts)
 # model = "all-minilm"
 # query_endpoint = "http://localhost:11434"   # local ollama for query embedding (this is the default)
 

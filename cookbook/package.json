@@ -7,24 +7,27 @@
   "engines": {
     "node": ">=18"
   },
-  "main": "dist/contract.js",
-  "types": "dist/contract.d.ts",
+  "main": "dist/src/contract.js",
+  "types": "dist/src/contract.d.ts",
+  "bin": "./dist/cli.mjs",
   "exports": {
     ".": {
-      "types": "./dist/contract.d.ts",
-      "default": "./dist/contract.js"
+      "types": "./dist/src/contract.d.ts",
+      "default": "./dist/src/contract.js"
     }
   },
   "files": [
     "dist",
     "src",
     "recipes",
+    "cli.mts",
     "README.md"
   ],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "recipe:modal-ollama": "node dist/recipes/modal-ollama.mjs"
+    "recipe:modal-ollama": "node dist/recipes/modal-ollama.mjs",
+    "recipe:runpod-ollama": "node dist/recipes/runpod-ollama.mjs"
   },
   "dependencies": {
     "modal": "^0.8.1"

@@ -23,7 +23,7 @@
 import { ModalClient } from "modal";
 import type { Sandbox } from "modal";
 
-import { type CookbookInput, log, runRecipe } from "../src/contract.js";
+import { type CookbookInput, log, runRecipe, verifyEmbed } from "../src/contract.js";
 
 /** Port ollama serves on inside the box; the one port we tunnel out. */
 const OLLAMA_PORT = 11434;
@@ -93,7 +93,7 @@ async function provision(input: CookbookInput): Promise<{
 
     // Verify the server actually embeds before we hand rag-rat the endpoint. This catches a
     // box that booted but isn't serving (the whole point of waiting to handshake).
-    await verifyEmbed(endpoint, input.model, requestTimeoutMs);
+    await verifyEmbed(endpoint, { model: input.model, budgetMs: requestTimeoutMs });
     log("embed verification passed; box is serving");
 
     // Open tunnel via encryptedPorts → no per-request token needed. auth_token stays null.
@@ -104,49 +104,6 @@ async function provision(input: CookbookInput): Promise<{
     await sb.terminate().catch((e) => log("terminate-on-error failed (backstop will reap):", e));
     throw cause;
   }
-}
-
-/** POST /api/embed and confirm a non-empty vector comes back, retrying until the budget runs out. */
-async function verifyEmbed(endpoint: string, model: string, budgetMs: number): Promise<void> {
-  const url = `${endpoint.replace(/\/+$/, "")}/api/embed`;
-  const deadline = Date.now() + budgetMs;
-  let lastError = "(no attempt made)";
-  let attempt = 0;
-
-  while (Date.now() < deadline) {
-    attempt += 1;
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model, input: "rag-rat embed readiness probe" }),
-      });
-      if (!res.ok) {
-        lastError = `HTTP ${res.status} ${res.statusText}`;
-      } else {
-        const body = (await res.json()) as { embeddings?: unknown };
-        const embeddings = body.embeddings;
-        if (
-          Array.isArray(embeddings) &&
-          embeddings.length > 0 &&
-          Array.isArray(embeddings[0]) &&
-          embeddings[0].length > 0
-        ) {
-          return;
-        }
-        lastError = `200 OK but no embedding vector in response: ${JSON.stringify(body).slice(0, 200)}`;
-      }
-    } catch (cause) {
-      lastError = (cause as Error).message;
-    }
-    log(`embed probe attempt ${attempt} not ready (${lastError}); retrying…`);
-    await sleep(2000);
-  }
-  throw new Error(`/api/embed never returned a vector within ${budgetMs}ms; last error: ${lastError}`);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Destroy the box. Idempotent enough — terminate on an already-gone box is a no-op/soft error. */

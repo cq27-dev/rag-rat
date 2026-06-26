@@ -82,8 +82,11 @@ space as the remote-embedded chunks.
 model = "sentence-transformers/all-MiniLM-L6-v2"
 
 [local_ai.embedding.remote]
-cookbook = "@rag-rat/cookbook/modal"        # EPHEMERAL: an npm spec (npx -y), or a recipe path
-                                            #   (.mjs/.js → node, .ts → npx tsx)
+cookbook = "@rag-rat/cookbook modal"        # EPHEMERAL: an npm package + a provider subcommand
+                                            #   (e.g. `modal`, `runpod`), or a recipe path + args.
+                                            #   First token picks the runner: .mjs/.js → node,
+                                            #   .ts/.mts → npx tsx, else → npx -y. The value is split
+                                            #   on whitespace — paths with spaces are unsupported.
 model = "all-minilm"                        # the Ollama-side model name
 # query_endpoint = "http://localhost:11434" # the LOCAL ollama for QUERY embedding
                                             #   (defaults to http://localhost:11434)
