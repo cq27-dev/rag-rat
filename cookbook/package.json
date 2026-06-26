@@ -1,8 +1,15 @@
 {
   "name": "@rag-rat/cookbook",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Ephemeral remote-runtime provisioning recipes for rag-rat. rag-rat (Rust) spawns a recipe as a subprocess, reads a typed JSONL event stream from its stdout (status/log/ready/error), embeds against the endpoint, then signals teardown.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cq27-dev/rag-rat.git",
+    "directory": "cookbook"
+  },
+  "homepage": "https://github.com/cq27-dev/rag-rat/tree/main/cookbook#readme",
+  "bugs": "https://github.com/cq27-dev/rag-rat/issues",
   "type": "module",
   "engines": {
     "node": ">=18"

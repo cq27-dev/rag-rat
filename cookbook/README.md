@@ -1,11 +1,11 @@
 # @rag-rat/cookbook
 
-Ephemeral remote-runtime provisioning recipes for [rag-rat](../). A **recipe** is a standalone
+Ephemeral remote-runtime provisioning recipes for [rag-rat](https://github.com/cq27-dev/rag-rat). A **recipe** is a standalone
 Node program that rag-rat spawns as a subprocess: it provisions a remote box (e.g. an Ollama
 embedding server), streams typed JSONL events to stdout (handing rag-rat the endpoint via a
 `ready` event), holds the box while rag-rat works, then tears it down on signal.
 
-This is the JS/TS half of rag-rat's remote-runtime rework (#317/#318). rag-rat (Rust) owns the
+This is the JS/TS half of rag-rat's remote-runtime rework. rag-rat (Rust) owns the
 lifecycle and the embedding traffic; the cookbook owns provider provisioning.
 
 > **Security — a cookbook spec must be TRUSTED.** A recipe runs with your full privileges and
@@ -18,7 +18,7 @@ lifecycle and the embedding traffic; the cookbook owns provider provisioning.
 ## The process contract
 
 rag-rat and a recipe communicate over a strict process protocol. **stdout is a typed JSONL event
-stream** — one JSON object per line — which a future ratatui `log` view (#329) renders live. The
+stream** — one JSON object per line — which a future ratatui `log` view renders live. The
 Rust parser is built against the exact event shapes below; implement them precisely.
 
 | Stage | rag-rat | recipe |
