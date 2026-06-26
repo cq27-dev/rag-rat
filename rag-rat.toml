@@ -3,8 +3,19 @@ root = "."
 database = ".rag-rat/index.sqlite"
 
 [local_ai.embedding]
-# model2vec — static embeddings; ~100-500x faster on CPU, some quality cost
-model = "model2vec"
+# the MODEL by its full id (the HF path); minishlab/potion-retrieval-32M is the static model2vec
+# tier — ~100-500x faster on CPU, some quality cost. "none" disables embeddings.
+model = "minishlab/potion-retrieval-32M"
+
+# Optional: serve a TRANSFORMER model over an Ollama server instead of in-process — e.g.
+# model = "sentence-transformers/all-MiniLM-L6-v2" (not model2vec/hash). Presence of this block flips
+# the runtime; same model + dim, only transport changes. Endpoint is read from the toml below
+# (required in connect mode). See docs/config.md "Remote embedding over Ollama".
+# [local_ai.embedding.remote]
+# mode = "connect"               # "connect" only for now ("ephemeral" reserved)
+# endpoint = "http://box:11434"  # the Ollama server URL (required in connect mode)
+# model = "all-minilm"           # the Ollama-side model name
+# auth_env = "OLLAMA_TOKEN"      # NAME of an env var with a bearer token (never the token)
 
 [local_ai.embedding.runtime]
 batch_size = 64

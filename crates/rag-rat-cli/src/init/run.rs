@@ -252,6 +252,8 @@ pub(crate) fn setup_model_and_reconcile(
         return Ok(());
     }
     eprintln!("init: installing model {model_id}");
+    // A `[remote]` block (endpoint from the toml, validated at config-parse) installs the model
+    // over Ollama; absent → local install.
     let remote = config.local_ai.embedding.remote.as_ref();
     match db.install_model(model_id, remote) {
         Ok(model) => eprintln!("init: model status {} {}", model.model_id, model.status),

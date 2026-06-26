@@ -258,7 +258,8 @@ mod tests {
         assert!(text.contains("rust = [\"crates/app/src\"]"));
         assert!(text.contains("typescript = [\"web/src\", \"app/src\"]"));
         assert!(text.contains("[local_ai.embedding]"));
-        assert!(text.contains("model = \"model2vec\""));
+        // The selector is now the model_id (HF path), not an alias (#317).
+        assert!(text.contains("model = \"minishlab/potion-retrieval-32M\""));
         // The oracle section is always rendered so the knob is discoverable; default is OFF.
         assert!(text.contains("[oracle]"));
         assert!(text.contains("auto_run = false"));

@@ -6,7 +6,9 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::embedding_models::{Backend, EmbeddingModelSpec, spec_for_alias};
+use crate::embedding_models::{
+    Backend, EmbeddingModelSpec, FASTEMBED_MODEL_ID, MODEL2VEC_MODEL_ID, spec,
+};
 use crate::language::{Language, LanguageError};
 
 #[derive(Debug, Clone)]
@@ -117,19 +119,20 @@ pub struct EmbeddingConfig {
 
 /// The embedding backend selector (`[local_ai.embedding] model = "..."`).
 ///
-/// Resolves the toml `model = "..."` string through the [`crate::embedding_models`] registry, so
-/// ANY registered model (`minilm` / `bge` / `jina` / `model2vec` / `hash`, or any of their aliases)
-/// is selectable — adding a model to the registry makes it selectable here with no edit. The
-/// embeddings-off choice (`none` / `off`) carries `None`. Kept a thin wrapper over a registry spec
-/// reference so `config` resolves model identity without depending on `index`
-/// (`crate::embedding_models` has no `index` dependency, so there is no cycle).
+/// Resolves the toml `model = "..."` string through the [`crate::embedding_models`] registry by its
+/// `model_id` (the HF path — NO aliases, #317), so ANY registered model is selectable by its full
+/// name — adding a model to the registry makes it selectable here with no edit. The embeddings-off
+/// choice (`none` / `off`) carries `None`. Kept a thin wrapper over a registry spec reference so
+/// `config` resolves model identity without depending on `index` (`crate::embedding_models` has no
+/// `index` dependency, so there is no cycle).
 ///
 /// The common tiers, for reference:
-/// - `minilm` (the `EmbeddingBackend::default`): MiniLM transformer — best general quality, but the
-///   cold backfill is CPU-bound (~10-100 chunks/sec), so impractical for very large repos.
-/// - `model2vec`: static token-vector lookup + mean-pool — ~100-500× faster on CPU at some
-///   retrieval-quality cost (no context/word-order). The choice for huge repos that still want
-///   vectors.
+/// - `sentence-transformers/all-MiniLM-L6-v2` (the `EmbeddingBackend::default`): MiniLM transformer
+///   — best general quality, but the cold backfill is CPU-bound (~10-100 chunks/sec), so
+///   impractical for very large repos.
+/// - `minishlab/potion-retrieval-32M`: static token-vector lookup + mean-pool — ~100-500× faster on
+///   CPU at some retrieval-quality cost (no context/word-order). The choice for huge repos that
+///   still want vectors.
 /// - `none`: structural + BM25 only; no dense vectors. `semantic_search` degrades to BM25. The
 ///   cheapest option for enormous codebases where any embedding backfill is too slow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,21 +143,21 @@ impl EmbeddingBackend {
     pub const NONE: Self = Self(None);
 
     /// The FastEmbed MiniLM tier — the default backend (`init` recommends it for smaller repos).
-    /// Resolved from the registry; the `minilm` alias is guaranteed present by the registry test.
+    /// Resolved from the registry by model_id.
     pub fn fast_embed() -> Self {
-        Self(spec_for_alias("minilm"))
+        Self(spec(FASTEMBED_MODEL_ID))
     }
 
     /// The Model2Vec static tier (`init` recommends it for very large repos).
     pub fn model2vec() -> Self {
-        Self(spec_for_alias("model2vec"))
+        Self(spec(MODEL2VEC_MODEL_ID))
     }
 
-    /// The canonical toml selector for this backend — the spec's FIRST alias (`init` renders this
-    /// back into `rag-rat.toml`), or `"none"` for the embeddings-off choice.
+    /// The toml selector for this backend — the model_id (the HF path `init` renders back into
+    /// `rag-rat.toml`), or `"none"` for the embeddings-off choice.
     pub fn as_str(self) -> &'static str {
         match self.0 {
-            Some(spec) => spec.aliases.first().copied().unwrap_or(spec.model_id),
+            Some(spec) => spec.model_id,
             None => "none",
         }
     }
@@ -166,9 +169,9 @@ impl EmbeddingBackend {
     }
 
     /// The registry [`Backend`] this selector resolves to (`None` for the embeddings-off choice).
-    /// Lets `config` reason about which runtime a `model = "..."` picks — e.g. the
-    /// `[embedding.remote]` coherence check that pairs an Ollama backend with a remote block —
-    /// without re-deriving the mapping the registry already owns.
+    /// Lets `config` reason about a `model = "..."` selection without re-deriving the mapping the
+    /// registry owns — e.g. the `[embedding.remote]` guardrail that rejects serving a
+    /// non-transformer (static/hash) model over Ollama.
     pub fn registry_backend(self) -> Option<Backend> {
         self.0.map(|spec| spec.backend)
     }
@@ -184,12 +187,15 @@ impl FromStr for EmbeddingBackend {
     type Err = ConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.trim().to_ascii_lowercase();
-        match value.as_str() {
+        let value = value.trim();
+        // The embeddings-off keywords are case-insensitive; the MODEL selector is the HF path,
+        // which is CASE-SENSITIVE (`all-MiniLM-L6-v2`, `BAAI/...`) — match it verbatim via
+        // `spec`, never lowercased, or the case-sensitive model_id lookup would miss.
+        match value.to_ascii_lowercase().as_str() {
             "none" | "off" | "bm25" => Ok(Self::NONE),
-            other => spec_for_alias(other)
+            _ => spec(value)
                 .map(|spec| Self(Some(spec)))
-                .ok_or_else(|| ConfigError::UnknownEmbeddingBackend(other.to_string())),
+                .ok_or_else(|| ConfigError::UnknownEmbeddingBackend(value.to_string())),
         }
     }
 }
@@ -219,9 +225,10 @@ impl Default for EmbeddingRuntimeConfig {
 /// embedding only.
 ///
 /// Deliberately carries NO `dim` or `backend` field. The vector dimension comes from the registry
-/// spec of the selected model (the `ollama-all-minilm` row, dim 384) and is validated against the
-/// server's first response at runtime by the embedder (#317 task 4); the backend is implied by the
-/// selected registry model. Duplicating either here would be redundant and drift-prone.
+/// spec of the SELECTED model (`model = "sentence-transformers/all-MiniLM-L6-v2"`, dim 384) and is
+/// validated against the server's first response at runtime by the embedder; the runtime is implied
+/// by this block's mere PRESENCE (#317 rework). Duplicating either here would be redundant and
+/// drift-prone.
 ///
 /// `Serialize` (#317 task 5) lets the install step persist this verbatim into the secret-free
 /// `active_embedding_remote_config` meta, so the `conn`-based `active_embedder` can reconstruct the
@@ -238,8 +245,10 @@ pub struct RemoteEmbeddingConfig {
     /// own model identifier, NOT a `rag-rat` registry alias — the registry only supplies the dim
     /// parity contract.
     pub model: String,
-    /// Base URL of the remote server (e.g. `"http://localhost:11434"`). Required in `Connect`
-    /// mode; `/api/embed` is appended by the embedder.
+    /// Base URL of the remote server (e.g. `"http://localhost:11434"`); `/api/embed` is appended by
+    /// the embedder. REQUIRED in `Connect` mode (read from the toml at parse). `Option` only
+    /// because a future `Ephemeral` mode will inject it per-run via the provisioning cookbook
+    /// (#318).
     pub endpoint: Option<String>,
     /// Name of the environment variable holding the bearer token, if the server needs auth. Local
     /// Ollama needs none, so this is optional; the embedder reads the var once at construction.
@@ -724,8 +733,8 @@ impl TryFrom<RawLocalAi> for LocalAiConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawEmbedding {
-    /// `model = "<registered alias>" | "none"` — the embedding backend selector (`minilm`, `bge`,
-    /// `jina`, `model2vec`, … resolve through the embedding-model registry).
+    /// `model = "<model_id>" | "none"` — the embedding model selector, the registry model_id (the
+    /// HF path, e.g. `sentence-transformers/all-MiniLM-L6-v2`; no aliases, #317).
     model: Option<String>,
     #[serde(default)]
     runtime: RawEmbeddingRuntime,
@@ -742,17 +751,20 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
             None => EmbeddingBackend::default(),
         };
         let remote = raw.remote.map(RemoteEmbeddingConfig::try_from).transpose()?;
-        // Cross-field coherence: the `[embedding.remote]` block and the `model = "..."` selector
-        // must AGREE on whether embedding is remote. Run AFTER `RemoteEmbeddingConfig::try_from`
-        // (above) so a malformed block fails with its own specific error first. We REJECT
-        // incoherent configs rather than auto-selecting a backend — silently running the LOCAL
-        // model while the user believes remote offload is on (a remote block but a fastembed
-        // `model`) is the trap this guards.
-        let selects_ollama = backend.registry_backend() == Some(Backend::Ollama);
-        match (selects_ollama, remote.is_some()) {
-            (false, true) => return Err(ConfigError::RemoteEmbeddingBackendMismatch),
-            (true, false) => return Err(ConfigError::RemoteEmbeddingMissingConfig),
-            _ => {},
+        // #317 rework: the `model = "..."` selector names the MODEL; a `[remote]` block serves THAT
+        // model over Ollama. The two no longer have to "agree on a backend" — the old
+        // model="ollama" coupling (`RemoteEmbeddingBackendMismatch` /
+        // `RemoteEmbeddingMissingConfig`) is gone. The only coherence left: Ollama can only
+        // serve TRANSFORMER models, so a `[remote]` block on a static/hash model is a
+        // misconfiguration the dim probe couldn't usefully explain — reject it here with a
+        // clear message.
+        if remote.is_some()
+            && let Some(spec_backend) = backend.registry_backend()
+            && !matches!(spec_backend, Backend::FastEmbed)
+        {
+            return Err(ConfigError::RemoteEmbeddingNonTransformerModel(
+                backend.as_str().to_string(),
+            ));
         }
         Ok(Self { backend, runtime: raw.runtime.into(), remote })
     }
@@ -797,7 +809,8 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
         if model.is_empty() {
             return Err(ConfigError::RemoteEmbeddingMissingModel);
         }
-        // `Connect` mode needs a non-empty server URL to reach.
+        // `Connect` mode needs a non-empty server URL to reach — read from the toml here (there is
+        // no flag/env endpoint injection; the cookbook auto-provisioning path is deferred to #318).
         let endpoint = raw.endpoint.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
         if mode == RemoteMode::Connect && endpoint.is_none() {
             return Err(ConfigError::RemoteEmbeddingMissingEndpoint);
@@ -866,8 +879,9 @@ pub enum ConfigError {
     #[error("unknown target kind `{0}`")]
     UnknownTargetKind(String),
     #[error(
-        "unknown embedding backend `{0}` (expected a registered model alias such as `minilm`, \
-         `bge`, `jina`, `model2vec`, or `none`)"
+        "unknown embedding model `{0}` (expected a registered model id — the HF path, e.g. \
+         `sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`, \
+         `jinaai/jina-embeddings-v2-base-code`, `minishlab/potion-retrieval-32M` — or `none`)"
     )]
     UnknownEmbeddingBackend(String),
     #[error("unknown remote embedding mode `{0}` (expected `connect` or `ephemeral`)")]
@@ -894,15 +908,11 @@ pub enum ConfigError {
     )]
     RemoteEmbeddingEndpointHasCredentials,
     #[error(
-        "an [local_ai.embedding.remote] block is set but `model` doesn't select an Ollama model; \
-         set `model = \"ollama\"` or remove the remote block"
+        "[local_ai.embedding.remote] can only serve a transformer model over Ollama, but `model = \
+         \"{0}\"` selects a non-transformer backend (static/hash) — remove the remote block, or \
+         pick a transformer model such as `minilm` / `bge` / `jina`"
     )]
-    RemoteEmbeddingBackendMismatch,
-    #[error(
-        "the Ollama embedding backend (`model = \"ollama\"`) requires an \
-         [local_ai.embedding.remote] block with `endpoint` + `model`"
-    )]
-    RemoteEmbeddingMissingConfig,
+    RemoteEmbeddingNonTransformerModel(String),
     #[error("duplicate target name `{0}`")]
     DuplicateTarget(String),
     #[error("configured directory does not exist: {0}")]
@@ -1237,7 +1247,7 @@ mod tests {
             root = "."
 
             [local_ai.embedding]
-            model = "minilm"
+            model = "sentence-transformers/all-MiniLM-L6-v2"
             "#,
         )
         .unwrap();
@@ -1247,13 +1257,15 @@ mod tests {
 
     #[test]
     fn remote_embedding_connect_happy_path_applies_defaults() {
+        // #317 rework: the selector names a real MODEL (`minilm`); the [remote] block serves it via
+        // Ollama. No `model = "ollama"` selector exists anymore.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
 
             [local_ai.embedding]
-            model = "ollama"
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
             mode = "connect"
@@ -1275,6 +1287,12 @@ mod tests {
                 request_timeout_s: 60,
             })
         );
+        // The selector still resolves to the LOCAL fastembed model — the [remote] block overrides
+        // the RUNTIME, not the model identity.
+        assert_eq!(
+            local_ai.embedding.backend.model_id(),
+            Some(crate::embedding_models::FASTEMBED_MODEL_ID)
+        );
     }
 
     #[test]
@@ -1285,7 +1303,7 @@ mod tests {
             root = "."
 
             [local_ai.embedding]
-            model = "ollama"
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
             model = "all-minilm"
@@ -1306,7 +1324,7 @@ mod tests {
             root = "."
 
             [local_ai.embedding]
-            model = "ollama"
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
             model = "all-minilm"
@@ -1333,16 +1351,15 @@ mod tests {
 
     #[test]
     fn remote_embedding_connect_without_endpoint_is_rejected() {
-        // `model = "ollama"` keeps the config coherent on the cross-field axis, so the block's own
-        // missing-endpoint error (which fires first, in RemoteEmbeddingConfig::try_from) is the
-        // ONLY error in play — not the mismatch guard.
+        // Connect mode requires a non-empty `endpoint` read from the toml — the flag/env injection
+        // was dropped (the cookbook auto-provisioning path is deferred to #318).
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
 
             [local_ai.embedding]
-            model = "ollama"
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
             mode = "connect"
@@ -1367,7 +1384,7 @@ mod tests {
             root = "."
 
             [local_ai.embedding]
-            model = "ollama"
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
             model = "all-minilm"
@@ -1393,8 +1410,8 @@ mod tests {
         ] {
             let raw: RawConfig = toml::from_str(&format!(
                 "[index]\nroot = \".\"\n\n[local_ai.embedding]\nmodel = \
-                 \"ollama\"\n\n[local_ai.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
-                 \"{endpoint}\"\n"
+                 \"sentence-transformers/all-MiniLM-L6-v2\"\n\n[local_ai.embedding.remote]\nmodel \
+                 = \"all-minilm\"\nendpoint = \"{endpoint}\"\n"
             ))
             .unwrap();
             let remote = LocalAiConfig::try_from(raw.local_ai)
@@ -1424,7 +1441,7 @@ mod tests {
             root = "."
 
             [local_ai.embedding]
-            model = "ollama"
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
             mode = "ephemeral"
@@ -1441,18 +1458,15 @@ mod tests {
 
     #[test]
     fn remote_embedding_missing_model_is_rejected() {
-        // `model = "ollama"` (the backend selector) keeps the config coherent so the block's own
-        // missing-model error is the only one in play. NOTE the two `model` keys are distinct: the
-        // `[local_ai.embedding] model` is the registry SELECTOR; the `[remote] model` is the Ollama
-        // API model name — it's the latter that's missing here.
-        // Block present (so it parses to Some) but `[remote] model` omitted → missing-model error.
+        // The two `model` keys are distinct: `[local_ai.embedding] model` is the registry SELECTOR;
+        // `[remote] model` is the Ollama API model name — it's the latter that's required here.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
 
             [local_ai.embedding]
-            model = "ollama"
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
             endpoint = "http://localhost:11434"
@@ -1462,7 +1476,7 @@ mod tests {
         let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingMissingModel),
-            "omitted model → RemoteEmbeddingMissingModel, got {err:?}",
+            "omitted [remote] model → RemoteEmbeddingMissingModel, got {err:?}",
         );
 
         // A whitespace-only `[remote] model` trims to empty and is rejected the same way.
@@ -1472,7 +1486,7 @@ mod tests {
             root = "."
 
             [local_ai.embedding]
-            model = "ollama"
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
             model = "   "
@@ -1483,52 +1497,50 @@ mod tests {
         let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingMissingModel),
-            "whitespace-only model → RemoteEmbeddingMissingModel, got {err:?}",
+            "whitespace-only [remote] model → RemoteEmbeddingMissingModel, got {err:?}",
         );
     }
 
     #[test]
-    fn remote_block_without_ollama_backend_is_a_mismatch() {
-        // A fully-valid [remote] block but `model` selects (defaults to) fastembed — the trap: the
-        // user believes remote offload is on, but the LOCAL model would run. Rejected, not
-        // auto-selected.
-        let raw: RawConfig = toml::from_str(
-            r#"
-            [index]
-            root = "."
-
-            [local_ai.embedding.remote]
-            model = "all-minilm"
-            endpoint = "http://localhost:11434"
-            "#,
-        )
-        .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::RemoteEmbeddingBackendMismatch),
-            "remote block + non-ollama model → RemoteEmbeddingBackendMismatch, got {err:?}",
-        );
+    fn remote_block_on_a_non_transformer_model_is_rejected() {
+        // #317 rework guardrail: Ollama can only serve transformer models. A [remote] block on the
+        // static model2vec or the hash model is a misconfiguration the dim probe couldn't usefully
+        // explain — reject at parse with a clear message. Selectors are the HF-path model_ids now.
+        for model in ["minishlab/potion-retrieval-32M", "embedding-hash"] {
+            let raw: RawConfig = toml::from_str(&format!(
+                "[index]\nroot = \".\"\n\n[local_ai.embedding]\nmodel = \
+                 \"{model}\"\n\n[local_ai.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
+                 \"http://localhost:11434\"\n"
+            ))
+            .unwrap();
+            let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RemoteEmbeddingNonTransformerModel(_)),
+                "remote block + {model} → RemoteEmbeddingNonTransformerModel, got {err:?}",
+            );
+        }
     }
 
     #[test]
-    fn ollama_backend_without_remote_block_is_missing_config() {
-        // `model = "ollama"` selects the Ollama backend, but there's no [remote] block to tell it
-        // where/how to reach the server → incoherent, rejected.
-        let raw: RawConfig = toml::from_str(
-            r#"
-            [index]
-            root = "."
-
-            [local_ai.embedding]
-            model = "ollama"
-            "#,
-        )
-        .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::RemoteEmbeddingMissingConfig),
-            "ollama backend without remote block → RemoteEmbeddingMissingConfig, got {err:?}",
-        );
+    fn remote_block_with_a_transformer_model_is_accepted() {
+        // The inverse of the guardrail: the FastEmbed (transformer) HF-path models accept a
+        // [remote] block.
+        for model in [
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "BAAI/bge-small-en-v1.5",
+            "jinaai/jina-embeddings-v2-base-code",
+        ] {
+            let raw: RawConfig = toml::from_str(&format!(
+                "[index]\nroot = \".\"\n\n[local_ai.embedding]\nmodel = \
+                 \"{model}\"\n\n[local_ai.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
+                 \"http://localhost:11434\"\n"
+            ))
+            .unwrap();
+            assert!(
+                LocalAiConfig::try_from(raw.local_ai).is_ok(),
+                "remote block + {model} (transformer) must be accepted",
+            );
+        }
     }
 
     #[test]

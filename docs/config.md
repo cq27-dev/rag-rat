@@ -10,7 +10,8 @@ root = "."
 database = ".rag-rat/index.sqlite"
 
 [local_ai.embedding]
-model = "minilm"   # embedding backend: "minilm" | "model2vec" | "none"
+# the MODEL by its full id (the HF path) — no aliases. "none" disables embeddings.
+model = "sentence-transformers/all-MiniLM-L6-v2"
 
 [local_ai.embedding.runtime]
 batch_size = 64
@@ -19,26 +20,74 @@ omp_threads = 1
 max_embedding_chars = 4000
 ```
 
-## Embedding backend (`[local_ai.embedding] model`)
+## Embedding model (`[local_ai.embedding] model`)
 
-Selects how `semantic_search` computes the **vector** half of its hybrid ranking. `rag-rat init`
-recommends a default from repo size; you can override it here.
+Selects how `semantic_search` computes the **vector** half of its hybrid ranking. The selector is the
+model's **full id — its HF path** (no aliases). `rag-rat init` recommends a default from repo size;
+you can override it here. The registered models:
 
-- `minilm` (default) — MiniLM transformer via FastEmbed. Best retrieval quality, but the cold
-  embedding backfill is CPU-bound (~10-100 chunks/sec), so it's only comfortable for repos that
-  finish in a few minutes.
-- `model2vec` — static token-vector lookup + mean-pool (`minishlab/potion-retrieval-32M`, 512-dim).
-  ~100-500× faster on CPU at some retrieval-quality cost: it has distributional/synonym semantics
-  but no context, word order, or polysemy disambiguation. The right choice for large repos that
-  still want vectors. BM25 (the other half of the hybrid) cushions the quality drop.
+- `sentence-transformers/all-MiniLM-L6-v2` (default) — MiniLM transformer via FastEmbed (384-dim).
+  Best retrieval quality, but the cold backfill is CPU-bound (~10-100 chunks/sec), so it's only
+  comfortable for repos that finish in a few minutes.
+- `BAAI/bge-small-en-v1.5` — a stronger general-retrieval transformer at the same 384-dim.
+- `jinaai/jina-embeddings-v2-base-code` — a code-specific transformer (768-dim).
+- `minishlab/potion-retrieval-32M` — static token-vector lookup + mean-pool (512-dim). ~100-500×
+  faster on CPU at some retrieval-quality cost: distributional/synonym semantics but no context, word
+  order, or polysemy disambiguation. The right choice for large repos that still want vectors. BM25
+  (the other half of the hybrid) cushions the quality drop.
 - `none` — structural + BM25 only; no dense vectors. `semantic_search` degrades to BM25, and every
   other tool (symbols, graph, impact, git/papertrail, memories) is unaffected. The cheapest option
   for enormous codebases (e.g. the Linux kernel) where any embedding backfill is impractical.
 
 The selector chooses which model `init` installs and activates. The active model is recorded in the
-index, so switching the backend in the config takes effect after re-running `rag-rat init` or
+index, so switching the model in the config takes effect after re-running `rag-rat init` or
 `rag-rat models install <model-id>` (and a reconcile to re-embed under the new model). Different
-backends have different vector dimensions, so switching re-embeds from scratch.
+models have different vector dimensions, so switching re-embeds from scratch.
+
+## Remote embedding over Ollama (`[local_ai.embedding.remote]`)
+
+The `model = "..."` selector names the **model**; an optional `[local_ai.embedding.remote]` block
+serves **that same model** over an Ollama server (`POST /api/embed`) instead of running it
+in-process — the lever for large repos whose CPU backfill is too slow on the indexing box. Ollama is
+a **transport, not a model**: there is no `model = "ollama"` selector. The block's mere **presence**
+flips the runtime; absent it, embedding stays local. Same model, same `model_id`, same dimension —
+only the runtime changes, so chunk embeddings are keyed by the model regardless of where they were
+computed.
+
+```toml
+[local_ai.embedding]
+model = "sentence-transformers/all-MiniLM-L6-v2"   # the MODEL (HF path, 384-dim)
+
+[local_ai.embedding.remote]       # PRESENCE = "serve that model via Ollama"
+mode = "connect"                  # "connect" (default). "ephemeral" is reserved, not yet supported.
+endpoint = "http://box:11434"     # the Ollama server URL (required in connect mode)
+model = "all-minilm"              # the Ollama-side model name (the server's own identifier)
+# auth_env = "OLLAMA_TOKEN"       # NAME of an env var holding a bearer token (never the token itself)
+# batch_size = 256                # texts per /api/embed request
+# request_timeout_s = 60          # per-request HTTP timeout
+```
+
+The **two `model` keys are different things**: `[local_ai.embedding] model` is the rag-rat **model
+selector** (the HF-path model_id — resolves the dimension + identity); `[remote] model` is the
+**Ollama-side model name** sent in the request body. They need not be spelled the same. Only
+**transformer** models (`sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`,
+`jinaai/jina-embeddings-v2-base-code`) can be served remotely — a `[remote]` block on
+`minishlab/potion-retrieval-32M` (static), the hash model, or `none` is rejected.
+
+In `connect` mode the `endpoint` is **required in `rag-rat.toml`** (read at config-parse). Install
+and reconcile then pick it up automatically:
+
+```bash
+rag-rat models install sentence-transformers/all-MiniLM-L6-v2   # install/activate over Ollama
+rag-rat reconcile                                               # embeds chunks via the endpoint
+```
+
+The freshness key is **endpoint-independent** — pointing the `endpoint` at a different box does
+**not** re-embed the repo. A re-embed happens only when the `[remote] model` changes or you flip
+between local and remote (those change the vector space; the endpoint does not). If the endpoint is
+unreachable at query time, `semantic_search` degrades to BM25 rather than failing. Embedding is fully
+offline only when the endpoint is local. **Credentials go in `auth_env` only** — an endpoint URL with
+embedded `user:pass@host` is rejected, because the endpoint string is persisted into the index.
 
 The database stores explicit schema migrations in `schema_version` with migration id,
 `applied_at_ms`, checksum, and description. Opening the index **migrates an older schema forward

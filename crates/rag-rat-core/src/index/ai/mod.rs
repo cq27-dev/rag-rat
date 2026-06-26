@@ -56,7 +56,16 @@ const DEFAULT_BATCH_SIZE: usize = 64;
 pub const DEFAULT_MAX_EMBEDDING_CHARS: usize = 4_000;
 const MIN_EMBEDDING_CHARS: usize = 80;
 pub const EMBEDDING_TEXT_VERSION: &str = "embedding-text-v2";
-const LEGACY_MODEL_IDS: &[&str] = &["embedding-small"];
+// Old model ids that must be cleaned on open. `embedding-small` is the pre-#112 id; the four
+// dashed ids are the pre-#317 ids renamed to HF paths (existing vectors re-key → re-embed, fine
+// pre-launch). `remove_legacy_models` drops their `ai_models`/`chunk_embeddings`/active-meta rows.
+const LEGACY_MODEL_IDS: &[&str] = &[
+    "embedding-small",
+    "fastembed-all-minilm-l6-v2",
+    "fastembed-bge-small-en-v1.5",
+    "fastembed-jina-v2-base-code",
+    "model2vec-potion-retrieval-32m",
+];
 #[cfg(feature = "fastembed")]
 const FASTEMBED_HF_CACHE_REPO_DIR: &str = "models--Qdrant--all-MiniLM-L6-v2-onnx";
 

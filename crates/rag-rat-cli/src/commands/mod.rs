@@ -475,8 +475,12 @@ pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     match &args.command {
         None | Some(ModelsCommand::List) => print_output(&db.list_models()?),
-        Some(ModelsCommand::Install { model_id }) =>
-            print_output(&db.install_model(model_id, config.local_ai.embedding.remote.as_ref())?),
+        Some(ModelsCommand::Install { model_id }) => {
+            // A `[remote]` block (endpoint read from the toml, validated at config-parse) installs
+            // the model over Ollama; absent → local install.
+            let remote = config.local_ai.embedding.remote.as_ref();
+            print_output(&db.install_model(model_id, remote)?)
+        },
     }
 }
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {
