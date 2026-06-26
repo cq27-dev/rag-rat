@@ -1070,6 +1070,10 @@ mod freshness_version_tests {
         assert!(err.to_string().contains("unknown embedding model"), "{err}");
     }
 
+    // Needs a real fastembed install (the no-default-features CI build bails without the feature);
+    // HF-path id resolution is also exercised by the rejection + registry tests, which run
+    // everywhere.
+    #[cfg(feature = "fastembed")]
     #[test]
     fn install_activates_a_model_by_its_hf_path_id() {
         let conn = schema_conn();
@@ -1077,6 +1081,9 @@ mod freshness_version_tests {
         assert_eq!(model.model_id, FASTEMBED_MODEL_ID);
     }
 
+    // The LOCAL re-install is a real fastembed install — gated for the no-default-features build.
+    // (`remote_freshness_version` itself + the endpoint-independence are unit-tested feature-free.)
+    #[cfg(feature = "fastembed")]
     #[test]
     fn flipping_remote_to_local_resets_the_freshness_version_to_the_static_version() {
         // Install the model over Ollama (remote key), then re-install it LOCALLY (no remote). The
