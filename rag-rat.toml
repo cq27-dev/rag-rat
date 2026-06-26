@@ -17,6 +17,9 @@ model = "sentence-transformers/all-MiniLM-L6-v2"
 endpoint = "http://localhost:11434"   # this box's Ollama server
 model = "all-minilm"                  # the Ollama-side model name
 batch_size = 256                      # texts per /api/embed request
+# To EPHEMERALLY provision a box instead, drop `endpoint` and set `cookbook` (see docs/config.md).
+# Only then may you pick the GPU (a connect endpoint + gpu is rejected):
+# gpu = "A10G"                        # cookbook-only; Modal GPU class / RunPod gpuTypeId
 
 [llm.embedding.runtime]
 batch_size = 64

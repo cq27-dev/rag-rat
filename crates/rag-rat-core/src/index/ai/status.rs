@@ -301,6 +301,7 @@ mod ollama_install_tests {
             cookbook: None,
             query_endpoint: None,
             auth_env: None,
+            gpu: None,
             batch_size: 256,
             request_timeout_s: 5,
         }

@@ -388,6 +388,24 @@ impl CookbookProvisioner {
     }
 }
 
+/// Build the `CookbookInput` (the env-passed provisioning request) from an ephemeral remote config.
+/// Split out from `provision_and_build` so the config→input mapping — notably that the configured
+/// `gpu` is forwarded — is unit-testable without spawning a real recipe.
+fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
+    CookbookInput {
+        model: remote.model.trim().to_string(),
+        request_timeout_s: remote.request_timeout_s,
+        // Give the recipe a provisioning budget just under the Rust hard ceiling, so ITS budget
+        // runs out first (clean provider-side teardown) before the Rust SIGKILL backstop
+        // fires.
+        provision_timeout_s: PROVISION_TIMEOUT.as_secs().saturating_sub(20),
+        // The configured GPU (provider-specific; validated by the provider at provision time). The
+        // recipe picks its own default when `None`. Config validation guarantees `gpu` is only set
+        // in ephemeral mode, which is the only mode reaching this function.
+        gpu: remote.gpu.clone(),
+    }
+}
+
 /// Provision an ephemeral cookbook box for the selected `spec` over `remote` and build an
 /// [`OllamaEmbedder`] against it. The single place that wires `cookbook` → `CookbookInput` →
 /// `CookbookProvisioner::provision` → `OllamaEmbedder::from_provisioned`; shared by the reconcile
@@ -402,15 +420,7 @@ pub(crate) fn provision_and_build(
         .cookbook
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("ephemeral remote config has no cookbook"))?;
-    let input = CookbookInput {
-        model: remote.model.trim().to_string(),
-        request_timeout_s: remote.request_timeout_s,
-        // Give the recipe a provisioning budget just under the Rust hard ceiling, so ITS budget
-        // runs out first (clean provider-side teardown) before the Rust SIGKILL backstop
-        // fires.
-        provision_timeout_s: PROVISION_TIMEOUT.as_secs().saturating_sub(20),
-        gpu: None,
-    };
+    let input = cookbook_input_for(remote);
     let provisioned = CookbookProvisioner::provision(cookbook, &input)?;
     let embedder = OllamaEmbedder::from_provisioned(ProvisionedEmbedderParams {
         endpoint: &provisioned.endpoint,
@@ -901,6 +911,24 @@ mod tests {
     fn tmp(name: &str) -> PathBuf {
         let id = N.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("ragrat-cookbook-{}-{id}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn cookbook_input_carries_the_configured_gpu() {
+        // The config→CookbookInput mapping must forward the configured `gpu` to the recipe (it's
+        // the only way a user picks a GPU — the contract.ts side reads `input.gpu`). `None`
+        // stays `None` so the recipe keeps its own default.
+        let ephemeral = |gpu: Option<&str>| RemoteEmbeddingConfig {
+            model: "all-minilm".to_string(),
+            cookbook: Some("@rag-rat/cookbook modal".to_string()),
+            query_endpoint: Some(crate::config::DEFAULT_QUERY_ENDPOINT.to_string()),
+            gpu: gpu.map(str::to_string),
+            ..RemoteEmbeddingConfig::default()
+        };
+        assert_eq!(cookbook_input_for(&ephemeral(Some("A10G"))).gpu.as_deref(), Some("A10G"));
+        assert_eq!(cookbook_input_for(&ephemeral(None)).gpu, None);
+        // The model is trimmed into the input regardless of gpu.
+        assert_eq!(cookbook_input_for(&ephemeral(Some("A100"))).model, "all-minilm");
     }
 
     #[test]

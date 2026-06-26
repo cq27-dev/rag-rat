@@ -262,6 +262,17 @@ pub struct RemoteEmbeddingConfig {
     /// Name of the environment variable holding the bearer token, if the server needs auth. Local
     /// Ollama needs none, so this is optional; the embedder reads the var once at construction.
     pub auth_env: Option<String>,
+    /// EPHEMERAL-only: the GPU the cookbook recipe should provision for the on-demand box. The
+    /// value is PROVIDER-specific and validated by the provider at provision time, not here —
+    /// Modal wants a GPU class (`A10G`/`T4`/`A100`), RunPod a `gpuTypeId`. `None` lets the
+    /// recipe pick its default (Modal defaults to CPU; RunPod to a cheap on-demand GPU). Set
+    /// together with a connect `endpoint` it is a config error (`RemoteGpuRequiresCookbook`).
+    ///
+    /// `#[serde(default)]`: this field post-dates the meta round-trip, so a config JSON persisted
+    /// by an older binary (no `gpu` key) must still deserialize (→ `None`) instead of
+    /// erroring.
+    #[serde(default)]
+    pub gpu: Option<String>,
     /// How many texts to send per `/api/embed` request.
     pub batch_size: u32,
     /// Per-request HTTP timeout, in seconds.
@@ -279,6 +290,7 @@ impl Default for RemoteEmbeddingConfig {
             cookbook: None,
             query_endpoint: None,
             auth_env: None,
+            gpu: None,
             batch_size: 256,
             request_timeout_s: 60,
         }
@@ -794,6 +806,7 @@ struct RawRemoteEmbedding {
     cookbook: Option<String>,
     query_endpoint: Option<String>,
     auth_env: Option<String>,
+    gpu: Option<String>,
     batch_size: Option<u32>,
     request_timeout_s: Option<u64>,
 }
@@ -880,12 +893,31 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
         }
         // Optional — local Ollama needs no auth; trim if present.
         let auth_env = trimmed(raw.auth_env);
+        // EPHEMERAL-only: the GPU to provision. A PRESENT-but-empty/whitespace value is a config
+        // error (clearer than silently dropping a meant-to-be-set key). Set together with a connect
+        // `endpoint` it is meaningless — reject it rather than ignore it. The VALUE is
+        // provider-specific (Modal GPU class / RunPod gpuTypeId); we do NOT validate it against an
+        // allow-list — the provider does so at provision time.
+        let gpu = match raw.gpu {
+            Some(g) => {
+                let g = g.trim();
+                if g.is_empty() {
+                    return Err(ConfigError::RemoteGpuEmpty);
+                }
+                if endpoint.is_some() {
+                    return Err(ConfigError::RemoteGpuRequiresCookbook);
+                }
+                Some(g.to_string())
+            },
+            None => None,
+        };
         Ok(Self {
             model: model.to_string(),
             endpoint,
             cookbook,
             query_endpoint,
             auth_env,
+            gpu,
             batch_size: raw.batch_size.unwrap_or(default.batch_size),
             request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
         })
@@ -954,6 +986,17 @@ pub enum ConfigError {
          var and name it via `auth_env` instead"
     )]
     RemoteEmbeddingEndpointHasCredentials,
+    #[error(
+        "[llm.embedding.remote] `gpu` applies only to ephemeral `cookbook` provisioning, not a \
+         connect `endpoint` — remove `gpu`, or switch the remote block to a `cookbook` recipe"
+    )]
+    RemoteGpuRequiresCookbook,
+    #[error(
+        "[llm.embedding.remote] `gpu` is set but empty — give it a provider-specific value (a \
+         Modal GPU class like `A10G`, or a RunPod `gpuTypeId`), or remove the key to use the \
+         recipe default"
+    )]
+    RemoteGpuEmpty,
     #[error(
         "[llm.embedding.remote] can only serve a transformer model over Ollama, but `model = \
          \"{0}\"` is not a transformer (it is a static/hash model, or `none`/disabled) — remove \
@@ -1337,6 +1380,7 @@ mod tests {
                 cookbook: None,
                 query_endpoint: None, // connect mode: no local query box
                 auth_env: None,
+                gpu: None,
                 // defaults applied when omitted
                 batch_size: 256,
                 request_timeout_s: 60,
@@ -1399,6 +1443,85 @@ mod tests {
     }
 
     #[test]
+    fn remote_embedding_ephemeral_gpu_is_parsed_and_trimmed() {
+        // EPHEMERAL: `gpu` picks the GPU the cookbook recipe provisions. The value is
+        // provider-specific (Modal class / RunPod gpuTypeId) and NOT validated against an
+        // allow-list here — only trimmed.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+
+            [llm.embedding.remote]
+            model = "all-minilm"
+            cookbook = "@rag-rat/cookbook/modal"
+            gpu = "  A10G  "
+            "#,
+        )
+        .unwrap();
+        let remote = LlmConfig::try_from(raw.llm).unwrap().embedding.remote.unwrap();
+        assert_eq!(remote.gpu.as_deref(), Some("A10G"));
+    }
+
+    #[test]
+    fn remote_embedding_gpu_with_connect_endpoint_is_rejected() {
+        // `gpu` only applies to ephemeral `cookbook` provisioning. Set alongside a connect
+        // `endpoint` it is meaningless → rejected (not silently ignored).
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+
+            [llm.embedding.remote]
+            model = "all-minilm"
+            endpoint = "http://localhost:11434"
+            gpu = "A10G"
+            "#,
+        )
+        .unwrap();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RemoteGpuRequiresCookbook),
+            "gpu + endpoint → RemoteGpuRequiresCookbook, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn remote_embedding_empty_gpu_is_rejected() {
+        // A present-but-empty/whitespace `gpu` is a config error — clearer than silently dropping a
+        // key the user meant to set. (Omitting `gpu` entirely is fine: the recipe uses its
+        // default.)
+        for value in ["\"\"", "\"   \""] {
+            let raw: RawConfig = toml::from_str(&format!(
+                r#"
+                [index]
+                root = "."
+
+                [llm.embedding]
+                model = "sentence-transformers/all-MiniLM-L6-v2"
+
+                [llm.embedding.remote]
+                model = "all-minilm"
+                cookbook = "@rag-rat/cookbook/modal"
+                gpu = {value}
+                "#,
+            ))
+            .unwrap();
+            let err = LlmConfig::try_from(raw.llm).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RemoteGpuEmpty),
+                "gpu={value} → RemoteGpuEmpty, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
     fn remote_embedding_overrides_batch_and_timeout() {
         let raw: RawConfig = toml::from_str(
             r#"
@@ -1426,6 +1549,7 @@ mod tests {
                 cookbook: None,
                 query_endpoint: None,
                 auth_env: Some("OLLAMA_TOKEN".to_string()),
+                gpu: None,
                 batch_size: 512,
                 request_timeout_s: 120,
             })

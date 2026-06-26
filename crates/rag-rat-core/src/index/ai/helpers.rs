@@ -521,6 +521,7 @@ mod tests {
             // The NAME of an env var — never a token. The round-trip test asserts this name is
             // present and no token is.
             auth_env: Some("OLLAMA_TOKEN".to_string()),
+            gpu: None,
             batch_size: 256,
             request_timeout_s: 60,
         }
@@ -614,6 +615,7 @@ mod tests {
             cookbook: None,
             query_endpoint: None,
             auth_env: None,
+            gpu: None,
             batch_size: 256,
             request_timeout_s: 2,
         };

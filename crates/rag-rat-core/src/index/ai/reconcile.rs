@@ -1143,6 +1143,7 @@ mod freshness_version_tests {
             cookbook: None,
             query_endpoint: None,
             auth_env: None,
+            gpu: None,
             batch_size: 256,
             request_timeout_s: 5,
         }
@@ -1398,6 +1399,7 @@ mod freshness_version_tests {
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
             query_endpoint: Some("http://localhost:11434".to_string()),
             auth_env: None,
+            gpu: None,
             batch_size: 256,
             request_timeout_s: 5,
         };

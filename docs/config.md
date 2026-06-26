@@ -91,7 +91,17 @@ model = "all-minilm"                        # the Ollama-side model name
 # query_endpoint = "http://localhost:11434" # the LOCAL ollama for QUERY embedding
                                             #   (defaults to http://localhost:11434)
 # auth_env = "OLLAMA_TOKEN"                 # optional bearer-token env var NAME
+# gpu = "A10G"                              # cookbook-only: the GPU the recipe provisions.
+                                            #   Provider-specific, validated at provision time:
+                                            #   Modal = a GPU CLASS (A10G / T4 / A100; default CPU
+                                            #     — the modal recipe WARNS that GPU there has an
+                                            #     exit-137 cold-start risk);
+                                            #   RunPod = a gpuTypeId (default: a cheap on-demand GPU).
 ```
+
+`gpu` applies **only** to the EPHEMERAL `cookbook` path; setting it alongside a connect `endpoint` is
+a config error. Its value is **not** validated by rag-rat — the provider rejects an unknown GPU when
+it tries to provision.
 
 Provisioning happens **only on an explicit `rag-rat reconcile`** (the deliberate bulk pass) — the
 background watcher/maintenance pass does **not** cold-start a GPU box for a few changed chunks (it

@@ -89,6 +89,10 @@ fn query_embed_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingConfig {
             // query embed → `embed_query` returns None → silent, PERMANENT BM25.
             // `auth_env` is a secret-free NAME.
             auth_env: remote.auth_env.clone(),
+            // DROP `gpu`: this is now a CONNECT-shaped config (it has `endpoint`), and `gpu` is
+            // cookbook-only. The query path never reads it, but keep the "gpu ⟹ ephemeral"
+            // invariant true for derived configs too.
+            gpu: None,
             ..remote.clone()
         }
     } else {
@@ -287,6 +291,7 @@ mod dispatch_tests {
             cookbook: None,
             query_endpoint: None,
             auth_env: None,
+            gpu: None,
             batch_size: 256,
             request_timeout_s: 5,
         }
@@ -337,6 +342,7 @@ mod dispatch_tests {
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
             query_endpoint: Some(query_endpoint.to_string()),
             auth_env: auth_env.map(str::to_string),
+            gpu: None,
             batch_size: 256,
             request_timeout_s: 5,
         }
