@@ -72,6 +72,22 @@ static ACTIVE_PGID: AtomicI32 = AtomicI32::new(0);
 #[cfg(unix)]
 static SIGNAL_HANDLER_INSTALLED: OnceLock<()> = OnceLock::new();
 
+/// Short SIGTERM→SIGKILL grace IN THE SIGNAL HANDLER (R2). Much shorter than `TEARDOWN_GRACE` (the
+/// `Drop` path) because we're terminating the whole process: give the recipe a moment to release
+/// the box, then SIGKILL-backstop and chain to the saved/default disposition.
+#[cfg(unix)]
+const SIGNAL_TEARDOWN_GRACE_SECS: i64 = 2;
+
+/// The `sigaction`s that were installed BEFORE ours (e.g. init's `TerminalResetGuard`), saved per
+/// signal at install so the handler can RESTORE + re-raise them — chaining the terminal reset / the
+/// default disposition instead of clobbering it. Written ONCE under `SIGNAL_HANDLER_INSTALLED`
+/// before any cookbook spawns (so the write happens-before any handler run); read only in the
+/// async-signal-safe handler.
+#[cfg(unix)]
+static mut SAVED_SIGINT: Option<libc::sigaction> = None;
+#[cfg(unix)]
+static mut SAVED_SIGTERM: Option<libc::sigaction> = None;
+
 /// The JSON written to `RAG_RAT_COOKBOOK_INPUT` for the cookbook subprocess.
 #[derive(Debug, Clone, Serialize)]
 pub struct CookbookInput {
@@ -306,14 +322,18 @@ impl CookbookProvisioner {
                         ));
                     }
                     if Instant::now() >= deadline {
-                        // Timed out: kill the WHOLE group (it never served) and report.
+                        // Timed out — but the recipe may hold a LIVE box mid-pull/verify, so give
+                        // it its SIGTERM teardown window before SIGKILL
+                        // (R1): `teardown_group` does SIGTERM → grace →
+                        // SIGKILL. (`reap_group` = hard SIGKILL is ONLY for the
+                        // already-exited paths above.)
                         #[cfg(unix)]
-                        reap_group(pgid);
+                        teardown_group(pgid, &mut child);
                         #[cfg(not(unix))]
                         {
                             let _ = child.kill();
+                            let _ = child.wait();
                         }
-                        let _ = child.wait();
                         let _ = stdout_handle.join();
                         let _ = stderr_handle.join();
                         anyhow::bail!(
@@ -510,10 +530,16 @@ fn teardown_group(pgid: i32, child: &mut Child) {
 }
 
 /// `true` while ANY member of the process group `pgid` is still alive. `killpg(pgid, 0)` sends no
-/// signal but performs the existence/permission check: success (or any errno other than `ESRCH`,
-/// e.g. `EPERM`) means at least one member exists; `ESRCH` means the whole group is gone. This is
-/// what lets teardown wait on the box-holding GRANDCHILD, not just the leader's `waitpid`. SAFETY:
-/// `killpg(2)` with signal 0 touches no memory and only probes the group.
+/// signal but performs the existence/permission check: success means at least one member exists;
+/// `ESRCH` means the whole group is gone. This is what lets teardown wait on the box-holding
+/// GRANDCHILD, not just the leader's `waitpid`.
+///
+/// EPERM is the honest unhappy case (R7): a group member exists that WE CANNOT SIGNAL — our SIGKILL
+/// would also EPERM, so we cannot actually reclaim it. We still report it "alive" (so the caller
+/// doesn't falsely believe the box is gone) and warn loudly that the box may leak, rather than
+/// silently treating SIGKILL as effective.
+///
+/// SAFETY: `killpg(2)` with signal 0 touches no memory and only probes the group.
 #[cfg(unix)]
 fn group_alive(pgid: i32) -> bool {
     if pgid <= 1 {
@@ -523,9 +549,20 @@ fn group_alive(pgid: i32) -> bool {
     if unsafe { libc::killpg(pgid, 0) } == 0 {
         return true;
     }
-    // Portable errno read (works on every unix, unlike a glibc-specific `__errno_location`): only
-    // ESRCH ("no such process group") means fully gone; EPERM etc. means a member is still around.
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    // Portable errno read (works on every unix, unlike a glibc-specific `__errno_location`).
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => false, // the whole group is gone
+        Some(libc::EPERM) => {
+            // A member we can't signal — SIGKILL won't reach it either. Don't pretend we reclaimed
+            // it: warn that the paid box may leak.
+            eprintln!(
+                "rag-rat: cookbook group {pgid} has a member we cannot signal (EPERM); the remote \
+                 box may leak — check your cloud provider"
+            );
+            true
+        },
+        _ => true, // any other errno: assume a member is still around
+    }
 }
 
 /// Reap a process group on a provisioning-FAILURE path (early exit / timeout): SIGKILL the group
@@ -548,39 +585,84 @@ fn killpg(pgid: i32, sig: i32) {
 }
 
 /// Install the process-wide SIGINT/SIGTERM handler ONCE. `Drop` does NOT run on Ctrl-C / `exit()`,
-/// so without this a Ctrl-C mid-ephemeral-reconcile leaks the paid box. The handler killpg's the
-/// active group (if any) then re-raises the default disposition so the process still dies.
+/// so without this a Ctrl-C mid-ephemeral-reconcile leaks the paid box. We use `sigaction` (not
+/// `signal`) so we can SAVE the previously-installed handler per signal (e.g. init's
+/// `TerminalResetGuard`) — the handler restores + re-raises it so the terminal reset / default
+/// disposition still runs after we reclaim the box.
 #[cfg(unix)]
 fn install_signal_handler() {
     SIGNAL_HANDLER_INSTALLED.get_or_init(|| {
-        // SAFETY: `signal(2)` installs our async-signal-safe handler for SIGINT/SIGTERM. The
-        // handler only reads an atomic + calls killpg/signal/_exit — all async-signal-safe.
-        // Cast through a fn POINTER (not the fn item directly) for the `sighandler_t`
-        // integer.
-        let handler = handle_terminating_signal as extern "C" fn(libc::c_int);
+        // SAFETY: `sigaction(2)` installs our async-signal-safe handler and writes the PREVIOUS
+        // action into our `SAVED_*` statics. This runs once (OnceLock) before any cookbook spawns,
+        // so the writes happen-before any handler invocation reads them.
         unsafe {
-            libc::signal(libc::SIGINT, handler as libc::sighandler_t);
-            libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+            install_one(libc::SIGINT, &raw mut SAVED_SIGINT);
+            install_one(libc::SIGTERM, &raw mut SAVED_SIGTERM);
         }
     });
 }
 
-/// SIGINT/SIGTERM handler: killpg the active cookbook group so a paid box isn't leaked on Ctrl-C,
-/// then exit with the conventional 128+signo code. Async-signal-safe: reads one atomic, calls
-/// `killpg` + `_exit` (no allocation, no locks, no stdio).
+/// Install `handle_terminating_signal` for `signo`, saving the previous action into `*saved`.
+/// SAFETY: `sigaction` with a zeroed-then-populated `struct sigaction`; `saved` points at a valid
+/// `static mut Option<sigaction>`.
+#[cfg(unix)]
+unsafe fn install_one(signo: libc::c_int, saved: *mut Option<libc::sigaction>) {
+    unsafe {
+        let mut new_action: libc::sigaction = std::mem::zeroed();
+        // Cast through a fn POINTER (not the fn item) for the `sa_sigaction` usize.
+        let handler = handle_terminating_signal as extern "C" fn(libc::c_int);
+        new_action.sa_sigaction = handler as usize;
+        libc::sigemptyset(&raw mut new_action.sa_mask);
+        // No SA_RESTART/SA_SIGINFO: a plain `void(int)` handler is all we need.
+        new_action.sa_flags = 0;
+        let mut old_action: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(signo, &raw const new_action, &raw mut old_action) == 0 {
+            *saved = Some(old_action);
+        }
+    }
+}
+
+/// SIGINT/SIGTERM handler (async-signal-safe — only `killpg`/`nanosleep`/`sigaction`/`raise`, no
+/// allocation/locks/stdio): reclaim the active cookbook group with a real SIGTERM → grace → SIGKILL
+/// backstop (so a hung recipe teardown can't leak the box), then RESTORE + re-raise the previously
+/// installed handler (e.g. init's terminal reset) so it runs too. If there was no prior handler,
+/// the default disposition (restored as `SIG_DFL` by `raise`) terminates us with the right status.
 #[cfg(unix)]
 extern "C" fn handle_terminating_signal(signo: libc::c_int) {
     let pgid = ACTIVE_PGID.swap(0, Ordering::SeqCst);
     if pgid > 1 {
         unsafe {
-            // Politely first so the recipe can release the cloud box; SIGKILL backstops it.
+            // SIGTERM first so the recipe can release the cloud box…
             libc::killpg(pgid, libc::SIGTERM);
+            // …a short grace (async-signal-safe sleep)…
+            let grace = libc::timespec { tv_sec: SIGNAL_TEARDOWN_GRACE_SECS, tv_nsec: 0 };
+            libc::nanosleep(&raw const grace, std::ptr::null_mut());
+            // …then a SIGKILL backstop for a hung teardown.
+            libc::killpg(pgid, libc::SIGKILL);
         }
     }
-    // Exit promptly with the standard 128+signo status (re-raising the default disposition would be
-    // cleaner, but `_exit` is the simplest async-signal-safe termination and the OS reaps us).
+    // Restore the previously-installed handler for THIS signal and re-raise, so init's terminal
+    // reset (or the default disposition) runs and the process terminates with the right status.
+    // SAFETY: reads a `static mut` written once at install (happens-before); `sigaction`/`raise`/
+    // `_exit` are async-signal-safe.
     unsafe {
-        libc::_exit(128 + signo);
+        // Read the saved action through the raw pointer (`.read()`, not a deref-of-ref) — sound for
+        // a `static mut` whose write happened-before this handler, and `sigaction` is `Copy`.
+        let saved = if signo == libc::SIGINT {
+            (&raw const SAVED_SIGINT).read()
+        } else {
+            (&raw const SAVED_SIGTERM).read()
+        };
+        match saved {
+            Some(prev) => {
+                libc::sigaction(signo, &raw const prev, std::ptr::null_mut());
+                libc::raise(signo);
+                // If the restored handler returned (didn't terminate), fall through to _exit so we
+                // don't loop back into our own (now-uninstalled) handler.
+                libc::_exit(128 + signo);
+            },
+            None => libc::_exit(128 + signo),
+        }
     }
 }
 

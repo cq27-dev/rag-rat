@@ -469,7 +469,18 @@ impl Config {
         // (`refresh_worktree_overlays`) and indexes the branch with its own target set (#219
         // review).
         let targets = main_base_targets(&root, &local_root).unwrap_or(local_targets);
-        let llm = LlmConfig::try_from(raw.llm)?;
+        let mut llm = LlmConfig::try_from(raw.llm)?;
+        // Resolve a RELATIVE cookbook recipe PATH against the config dir, not the process CWD (R6):
+        // the recipe is handed to `node`/`npx`, which resolve it against wherever reconcile/the
+        // watcher runs — ENOENT from a subdir or a daemon. npm-package specs (`@scope/pkg`) are
+        // left untouched. Done here (not in the config TryFrom) because only `load` knows
+        // the config dir.
+        if let Some(remote) = llm.embedding.remote.as_mut()
+            && let Some(cookbook) = remote.cookbook.as_ref()
+            && let Some(resolved) = resolve_relative_cookbook_path(cookbook, config_dir)
+        {
+            remote.cookbook = Some(resolved);
+        }
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();
@@ -795,6 +806,37 @@ fn endpoint_authority_has_userinfo(endpoint: &str) -> bool {
     let after_scheme = endpoint.split_once("://").map_or(endpoint, |(_, rest)| rest);
     let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
     authority.contains('@')
+}
+
+/// If the cookbook spec's FIRST token is a RELATIVE recipe PATH, return the spec with that token
+/// resolved against `config_dir` (the `rag-rat.toml` directory). Returns `None` — leave the spec
+/// unchanged — for an npm-package spec (`@scope/pkg`, a bare name) or an ALREADY-ABSOLUTE path; the
+/// recipe runner (`node`/`npx`) would otherwise resolve a relative path against the process CWD
+/// (wherever reconcile/the watcher runs), giving ENOENT from a subdir or a daemon (R6).
+///
+/// "Path-shaped" = starts with `./` or `../`, OR ends in a recipe extension (`.mjs`/`.js`/`.ts`/
+/// `.mts`). Only the first whitespace token (the path) is rewritten; provider subcommand/args after
+/// it are preserved verbatim.
+fn resolve_relative_cookbook_path(cookbook: &str, config_dir: &Path) -> Option<String> {
+    let mut tokens = cookbook.split_whitespace();
+    let first = tokens.next()?;
+    let lower = first.to_ascii_lowercase();
+    let is_path_shaped = first.starts_with("./")
+        || first.starts_with("../")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".js")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".mts");
+    if !is_path_shaped || Path::new(first).is_absolute() {
+        return None; // npm spec or already absolute → leave verbatim
+    }
+    let resolved = config_dir.join(first);
+    let mut out = resolved.to_string_lossy().into_owned();
+    for arg in tokens {
+        out.push(' ');
+        out.push_str(arg);
+    }
+    Some(out)
 }
 
 impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
@@ -1483,6 +1525,31 @@ mod tests {
         assert!(!endpoint_authority_has_userinfo("http://127.0.0.1:11434"));
         // An `@` in the PATH/query is not userinfo.
         assert!(!endpoint_authority_has_userinfo("http://host:11434/path?x=a@b"));
+    }
+
+    #[test]
+    fn resolve_relative_cookbook_path_anchors_relative_recipe_paths_to_config_dir() {
+        let dir = Path::new("/repo/sub");
+        // Relative path-shaped specs → resolved against config_dir; the trailing args are
+        // preserved.
+        assert_eq!(
+            resolve_relative_cookbook_path("./recipes/x.mts", dir).as_deref(),
+            Some("/repo/sub/./recipes/x.mts")
+        );
+        assert_eq!(
+            resolve_relative_cookbook_path("../cookbook.mjs modal", dir).as_deref(),
+            Some("/repo/sub/../cookbook.mjs modal")
+        );
+        // A bare relative `.ts`/`.mts`/`.js` path (no `./`) is still path-shaped → resolved.
+        assert_eq!(
+            resolve_relative_cookbook_path("recipe.mts", dir).as_deref(),
+            Some("/repo/sub/recipe.mts")
+        );
+        // npm package specs and a bare token are LEFT VERBATIM (None).
+        assert_eq!(resolve_relative_cookbook_path("@rag-rat/cookbook modal", dir), None);
+        assert_eq!(resolve_relative_cookbook_path("some-pkg", dir), None);
+        // An ALREADY-ABSOLUTE recipe path is left verbatim (None).
+        assert_eq!(resolve_relative_cookbook_path("/abs/recipe.mjs runpod", dir), None);
     }
 
     #[test]

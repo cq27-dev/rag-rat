@@ -40,9 +40,12 @@ Hard rules:
   recipes probe `/api/embed` and wait for a vector).
 - **Stay alive after `ready`** until signaled.
 - **Tear down on `SIGTERM`/`SIGINT`** (a `tearing_down` status precedes it), then `exit(0)`.
-- **Bound every network call.** A stalled fetch that hangs past the Rust-side grace gets SIGKILLed
-  with the box still up → a leaked, billed box. Use `pollUntil` / `fetchWithTimeout` (both carry an
-  `AbortSignal.timeout`); never call bare `fetch` on a path that could stall.
+- **Bound EVERY await — fetch AND SDK call.** Anything that can stall past the Rust-side grace gets
+  SIGKILLed with the box still up → a leaked, billed box. For fetches use `pollUntil` /
+  `fetchWithTimeout` (`AbortSignal.timeout`); for an SDK await with no native timeout (Modal's
+  `sandboxes.create`/`exec`/`tunnels`, `terminate`) wrap it in `withBudget(deadline, label, work)`
+  (races the remaining provisioning budget) or `raceWithTimeout(work, ms, label)` (a fixed wall, for
+  teardown). Never leave a bare unbounded `await` on a provisioning or teardown path.
 - **Use a provider-side backstop where one exists** (Modal's `timeoutMs: 1_800_000` self-destructs
   a leaked box). Where the provider has none — RunPod on-demand pods have no idle/lifetime auto-stop
   — **reliable teardown is the only thing that stops billing**, which is why teardown is
@@ -169,6 +172,11 @@ Provider gotchas baked into the recipe:
   GraphQL spec). So **reliable teardown is the only thing that stops the billing**: every fetch is
   `AbortSignal`-bounded, and `podTerminate` runs under a tight (~8 s) timeout to finish inside the
   Rust-side grace.
+- **Deploy-timeout orphan sweep.** The pod is deployed with a unique name
+  (`rag-rat-cookbook-ollama-<ts>`). If the deploy call throws (e.g. RunPod created the pod but the
+  response was lost/slow) before the pod handle is reported, the recipe queries `myself { pods }`,
+  terminates any pod matching that name, then rethrows — so a created-but-unacknowledged pod can't
+  bill forever. Best-effort and bounded; it only logs, never masks the original deploy error.
 - Default GPU is a cheap `NVIDIA RTX A4000`; `input.gpu` is a `gpuTypeId` override.
 
 Auth: `RUNPOD_API_KEY` in the process env — the recipe emits an `error` event and exits `1` (no
@@ -247,16 +255,24 @@ with **`log(level, message)`** — both go out as JSONL events. Never `console.l
 stdout stream). Call `ctx.onBox(handle)` the instant the box exists (before it's verified serving) —
 that is what lets the harness clean up a half-provisioned box.
 
-The contract module also exports the shared network helpers — call these instead of bare `fetch`:
+The contract module also exports the shared bounding helpers — call these instead of a bare `fetch`
+or a bare SDK `await`:
 
 - **`verifyEmbed(endpoint, { model, budgetMs, headers? })`** — poll `<endpoint>/api/embed` until a
   real vector comes back. Call it before returning from `provision` (a reachable box is not a
   serving box).
 - **`pollUntil(url, { label, body, isReady, budgetMs, pollIntervalMs?, perAttemptTimeoutMs? })`** —
-  the generic retry-until-ready loop (each attempt `AbortSignal`-bounded). `verifyEmbed` and the
-  RunPod model pull are both built on it.
+  the generic retry-until-ready loop. Each attempt is `AbortSignal`-bounded AND clamped to the
+  remaining budget, so no attempt runs past the deadline. `verifyEmbed` and the RunPod model pull
+  are both built on it.
 - **`fetchWithTimeout(url, init, timeoutMs)`** — a single `fetch` with a hard `AbortSignal.timeout`.
-  Use it for one-shot calls (e.g. teardown) so a stall can't hang past the grace and leak the box.
+- **`withBudget(deadline, label, work)`** — race an SDK await (no native timeout) against the
+  provisioning budget remaining until `deadline`; throws (naming the step) if the budget runs out,
+  so a hang aborts into teardown instead of being SIGKILLed. Throws immediately if <1s remains.
+- **`raceWithTimeout(work, ms, label)`** — race an await against a fixed `ms` wall (used to bound
+  teardown's `terminate`); the timer self-clears the instant `work` settles.
+- **`assertBudgetRemaining(deadline, label)` / `remainingBudgetMs(deadline)`** — compute/guard the
+  one shared provisioning deadline that `verifyEmbed`/`pullModel` budgets derive from.
 
 To add a provider, drop a `recipes/<name>-ollama.mts` and register it in the `PROVIDERS` map in
 `cli.mts`.

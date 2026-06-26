@@ -83,8 +83,11 @@ fn query_embed_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingConfig {
             endpoint: remote.query_endpoint.clone(),
             cookbook: None,
             query_endpoint: None,
-            // The local query box needs no auth (it's our own ollama), so drop `auth_env`.
-            auth_env: None,
+            // PRESERVE `auth_env` (R5): a user can point `query_endpoint` at an authenticated
+            // Ollama and name the bearer-token env var. Dropping it → 401 on every
+            // query embed → `embed_query` returns None → silent, PERMANENT BM25.
+            // `auth_env` is a secret-free NAME.
+            auth_env: remote.auth_env.clone(),
             ..remote.clone()
         }
     } else {
@@ -310,28 +313,30 @@ mod dispatch_tests {
         assert_eq!(embedder.model_id(), crate::embedding_models::HASH_MODEL_ID);
     }
 
-    fn ephemeral_at(query_endpoint: &str) -> RemoteEmbeddingConfig {
+    fn ephemeral_at(query_endpoint: &str, auth_env: Option<&str>) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
             endpoint: None,
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
             query_endpoint: Some(query_endpoint.to_string()),
-            auth_env: Some("SHOULD_BE_DROPPED".to_string()),
+            auth_env: auth_env.map(str::to_string),
             batch_size: 256,
             request_timeout_s: 5,
         }
     }
 
     #[test]
-    fn query_embed_config_for_ephemeral_points_at_the_local_query_endpoint() {
+    fn query_embed_config_for_ephemeral_points_at_the_local_query_endpoint_keeping_auth() {
         // The QUERY path for an ephemeral active config embeds against the LOCAL query box (same
         // model → same vector space), NOT the cookbook. `query_embed_config` rewrites the config to
-        // a connect-shaped one pointed at `query_endpoint`, dropping the cookbook + auth.
-        let q = query_embed_config(&ephemeral_at("http://127.0.0.1:11434"));
+        // a connect-shaped one pointed at `query_endpoint`, dropping the cookbook — but PRESERVING
+        // `auth_env` (R5), since the query box may be an authenticated Ollama. This is a pure
+        // config mapping (no embedder construction), so the named env var need not exist.
+        let q = query_embed_config(&ephemeral_at("http://127.0.0.1:11434", Some("OLLAMA_TOKEN")));
         assert!(q.is_connect() && !q.is_ephemeral());
         assert_eq!(q.endpoint.as_deref(), Some("http://127.0.0.1:11434"));
         assert_eq!(q.cookbook, None);
-        assert_eq!(q.auth_env, None, "local query box needs no auth");
+        assert_eq!(q.auth_env.as_deref(), Some("OLLAMA_TOKEN"), "auth_env preserved for query box");
     }
 
     #[test]
@@ -344,7 +349,9 @@ mod dispatch_tests {
             l.local_addr().unwrap().port()
         };
         let conn = conn_with_active_model(FASTEMBED_MODEL_ID);
-        set_active_remote_config(&conn, &ephemeral_at(&format!("http://127.0.0.1:{port}")))
+        // No `auth_env` here: this test BUILDS the embedder (which would try to resolve a named env
+        // var); the auth-preservation behavior is covered by the `query_embed_config` mapping test.
+        set_active_remote_config(&conn, &ephemeral_at(&format!("http://127.0.0.1:{port}"), None))
             .unwrap();
 
         let embedder = active_embedder(&conn, None).expect("query embedder constructs locally");

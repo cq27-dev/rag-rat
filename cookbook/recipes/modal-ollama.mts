@@ -19,8 +19,10 @@
  *   - timeout=1800s (30 min) is the provider-side max-lifetime backstop: if rag-rat dies or
  *     SIGKILLs us before teardown runs, Modal self-destructs the box. (RunPod has no equivalent.)
  *
- * The harness ({@link runRecipe}) owns the terminate-on-error wrapper and the request-timeout
+ * The harness ({@link runRecipe}) owns the terminate-on-error wrapper and the provision-timeout
  * clamp, so this recipe is just: create the box, report it via `ctx.onBox`, pull, verify, return.
+ * Every Modal SDK await here is wrapped in `withBudget` so a hang aborts into teardown rather than
+ * running past the Rust hard timeout and getting SIGKILLed with the box still billing (N2).
  */
 
 import { ModalClient } from "modal";
@@ -32,8 +34,10 @@ import {
   type Recipe,
   assertBudgetRemaining,
   log,
+  raceWithTimeout,
   runRecipe,
   verifyEmbed,
+  withBudget,
 } from "../src/contract.js";
 
 /** Port ollama serves on inside the box; the one port we tunnel out. */
@@ -44,14 +48,22 @@ const BOX_MAX_LIFETIME_MS = 1_800_000; // 30 minutes
 const DEFAULT_PROVISION_TIMEOUT_S = 600;
 /** Modal app the sandboxes are grouped under (created on first use). */
 const APP_NAME = "rag-rat-cookbook";
+/**
+ * Bound on the teardown `sb.terminate()` — kept under the Rust side's ~10s teardown grace (like
+ * RunPod's `TEARDOWN_TIMEOUT_MS`) so terminate completes-or-aborts BEFORE rag-rat SIGKILLs us; a
+ * hung terminate would otherwise leak a billed box until Modal's `timeoutMs` backstop fires.
+ */
+const TEARDOWN_TIMEOUT_MS = 8_000;
 
 /** Provision an Ollama box serving `input.model` and return its tunnel endpoint. */
 async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sandbox>> {
   const { input, provisionTimeoutMs } = ctx;
-  // ONE deadline for the WHOLE sequence (create + pull + verify); each budgeted step below uses the
-  // REMAINING time until it, never a fresh full budget, so the total stays inside the provisioning
-  // budget and aborts (→ teardown) before the Rust provisioner's hard timeout. (Modal also has the
-  // `timeoutMs` provider backstop, but a leaked box still bills until then — keep us inside budget.)
+  // ONE deadline for the WHOLE sequence (create + pull + verify). EVERY SDK await below — none of
+  // which has a native timeout — is raced against the time REMAINING until this deadline via
+  // `withBudget`, so a single hung Modal call can't run past the Rust provisioner's hard timeout
+  // and get SIGKILLed before teardown. A budget-exhaustion throw lands in `runRecipe`'s catch,
+  // which tears the box down gracefully. (Modal's `timeoutMs` is only a last-resort backstop; a
+  // leaked box bills until then.) See N2.
   const deadline = Date.now() + provisionTimeoutMs;
   const gpu = input.gpu ?? null;
 
@@ -59,40 +71,43 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
 
   // Creds resolve from env (MODAL_TOKEN_ID/MODAL_TOKEN_SECRET) or ~/.modal.toml.
   const modal = new ModalClient();
-  const app = await modal.apps.fromName(APP_NAME, { createIfMissing: true });
+  const app = await withBudget(deadline, "apps.fromName", () =>
+    modal.apps.fromName(APP_NAME, { createIfMissing: true }),
+  );
 
   const image = modal.images.fromRegistry("ollama/ollama:latest");
 
   // `command: ["serve"]` is appended to the image entrypoint (/bin/ollama) → `ollama serve`.
   // OLLAMA_HOST goes in the sandbox env so the runtime process binds all interfaces.
-  const sb = await modal.sandboxes.create(app, image, {
-    command: ["serve"],
-    env: { OLLAMA_HOST: `0.0.0.0:${OLLAMA_PORT}` },
-    encryptedPorts: [OLLAMA_PORT],
-    timeoutMs: BOX_MAX_LIFETIME_MS,
-    ...(gpu !== null ? { gpu } : {}),
-  });
+  const sb = await withBudget(deadline, "sandboxes.create", () =>
+    modal.sandboxes.create(app, image, {
+      command: ["serve"],
+      env: { OLLAMA_HOST: `0.0.0.0:${OLLAMA_PORT}` },
+      encryptedPorts: [OLLAMA_PORT],
+      timeoutMs: BOX_MAX_LIFETIME_MS,
+      ...(gpu !== null ? { gpu } : {}),
+    }),
+  );
   // Report the box NOW so runRecipe tears it down if anything below throws.
   ctx.onBox(sb);
   log("info", `sandbox created: ${sb.sandboxId ?? "(id unavailable)"}`);
 
   // Pull the model. The server (`serve`) is the box's main process; pull runs as an exec
-  // against the same ollama install, populating the model store the server reads.
+  // against the same ollama install, populating the model store the server reads. Every step
+  // (exec dispatch, wait, stderr read) is budget-bounded.
   ctx.status("pulling", `pulling model "${input.model}" (cold-start cost)`);
-  const pull = await sb.exec(["ollama", "pull", input.model], {
-    mode: "text",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const pullCode = await pull.wait();
+  const pull = await withBudget(deadline, "exec(ollama pull)", () =>
+    sb.exec(["ollama", "pull", input.model], { mode: "text", stdout: "pipe", stderr: "pipe" }),
+  );
+  const pullCode = await withBudget(deadline, "pull.wait", () => pull.wait());
   if (pullCode !== 0) {
-    const err = await pull.stderr.readText();
+    const err = await withBudget(deadline, "pull.stderr.readText", () => pull.stderr.readText());
     throw new Error(`"ollama pull ${input.model}" exited ${pullCode}: ${err.trim()}`);
   }
   log("info", `model "${input.model}" pulled`);
 
   // Resolve the public tunnel URL for the served port.
-  const tunnels = await sb.tunnels();
+  const tunnels = await withBudget(deadline, "sb.tunnels", () => sb.tunnels());
   const tunnel = tunnels[OLLAMA_PORT];
   if (tunnel === undefined) {
     throw new Error(`no tunnel for port ${OLLAMA_PORT}; got ports [${Object.keys(tunnels).join(", ")}]`);
@@ -114,9 +129,12 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   return { handle: sb, endpoint, auth_token: null };
 }
 
-/** Destroy the box. Idempotent enough — terminate on an already-gone box is a no-op/soft error. */
+/**
+ * Destroy the box, bounded so a hung `terminate()` can't run past the Rust teardown grace and leak
+ * a billed box. Idempotent enough — terminate on an already-gone box is a no-op/soft error.
+ */
 async function teardown(sb: Sandbox): Promise<void> {
-  await sb.terminate();
+  await raceWithTimeout(() => sb.terminate(), TEARDOWN_TIMEOUT_MS, "sb.terminate");
 }
 
 const recipe: Recipe<Sandbox> = {

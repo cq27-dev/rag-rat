@@ -257,7 +257,15 @@ pub(crate) fn setup_model_and_reconcile(
     let remote = config.llm.embedding.remote.as_ref();
     match db.install_model(model_id, remote) {
         Ok(model) => eprintln!("init: model status {} {}", model.model_id, model.status),
-        Err(err) if model_id == FASTEMBED_MODEL_ID || model_id == MODEL2VEC_MODEL_ID => {
+        // Soft fallback to hash ONLY for a LOCAL install whose feature wasn't compiled in
+        // (fastembed/model2vec missing). A REMOTE install failure (endpoint down, auth wrong,
+        // cookbook failed, dim mismatch) must PROPAGATE — the user asked for remote GPU embedding,
+        // so silently degrading to hash with only an eprintln would be wrong (R4). Gate on
+        // `remote.is_none()`.
+        Err(err)
+            if remote.is_none()
+                && (model_id == FASTEMBED_MODEL_ID || model_id == MODEL2VEC_MODEL_ID) =>
+        {
             eprintln!("init: {} install failed: {err}", backend.as_str());
             eprintln!("init: falling back to {HASH_MODEL_ID}");
             // Hash is a local backend — no remote config needed for the fallback.
@@ -469,5 +477,51 @@ mod default_plan_tests {
         }
         let plan = default_plan(".".to_string(), &scan);
         assert_eq!(plan.bindings.get(&Language::Python), Some(&vec![PathBuf::from("myapp")]));
+    }
+
+    #[test]
+    fn init_propagates_a_remote_install_failure_instead_of_falling_back_to_hash() {
+        // R4: with a `[remote]` block, a remote-install failure (here: a closed-port connect
+        // endpoint) must PROPAGATE — the user asked for remote GPU embedding, so init must NOT
+        // silently degrade to hash. (Contrast a LOCAL feature-missing install, which still falls
+        // back.) `assume_yes=true` skips the prompt.
+        let n = std::sync::atomic::AtomicU64::new(0);
+        let id = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ragrat-r4-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+        // A closed port: bind then drop so the connect is refused at probe time.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        std::fs::write(
+            root.join("rag-rat.toml"),
+            format!(
+                "[index]\nroot = \".\"\n\n[target_bindings]\nrust = [\"src\"]\n\n\
+                 [llm.embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\n\n\
+                 [llm.embedding.remote]\nendpoint = \"http://127.0.0.1:{port}\"\nmodel = \
+                 \"all-minilm\"\n"
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(root.join("rag-rat.toml")).unwrap();
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let err = setup_model_and_reconcile(&config, &db, true)
+            .expect_err("a remote-install failure must propagate, not fall back to hash");
+        // The Ollama probe against the dead endpoint failed and that error surfaced.
+        assert!(err.to_string().to_lowercase().contains("ollama"), "{err}");
+        // And the active model was NOT silently switched to hash.
+        let active = db
+            .list_models()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.model_id == rag_rat_core::embedding_models::HASH_MODEL_ID)
+            .unwrap();
+        assert!(!active.installed, "hash must NOT have been installed as a silent fallback");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

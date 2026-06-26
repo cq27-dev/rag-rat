@@ -41,6 +41,7 @@ import {
   type Provisioned,
   type Recipe,
   assertBudgetRemaining,
+  errorMessage,
   fetchWithTimeout,
   log,
   pollUntil,
@@ -102,29 +103,44 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
   const apiKey = rawKey.trim();
   const gpuTypeId = input.gpu ?? DEFAULT_GPU_TYPE_ID;
 
+  // Unique pod name so a deploy-timeout orphan sweep can find a pod that RunPod created but whose
+  // create-response we lost (see below). The instant suffix makes it unambiguous across runs.
+  const podName = `${POD_NAME}-${Date.now()}`;
   ctx.status("provisioning", `deploying RunPod pod (model=${input.model}, gpu=${gpuTypeId})`);
 
   // Deploy the pod. dockerArgs="serve" → `ollama serve`; OLLAMA_HOST binds all interfaces;
   // ports "11434/http" exposes the proxy. No persistent volume (ephemeral box).
-  const deploy = await graphql<{ podFindAndDeployOnDemand: DeployedPod | null }>(
-    apiKey,
-    POD_DEPLOY_MUTATION,
-    {
-      input: {
-        cloudType: "ALL",
-        gpuCount: 1,
-        gpuTypeId,
-        name: `${POD_NAME}-${Date.now()}`,
-        imageName: "ollama/ollama:latest",
-        dockerArgs: "serve",
-        ports: `${OLLAMA_PORT}/http`,
-        containerDiskInGb: CONTAINER_DISK_GB,
-        volumeInGb: 0,
-        env: [{ key: "OLLAMA_HOST", value: `0.0.0.0:${OLLAMA_PORT}` }],
+  //
+  // DEPLOY-TIMEOUT ORPHAN (N3): the call is bounded at GRAPHQL_TIMEOUT_MS, but RunPod can CREATE the
+  // pod and then lose/slow the response — `graphql` throws BEFORE `ctx.onBox`, so `runRecipe` would
+  // tear down "nothing" while the created pod bills forever (no provider backstop). On ANY deploy
+  // throw, sweep for a pod with our unique `podName` and terminate it, THEN rethrow (best-effort,
+  // bounded — never masks the original error).
+  let deploy: { podFindAndDeployOnDemand: DeployedPod | null };
+  try {
+    deploy = await graphql<{ podFindAndDeployOnDemand: DeployedPod | null }>(
+      apiKey,
+      POD_DEPLOY_MUTATION,
+      {
+        input: {
+          cloudType: "ALL",
+          gpuCount: 1,
+          gpuTypeId,
+          name: podName,
+          imageName: "ollama/ollama:latest",
+          dockerArgs: "serve",
+          ports: `${OLLAMA_PORT}/http`,
+          containerDiskInGb: CONTAINER_DISK_GB,
+          volumeInGb: 0,
+          env: [{ key: "OLLAMA_HOST", value: `0.0.0.0:${OLLAMA_PORT}` }],
+        },
       },
-    },
-    GRAPHQL_TIMEOUT_MS,
-  );
+      GRAPHQL_TIMEOUT_MS,
+    );
+  } catch (cause) {
+    await sweepOrphanByName(apiKey, podName);
+    throw cause;
+  }
   const deployed = deploy.podFindAndDeployOnDemand;
   if (deployed === null || typeof deployed.id !== "string" || deployed.id === "") {
     throw new Error(
@@ -189,6 +205,39 @@ async function teardown(handle: PodHandle): Promise<void> {
   await graphql(handle.apiKey, POD_TERMINATE_MUTATION, { input: { podId: handle.podId } }, TEARDOWN_TIMEOUT_MS);
 }
 
+/**
+ * Best-effort orphan sweep for the deploy-timeout race (N3): if `podFindAndDeployOnDemand` threw
+ * but RunPod actually created a pod, that pod carries our unique `podName`. List the account's pods
+ * and terminate every match. Bounded and fully swallowed — it must NEVER throw (the caller is about
+ * to rethrow the original deploy error, which is the signal rag-rat acts on); it only logs.
+ */
+async function sweepOrphanByName(apiKey: string, podName: string): Promise<void> {
+  try {
+    const me = await graphql<{ myself: { pods: ReadonlyArray<{ id?: unknown; name?: unknown }> } }>(
+      apiKey,
+      LIST_PODS_QUERY,
+      {},
+      TEARDOWN_TIMEOUT_MS,
+    );
+    const orphans = me.myself.pods.filter((p) => p.name === podName && typeof p.id === "string");
+    if (orphans.length === 0) {
+      log("info", `orphan sweep: no pod named "${podName}" found (deploy likely never created one)`);
+      return;
+    }
+    for (const pod of orphans) {
+      const podId = pod.id as string;
+      try {
+        await graphql(apiKey, POD_TERMINATE_MUTATION, { input: { podId } }, TEARDOWN_TIMEOUT_MS);
+        log("warn", `orphan sweep: terminated leaked pod ${podId} (named "${podName}")`);
+      } catch (cause) {
+        log("error", `orphan sweep: FAILED to terminate ${podId} (named "${podName}"): ${errorMessage(cause)}`);
+      }
+    }
+  } catch (cause) {
+    log("error", `orphan sweep: could not list pods to check for a leak: ${errorMessage(cause)}`);
+  }
+}
+
 /** podFindAndDeployOnDemand — deploy an on-demand GPU pod; returns the pod with its id. */
 const POD_DEPLOY_MUTATION = `
 mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
@@ -203,6 +252,17 @@ mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
 const POD_TERMINATE_MUTATION = `
 mutation Terminate($input: PodTerminateInput!) {
   podTerminate(input: $input)
+}`;
+
+/** myself.pods — the account's current pods (id + name), for the deploy-timeout orphan sweep. */
+const LIST_PODS_QUERY = `
+query Pods {
+  myself {
+    pods {
+      id
+      name
+    }
+  }
 }`;
 
 /**

@@ -273,6 +273,50 @@ export function assertBudgetRemaining(deadline: number, label: string, minMs = 1
 }
 
 /**
+ * Race `work` against a hard `ms` timeout: resolves/rejects with `work` if it settles first, else
+ * rejects (naming `label`). The timeout timer is CLEARED the moment `work` settles, so it neither
+ * leaks nor — critically — holds the event loop open past `work` (and, conversely, while `work` is
+ * genuinely pending the live timer keeps the process alive so the timeout can actually fire). Use it
+ * to put a wall around any await with no native timeout — Modal's `sandboxes.create`/`exec`/
+ * `tunnels`, `sb.terminate()`, RunPod's `podTerminate`. The losing `work` keeps running in the
+ * background after a timeout; that's fine here because the caller is about to throw into teardown.
+ */
+export function raceWithTimeout<T>(work: () => Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`"${label}" exceeded its ${ms}ms timeout`));
+    }, ms);
+    work().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (cause: unknown) => {
+        clearTimeout(timer);
+        reject(cause instanceof Error ? cause : new Error(String(cause)));
+      },
+    );
+  });
+}
+
+/**
+ * Race an unbounded `work` promise against the budget left until `deadline`: resolves with `work`'s
+ * value if it wins, throws (naming `label`) if the budget runs out first. The one wrapper recipes
+ * put around every SDK await that lacks its own timeout, so a single hang can't run past the Rust
+ * provisioner's hard ceiling and get SIGKILLed before teardown. Throws immediately (does not even
+ * start `work`) if the budget is already below `minMs` — see {@link assertBudgetRemaining}.
+ */
+export function withBudget<T>(
+  deadline: number,
+  label: string,
+  work: () => Promise<T>,
+  minMs = 1_000,
+): Promise<T> {
+  const remaining = assertBudgetRemaining(deadline, label, minMs);
+  return raceWithTimeout(work, remaining, label);
+}
+
+/**
  * `fetch` with a hard per-call timeout via `AbortSignal.timeout`. Use this instead of a bare
  * `fetch` anywhere a stall would let the box leak: a hung connection must abort and surface as an
  * error, never hang past the caller's budget.
@@ -324,10 +368,19 @@ export async function pollUntil<T>(url: string, options: PollUntilOptions<T>): P
   const pollIntervalMs = options.pollIntervalMs ?? 2000;
   const perAttemptTimeoutMs = options.perAttemptTimeoutMs ?? pollIntervalMs;
   const deadline = Date.now() + options.budgetMs;
+  // Floor below which it isn't worth starting another attempt — a sub-second fetch can't both
+  // dial and respond, and starting it would only push us past `deadline`.
+  const attemptFloorMs = 250;
   let lastError = "(no attempt made)";
   let attempt = 0;
 
   while (Date.now() < deadline) {
+    // Clamp THIS attempt's timeout to whatever budget remains, so no single attempt can run past
+    // `deadline` (the top-of-loop guard alone lets an attempt entered near the deadline still burn a
+    // full `perAttemptTimeoutMs` + sleep, overshooting `budgetMs` by ~30s → past Rust's hard ceiling
+    // → SIGKILL before teardown). See N4.
+    const attemptTimeout = Math.min(perAttemptTimeoutMs, remainingBudgetMs(deadline));
+    if (attemptTimeout < attemptFloorMs) break;
     attempt += 1;
     try {
       const res = await fetchWithTimeout(
@@ -337,7 +390,7 @@ export async function pollUntil<T>(url: string, options: PollUntilOptions<T>): P
           headers: { "content-type": "application/json", ...options.headers },
           body: JSON.stringify(options.body),
         },
-        perAttemptTimeoutMs,
+        attemptTimeout,
       );
       if (!res.ok) {
         lastError = `HTTP ${res.status} ${res.statusText}`;
@@ -352,6 +405,9 @@ export async function pollUntil<T>(url: string, options: PollUntilOptions<T>): P
       // early; keep retrying until the budget runs out.
       lastError = errorMessage(cause);
     }
+    // Skip the trailing sleep if it would itself cross the deadline — no point waiting only to
+    // fail the loop guard. (The next attempt would in any case be floored out above.)
+    if (Date.now() + pollIntervalMs >= deadline) break;
     log("info", `${options.label} attempt ${attempt} not ready (${lastError}); retrying…`);
     await sleep(pollIntervalMs);
   }
@@ -456,22 +512,34 @@ export async function runRecipe<H>(recipe: Recipe<H>): Promise<void> {
     Math.max(1, input.provision_timeout_s ?? recipe.defaultProvisionTimeoutS) * 1000;
 
   // The one box handle, shared by every teardown path. Set by provision via `onBox`, or on the
-  // happy path from the provision result. A single `tornDown` latch makes teardown idempotent.
+  // happy path from the provision result.
   let box: { value: H } | null = null;
-  let tornDown = false;
 
-  const tearDownOnce = async (reason: string): Promise<void> => {
-    if (tornDown) return;
-    tornDown = true;
-    if (box === null) {
-      log("info", `nothing to tear down (${reason}; no box was provisioned)`);
-      return;
-    }
-    status(recipe.provider, "tearing_down", reason);
-    await recipe.teardown(box.value);
-    log("info", "teardown complete");
+  // Teardown runs AT MOST ONCE: the first caller starts it and memoizes the in-flight promise;
+  // every later caller (a second signal, the provision-failure path) awaits THAT SAME promise
+  // instead of starting a new teardown. Crucially this means a second SIGTERM/SIGINT cannot
+  // `process.exit` while `recipe.teardown` (a slow `podTerminate`/`sb.terminate`) is still in
+  // flight — which would orphan a billed box (RunPod has no provider backstop). See N1.
+  let teardownPromise: Promise<void> | null = null;
+
+  const tearDownOnce = (reason: string): Promise<void> => {
+    if (teardownPromise !== null) return teardownPromise;
+    teardownPromise = (async () => {
+      if (box === null) {
+        log("info", `nothing to tear down (${reason}; no box was provisioned)`);
+        return;
+      }
+      status(recipe.provider, "tearing_down", reason);
+      await recipe.teardown(box.value);
+      log("info", "teardown complete");
+    })();
+    return teardownPromise;
   };
 
+  // Keep `process.on` (NOT `.once`): we must intercept EVERY signal so Node's default "terminate
+  // immediately" action never fires mid-teardown. The shared `tearDownOnce` promise makes re-entry
+  // safe — a second signal awaits the SAME in-flight teardown and only exits AFTER it settles, so
+  // `process.exit` never runs while `recipe.teardown` is in flight.
   const onSignal = (signal: NodeJS.Signals): void => {
     void (async () => {
       try {

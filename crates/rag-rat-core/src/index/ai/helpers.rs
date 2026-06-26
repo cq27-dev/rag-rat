@@ -459,6 +459,13 @@ pub(crate) fn reconcile_meta(conn: &Connection, key: &str) -> anyhow::Result<Opt
         .optional()?)
 }
 
+/// Delete a `reconcile_meta` key (a no-op when absent). Used to clear the stale freshness-version
+/// meta when the active model goes away, so the hash fallback doesn't inherit a legacy model's key.
+pub(crate) fn clear_reconcile_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM reconcile_meta WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
 pub(crate) fn collect_rows<T>(
     rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
 ) -> anyhow::Result<Vec<T>> {

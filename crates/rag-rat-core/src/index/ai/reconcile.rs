@@ -90,6 +90,11 @@ pub(crate) fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
             ])?;
         if was_active > 0 {
             clear_active_remote_config(conn)?;
+            // ALSO drop the legacy model's freshness-version meta (R3a): otherwise the hash
+            // fallback inherits the removed model's `model_version` key and reports the
+            // wrong freshness. The next install re-stamps it; clearing here keeps the
+            // gap correct.
+            clear_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?;
         }
     }
     Ok(())
@@ -153,7 +158,14 @@ pub(crate) fn recover_cached_fastembed_model_at(
         )?;
     }
     if active_embedding_model_is_missing(conn)? {
-        set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID)?;
+        // Activate the recovered model AND stamp its freshness version in ONE call (R3b): a bare
+        // `set_meta(ACTIVE_EMBEDDING_MODEL_META, ...)` without the version would leave
+        // `active_embedding_model_version` returning a STALE legacy key, so new embeddings bake
+        // under the wrong `model_version` and a later install flips it → a spurious full
+        // re-embed.
+        let spec = spec(FASTEMBED_MODEL_ID)
+            .ok_or_else(|| anyhow::anyhow!("unknown model `{FASTEMBED_MODEL_ID}`"))?;
+        activate_model_with_version(conn, FASTEMBED_MODEL_ID, spec.version)?;
     }
     Ok(())
 }
@@ -188,6 +200,20 @@ pub(crate) fn fastembed_cache_ready(cache_dir: &Path) -> bool {
     };
     let revision = revision.trim();
     !revision.is_empty() && repo.join("snapshots").join(revision).is_dir()
+}
+
+/// Activate `model_id` as the active embedding model AND stamp its freshness `version` in ONE call
+/// — the SINGLE place that writes both metas, so no activation site can set the active model
+/// without its version (the bug R3b fixed in recovery). `install_model` and
+/// `recover_cached_fastembed_model` both go through here.
+pub(crate) fn activate_model_with_version(
+    conn: &Connection,
+    model_id: &str,
+    version: &str,
+) -> anyhow::Result<()> {
+    set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
+    set_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, version)?;
+    Ok(())
 }
 
 pub(crate) fn install_model(
@@ -246,17 +272,15 @@ pub(crate) fn install_model(
         // model.
         clear_active_remote_config(conn)?;
     }
-    set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
-    // SINGLE WRITER of the active freshness version — for EVERY runtime, AFTER activation.
-    // `active_embedding_model_version` reads this meta for the active model, so it must reflect the
-    // runtime actually installed: a remote install uses the endpoint-INDEPENDENT remote key (so an
-    // ephemeral box's new URL with the same `remote.model` does NOT re-embed), and a local install
-    // uses the static `spec.version` (so flipping remote→local re-embeds).
+    // Activate + stamp the freshness version in one call (the single writer). The version must
+    // reflect the runtime actually installed: a remote install uses the endpoint-INDEPENDENT remote
+    // key (so an ephemeral box's new URL with the same `remote.model` does NOT re-embed), and a
+    // local install uses the static `spec.version` (so flipping remote→local re-embeds).
     let freshness = match remote {
         Some(remote) => remote_freshness_version(spec, remote),
         None => spec.version.to_string(),
     };
-    set_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, &freshness)?;
+    activate_model_with_version(conn, model_id, &freshness)?;
     model(conn, model_id)
 }
 
@@ -1220,6 +1244,61 @@ mod freshness_version_tests {
         let embedder =
             active_embedder(&conn, None).expect("falls back to hash, no unknown-model err");
         assert_eq!(embedder.model_id(), HASH_MODEL_ID, "active embedder falls back to hash");
+    }
+
+    #[test]
+    fn legacy_active_model_cleanup_clears_the_stale_version_meta() {
+        // R3a: a pre-#317 legacy-active model (id removed from the registry) had its freshness
+        // version meta stamped. `remove_legacy_models` must clear
+        // `ACTIVE_EMBEDDING_MODEL_VERSION_META` too when the legacy id was active — else
+        // `active_embedding_model_version(HASH)` would inherit the legacy key (it reads the
+        // meta for the active model) and bake new hash embeddings under the wrong
+        // `model_version`.
+        const LEGACY_OLLAMA_ID: &str = "ollama-all-minilm";
+        let conn = schema_conn();
+        conn.execute(
+            "INSERT INTO ai_models(model_id, capability, embedding_dim, runtime, installed, \
+             disabled, status, installed_at_ms) VALUES (?1, 'embedding', 384, 'ollama', 1, 0, \
+             'Ready', 1)",
+            params![LEGACY_OLLAMA_ID],
+        )
+        .unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, LEGACY_OLLAMA_ID).unwrap();
+        set_reconcile_meta(
+            &conn,
+            ACTIVE_EMBEDDING_MODEL_VERSION_META,
+            "ollama-all-minilm-v1-deadbeef",
+        )
+        .unwrap();
+
+        ensure_model_manifest(&conn).unwrap();
+
+        // The stale version meta is gone. With the active model now the hash fallback,
+        // `active_embedding_model_version(HASH)` falls back to the hash spec's static version — NOT
+        // the legacy key.
+        assert_eq!(
+            reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap(),
+            None,
+            "the legacy freshness-version meta is cleared",
+        );
+        assert_eq!(
+            active_embedding_model_version(&conn, HASH_MODEL_ID).unwrap(),
+            spec(HASH_MODEL_ID).unwrap().version,
+            "hash fallback gets its OWN version, not the stale legacy key",
+        );
+    }
+
+    #[test]
+    fn activate_model_with_version_writes_both_metas() {
+        // R3b centralization: the helper every activation site goes through stamps BOTH the active
+        // model AND its version — so no site can activate without a version (the recovery bug).
+        let conn = schema_conn();
+        activate_model_with_version(&conn, HASH_MODEL_ID, "hash-v1").unwrap();
+        assert_eq!(
+            meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().as_deref(),
+            Some(HASH_MODEL_ID)
+        );
+        assert_eq!(active_version(&conn), "hash-v1");
     }
 
     // Needs a real fastembed install (the no-default-features CI build bails without the feature);

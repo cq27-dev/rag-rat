@@ -922,6 +922,16 @@ fn cached_fastembed_model_recovers_ready_state() {
     fs::create_dir_all(repo.join("snapshots").join(revision)).unwrap();
     fs::write(repo.join("refs").join("main"), revision).unwrap();
 
+    // R3b regression: simulate a pre-#317 upgrade where a STALE legacy freshness-version meta
+    // lingers and no model is active. Recovery must ACTIVATE the recovered model AND stamp its
+    // version — not leave the stale key (which would bake new embeddings under the wrong
+    // `model_version`).
+    {
+        let conn = db.storage.connection();
+        conn.execute("DELETE FROM index_meta WHERE key = 'active_embedding_model'", []).unwrap();
+        ai::set_reconcile_meta(conn, "embedding_active_model_version", "legacy-stale-key").unwrap();
+    }
+
     ai::recover_cached_fastembed_model_at(db.storage.connection(), &cache_dir).unwrap();
 
     let models = db.list_models().unwrap();
@@ -931,6 +941,12 @@ fn cached_fastembed_model_recovers_ready_state() {
     let status = db.llm_status().unwrap();
     assert_eq!(status.fastembed.status, "Ready");
     assert!(status.fastembed.active);
+    // The recovered model's version meta is its OWN static spec.version — not the stale legacy key.
+    assert_eq!(
+        ai::active_embedding_model_version(db.storage.connection(), FASTEMBED_MODEL_ID).unwrap(),
+        crate::embedding_models::spec(FASTEMBED_MODEL_ID).unwrap().version,
+        "recovery stamps the recovered model's version (R3b)",
+    );
 
     let _ = fs::remove_dir_all(root);
 }
