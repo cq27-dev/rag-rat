@@ -3,8 +3,10 @@
 //!
 //! - **One watcher per worktree** via the election lock; **one writer at a time per DB** via the
 //!   write lock (see [`crate::locks`]).
-//! - Watches the configured target *directories* recursively (so **new files** are seen),
-//!   classifies events through the target globs to decide whether to fire, and debounces bursts
+//! - Watches the configured target *directories* and their non-ignored subtrees (so **new files**
+//!   are seen) — placing a watch per non-ignored directory rather than one recursive watch, so a
+//!   gitignored build/dependency tree can't exhaust `fs.inotify.max_user_watches` (issue #331).
+//!   Classifies events through the target globs to decide whether to fire, and debounces bursts
 //!   with a max-latency cap so sustained writes can't starve a pass.
 //! - Each pass runs the existing pipeline: discover → reconcile → (rate-limited) gc →
 //!   memory_validate. Discover handles additions/edits/deletions; the pass is idempotent.
@@ -511,6 +513,51 @@ fn sleep_checking_stop(total: Duration, stop: &AtomicBool) {
     }
 }
 
+/// Place a NON-recursive watch on `dir` and every non-ignored directory beneath it, pruning ignored
+/// subtrees (issue #331). Replaces a single `RecursiveMode::Recursive` target watch, which descends
+/// into gitignored build/dependency dirs (`node_modules`, `target`, …) and can exhaust
+/// `fs.inotify.max_user_watches`. `ignore` is the same matcher `event_is_relevant` classifies with,
+/// so the watched set matches the indexed set — a directory whose events the watcher would discard
+/// never gets a watch in the first place. Best-effort: a dir that fails to watch (e.g. removed
+/// mid-walk, or the watch budget is already exhausted) is skipped, not propagated.
+fn watch_tree_pruned(watcher: &mut impl notify::Watcher, dir: &Path, ignore: &IgnoreMatcher) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if watcher.watch(&d, RecursiveMode::NonRecursive).is_err() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && !ignore.is_ignored(&p, true)
+            {
+                stack.push(p);
+            }
+        }
+    }
+}
+
+/// For a relevant `Create` event, place a pruned watch on any newly-created, non-ignored directory
+/// among its paths (issue #331). Target dirs are watched non-recursively, so notify will not
+/// auto-watch a freshly-created subdir; without this, edits inside it would never fire a pass.
+/// Dir-ness is read from the filesystem rather than the notify `CreateKind` — the inotify backend
+/// commonly reports `CreateKind::Any`, so the kind alone can't distinguish a new dir from a new
+/// file. A dir already ignored (a fresh `node_modules`/`target`) is left unwatched.
+fn watch_created_dirs(watcher: &mut impl notify::Watcher, event: &Event, ignore: &IgnoreMatcher) {
+    if !matches!(event.kind, EventKind::Create(_)) {
+        return;
+    }
+    for path in &event.paths {
+        let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+        if is_dir && !ignore.is_ignored(path, true) {
+            watch_tree_pruned(watcher, path, ignore);
+        }
+    }
+}
+
 fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     let base_dir =
         config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
@@ -536,9 +583,24 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     }) else {
         return;
     };
+    // Compile the repo's `.gitignore` rules for event classification — the same matcher the
+    // discover walk uses (issue #62), so an ignored path never fires a pass. Recompiled whenever a
+    // `.gitignore` mutation is observed (finding 3) so the running classifier never applies stale
+    // rules; each pass's discover walk also compiles its own fresh matcher, so the index itself is
+    // always current regardless. Compiled BEFORE the target watches so placement can prune ignored
+    // subtrees (issue #331) — not just classification.
+    let target_dirs = config.target_directories();
+    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+    // Watch each target dir and its non-ignored subtree NON-recursively (issue #331). notify's
+    // `RecursiveMode::Recursive` places an inotify watch on EVERY subdirectory — including
+    // gitignored build/dependency trees (`node_modules`, `target`, …) — which on a large repo can
+    // exhaust `fs.inotify.max_user_watches` (~65k observed on a held checkout), after which no new
+    // watcher can start. `event_is_relevant` already drops events from ignored paths; placing the
+    // watches the same way keeps the watch count proportional to the *indexed* tree, not the whole
+    // working directory.
     for target in &config.targets {
         for dir in &target.directories {
-            let _ = notify_watcher.watch(&config.root.join(dir), RecursiveMode::Recursive);
+            watch_tree_pruned(&mut notify_watcher, &config.root.join(dir), &ignore);
         }
     }
     // Round-3 finding 1: when `config.root` is a subdirectory of a larger Git worktree, the target
@@ -553,13 +615,6 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     for dir in gitignore_watch_dirs(&config.root) {
         let _ = notify_watcher.watch(&dir, RecursiveMode::NonRecursive);
     }
-    // Compile the repo's `.gitignore` rules for event classification — the same matcher the
-    // discover walk uses (issue #62), so an ignored path never fires a pass. Recompiled whenever a
-    // `.gitignore` mutation is observed (finding 3) so the running classifier never applies stale
-    // rules; each pass's discover walk also compiles its own fresh matcher, so the index itself is
-    // always current regardless.
-    let target_dirs = config.target_directories();
-    let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
     // Fleet hot-upgrade: also watch the installed binary's directory so a new `cargo install`
     // rename triggers a fleet-wide upgrade. Watch the directory (not the file) so the atomic
     // rename — which replaces the inode — is still observed.
@@ -570,6 +625,9 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     // Linked worktrees (#219): watch each branch checkout recursively so its edits refresh the
     // overlay, and the worktree registry non-recursively so a `git worktree add`/`remove` fires a
     // pass. `linked_worktrees` is reconciled after each pass to pick up newly-added worktrees.
+    // NOTE (#331): these remain `Recursive` — the secondary inotify consumer. Pruning them needs a
+    // per-worktree `IgnoreMatcher` (the `config.root` matcher doesn't govern paths outside it, and
+    // each branch carries its own targets/`.gitignore`), which #331 scopes out (target dirs first).
     let (mut linked_worktrees, worktree_registry) = worktree_watch_targets(&config);
     for worktree in &linked_worktrees {
         let _ = notify_watcher.watch(worktree, RecursiveMode::Recursive);
@@ -620,6 +678,14 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
                     {
                         ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
                     }
+                    // A newly-created, non-ignored directory under a target needs its own watch:
+                    // target dirs are watched NON-recursively now (issue #331), so notify won't
+                    // auto-descend into it, and without this no change inside the new dir would
+                    // ever fire a pass. The maintenance pass this same event fires re-discovers the
+                    // dir's files via the gitignore-aware walk, so the brief placement gap loses
+                    // nothing; the watch is what keeps SUBSEQUENT edits firing. Pruned, so a fresh
+                    // `node_modules`/`target` doesn't drag the recursive subtree back in.
+                    watch_created_dirs(&mut notify_watcher, &event, &ignore);
                 }
                 if event_targets_binary(fleet_bin.as_deref(), &event) {
                     fleet_debounce.on_event(now);
@@ -1214,8 +1280,11 @@ mod tests {
             std::fs::remove_dir_all(&wt).ok();
             return; // no watcher backend available (sandboxed CI) — nothing to assert.
         };
-        // Subscribe exactly as watcher_main does: the (recursive) target dir + the gitignore chain.
-        w.watch(&sub, RecursiveMode::Recursive).unwrap();
+        // Subscribe exactly as watcher_main does: the gitignore-pruned target subtree (issue #331)
+        // + the ancestor gitignore chain. The root `.gitignore` edit is delivered by the chain
+        // watch, not the target subtree, so the pruned placement doesn't weaken this assertion.
+        let ignore = IgnoreMatcher::compile(&sub, &[PathBuf::from(".")]);
+        watch_tree_pruned(&mut w, &sub, &ignore);
         for dir in gitignore_watch_dirs(&sub) {
             let _ = w.watch(&dir, RecursiveMode::NonRecursive);
         }
@@ -1241,5 +1310,109 @@ mod tests {
         drop(w);
         std::fs::remove_dir_all(&wt).ok();
         assert!(delivered, "root .gitignore edit above config.root must be delivered (finding 1)");
+    }
+
+    /// Drain notify events for up to `secs` seconds; return whether any event references a path
+    /// under `needle`. Shared by the issue-#331 placement tests below.
+    fn drain_until_path_under(
+        rx: &std::sync::mpsc::Receiver<notify::Result<Event>>,
+        needle: &Path,
+        secs: u64,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(event)) =>
+                    if event.paths.iter().any(|p| p.starts_with(needle)) {
+                        return true;
+                    },
+                Ok(Err(_)) | Err(RecvTimeoutError::Timeout) => {},
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn gitignored_subdir_under_a_target_is_not_watched() {
+        // ISSUE #331: a gitignored directory under a target dir must NOT receive an inotify watch
+        // (that's how a recursive watch exhausted `fs.inotify.max_user_watches`). End-to-end: an
+        // edit inside the ignored subtree is never delivered, while an edit to a non-ignored
+        // sibling is — proving placement, not just classification, honors `.gitignore`.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ragrat-331ign-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(root.join("ignored_dir")).unwrap();
+        std::fs::create_dir_all(root.join("kept_dir")).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored_dir/\n").unwrap();
+        // Seed a file in each so the dirs exist before the watch is placed.
+        std::fs::write(root.join("ignored_dir/a.rs"), "// a\n").unwrap();
+        std::fs::write(root.join("kept_dir/b.rs"), "// b\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Ok(mut w) = recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) else {
+            std::fs::remove_dir_all(&root).ok();
+            return; // no watcher backend available (sandboxed CI) — nothing to assert.
+        };
+        // Place watches exactly as watcher_main does: the gitignore-pruned target subtree.
+        let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from(".")]);
+        watch_tree_pruned(&mut w, &root, &ignore);
+
+        // A write inside the gitignored subtree must NOT be delivered (the dir was never watched).
+        std::fs::write(root.join("ignored_dir/a.rs"), "// a edited\n").unwrap();
+        let ignored_seen = drain_until_path_under(&rx, &root.join("ignored_dir"), 2);
+
+        // A write to a non-ignored sibling under the same target MUST be delivered.
+        std::fs::write(root.join("kept_dir/b.rs"), "// b edited\n").unwrap();
+        let kept_seen = drain_until_path_under(&rx, &root.join("kept_dir"), 3);
+
+        drop(w);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(!ignored_seen, "an edit inside a gitignored subtree must not be delivered (#331)");
+        assert!(kept_seen, "an edit in a non-ignored sibling must still be delivered");
+    }
+
+    #[test]
+    fn newly_created_non_ignored_dir_gets_watched() {
+        // ISSUE #331: target dirs are watched NON-recursively, so a directory created AFTER the
+        // watch is placed needs an explicit pruned watch (`watch_created_dirs`), or edits inside it
+        // would never fire. End-to-end: create a dir post-spawn, run the create-event handling,
+        // then write a file inside it and assert the change is delivered.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ragrat-331new-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored_dir/\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Ok(mut w) = recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) else {
+            std::fs::remove_dir_all(&root).ok();
+            return; // no watcher backend available (sandboxed CI) — nothing to assert.
+        };
+        let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from(".")]);
+        watch_tree_pruned(&mut w, &root, &ignore);
+
+        // Create a NEW non-ignored directory after the initial placement.
+        let fresh = root.join("fresh_dir");
+        std::fs::create_dir_all(&fresh).unwrap();
+        // Feed the create event through the same handler watcher_main runs, which places the watch.
+        let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(fresh.clone());
+        watch_created_dirs(&mut w, &create, &ignore);
+
+        // A write inside the freshly-watched dir must now be delivered.
+        std::fs::write(fresh.join("c.rs"), "// c\n").unwrap();
+        let seen = drain_until_path_under(&rx, &fresh, 3);
+
+        drop(w);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(seen, "an edit in a newly-created non-ignored dir must be delivered (#331)");
     }
 }
