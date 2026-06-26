@@ -307,8 +307,9 @@ impl CookbookProvisioner {
         // Wait for the handshake, the child exiting first, or the provision timeout — whichever
         // comes first. Poll so we can notice an early exit without blocking on the
         // handshake channel.
-        // On ANY provisioning-failure exit below, the group is reclaimed and `ACTIVE_PGID` cleared
-        // (so a later signal can't killpg a recycled pid). `reap_group` does both.
+        // On ANY provisioning-failure exit below, the group is reclaimed (SIGKILL) and THEN
+        // `ACTIVE_PGID` cleared — `reap_group` keeps the pgid visible until the kill lands, so a
+        // signal mid-reap still reaches the group rather than reading a prematurely-cleared 0.
         let deadline = Instant::now() + timeout;
         let (endpoint, auth_token) = loop {
             match hs_rx.recv_timeout(Duration::from_millis(50)) {
@@ -427,7 +428,9 @@ const COOKBOOK_SLASH_PREFIX: &str = "@rag-rat/cookbook/";
 /// or recipe path FOLLOWED by provider subcommand/args, e.g. `@rag-rat/cookbook modal`). The FIRST
 /// token decides the runner; the first token + the rest are passed as SEPARATE process args:
 /// - first token ends `.mjs`/`.js` → `node <first> <rest...>`
-/// - first token ends `.ts`/`.mts` → `npx tsx <first> <rest...>` (recipes are `.mts`)
+/// - first token ends `.ts`/`.mts` → `npx -y tsx <first> <rest...>` (recipes are `.mts`; `-y`
+///   auto-confirms the `tsx` install, since the child's stdin is null and an unconfirmed prompt
+///   would hang)
 /// - else (a package spec) → `npx -y <first> <rest...>` (`-y` auto-confirms the npx install)
 ///
 /// SLASH-FORM NORMALIZATION (#330-2): the docs/tests also show the single-token form
@@ -452,8 +455,11 @@ fn cookbook_command(cookbook: &str) -> Command {
         c.arg(first);
         c
     } else if lower.ends_with(".ts") || lower.ends_with(".mts") {
+        // `-y` auto-confirms npx's install-confirm prompt for `tsx` (#330: stdin is
+        // `Stdio::null()`, so an unconfirmed prompt would hang/fail on a machine without
+        // `tsx` installed — same as the package-spec branch below).
         let mut c = Command::new("npx");
-        c.args(["tsx", first]);
+        c.args(["-y", "tsx", first]);
         c
     } else {
         let mut c = Command::new("npx");
@@ -611,21 +617,32 @@ impl Drop for ProvisionedBox {
 /// cloud box, wait a grace period, then killpg SIGKILL if anything in the group is still alive. The
 /// cookbook contract is "SIGTERM → tear down + exit 0"; the grace period gives it time to actually
 /// reclaim the remote box. We signal the GROUP (not `child.id()`) because `npx` makes the recipe
-/// holding the box a grandchild. `ACTIVE_PGID` is cleared first so the signal handler won't also
-/// act on a pgid we're already reclaiming.
+/// holding the box a grandchild.
+///
+/// INVARIANT (#330-6 leak fix): `ACTIVE_PGID` stays SET until the group is FULLY reaped — it is
+/// cleared at the END here (and in the early-return), NEVER at the start. Why: clearing it first
+/// opened a race — a SIGINT/SIGTERM arriving during the grace poll would `swap(0)` and read 0, so
+/// the handler did NOTHING and `_exit`ed, interrupting this in-progress teardown BEFORE its SIGKILL
+/// backstop → a leaked live box. With the pgid kept visible, a mid-teardown signal's `swap(0)`
+/// takes OWNERSHIP and the handler runs its OWN complete SIGTERM→grace→SIGKILL before exiting, so
+/// the group is reaped either way. The `swap` is also what prevents a double-teardown (whoever
+/// clears it owns it). If the handler already took it (swap returned non-0 there), our `store(0)`
+/// at the end is a harmless idempotent re-clear.
 ///
 /// We poll the WHOLE GROUP (`killpg(pgid, 0)`), NOT just the leader's `waitpid`. The `npx` leader
 /// is the group leader, but the recipe GRANDCHILD is what holds the paid box and runs the SIGTERM
 /// teardown. The leader can exit while the grandchild is still mid-teardown — if we returned the
 /// instant the leader was reaped (the old bug), we'd skip the SIGKILL backstop and a STUCK
 /// grandchild teardown would orphan the box. So we reap the leader (no zombie) but keep waiting on
-/// the group: the grace period ends early only when EVERY member is gone (`ESRCH`), and a group
-/// still alive at the deadline gets `killpg(SIGKILL)`.
+/// the group: the grace ends early only when EVERY member is gone (`ESRCH`), and a group still
+/// alive at the deadline gets `killpg(SIGKILL)`.
 #[cfg(unix)]
 fn teardown_group(pgid: i32, child: &mut Child) {
-    ACTIVE_PGID.store(0, Ordering::SeqCst);
     if matches!(child.try_wait(), Ok(Some(_))) {
-        return; // already reaped (e.g. a failure path already killed the group)
+        // Already reaped (e.g. a failure path already killed the group). Now that it's gone,
+        // release the pgid so a later signal doesn't act on a recycled pid.
+        ACTIVE_PGID.store(0, Ordering::SeqCst);
+        return;
     }
     killpg(pgid, libc::SIGTERM);
     let deadline = Instant::now() + TEARDOWN_GRACE;
@@ -634,7 +651,9 @@ fn teardown_group(pgid: i32, child: &mut Child) {
         // that as "the group is gone" — the box-holding grandchild may still be tearing down.
         let _ = child.try_wait();
         if !group_alive(pgid) {
-            return; // every member of the group is gone (the recipe finished its teardown)
+            // Every member is gone (the recipe finished its teardown) → release the pgid.
+            ACTIVE_PGID.store(0, Ordering::SeqCst);
+            return;
         }
         if Instant::now() >= deadline {
             break;
@@ -642,9 +661,10 @@ fn teardown_group(pgid: i32, child: &mut Child) {
         std::thread::sleep(Duration::from_millis(100));
     }
     // The group is STILL alive past the grace period (a stuck grandchild teardown) → force the
-    // whole group, then reap the leader so it isn't left a zombie.
+    // whole group, reap the leader, THEN clear the pgid (only now is the group actually gone).
     killpg(pgid, libc::SIGKILL);
     let _ = child.wait();
+    ACTIVE_PGID.store(0, Ordering::SeqCst);
 }
 
 /// `true` while ANY member of the process group `pgid` is still alive. `killpg(pgid, 0)` sends no
@@ -707,12 +727,15 @@ fn group_alive_in_handler(pgid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// Reap a process group on a provisioning-FAILURE path (early exit / timeout): SIGKILL the group
-/// (no graceful wait — provisioning never reached the serving state) and clear `ACTIVE_PGID`.
+/// Reap a process group on a provisioning-FAILURE path (early exit / child already dead): SIGKILL
+/// the group (no graceful wait — provisioning never reached the serving state), THEN clear
+/// `ACTIVE_PGID`. Same invariant as `teardown_group`: the pgid stays visible until the group is
+/// killed, so a signal mid-reap takes ownership and SIGKILLs rather than reading a cleared 0 and
+/// skipping it.
 #[cfg(unix)]
 fn reap_group(pgid: i32) {
-    ACTIVE_PGID.store(0, Ordering::SeqCst);
     killpg(pgid, libc::SIGKILL);
+    ACTIVE_PGID.store(0, Ordering::SeqCst);
 }
 
 /// `killpg(pgid, sig)` — signal the whole process group. SAFETY: `killpg(2)` with a valid signal; a
@@ -1130,14 +1153,15 @@ mod tests {
         assert_eq!(prog(&mjs), "node");
         assert_eq!(args(&mjs), vec!["./recipe.mjs"]);
 
+        // `.ts`/`.mts` → `npx -y tsx <recipe>` — the `-y` auto-confirms the `tsx` install (#330:
+        // the child's stdin is null, so an unconfirmed npx prompt would hang).
         let ts = cookbook_command("./recipe.ts");
         assert_eq!(prog(&ts), "npx");
-        assert_eq!(args(&ts), vec!["tsx", "./recipe.ts"]);
+        assert_eq!(args(&ts), vec!["-y", "tsx", "./recipe.ts"]);
 
-        // `.mts` (the recipes' actual extension) routes through npx tsx too.
         let mts = cookbook_command("./recipe.mts");
         assert_eq!(prog(&mts), "npx");
-        assert_eq!(args(&mts), vec!["tsx", "./recipe.mts"]);
+        assert_eq!(args(&mts), vec!["-y", "tsx", "./recipe.mts"]);
 
         // SLASH FORM (#330-2): the single-token `@rag-rat/cookbook/modal` is NORMALIZED to the
         // package + a `modal` arg, NOT passed verbatim (which npx would treat as a package subpath

@@ -471,14 +471,43 @@ pub(crate) fn default_eval_path(config: &Config, file_name: &str) -> PathBuf {
     config.root.join("evals").join(file_name)
 }
 
+/// Decide whether a `models install <model_id>` should use the configured `[llm.embedding.remote]`
+/// block. The block is configured for ONE specific model — the SELECTED `[llm.embedding] model` —
+/// and serves `[remote] model` (e.g. MiniLM) over Ollama. Reusing it for a DIFFERENT transformer id
+/// (e.g. `BAAI/bge-small-en-v1.5`, also FastEmbed/384) would pass the non-transformer guard + the
+/// 384-dim probe yet mark the BGE row `runtime='ollama'` while the server actually embeds MiniLM
+/// under the BGE id (#330). So:
+/// - no `[remote]` block → `None` (local install for whatever the user typed);
+/// - `[remote]` + the user installs the CONFIGURED model → the remote (serve it over Ollama);
+/// - `[remote]` + a DIFFERENT model → a clear error (don't silently install the wrong model).
+fn remote_for_install<'a>(
+    config: &'a Config,
+    model_id: &str,
+) -> anyhow::Result<Option<&'a rag_rat_core::config::RemoteEmbeddingConfig>> {
+    let Some(remote) = config.llm.embedding.remote.as_ref() else {
+        return Ok(None);
+    };
+    // Resolve the requested id to its canonical spec id and compare to the configured selected
+    // model.
+    let requested = rag_rat_core::embedding_models::spec(model_id).map(|s| s.model_id);
+    let configured = config.llm.embedding.backend.model_id();
+    if requested.is_some() && requested == configured {
+        Ok(Some(remote))
+    } else {
+        anyhow::bail!(
+            "remote embedding is configured for `{}`; install that model remotely, or remove the \
+             [llm.embedding.remote] block to install `{model_id}` locally",
+            configured.unwrap_or("none"),
+        )
+    }
+}
+
 pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     match &args.command {
         None | Some(ModelsCommand::List) => print_output(&db.list_models()?),
         Some(ModelsCommand::Install { model_id }) => {
-            // A `[remote]` block (endpoint read from the toml, validated at config-parse) installs
-            // the model over Ollama; absent → local install.
-            let remote = config.llm.embedding.remote.as_ref();
+            let remote = remote_for_install(config, model_id)?;
             print_output(&db.install_model(model_id, remote)?)
         },
     }
@@ -1387,6 +1416,69 @@ mod tests {
         super::maintenance(&config, &args).unwrap();
         assert!(!pending.exists(), "the runner clears the rerun marker after its pass");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Build a `Config` from a written rag-rat.toml with the given embedding-model selector and an
+    /// optional connect `[remote]` block (a closed-port endpoint — never connected in these tests).
+    fn config_with_remote(model: &str, with_remote: bool) -> (PathBuf, Config) {
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-remote-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        let remote = if with_remote {
+            "\n[llm.embedding.remote]\nendpoint = \"http://127.0.0.1:1\"\nmodel = \"all-minilm\"\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            root.join("rag-rat.toml"),
+            format!(
+                "[index]\nroot = \".\"\n\n[target_bindings]\nrust = \
+                 [\"src\"]\n\n[llm.embedding]\nmodel = \"{model}\"\n{remote}"
+            ),
+        )
+        .unwrap();
+        let config = Config::load(root.join("rag-rat.toml")).unwrap();
+        (root, config)
+    }
+
+    #[test]
+    fn remote_for_install_only_applies_the_remote_block_to_the_configured_model() {
+        // Configured for the MiniLM transformer over a [remote] block.
+        let (root, config) = config_with_remote("sentence-transformers/all-MiniLM-L6-v2", true);
+
+        // Installing the CONFIGURED model → uses the remote block.
+        assert!(
+            super::remote_for_install(&config, "sentence-transformers/all-MiniLM-L6-v2")
+                .unwrap()
+                .is_some(),
+            "the configured model installs over the remote",
+        );
+
+        // Installing a DIFFERENT transformer (BGE, also FastEmbed/384) → REJECTED (#330): the
+        // remote serves MiniLM, so installing BGE over it would store MiniLM vectors under
+        // the BGE id.
+        let err = super::remote_for_install(&config, "BAAI/bge-small-en-v1.5")
+            .expect_err("a different model than the configured one must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("remote embedding is configured for"), "{msg}");
+        assert!(msg.contains("sentence-transformers/all-MiniLM-L6-v2"), "names configured: {msg}");
+        assert!(msg.contains("BAAI/bge-small-en-v1.5"), "names requested: {msg}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remote_for_install_returns_none_without_a_remote_block() {
+        // No [remote] block → any install is local (None) regardless of the requested id.
+        let (root, config) = config_with_remote("sentence-transformers/all-MiniLM-L6-v2", false);
+        assert!(super::remote_for_install(&config, "BAAI/bge-small-en-v1.5").unwrap().is_none());
+        assert!(super::remote_for_install(&config, "embedding-hash").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
