@@ -531,6 +531,10 @@ fn watch_tree_pruned(watcher: &mut impl notify::Watcher, dir: &Path, ignore: &Ig
         };
         for entry in entries.flatten() {
             let p = entry.path();
+            // `DirEntry::file_type` does NOT follow symlinks (unlike `fs::metadata`): a
+            // symlink-to-dir reports `is_dir() == false` here, so the recursion never descends
+            // through a link and can't place watches outside `config.root` (#332). Matches the
+            // index walker, which also skips symlinks.
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
                 && !ignore.is_ignored(&p, true)
             {
@@ -540,13 +544,41 @@ fn watch_tree_pruned(watcher: &mut impl notify::Watcher, dir: &Path, ignore: &Ig
     }
 }
 
-/// For a relevant `Create` event, place a pruned watch on any newly-created, non-ignored directory
-/// among its paths (issue #331). Target dirs are watched non-recursively, so notify will not
+/// Whether `path` is inside a configured target directory (so it could ever satisfy
+/// `target_for_path`). `config.root` itself is watched non-recursively (the `gitignore_watch_dirs`
+/// ancestor chain), so a top-level create OUTSIDE a target — `vendor/`, a sibling of `src/`, or an
+/// ancestor of `config.root` — is also delivered to the event loop; without this gate
+/// [`watch_created_dirs`] would watch it even though it can never be indexed, re-exhausting inotify
+/// (#332). A whole-root target (`directories = ["."]`) matches any path under `config.root`.
+fn dir_under_a_target(config: &Config, target_dirs: &[PathBuf], path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(&config.root) else {
+        return false; // outside config.root entirely (an ancestor-chain event).
+    };
+    target_dirs.iter().any(|d| d == Path::new(".") || rel.starts_with(d))
+}
+
+/// Place a pruned watch on any newly-appeared, in-target, non-ignored *real* directory among an
+/// event's paths (issue #331/#332). Target dirs are watched non-recursively, so notify will not
 /// auto-watch a freshly-created subdir; without this, edits inside it would never fire a pass.
-/// Dir-ness is read from the filesystem rather than the notify `CreateKind` — the inotify backend
-/// commonly reports `CreateKind::Any`, so the kind alone can't distinguish a new dir from a new
-/// file. A dir already ignored (a fresh `node_modules`/`target`) is left unwatched.
-fn watch_created_dirs(watcher: &mut impl notify::Watcher, event: &Event, ignore: &IgnoreMatcher) {
+///
+/// Each path is gated, in order, by:
+/// 1. **real dir** — `symlink_metadata` (which does NOT follow links) so a symlink-to-dir is
+///    `is_dir() == false` and skipped. Following it would let `watch_tree_pruned` recurse OUTSIDE
+///    `config.root` (e.g. a link to a dep cache) and re-exhaust inotify; the index walker likewise
+///    skips symlinks. Dir-ness comes from the filesystem, not the notify `CreateKind`, because the
+///    inotify backend commonly reports `CreateKind::Any`.
+/// 2. **under a target** — [`dir_under_a_target`]; a non-target top-level dir can never be indexed.
+/// 3. **not ignored** — by the current matcher.
+/// 4. **recompile + re-check** — a directory MOVED in can carry its own nested `.gitignore`, which
+///    the long-lived matcher (compiled before that subtree existed) doesn't know about; recompiling
+///    here picks the nested rules up so `watch_tree_pruned` prunes against them, not stale rules.
+fn watch_created_dirs(
+    watcher: &mut impl notify::Watcher,
+    event: &Event,
+    config: &Config,
+    target_dirs: &[PathBuf],
+    ignore: &mut IgnoreMatcher,
+) {
     // A directory APPEARS either as a Create or — when moved/renamed INTO a watched target
     // (`mv /tmp/pkg src/pkg`) — as a name Modify (`RenameMode::To`/`Both`) (#332). Both need a
     // fresh pruned watch, because the parent is watched NonRecursive (#331) so notify won't
@@ -560,10 +592,25 @@ fn watch_created_dirs(watcher: &mut impl notify::Watcher, event: &Event, ignore:
         return;
     }
     for path in &event.paths {
-        let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
-        if is_dir && !ignore.is_ignored(path, true) {
-            watch_tree_pruned(watcher, path, ignore);
+        // `symlink_metadata` does NOT follow links: a symlink pointing at a directory is reported
+        // as a symlink (`is_dir() == false`) → skipped, so we never recurse through it (#332).
+        let is_real_dir = std::fs::symlink_metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+        if !is_real_dir {
+            continue;
         }
+        if !dir_under_a_target(config, target_dirs, path) {
+            continue;
+        }
+        if ignore.is_ignored(path, true) {
+            continue;
+        }
+        // A moved-in dir may carry a nested `.gitignore` the long-lived matcher predates; recompile
+        // so the subtree is pruned against current (incl. nested) rules, then re-check the root.
+        *ignore = IgnoreMatcher::compile(&config.root, target_dirs);
+        if ignore.is_ignored(path, true) {
+            continue;
+        }
+        watch_tree_pruned(watcher, path, ignore);
     }
 }
 
@@ -680,8 +727,9 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
                 // (Create/rename + is-dir + not-ignored) makes calling it on every
                 // event correct; the maintenance pass a relevant event fires
                 // re-discovers the dir's current files, and the watch keeps SUBSEQUENT edits
-                // firing.
-                watch_created_dirs(&mut notify_watcher, &event, &ignore);
+                // firing. Gates each path on real-dir + under-a-target + not-ignored, and
+                // recompiles the matcher for a moved-in nested `.gitignore` (#332).
+                watch_created_dirs(&mut notify_watcher, &event, &config, &target_dirs, &mut ignore);
                 if event_is_relevant(&config, &ignore, &event)
                     || event_touches_worktree(
                         &config,
@@ -783,6 +831,29 @@ mod tests {
 
     fn mutation_event(path: PathBuf) -> Event {
         Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path)
+    }
+
+    /// A single-Rust-target `Config` rooted at `root` watching `target_dirs` — the inline builder
+    /// the real-watcher placement tests share so they can call `watch_created_dirs` (which needs a
+    /// `&Config` for the under-a-target gate, #332).
+    fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
+        Config {
+            root: root.to_path_buf(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: target_dirs.to_vec(),
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            watch: WatchConfig::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+            search: Default::default(),
+        }
     }
 
     #[test]
@@ -1427,7 +1498,9 @@ mod tests {
             std::fs::remove_dir_all(&root).ok();
             return; // no watcher backend available (sandboxed CI) — nothing to assert.
         };
-        let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from(".")]);
+        let target_dirs = vec![PathBuf::from(".")];
+        let config = whole_root_config(&root, &target_dirs);
+        let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
         watch_tree_pruned(&mut w, &root, &ignore);
 
         // Create a NEW non-ignored directory after the initial placement.
@@ -1435,7 +1508,7 @@ mod tests {
         std::fs::create_dir_all(&fresh).unwrap();
         // Feed the create event through the same handler watcher_main runs, which places the watch.
         let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(fresh.clone());
-        watch_created_dirs(&mut w, &create, &ignore);
+        watch_created_dirs(&mut w, &create, &config, &target_dirs, &mut ignore);
 
         // A write inside the freshly-watched dir must now be delivered.
         std::fs::write(fresh.join("c.rs"), "// c\n").unwrap();
@@ -1518,7 +1591,9 @@ mod tests {
             std::fs::remove_dir_all(&root).ok();
             return; // no watcher backend available (sandboxed CI) — nothing to assert.
         };
-        let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from(".")]);
+        let target_dirs = vec![PathBuf::from(".")];
+        let config = whole_root_config(&root, &target_dirs);
+        let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
         watch_tree_pruned(&mut w, &root, &ignore);
         // Simulate `mv` landing a directory into the target: create it, then feed a rename-To
         // event.
@@ -1526,7 +1601,7 @@ mod tests {
         std::fs::create_dir_all(&moved).unwrap();
         let rename =
             Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(moved.clone());
-        watch_created_dirs(&mut w, &rename, &ignore);
+        watch_created_dirs(&mut w, &rename, &config, &target_dirs, &mut ignore);
         std::fs::write(moved.join("d.rs"), "// d\n").unwrap();
         let seen = drain_until_path_under(&rx, &moved, 3);
         drop(w);
@@ -1572,5 +1647,166 @@ mod tests {
             seen,
             "after relaxing an ignore rule, re-placement must watch the unignored subtree (#332)",
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_to_a_directory_is_not_followed_into_watches() {
+        // ISSUE #332 (P2): `watch_created_dirs` must NOT follow a symlink-to-dir. A symlink created
+        // (or moved) under a target pointing at a huge tree OUTSIDE config.root (a dep cache,
+        // another checkout) would, if followed, make `watch_tree_pruned` recurse through it
+        // and place watches outside the indexed root → re-exhaust inotify.
+        // `symlink_metadata` reports the link as a link (`is_dir() == false`), so the path
+        // is skipped.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ragrat-332sym-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "").unwrap();
+        // A real directory OUTSIDE the target, with a file in it — the symlink's target.
+        let outside = std::env::temp_dir().join(format!("ragrat-332symtgt-{}-{id}", id));
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside = outside.canonicalize().unwrap();
+        std::fs::write(outside.join("f.rs"), "// f\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Ok(mut w) = recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) else {
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::remove_dir_all(&outside).ok();
+            return; // no watcher backend available (sandboxed CI) — nothing to assert.
+        };
+        let target_dirs = vec![PathBuf::from(".")];
+        let config = whole_root_config(&root, &target_dirs);
+        let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
+        watch_tree_pruned(&mut w, &root, &ignore);
+
+        // Symlink the outside dir UNDER the target, then feed its create event.
+        let link = root.join("linked");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(link.clone());
+        watch_created_dirs(&mut w, &create, &config, &target_dirs, &mut ignore);
+
+        // An edit to the file INSIDE the link target must NOT be delivered (the link wasn't
+        // watched, and the outside dir is not under config.root at all).
+        std::fs::write(outside.join("f.rs"), "// f edited\n").unwrap();
+        let followed = drain_until_path_under(&rx, &outside, 2);
+
+        drop(w);
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+        assert!(!followed, "a symlink-to-dir must not be followed into watches (#332)");
+    }
+
+    #[test]
+    fn a_non_target_top_level_dir_is_not_watched() {
+        // ISSUE #332 (P2): config.root is watched NON-recursively (the gitignore-chain ancestor
+        // watches), so a create of a top-level dir OUTSIDE any target (`vendor/`, a sibling of the
+        // `src` target) is delivered to the loop too. `watch_created_dirs` must gate on
+        // `dir_under_a_target` so it never watches such a dir — it can't be indexed and would just
+        // burn inotify watches. A new subdir UNDER the target still gets watched.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ragrat-332nt-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Ok(mut w) = recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) else {
+            std::fs::remove_dir_all(&root).ok();
+            return; // no watcher backend available (sandboxed CI) — nothing to assert.
+        };
+        let target_dirs = vec![PathBuf::from("src")];
+        let config = whole_root_config(&root, &target_dirs);
+        let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
+        // Watch the target subtree + (mirroring watcher_main) config.root itself non-recursively,
+        // so a top-level create is delivered here exactly as it would be in production.
+        watch_tree_pruned(&mut w, &root.join("src"), &ignore);
+        let _ = w.watch(&root, RecursiveMode::NonRecursive);
+
+        // A NON-target top-level dir: created + its event fed → must NOT be watched. Probe a file
+        // two levels deep (`vendor/sub/v.rs`) — a delivery there could ONLY come from a watch on
+        // `vendor` (or below), never from the root's own NON-recursive watch, which sees the
+        // top-level `vendor` entry but not its contents. (Probing `vendor/v.rs` would falsely match
+        // the root watch's delivery of the direct `vendor` child.)
+        let vendor = root.join("vendor");
+        let vendor_sub = vendor.join("sub");
+        std::fs::create_dir_all(&vendor_sub).unwrap();
+        let vendor_ev = Event::new(EventKind::Create(CreateKind::Folder)).add_path(vendor.clone());
+        watch_created_dirs(&mut w, &vendor_ev, &config, &target_dirs, &mut ignore);
+        std::fs::write(vendor_sub.join("v.rs"), "// v\n").unwrap();
+        let vendor_seen = drain_until_path_under(&rx, &vendor_sub, 2);
+
+        // A new dir UNDER the target: must be watched.
+        let pkg = root.join("src/pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let pkg_ev = Event::new(EventKind::Create(CreateKind::Folder)).add_path(pkg.clone());
+        watch_created_dirs(&mut w, &pkg_ev, &config, &target_dirs, &mut ignore);
+        std::fs::write(pkg.join("p.rs"), "// p\n").unwrap();
+        let pkg_seen = drain_until_path_under(&rx, &pkg, 3);
+
+        drop(w);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(!vendor_seen, "a non-target top-level dir must not be watched (#332)");
+        assert!(pkg_seen, "a new dir under the target must still be watched");
+    }
+
+    #[test]
+    fn a_moved_in_dir_with_a_nested_gitignore_prunes_against_it() {
+        // ISSUE #332 (P2): a dir MOVED into a target carrying its OWN nested `.gitignore` must be
+        // pruned against that nested rule. The long-lived matcher was compiled before the subtree
+        // existed, so it doesn't know the nested rule; `watch_created_dirs` recompiles before
+        // walking so `watch_tree_pruned` skips the nested-ignored subdir.
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use notify::event::{ModifyKind, RenameMode};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ragrat-332nest-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Ok(mut w) = recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) else {
+            std::fs::remove_dir_all(&root).ok();
+            return; // no watcher backend available (sandboxed CI) — nothing to assert.
+        };
+        let target_dirs = vec![PathBuf::from(".")];
+        let config = whole_root_config(&root, &target_dirs);
+        let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
+        watch_tree_pruned(&mut w, &root, &ignore);
+
+        // Build the moved-in dir with a NESTED `.gitignore` ignoring `ignored_sub/`, plus a kept
+        // sibling — all created BEFORE feeding the rename event (so the matcher was stale to them).
+        let pkg = root.join("pkg");
+        std::fs::create_dir_all(pkg.join("ignored_sub")).unwrap();
+        std::fs::create_dir_all(pkg.join("kept_sub")).unwrap();
+        std::fs::write(pkg.join(".gitignore"), "ignored_sub/\n").unwrap();
+        std::fs::write(pkg.join("ignored_sub/x.rs"), "// x\n").unwrap();
+        std::fs::write(pkg.join("kept_sub/y.rs"), "// y\n").unwrap();
+        let rename =
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(pkg.clone());
+        watch_created_dirs(&mut w, &rename, &config, &target_dirs, &mut ignore);
+
+        // The nested-ignored subdir must NOT be watched; the kept sibling MUST be.
+        std::fs::write(pkg.join("ignored_sub/x.rs"), "// x edited\n").unwrap();
+        let ignored_seen = drain_until_path_under(&rx, &pkg.join("ignored_sub"), 2);
+        std::fs::write(pkg.join("kept_sub/y.rs"), "// y edited\n").unwrap();
+        let kept_seen = drain_until_path_under(&rx, &pkg.join("kept_sub"), 3);
+
+        drop(w);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(!ignored_seen, "a moved-in nested-.gitignore-ignored subdir must not be watched");
+        assert!(kept_seen, "the kept sibling under the moved-in dir must be watched (#332)");
     }
 }
