@@ -73,7 +73,7 @@ impl IndexDatabase {
             parser_failure_paths: self.parser_failure_paths()?,
             git_history: self.git_history_status()?,
             github: self.github_status()?,
-            local_ai: self.local_ai_status()?,
+            llm: self.local_ai_status()?,
             anchor_health: crate::query::memory::anchor_health_counts(self.storage.connection())
                 .unwrap_or_default(),
         })

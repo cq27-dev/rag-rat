@@ -277,7 +277,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: Default::default(),
+            llm: Default::default(),
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),

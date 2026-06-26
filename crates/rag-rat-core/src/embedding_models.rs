@@ -28,7 +28,7 @@ pub enum Backend {
     /// already a non-optional workspace dep, so there is no heavy optional dependency to gate — no
     /// `remote-embed` feature). This is a RUNTIME value ONLY: NO `EMBEDDING_MODELS` row carries it
     /// and it is NOT a `model = "..."` selector (#317 rework). It is the EFFECTIVE runtime computed
-    /// at dispatch when a `[local_ai.embedding.remote]` block is present — the selected model
+    /// at dispatch when a `[llm.embedding.remote]` block is present — the selected model
     /// (e.g. `minilm`) is served by Ollama instead of in-process, same model_id + dim, runtime
     /// overridden. The endpoint/auth/timeout/server-side model come from the `[remote]` config
     /// block, never the static registry.
@@ -107,7 +107,7 @@ pub const MODEL2VEC_EMBEDDING_DIM: usize = 512;
 
 // NOTE (#317 rework): there is intentionally NO `ollama-*` registry row, alias, or const. Ollama is
 // a TRANSPORT, not a model — the model selector (`model = "minilm"`) names the MODEL, and a
-// `[local_ai.embedding.remote]` block serves THAT model via Ollama (same model_id + dim, runtime
+// `[llm.embedding.remote]` block serves THAT model via Ollama (same model_id + dim, runtime
 // overridden to `Backend::Ollama` at dispatch). `Backend::Ollama` therefore never appears in this
 // table; it is only ever the EFFECTIVE runtime when a remote block is present.
 

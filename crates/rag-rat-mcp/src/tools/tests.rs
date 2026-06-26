@@ -368,9 +368,9 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
     let status = call_tool(&config.database, "index_status", json!({})).unwrap();
     assert!(status["database"].as_str().unwrap().ends_with("index.sqlite"));
     assert_eq!(status["fts_fresh"], true);
-    // index_status trims the embedded local_ai block (use local_ai_status) and the static
+    // index_status trims the embedded llm block (use local_ai_status) and the static
     // migration ledger (use the CLI doctor/migrate).
-    assert!(status.get("local_ai").is_none(), "local_ai should not be embedded in index_status");
+    assert!(status.get("llm").is_none(), "llm should not be embedded in index_status");
     assert!(
         status["schema"].get("migrations").is_none(),
         "migration ledger should be trimmed from index_status"
@@ -388,8 +388,8 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
     let github_status = call_tool(&config.database, "github_sync_status", json!({})).unwrap();
     assert!(github_status["capability"].is_string());
 
-    let local_ai = call_tool(&config.database, "local_ai_status", json!({})).unwrap();
-    assert_eq!(local_ai["embedding"]["state"], "MissingModel");
+    let llm = call_tool(&config.database, "local_ai_status", json!({})).unwrap();
+    assert_eq!(llm["embedding"]["state"], "MissingModel");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -883,7 +883,7 @@ fn mixed_config() -> (PathBuf, Config) {
                 kind: TargetKind::Source,
             },
         ],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -906,7 +906,7 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
             exclude: Vec::new(),
             kind: TargetKind::Docs,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -926,7 +926,7 @@ fn rust_config(root: PathBuf) -> Config {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),

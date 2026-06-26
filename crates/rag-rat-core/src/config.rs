@@ -16,7 +16,7 @@ pub struct Config {
     pub root: PathBuf,
     pub database: PathBuf,
     pub targets: Vec<ResolvedTarget>,
-    pub local_ai: LocalAiConfig,
+    pub llm: LlmConfig,
     pub watch: WatchConfig,
     pub version_check: VersionCheckConfig,
     pub oracle: OracleConfig,
@@ -99,7 +99,7 @@ impl Default for WatchConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LocalAiConfig {
+pub struct LlmConfig {
     pub embedding: EmbeddingConfig,
 }
 
@@ -109,7 +109,7 @@ pub struct EmbeddingConfig {
     /// on repo size; see [`EmbeddingBackend`].
     pub backend: EmbeddingBackend,
     pub runtime: EmbeddingRuntimeConfig,
-    /// Optional remote-embedding offload (`[local_ai.embedding.remote]`). When present, the
+    /// Optional remote-embedding offload (`[llm.embedding.remote]`). When present, the
     /// indexer can hand embedding work to an HTTP server (Ollama's `/api/embed`) instead of
     /// running the model in-process — see [`RemoteEmbeddingConfig`]. Absent → `None` → in-process
     /// embedding only. Parsed + validated here; the dispatch that consumes it lands in #317 task
@@ -117,7 +117,7 @@ pub struct EmbeddingConfig {
     pub remote: Option<RemoteEmbeddingConfig>,
 }
 
-/// The embedding backend selector (`[local_ai.embedding] model = "..."`).
+/// The embedding backend selector (`[llm.embedding] model = "..."`).
 ///
 /// Resolves the toml `model = "..."` string through the [`crate::embedding_models`] registry by its
 /// `model_id` (the HF path — NO aliases, #317), so ANY registered model is selectable by its full
@@ -219,7 +219,7 @@ impl Default for EmbeddingRuntimeConfig {
     }
 }
 
-/// Remote-embedding offload (`[local_ai.embedding.remote]`). Hands embedding work to an HTTP
+/// Remote-embedding offload (`[llm.embedding.remote]`). Hands embedding work to an HTTP
 /// server (Ollama's `/api/embed`) instead of running the model in-process — the lever for huge
 /// repos whose in-process backfill is too slow on the indexing box. Optional: absent → in-process
 /// embedding only.
@@ -464,13 +464,13 @@ impl Config {
         // (`refresh_worktree_overlays`) and indexes the branch with its own target set (#219
         // review).
         let targets = main_base_targets(&root, &local_root).unwrap_or(local_targets);
-        let local_ai = LocalAiConfig::try_from(raw.local_ai)?;
+        let llm = LlmConfig::try_from(raw.llm)?;
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();
         let search = raw.search.into();
 
-        Ok(Self { root, database, targets, local_ai, watch, version_check, oracle, search })
+        Ok(Self { root, database, targets, llm, watch, version_check, oracle, search })
     }
 }
 
@@ -620,7 +620,7 @@ struct RawConfig {
     #[serde(default)]
     index: RawIndex,
     #[serde(default)]
-    local_ai: RawLocalAi,
+    llm: RawLlm,
     #[serde(default)]
     watch: RawWatch,
     #[serde(default)]
@@ -710,15 +710,15 @@ struct RawIndex {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct RawLocalAi {
+struct RawLlm {
     #[serde(default)]
     embedding: RawEmbedding,
 }
 
-impl TryFrom<RawLocalAi> for LocalAiConfig {
+impl TryFrom<RawLlm> for LlmConfig {
     type Error = ConfigError;
 
-    fn try_from(raw: RawLocalAi) -> Result<Self, Self::Error> {
+    fn try_from(raw: RawLlm) -> Result<Self, Self::Error> {
         Ok(Self { embedding: EmbeddingConfig::try_from(raw.embedding)? })
     }
 }
@@ -730,7 +730,7 @@ struct RawEmbedding {
     model: Option<String>,
     #[serde(default)]
     runtime: RawEmbeddingRuntime,
-    /// `[local_ai.embedding.remote]` — absent → no remote offload (`remote: None`).
+    /// `[llm.embedding.remote]` — absent → no remote offload (`remote: None`).
     remote: Option<RawRemoteEmbedding>,
 }
 
@@ -883,23 +883,23 @@ pub enum ConfigError {
     )]
     UnknownEmbeddingBackend(String),
     #[error(
-        "[local_ai.embedding.remote] requires a non-empty `model` (the Ollama API model name, \
-         such as `all-minilm`)"
+        "[llm.embedding.remote] requires a non-empty `model` (the Ollama API model name, such as \
+         `all-minilm`)"
     )]
     RemoteEmbeddingMissingModel,
     #[error(
-        "[local_ai.embedding.remote] requires EXACTLY ONE of `endpoint` (connect to a running \
-         Ollama) or `cookbook` (provision an ephemeral box) — set neither both nor zero"
+        "[llm.embedding.remote] requires EXACTLY ONE of `endpoint` (connect to a running Ollama) \
+         or `cookbook` (provision an ephemeral box) — set neither both nor zero"
     )]
     RemoteEmbeddingModeAmbiguous,
     #[error(
-        "[local_ai.embedding.remote] `endpoint` must not embed credentials in the URL (no \
+        "[llm.embedding.remote] `endpoint` must not embed credentials in the URL (no \
          `user:pass@host`) — the endpoint is persisted into the index; put any token in an env \
          var and name it via `auth_env` instead"
     )]
     RemoteEmbeddingEndpointHasCredentials,
     #[error(
-        "[local_ai.embedding.remote] can only serve a transformer model over Ollama, but `model = \
+        "[llm.embedding.remote] can only serve a transformer model over Ollama, but `model = \
          \"{0}\"` selects a non-transformer backend (static/hash) — remove the remote block, or \
          pick a transformer model such as `minilm` / `bge` / `jina`"
     )]
@@ -1211,7 +1211,7 @@ mod tests {
             root = "."
             database = ".rag-rat/index.sqlite"
 
-            [local_ai.embedding.runtime]
+            [llm.embedding.runtime]
             batch_size = 128
             ort_threads = 2
             omp_threads = 1
@@ -1220,9 +1220,9 @@ mod tests {
         )
         .unwrap();
 
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        let llm = LlmConfig::try_from(raw.llm).unwrap();
 
-        assert_eq!(local_ai.embedding.runtime, EmbeddingRuntimeConfig {
+        assert_eq!(llm.embedding.runtime, EmbeddingRuntimeConfig {
             batch_size: 128,
             ort_threads: Some(2),
             omp_threads: Some(1),
@@ -1237,13 +1237,13 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
             "#,
         )
         .unwrap();
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
-        assert_eq!(local_ai.embedding.remote, None, "no [remote] block → remote: None");
+        let llm = LlmConfig::try_from(raw.llm).unwrap();
+        assert_eq!(llm.embedding.remote, None, "no [remote] block → remote: None");
     }
 
     #[test]
@@ -1255,18 +1255,18 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             endpoint = "http://localhost:11434"
             "#,
         )
         .unwrap();
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        let llm = LlmConfig::try_from(raw.llm).unwrap();
         assert_eq!(
-            local_ai.embedding.remote,
+            llm.embedding.remote,
             Some(RemoteEmbeddingConfig {
                 model: "all-minilm".to_string(),
                 endpoint: Some("http://localhost:11434".to_string()),
@@ -1278,12 +1278,12 @@ mod tests {
                 request_timeout_s: 60,
             })
         );
-        let remote = local_ai.embedding.remote.as_ref().unwrap();
+        let remote = llm.embedding.remote.as_ref().unwrap();
         assert!(remote.is_connect() && !remote.is_ephemeral());
         // The selector still resolves to the LOCAL fastembed model — the [remote] block overrides
         // the RUNTIME, not the model identity.
         assert_eq!(
-            local_ai.embedding.backend.model_id(),
+            llm.embedding.backend.model_id(),
             Some(crate::embedding_models::FASTEMBED_MODEL_ID)
         );
     }
@@ -1297,16 +1297,16 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             cookbook = "@rag-rat/cookbook/modal"
             "#,
         )
         .unwrap();
-        let remote = LocalAiConfig::try_from(raw.local_ai).unwrap().embedding.remote.unwrap();
+        let remote = LlmConfig::try_from(raw.llm).unwrap().embedding.remote.unwrap();
         assert!(remote.is_ephemeral() && !remote.is_connect());
         assert_eq!(remote.cookbook.as_deref(), Some("@rag-rat/cookbook/modal"));
         assert_eq!(remote.endpoint, None);
@@ -1320,17 +1320,17 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             cookbook = "./recipe.mjs"
             query_endpoint = "http://127.0.0.1:11999"
             "#,
         )
         .unwrap();
-        let remote = LocalAiConfig::try_from(raw.local_ai).unwrap().embedding.remote.unwrap();
+        let remote = LlmConfig::try_from(raw.llm).unwrap().embedding.remote.unwrap();
         assert_eq!(remote.query_endpoint.as_deref(), Some("http://127.0.0.1:11999"));
     }
 
@@ -1341,10 +1341,10 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             endpoint = "http://localhost:11434"
             auth_env = "OLLAMA_TOKEN"
@@ -1353,9 +1353,9 @@ mod tests {
             "#,
         )
         .unwrap();
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        let llm = LlmConfig::try_from(raw.llm).unwrap();
         assert_eq!(
-            local_ai.embedding.remote,
+            llm.embedding.remote,
             Some(RemoteEmbeddingConfig {
                 model: "all-minilm".to_string(),
                 endpoint: Some("http://localhost:11434".to_string()),
@@ -1376,27 +1376,27 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             "#;
         let both = r#"
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             endpoint = "http://localhost:11434"
             cookbook = "@rag-rat/cookbook/modal"
             "#;
         for (label, toml_str) in [("neither", neither), ("both", both)] {
             let raw: RawConfig = toml::from_str(toml_str).unwrap();
-            let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+            let err = LlmConfig::try_from(raw.llm).unwrap_err();
             assert!(
                 matches!(err, ConfigError::RemoteEmbeddingModeAmbiguous),
                 "{label} endpoint/cookbook → RemoteEmbeddingModeAmbiguous, got {err:?}",
@@ -1413,16 +1413,16 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             endpoint = "https://user:token@host:11434"
             "#,
         )
         .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingEndpointHasCredentials),
             "endpoint with userinfo → RemoteEmbeddingEndpointHasCredentials, got {err:?}",
@@ -1439,12 +1439,12 @@ mod tests {
             "http://localhost:11434/v1/embeddings?user=a@b",
         ] {
             let raw: RawConfig = toml::from_str(&format!(
-                "[index]\nroot = \".\"\n\n[local_ai.embedding]\nmodel = \
-                 \"sentence-transformers/all-MiniLM-L6-v2\"\n\n[local_ai.embedding.remote]\nmodel \
-                 = \"all-minilm\"\nendpoint = \"{endpoint}\"\n"
+                "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \
+                 \"sentence-transformers/all-MiniLM-L6-v2\"\n\n[llm.embedding.remote]\nmodel = \
+                 \"all-minilm\"\nendpoint = \"{endpoint}\"\n"
             ))
             .unwrap();
-            let remote = LocalAiConfig::try_from(raw.local_ai)
+            let remote = LlmConfig::try_from(raw.llm)
                 .unwrap_or_else(|e| panic!("`{endpoint}` must be accepted: {e:?}"))
                 .embedding
                 .remote
@@ -1472,17 +1472,17 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             cookbook = "@rag-rat/cookbook/modal"
             query_endpoint = "http://user:tok@127.0.0.1:11434"
             "#,
         )
         .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingEndpointHasCredentials),
             "query_endpoint with userinfo → RemoteEmbeddingEndpointHasCredentials, got {err:?}",
@@ -1491,22 +1491,22 @@ mod tests {
 
     #[test]
     fn remote_embedding_missing_model_is_rejected() {
-        // The two `model` keys are distinct: `[local_ai.embedding] model` is the registry SELECTOR;
+        // The two `model` keys are distinct: `[llm.embedding] model` is the registry SELECTOR;
         // `[remote] model` is the Ollama API model name — it's the latter that's required here.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             endpoint = "http://localhost:11434"
             "#,
         )
         .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingMissingModel),
             "omitted [remote] model → RemoteEmbeddingMissingModel, got {err:?}",
@@ -1518,16 +1518,16 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
+            [llm.embedding]
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "   "
             endpoint = "http://localhost:11434"
             "#,
         )
         .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingMissingModel),
             "whitespace-only [remote] model → RemoteEmbeddingMissingModel, got {err:?}",
@@ -1541,12 +1541,12 @@ mod tests {
         // explain — reject at parse with a clear message. Selectors are the HF-path model_ids now.
         for model in ["minishlab/potion-retrieval-32M", "embedding-hash"] {
             let raw: RawConfig = toml::from_str(&format!(
-                "[index]\nroot = \".\"\n\n[local_ai.embedding]\nmodel = \
-                 \"{model}\"\n\n[local_ai.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
+                "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \
+                 \"{model}\"\n\n[llm.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
                  \"http://localhost:11434\"\n"
             ))
             .unwrap();
-            let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+            let err = LlmConfig::try_from(raw.llm).unwrap_err();
             assert!(
                 matches!(err, ConfigError::RemoteEmbeddingNonTransformerModel(_)),
                 "remote block + {model} → RemoteEmbeddingNonTransformerModel, got {err:?}",
@@ -1564,13 +1564,13 @@ mod tests {
             "jinaai/jina-embeddings-v2-base-code",
         ] {
             let raw: RawConfig = toml::from_str(&format!(
-                "[index]\nroot = \".\"\n\n[local_ai.embedding]\nmodel = \
-                 \"{model}\"\n\n[local_ai.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
+                "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \
+                 \"{model}\"\n\n[llm.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
                  \"http://localhost:11434\"\n"
             ))
             .unwrap();
             assert!(
-                LocalAiConfig::try_from(raw.local_ai).is_ok(),
+                LlmConfig::try_from(raw.llm).is_ok(),
                 "remote block + {model} (transformer) must be accepted",
             );
         }

@@ -46,7 +46,7 @@ pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Res
     eprintln!("init: wrote {}", options.config_path.display());
 
     let config = Config::load(&options.config_path)?;
-    apply_embedding_runtime_env(&config.local_ai.embedding.runtime);
+    apply_embedding_runtime_env(&config.llm.embedding.runtime);
     let db = setup_index(&config)?;
     setup_model_and_reconcile(&config, &db, options.yes)?;
     offer_mcp_install(&config, &options.config_path, options.yes)?;
@@ -231,7 +231,7 @@ pub(crate) fn setup_model_and_reconcile(
     db: &IndexDatabase,
     assume_yes: bool,
 ) -> anyhow::Result<()> {
-    let backend = config.local_ai.embedding.backend;
+    let backend = config.llm.embedding.backend;
     let Some(model_id) = backend.model_id() else {
         eprintln!(
             "init: embeddings disabled (model = \"none\") — structural + BM25 search only, no \
@@ -254,7 +254,7 @@ pub(crate) fn setup_model_and_reconcile(
     eprintln!("init: installing model {model_id}");
     // A `[remote]` block (endpoint from the toml, validated at config-parse) installs the model
     // over Ollama; absent → local install.
-    let remote = config.local_ai.embedding.remote.as_ref();
+    let remote = config.llm.embedding.remote.as_ref();
     match db.install_model(model_id, remote) {
         Ok(model) => eprintln!("init: model status {} {}", model.model_id, model.status),
         Err(err) if model_id == FASTEMBED_MODEL_ID || model_id == MODEL2VEC_MODEL_ID => {
@@ -269,13 +269,13 @@ pub(crate) fn setup_model_and_reconcile(
     db.reconcile_with_options_progress(
         ReconcileOptions {
             limit: None,
-            batch_size: Some(config.local_ai.embedding.runtime.batch_size),
+            batch_size: Some(config.llm.embedding.runtime.batch_size),
             force: false,
             until_clean: true,
             changed_first: true,
             max_seconds: None,
-            max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
-            intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
+            max_embedding_chars: config.llm.embedding.runtime.max_embedding_chars,
+            intra_threads: config.llm.embedding.runtime.ort_threads.map(|n| n as usize),
             // `init`'s reconcile is the deliberate bulk pass — provision an ephemeral box if
             // active.
             provision_remote: true,

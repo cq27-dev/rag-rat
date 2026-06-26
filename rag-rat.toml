@@ -2,7 +2,7 @@
 root = "."
 database = ".rag-rat/index.sqlite"
 
-[local_ai.embedding]
+[llm.embedding]
 # the MODEL by its full id (the HF path); minishlab/potion-retrieval-32M is the static model2vec
 # tier — ~100-500x faster on CPU, some quality cost. "none" disables embeddings.
 model = "minishlab/potion-retrieval-32M"
@@ -12,18 +12,18 @@ model = "minishlab/potion-retrieval-32M"
 # (provision an ephemeral box for the bulk `reconcile`). See docs/config.md "Remote embedding over
 # Ollama".
 #   CONNECT:
-# [local_ai.embedding.remote]
+# [llm.embedding.remote]
 # endpoint = "http://box:11434"  # the Ollama server URL
 # model = "all-minilm"           # the Ollama-side model name
 # auth_env = "OLLAMA_TOKEN"      # NAME of an env var with a bearer token (never the token)
 #   EPHEMERAL (provision-on-demand; queries use a local ollama):
-# [local_ai.embedding.remote]
+# [llm.embedding.remote]
 # cookbook = "@rag-rat/cookbook modal"        # npm package + provider subcommand (modal/runpod),
                                               # or a recipe path + args (.mjs/.js/.ts/.mts)
 # model = "all-minilm"
 # query_endpoint = "http://localhost:11434"   # local ollama for query embedding (this is the default)
 
-[local_ai.embedding.runtime]
+[llm.embedding.runtime]
 batch_size = 64
 ort_threads = 4
 omp_threads = 1

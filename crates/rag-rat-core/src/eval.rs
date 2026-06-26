@@ -1302,8 +1302,8 @@ mod tests {
         #[cfg(feature = "fastembed")]
         {
             let db = IndexDatabase::open_config(&config).unwrap();
-            if let Some(model_id) = config.local_ai.embedding.backend.model_id() {
-                db.install_model(model_id, config.local_ai.embedding.remote.as_ref())
+            if let Some(model_id) = config.llm.embedding.backend.model_id() {
+                db.install_model(model_id, config.llm.embedding.remote.as_ref())
                     .expect("install embedding model");
                 db.reconcile(None, None).expect("reconcile embeddings");
             }

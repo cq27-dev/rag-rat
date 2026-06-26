@@ -18,6 +18,7 @@ mod ollama;
 
 use rusqlite::Connection;
 
+pub(crate) use self::cookbook::provision_and_build;
 pub use self::cookbook::{CookbookInput, CookbookProvisioner, ProvisionedBox};
 #[cfg(feature = "fastembed")]
 pub use self::fastembed::FastEmbedEmbedder;
@@ -91,8 +92,65 @@ fn query_embed_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingConfig {
     }
 }
 
+/// The outcome of acquiring the CHUNK-embed embedder for a reconcile. `Ready` carries the optional
+/// `ProvisionedBox` guard so the caller keeps it alive for the whole embed loop (its `Drop` is the
+/// box teardown). This is the ONE place that branches on `is_ephemeral()` for chunk embedding — the
+/// reconcile loop just calls [`acquire_chunk_embedder`] and matches.
+pub(crate) enum ChunkEmbedder {
+    /// An embedder is ready. `provisioned` is `Some` only for an ephemeral box; `None` for
+    /// connect/local.
+    Ready { embedder: Box<dyn Embedder>, provisioned: Option<ProvisionedBox> },
+    /// Ephemeral active model on a non-provisioning pass — skip remote chunk embedding entirely.
+    SkipEphemeral,
+    /// The model isn't ready (not installed / dim mismatch / provisioning failed). The error is for
+    /// diagnostics; the caller reports a generic "model not ready".
+    NotReady(anyhow::Error),
+}
+
+/// Acquire the CHUNK-embed embedder for a reconcile. EPHEMERAL active model: on a provisioning
+/// reconcile, provision the cookbook box + build an embedder against it (the bulk path,
+/// `provision_and_build`); on a non-provisioning pass (watcher), `SkipEphemeral`. CONNECT/local:
+/// the usual `active_embedder`. Provisioning happens ONCE here, not per batch. `provision_remote`
+/// gates the cold-start (only an explicit `rag-rat reconcile` sets it).
+pub(crate) fn acquire_chunk_embedder(
+    conn: &Connection,
+    intra_threads: Option<usize>,
+    provision_remote: bool,
+) -> ChunkEmbedder {
+    let remote = match active_remote_config(conn) {
+        Ok(remote) => remote,
+        Err(err) => return ChunkEmbedder::NotReady(err),
+    };
+    if let Some(remote) = remote.as_ref().filter(|r| r.is_ephemeral()) {
+        if !provision_remote {
+            return ChunkEmbedder::SkipEphemeral;
+        }
+        let active_model_id = match active_embedding_model_id(conn) {
+            Ok(id) => id,
+            Err(err) => return ChunkEmbedder::NotReady(err),
+        };
+        let Some(spec) = spec(&active_model_id) else {
+            return ChunkEmbedder::NotReady(anyhow::anyhow!(
+                "unknown active embedding model `{active_model_id}`"
+            ));
+        };
+        return match provision_and_build(remote, spec) {
+            Ok((embedder, provisioned)) => ChunkEmbedder::Ready {
+                embedder: Box::new(embedder),
+                provisioned: Some(provisioned),
+            },
+            Err(err) => ChunkEmbedder::NotReady(err),
+        };
+    }
+    // Connect / local: the usual single construction site.
+    match active_embedder(conn, intra_threads) {
+        Ok(embedder) => ChunkEmbedder::Ready { embedder, provisioned: None },
+        Err(err) => ChunkEmbedder::NotReady(err),
+    }
+}
+
 /// Build the embedder for a registry spec. The EFFECTIVE runtime is `remote.is_some() ? Ollama :
-/// spec.backend` (#317 rework): a `[local_ai.embedding.remote]` block serves the SELECTED model
+/// spec.backend` (#317 rework): a `[llm.embedding.remote]` block serves the SELECTED model
 /// (`spec`) via Ollama instead of in-process — same `model_id` + `dim`, transport overridden. The
 /// single construction site for every model; the `#[cfg]` gating + missing-feature bails for builds
 /// without `fastembed` / `model2vec` apply only on the local path (Ollama is unconditional).

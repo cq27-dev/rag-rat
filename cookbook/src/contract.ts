@@ -14,6 +14,12 @@
  *   - after the handshake the process STAYS RUNNING until signaled.
  *   - on SIGTERM/SIGINT: teardown the box, then exit 0.
  *   - on provision failure: error to stderr, exit non-zero, BEFORE any handshake.
+ *
+ * SECURITY: a cookbook recipe runs with the spawning user's full privileges and credentials
+ * (Modal/RunPod tokens in the env, the shell, the network). rag-rat invokes it via `npx`, which
+ * downloads and executes whatever the configured spec resolves to. Treat the cookbook spec like a
+ * dependency you pin and trust — NEVER point rag-rat at an untrusted package name or a recipe path
+ * you have not read. `npx -y <name>` runs arbitrary downloaded code as you.
  */
 
 /** Env var rag-rat sets to the JSON-encoded {@link CookbookInput}. */
@@ -29,14 +35,24 @@ export interface CookbookInput {
   /** Embedding model to pull and serve, e.g. "all-minilm". */
   readonly model: string;
   /**
-   * How long the recipe may wait (seconds) for a single provisioning request — pull, boot,
-   * first serving response. Advisory; recipes clamp to their own sane bounds. Defaults vary
-   * by recipe when omitted.
+   * Wall-clock budget (seconds) for the WHOLE provisioning sequence — box boot + model pull +
+   * first serving response. A remote box's cold start takes MINUTES, so this is generous (the Rust
+   * side sends ~280s). It is what {@link runRecipe} resolves into `ctx.provisionTimeoutMs`, the
+   * `budgetMs` the recipes' poll loops use. Falls back to the recipe's `defaultProvisionTimeoutS`
+   * when omitted/null.
+   *
+   * NOT the same as {@link request_timeout_s} — that is the Rust embedder's per-HTTP-request
+   * timeout (~60s), far too short to boot a box. Conflating them is what made the e2e time out.
+   */
+  readonly provision_timeout_s?: number | null;
+  /**
+   * The Rust-side embedder's PER-REQUEST timeout (seconds), passed through for completeness. The
+   * recipes do NOT use this as a provisioning budget — see {@link provision_timeout_s}.
    */
   readonly request_timeout_s?: number | null;
   /**
-   * GPU spec passed through to the provider (e.g. "A10G", "T4"), or null/omitted for CPU.
-   * CPU is the safe default for v1 — see the modal-ollama recipe notes on GPU cold-start.
+   * GPU spec passed through to the provider (e.g. "A10G", "T4", or a RunPod gpuTypeId), or
+   * null/omitted for the recipe's default. CPU is the safe default where the provider supports it.
    */
   readonly gpu?: string | null;
 }
@@ -71,14 +87,40 @@ export interface Provisioned<H> {
   readonly auth_token?: string | null;
 }
 
-/** Provisions the box for `input`. Throws to signal failure (no handshake is printed). */
-export type ProvisionFn<H> = (input: CookbookInput) => Promise<Provisioned<H>>;
+/**
+ * Context `runRecipe` passes into a recipe's `provision`.
+ *
+ * @typeParam H - the recipe's opaque box handle.
+ */
+export interface ProvisionContext<H> {
+  /** The validated, parsed request. */
+  readonly input: CookbookInput;
+  /**
+   * The resolved provisioning budget in ms (input.provision_timeout_s clamped to >= 1s, or the
+   * recipe's `defaultProvisionTimeoutS`). THIS is the `budgetMs` for the boot/pull/verify poll
+   * loops — `runRecipe` owns the clamp so recipes don't each re-derive it. Generous (minutes), not
+   * the per-request timeout.
+   */
+  readonly provisionTimeoutMs: number;
+  /**
+   * Report the box handle to the harness the INSTANT it exists (before the box is verified
+   * serving). This lets `runRecipe` tear the box down if `provision` later throws — so recipes
+   * no longer need their own `try { … } catch { terminate; throw }` wrapper. Call it once, right
+   * after the provider returns the box id/handle.
+   */
+  readonly onBox: (handle: H) => void;
+}
+
+/** Provisions the box for `ctx`. Throws to signal failure (no handshake is printed). */
+export type ProvisionFn<H> = (ctx: ProvisionContext<H>) => Promise<Provisioned<H>>;
 
 /** Destroys the box identified by `handle`. Must be idempotent (may be called once). */
 export type TeardownFn<H> = (handle: H) => Promise<void>;
 
-/** A recipe = a provision step paired with its teardown step. */
+/** A recipe = a provision step, its teardown step, and a default provisioning budget. */
 export interface Recipe<H> {
+  /** Fallback provisioning budget (seconds) when the input omits `provision_timeout_s`. */
+  readonly defaultProvisionTimeoutS: number;
   readonly provision: ProvisionFn<H>;
   readonly teardown: TeardownFn<H>;
 }
@@ -86,6 +128,11 @@ export interface Recipe<H> {
 /** Structured log to stderr. Never writes to stdout (which is reserved for the handshake). */
 export function log(...args: unknown[]): void {
   console.error("[cookbook]", ...args);
+}
+
+/** Renders an unknown thrown value as a message string without assuming it's an `Error`. */
+export function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }
 
 /** Reads and parses {@link COOKBOOK_INPUT_ENV}. Throws a clear error if absent or malformed. */
@@ -100,16 +147,44 @@ export function readInput(): CookbookInput {
   try {
     parsed = JSON.parse(raw);
   } catch (cause) {
-    throw new Error(`${COOKBOOK_INPUT_ENV} is not valid JSON: ${(cause as Error).message}`);
+    throw new Error(`${COOKBOOK_INPUT_ENV} is not valid JSON: ${errorMessage(cause)}`);
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error(`${COOKBOOK_INPUT_ENV} must be a JSON object, got ${describe(parsed)}.`);
   }
   const obj = parsed as Record<string, unknown>;
+
   if (typeof obj["model"] !== "string" || obj["model"].trim() === "") {
     throw new Error(`${COOKBOOK_INPUT_ENV}.model must be a non-empty string.`);
   }
-  return obj as unknown as CookbookInput;
+
+  // Optional positive-number budgets. If present they must be a finite positive NUMBER — a string
+  // like "60" would slip through to budget arithmetic as NaN and break every poll loop.
+  const provisionTimeout = optionalPositiveNumber(obj["provision_timeout_s"], "provision_timeout_s");
+  const requestTimeout = optionalPositiveNumber(obj["request_timeout_s"], "request_timeout_s");
+
+  // gpu: optional; if present must be a string (provider spec) or null.
+  const gpu = obj["gpu"];
+  if (gpu !== undefined && gpu !== null && typeof gpu !== "string") {
+    throw new Error(`${COOKBOOK_INPUT_ENV}.gpu must be a string or null (got ${describe(gpu)}).`);
+  }
+
+  const result: CookbookInput = {
+    model: obj["model"],
+    ...(provisionTimeout !== undefined ? { provision_timeout_s: provisionTimeout } : {}),
+    ...(requestTimeout !== undefined ? { request_timeout_s: requestTimeout } : {}),
+    ...(typeof gpu === "string" ? { gpu } : gpu === null ? { gpu: null } : {}),
+  };
+  return result;
+}
+
+/** Validates an optional positive-number field; returns the number, or undefined if absent/null. */
+function optionalPositiveNumber(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`${COOKBOOK_INPUT_ENV}.${field} must be a positive number (got ${describe(value)}).`);
+  }
+  return value;
 }
 
 function describe(v: unknown): string {
@@ -123,16 +198,115 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * `fetch` with a hard per-call timeout via `AbortSignal.timeout`. Use this instead of a bare
+ * `fetch` anywhere a stall would let the box leak: a hung connection must abort and surface as an
+ * error, never hang past the caller's budget.
+ */
+export function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+}
+
+/** Options for {@link pollUntil}. */
+export interface PollUntilOptions<T> {
+  /** Short label for log lines, e.g. "embed probe" / "pull". */
+  readonly label: string;
+  /** Total wall-clock budget in ms to keep retrying before throwing. */
+  readonly budgetMs: number;
+  /** Request method. Defaults to "POST". */
+  readonly method?: string;
+  /** JSON-serializable request body sent on every attempt. */
+  readonly body: unknown;
+  /** Extra headers (e.g. an auth bearer) merged onto `content-type: application/json`. */
+  readonly headers?: Record<string, string>;
+  /** Delay between attempts in ms. Defaults to 2000. */
+  readonly pollIntervalMs?: number;
+  /**
+   * Per-attempt fetch timeout in ms. Defaults to `pollIntervalMs` (so a stalled attempt aborts
+   * before the next would fire). Bounds each fetch so a hung request can't blow the budget.
+   */
+  readonly perAttemptTimeoutMs?: number;
+  /**
+   * Inspect a successful (2xx) parsed JSON body. Return `{ ready: true }` to finish, or
+   * `{ ready: false, reason }` to keep polling with `reason` as the last-error context.
+   */
+  readonly isReady: (body: T) => { ready: true } | { ready: false; reason: string };
+}
+
+/**
+ * Poll `url` with a JSON body until `isReady` is satisfied, or the budget elapses. The single
+ * retry-until-ready loop shared by every readiness check ({@link verifyEmbed}, model pulls, …):
+ * one place that owns the per-attempt timeout, the poll interval, and the budget accounting.
+ *
+ * Each attempt is bounded by `perAttemptTimeoutMs` (default = `pollIntervalMs`) so a stalled
+ * server aborts rather than hanging past the budget — load-bearing, because a hung fetch on the
+ * Rust side means a SIGKILL with no teardown and a leaked (billed) box.
+ */
+export async function pollUntil<T>(url: string, options: PollUntilOptions<T>): Promise<void> {
+  const pollIntervalMs = options.pollIntervalMs ?? 2000;
+  const perAttemptTimeoutMs = options.perAttemptTimeoutMs ?? pollIntervalMs;
+  const deadline = Date.now() + options.budgetMs;
+  let lastError = "(no attempt made)";
+  let attempt = 0;
+
+  while (Date.now() < deadline) {
+    attempt += 1;
+    try {
+      const res = await fetchWithTimeout(
+        url,
+        {
+          method: options.method ?? "POST",
+          headers: { "content-type": "application/json", ...options.headers },
+          body: JSON.stringify(options.body),
+        },
+        perAttemptTimeoutMs,
+      );
+      if (!res.ok) {
+        lastError = `HTTP ${res.status} ${res.statusText}`;
+      } else {
+        const body = (await res.json()) as T;
+        const verdict = options.isReady(body);
+        if (verdict.ready) return;
+        lastError = verdict.reason;
+      }
+    } catch (cause) {
+      // Connection refused / DNS not ready / per-attempt abort while the box boots — expected
+      // early; keep retrying until the budget runs out.
+      lastError = errorMessage(cause);
+    }
+    log(`${options.label} attempt ${attempt} not ready (${lastError}); retrying…`);
+    await sleep(pollIntervalMs);
+  }
+  throw new Error(
+    `${options.label} did not become ready within ${options.budgetMs}ms; last error: ${lastError}`,
+  );
+}
+
+/** Default delay between embed-readiness probes (ms). */
+const VERIFY_EMBED_POLL_INTERVAL_MS = 3_000;
+/**
+ * Default per-attempt timeout for an embed probe (ms). The first successful embed on a
+ * freshly-booted box can be slow (model load into memory), so this is generous — but still well
+ * under any sane provisioning budget, so a genuinely stalled attempt aborts and retries.
+ */
+const VERIFY_EMBED_ATTEMPT_TIMEOUT_MS = 30_000;
+
 /** Options for {@link verifyEmbed}. */
 export interface VerifyEmbedOptions {
   /** Embedding model name to probe with (the value the server keys on). */
   readonly model: string;
-  /** Wall-clock budget in ms to keep retrying before giving up. */
+  /** Wall-clock budget in ms to keep retrying before giving up. Use the provisioning budget. */
   readonly budgetMs: number;
   /** Extra headers (e.g. an auth bearer) to send with each probe. Defaults to none. */
   readonly headers?: Record<string, string>;
-  /** Delay between retries in ms. Defaults to 2000. */
+  /** Delay between retries in ms. Defaults to {@link VERIFY_EMBED_POLL_INTERVAL_MS}. */
   readonly pollIntervalMs?: number;
+  /** Per-attempt fetch timeout in ms. Defaults to {@link VERIFY_EMBED_ATTEMPT_TIMEOUT_MS}. */
+  readonly perAttemptTimeoutMs?: number;
 }
 
 /**
@@ -141,49 +315,32 @@ export interface VerifyEmbedOptions {
  * Every recipe must call this BEFORE handing rag-rat the endpoint: a box can be reachable (tunnel
  * up) while ollama is still loading the model, so "box created" is not "box serving". A non-empty
  * `embeddings[0]` vector is the readiness signal. Throws if the budget elapses with no vector.
- *
- * Shared by every recipe so the readiness contract (Ollama `/api/embed`, retry-until-ready) lives
- * in exactly one place rather than copy-pasted per provider.
  */
-export async function verifyEmbed(endpoint: string, options: VerifyEmbedOptions): Promise<void> {
+export function verifyEmbed(endpoint: string, options: VerifyEmbedOptions): Promise<void> {
   const url = `${endpoint.replace(/\/+$/, "")}/api/embed`;
-  const pollIntervalMs = options.pollIntervalMs ?? 2000;
-  const deadline = Date.now() + options.budgetMs;
-  let lastError = "(no attempt made)";
-  let attempt = 0;
-
-  while (Date.now() < deadline) {
-    attempt += 1;
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json", ...options.headers },
-        body: JSON.stringify({ model: options.model, input: "rag-rat embed readiness probe" }),
-      });
-      if (!res.ok) {
-        lastError = `HTTP ${res.status} ${res.statusText}`;
-      } else {
-        const body = (await res.json()) as { embeddings?: unknown };
-        const embeddings = body.embeddings;
-        if (
-          Array.isArray(embeddings) &&
-          embeddings.length > 0 &&
-          Array.isArray(embeddings[0]) &&
-          embeddings[0].length > 0
-        ) {
-          return;
-        }
-        lastError = `200 OK but no embedding vector in response: ${JSON.stringify(body).slice(0, 200)}`;
+  return pollUntil<{ embeddings?: unknown }>(url, {
+    label: "embed probe",
+    budgetMs: options.budgetMs,
+    body: { model: options.model, input: "rag-rat embed readiness probe" },
+    pollIntervalMs: options.pollIntervalMs ?? VERIFY_EMBED_POLL_INTERVAL_MS,
+    perAttemptTimeoutMs: options.perAttemptTimeoutMs ?? VERIFY_EMBED_ATTEMPT_TIMEOUT_MS,
+    ...(options.headers !== undefined ? { headers: options.headers } : {}),
+    isReady: (body) => {
+      const embeddings = body.embeddings;
+      if (
+        Array.isArray(embeddings) &&
+        embeddings.length > 0 &&
+        Array.isArray(embeddings[0]) &&
+        embeddings[0].length > 0
+      ) {
+        return { ready: true };
       }
-    } catch (cause) {
-      lastError = (cause as Error).message;
-    }
-    log(`embed probe attempt ${attempt} not ready (${lastError}); retrying…`);
-    await sleep(pollIntervalMs);
-  }
-  throw new Error(
-    `/api/embed never returned a vector within ${options.budgetMs}ms; last error: ${lastError}`,
-  );
+      return {
+        ready: false,
+        reason: `200 OK but no embedding vector: ${JSON.stringify(body).slice(0, 200)}`,
+      };
+    },
+  });
 }
 
 /** Serializes the handshake to its canonical one-line wire form (omitting an undefined token). */
@@ -199,49 +356,61 @@ export function encodeHandshake(h: Handshake): string {
  * Runs a recipe end-to-end against the rag-rat process contract.
  *
  * Flow:
- *   1. read+parse {@link COOKBOOK_INPUT_ENV};
+ *   1. read+parse+validate {@link COOKBOOK_INPUT_ENV}; resolve the request-timeout budget;
  *   2. install SIGTERM/SIGINT handlers (so a signal during provisioning still tears down);
- *   3. `provision(input)` — on throw: log to stderr, exit 1, no handshake;
+ *   3. `provision(ctx)` — on throw: tear down any box it reported via `onBox`, log to stderr,
+ *      exit 1, no handshake;
  *   4. print the handshake JSON as the single stdout line;
  *   5. keep the process alive until a signal arrives;
  *   6. on signal: `teardown(handle)`, then exit 0.
  *
- * Resolves only on a fatal pre-handshake error path that opts to return rather than exit; in
- * normal operation it never resolves (it parks until a signal terminates the process).
+ * The harness owns the terminate-on-error wrapper and the timeout clamp so recipes stay thin: a
+ * recipe reports its box via `ctx.onBox(handle)` the instant it exists, and `runRecipe` guarantees
+ * exactly one teardown whether provisioning fails, the box serves, or a signal arrives mid-flight.
+ *
+ * In normal operation this never resolves (it parks until a signal terminates the process).
  */
-export async function runRecipe<H>(
-  provision: ProvisionFn<H>,
-  teardown: TeardownFn<H>,
-): Promise<never> {
+export async function runRecipe<H>(recipe: Recipe<H>): Promise<void> {
   let input: CookbookInput;
   try {
     input = readInput();
   } catch (cause) {
     // Bad/absent input is a pre-handshake failure: clean stderr message, non-zero exit, no stdout.
-    log("invalid input:", cause instanceof Error ? cause.message : cause);
+    log("invalid input:", errorMessage(cause));
     process.exit(1);
   }
 
-  // Handle is captured once provisioned so a signal mid-provision can still tear down.
-  let handle: { value: H } | null = null;
-  let tearingDown = false;
+  // The boot/pull/verify budget — provision_timeout_s (generous, ~minutes), NOT request_timeout_s
+  // (the Rust embedder's per-HTTP-request timeout, ~60s, far too short to cold-start a remote box).
+  const provisionTimeoutMs =
+    Math.max(1, input.provision_timeout_s ?? recipe.defaultProvisionTimeoutS) * 1000;
+
+  // The one box handle, shared by every teardown path. Set by provision via `onBox`, or on the
+  // happy path from the provision result. A single `tornDown` latch makes teardown idempotent.
+  let box: { value: H } | null = null;
+  let tornDown = false;
+
+  const tearDownOnce = async (reason: string): Promise<void> => {
+    if (tornDown) return;
+    tornDown = true;
+    if (box === null) {
+      log(`nothing to tear down (${reason}; no box was provisioned)`);
+      return;
+    }
+    log(`tearing down (${reason})`);
+    await recipe.teardown(box.value);
+    log("teardown complete");
+  };
 
   const onSignal = (signal: NodeJS.Signals): void => {
     void (async () => {
-      if (tearingDown) return;
-      tearingDown = true;
-      log(`received ${signal}, tearing down`);
       try {
-        if (handle !== null) {
-          await teardown(handle.value);
-          log("teardown complete");
-        } else {
-          log("no box to tear down (signal arrived before provisioning completed)");
-        }
+        await tearDownOnce(`received ${signal}`);
         process.exit(0);
       } catch (cause) {
-        log("teardown FAILED:", cause);
-        // Exit non-zero so rag-rat knows the box may be leaked (the provider backstop is the net).
+        log("teardown FAILED:", errorMessage(cause));
+        // Exit non-zero so rag-rat knows the box may be leaked. RunPod has no provider backstop;
+        // reliable teardown is the only net, so a failed teardown is a money-leak signal.
         process.exit(1);
       }
     })();
@@ -252,12 +421,23 @@ export async function runRecipe<H>(
 
   let result: Provisioned<H>;
   try {
-    result = await provision(input);
+    result = await recipe.provision({
+      input,
+      provisionTimeoutMs,
+      onBox: (handle) => {
+        box = { value: handle };
+      },
+    });
   } catch (cause) {
-    log("provisioning FAILED:", cause instanceof Error ? cause.stack ?? cause.message : cause);
+    log("provisioning FAILED:", cause instanceof Error ? (cause.stack ?? cause.message) : String(cause));
+    // If a box was created before the failure, tear it down — recipes no longer do this themselves.
+    await tearDownOnce("provisioning failed").catch((e) =>
+      log("terminate-on-error FAILED (box may be leaked):", errorMessage(e)),
+    );
     process.exit(1);
   }
-  handle = { value: result.handle };
+  // Happy path: ensure the handle is captured even if the recipe didn't call onBox.
+  box = { value: result.handle };
 
   // THE handshake line — the only thing ever written to stdout.
   process.stdout.write(
@@ -266,10 +446,9 @@ export async function runRecipe<H>(
   log("handshake emitted; holding box until signaled");
 
   // Park forever. Node keeps the loop alive on the signal listeners; this timer is belt-and-braces
-  // (and gives `unref`-free liveness even if listeners are detached by exotic runtimes).
+  // (and gives liveness even if listeners are detached by exotic runtimes). The process exits via
+  // onSignal/exit, so this promise is intentionally never resolved.
   await new Promise<never>(() => {
     setInterval(() => {}, 1 << 30);
   });
-  // Unreachable: the promise above never resolves; the process exits via onSignal/exit.
-  throw new Error("unreachable: runRecipe parked promise resolved");
 }

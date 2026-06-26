@@ -17,37 +17,32 @@
  *     discovery watchdog times out, or the box dies with exit 137 at cold start; CPU `serve`
  *     is the safe v1 path. Pass input.gpu only when you've accepted that risk.
  *   - timeout=1800s (30 min) is the provider-side max-lifetime backstop: if rag-rat dies or
- *     SIGKILLs us before teardown runs, Modal self-destructs the box.
+ *     SIGKILLs us before teardown runs, Modal self-destructs the box. (RunPod has no equivalent.)
+ *
+ * The harness ({@link runRecipe}) owns the terminate-on-error wrapper and the request-timeout
+ * clamp, so this recipe is just: create the box, report it via `ctx.onBox`, pull, verify, return.
  */
 
 import { ModalClient } from "modal";
 import type { Sandbox } from "modal";
 
-import { type CookbookInput, log, runRecipe, verifyEmbed } from "../src/contract.js";
+import { type ProvisionContext, type Provisioned, type Recipe, log, runRecipe, verifyEmbed } from "../src/contract.js";
 
 /** Port ollama serves on inside the box; the one port we tunnel out. */
 const OLLAMA_PORT = 11434;
 /** Provider-side max-lifetime backstop in ms — a leaked box self-destructs after this. */
 const BOX_MAX_LIFETIME_MS = 1_800_000; // 30 minutes
-/** Default per-request budget (pull + boot + first serving response) when input omits it. */
-const DEFAULT_REQUEST_TIMEOUT_S = 600;
+/** Default provisioning budget (boot + pull + first serving response) when input omits it. */
+const DEFAULT_PROVISION_TIMEOUT_S = 600;
 /** Modal app the sandboxes are grouped under (created on first use). */
 const APP_NAME = "rag-rat-cookbook";
 
 /** Provision an Ollama box serving `input.model` and return its tunnel endpoint. */
-async function provision(input: CookbookInput): Promise<{
-  handle: Sandbox;
-  endpoint: string;
-  auth_token: string | null;
-}> {
-  const requestTimeoutS = input.request_timeout_s ?? DEFAULT_REQUEST_TIMEOUT_S;
-  const requestTimeoutMs = Math.max(1, requestTimeoutS) * 1000;
+async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sandbox>> {
+  const { input, provisionTimeoutMs } = ctx;
   const gpu = input.gpu ?? null;
 
-  log(
-    `provisioning ollama box: model=${input.model} gpu=${gpu ?? "cpu"} ` +
-      `request_timeout_s=${requestTimeoutS}`,
-  );
+  log(`provisioning ollama box: model=${input.model} gpu=${gpu ?? "cpu"}`);
 
   // Creds resolve from env (MODAL_TOKEN_ID/MODAL_TOKEN_SECRET) or ~/.modal.toml.
   const modal = new ModalClient();
@@ -64,46 +59,41 @@ async function provision(input: CookbookInput): Promise<{
     timeoutMs: BOX_MAX_LIFETIME_MS,
     ...(gpu !== null ? { gpu } : {}),
   });
+  // Report the box NOW so runRecipe tears it down if anything below throws.
+  ctx.onBox(sb);
   log(`sandbox created: ${sb.sandboxId ?? "(id unavailable)"}`);
 
-  try {
-    // Pull the model. The server (`serve`) is the box's main process; pull runs as an exec
-    // against the same ollama install, populating the model store the server reads.
-    log(`pulling model "${input.model}" (this is the cold-start cost)…`);
-    const pull = await sb.exec(["ollama", "pull", input.model], {
-      mode: "text",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const pullCode = await pull.wait();
-    if (pullCode !== 0) {
-      const err = await pull.stderr.readText();
-      throw new Error(`"ollama pull ${input.model}" exited ${pullCode}: ${err.trim()}`);
-    }
-    log(`model "${input.model}" pulled`);
-
-    // Resolve the public tunnel URL for the served port.
-    const tunnels = await sb.tunnels();
-    const tunnel = tunnels[OLLAMA_PORT];
-    if (tunnel === undefined) {
-      throw new Error(`no tunnel for port ${OLLAMA_PORT}; got ports [${Object.keys(tunnels).join(", ")}]`);
-    }
-    const endpoint = tunnel.url;
-    log(`tunnel up: ${endpoint}`);
-
-    // Verify the server actually embeds before we hand rag-rat the endpoint. This catches a
-    // box that booted but isn't serving (the whole point of waiting to handshake).
-    await verifyEmbed(endpoint, { model: input.model, budgetMs: requestTimeoutMs });
-    log("embed verification passed; box is serving");
-
-    // Open tunnel via encryptedPorts → no per-request token needed. auth_token stays null.
-    return { handle: sb, endpoint, auth_token: null };
-  } catch (cause) {
-    // Provisioning failed after the box came up — terminate it so we don't lean on the backstop.
-    log("provision error after box creation; terminating box");
-    await sb.terminate().catch((e) => log("terminate-on-error failed (backstop will reap):", e));
-    throw cause;
+  // Pull the model. The server (`serve`) is the box's main process; pull runs as an exec
+  // against the same ollama install, populating the model store the server reads.
+  log(`pulling model "${input.model}" (this is the cold-start cost)…`);
+  const pull = await sb.exec(["ollama", "pull", input.model], {
+    mode: "text",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const pullCode = await pull.wait();
+  if (pullCode !== 0) {
+    const err = await pull.stderr.readText();
+    throw new Error(`"ollama pull ${input.model}" exited ${pullCode}: ${err.trim()}`);
   }
+  log(`model "${input.model}" pulled`);
+
+  // Resolve the public tunnel URL for the served port.
+  const tunnels = await sb.tunnels();
+  const tunnel = tunnels[OLLAMA_PORT];
+  if (tunnel === undefined) {
+    throw new Error(`no tunnel for port ${OLLAMA_PORT}; got ports [${Object.keys(tunnels).join(", ")}]`);
+  }
+  const endpoint = tunnel.url;
+  log(`tunnel up: ${endpoint}`);
+
+  // Verify the server actually embeds before we hand rag-rat the endpoint. This catches a
+  // box that booted but isn't serving (the whole point of waiting to handshake).
+  await verifyEmbed(endpoint, { model: input.model, budgetMs: provisionTimeoutMs });
+  log("embed verification passed; box is serving");
+
+  // Open tunnel via encryptedPorts → no per-request token needed. auth_token stays null.
+  return { handle: sb, endpoint, auth_token: null };
 }
 
 /** Destroy the box. Idempotent enough — terminate on an already-gone box is a no-op/soft error. */
@@ -111,4 +101,10 @@ async function teardown(sb: Sandbox): Promise<void> {
   await sb.terminate();
 }
 
-await runRecipe(provision, teardown);
+const recipe: Recipe<Sandbox> = {
+  defaultProvisionTimeoutS: DEFAULT_PROVISION_TIMEOUT_S,
+  provision,
+  teardown,
+};
+
+await runRecipe(recipe);

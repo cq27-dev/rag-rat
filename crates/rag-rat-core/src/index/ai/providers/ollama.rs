@@ -46,13 +46,33 @@ pub struct OllamaEmbedder {
     /// `all-minilm`) — the server's own identifier, NOT the registry id.
     server_model: String,
     dim: usize,
-    /// Max texts per `/api/embed` request (`[local_ai.embedding.remote] batch_size`).
+    /// Max texts per `/api/embed` request (`[llm.embedding.remote] batch_size`).
     /// `embed_batch` splits its input into sub-batches of at most this, so a request never
     /// exceeds the configured cap regardless of the reconcile/runtime batch size. Clamped to
     /// `>= 1` at construction so the `chunks()` split can't panic on a misconfigured `0`.
     batch_size: usize,
     /// `Some("Bearer <token>")` when the server needs auth, read from `auth_env` at construction.
     auth_header: Option<String>,
+}
+
+/// Construction params for [`OllamaEmbedder::from_provisioned`] — groups the handshake outputs
+/// (`endpoint`, `auth_token`) with the model identity + transport knobs so the constructor takes
+/// one struct instead of seven positional args.
+pub struct ProvisionedEmbedderParams<'a> {
+    /// The serving endpoint from the cookbook handshake (`https://...`).
+    pub endpoint: &'a str,
+    /// A DIRECT bearer token from the handshake (NOT an env-var name), or `None` for an open box.
+    pub auth_token: Option<&'a str>,
+    /// The Ollama API model name sent in the request body (`[remote] model`).
+    pub server_model: &'a str,
+    /// The SELECTED model's registry id (what `model_id()` returns — chunks key by the model).
+    pub selected_model_id: &'a str,
+    /// The dim parity contract (the selected model's `spec.dim`).
+    pub dim: usize,
+    /// Per-request HTTP timeout, seconds.
+    pub request_timeout_s: u64,
+    /// Max texts per `/api/embed` request.
+    pub batch_size: u32,
 }
 
 impl OllamaEmbedder {
@@ -76,7 +96,7 @@ impl OllamaEmbedder {
             cfg.endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!(
                     "remote embedding endpoint is required in connect mode but was not configured \
-                     (`[local_ai.embedding.remote] endpoint`)"
+                     (`[llm.embedding.remote] endpoint`)"
                 )
             })?;
         // CONNECT auth comes from the env var NAMED by `auth_env` (the token never enters config).
@@ -93,33 +113,26 @@ impl OllamaEmbedder {
         ))
     }
 
-    /// Build the embedder against a freshly PROVISIONED ephemeral box (#318). The `endpoint` +
-    /// `auth_token` come from the cookbook handshake — `auth_token` is a DIRECT bearer token (the
-    /// box's per-run credential), NOT an env-var name (contrast [`Self::from_remote_config`], which
-    /// resolves `auth_env`). The model identity (`selected_model_id` + `dim`) + transport knobs
-    /// (server `model`, timeout, batch) come from the config the same way.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_provisioned(
-        endpoint: &str,
-        auth_token: Option<&str>,
-        server_model: &str,
-        selected_model_id: &str,
-        dim: usize,
-        request_timeout_s: u64,
-        batch_size: u32,
-    ) -> Self {
-        let auth_header = auth_token
+    /// Build the embedder against a freshly PROVISIONED ephemeral box (#318) from
+    /// [`ProvisionedEmbedderParams`]. The `endpoint` + `auth_token` come from the cookbook
+    /// handshake — `auth_token` is a DIRECT bearer token (the box's per-run credential), NOT an
+    /// env-var name (contrast [`Self::from_remote_config`], which resolves `auth_env`). The
+    /// model identity (`selected_model_id` + `dim`) + transport knobs (server `model`, timeout,
+    /// batch) come from the config the same way.
+    pub fn from_provisioned(params: ProvisionedEmbedderParams<'_>) -> Self {
+        let auth_header = params
+            .auth_token
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(|token| format!("Bearer {token}"));
         Self::build(
-            endpoint.trim(),
+            params.endpoint.trim(),
             auth_header,
-            selected_model_id,
-            server_model.trim(),
-            dim,
-            request_timeout_s,
-            batch_size,
+            params.selected_model_id,
+            params.server_model.trim(),
+            params.dim,
+            params.request_timeout_s,
+            params.batch_size,
         )
     }
 

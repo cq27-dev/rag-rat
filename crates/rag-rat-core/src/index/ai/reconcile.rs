@@ -431,78 +431,6 @@ pub(crate) fn reconcile_with_progress(
     )
 }
 
-/// The outcome of acquiring the chunk-embed embedder for a reconcile. The `Ready` variant carries
-/// the optional `ProvisionedBox` guard so the caller can keep it alive for the whole embed loop.
-enum ChunkEmbedder {
-    /// An embedder is ready. `provisioned` is `Some` only for an ephemeral box (its `Drop` tears
-    /// the box down); `None` for connect/local.
-    Ready { embedder: Box<dyn Embedder>, provisioned: Option<ProvisionedBox> },
-    /// Ephemeral active model on a non-provisioning pass — skip remote chunk embedding entirely.
-    SkipEphemeral,
-    /// The model isn't ready (not installed / dim mismatch / provisioning failed). Carried error is
-    /// for diagnostics; the caller reports a generic "model not ready".
-    NotReady(anyhow::Error),
-}
-
-/// Acquire the chunk-embed embedder. EPHEMERAL active model: on a provisioning reconcile, spawn the
-/// cookbook + build an embedder against the provisioned box (the bulk path); on a non-provisioning
-/// pass (watcher), return `SkipEphemeral`. CONNECT/local: the usual `active_embedder`. Provisioning
-/// happens ONCE here, not per batch.
-fn acquire_chunk_embedder(conn: &Connection, options: &ReconcileOptions) -> ChunkEmbedder {
-    // Detect the ephemeral case from the active model's persisted remote config.
-    let remote = match active_remote_config(conn) {
-        Ok(remote) => remote,
-        Err(err) => return ChunkEmbedder::NotReady(err),
-    };
-    if let Some(remote) = remote.as_ref().filter(|r| r.is_ephemeral()) {
-        if !options.provision_remote {
-            return ChunkEmbedder::SkipEphemeral;
-        }
-        return match provision_ephemeral_embedder(conn, remote) {
-            Ok((embedder, provisioned)) =>
-                ChunkEmbedder::Ready { embedder, provisioned: Some(provisioned) },
-            Err(err) => ChunkEmbedder::NotReady(err),
-        };
-    }
-    // Connect / local: the usual single construction site.
-    match active_embedder(conn, options.intra_threads) {
-        Ok(embedder) => ChunkEmbedder::Ready { embedder, provisioned: None },
-        Err(err) => ChunkEmbedder::NotReady(err),
-    }
-}
-
-/// Provision an ephemeral cookbook box for the active model and build an `OllamaEmbedder` against
-/// it. The returned `ProvisionedBox` MUST be kept alive for the embed loop (its `Drop` is
-/// teardown).
-fn provision_ephemeral_embedder(
-    conn: &Connection,
-    remote: &RemoteEmbeddingConfig,
-) -> anyhow::Result<(Box<dyn Embedder>, ProvisionedBox)> {
-    let active_model_id = active_embedding_model_id(conn)?;
-    let spec = spec(&active_model_id)
-        .ok_or_else(|| anyhow::anyhow!("unknown active embedding model `{active_model_id}`"))?;
-    let cookbook = remote
-        .cookbook
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("ephemeral remote config has no cookbook"))?;
-    let input = CookbookInput {
-        model: remote.model.trim().to_string(),
-        request_timeout_s: remote.request_timeout_s,
-        gpu: None,
-    };
-    let provisioned = CookbookProvisioner::provision(cookbook, &input)?;
-    let embedder = OllamaEmbedder::from_provisioned(
-        &provisioned.endpoint,
-        provisioned.auth_token.as_deref(),
-        remote.model.trim(),
-        spec.model_id,
-        spec.dim,
-        remote.request_timeout_s,
-        remote.batch_size,
-    );
-    Ok((Box::new(embedder), provisioned))
-}
-
 pub(crate) fn reconcile_with_options_progress(
     conn: &Connection,
     options: ReconcileOptions,
@@ -538,7 +466,7 @@ pub(crate) fn reconcile_with_options_progress(
     // PROVISIONS a cookbook box (held by `_provisioned` for the whole loop — its `Drop` tears the
     // box down on success/error/panic). Otherwise it's `active_embedder` (connect/local). The
     // `acquire_chunk_embedder` result distinguishes ready / skip-ephemeral / not-ready.
-    let acquired = acquire_chunk_embedder(conn, &options);
+    let acquired = acquire_chunk_embedder(conn, options.intra_threads, options.provision_remote);
     let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let skipped_chunks = skipped_by_policy.values().sum();
     let mut report = ReconcileReport {

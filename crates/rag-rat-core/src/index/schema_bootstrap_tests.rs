@@ -31,7 +31,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
             exclude: Vec::new(),
             kind: TargetKind::Docs,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -783,21 +783,20 @@ fn rebuild_populates_revision_metadata_and_fresh_fts_state() {
     assert!(status.fts_fresh);
     assert!(!status.git_history.available);
     assert_eq!(status.git_history.commit_count, 0);
-    assert_eq!(status.local_ai.embedding.state, "MissingModel");
-    assert_eq!(status.local_ai.fastembed.backend, "fastembed");
-    assert_eq!(status.local_ai.fastembed.model, FASTEMBED_DISPLAY_MODEL);
-    assert_eq!(status.local_ai.fastembed.dim, FASTEMBED_EMBEDDING_DIM);
-    assert!(!status.local_ai.fastembed.cache.is_empty());
-    assert_eq!(status.local_ai.fastembed.build_feature_enabled, cfg!(feature = "fastembed"));
-    assert_eq!(status.local_ai.artifacts.total_chunks, 1);
+    assert_eq!(status.llm.embedding.state, "MissingModel");
+    assert_eq!(status.llm.fastembed.backend, "fastembed");
+    assert_eq!(status.llm.fastembed.model, FASTEMBED_DISPLAY_MODEL);
+    assert_eq!(status.llm.fastembed.dim, FASTEMBED_EMBEDDING_DIM);
+    assert!(!status.llm.fastembed.cache.is_empty());
+    assert_eq!(status.llm.fastembed.build_feature_enabled, cfg!(feature = "fastembed"));
+    assert_eq!(status.llm.artifacts.total_chunks, 1);
     assert_eq!(
-        status.local_ai.artifacts.eligible_chunks + status.local_ai.artifacts.skipped_chunks,
-        status.local_ai.artifacts.total_chunks
+        status.llm.artifacts.eligible_chunks + status.llm.artifacts.skipped_chunks,
+        status.llm.artifacts.total_chunks
     );
     assert_eq!(
-        status.local_ai.fastembed.eligible_embeddings
-            + status.local_ai.fastembed.skipped_embeddings,
-        status.local_ai.artifacts.total_chunks
+        status.llm.fastembed.eligible_embeddings + status.llm.fastembed.skipped_embeddings,
+        status.llm.artifacts.total_chunks
     );
     assert_eq!(indexed_revision_count(&db), 1);
     assert_eq!(chunk_source_revision_count(&db), 1);
@@ -1428,7 +1427,7 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
                 kind: TargetKind::Source,
             },
         ],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -1544,7 +1543,7 @@ fn rag_rat_config(root: &Path) -> Config {
         root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: git_history_targets(),
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -4128,7 +4127,7 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -4909,7 +4908,7 @@ where
                 kind: TargetKind::Docs,
             },
         ],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -5675,7 +5674,7 @@ fn parser_failures_report_paths() {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -7748,7 +7747,7 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -7829,7 +7828,7 @@ fn repo_clusters_groups_cotouched_files() {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -7920,7 +7919,7 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
             exclude: Vec::new(),
             kind: TargetKind::Docs,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -9324,7 +9323,7 @@ fn source_config(root: PathBuf, language: Language) -> Config {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -9732,7 +9731,7 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -9958,7 +9957,7 @@ fn dir_tree_truncates_at_max_nodes() {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -10101,7 +10100,7 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -11450,7 +11449,7 @@ fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -11612,7 +11611,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -13284,7 +13283,7 @@ fn multi_language_clone_integration_finds_within_language_no_cross() {
                 kind: TargetKind::Source,
             },
         ],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -13475,7 +13474,7 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),
@@ -14079,7 +14078,7 @@ fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
             exclude: Vec::new(),
             kind: TargetKind::Source,
         }],
-        local_ai: Default::default(),
+        llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
         oracle: Default::default(),

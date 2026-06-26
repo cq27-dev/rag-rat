@@ -8,6 +8,13 @@ while rag-rat works, then tears it down on signal.
 This is the JS/TS half of rag-rat's remote-runtime rework (#317/#318). rag-rat (Rust) owns the
 lifecycle and the embedding traffic; the cookbook owns provider provisioning.
 
+> **Security — a cookbook spec must be TRUSTED.** A recipe runs with your full privileges and
+> credentials (Modal/RunPod tokens in the env, your shell, your network) and provisions paid cloud
+> compute. rag-rat invokes it via `npx`, which **downloads and runs whatever the configured spec
+> resolves to** — `npx -y <name>` runs arbitrary downloaded code as you. Pin and trust the cookbook
+> spec like any dependency; never point rag-rat at an untrusted package name or a recipe path you
+> have not read.
+
 ## The process contract
 
 rag-rat and a recipe communicate over a tiny, strict process protocol. Implement it exactly — the
@@ -31,19 +38,37 @@ Hard rules:
   (the Modal recipe probes `/api/embed` and waits for a vector).
 - **Stay alive after the handshake** until signaled.
 - **Tear down on `SIGTERM`/`SIGINT`**, then `exit(0)`.
-- **Provider-side backstop.** Always set a max box lifetime (the Modal recipe uses `timeoutMs:
-  1_800_000`) so a leaked box self-destructs if rag-rat dies before it can signal teardown.
+- **Bound every network call.** A stalled fetch that hangs past the Rust-side grace gets SIGKILLed
+  with the box still up → a leaked, billed box. Use `pollUntil` / `fetchWithTimeout` (both carry an
+  `AbortSignal.timeout`); never call bare `fetch` on a path that could stall.
+- **Use a provider-side backstop where one exists** (Modal's `timeoutMs: 1_800_000` self-destructs
+  a leaked box). Where the provider has none — RunPod on-demand pods have no idle/lifetime auto-stop
+  — **reliable teardown is the only thing that stops billing**, which is why teardown is
+  timeout-bounded to finish inside the grace.
 
 ### `CookbookInput` (env var `RAG_RAT_COOKBOOK_INPUT`)
 
 ```jsonc
 {
-  "model": "all-minilm",     // required: embedding model to pull + serve
-  "request_timeout_s": 600,  // optional: budget for pull+boot+first response (advisory)
-  "gpu": null                // optional: provider GPU spec or null. For Modal this is "A10G"/"T4"
-                             //   (CPU default); for RunPod a gpuTypeId like "NVIDIA RTX A4000".
+  "model": "all-minilm",       // required: non-empty string — the embedding model to pull + serve
+  "provision_timeout_s": 280,  // optional: positive number — wall-clock budget for the WHOLE
+                               //   provisioning sequence (box boot + model pull + first serving
+                               //   response). A remote cold start takes MINUTES; rag-rat sends
+                               //   ~280s. THIS is the recipes' poll-loop budget. Omitted/null →
+                               //   the recipe's default.
+  "request_timeout_s": 30,     // optional: positive number — the Rust embedder's per-HTTP-request
+                               //   timeout, passed through for completeness. NOT a provisioning
+                               //   budget (~30–60s is far too short to boot a box).
+  "gpu": null                  // optional: string or null. For Modal this is "A10G"/"T4" (CPU
+                               //   default); for RunPod a gpuTypeId like "NVIDIA RTX A4000".
 }
 ```
+
+The provisioning budget is **`provision_timeout_s`**, never `request_timeout_s` — conflating the
+two (using the ~30–60s per-request timeout as the boot budget) is what made the first live e2e time
+out before the box finished booting. `readInput` validates each field up front (a string timeout
+would otherwise become `NaN` and break the poll loops); a malformed input is a clean `exit(1)` with
+no handshake.
 
 ### `Handshake` (the one stdout line)
 
@@ -124,8 +149,12 @@ Provider gotchas baked into the recipe:
 - There is **no in-pod exec** in `podFindAndDeployOnDemand`, so the model is pulled **client-side**
   over the proxy URL (`POST /api/pull`, non-streaming, retried until the pod finishes booting),
   then `/api/embed` is probed before the handshake.
-- A pod **idle-timeout** (no proxy traffic) is the leaked-pod backstop: a pod that rag-rat never
-  tears down self-stops instead of billing forever.
+- **No provider-side backstop.** RunPod's `podFindAndDeployOnDemand` has **no** field that
+  auto-stops or auto-terminates an on-demand GPU pod after a duration or after idle (`idleTimeout`
+  is a serverless/flex-worker concept, not an on-demand-pod control — verified against the RunPod
+  GraphQL spec). So **reliable teardown is the only thing that stops the billing**: every fetch is
+  `AbortSignal`-bounded, and `podTerminate` runs under a tight (~8 s) timeout to finish inside the
+  Rust-side grace.
 - Default GPU is a cheap `NVIDIA RTX A4000`; `input.gpu` is a `gpuTypeId` override.
 
 Auth: `RUNPOD_API_KEY` in the process env — the recipe errors and exits `1` (no handshake) if it's
@@ -153,15 +182,23 @@ The recipe runs until you `SIGTERM`/`SIGINT` it (Ctrl-C), at which point it tear
 
 ## Writing your own recipe
 
-A recipe is a `.mts` file that calls `runRecipe(provision, teardown)` from `@rag-rat/cookbook`:
+A recipe is a `.mts` file that hands a `Recipe<H>` to `runRecipe` from `@rag-rat/cookbook`. The
+harness owns all the contract plumbing **and** the terminate-on-error wrapper and the
+request-timeout clamp, so a recipe is just: provision, report the box via `ctx.onBox`, verify, and
+return.
 
 ```ts
-import { type CookbookInput, runRecipe, log } from "@rag-rat/cookbook"; // or "../src/contract.js" in-repo
+import {
+  type ProvisionContext, type Provisioned, type Recipe,
+  runRecipe, verifyEmbed, log,
+} from "@rag-rat/cookbook"; // or "../src/contract.js" in-repo
 
-async function provision(input: CookbookInput) {
+async function provision(ctx: ProvisionContext<MyBox>): Promise<Provisioned<MyBox>> {
+  const { input, provisionTimeoutMs } = ctx;       // already clamped from provision_timeout_s
   log("provisioning", input.model);
   const box = await myProvider.spawn(/* … */);
-  // … wait until the box actually serves embeddings …
+  ctx.onBox(box);                                  // report NOW → runRecipe tears down if we throw
+  await verifyEmbed(box.url, { model: input.model, budgetMs: provisionTimeoutMs });
   return { handle: box, endpoint: box.url, auth_token: null };
 }
 
@@ -169,17 +206,38 @@ async function teardown(box: MyBox) {
   await box.destroy();
 }
 
-await runRecipe(provision, teardown);
+const recipe: Recipe<MyBox> = {
+  defaultProvisionTimeoutS: 600,  // budget when input.provision_timeout_s is omitted/null
+  provision,
+  teardown,
+};
+
+await runRecipe(recipe);
 ```
 
-`runRecipe` does all the contract plumbing: it reads `RAG_RAT_COOKBOOK_INPUT`, installs the signal
-handlers (so a signal mid-provision still tears down), prints the single handshake line on success,
-parks the process, and tears down + exits on signal. Your `provision` throws to fail (the helper
-logs to stderr and exits non-zero before any handshake). Keep all of your own logging on stderr.
+What the harness guarantees so you don't have to:
 
-The contract module also exports the shared readiness helper **`verifyEmbed(endpoint, { model,
-budgetMs, headers? })`** — poll `<endpoint>/api/embed` until a real vector comes back, or the
-budget elapses. Call it before returning from `provision` (a reachable box is not a serving box).
+- reads + validates `RAG_RAT_COOKBOOK_INPUT`, resolves `provisionTimeoutMs` (clamp + default);
+- installs `SIGTERM`/`SIGINT` handlers;
+- runs **exactly one** teardown on every path — provision throws (after `onBox`), or the box serves
+  and a signal arrives later — via an idempotent latch. You no longer write `try { … } catch {
+  terminate; throw }` in the recipe;
+- prints the single handshake line on success, parks the process, exits `0` on signal.
+
+Call `ctx.onBox(handle)` the instant the box exists (before it's verified serving) — that is what
+lets the harness clean up a half-provisioned box.
+
+The contract module also exports the shared network helpers — call these instead of bare `fetch`:
+
+- **`verifyEmbed(endpoint, { model, budgetMs, headers? })`** — poll `<endpoint>/api/embed` until a
+  real vector comes back. Call it before returning from `provision` (a reachable box is not a
+  serving box).
+- **`pollUntil(url, { label, body, isReady, budgetMs, pollIntervalMs?, perAttemptTimeoutMs? })`** —
+  the generic retry-until-ready loop (each attempt `AbortSignal`-bounded). `verifyEmbed` and the
+  RunPod model pull are both built on it.
+- **`fetchWithTimeout(url, init, timeoutMs)`** — a single `fetch` with a hard `AbortSignal.timeout`.
+  Use it for one-shot calls (e.g. teardown) so a stall can't hang past the grace and leak the box.
+
 To add a provider, drop a `recipes/<name>-ollama.mts` and register it in the `PROVIDERS` map in
 `cli.mts`.
 
@@ -190,7 +248,7 @@ cookbook/
   package.json                 @rag-rat/cookbook — bin → dist/cli.mjs; deps: modal; dev: typescript, tsx
   tsconfig.json                strict, ESM (NodeNext)
   cli.mts                      the bin dispatcher: `cookbook <provider>` → imports the recipe (→ dist/cli.mjs)
-  src/contract.ts              the published contract: types + runRecipe() + verifyEmbed() (→ dist/src/contract.js)
+  src/contract.ts              the published contract: types + runRecipe() + pollUntil/verifyEmbed/fetchWithTimeout (→ dist/src/contract.js)
   recipes/modal-ollama.mts     the Modal + Ollama recipe       (→ dist/recipes/modal-ollama.mjs)
   recipes/runpod-ollama.mts    the RunPod + Ollama recipe       (→ dist/recipes/runpod-ollama.mjs)
   README.md                    this file

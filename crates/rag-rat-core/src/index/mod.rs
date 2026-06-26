@@ -182,7 +182,7 @@ pub struct IndexStatus {
     pub parser_failure_paths: Vec<ParserFailure>,
     pub git_history: GitHistoryIndexStatus,
     pub github: GitHubStatus,
-    pub local_ai: LocalAiStatus,
+    pub llm: LocalAiStatus,
     pub anchor_health: AnchorHealth,
 }
 

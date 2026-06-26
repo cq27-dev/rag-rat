@@ -56,31 +56,13 @@ pub(crate) fn install_ollama_model(
 ) -> anyhow::Result<()> {
     // Probe: construct + one-shot embed. Reachability, auth, AND the dim contract are validated in
     // this single call (the embedder checks every returned vector against the selected model's
-    // dim). EPHEMERAL has no static endpoint, so the probe PROVISIONS a box, pings it, then tears
-    // it down (the `_box` guard's Drop at the end of this fn) — exactly the connection the
-    // reconcile will later provision.
+    // dim). EPHEMERAL has no static endpoint, so the probe PROVISIONS a box (via the shared
+    // `provision_and_build`), pings it, then tears it down (the `_box` guard's Drop at the end of
+    // this fn) — exactly the connection the reconcile will later provision.
     let (embedder, _box): (OllamaEmbedder, Option<ProvisionedBox>) = if remote.is_ephemeral() {
-        let cookbook = remote
-            .cookbook
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("ephemeral remote config has no cookbook"))?;
-        let input = CookbookInput {
-            model: remote.model.trim().to_string(),
-            request_timeout_s: remote.request_timeout_s,
-            gpu: None,
-        };
-        let provisioned = CookbookProvisioner::provision(cookbook, &input).map_err(|err| {
+        let (embedder, provisioned) = provision_and_build(remote, spec).map_err(|err| {
             anyhow::anyhow!("failed to provision ephemeral box for `{model_id}`: {err}")
         })?;
-        let embedder = OllamaEmbedder::from_provisioned(
-            &provisioned.endpoint,
-            provisioned.auth_token.as_deref(),
-            remote.model.trim(),
-            spec.model_id,
-            spec.dim,
-            remote.request_timeout_s,
-            remote.batch_size,
-        );
         (embedder, Some(provisioned))
     } else {
         let embedder = OllamaEmbedder::from_remote_config(remote, spec.model_id, spec.dim)

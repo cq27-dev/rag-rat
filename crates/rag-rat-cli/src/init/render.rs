@@ -39,14 +39,14 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
          [\"**/*.ts\"]\n# exclude = [\"**/*.map\"]\n\n",
     );
 
-    text.push_str("[local_ai.embedding]\n");
+    text.push_str("[llm.embedding]\n");
     text.push_str(&format!("# {}\n", backend_label(plan.backend)));
     text.push_str(&format!("model = {}\n\n", toml_string(plan.backend.as_str())));
 
     text.push_str(
         "# Embedding runtime tuning (defaults shown; uncomment to override).\n# \
-         [local_ai.embedding.runtime]\n# batch_size = 64\n# ort_threads = 4          # ONNX \
-         intra-op threads\n# omp_threads = 1\n# max_embedding_chars = 4000\n\n",
+         [llm.embedding.runtime]\n# batch_size = 64\n# ort_threads = 4          # ONNX intra-op \
+         threads\n# omp_threads = 1\n# max_embedding_chars = 4000\n\n",
     );
 
     text.push_str(

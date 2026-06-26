@@ -17,7 +17,9 @@ pub use providers::FastEmbedEmbedder;
 pub use providers::MockEmbedder;
 #[cfg(feature = "model2vec")]
 pub use providers::Model2VecEmbedder;
-pub(crate) use providers::active_embedder;
+pub(crate) use providers::{
+    ChunkEmbedder, acquire_chunk_embedder, active_embedder, provision_and_build,
+};
 // Curate the provider surface onto the `index::ai` path so existing `super::*` callers
 // (`reconcile`, `status`, `helpers`) and the external `ai::Embedder` /
 // `ai::FASTEMBED_MISSING_*` references keep resolving after the move into `providers/`. mod.rs

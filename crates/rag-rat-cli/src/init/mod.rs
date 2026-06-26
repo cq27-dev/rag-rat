@@ -257,7 +257,7 @@ mod tests {
         assert!(text.contains("database = \".rag-rat/index.sqlite\""));
         assert!(text.contains("rust = [\"crates/app/src\"]"));
         assert!(text.contains("typescript = [\"web/src\", \"app/src\"]"));
-        assert!(text.contains("[local_ai.embedding]"));
+        assert!(text.contains("[llm.embedding]"));
         // The selector is now the model_id (HF path), not an alias (#317).
         assert!(text.contains("model = \"minishlab/potion-retrieval-32M\""));
         // The oracle section is always rendered so the knob is discoverable; default is OFF.
@@ -300,7 +300,7 @@ mod tests {
         assert!(text.contains("# [[target]]"), "documents the expanded target form");
         assert!(text.contains("# [watch]"));
         assert!(text.contains("# [version_check]"));
-        assert!(text.contains("# [local_ai.embedding.runtime]"));
+        assert!(text.contains("# [llm.embedding.runtime]"));
         assert!(text.contains("`.h`"), "explains the cpp .h-header binding");
 
         std::fs::write(root.join("rag-rat.toml"), &text).unwrap();

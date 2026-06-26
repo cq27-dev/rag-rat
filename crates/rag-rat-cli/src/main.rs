@@ -78,7 +78,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let config = load_config_or_hint(&cli.config)?;
-    apply_embedding_runtime_env(&config.local_ai.embedding.runtime);
+    apply_embedding_runtime_env(&config.llm.embedding.runtime);
 
     match cli.command {
         Cmd::Init(_) | Cmd::ClaudeHook => unreachable!("handled before the config load above"),

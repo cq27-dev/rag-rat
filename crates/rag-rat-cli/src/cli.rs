@@ -547,7 +547,7 @@ pub(crate) struct ModelsArgs {
 pub(crate) enum ModelsCommand {
     /// List models and their install state (the default).
     List,
-    /// Download and install a model by id. A `[local_ai.embedding.remote]` block in `rag-rat.toml`
+    /// Download and install a model by id. A `[llm.embedding.remote]` block in `rag-rat.toml`
     /// installs it over Ollama instead; otherwise it's a local install.
     Install { model_id: String },
 }

@@ -9,18 +9,18 @@
 root = "."
 database = ".rag-rat/index.sqlite"
 
-[local_ai.embedding]
+[llm.embedding]
 # the MODEL by its full id (the HF path) — no aliases. "none" disables embeddings.
 model = "sentence-transformers/all-MiniLM-L6-v2"
 
-[local_ai.embedding.runtime]
+[llm.embedding.runtime]
 batch_size = 64
 ort_threads = 4
 omp_threads = 1
 max_embedding_chars = 4000
 ```
 
-## Embedding model (`[local_ai.embedding] model`)
+## Embedding model (`[llm.embedding] model`)
 
 Selects how `semantic_search` computes the **vector** half of its hybrid ranking. The selector is the
 model's **full id — its HF path** (no aliases). `rag-rat init` recommends a default from repo size;
@@ -44,9 +44,9 @@ index, so switching the model in the config takes effect after re-running `rag-r
 `rag-rat models install <model-id>` (and a reconcile to re-embed under the new model). Different
 models have different vector dimensions, so switching re-embeds from scratch.
 
-## Remote embedding over Ollama (`[local_ai.embedding.remote]`)
+## Remote embedding over Ollama (`[llm.embedding.remote]`)
 
-The `model = "..."` selector names the **model**; an optional `[local_ai.embedding.remote]` block
+The `model = "..."` selector names the **model**; an optional `[llm.embedding.remote]` block
 serves **that same model** over an Ollama server (`POST /api/embed`) instead of running it
 in-process — the lever for large repos whose CPU backfill is too slow on the indexing box. Ollama is
 a **transport, not a model**: there is no `model = "ollama"` selector. The block's mere **presence**
@@ -60,10 +60,10 @@ There is **no `mode` field** — the mode is INFERRED from which URL field is se
 **CONNECT** — talk to an already-running Ollama at a fixed URL:
 
 ```toml
-[local_ai.embedding]
+[llm.embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"   # the MODEL (HF path, 384-dim)
 
-[local_ai.embedding.remote]       # PRESENCE = "serve that model via Ollama"
+[llm.embedding.remote]       # PRESENCE = "serve that model via Ollama"
 endpoint = "http://box:11434"     # CONNECT: the Ollama server URL (required)
 model = "all-minilm"              # the Ollama-side model name (the server's own identifier)
 # auth_env = "OLLAMA_TOKEN"       # NAME of an env var holding a bearer token (never the token itself)
@@ -78,10 +78,10 @@ when it's serving, and is torn down (SIGTERM) when the reconcile finishes. Queri
 space as the remote-embedded chunks.
 
 ```toml
-[local_ai.embedding]
+[llm.embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"
 
-[local_ai.embedding.remote]
+[llm.embedding.remote]
 cookbook = "@rag-rat/cookbook modal"        # EPHEMERAL: an npm package + a provider subcommand
                                             #   (e.g. `modal`, `runpod`), or a recipe path + args.
                                             #   First token picks the runner: .mjs/.js → node,
@@ -102,7 +102,7 @@ rag-rat models install sentence-transformers/all-MiniLM-L6-v2   # install/activa
 rag-rat reconcile                                               # provisions, embeds, tears down
 ```
 
-The **two `model` keys are different things**: `[local_ai.embedding] model` is the rag-rat **model
+The **two `model` keys are different things**: `[llm.embedding] model` is the rag-rat **model
 selector** (the HF-path model_id — resolves the dimension + identity); `[remote] model` is the
 **Ollama-side model name** sent in the request body. They need not be spelled the same. Only
 **transformer** models (`sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`,
@@ -165,7 +165,7 @@ still obey `include_generated` filtering.
 Parser grammar dependencies are exact-pinned in `Cargo.toml`: `tree-sitter` 0.22.6,
 `tree-sitter-rust` 0.21.2, `tree-sitter-typescript` 0.21.2, and `tree-sitter-kotlin` 0.3.8.
 
-`[local_ai.embedding.runtime]` controls reconcile defaults for local embedding generation. CLI flags
+`[llm.embedding.runtime]` controls reconcile defaults for local embedding generation. CLI flags
 still take precedence: `--batch-size` overrides `batch_size`, and `--max-embedding-chars` overrides
 `max_embedding_chars`.
 

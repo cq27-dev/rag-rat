@@ -380,13 +380,13 @@ pub(crate) fn dump_config(config: &Config) -> anyhow::Result<()> {
     print_output(&serde_json::json!({
         "root": config.root,
         "database": config.database,
-        "local_ai": {
+        "llm": {
             "embedding": {
                 "runtime": {
-                    "batch_size": config.local_ai.embedding.runtime.batch_size,
-                    "ort_threads": config.local_ai.embedding.runtime.ort_threads,
-                    "omp_threads": config.local_ai.embedding.runtime.omp_threads,
-                    "max_embedding_chars": config.local_ai.embedding.runtime.max_embedding_chars,
+                    "batch_size": config.llm.embedding.runtime.batch_size,
+                    "ort_threads": config.llm.embedding.runtime.ort_threads,
+                    "omp_threads": config.llm.embedding.runtime.omp_threads,
+                    "max_embedding_chars": config.llm.embedding.runtime.max_embedding_chars,
                 }
             }
         },
@@ -478,7 +478,7 @@ pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
         Some(ModelsCommand::Install { model_id }) => {
             // A `[remote]` block (endpoint read from the toml, validated at config-parse) installs
             // the model over Ollama; absent → local install.
-            let remote = config.local_ai.embedding.remote.as_ref();
+            let remote = config.llm.embedding.remote.as_ref();
             print_output(&db.install_model(model_id, remote)?)
         },
     }
@@ -518,15 +518,15 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
     }
     let options = rag_rat_core::index::ai::ReconcileOptions {
         limit: args.limit,
-        batch_size: args.batch_size.or(Some(config.local_ai.embedding.runtime.batch_size)),
+        batch_size: args.batch_size.or(Some(config.llm.embedding.runtime.batch_size)),
         force: args.force,
         until_clean: args.until_clean,
         changed_first: args.changed_first,
         max_seconds: args.max_seconds,
         max_embedding_chars: args
             .max_embedding_chars
-            .unwrap_or(config.local_ai.embedding.runtime.max_embedding_chars),
-        intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
+            .unwrap_or(config.llm.embedding.runtime.max_embedding_chars),
+        intra_threads: config.llm.embedding.runtime.ort_threads.map(|n| n as usize),
         // The explicit `rag-rat reconcile` is the deliberate bulk pass that MAY provision an
         // ephemeral cookbook box (#318); the watcher's incremental pass does not.
         provision_remote: true,
@@ -1026,13 +1026,13 @@ fn run_maintenance_pass(
         rag_rat_core::watch::ReconcileBudget::new(
             rag_rat_core::index::ai::ReconcileOptions {
                 limit: None,
-                batch_size: Some(config.local_ai.embedding.runtime.batch_size),
+                batch_size: Some(config.llm.embedding.runtime.batch_size),
                 force: false,
                 until_clean: false,
                 changed_first: true,
                 max_seconds: Some(max_seconds),
-                max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
-                intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
+                max_embedding_chars: config.llm.embedding.runtime.max_embedding_chars,
+                intra_threads: config.llm.embedding.runtime.ort_threads.map(|n| n as usize),
                 // Maintenance is a background pass (watcher-like) — it must NOT cold-start a GPU
                 // box for incremental work. Only the explicit `rag-rat reconcile`
                 // provisions (#318).
@@ -1186,7 +1186,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: Default::default(),
+            llm: Default::default(),
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -1292,7 +1292,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: Default::default(),
+            llm: Default::default(),
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -1356,7 +1356,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: Default::default(),
+            llm: Default::default(),
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),

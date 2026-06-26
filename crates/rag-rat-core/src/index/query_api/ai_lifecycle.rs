@@ -13,10 +13,10 @@ impl IndexDatabase {
         ai::models(self.storage.connection())
     }
 
-    /// Install/activate an embedding model. `remote` carries the `[local_ai.embedding.remote]`
+    /// Install/activate an embedding model. `remote` carries the `[llm.embedding.remote]`
     /// connection params and is REQUIRED for the Ollama backend (the install is a reachability +
     /// dim probe against that endpoint); every other backend ignores it. Callers pass
-    /// `config.local_ai.embedding.remote.as_ref()` — `None` for the local backends.
+    /// `config.llm.embedding.remote.as_ref()` — `None` for the local backends.
     pub fn install_model(
         &self,
         model_id: &str,
