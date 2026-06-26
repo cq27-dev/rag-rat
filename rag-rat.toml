@@ -7,15 +7,20 @@ database = ".rag-rat/index.sqlite"
 # tier — ~100-500x faster on CPU, some quality cost. "none" disables embeddings.
 model = "minishlab/potion-retrieval-32M"
 
-# Optional: serve a TRANSFORMER model over an Ollama server instead of in-process — e.g.
-# model = "sentence-transformers/all-MiniLM-L6-v2" (not model2vec/hash). Presence of this block flips
-# the runtime; same model + dim, only transport changes. Endpoint is read from the toml below
-# (required in connect mode). See docs/config.md "Remote embedding over Ollama".
+# Optional: serve a TRANSFORMER model (not model2vec/hash) over Ollama instead of in-process. The
+# mode is INFERRED — set EXACTLY ONE of `endpoint` (connect to a running box) or `cookbook`
+# (provision an ephemeral box for the bulk `reconcile`). See docs/config.md "Remote embedding over
+# Ollama".
+#   CONNECT:
 # [local_ai.embedding.remote]
-# mode = "connect"               # "connect" only for now ("ephemeral" reserved)
-# endpoint = "http://box:11434"  # the Ollama server URL (required in connect mode)
+# endpoint = "http://box:11434"  # the Ollama server URL
 # model = "all-minilm"           # the Ollama-side model name
 # auth_env = "OLLAMA_TOKEN"      # NAME of an env var with a bearer token (never the token)
+#   EPHEMERAL (provision-on-demand; queries use a local ollama):
+# [local_ai.embedding.remote]
+# cookbook = "@rag-rat/cookbook/modal"        # npm spec, or a recipe path (.mjs/.ts)
+# model = "all-minilm"
+# query_endpoint = "http://localhost:11434"   # local ollama for query embedding (this is the default)
 
 [local_ai.embedding.runtime]
 batch_size = 64

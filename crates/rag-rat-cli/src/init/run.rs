@@ -276,6 +276,9 @@ pub(crate) fn setup_model_and_reconcile(
             max_seconds: None,
             max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
             intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
+            // `init`'s reconcile is the deliberate bulk pass — provision an ephemeral box if
+            // active.
+            provision_remote: true,
         },
         render_reconcile_progress,
     )?;

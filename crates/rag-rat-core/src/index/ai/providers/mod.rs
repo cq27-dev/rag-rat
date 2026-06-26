@@ -3,6 +3,9 @@
 //! This module is the single construction site for every embedder — callers reach it through the
 //! curated re-exports in `index::ai`.
 
+// Ungated: the ephemeral cookbook lifecycle (#318) spawns a subprocess via std::process — no heavy
+// optional dependency, so it ships unconditionally like the Ollama backend.
+mod cookbook;
 #[cfg(feature = "fastembed")]
 mod fastembed;
 mod hash;
@@ -15,6 +18,7 @@ mod ollama;
 
 use rusqlite::Connection;
 
+pub use self::cookbook::{CookbookInput, CookbookProvisioner, ProvisionedBox};
 #[cfg(feature = "fastembed")]
 pub use self::fastembed::FastEmbedEmbedder;
 pub use self::hash::HashEmbedder;
@@ -54,13 +58,37 @@ pub(crate) fn active_embedder(
     validate_ready_model(&model)?;
     let spec = spec(&model.model_id)
         .ok_or_else(|| anyhow::anyhow!("unknown active embedding model `{}`", model.model_id))?;
-    // The remote config (persisted at install) is what FLIPS the effective runtime to Ollama for
-    // the active model — the model is the same (`spec`), only the transport changes. Read it once
-    // here so this single construction site serves both callers (reconcile's chunk-embed and
-    // `embed_query`'s query-embed): connect mode has no chunk/query split (the mirror is deferred
-    // to ephemeral, #318). A non-remote active model gets `None` → its local backend.
+    // The remote config (persisted at install) flips the effective runtime to Ollama for the active
+    // model — same `spec`, only the transport changes. `active_embedder` is the CONNECT-chunk +
+    // QUERY-embed path (NOT the ephemeral-CHUNK path — that's the reconcile provisioner, which
+    // constructs its own embedder against the provisioned box):
+    // - CONNECT → the configured `endpoint`.
+    // - EPHEMERAL → the LOCAL `query_endpoint` (queries embed the same model → same GGUF vector
+    //   space as the remote-embedded chunks; we never cold-start a GPU box just to embed a query).
+    // - local → the local backend.
     let remote = active_remote_config(conn)?;
-    embedder_for_spec(spec, intra_threads, remote.as_ref())
+    let query_remote = remote.as_ref().map(query_embed_config);
+    embedder_for_spec(spec, intra_threads, query_remote.as_ref())
+}
+
+/// Map a persisted remote config to the one `active_embedder` should embed QUERIES with. Connect →
+/// the config unchanged (its `endpoint`). Ephemeral → a connect-shaped config pointed at the LOCAL
+/// `query_endpoint`, so the query embeds against the local box (same model) rather than
+/// provisioning a remote GPU. Used only on the query/connect-chunk path; the ephemeral CHUNK path
+/// provisions.
+fn query_embed_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingConfig {
+    if remote.is_ephemeral() {
+        RemoteEmbeddingConfig {
+            endpoint: remote.query_endpoint.clone(),
+            cookbook: None,
+            query_endpoint: None,
+            // The local query box needs no auth (it's our own ollama), so drop `auth_env`.
+            auth_env: None,
+            ..remote.clone()
+        }
+    } else {
+        remote.clone()
+    }
 }
 
 /// Build the embedder for a registry spec. The EFFECTIVE runtime is `remote.is_some() ? Ollama :
@@ -152,7 +180,6 @@ impl Embedder for MockEmbedder {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
-    use crate::config::RemoteMode;
     use crate::embedding_models::FASTEMBED_MODEL_ID;
     use crate::index::ai::set_active_remote_config;
 
@@ -177,9 +204,10 @@ mod dispatch_tests {
 
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
-            mode: RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some(endpoint.to_string()),
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: 5,
@@ -222,5 +250,54 @@ mod dispatch_tests {
         let spec = spec(crate::embedding_models::HASH_MODEL_ID).unwrap();
         let embedder = embedder_for_spec(spec, None, None).unwrap();
         assert_eq!(embedder.model_id(), crate::embedding_models::HASH_MODEL_ID);
+    }
+
+    fn ephemeral_at(query_endpoint: &str) -> RemoteEmbeddingConfig {
+        RemoteEmbeddingConfig {
+            model: "all-minilm".to_string(),
+            endpoint: None,
+            cookbook: Some("@rag-rat/cookbook/modal".to_string()),
+            query_endpoint: Some(query_endpoint.to_string()),
+            auth_env: Some("SHOULD_BE_DROPPED".to_string()),
+            batch_size: 256,
+            request_timeout_s: 5,
+        }
+    }
+
+    #[test]
+    fn query_embed_config_for_ephemeral_points_at_the_local_query_endpoint() {
+        // The QUERY path for an ephemeral active config embeds against the LOCAL query box (same
+        // model → same vector space), NOT the cookbook. `query_embed_config` rewrites the config to
+        // a connect-shaped one pointed at `query_endpoint`, dropping the cookbook + auth.
+        let q = query_embed_config(&ephemeral_at("http://127.0.0.1:11434"));
+        assert!(q.is_connect() && !q.is_ephemeral());
+        assert_eq!(q.endpoint.as_deref(), Some("http://127.0.0.1:11434"));
+        assert_eq!(q.cookbook, None);
+        assert_eq!(q.auth_env, None, "local query box needs no auth");
+    }
+
+    #[test]
+    fn active_embedder_for_ephemeral_builds_against_the_query_endpoint() {
+        // An ephemeral active model: `active_embedder` (the query/connect path) must build against
+        // the LOCAL query_endpoint — never provision a cookbook box just to embed a query.
+        // Construction doesn't connect, so a closed port is fine.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let conn = conn_with_active_model(FASTEMBED_MODEL_ID);
+        set_active_remote_config(&conn, &ephemeral_at(&format!("http://127.0.0.1:{port}")))
+            .unwrap();
+
+        let embedder = active_embedder(&conn, None).expect("query embedder constructs locally");
+        assert_eq!(embedder.model_id(), FASTEMBED_MODEL_ID);
+        assert_eq!(embedder.dim(), spec(FASTEMBED_MODEL_ID).unwrap().dim);
+    }
+
+    #[test]
+    fn query_embed_config_for_connect_is_unchanged() {
+        let connect = remote_at("http://box:11434");
+        let q = query_embed_config(&connect);
+        assert_eq!(q, connect, "connect query config is the config unchanged");
     }
 }

@@ -56,16 +56,44 @@ pub(crate) fn install_ollama_model(
 ) -> anyhow::Result<()> {
     // Probe: construct + one-shot embed. Reachability, auth, AND the dim contract are validated in
     // this single call (the embedder checks every returned vector against the selected model's
-    // dim).
-    let embedder =
-        OllamaEmbedder::from_remote_config(remote, spec.model_id, spec.dim).map_err(|err| {
-            anyhow::anyhow!("failed to construct ollama embedder for `{model_id}`: {err}")
+    // dim). EPHEMERAL has no static endpoint, so the probe PROVISIONS a box, pings it, then tears
+    // it down (the `_box` guard's Drop at the end of this fn) — exactly the connection the
+    // reconcile will later provision.
+    let (embedder, _box): (OllamaEmbedder, Option<ProvisionedBox>) = if remote.is_ephemeral() {
+        let cookbook = remote
+            .cookbook
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("ephemeral remote config has no cookbook"))?;
+        let input = CookbookInput {
+            model: remote.model.trim().to_string(),
+            request_timeout_s: remote.request_timeout_s,
+            gpu: None,
+        };
+        let provisioned = CookbookProvisioner::provision(cookbook, &input).map_err(|err| {
+            anyhow::anyhow!("failed to provision ephemeral box for `{model_id}`: {err}")
         })?;
+        let embedder = OllamaEmbedder::from_provisioned(
+            &provisioned.endpoint,
+            provisioned.auth_token.as_deref(),
+            remote.model.trim(),
+            spec.model_id,
+            spec.dim,
+            remote.request_timeout_s,
+            remote.batch_size,
+        );
+        (embedder, Some(provisioned))
+    } else {
+        let embedder = OllamaEmbedder::from_remote_config(remote, spec.model_id, spec.dim)
+            .map_err(|err| {
+                anyhow::anyhow!("failed to construct ollama embedder for `{model_id}`: {err}")
+            })?;
+        (embedder, None)
+    };
     embedder.embed_batch(&["ping".to_string()]).map_err(|err| {
         anyhow::anyhow!(
             "ollama reachability/dim probe failed for `{model_id}` (endpoint `{}`, model `{}`): \
              {err}",
-            remote.endpoint.as_deref().unwrap_or("<none>"),
+            remote.endpoint.as_deref().unwrap_or("<ephemeral>"),
             remote.model
         )
     })?;
@@ -252,7 +280,6 @@ mod ollama_install_tests {
     use std::thread;
 
     use super::*;
-    use crate::config::RemoteMode;
     use crate::embedding_models::FASTEMBED_MODEL_ID;
 
     /// One-shot HTTP/1.1 stub on an ephemeral port that replies to the probe's single `/api/embed`
@@ -287,9 +314,10 @@ mod ollama_install_tests {
 
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
-            mode: RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some(endpoint.to_string()),
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: 5,

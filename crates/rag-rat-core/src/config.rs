@@ -230,26 +230,35 @@ impl Default for EmbeddingRuntimeConfig {
 /// by this block's mere PRESENCE (#317 rework). Duplicating either here would be redundant and
 /// drift-prone.
 ///
-/// `Serialize` (#317 task 5) lets the install step persist this verbatim into the secret-free
+/// The mode is INFERRED, not configured — there is no `mode` field (#318). EXACTLY ONE of
+/// `endpoint` / `cookbook` is set:
+/// - `endpoint` present → CONNECT: talk to an already-running Ollama at that URL.
+/// - `cookbook` present → EPHEMERAL: the bulk-`reconcile` path provisions an on-demand box via the
+///   cookbook subprocess, embeds the repo against it, then tears it down. Queries use the LOCAL box
+///   at `query_endpoint` (same model → same GGUF vector space as the remote-embedded chunks).
+///
+/// `Serialize` lets the install step persist this verbatim into the secret-free
 /// `active_embedding_remote_config` meta, so the `conn`-based `active_embedder` can reconstruct the
 /// remote embedder for both chunk-embed (reconcile) and query-embed (search) without threading
 /// config through the search path. SECRET-FREE: `auth_env` is the env-var NAME, never a token, so
 /// the serialized JSON holds no secret. `Deserialize` is the read side of that meta round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEmbeddingConfig {
-    /// How the remote server is reached. `Connect` (the v1 default) talks to an
-    /// already-running server at `endpoint`; `Ephemeral` (provision-on-demand) is not yet
-    /// supported — see [`RemoteMode`].
-    pub mode: RemoteMode,
     /// The Ollama API model name sent to `/api/embed` (e.g. `"all-minilm"`). This is the server's
     /// own model identifier, NOT a `rag-rat` registry alias — the registry only supplies the dim
     /// parity contract.
     pub model: String,
-    /// Base URL of the remote server (e.g. `"http://localhost:11434"`); `/api/embed` is appended by
-    /// the embedder. REQUIRED in `Connect` mode (read from the toml at parse). `Option` only
-    /// because a future `Ephemeral` mode will inject it per-run via the provisioning cookbook
-    /// (#318).
+    /// CONNECT: base URL of an already-running Ollama (e.g. `"http://localhost:11434"`);
+    /// `/api/embed` is appended by the embedder. Mutually exclusive with `cookbook`.
     pub endpoint: Option<String>,
+    /// EPHEMERAL: the cookbook recipe rag-rat spawns to provision an on-demand box — an npm
+    /// package spec (`"@rag-rat/cookbook/modal"`, run via `npx -y`) or a recipe file path
+    /// (`.mjs`/`.js` → `node`, `.ts` → `npx tsx`). Mutually exclusive with `endpoint`.
+    pub cookbook: Option<String>,
+    /// EPHEMERAL: the LOCAL Ollama used for QUERY embedding (queries embed the same model as the
+    /// remote-embedded chunks → identical vector space). Defaults to `http://localhost:11434` when
+    /// ephemeral and omitted. Ignored in connect mode.
+    pub query_endpoint: Option<String>,
     /// Name of the environment variable holding the bearer token, if the server needs auth. Local
     /// Ollama needs none, so this is optional; the embedder reads the var once at construction.
     pub auth_env: Option<String>,
@@ -259,12 +268,16 @@ pub struct RemoteEmbeddingConfig {
     pub request_timeout_s: u64,
 }
 
+/// The default LOCAL Ollama URL for ephemeral query embedding when `query_endpoint` is omitted.
+pub const DEFAULT_QUERY_ENDPOINT: &str = "http://localhost:11434";
+
 impl Default for RemoteEmbeddingConfig {
     fn default() -> Self {
         Self {
-            mode: RemoteMode::Connect,
             model: String::new(),
             endpoint: None,
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: 60,
@@ -272,37 +285,16 @@ impl Default for RemoteEmbeddingConfig {
     }
 }
 
-/// How the remote-embedding server is obtained (`[local_ai.embedding.remote] mode = "..."`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum RemoteMode {
-    /// Connect to an already-running server at the configured `endpoint`. The v1 default and the
-    /// only supported mode today.
-    #[default]
-    Connect,
-    /// Provision an ephemeral server on demand. Not yet supported — needs the provisioning
-    /// cookbook (#318); selecting it is a [`ConfigError::RemoteEmbeddingEphemeralUnsupported`].
-    Ephemeral,
-}
-
-impl RemoteMode {
-    /// The canonical toml selector for this mode.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Connect => "connect",
-            Self::Ephemeral => "ephemeral",
-        }
+impl RemoteEmbeddingConfig {
+    /// CONNECT mode: an already-running server at `endpoint`. Exactly one of connect/ephemeral
+    /// holds (config validation guarantees it), so `is_connect() == !is_ephemeral()`.
+    pub fn is_connect(&self) -> bool {
+        self.endpoint.is_some()
     }
-}
 
-impl FromStr for RemoteMode {
-    type Err = ConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "connect" => Ok(Self::Connect),
-            "ephemeral" => Ok(Self::Ephemeral),
-            other => Err(ConfigError::UnknownRemoteMode(other.to_string())),
-        }
+    /// EPHEMERAL mode: provision an on-demand box via `cookbook` for the bulk reconcile.
+    pub fn is_ephemeral(&self) -> bool {
+        self.cookbook.is_some()
     }
 }
 
@@ -772,9 +764,10 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawRemoteEmbedding {
-    mode: Option<String>,
     model: Option<String>,
     endpoint: Option<String>,
+    cookbook: Option<String>,
+    query_endpoint: Option<String>,
     auth_env: Option<String>,
     batch_size: Option<u32>,
     request_timeout_s: Option<u64>,
@@ -795,42 +788,47 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
 
     fn try_from(raw: RawRemoteEmbedding) -> Result<Self, Self::Error> {
         let default = RemoteEmbeddingConfig::default();
-        // `mode` absent → `Connect` (the v1 default). `Ephemeral` parses but isn't wired yet.
-        let mode = match raw.mode.as_deref() {
-            Some(value) => value.parse()?,
-            None => default.mode,
-        };
-        if mode == RemoteMode::Ephemeral {
-            return Err(ConfigError::RemoteEmbeddingEphemeralUnsupported);
-        }
+        let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         // The Ollama API model name (e.g. `all-minilm`) — required, non-empty.
         let model = raw.model.unwrap_or_default();
         let model = model.trim();
         if model.is_empty() {
             return Err(ConfigError::RemoteEmbeddingMissingModel);
         }
-        // `Connect` mode needs a non-empty server URL to reach — read from the toml here (there is
-        // no flag/env endpoint injection; the cookbook auto-provisioning path is deferred to #318).
-        let endpoint = raw.endpoint.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
-        if mode == RemoteMode::Connect && endpoint.is_none() {
-            return Err(ConfigError::RemoteEmbeddingMissingEndpoint);
+        // The MODE is INFERRED from which URL field is set (#318): EXACTLY ONE of `endpoint`
+        // (connect) / `cookbook` (ephemeral). Both → ambiguous; neither → no server to reach.
+        let endpoint = trimmed(raw.endpoint);
+        let cookbook = trimmed(raw.cookbook);
+        match (endpoint.is_some(), cookbook.is_some()) {
+            (true, true) | (false, false) => {
+                return Err(ConfigError::RemoteEmbeddingModeAmbiguous);
+            },
+            _ => {},
         }
-        // SECRET HYGIENE: the endpoint string is persisted WHOLE into the (secret-free) index meta
-        // at install. A URL with userinfo (`https://user:token@host`) would copy that credential
-        // into the SQLite index — reject it here and direct the user to `auth_env`. Checked against
-        // the URL authority only (between `scheme://` and the next `/`), so an `@` in a path/query
-        // is fine.
-        if let Some(endpoint) = endpoint.as_deref()
-            && endpoint_authority_has_userinfo(endpoint)
-        {
-            return Err(ConfigError::RemoteEmbeddingEndpointHasCredentials);
+        // SECRET HYGIENE: `endpoint`/`query_endpoint` are persisted WHOLE into the (secret-free)
+        // index meta. A URL with userinfo (`https://user:token@host`) would copy that credential
+        // into the SQLite index — reject it and direct the user to `auth_env`. Checked against the
+        // URL authority only (between `scheme://` and the next `/`), so an `@` in a path/query is
+        // fine. `cookbook` is a recipe spec, not a URL, so it is not checked.
+        // EPHEMERAL: the LOCAL query box. Defaults to `DEFAULT_QUERY_ENDPOINT`; ignored for
+        // connect.
+        let query_endpoint = if cookbook.is_some() {
+            Some(trimmed(raw.query_endpoint).unwrap_or_else(|| DEFAULT_QUERY_ENDPOINT.to_string()))
+        } else {
+            None
+        };
+        for url in [endpoint.as_deref(), query_endpoint.as_deref()].into_iter().flatten() {
+            if endpoint_authority_has_userinfo(url) {
+                return Err(ConfigError::RemoteEmbeddingEndpointHasCredentials);
+            }
         }
         // Optional — local Ollama needs no auth; trim if present.
-        let auth_env = raw.auth_env.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+        let auth_env = trimmed(raw.auth_env);
         Ok(Self {
-            mode,
             model: model.to_string(),
             endpoint,
+            cookbook,
+            query_endpoint,
             auth_env,
             batch_size: raw.batch_size.unwrap_or(default.batch_size),
             request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
@@ -884,23 +882,16 @@ pub enum ConfigError {
          `jinaai/jina-embeddings-v2-base-code`, `minishlab/potion-retrieval-32M` — or `none`)"
     )]
     UnknownEmbeddingBackend(String),
-    #[error("unknown remote embedding mode `{0}` (expected `connect` or `ephemeral`)")]
-    UnknownRemoteMode(String),
     #[error(
         "[local_ai.embedding.remote] requires a non-empty `model` (the Ollama API model name, \
          such as `all-minilm`)"
     )]
     RemoteEmbeddingMissingModel,
     #[error(
-        "[local_ai.embedding.remote] mode = \"connect\" requires a non-empty `endpoint` (the \
-         remote server URL, such as `http://localhost:11434`)"
+        "[local_ai.embedding.remote] requires EXACTLY ONE of `endpoint` (connect to a running \
+         Ollama) or `cookbook` (provision an ephemeral box) — set neither both nor zero"
     )]
-    RemoteEmbeddingMissingEndpoint,
-    #[error(
-        "[local_ai.embedding.remote] mode = \"ephemeral\" is not yet supported (needs the \
-         provisioning cookbook, #318); use mode = \"connect\" for now"
-    )]
-    RemoteEmbeddingEphemeralUnsupported,
+    RemoteEmbeddingModeAmbiguous,
     #[error(
         "[local_ai.embedding.remote] `endpoint` must not embed credentials in the URL (no \
          `user:pass@host`) — the endpoint is persisted into the index; put any token in an env \
@@ -1257,8 +1248,8 @@ mod tests {
 
     #[test]
     fn remote_embedding_connect_happy_path_applies_defaults() {
-        // #317 rework: the selector names a real MODEL (`minilm`); the [remote] block serves it via
-        // Ollama. No `model = "ollama"` selector exists anymore.
+        // CONNECT is inferred from `endpoint` being set (#318) — no `mode` field. The selector
+        // names a real MODEL; the [remote] block serves it via Ollama.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
@@ -1268,7 +1259,6 @@ mod tests {
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
-            mode = "connect"
             model = "all-minilm"
             endpoint = "http://localhost:11434"
             "#,
@@ -1278,15 +1268,18 @@ mod tests {
         assert_eq!(
             local_ai.embedding.remote,
             Some(RemoteEmbeddingConfig {
-                mode: RemoteMode::Connect,
                 model: "all-minilm".to_string(),
                 endpoint: Some("http://localhost:11434".to_string()),
+                cookbook: None,
+                query_endpoint: None, // connect mode: no local query box
                 auth_env: None,
                 // defaults applied when omitted
                 batch_size: 256,
                 request_timeout_s: 60,
             })
         );
+        let remote = local_ai.embedding.remote.as_ref().unwrap();
+        assert!(remote.is_connect() && !remote.is_ephemeral());
         // The selector still resolves to the LOCAL fastembed model — the [remote] block overrides
         // the RUNTIME, not the model identity.
         assert_eq!(
@@ -1296,7 +1289,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_embedding_mode_omitted_defaults_to_connect() {
+    fn remote_embedding_ephemeral_infers_mode_and_defaults_query_endpoint() {
+        // EPHEMERAL is inferred from `cookbook` being set; `query_endpoint` defaults to the local
+        // Ollama when omitted (queries embed the same model → same vector space as remote chunks).
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
@@ -1307,13 +1302,36 @@ mod tests {
 
             [local_ai.embedding.remote]
             model = "all-minilm"
-            endpoint = "http://localhost:11434"
+            cookbook = "@rag-rat/cookbook/modal"
             "#,
         )
         .unwrap();
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
-        let remote = local_ai.embedding.remote.expect("remote block present");
-        assert_eq!(remote.mode, RemoteMode::Connect, "absent mode → Connect (the v1 default)");
+        let remote = LocalAiConfig::try_from(raw.local_ai).unwrap().embedding.remote.unwrap();
+        assert!(remote.is_ephemeral() && !remote.is_connect());
+        assert_eq!(remote.cookbook.as_deref(), Some("@rag-rat/cookbook/modal"));
+        assert_eq!(remote.endpoint, None);
+        assert_eq!(remote.query_endpoint.as_deref(), Some(DEFAULT_QUERY_ENDPOINT));
+    }
+
+    #[test]
+    fn remote_embedding_ephemeral_honors_explicit_query_endpoint() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+
+            [local_ai.embedding.remote]
+            model = "all-minilm"
+            cookbook = "./recipe.mjs"
+            query_endpoint = "http://127.0.0.1:11999"
+            "#,
+        )
+        .unwrap();
+        let remote = LocalAiConfig::try_from(raw.local_ai).unwrap().embedding.remote.unwrap();
+        assert_eq!(remote.query_endpoint.as_deref(), Some("http://127.0.0.1:11999"));
     }
 
     #[test]
@@ -1339,9 +1357,10 @@ mod tests {
         assert_eq!(
             local_ai.embedding.remote,
             Some(RemoteEmbeddingConfig {
-                mode: RemoteMode::Connect,
                 model: "all-minilm".to_string(),
                 endpoint: Some("http://localhost:11434".to_string()),
+                cookbook: None,
+                query_endpoint: None,
                 auth_env: Some("OLLAMA_TOKEN".to_string()),
                 batch_size: 512,
                 request_timeout_s: 120,
@@ -1350,11 +1369,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_embedding_connect_without_endpoint_is_rejected() {
-        // Connect mode requires a non-empty `endpoint` read from the toml — the flag/env injection
-        // was dropped (the cookbook auto-provisioning path is deferred to #318).
-        let raw: RawConfig = toml::from_str(
-            r#"
+    fn remote_embedding_requires_exactly_one_of_endpoint_or_cookbook() {
+        // Neither → no server to reach; both → ambiguous mode. Both reject with the exactly-one
+        // rule.
+        let neither = r#"
             [index]
             root = "."
 
@@ -1362,16 +1380,28 @@ mod tests {
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
-            mode = "connect"
             model = "all-minilm"
-            "#,
-        )
-        .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::RemoteEmbeddingMissingEndpoint),
-            "connect mode without endpoint → RemoteEmbeddingMissingEndpoint, got {err:?}",
-        );
+            "#;
+        let both = r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+
+            [local_ai.embedding.remote]
+            model = "all-minilm"
+            endpoint = "http://localhost:11434"
+            cookbook = "@rag-rat/cookbook/modal"
+            "#;
+        for (label, toml_str) in [("neither", neither), ("both", both)] {
+            let raw: RawConfig = toml::from_str(toml_str).unwrap();
+            let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RemoteEmbeddingModeAmbiguous),
+                "{label} endpoint/cookbook → RemoteEmbeddingModeAmbiguous, got {err:?}",
+            );
+        }
     }
 
     #[test]
@@ -1434,7 +1464,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_embedding_ephemeral_mode_is_unsupported() {
+    fn remote_embedding_query_endpoint_with_credentials_is_rejected() {
+        // The query_endpoint is persisted too, so userinfo in it is rejected the same as
+        // `endpoint`.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
@@ -1444,15 +1476,16 @@ mod tests {
             model = "sentence-transformers/all-MiniLM-L6-v2"
 
             [local_ai.embedding.remote]
-            mode = "ephemeral"
             model = "all-minilm"
+            cookbook = "@rag-rat/cookbook/modal"
+            query_endpoint = "http://user:tok@127.0.0.1:11434"
             "#,
         )
         .unwrap();
         let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
         assert!(
-            matches!(err, ConfigError::RemoteEmbeddingEphemeralUnsupported),
-            "ephemeral mode → RemoteEmbeddingEphemeralUnsupported, got {err:?}",
+            matches!(err, ConfigError::RemoteEmbeddingEndpointHasCredentials),
+            "query_endpoint with userinfo → RemoteEmbeddingEndpointHasCredentials, got {err:?}",
         );
     }
 

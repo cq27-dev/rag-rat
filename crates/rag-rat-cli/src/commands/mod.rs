@@ -527,6 +527,9 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
             .max_embedding_chars
             .unwrap_or(config.local_ai.embedding.runtime.max_embedding_chars),
         intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
+        // The explicit `rag-rat reconcile` is the deliberate bulk pass that MAY provision an
+        // ephemeral cookbook box (#318); the watcher's incremental pass does not.
+        provision_remote: true,
     };
     let report = db.reconcile_with_options_progress(options, render_reconcile_progress)?;
     // After reconciling, surface non-current memory anchors so they don't rot silently.
@@ -1030,6 +1033,10 @@ fn run_maintenance_pass(
                 max_seconds: Some(max_seconds),
                 max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
                 intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
+                // Maintenance is a background pass (watcher-like) — it must NOT cold-start a GPU
+                // box for incremental work. Only the explicit `rag-rat reconcile`
+                // provisions (#318).
+                provision_remote: false,
             },
             started,
         )

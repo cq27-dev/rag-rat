@@ -28,8 +28,8 @@ pub(crate) use providers::active_embedder;
 // `#[cfg(not(...))]`-only consts). A `pub(crate)` re-export would narrow that and redden `-D
 // warnings`.
 pub use providers::{
-    Embedder, FASTEMBED_MISSING_FEATURE_MESSAGE, HashEmbedder, MODEL2VEC_HF_REPO,
-    MODEL2VEC_MISSING_FEATURE_MESSAGE, OllamaEmbedder,
+    CookbookInput, CookbookProvisioner, Embedder, FASTEMBED_MISSING_FEATURE_MESSAGE, HashEmbedder,
+    MODEL2VEC_HF_REPO, MODEL2VEC_MISSING_FEATURE_MESSAGE, OllamaEmbedder, ProvisionedBox,
 };
 pub(crate) use reconcile::*;
 pub(crate) use reencode::*;
@@ -276,6 +276,13 @@ pub struct ReconcileOptions {
     pub max_embedding_chars: usize,
     /// ONNX Runtime intra-op thread cap (`ort_threads`). `None` lets the backend pick (all cores).
     pub intra_threads: Option<usize>,
+    /// Whether this reconcile may PROVISION an ephemeral cookbook box for chunk embedding (#318).
+    /// The explicit `rag-rat reconcile` (a deliberate bulk pass) sets this TRUE; the
+    /// watcher/maintenance incremental pass sets it FALSE — a 2-chunk edit must never cold-start a
+    /// GPU box. With an ephemeral active model and this FALSE, the chunk embed is SKIPPED (chunks
+    /// stay pending; lexical search still works; query embedding uses the local box). Ignored for
+    /// connect / local models.
+    pub provision_remote: bool,
 }
 
 impl Default for ReconcileOptions {
@@ -289,6 +296,9 @@ impl Default for ReconcileOptions {
             max_seconds: None,
             max_embedding_chars: DEFAULT_MAX_EMBEDDING_CHARS,
             intra_threads: None,
+            // Default FALSE: only the explicit `rag-rat reconcile` opts into provisioning. The
+            // watcher (which uses `..ReconcileOptions::default()`) must never provision.
+            provision_remote: false,
         }
     }
 }

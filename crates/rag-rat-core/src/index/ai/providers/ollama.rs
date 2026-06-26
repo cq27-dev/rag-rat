@@ -79,13 +79,64 @@ impl OllamaEmbedder {
                      (`[local_ai.embedding.remote] endpoint`)"
                 )
             })?;
-        let embed_url = format!("{}/api/embed", endpoint.trim_end_matches('/'));
-
+        // CONNECT auth comes from the env var NAMED by `auth_env` (the token never enters config).
         let auth_header =
             resolve_auth_header(cfg.auth_env.as_deref(), |var| std::env::var(var).ok())?;
+        Ok(Self::build(
+            endpoint,
+            auth_header,
+            selected_model_id,
+            cfg.model.trim(),
+            dim,
+            cfg.request_timeout_s,
+            cfg.batch_size,
+        ))
+    }
 
+    /// Build the embedder against a freshly PROVISIONED ephemeral box (#318). The `endpoint` +
+    /// `auth_token` come from the cookbook handshake — `auth_token` is a DIRECT bearer token (the
+    /// box's per-run credential), NOT an env-var name (contrast [`Self::from_remote_config`], which
+    /// resolves `auth_env`). The model identity (`selected_model_id` + `dim`) + transport knobs
+    /// (server `model`, timeout, batch) come from the config the same way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_provisioned(
+        endpoint: &str,
+        auth_token: Option<&str>,
+        server_model: &str,
+        selected_model_id: &str,
+        dim: usize,
+        request_timeout_s: u64,
+        batch_size: u32,
+    ) -> Self {
+        let auth_header = auth_token
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|token| format!("Bearer {token}"));
+        Self::build(
+            endpoint.trim(),
+            auth_header,
+            selected_model_id,
+            server_model.trim(),
+            dim,
+            request_timeout_s,
+            batch_size,
+        )
+    }
+
+    /// Shared assembler: build the `ureq::Agent` (with the loopback proxy bypass) + the struct.
+    /// `endpoint` is already trimmed/validated by the caller.
+    fn build(
+        endpoint: &str,
+        auth_header: Option<String>,
+        selected_model_id: &str,
+        server_model: &str,
+        dim: usize,
+        request_timeout_s: u64,
+        batch_size: u32,
+    ) -> Self {
+        let embed_url = format!("{}/api/embed", endpoint.trim_end_matches('/'));
         let mut builder = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(cfg.request_timeout_s)))
+            .timeout_global(Some(Duration::from_secs(request_timeout_s)))
             .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (ollama-embed)"));
         // ureq's default config inherits `HTTP_PROXY`/`HTTPS_PROXY` from the env. A local Ollama
         // (`http://127.0.0.1:11434`) routed through a corporate proxy 403s, so disable the proxy for
@@ -95,18 +146,17 @@ impl OllamaEmbedder {
             builder = builder.proxy(None);
         }
         let agent: ureq::Agent = builder.build().into();
-
-        Ok(Self {
+        Self {
             agent,
             embed_url,
             selected_model_id: selected_model_id.to_string(),
-            server_model: cfg.model.trim().to_string(),
+            server_model: server_model.to_string(),
             dim,
             // Clamp to >= 1: a configured 0 would panic `slice::chunks`; treat it as "one per
             // request" rather than failing construction.
-            batch_size: (cfg.batch_size as usize).max(1),
+            batch_size: (batch_size as usize).max(1),
             auth_header,
-        })
+        }
     }
 
     /// Send ONE `/api/embed` request for `texts` (already sized to `<= self.batch_size` by the
@@ -314,9 +364,10 @@ mod tests {
 
     fn config_for(endpoint: &str, timeout_s: u64) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
-            mode: crate::config::RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some(endpoint.to_string()),
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: timeout_s,

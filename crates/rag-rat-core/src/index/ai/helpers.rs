@@ -480,7 +480,6 @@ pub(crate) fn find_existing_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RemoteMode;
 
     fn unit(v: &[f32]) -> Vec<f32> {
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -498,9 +497,10 @@ mod tests {
 
     fn sample_remote() -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
-            mode: RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some("http://localhost:11434".to_string()),
+            cookbook: None,
+            query_endpoint: None,
             // The NAME of an env var — never a token. The round-trip test asserts this name is
             // present and no token is.
             auth_env: Some("OLLAMA_TOKEN".to_string()),
@@ -592,9 +592,10 @@ mod tests {
         let conn = schema_conn();
         activate_model(&conn, FASTEMBED_MODEL_ID);
         let remote = RemoteEmbeddingConfig {
-            mode: RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some(format!("http://127.0.0.1:{port}")),
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: 2,

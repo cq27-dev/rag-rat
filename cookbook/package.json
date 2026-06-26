@@ -1,0 +1,36 @@
+{
+  "name": "@rag-rat/cookbook",
+  "version": "0.1.0",
+  "description": "Ephemeral remote-runtime provisioning recipes for rag-rat. rag-rat (Rust) spawns a recipe as a subprocess, gets an endpoint over a stdout handshake, embeds against it, then signals teardown.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "dist/contract.js",
+  "types": "dist/contract.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/contract.d.ts",
+      "default": "./dist/contract.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "recipes",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "recipe:modal-ollama": "node dist/recipes/modal-ollama.mjs"
+  },
+  "dependencies": {
+    "modal": "^0.8.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

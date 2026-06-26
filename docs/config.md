@@ -54,17 +54,49 @@ flips the runtime; absent it, embedding stays local. Same model, same `model_id`
 only the runtime changes, so chunk embeddings are keyed by the model regardless of where they were
 computed.
 
+There is **no `mode` field** — the mode is INFERRED from which URL field is set. **Exactly one** of
+`endpoint` (CONNECT) or `cookbook` (EPHEMERAL) must be present; both or neither is rejected.
+
+**CONNECT** — talk to an already-running Ollama at a fixed URL:
+
 ```toml
 [local_ai.embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"   # the MODEL (HF path, 384-dim)
 
 [local_ai.embedding.remote]       # PRESENCE = "serve that model via Ollama"
-mode = "connect"                  # "connect" (default). "ephemeral" is reserved, not yet supported.
-endpoint = "http://box:11434"     # the Ollama server URL (required in connect mode)
+endpoint = "http://box:11434"     # CONNECT: the Ollama server URL (required)
 model = "all-minilm"              # the Ollama-side model name (the server's own identifier)
 # auth_env = "OLLAMA_TOKEN"       # NAME of an env var holding a bearer token (never the token itself)
 # batch_size = 256                # texts per /api/embed request
 # request_timeout_s = 60          # per-request HTTP timeout
+```
+
+**EPHEMERAL** — provision an on-demand GPU box (e.g. Modal) for the bulk reconcile, then tear it
+down. rag-rat spawns the **cookbook** recipe as a subprocess; it provisions a box, prints a handshake
+when it's serving, and is torn down (SIGTERM) when the reconcile finishes. Queries embed against a
+**local** Ollama (`query_endpoint`) running the same model — so the query vectors share the same
+space as the remote-embedded chunks.
+
+```toml
+[local_ai.embedding]
+model = "sentence-transformers/all-MiniLM-L6-v2"
+
+[local_ai.embedding.remote]
+cookbook = "@rag-rat/cookbook/modal"        # EPHEMERAL: an npm spec (npx -y), or a recipe path
+                                            #   (.mjs/.js → node, .ts → npx tsx)
+model = "all-minilm"                        # the Ollama-side model name
+# query_endpoint = "http://localhost:11434" # the LOCAL ollama for QUERY embedding
+                                            #   (defaults to http://localhost:11434)
+# auth_env = "OLLAMA_TOKEN"                 # optional bearer-token env var NAME
+```
+
+Provisioning happens **only on an explicit `rag-rat reconcile`** (the deliberate bulk pass) — the
+background watcher/maintenance pass does **not** cold-start a GPU box for a few changed chunks (it
+leaves them pending; an explicit reconcile embeds them). So run, after editing:
+
+```bash
+rag-rat models install sentence-transformers/all-MiniLM-L6-v2   # install/activate (probes the box)
+rag-rat reconcile                                               # provisions, embeds, tears down
 ```
 
 The **two `model` keys are different things**: `[local_ai.embedding] model` is the rag-rat **model
@@ -74,20 +106,13 @@ selector** (the HF-path model_id — resolves the dimension + identity); `[remot
 `jinaai/jina-embeddings-v2-base-code`) can be served remotely — a `[remote]` block on
 `minishlab/potion-retrieval-32M` (static), the hash model, or `none` is rejected.
 
-In `connect` mode the `endpoint` is **required in `rag-rat.toml`** (read at config-parse). Install
-and reconcile then pick it up automatically:
-
-```bash
-rag-rat models install sentence-transformers/all-MiniLM-L6-v2   # install/activate over Ollama
-rag-rat reconcile                                               # embeds chunks via the endpoint
-```
-
-The freshness key is **endpoint-independent** — pointing the `endpoint` at a different box does
-**not** re-embed the repo. A re-embed happens only when the `[remote] model` changes or you flip
-between local and remote (those change the vector space; the endpoint does not). If the endpoint is
-unreachable at query time, `semantic_search` degrades to BM25 rather than failing. Embedding is fully
-offline only when the endpoint is local. **Credentials go in `auth_env` only** — an endpoint URL with
-embedded `user:pass@host` is rejected, because the endpoint string is persisted into the index.
+The freshness key is **endpoint-independent** — pointing the `endpoint` (or each ephemeral box's
+per-run URL) at a different host does **not** re-embed the repo. A re-embed happens only when the
+`[remote] model` changes or you flip between local and remote (those change the vector space; the
+endpoint does not). If the (query) endpoint is unreachable at query time, `semantic_search` degrades
+to BM25 rather than failing. Embedding is fully offline only when the endpoint is local.
+**Credentials go in `auth_env` only** — an `endpoint`/`query_endpoint` URL with embedded
+`user:pass@host` is rejected, because that URL is persisted into the index.
 
 The database stores explicit schema migrations in `schema_version` with migration id,
 `applied_at_ms`, checksum, and description. Opening the index **migrates an older schema forward

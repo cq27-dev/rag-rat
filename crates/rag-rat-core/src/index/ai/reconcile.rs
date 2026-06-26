@@ -431,6 +431,78 @@ pub(crate) fn reconcile_with_progress(
     )
 }
 
+/// The outcome of acquiring the chunk-embed embedder for a reconcile. The `Ready` variant carries
+/// the optional `ProvisionedBox` guard so the caller can keep it alive for the whole embed loop.
+enum ChunkEmbedder {
+    /// An embedder is ready. `provisioned` is `Some` only for an ephemeral box (its `Drop` tears
+    /// the box down); `None` for connect/local.
+    Ready { embedder: Box<dyn Embedder>, provisioned: Option<ProvisionedBox> },
+    /// Ephemeral active model on a non-provisioning pass — skip remote chunk embedding entirely.
+    SkipEphemeral,
+    /// The model isn't ready (not installed / dim mismatch / provisioning failed). Carried error is
+    /// for diagnostics; the caller reports a generic "model not ready".
+    NotReady(anyhow::Error),
+}
+
+/// Acquire the chunk-embed embedder. EPHEMERAL active model: on a provisioning reconcile, spawn the
+/// cookbook + build an embedder against the provisioned box (the bulk path); on a non-provisioning
+/// pass (watcher), return `SkipEphemeral`. CONNECT/local: the usual `active_embedder`. Provisioning
+/// happens ONCE here, not per batch.
+fn acquire_chunk_embedder(conn: &Connection, options: &ReconcileOptions) -> ChunkEmbedder {
+    // Detect the ephemeral case from the active model's persisted remote config.
+    let remote = match active_remote_config(conn) {
+        Ok(remote) => remote,
+        Err(err) => return ChunkEmbedder::NotReady(err),
+    };
+    if let Some(remote) = remote.as_ref().filter(|r| r.is_ephemeral()) {
+        if !options.provision_remote {
+            return ChunkEmbedder::SkipEphemeral;
+        }
+        return match provision_ephemeral_embedder(conn, remote) {
+            Ok((embedder, provisioned)) =>
+                ChunkEmbedder::Ready { embedder, provisioned: Some(provisioned) },
+            Err(err) => ChunkEmbedder::NotReady(err),
+        };
+    }
+    // Connect / local: the usual single construction site.
+    match active_embedder(conn, options.intra_threads) {
+        Ok(embedder) => ChunkEmbedder::Ready { embedder, provisioned: None },
+        Err(err) => ChunkEmbedder::NotReady(err),
+    }
+}
+
+/// Provision an ephemeral cookbook box for the active model and build an `OllamaEmbedder` against
+/// it. The returned `ProvisionedBox` MUST be kept alive for the embed loop (its `Drop` is
+/// teardown).
+fn provision_ephemeral_embedder(
+    conn: &Connection,
+    remote: &RemoteEmbeddingConfig,
+) -> anyhow::Result<(Box<dyn Embedder>, ProvisionedBox)> {
+    let active_model_id = active_embedding_model_id(conn)?;
+    let spec = spec(&active_model_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown active embedding model `{active_model_id}`"))?;
+    let cookbook = remote
+        .cookbook
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("ephemeral remote config has no cookbook"))?;
+    let input = CookbookInput {
+        model: remote.model.trim().to_string(),
+        request_timeout_s: remote.request_timeout_s,
+        gpu: None,
+    };
+    let provisioned = CookbookProvisioner::provision(cookbook, &input)?;
+    let embedder = OllamaEmbedder::from_provisioned(
+        &provisioned.endpoint,
+        provisioned.auth_token.as_deref(),
+        remote.model.trim(),
+        spec.model_id,
+        spec.dim,
+        remote.request_timeout_s,
+        remote.batch_size,
+    );
+    Ok((Box::new(embedder), provisioned))
+}
+
 pub(crate) fn reconcile_with_options_progress(
     conn: &Connection,
     options: ReconcileOptions,
@@ -462,7 +534,11 @@ pub(crate) fn reconcile_with_options_progress(
     let attempt_id = conn.last_insert_rowid();
     let timer = Instant::now();
 
-    let embedder = active_embedder(conn, options.intra_threads);
+    // The chunk-embed embedder. For an EPHEMERAL active model on a provisioning reconcile, this
+    // PROVISIONS a cookbook box (held by `_provisioned` for the whole loop — its `Drop` tears the
+    // box down on success/error/panic). Otherwise it's `active_embedder` (connect/local). The
+    // `acquire_chunk_embedder` result distinguishes ready / skip-ephemeral / not-ready.
+    let acquired = acquire_chunk_embedder(conn, &options);
     let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let skipped_chunks = skipped_by_policy.values().sum();
     let mut report = ReconcileReport {
@@ -492,9 +568,38 @@ pub(crate) fn reconcile_with_options_progress(
         message: None,
     };
 
-    let embedder = match embedder {
-        Ok(embedder) => embedder,
-        Err(_) => {
+    // `_provisioned` MUST outlive the embed loop: its `Drop` is the box teardown. Bound at function
+    // scope here (not inside the match) so it lives until the function returns.
+    let (embedder, _provisioned) = match acquired {
+        ChunkEmbedder::Ready { embedder, provisioned } => (embedder, provisioned),
+        ChunkEmbedder::SkipEphemeral => {
+            // Ephemeral active model on a non-provisioning (watcher) pass: do NOT cold-start a GPU
+            // box for incremental work. Leave chunks pending; an explicit `rag-rat reconcile` does
+            // the bulk embed. Lexical search still works, and query embedding uses the local box.
+            report.status = "Blocked".to_string();
+            report.message = Some(
+                "ephemeral remote embedding needs an explicit `rag-rat reconcile` (the watcher \
+                 does not provision a GPU box for incremental edits)"
+                    .to_string(),
+            );
+            finish_reconcile_attempt(conn, attempt_id, &report)?;
+            progress(ReconcileProgress::Started {
+                model_id: active_model_id,
+                total_chunks: 0,
+                batch_size,
+            });
+            progress(ReconcileProgress::Finished {
+                processed_chunks: 0,
+                embeddings_written: 0,
+                blocked_chunks: 0,
+            });
+            return Ok(report);
+        },
+        ChunkEmbedder::NotReady(err) => {
+            // Surface the cause (e.g. a cookbook provisioning failure with its captured stderr) so
+            // a remote outage isn't swallowed; the report keeps the actionable
+            // "install" hint.
+            eprintln!("rag-rat: chunk embedder unavailable: {err:#}");
             report.status = "Blocked".to_string();
             report.message = Some(format!(
                 "{} model is not ready; run `rag-rat models install {}`",
@@ -953,7 +1058,6 @@ mod freshness_version_tests {
     use std::thread;
 
     use super::*;
-    use crate::config::RemoteMode;
     use crate::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID};
 
     /// One-shot HTTP/1.1 stub replying to the install probe's `/api/embed` with a `dim`-wide
@@ -992,9 +1096,10 @@ mod freshness_version_tests {
 
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
-            mode: RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some(endpoint.to_string()),
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: 5,
@@ -1088,5 +1193,62 @@ mod freshness_version_tests {
         let conn = schema_conn();
         install_model(&conn, HASH_MODEL_ID, None).expect("hash installs");
         assert_eq!(active_version(&conn), spec(HASH_MODEL_ID).unwrap().version);
+    }
+
+    /// Activate an ephemeral remote config WITHOUT provisioning (mark the model Ready + persist a
+    /// cookbook remote config + freshness meta), mirroring a real ephemeral install's DB state.
+    fn activate_ephemeral(conn: &Connection) {
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2, runtime = \
+             'ollama'
+             WHERE model_id = ?1",
+            params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
+        )
+        .unwrap();
+        set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        let remote = RemoteEmbeddingConfig {
+            model: "all-minilm".to_string(),
+            endpoint: None,
+            cookbook: Some("@rag-rat/cookbook/modal".to_string()),
+            query_endpoint: Some("http://localhost:11434".to_string()),
+            auth_env: None,
+            batch_size: 256,
+            request_timeout_s: 5,
+        };
+        set_active_remote_config(conn, &remote).unwrap();
+        set_reconcile_meta(
+            conn,
+            ACTIVE_EMBEDDING_MODEL_VERSION_META,
+            &remote_freshness_version(spec, &remote),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reconcile_skips_ephemeral_chunk_embed_without_provision_remote() {
+        // The watcher/maintenance pass (`provision_remote: false`) must NOT cold-start a cookbook
+        // box for an ephemeral active model — it returns Blocked with a "needs explicit
+        // reconcile" message and never spawns a subprocess. (No cookbook is actually
+        // runnable here, so a provisioning attempt would error/hang; the skip is what keeps
+        // this test fast + offline.)
+        let conn = schema_conn();
+        activate_ephemeral(&conn);
+
+        let report = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions { provision_remote: false, ..ReconcileOptions::default() },
+            |_| {},
+        )
+        .expect("reconcile returns a report (skips, does not error)");
+
+        assert_eq!(report.status, "Blocked");
+        assert_eq!(report.embeddings_written, 0);
+        assert!(
+            report.message.as_deref().unwrap_or_default().contains("explicit `rag-rat reconcile`"),
+            "skip message: {:?}",
+            report.message
+        );
     }
 }
