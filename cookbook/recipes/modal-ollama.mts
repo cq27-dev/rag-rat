@@ -33,6 +33,7 @@ import {
   type Provisioned,
   type Recipe,
   assertBudgetRemaining,
+  errorMessage,
   log,
   raceWithTimeout,
   runRecipe,
@@ -77,17 +78,33 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
 
   const image = modal.images.fromRegistry("ollama/ollama:latest");
 
+  // CREATE-TIMEOUT ORPHAN (#330-1, the Modal analog of RunPod's N3 deploy-orphan sweep): the create
+  // is `withBudget`-bounded, but Modal can REACH the backend and CREATE the sandbox and then have the
+  // SDK call stall past the budget — `withBudget` throws BEFORE `ctx.onBox(sb)`, so `runRecipe` tears
+  // down "nothing" while the created sandbox bills until Modal's `timeoutMs` backstop (30 min). We
+  // give the sandbox a recoverable UNIQUE name; on ANY create throw, look it up by name and terminate
+  // it before rethrowing. (Unlike RunPod, Modal HAS a provider backstop, so this only shortens the
+  // worst case — but a leaked GPU box for up to 30 min is still real money.)
+  const sandboxName = `${APP_NAME}-${Date.now()}`;
+
   // `command: ["serve"]` is appended to the image entrypoint (/bin/ollama) → `ollama serve`.
   // OLLAMA_HOST goes in the sandbox env so the runtime process binds all interfaces.
-  const sb = await withBudget(deadline, "sandboxes.create", () =>
-    modal.sandboxes.create(app, image, {
-      command: ["serve"],
-      env: { OLLAMA_HOST: `0.0.0.0:${OLLAMA_PORT}` },
-      encryptedPorts: [OLLAMA_PORT],
-      timeoutMs: BOX_MAX_LIFETIME_MS,
-      ...(gpu !== null ? { gpu } : {}),
-    }),
-  );
+  let sb: Sandbox;
+  try {
+    sb = await withBudget(deadline, "sandboxes.create", () =>
+      modal.sandboxes.create(app, image, {
+        name: sandboxName,
+        command: ["serve"],
+        env: { OLLAMA_HOST: `0.0.0.0:${OLLAMA_PORT}` },
+        encryptedPorts: [OLLAMA_PORT],
+        timeoutMs: BOX_MAX_LIFETIME_MS,
+        ...(gpu !== null ? { gpu } : {}),
+      }),
+    );
+  } catch (cause) {
+    await sweepOrphanByName(modal, sandboxName);
+    throw cause;
+  }
   // Report the box NOW so runRecipe tears it down if anything below throws.
   ctx.onBox(sb);
   log("info", `sandbox created: ${sb.sandboxId ?? "(id unavailable)"}`);
@@ -135,6 +152,39 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
  */
 async function teardown(sb: Sandbox): Promise<void> {
   await raceWithTimeout(() => sb.terminate(), TEARDOWN_TIMEOUT_MS, "sb.terminate");
+}
+
+/**
+ * Best-effort orphan sweep for the create-timeout race (#330-1): if `sandboxes.create` threw but
+ * Modal actually created the sandbox, that sandbox carries our unique `sandboxName`. Look it up by
+ * name within the cookbook App and terminate it. Bounded (`TEARDOWN_TIMEOUT_MS`) and fully swallowed
+ * — it must NEVER throw (the caller is about to rethrow the original create error, which is the
+ * signal rag-rat acts on); it only logs. A `NotFoundError` from `fromName` is the EXPECTED happy
+ * case (create never actually made a box) and is logged as info, not an error.
+ */
+async function sweepOrphanByName(modal: ModalClient, sandboxName: string): Promise<void> {
+  try {
+    const orphan = await raceWithTimeout(
+      () => modal.sandboxes.fromName(APP_NAME, sandboxName),
+      TEARDOWN_TIMEOUT_MS,
+      "sandboxes.fromName(orphan sweep)",
+    );
+    await raceWithTimeout(
+      () => orphan.terminate(),
+      TEARDOWN_TIMEOUT_MS,
+      "orphan.terminate",
+    );
+    log("warn", `orphan sweep: terminated leaked sandbox "${sandboxName}" (${orphan.sandboxId})`);
+  } catch (cause) {
+    // fromName raises NotFoundError when no sandbox with that name exists — the common case (create
+    // never made one). Distinguish it from a real failure so the log isn't alarming.
+    const message = errorMessage(cause);
+    if (/not\s*found/i.test(message)) {
+      log("info", `orphan sweep: no sandbox named "${sandboxName}" found (create likely never made one)`);
+    } else {
+      log("error", `orphan sweep: could not reclaim a possible leak "${sandboxName}": ${message}`);
+    }
+  }
 }
 
 const recipe: Recipe<Sandbox> = {

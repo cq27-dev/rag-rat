@@ -44,7 +44,7 @@ RUN cargo install --locked --path crates/rag-rat-cli --bin rag-rat \
 RUN mkdir -p /workspace/src \
     && printf '%s\n' \
         '[index]' 'root = "/workspace"' 'database = "/workspace/.rag-rat/index.sqlite"' '' \
-        '[local_ai.embedding]' 'model = "none"' '' \
+        '[llm.embedding]' 'model = "none"' '' \
         '[watch]' 'enabled = false' '' \
         '[version_check]' 'enabled = false' '' \
         '[target_bindings]' 'rust = ["src"]' > /workspace/rag-rat.toml \

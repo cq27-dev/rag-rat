@@ -514,27 +514,56 @@ pub(crate) fn reconcile_with_options_progress(
     let attempt_id = conn.last_insert_rowid();
     let timer = Instant::now();
 
+    // The reconcile scan identity (model id/version/dim + char cap), built ONCE up front so the
+    // ephemeral pending-work check inside `acquire_chunk_embedder` sizes candidates exactly like
+    // the embed loop below (which reuses this same `scan`).
+    let scan = EmbeddingScan {
+        model_id: &active_model_id,
+        model_version: &model_version,
+        dim: embedding_dim,
+        max_embedding_chars,
+    };
+
     // The chunk-embed embedder. For an EPHEMERAL active model on a provisioning reconcile, this
     // PROVISIONS a cookbook box (held by `_provisioned` for the whole loop — its `Drop` tears the
-    // box down on success/error/panic). Otherwise it's `active_embedder` (connect/local). The
-    // `acquire_chunk_embedder` result distinguishes ready / skip-ephemeral / not-ready.
+    // box down on success/error/panic) — but only AFTER confirming there's pending work, so a no-op
+    // reconcile never cold-starts a paid box (#330-6). Otherwise it's `active_embedder`
+    // (connect/local). The `acquire_chunk_embedder` result distinguishes ready / skip-ephemeral /
+    // no-ephemeral-work / not-ready.
     //
     // Acquire FIRST, then decide whether to do any work — `embedding_policy_skip_summary` streams +
     // decompresses EVERY chunk (O(repo)). The skip/not-ready paths embed nothing, so they must NOT
     // pay that scan: a watcher pass with an ephemeral active model + `provision_remote=false` fires
     // on every file change, and running a full-repo scan per pass just to return "Blocked" is pure
     // waste. Only the Ready path (which actually walks the candidates) runs the policy summary.
-    let acquired = acquire_chunk_embedder(conn, options.intra_threads, options.provision_remote);
+    let acquired = acquire_chunk_embedder(conn, options.intra_threads, &scan, &options);
 
-    // SkipEphemeral is the ONLY path that returns BEFORE the policy scan. It's the watcher/
-    // maintenance pass with an ephemeral active model + `provision_remote=false`: it fires on every
-    // file change and embeds nothing, so paying the O(repo) `embedding_policy_skip_summary` (every
-    // chunk streamed + decompressed) just to return "Blocked" is pure per-edit waste. Its report
-    // carries an empty `skipped_by_policy` — that path reports no policy counts. (The NotReady path
-    // below DOES report policy skips — `blocked_fastembed_reconcile_still_reports_policy_skips`
-    // pins that — so it runs the scan like the Ready path.)
+    // SkipEphemeral and NoEphemeralWork are the ONLY paths that return BEFORE the policy scan, and
+    // both embed nothing:
+    //  - SkipEphemeral: the watcher/maintenance pass with an ephemeral active model +
+    //    `provision_remote=false`. It fires on every file change, so paying the O(repo)
+    //    `embedding_policy_skip_summary` just to return "Blocked" is pure per-edit waste.
+    //  - NoEphemeralWork: an explicit provisioning reconcile on an already-current ephemeral model.
+    //    `acquire_chunk_embedder` already confirmed ZERO candidates, so it deliberately did NOT
+    //    provision a paid box (#330-6) — and the policy scan would likewise be wasted work.
+    // Both carry an empty `skipped_by_policy` (no policy counts on these early-return paths). The
+    // NotReady path below DOES report policy skips
+    // (`blocked_fastembed_reconcile_still_reports_policy_skips` pins that), so it runs the scan
+    // like the Ready path.
     let acquired = match acquired {
-        ChunkEmbedder::SkipEphemeral => {
+        skip @ (ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork) => {
+            let (status, message) = match skip {
+                ChunkEmbedder::SkipEphemeral => (
+                    "Blocked",
+                    Some(
+                        "ephemeral remote embedding needs an explicit `rag-rat reconcile` (the \
+                         watcher does not provision a GPU box for incremental edits)"
+                            .to_string(),
+                    ),
+                ),
+                // Already current → nothing to embed; no paid box was provisioned.
+                _ => ("Current", None),
+            };
             let report = ReconcileReport {
                 processed_chunks: 0,
                 embeddings_written: 0,
@@ -558,12 +587,8 @@ pub(crate) fn reconcile_with_options_progress(
                 chunks_per_sec: 0.0,
                 chars_per_sec: 0.0,
                 avg_chars_per_chunk: 0.0,
-                status: "Blocked".to_string(),
-                message: Some(
-                    "ephemeral remote embedding needs an explicit `rag-rat reconcile` (the \
-                     watcher does not provision a GPU box for incremental edits)"
-                        .to_string(),
-                ),
+                status: status.to_string(),
+                message,
             };
             finish_reconcile_attempt(conn, attempt_id, &report)?;
             progress(ReconcileProgress::Started {
@@ -639,16 +664,9 @@ pub(crate) fn reconcile_with_options_progress(
             });
             return Ok(report);
         },
-        // SkipEphemeral already returned above.
-        ChunkEmbedder::SkipEphemeral =>
-            unreachable!("SkipEphemeral handled before the policy scan"),
-    };
-
-    let scan = EmbeddingScan {
-        model_id: &active_model_id,
-        model_version: &model_version,
-        dim: embedding_dim,
-        max_embedding_chars,
+        // SkipEphemeral / NoEphemeralWork already returned above.
+        ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork =>
+            unreachable!("SkipEphemeral / NoEphemeralWork handled before the policy scan"),
     };
     let mut progress_total_chunks = estimated_reconcile_jobs(conn, &scan, &options)?;
     progress(ReconcileProgress::Started {
@@ -1414,6 +1432,36 @@ mod freshness_version_tests {
         assert!(
             report.message.as_deref().unwrap_or_default().contains("explicit `rag-rat reconcile`"),
             "skip message: {:?}",
+            report.message
+        );
+    }
+
+    #[test]
+    fn reconcile_does_not_provision_when_an_ephemeral_model_is_already_current() {
+        // #330-6: an explicit `rag-rat reconcile` (`provision_remote: true`) on an ephemeral active
+        // model that has NOTHING pending must NOT cold-start (and immediately tear down) a paid GPU
+        // box. The repo here has ZERO chunks, so there are zero candidates. The cookbook spec
+        // (`@rag-rat/cookbook/modal`) is NOT runnable in the test env, so IF provisioning were
+        // attempted it would fail → a "Blocked" / error report. A clean "Current" report with no
+        // embeddings is the proof that `acquire_chunk_embedder` short-circuited to
+        // `NoEphemeralWork` BEFORE provisioning. (Contrast the `provision_remote: false`
+        // skip test above, which returns "Blocked".)
+        let conn = schema_conn();
+        activate_ephemeral(&conn);
+
+        let report = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions { provision_remote: true, ..ReconcileOptions::default() },
+            |_| {},
+        )
+        .expect("reconcile returns a report (no provision attempt, no error)");
+
+        assert_eq!(report.status, "Current", "no pending work → Current, not Blocked: {report:?}");
+        assert_eq!(report.embeddings_written, 0);
+        assert_eq!(report.processed_chunks, 0);
+        assert!(
+            report.message.is_none(),
+            "no-op reconcile carries no failure message: {:?}",
             report.message
         );
     }

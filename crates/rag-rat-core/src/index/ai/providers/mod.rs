@@ -34,7 +34,8 @@ pub use self::ollama::OllamaEmbedder;
 use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
 use crate::index::ai::{
-    active_embedding_model_id, active_remote_config, model, validate_ready_model,
+    EmbeddingScan, ReconcileOptions, active_embedding_model_id, active_remote_config,
+    estimated_reconcile_jobs, model, validate_ready_model,
 };
 
 pub const MODEL2VEC_MISSING_FEATURE_MESSAGE: &str =
@@ -105,28 +106,44 @@ pub(crate) enum ChunkEmbedder {
     Ready { embedder: Box<dyn Embedder>, provisioned: Option<ProvisionedBox> },
     /// Ephemeral active model on a non-provisioning pass — skip remote chunk embedding entirely.
     SkipEphemeral,
+    /// Ephemeral active model on a PROVISIONING reconcile, but there is NOTHING to embed (the model
+    /// is already current). We return this INSTEAD of provisioning so a no-op `rag-rat reconcile`
+    /// doesn't cold-start (and immediately tear down) a paid GPU box for zero work (#330-6). The
+    /// reconcile maps it to a clean "Current" report.
+    NoEphemeralWork,
     /// The model isn't ready (not installed / dim mismatch / provisioning failed). The error is for
     /// diagnostics; the caller reports a generic "model not ready".
     NotReady(anyhow::Error),
 }
 
 /// Acquire the CHUNK-embed embedder for a reconcile. EPHEMERAL active model: on a provisioning
-/// reconcile, provision the cookbook box + build an embedder against it (the bulk path,
-/// `provision_and_build`); on a non-provisioning pass (watcher), `SkipEphemeral`. CONNECT/local:
-/// the usual `active_embedder`. Provisioning happens ONCE here, not per batch. `provision_remote`
-/// gates the cold-start (only an explicit `rag-rat reconcile` sets it).
+/// reconcile, FIRST check for pending candidate chunks — if none, `NoEphemeralWork` (never
+/// provision a paid box for zero work, #330-6); otherwise provision the cookbook box + build an
+/// embedder against it (the bulk path, `provision_and_build`). On a non-provisioning pass
+/// (watcher), `SkipEphemeral`. CONNECT/local: the usual `active_embedder`. Provisioning happens
+/// ONCE here, not per batch. `provision_remote` gates the cold-start (only an explicit `rag-rat
+/// reconcile` sets it); `scan`/`options` size the pending-work check exactly like the embed loop.
 pub(crate) fn acquire_chunk_embedder(
     conn: &Connection,
     intra_threads: Option<usize>,
-    provision_remote: bool,
+    scan: &EmbeddingScan<'_>,
+    options: &ReconcileOptions,
 ) -> ChunkEmbedder {
     let remote = match active_remote_config(conn) {
         Ok(remote) => remote,
         Err(err) => return ChunkEmbedder::NotReady(err),
     };
     if let Some(remote) = remote.as_ref().filter(|r| r.is_ephemeral()) {
-        if !provision_remote {
+        if !options.provision_remote {
             return ChunkEmbedder::SkipEphemeral;
+        }
+        // BEFORE provisioning a paid box, confirm there's actually work to do. An explicit
+        // `rag-rat reconcile` on an already-current ephemeral model would otherwise cold-start +
+        // tear down a GPU/pod for nothing (#330-6). `--force` makes every chunk a candidate, so a
+        // forced reconcile still provisions (count > 0). A count error is non-fatal — fall through
+        // to provisioning rather than skip real work on a transient query failure.
+        if let Ok(0) = estimated_reconcile_jobs(conn, scan, options) {
+            return ChunkEmbedder::NoEphemeralWork;
         }
         let active_model_id = match active_embedding_model_id(conn) {
             Ok(id) => id,

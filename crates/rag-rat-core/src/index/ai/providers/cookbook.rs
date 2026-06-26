@@ -72,11 +72,21 @@ static ACTIVE_PGID: AtomicI32 = AtomicI32::new(0);
 #[cfg(unix)]
 static SIGNAL_HANDLER_INSTALLED: OnceLock<()> = OnceLock::new();
 
-/// Short SIGTERM→SIGKILL grace IN THE SIGNAL HANDLER (R2). Much shorter than `TEARDOWN_GRACE` (the
-/// `Drop` path) because we're terminating the whole process: give the recipe a moment to release
-/// the box, then SIGKILL-backstop and chain to the saved/default disposition.
+/// SIGTERM→SIGKILL grace IN THE SIGNAL HANDLER (R2/#330-7). Must be >= the RECIPE teardown budget
+/// (`cookbook/recipes/*-ollama.mts`'s `TEARDOWN_TIMEOUT_MS = 8000`), or a recipe whose `terminate`
+/// takes >grace is SIGKILLed mid-teardown → the no-backstop pod keeps billing. We align it with the
+/// `Drop` path's `TEARDOWN_GRACE` (10s) so both teardown paths give the recipe the same window. The
+/// handler does NOT block this whole duration unconditionally: it polls the group in small steps
+/// (`SIGNAL_TEARDOWN_POLL_NSEC`) and SIGKILLs early the instant the group is gone — so a fast
+/// teardown still exits promptly, while a slow one gets the full budget before the backstop.
 #[cfg(unix)]
-const SIGNAL_TEARDOWN_GRACE_SECS: i64 = 2;
+const SIGNAL_TEARDOWN_GRACE_SECS: i64 = TEARDOWN_GRACE.as_secs() as i64;
+
+/// Poll step for the signal handler's grace loop (50ms). Small enough that a fast recipe teardown
+/// is detected (and the process exits) promptly, but coarse enough that the loop is mostly asleep.
+/// `nanosleep` is async-signal-safe, so polling in steps is sound inside the handler.
+#[cfg(unix)]
+const SIGNAL_TEARDOWN_POLL_NSEC: i64 = 50 * 1_000_000;
 
 /// The `sigaction`s that were installed BEFORE ours (e.g. init's `TerminalResetGuard`), saved per
 /// signal at install so the handler can RESTORE + re-raise them — chaining the terminal reset / the
@@ -246,8 +256,11 @@ impl CookbookProvisioner {
         let stderr_handle = std::thread::spawn(move || {
             let mut captured: std::collections::VecDeque<String> =
                 std::collections::VecDeque::new();
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let line = cap_line(line);
+            let mut reader = BufReader::new(stderr);
+            // `read_capped_line` bounds each line's memory at the READ level (a newline-less flood
+            // is drained, not buffered) — `BufRead::lines()` would allocate the whole
+            // line first.
+            while let Ok(Some(line)) = read_capped_line(&mut reader) {
                 eprintln!("cookbook: {line}");
                 captured.push_back(line);
                 if captured.len() > MAX_CAPTURED_LINES {
@@ -267,7 +280,11 @@ impl CookbookProvisioner {
         let last_error_reader = std::sync::Arc::clone(&last_error);
         let stdout_handle = std::thread::spawn(move || {
             let mut sent = false;
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let mut reader = BufReader::new(stdout);
+            // Bounded read (see `read_capped_line`): a hostile recipe emitting a giant newline-less
+            // line on stdout can't OOM us before the JSON parse. A capped/truncated line simply
+            // fails to parse as an event and is forwarded raw, exactly like other non-event noise.
+            while let Ok(Some(line)) = read_capped_line(&mut reader) {
                 match serde_json::from_str::<CookbookEvent>(line.trim()) {
                     Ok(CookbookEvent::Ready { endpoint, auth_token }) =>
                         if !sent {
@@ -280,8 +297,9 @@ impl CookbookProvisioner {
                         }
                         handle_event(&event);
                     },
-                    // Not a typed event (e.g. npx install noise) → forward raw (length-capped).
-                    Err(_) => eprintln!("cookbook: {}", cap_line(line)),
+                    // Not a typed event (e.g. npx install noise) → forward raw. `line` is already
+                    // length-capped by `read_capped_line`, so no further truncation is needed.
+                    Err(_) => eprintln!("cookbook: {line}"),
                 }
             }
         });
@@ -396,6 +414,15 @@ pub(crate) fn provision_and_build(
     Ok((embedder, provisioned))
 }
 
+/// The published cookbook npm scope+name. The single-token slash form
+/// `@rag-rat/cookbook/<provider>` is normalized to this package + a `<provider>` arg (see
+/// [`normalize_cookbook_tokens`]).
+const COOKBOOK_PACKAGE: &str = "@rag-rat/cookbook";
+
+/// The slash-form prefix we normalize: `@rag-rat/cookbook/`. A test pins it to
+/// `COOKBOOK_PACKAGE` + "/" so the two can't drift.
+const COOKBOOK_SLASH_PREFIX: &str = "@rag-rat/cookbook/";
+
 /// Build the `Command` for a cookbook spec. The spec is split on whitespace into tokens (a package
 /// or recipe path FOLLOWED by provider subcommand/args, e.g. `@rag-rat/cookbook modal`). The FIRST
 /// token decides the runner; the first token + the rest are passed as SEPARATE process args:
@@ -403,12 +430,21 @@ pub(crate) fn provision_and_build(
 /// - first token ends `.ts`/`.mts` → `npx tsx <first> <rest...>` (recipes are `.mts`)
 /// - else (a package spec) → `npx -y <first> <rest...>` (`-y` auto-confirms the npx install)
 ///
+/// SLASH-FORM NORMALIZATION (#330-2): the docs/tests also show the single-token form
+/// `@rag-rat/cookbook/<provider>`. Passed verbatim to `npx -y @rag-rat/cookbook/<provider>`, npx
+/// treats the whole thing as a PACKAGE PATH (a subpath of a package that doesn't publish one) and
+/// dispatch fails before the recipe ever sees `<provider>`. So we rewrite the FIRST token
+/// `@rag-rat/cookbook/<provider>` → package `@rag-rat/cookbook` + arg `<provider>` BEFORE resolving
+/// the runner. Scoped to OUR package only — any other slash path (a real package subpath, a
+/// filesystem path) is left exactly as-is.
+///
 /// Whitespace splitting is SIMPLE (no shell quoting): a recipe path containing spaces is NOT
 /// supported — point `cookbook` at a space-free path (or an npm spec) instead. Empty tokens are
 /// dropped. An all-empty spec degrades to a bare `npx -y` (which fails to spawn → a clear error).
 fn cookbook_command(cookbook: &str) -> Command {
-    let tokens: Vec<&str> = cookbook.split_whitespace().collect();
-    let first = tokens.first().copied().unwrap_or("");
+    let raw: Vec<&str> = cookbook.split_whitespace().collect();
+    let tokens = normalize_cookbook_tokens(&raw);
+    let first = tokens.first().map(String::as_str).unwrap_or("");
     let rest = &tokens[tokens.len().min(1)..];
     let lower = first.to_ascii_lowercase();
     let mut c = if lower.ends_with(".mjs") || lower.ends_with(".js") {
@@ -428,6 +464,31 @@ fn cookbook_command(cookbook: &str) -> Command {
     c
 }
 
+/// Normalize the whitespace-split cookbook tokens, rewriting the single-token slash form
+/// `@rag-rat/cookbook/<provider>` into the two tokens `[@rag-rat/cookbook, <provider>]` so `npx -y`
+/// dispatches the package with `<provider>` as its subcommand arg (#330-2). Only the FIRST token is
+/// rewritten, and only for our own `@rag-rat/cookbook/` scope with a non-empty single-segment
+/// provider — a deeper subpath (`@rag-rat/cookbook/a/b`), any other scope, or a filesystem path is
+/// returned unchanged. All other tokens (an explicitly-supplied provider arg, etc.) pass through.
+fn normalize_cookbook_tokens(tokens: &[&str]) -> Vec<String> {
+    let Some((&first, rest)) = tokens.split_first() else {
+        return Vec::new();
+    };
+    if let Some(provider) = first.strip_prefix(COOKBOOK_SLASH_PREFIX)
+        && !provider.is_empty()
+        && !provider.contains('/')
+    {
+        // `@rag-rat/cookbook/modal` (+ any already-present args) → `@rag-rat/cookbook modal
+        // <args>`.
+        let mut out = Vec::with_capacity(rest.len() + 2);
+        out.push(COOKBOOK_PACKAGE.to_string());
+        out.push(provider.to_string());
+        out.extend(rest.iter().map(|t| t.to_string()));
+        return out;
+    }
+    tokens.iter().map(|t| t.to_string()).collect()
+}
+
 /// Truncate a drained line to `MAX_DRAIN_LINE` chars with an elision marker, so a single huge line
 /// from a hostile cookbook can't be retained or printed unbounded.
 fn cap_line(mut line: String) -> String {
@@ -441,6 +502,63 @@ fn cap_line(mut line: String) -> String {
         line.push_str("…[truncated]");
     }
     line
+}
+
+/// Read one newline-terminated line from `reader` into a String, but stop reading at
+/// `MAX_DRAIN_LINE` bytes — the rest of an over-long line is DRAINED to the newline without being
+/// retained, so memory stays bounded REGARDLESS of input (#330-5). Returns `Ok(None)` at EOF with
+/// no bytes read; otherwise `Ok(Some(line))` where `line` is at most ~`MAX_DRAIN_LINE` bytes plus
+/// the elision marker.
+///
+/// WHY NOT `BufRead::lines()`: that allocates the ENTIRE line before any cap runs, so a cookbook
+/// emitting a multi-GB line with no newline would OOM rag-rat before `cap_line` could truncate it.
+/// Here the read buffer never grows past the cap; bytes beyond it are discarded as they arrive.
+fn read_capped_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    loop {
+        // Pull whatever the BufReader has buffered without copying it yet, so we can decide how
+        // much to keep vs discard before growing `buf`.
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            // EOF. If we read nothing at all, signal end-of-stream; otherwise return the last
+            // (newline-less) line.
+            if buf.is_empty() && !truncated {
+                return Ok(None);
+            }
+            break;
+        }
+        // Consume up to and including the next newline from THIS chunk.
+        let (chunk, consumed, hit_newline) = match available.iter().position(|&b| b == b'\n') {
+            Some(nl) => (&available[..nl], nl + 1, true),
+            None => (available, available.len(), false),
+        };
+        // Keep only up to the cap; everything past it is drained (read+discarded), never retained.
+        if !truncated && buf.len() < MAX_DRAIN_LINE {
+            let room = MAX_DRAIN_LINE - buf.len();
+            let take = room.min(chunk.len());
+            buf.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                truncated = true;
+            }
+        } else if !chunk.is_empty() {
+            truncated = true;
+        }
+        reader.consume(consumed);
+        if hit_newline {
+            break;
+        }
+    }
+    // Decode lossily so invalid UTF-8 from arbitrary npx output can't error the drain; then
+    // re-apply `cap_line` (it appends the elision marker once we crossed the cap).
+    let mut line = String::from_utf8_lossy(&buf).into_owned();
+    if truncated && line.len() <= MAX_DRAIN_LINE {
+        // Force the marker even when the lossy decode shrank `line` below the cap (multi-byte
+        // replacement chars): we DID discard input, so the line must read as truncated.
+        line.push_str("…[truncated]");
+        return Ok(Some(line));
+    }
+    Ok(Some(cap_line(line)))
 }
 
 /// Build the "provisioning failed" error after the child exited before a `ready` event: reap it,
@@ -565,6 +683,30 @@ fn group_alive(pgid: i32) -> bool {
     }
 }
 
+/// Async-signal-safe group-existence probe for the SIGNAL HANDLER's grace loop: `killpg(pgid, 0)`
+/// returns 0 while ANY member is alive, fails with `ESRCH` once the whole group is gone. Unlike
+/// [`group_alive`], this does NOT call `eprintln!` (stdio is NOT async-signal-safe) — on `EPERM` (a
+/// member we cannot signal) it conservatively reports "alive" SILENTLY, so the handler simply rides
+/// out the full grace and SIGKILL-backstops rather than performing forbidden I/O in the handler.
+/// The loud EPERM leak warning stays on the `Drop`/`teardown_group` path (`group_alive`), which is
+/// not a signal context.
+///
+/// SAFETY: `killpg(2)` with signal 0 touches no memory and only probes the group;
+/// async-signal-safe.
+#[cfg(unix)]
+fn group_alive_in_handler(pgid: i32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 only probes the group; no memory is touched; async-signal-safe.
+    if unsafe { libc::killpg(pgid, 0) } == 0 {
+        return true;
+    }
+    // ESRCH = the whole group is gone (the only case that lets the handler exit early). Any other
+    // errno (incl. EPERM) → assume a member is still around and keep waiting out the grace.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 /// Reap a process group on a provisioning-FAILURE path (early exit / timeout): SIGKILL the group
 /// (no graceful wait — provisioning never reached the serving state) and clear `ACTIVE_PGID`.
 #[cfg(unix)]
@@ -627,6 +769,13 @@ unsafe fn install_one(signo: libc::c_int, saved: *mut Option<libc::sigaction>) {
 /// backstop (so a hung recipe teardown can't leak the box), then RESTORE + re-raise the previously
 /// installed handler (e.g. init's terminal reset) so it runs too. If there was no prior handler,
 /// the default disposition (restored as `SIG_DFL` by `raise`) terminates us with the right status.
+///
+/// The grace is `SIGNAL_TEARDOWN_GRACE_SECS` (= `TEARDOWN_GRACE`, 10s) — long enough for the
+/// recipe's own `TEARDOWN_TIMEOUT_MS` (8s) teardown to complete (#330-7: a 2s grace SIGKILLed Node
+/// mid-pull of `sb.terminate()`/`podTerminate`, leaking the no-backstop pod). But we do NOT block
+/// the full grace blindly: we POLL the group in `SIGNAL_TEARDOWN_POLL_NSEC` (50ms) steps and
+/// SIGKILL-and-exit EARLY the instant the group is gone, so a fast teardown still terminates
+/// promptly. Only a genuinely hung teardown rides out the whole budget before the backstop fires.
 #[cfg(unix)]
 extern "C" fn handle_terminating_signal(signo: libc::c_int) {
     let pgid = ACTIVE_PGID.swap(0, Ordering::SeqCst);
@@ -634,10 +783,19 @@ extern "C" fn handle_terminating_signal(signo: libc::c_int) {
         unsafe {
             // SIGTERM first so the recipe can release the cloud box…
             libc::killpg(pgid, libc::SIGTERM);
-            // …a short grace (async-signal-safe sleep)…
-            let grace = libc::timespec { tv_sec: SIGNAL_TEARDOWN_GRACE_SECS, tv_nsec: 0 };
-            libc::nanosleep(&raw const grace, std::ptr::null_mut());
-            // …then a SIGKILL backstop for a hung teardown.
+            // …then poll the group up to the full teardown grace, SIGKILLing the instant it's gone
+            // (early exit for a fast teardown; a hung one waits out the budget). Step-sleeping with
+            // `nanosleep` + the `group_alive_in_handler` probe is async-signal-safe (no
+            // stdio/locks).
+            let steps = (SIGNAL_TEARDOWN_GRACE_SECS * 1_000_000_000) / SIGNAL_TEARDOWN_POLL_NSEC;
+            let step = libc::timespec { tv_sec: 0, tv_nsec: SIGNAL_TEARDOWN_POLL_NSEC };
+            let mut elapsed = 0;
+            while elapsed < steps && group_alive_in_handler(pgid) {
+                libc::nanosleep(&raw const step, std::ptr::null_mut());
+                elapsed += 1;
+            }
+            // SIGKILL backstop: a no-op if the group already exited (the early-out above), the
+            // hard reclaim if the recipe teardown hung past the grace.
             libc::killpg(pgid, libc::SIGKILL);
         }
     }
@@ -981,9 +1139,12 @@ mod tests {
         assert_eq!(prog(&mts), "npx");
         assert_eq!(args(&mts), vec!["tsx", "./recipe.mts"]);
 
+        // SLASH FORM (#330-2): the single-token `@rag-rat/cookbook/modal` is NORMALIZED to the
+        // package + a `modal` arg, NOT passed verbatim (which npx would treat as a package subpath
+        // and fail to dispatch). This is the same end command as the two-token form below.
         let pkg = cookbook_command("@rag-rat/cookbook/modal");
         assert_eq!(prog(&pkg), "npx");
-        assert_eq!(args(&pkg), vec!["-y", "@rag-rat/cookbook/modal"]);
+        assert_eq!(args(&pkg), vec!["-y", "@rag-rat/cookbook", "modal"]);
 
         // Multi-token: package + provider subcommand → `npx -y <pkg> <subcommand>`.
         let pkg_sub = cookbook_command("@rag-rat/cookbook modal");
@@ -999,5 +1160,98 @@ mod tests {
         let spaced = cookbook_command("  @rag-rat/cookbook   modal  ");
         assert_eq!(prog(&spaced), "npx");
         assert_eq!(args(&spaced), vec!["-y", "@rag-rat/cookbook", "modal"]);
+    }
+
+    #[test]
+    fn cookbook_slash_form_is_normalized_only_for_our_scope() {
+        // #330-2: the slash prefix const must stay in lockstep with the package name.
+        assert_eq!(COOKBOOK_SLASH_PREFIX, format!("{COOKBOOK_PACKAGE}/"));
+
+        let norm = |s: &str| normalize_cookbook_tokens(&s.split_whitespace().collect::<Vec<_>>());
+
+        // Our scope, single provider segment → split into package + provider arg.
+        assert_eq!(norm("@rag-rat/cookbook/modal"), vec!["@rag-rat/cookbook", "modal"]);
+        assert_eq!(norm("@rag-rat/cookbook/runpod"), vec!["@rag-rat/cookbook", "runpod"]);
+
+        // Slash form WITH extra explicit args keeps them after the rewritten provider.
+        assert_eq!(norm("@rag-rat/cookbook/modal --gpu T4"), vec![
+            "@rag-rat/cookbook",
+            "modal",
+            "--gpu",
+            "T4"
+        ]);
+
+        // A DEEPER subpath is NOT a provider subcommand — leave it verbatim (real package subpath).
+        assert_eq!(norm("@rag-rat/cookbook/sub/dir"), vec!["@rag-rat/cookbook/sub/dir"]);
+        // Trailing slash (empty provider) → unchanged.
+        assert_eq!(norm("@rag-rat/cookbook/"), vec!["@rag-rat/cookbook/"]);
+        // The two-token form is already correct → untouched.
+        assert_eq!(norm("@rag-rat/cookbook modal"), vec!["@rag-rat/cookbook", "modal"]);
+        // A DIFFERENT scope's slash path is left alone.
+        assert_eq!(norm("@other/pkg/modal"), vec!["@other/pkg/modal"]);
+        // A filesystem path is left alone.
+        assert_eq!(norm("/abs/recipe.mjs"), vec!["/abs/recipe.mjs"]);
+        // Empty spec → no tokens.
+        assert!(norm("   ").is_empty());
+
+        // End-to-end through cookbook_command: the runpod slash form resolves to the package + arg.
+        let prog = |c: &Command| c.get_program().to_string_lossy().to_string();
+        let args =
+            |c: &Command| c.get_args().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>();
+        let rp = cookbook_command("@rag-rat/cookbook/runpod");
+        assert_eq!(prog(&rp), "npx");
+        assert_eq!(args(&rp), vec!["-y", "@rag-rat/cookbook", "runpod"]);
+    }
+
+    #[test]
+    fn read_capped_line_truncates_a_giant_newlineless_line_without_unbounded_memory() {
+        // #330-5: a cookbook can emit a huge line with NO newline. `read_capped_line` must drain it
+        // bounded — the retained String stays within ~MAX_DRAIN_LINE + the marker, regardless of
+        // how many bytes the source produces. We feed 4 MiB of 'a' with no '\n'.
+        let huge = "a".repeat(4 * 1024 * 1024);
+        let mut reader = BufReader::new(std::io::Cursor::new(huge.into_bytes()));
+        let line = read_capped_line(&mut reader).unwrap().expect("a line");
+        assert!(
+            line.ends_with("…[truncated]"),
+            "over-long line is marked truncated: {}",
+            &line[..40]
+        );
+        // Retained length is bounded: the kept prefix is at most MAX_DRAIN_LINE bytes + the marker.
+        assert!(
+            line.len() <= MAX_DRAIN_LINE + "…[truncated]".len(),
+            "retained {} bytes exceeds the cap",
+            line.len()
+        );
+        // EOF after the (newline-less) line.
+        assert!(read_capped_line(&mut reader).unwrap().is_none(), "stream is drained");
+    }
+
+    #[test]
+    fn read_capped_line_passes_short_lines_through_and_splits_on_newlines() {
+        let input = "first\nsecond line\n\nlast-no-newline";
+        let mut reader = BufReader::new(std::io::Cursor::new(input.as_bytes().to_vec()));
+        assert_eq!(read_capped_line(&mut reader).unwrap().as_deref(), Some("first"));
+        assert_eq!(read_capped_line(&mut reader).unwrap().as_deref(), Some("second line"));
+        assert_eq!(read_capped_line(&mut reader).unwrap().as_deref(), Some(""));
+        assert_eq!(read_capped_line(&mut reader).unwrap().as_deref(), Some("last-no-newline"));
+        assert_eq!(read_capped_line(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn provision_does_not_oom_on_a_huge_unterminated_stdout_line() {
+        // The integration form of #330-5: a stub emits a multi-MiB line WITHOUT a newline before
+        // its `ready` event. The drain must stay bounded (the line is truncated, not
+        // buffered whole) and the handshake must still parse. If `read_capped_line`
+        // regressed to `lines()`, this would allocate the whole line first.
+        let cmd = stub_command("stub_huge_line.sh", &[("STUB_ENDPOINT", "http://127.0.0.1:7")]);
+        let provisioned = CookbookProvisioner::provision_with_command(
+            cmd,
+            "stub_huge_line.sh",
+            &input(),
+            Duration::from_secs(10),
+        )
+        .expect("handshake parses despite a giant pre-ready line");
+        assert_eq!(provisioned.endpoint, "http://127.0.0.1:7");
+        drop(provisioned);
     }
 }

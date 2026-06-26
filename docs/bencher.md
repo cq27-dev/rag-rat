@@ -84,7 +84,7 @@ Values are fractions in [0, 1] — the same numbers `eval` prints — so a Bench
 to a local run.
 
 The job builds an embedded index at HEAD (`index --discover` → `models install
-fastembed-all-minilm-l6-v2` → `reconcile`), then `rag-rat --json eval --replay --replay-max-cases
+sentence-transformers/all-MiniLM-L6-v2` → `reconcile`), then `rag-rat --json eval --replay --replay-max-cases
 200` → [`tools/eval-report-bmf.py`](../tools/eval-report-bmf.py) → `bencher run --adapter json`. Two
 footguns it has to handle:
 

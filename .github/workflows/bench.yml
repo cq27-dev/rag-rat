@@ -127,8 +127,16 @@ jobs:
       # footgun: a stale/absent index makes EVERY recall read a bogus 0.000.
       - name: Index + embed at HEAD
         run: |
+          # CI embeds with the cached local FastEmbed MiniLM, NOT the repo's dogfood
+          # [llm.embedding.remote] (there is no Ollama in CI) — overwrite with a CI config that keeps
+          # the same target bindings but drops the remote block, so `models install` uses the cached
+          # model instead of probing http://localhost:11434.
+          printf '%s\n' \
+            '[index]' 'root = "."' 'database = ".rag-rat/index.sqlite"' '' \
+            '[llm.embedding]' 'model = "sentence-transformers/all-MiniLM-L6-v2"' '' \
+            '[target_bindings]' 'rust = ["crates"]' 'markdown = ["docs"]' > rag-rat.toml
           ./target/release/rag-rat index --discover
-          ./target/release/rag-rat models install fastembed-all-minilm-l6-v2
+          ./target/release/rag-rat models install sentence-transformers/all-MiniLM-L6-v2
           ./target/release/rag-rat reconcile
 
       - name: Run commit-replay eval -> JSON -> BMF
