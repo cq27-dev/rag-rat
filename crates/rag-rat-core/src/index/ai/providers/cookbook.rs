@@ -430,6 +430,7 @@ pub(crate) fn provision_and_build(
         dim: spec.dim,
         request_timeout_s: remote.request_timeout_s,
         batch_size: remote.batch_size,
+        num_ctx: remote.num_ctx,
     });
     Ok((embedder, provisioned))
 }

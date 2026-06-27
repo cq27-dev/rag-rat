@@ -21,6 +21,14 @@ use crate::config::RemoteEmbeddingConfig;
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<EmbedOptions>,
+}
+
+/// Ollama runtime options for `/api/embed`.
+#[derive(Clone, Copy, Serialize)]
+struct EmbedOptions {
+    num_ctx: u32,
 }
 
 /// Response body from Ollama's `/api/embed`: one vector per input, in order.
@@ -51,13 +59,16 @@ pub struct OllamaEmbedder {
     /// exceeds the configured cap regardless of the reconcile/runtime batch size. Clamped to
     /// `>= 1` at construction so the `chunks()` split can't panic on a misconfigured `0`.
     batch_size: usize,
+    /// Optional Ollama context window (`options.num_ctx`) to avoid context-length 400s without
+    /// shrinking rag-rat's chunk size.
+    num_ctx: Option<u32>,
     /// `Some("Bearer <token>")` when the server needs auth, read from `auth_env` at construction.
     auth_header: Option<String>,
 }
 
 /// Construction params for [`OllamaEmbedder::from_provisioned`] — groups the handshake outputs
 /// (`endpoint`, `auth_token`) with the model identity + transport knobs so the constructor takes
-/// one struct instead of seven positional args.
+/// one struct instead of positional args.
 pub struct ProvisionedEmbedderParams<'a> {
     /// The serving endpoint from the cookbook handshake (`https://...`).
     pub endpoint: &'a str,
@@ -73,6 +84,19 @@ pub struct ProvisionedEmbedderParams<'a> {
     pub request_timeout_s: u64,
     /// Max texts per `/api/embed` request.
     pub batch_size: u32,
+    /// Optional Ollama context window (`options.num_ctx`) for `/api/embed`.
+    pub num_ctx: Option<u32>,
+}
+
+struct BuildParams<'a> {
+    endpoint: &'a str,
+    auth_header: Option<String>,
+    selected_model_id: &'a str,
+    server_model: &'a str,
+    dim: usize,
+    request_timeout_s: u64,
+    batch_size: u32,
+    num_ctx: Option<u32>,
 }
 
 impl OllamaEmbedder {
@@ -102,15 +126,16 @@ impl OllamaEmbedder {
         // CONNECT auth comes from the env var NAMED by `auth_env` (the token never enters config).
         let auth_header =
             resolve_auth_header(cfg.auth_env.as_deref(), |var| std::env::var(var).ok())?;
-        Ok(Self::build(
+        Ok(Self::build(BuildParams {
             endpoint,
             auth_header,
             selected_model_id,
-            cfg.model.trim(),
+            server_model: cfg.model.trim(),
             dim,
-            cfg.request_timeout_s,
-            cfg.batch_size,
-        ))
+            request_timeout_s: cfg.request_timeout_s,
+            batch_size: cfg.batch_size,
+            num_ctx: cfg.num_ctx,
+        }))
     }
 
     /// Build the embedder against a freshly PROVISIONED ephemeral box (#318) from
@@ -125,31 +150,35 @@ impl OllamaEmbedder {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(|token| format!("Bearer {token}"));
-        Self::build(
-            params.endpoint.trim(),
+        Self::build(BuildParams {
+            endpoint: params.endpoint.trim(),
             auth_header,
-            params.selected_model_id,
-            params.server_model.trim(),
-            params.dim,
-            params.request_timeout_s,
-            params.batch_size,
-        )
+            selected_model_id: params.selected_model_id,
+            server_model: params.server_model.trim(),
+            dim: params.dim,
+            request_timeout_s: params.request_timeout_s,
+            batch_size: params.batch_size,
+            num_ctx: params.num_ctx,
+        })
     }
 
     /// Shared assembler: build the `ureq::Agent` (with the loopback proxy bypass) + the struct.
     /// `endpoint` is already trimmed/validated by the caller.
-    fn build(
-        endpoint: &str,
-        auth_header: Option<String>,
-        selected_model_id: &str,
-        server_model: &str,
-        dim: usize,
-        request_timeout_s: u64,
-        batch_size: u32,
-    ) -> Self {
+    fn build(params: BuildParams<'_>) -> Self {
+        let BuildParams {
+            endpoint,
+            auth_header,
+            selected_model_id,
+            server_model,
+            dim,
+            request_timeout_s,
+            batch_size,
+            num_ctx,
+        } = params;
         let embed_url = format!("{}/api/embed", endpoint.trim_end_matches('/'));
         let mut builder = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(request_timeout_s)))
+            .http_status_as_error(false)
             .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (ollama-embed)"));
         // ureq's default config inherits `HTTP_PROXY`/`HTTPS_PROXY` from the env. A local Ollama
         // (`http://127.0.0.1:11434`) routed through a corporate proxy 403s, so disable the proxy for
@@ -168,6 +197,7 @@ impl OllamaEmbedder {
             // Clamp to >= 1: a configured 0 would panic `slice::chunks`; treat it as "one per
             // request" rather than failing construction.
             batch_size: (batch_size as usize).max(1),
+            num_ctx,
             auth_header,
         }
     }
@@ -177,7 +207,11 @@ impl OllamaEmbedder {
     /// Factored out of `embed_batch` so the sub-batch loop reuses the exact request/validation
     /// logic.
     fn embed_one_request(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let payload = EmbedRequest { model: &self.server_model, input: texts };
+        let payload = EmbedRequest {
+            model: &self.server_model,
+            input: texts,
+            options: self.num_ctx.map(|num_ctx| EmbedOptions { num_ctx }),
+        };
         // The `json` ureq feature is not enabled (workspace ureq is rustls-only), so serialize the
         // body ourselves and send it with an explicit content-type.
         let body = serde_json::to_vec(&payload)
@@ -188,16 +222,24 @@ impl OllamaEmbedder {
             request = request.header("Authorization", header);
         }
 
-        // `http_status_as_error` defaults to true in ureq 3, so a non-2xx status, a connection
-        // refusal, or a timeout all surface as `Err` here — all retryable by the reconcile loop.
-        let raw = request
-            .send(body)
-            .map_err(|e| {
-                anyhow::anyhow!("ollama embed request to `{}` failed: {e}", self.embed_url)
-            })?
+        // `http_status_as_error(false)` lets us read Ollama's JSON error body on 4xx/5xx instead
+        // of losing the actionable reason behind ureq's bare `http status: N` error.
+        let mut response = request.send(body).map_err(|e| {
+            anyhow::anyhow!("ollama embed request to `{}` failed: {e}", self.embed_url)
+        })?;
+        let status = response.status();
+        let raw = response
             .body_mut()
             .read_to_string()
             .map_err(|e| anyhow::anyhow!("reading ollama embed response failed: {e}"))?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "ollama embed request to `{}` failed: http status {}: {}",
+                self.embed_url,
+                status.as_u16(),
+                response_excerpt(&raw)
+            );
+        }
 
         let parsed: EmbedResponse = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("malformed ollama embed response: {e}"))?;
@@ -235,6 +277,15 @@ impl OllamaEmbedder {
 
         Ok(embeddings)
     }
+}
+
+fn response_excerpt(body: &str) -> String {
+    let trimmed = body.trim();
+    let mut excerpt = trimmed.chars().take(500).collect::<String>();
+    if trimmed.chars().count() > 500 {
+        excerpt.push_str("...");
+    }
+    excerpt
 }
 
 /// Resolve the `Authorization` header from the configured `auth_env` name, looking the value up
@@ -355,6 +406,59 @@ mod tests {
         (format!("http://127.0.0.1:{port}"), handle)
     }
 
+    /// Spawn a one-shot stub that captures the request JSON body before replying.
+    fn spawn_body_capture_stub(response_body: String) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return String::new();
+            };
+            let request_body = read_request_body(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                 {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            request_body
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    /// Read headers, parse Content-Length, then read exactly the request body bytes.
+    fn read_request_body(stream: &mut TcpStream) -> String {
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n");
+            if let Some(end) = header_end {
+                let headers = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                let content_len = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let body_start = end + 4;
+                while raw.len() < body_start + content_len {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                return String::from_utf8_lossy(&raw[body_start..body_start + content_len])
+                    .to_string();
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return String::new(),
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
     /// Read the request headers (up to the blank line) so the client's write completes before we
     /// reply — a one-shot read is enough for these small test bodies.
     fn drain_request(stream: &mut TcpStream) {
@@ -383,6 +487,7 @@ mod tests {
             query_endpoint: None,
             auth_env: None,
             gpu: None,
+            num_ctx: None,
             batch_size: 256,
             request_timeout_s: timeout_s,
         }
@@ -406,6 +511,22 @@ mod tests {
         assert_eq!(got[1][0], 2.0);
         assert_eq!(got[2][0], 3.0);
         assert!(got.iter().all(|v| v.len() == DIM));
+    }
+
+    #[test]
+    fn embed_request_includes_num_ctx_when_configured() {
+        let want = vec![vec![1.0f32; DIM]];
+        let (url, handle) = spawn_body_capture_stub(embeddings_json(&want));
+        let mut cfg = config_for(&url, 5);
+        cfg.num_ctx = Some(4096);
+        let embedder = build(&cfg, DIM).unwrap();
+
+        embedder.embed_batch(&texts(1)).expect("embed succeeds");
+        let body = handle.join().unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["model"], "all-minilm");
+        assert_eq!(payload["options"]["num_ctx"], 4096);
     }
 
     /// A multi-request HTTP stub: accepts `max_conns` connections, and for each request replies
@@ -601,7 +722,9 @@ mod tests {
 
         let err = embedder.embed_batch(&texts(1)).expect_err("non-2xx must error");
         handle.join().unwrap();
-        assert!(!err.to_string().is_empty());
+        let msg = err.to_string();
+        assert!(msg.contains("http status 500"), "{msg}");
+        assert!(msg.contains("boom"), "{msg}");
     }
 
     #[test]

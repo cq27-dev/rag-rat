@@ -321,9 +321,24 @@ pub struct EmbeddingPolicyDecision {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum ReconcileProgress {
-    Started { model_id: String, total_chunks: u64, batch_size: usize },
-    Batch { processed_chunks: u64, total_chunks: u64, embeddings_written: u64, blocked_chunks: u64 },
-    Finished { processed_chunks: u64, embeddings_written: u64, blocked_chunks: u64 },
+    Started {
+        model_id: String,
+        total_chunks: u64,
+        batch_size: usize,
+    },
+    Batch {
+        processed_chunks: u64,
+        total_chunks: u64,
+        embeddings_written: u64,
+        failed_chunks: u64,
+        blocked_chunks: u64,
+    },
+    Finished {
+        processed_chunks: u64,
+        embeddings_written: u64,
+        failed_chunks: u64,
+        blocked_chunks: u64,
+    },
 }
 
 #[derive(Debug, Clone)]

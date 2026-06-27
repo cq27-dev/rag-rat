@@ -273,6 +273,15 @@ pub struct RemoteEmbeddingConfig {
     /// erroring.
     #[serde(default)]
     pub gpu: Option<String>,
+    /// Optional Ollama context window (`options.num_ctx`) for `/api/embed` requests. Some local
+    /// embedding GGUFs default too small for rag-rat's code chunks; this lets config raise the
+    /// server context without shrinking chunk size or batch throughput.
+    ///
+    /// `#[serde(default)]`: this field post-dates the meta round-trip, so a config JSON persisted
+    /// by an older binary (no `num_ctx` key) must still deserialize (→ `None`) instead of
+    /// erroring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
     /// How many texts to send per `/api/embed` request.
     pub batch_size: u32,
     /// Per-request HTTP timeout, in seconds.
@@ -291,6 +300,7 @@ impl Default for RemoteEmbeddingConfig {
             query_endpoint: None,
             auth_env: None,
             gpu: None,
+            num_ctx: None,
             batch_size: 256,
             request_timeout_s: 60,
         }
@@ -807,6 +817,7 @@ struct RawRemoteEmbedding {
     query_endpoint: Option<String>,
     auth_env: Option<String>,
     gpu: Option<String>,
+    num_ctx: Option<u32>,
     batch_size: Option<u32>,
     request_timeout_s: Option<u64>,
 }
@@ -911,6 +922,9 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
             },
             None => None,
         };
+        if matches!(raw.num_ctx, Some(0)) {
+            return Err(ConfigError::RemoteEmbeddingInvalidNumCtx);
+        }
         Ok(Self {
             model: model.to_string(),
             endpoint,
@@ -918,6 +932,7 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
             query_endpoint,
             auth_env,
             gpu,
+            num_ctx: raw.num_ctx,
             batch_size: raw.batch_size.unwrap_or(default.batch_size),
             request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
         })
@@ -997,6 +1012,11 @@ pub enum ConfigError {
          recipe default"
     )]
     RemoteGpuEmpty,
+    #[error(
+        "[llm.embedding.remote] `num_ctx` must be greater than zero when set — remove it to use \
+         Ollama's default context, or set a positive context window such as 4096"
+    )]
+    RemoteEmbeddingInvalidNumCtx,
     #[error(
         "[llm.embedding.remote] can only serve a transformer model over Ollama, but `model = \
          \"{0}\"` is not a transformer (it is a static/hash model, or `none`/disabled) — remove \
@@ -1381,6 +1401,7 @@ mod tests {
                 query_endpoint: None, // connect mode: no local query box
                 auth_env: None,
                 gpu: None,
+                num_ctx: None,
                 // defaults applied when omitted
                 batch_size: 256,
                 request_timeout_s: 60,
@@ -1535,6 +1556,7 @@ mod tests {
             model = "all-minilm"
             endpoint = "http://localhost:11434"
             auth_env = "OLLAMA_TOKEN"
+            num_ctx = 4096
             batch_size = 512
             request_timeout_s = 120
             "#,
@@ -1550,6 +1572,7 @@ mod tests {
                 query_endpoint: None,
                 auth_env: Some("OLLAMA_TOKEN".to_string()),
                 gpu: None,
+                num_ctx: Some(4096),
                 batch_size: 512,
                 request_timeout_s: 120,
             })

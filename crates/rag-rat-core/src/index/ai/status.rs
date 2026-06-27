@@ -92,13 +92,14 @@ pub(crate) fn install_ollama_model(
 
 /// The reconcile freshness key for the SELECTED model when served over Ollama. Distinct from the
 /// static `spec.version` (the local key) so a local↔remote flip re-embeds, and folds in the
-/// server-side `remote.model` so switching THAT re-embeds too.
+/// server-side `remote.model` plus vector-affecting Ollama options so switching THOSE re-embeds
+/// too.
 ///
 /// DELIBERATELY ENDPOINT-INDEPENDENT (#317 rework — the key fix). The endpoint does NOT define the
 /// vector space; the model + runtime do. Folding the endpoint host would re-embed the WHOLE repo on
 /// every run for ephemeral/cookbook boxes (each gets a fresh URL). So: new URL + same
-/// `remote.model` → SAME freshness → no re-embed; a different `remote.model`, or a local↔remote
-/// flip → re-embed.
+/// `remote.model` + `num_ctx` → SAME freshness → no re-embed; a different `remote.model`, a
+/// different vector-affecting Ollama option, or a local↔remote flip → re-embed.
 pub(crate) fn remote_freshness_version(
     spec: &EmbeddingModelSpec,
     remote: &RemoteEmbeddingConfig,
@@ -112,6 +113,10 @@ pub(crate) fn remote_freshness_version(
     hasher.update(Backend::Ollama.runtime().as_bytes());
     hasher.update([0]);
     hasher.update(remote.model.trim().as_bytes());
+    hasher.update([0]);
+    if let Some(num_ctx) = remote.num_ctx {
+        hasher.update(num_ctx.to_le_bytes());
+    }
     let digest = hasher.finalize();
     // 8 hex bytes (16 chars) is ample to separate model/runtime combinations; keep the
     // human-legible `spec.version` prefix so the persisted value still reads as this model.
@@ -302,6 +307,7 @@ mod ollama_install_tests {
             query_endpoint: None,
             auth_env: None,
             gpu: None,
+            num_ctx: None,
             batch_size: 256,
             request_timeout_s: 5,
         }
@@ -379,6 +385,19 @@ mod ollama_install_tests {
             remote_freshness_version(spec, &a),
             remote_freshness_version(spec, &b),
             "switching the server-side model must bump the freshness version",
+        );
+    }
+
+    #[test]
+    fn remote_freshness_version_differs_by_num_ctx() {
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        let default_ctx = remote_at("http://localhost:11434");
+        let mut wider_ctx = default_ctx.clone();
+        wider_ctx.num_ctx = Some(4096);
+        assert_ne!(
+            remote_freshness_version(spec, &default_ctx),
+            remote_freshness_version(spec, &wider_ctx),
+            "changing Ollama's context window can change long-input embeddings and must refresh",
         );
     }
 }

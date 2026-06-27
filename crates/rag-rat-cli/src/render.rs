@@ -167,22 +167,24 @@ pub(crate) fn render_reconcile_progress(progress: rag_rat_core::index::ai::Recon
             processed_chunks,
             total_chunks,
             embeddings_written,
+            failed_chunks,
             blocked_chunks,
         } => {
             let percent = progress_percent(processed_chunks, total_chunks);
             eprintln!(
                 "reconcile: {processed_chunks}/{total_chunks} ({percent:>3}%) \
-                 written={embeddings_written} blocked={blocked_chunks}"
+                 written={embeddings_written} failed={failed_chunks} blocked={blocked_chunks}"
             );
         },
         rag_rat_core::index::ai::ReconcileProgress::Finished {
             processed_chunks,
             embeddings_written,
+            failed_chunks,
             blocked_chunks,
         } => {
             eprintln!(
                 "reconcile: complete processed={processed_chunks} written={embeddings_written} \
-                 blocked={blocked_chunks}"
+                 failed={failed_chunks} blocked={blocked_chunks}"
             );
         },
     }

@@ -599,6 +599,7 @@ pub(crate) fn reconcile_with_options_progress(
             progress(ReconcileProgress::Finished {
                 processed_chunks: 0,
                 embeddings_written: 0,
+                failed_chunks: 0,
                 blocked_chunks: 0,
             });
             return Ok(report);
@@ -660,13 +661,15 @@ pub(crate) fn reconcile_with_options_progress(
             progress(ReconcileProgress::Finished {
                 processed_chunks: 0,
                 embeddings_written: 0,
+                failed_chunks: 0,
                 blocked_chunks: 0,
             });
             return Ok(report);
         },
         // SkipEphemeral / NoEphemeralWork already returned above.
-        ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork =>
-            unreachable!("SkipEphemeral / NoEphemeralWork handled before the policy scan"),
+        ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork => {
+            unreachable!("SkipEphemeral / NoEphemeralWork handled before the policy scan")
+        },
     };
     let mut progress_total_chunks = estimated_reconcile_jobs(conn, &scan, &options)?;
     progress(ReconcileProgress::Started {
@@ -816,6 +819,7 @@ pub(crate) fn reconcile_with_options_progress(
                 + report.blocked_chunks,
             total_chunks: progress_total_chunks,
             embeddings_written: report.embeddings_written,
+            failed_chunks: report.failed_chunks,
             blocked_chunks: report.blocked_chunks,
         });
     }
@@ -830,6 +834,7 @@ pub(crate) fn reconcile_with_options_progress(
     progress(ReconcileProgress::Finished {
         processed_chunks: report.processed_chunks,
         embeddings_written: report.embeddings_written,
+        failed_chunks: report.failed_chunks,
         blocked_chunks: report.blocked_chunks,
     });
     Ok(report)
@@ -1144,6 +1149,7 @@ mod freshness_version_tests {
             query_endpoint: None,
             auth_env: None,
             gpu: None,
+            num_ctx: None,
             batch_size: 256,
             request_timeout_s: 5,
         }
@@ -1400,6 +1406,7 @@ mod freshness_version_tests {
             query_endpoint: Some("http://localhost:11434".to_string()),
             auth_env: None,
             gpu: None,
+            num_ctx: None,
             batch_size: 256,
             request_timeout_s: 5,
         };

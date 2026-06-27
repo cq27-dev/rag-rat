@@ -522,6 +522,7 @@ mod tests {
             // present and no token is.
             auth_env: Some("OLLAMA_TOKEN".to_string()),
             gpu: None,
+            num_ctx: None,
             batch_size: 256,
             request_timeout_s: 60,
         }
@@ -616,6 +617,7 @@ mod tests {
             query_endpoint: None,
             auth_env: None,
             gpu: None,
+            num_ctx: None,
             batch_size: 256,
             request_timeout_s: 2,
         };

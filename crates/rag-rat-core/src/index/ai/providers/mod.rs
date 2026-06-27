@@ -292,6 +292,7 @@ mod dispatch_tests {
             query_endpoint: None,
             auth_env: None,
             gpu: None,
+            num_ctx: None,
             batch_size: 256,
             request_timeout_s: 5,
         }
@@ -343,6 +344,7 @@ mod dispatch_tests {
             query_endpoint: Some(query_endpoint.to_string()),
             auth_env: auth_env.map(str::to_string),
             gpu: None,
+            num_ctx: None,
             batch_size: 256,
             request_timeout_s: 5,
         }
