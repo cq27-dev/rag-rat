@@ -1787,7 +1787,7 @@ fn new_connect_remote(local_model: &str) -> RemoteDraft {
         gpu: None,
         num_ctx: None,
         batch_size: 256,
-        concurrency: RemoteEmbeddingConfig::default().concurrency,
+        concurrency: RemoteEmbeddingConfig::omitted_concurrency_default(true),
         max_batch_chars: RemoteEmbeddingConfig::default().max_batch_chars,
         auth_env: None,
     }
@@ -1818,7 +1818,7 @@ fn new_ephemeral_remote_with_command(local_model: &str, cookbook: &str) -> Remot
         gpu: None,
         num_ctx: None,
         batch_size: 256,
-        concurrency: RemoteEmbeddingConfig::default().concurrency,
+        concurrency: RemoteEmbeddingConfig::omitted_concurrency_default(false),
         max_batch_chars: RemoteEmbeddingConfig::default().max_batch_chars,
         auth_env: None,
     }
@@ -2699,6 +2699,7 @@ mod tests {
             matches!(remote.mode, RemoteMode::Connect(ref endpoint) if endpoint == DEFAULT_QUERY_ENDPOINT)
         );
         assert_eq!(remote.model, default_remote_model_for(&state.draft.model));
+        assert_eq!(remote.concurrency, RemoteEmbeddingConfig::omitted_concurrency_default(true));
         assert_eq!(compatible_server_models(&state.draft.model), vec![
             "all-minilm",
             "qllama/bge-small-en-v1.5:f16"
@@ -2728,6 +2729,10 @@ mod tests {
             Some(RemoteMode::Ephemeral(_))
         ));
         assert_eq!(state.draft.remote.as_ref().and_then(|remote| remote.gpu.as_deref()), None);
+        assert_eq!(
+            state.draft.remote.as_ref().map(|remote| remote.concurrency),
+            Some(RemoteEmbeddingConfig::omitted_concurrency_default(false))
+        );
 
         step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
         step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
@@ -3031,7 +3036,7 @@ mod tests {
             step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
         }
         step_handle_key(StepId::Embedding, key(KeyCode::Char('4')), &mut state);
-        assert_eq!(state.draft.remote.as_ref().unwrap().concurrency, 324);
+        assert_eq!(state.draft.remote.as_ref().unwrap().concurrency, 14);
         assert!(matches!(state.probes.status(StepId::Embedding), ProbeStatus::Idle));
 
         while embed_focus(&state) != Some(EmbedFocus::MaxBatchChars) {
@@ -3042,7 +3047,7 @@ mod tests {
         assert_eq!(state.draft.remote.as_ref().unwrap().max_batch_chars, 38_399);
 
         let remote = remote_config_for(state.draft.remote.as_ref().unwrap());
-        assert_eq!(remote.concurrency, 324);
+        assert_eq!(remote.concurrency, 14);
         assert_eq!(remote.max_batch_chars, 38_399);
     }
 

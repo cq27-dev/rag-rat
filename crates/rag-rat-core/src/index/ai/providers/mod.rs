@@ -111,8 +111,13 @@ fn query_embed_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingConfig {
 /// reconcile loop just calls [`acquire_chunk_embedder`] and matches.
 pub(crate) enum ChunkEmbedder {
     /// An embedder is ready. `provisioned` is `Some` only for an ephemeral box; `None` for
-    /// connect/local.
-    Ready { embedder: Box<dyn Embedder>, provisioned: Option<ProvisionedBox> },
+    /// connect/local. `remote` is the already-read active remote config, if any, so reconcile does
+    /// not need to re-read potentially malformed meta outside the NotReady path.
+    Ready {
+        embedder: Box<dyn Embedder>,
+        provisioned: Option<ProvisionedBox>,
+        remote: Option<Box<RemoteEmbeddingConfig>>,
+    },
     /// Ephemeral active model on a non-provisioning pass — skip remote chunk embedding entirely.
     SkipEphemeral,
     /// Ephemeral active model on a PROVISIONING reconcile, but there is NOTHING to embed (the model
@@ -167,13 +172,15 @@ pub(crate) fn acquire_chunk_embedder(
             Ok((embedder, provisioned)) => ChunkEmbedder::Ready {
                 embedder: Box::new(embedder),
                 provisioned: Some(provisioned),
+                remote: Some(Box::new(remote.clone())),
             },
             Err(err) => ChunkEmbedder::NotReady(err),
         };
     }
     // Connect / local: the usual single construction site.
     match active_embedder(conn, intra_threads) {
-        Ok(embedder) => ChunkEmbedder::Ready { embedder, provisioned: None },
+        Ok(embedder) =>
+            ChunkEmbedder::Ready { embedder, provisioned: None, remote: remote.map(Box::new) },
         Err(err) => ChunkEmbedder::NotReady(err),
     }
 }

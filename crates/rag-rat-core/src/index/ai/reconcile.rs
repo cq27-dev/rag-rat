@@ -523,10 +523,6 @@ pub(crate) fn reconcile_with_options_progress(
         dim: embedding_dim,
         max_embedding_chars,
     };
-    let selection_batch_size = active_remote_config(conn)?
-        .map(|remote| remote_reconcile_batch_size(&remote, batch_size, options.max_seconds))
-        .unwrap_or(batch_size);
-
     // The chunk-embed embedder. For an EPHEMERAL active model on a provisioning reconcile, this
     // PROVISIONS a cookbook box (held by `_provisioned` for the whole loop — its `Drop` tears the
     // box down on success/error/panic) — but only AFTER confirming there's pending work, so a no-op
@@ -643,8 +639,8 @@ pub(crate) fn reconcile_with_options_progress(
 
     // `_provisioned` MUST outlive the embed loop: its `Drop` is the box teardown. Bound at function
     // scope here (not inside the match) so it lives until the function returns.
-    let (embedder, _provisioned) = match acquired {
-        ChunkEmbedder::Ready { embedder, provisioned } => (embedder, provisioned),
+    let (embedder, _provisioned, remote_config) = match acquired {
+        ChunkEmbedder::Ready { embedder, provisioned, remote } => (embedder, provisioned, remote),
         ChunkEmbedder::NotReady(err) => {
             // Surface the cause (e.g. a cookbook provisioning failure with its captured stderr) so
             // a remote outage isn't swallowed; the report keeps the actionable "install" hint AND
@@ -674,6 +670,10 @@ pub(crate) fn reconcile_with_options_progress(
             unreachable!("SkipEphemeral / NoEphemeralWork handled before the policy scan")
         },
     };
+    let selection_batch_size = remote_config
+        .as_deref()
+        .map(|remote| remote_reconcile_batch_size(remote, batch_size, options.max_seconds))
+        .unwrap_or(batch_size);
     let mut progress_total_chunks = estimated_reconcile_jobs(conn, &scan, &options)?;
     progress(ReconcileProgress::Started {
         model_id: active_model_id.clone(),
@@ -766,47 +766,15 @@ pub(crate) fn reconcile_with_options_progress(
         }
 
         if !to_embed_jobs.is_empty() {
-            let texts =
-                to_embed_jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
-            match embedder.embed_batch(&texts) {
-                Ok(vectors) if vectors.len() == to_embed_jobs.len() => {
-                    write_current_embedding_batch(
-                        conn,
-                        embedder.as_ref(),
-                        &model_version,
-                        &to_embed_jobs,
-                        &vectors,
-                    )?;
-                    report.embeddings_written +=
-                        u64::try_from(to_embed_jobs.len()).unwrap_or(u64::MAX);
-                },
-                Ok(vectors) => {
-                    let error = format!(
-                        "embedder {} returned {} vectors for {} texts",
-                        embedder.model_id(),
-                        vectors.len(),
-                        to_embed_jobs.len()
-                    );
-                    write_failed_embedding_batch(
-                        conn,
-                        embedder.as_ref(),
-                        &model_version,
-                        &to_embed_jobs,
-                        &error,
-                    )?;
-                    report.failed_chunks += u64::try_from(to_embed_jobs.len()).unwrap_or(u64::MAX);
-                },
-                Err(err) => {
-                    write_failed_embedding_batch(
-                        conn,
-                        embedder.as_ref(),
-                        &model_version,
-                        &to_embed_jobs,
-                        &err.to_string(),
-                    )?;
-                    report.failed_chunks += u64::try_from(to_embed_jobs.len()).unwrap_or(u64::MAX);
-                },
-            }
+            let (written, failed) = embed_and_write_jobs(
+                conn,
+                embedder.as_ref(),
+                &model_version,
+                &to_embed_jobs,
+                remote_config.as_deref(),
+            )?;
+            report.embeddings_written = report.embeddings_written.saturating_add(written);
+            report.failed_chunks = report.failed_chunks.saturating_add(failed);
         }
         report.processed_chunks = report
             .embeddings_written
@@ -854,6 +822,118 @@ fn remote_reconcile_batch_size(
     let remote_batch_size = (remote.batch_size as usize).max(1);
     let concurrency = (remote.concurrency as usize).max(1);
     batch_size.max(remote_batch_size.saturating_mul(concurrency))
+}
+
+fn embed_and_write_jobs(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    model_version: &str,
+    jobs: &[PreparedEmbeddingJob],
+    remote: Option<&RemoteEmbeddingConfig>,
+) -> anyhow::Result<(u64, u64)> {
+    let texts = jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
+    match embedder.embed_batch(&texts) {
+        Ok(vectors) if vectors.len() == jobs.len() => {
+            write_current_embedding_batch(conn, embedder, model_version, jobs, &vectors)?;
+            Ok((u64::try_from(jobs.len()).unwrap_or(u64::MAX), 0))
+        },
+        Ok(vectors) => {
+            let error = vector_count_error(embedder, vectors.len(), jobs.len());
+            write_remote_scoped_or_failed(conn, embedder, model_version, jobs, remote, &error)
+        },
+        Err(err) => {
+            let error = err.to_string();
+            write_remote_scoped_or_failed(conn, embedder, model_version, jobs, remote, &error)
+        },
+    }
+}
+
+fn write_remote_scoped_or_failed(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    model_version: &str,
+    jobs: &[PreparedEmbeddingJob],
+    remote: Option<&RemoteEmbeddingConfig>,
+    error: &str,
+) -> anyhow::Result<(u64, u64)> {
+    let Some(remote) = remote else {
+        write_failed_embedding_batch(conn, embedder, model_version, jobs, error)?;
+        return Ok((0, u64::try_from(jobs.len()).unwrap_or(u64::MAX)));
+    };
+
+    let mut written = 0u64;
+    let mut failed = 0u64;
+    for (start, end) in remote_request_job_ranges(jobs, remote) {
+        let scoped_jobs = &jobs[start..end];
+        let texts = scoped_jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
+        match embedder.embed_batch(&texts) {
+            Ok(vectors) if vectors.len() == scoped_jobs.len() => {
+                write_current_embedding_batch(
+                    conn,
+                    embedder,
+                    model_version,
+                    scoped_jobs,
+                    &vectors,
+                )?;
+                written =
+                    written.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
+            },
+            Ok(vectors) => {
+                let scoped_error = vector_count_error(embedder, vectors.len(), scoped_jobs.len());
+                write_failed_embedding_batch(
+                    conn,
+                    embedder,
+                    model_version,
+                    scoped_jobs,
+                    &scoped_error,
+                )?;
+                failed =
+                    failed.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
+            },
+            Err(err) => {
+                write_failed_embedding_batch(
+                    conn,
+                    embedder,
+                    model_version,
+                    scoped_jobs,
+                    &err.to_string(),
+                )?;
+                failed =
+                    failed.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
+            },
+        }
+    }
+    Ok((written, failed))
+}
+
+fn vector_count_error(embedder: &dyn Embedder, got: usize, expected: usize) -> String {
+    format!("embedder {} returned {} vectors for {} texts", embedder.model_id(), got, expected)
+}
+
+fn remote_request_job_ranges(
+    jobs: &[PreparedEmbeddingJob],
+    remote: &RemoteEmbeddingConfig,
+) -> Vec<(usize, usize)> {
+    let batch_size = (remote.batch_size as usize).max(1);
+    let max_batch_chars = remote.max_batch_chars.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut chars = 0usize;
+    for (idx, job) in jobs.iter().enumerate() {
+        let text_chars = job.input_text.chars().count();
+        let count_full = idx.saturating_sub(start) >= batch_size;
+        let chars_full = idx > start && chars.saturating_add(text_chars) > max_batch_chars;
+        if count_full || chars_full {
+            ranges.push((start, idx));
+            start = idx;
+            chars = 0;
+        }
+        chars = chars.saturating_add(text_chars);
+    }
+    if start < jobs.len() {
+        ranges.push((start, jobs.len()));
+    }
+    ranges
 }
 
 pub(crate) fn embedding_policy_skip_summary(
@@ -1279,6 +1359,69 @@ mod freshness_version_tests {
         (format!("http://127.0.0.1:{port}"), handle, max_in_flight)
     }
 
+    fn spawn_selective_failure_embed_stub(
+        dim: usize,
+        max_conns: usize,
+        fail_marker: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let mut workers = Vec::new();
+            let mut accepted = 0usize;
+            let started = Instant::now();
+            let mut last_accept = started;
+            while accepted < max_conns
+                && started.elapsed() < Duration::from_secs(5)
+                && (accepted == 0 || last_accept.elapsed() < Duration::from_millis(500))
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepted += 1;
+                        last_accept = Instant::now();
+                        workers.push(thread::spawn(move || {
+                            let body = read_request_body(&mut stream);
+                            let response = if body.contains(fail_marker) {
+                                let response_body = "{\"error\":\"transient\"}";
+                                format!(
+                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: \
+                                     application/json\r\nContent-Length: {}\r\nConnection: \
+                                     close\r\n\r\n{response_body}",
+                                    response_body.len()
+                                )
+                            } else {
+                                let inputs = body.matches("path: ").count().max(1);
+                                let vector = vec!["0.1"; dim].join(",");
+                                let rows = (0..inputs)
+                                    .map(|_| format!("[{vector}]"))
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                let response_body = format!("{{\"embeddings\":[{rows}]}}");
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: \
+                                     application/json\r\nContent-Length: {}\r\nConnection: \
+                                     close\r\n\r\n{response_body}",
+                                    response_body.len()
+                                )
+                            };
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                        }));
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    },
+                    Err(_) => break,
+                }
+            }
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
     fn seed_embedding_chunk(conn: &Connection, i: i64) {
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
@@ -1384,6 +1527,60 @@ mod freshness_version_tests {
     }
 
     #[test]
+    fn remote_reconcile_scopes_request_failure_to_remote_request_batch() {
+        let conn = schema_conn();
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        for i in 0..4 {
+            seed_embedding_chunk(&conn, i);
+        }
+        let (url, handle) = spawn_selective_failure_embed_stub(spec.dim, 8, "item_2");
+        let mut remote = remote_at(&url);
+        remote.batch_size = 1;
+        remote.concurrency = 4;
+        set_active_remote_config(&conn, &remote).unwrap();
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2, runtime = \
+             'ollama'
+             WHERE model_id = ?1",
+            params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
+        )
+        .unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_reconcile_meta(
+            &conn,
+            ACTIVE_EMBEDDING_MODEL_VERSION_META,
+            &remote_freshness_version(spec, &remote),
+        )
+        .unwrap();
+
+        let report = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions { batch_size: Some(1), ..ReconcileOptions::default() },
+            |_| {},
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(report.embeddings_written, 3);
+        assert_eq!(report.failed_chunks, 1);
+        let failed_rows: i64 = conn
+            .query_row("SELECT count(*) FROM chunk_embeddings WHERE status = 'Failed'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let current_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunk_embeddings WHERE status = 'Current'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_rows, 1);
+        assert_eq!(current_rows, 3);
+    }
+
+    #[test]
     fn remote_reconcile_keeps_caller_batch_size_when_time_bounded() {
         let mut remote = remote_at("http://localhost:11434");
         remote.batch_size = 256;
@@ -1391,6 +1588,36 @@ mod freshness_version_tests {
 
         assert_eq!(remote_reconcile_batch_size(&remote, 8, Some(1)), 8);
         assert_eq!(remote_reconcile_batch_size(&remote, 8, None), 8192);
+    }
+
+    #[test]
+    fn remote_reconcile_malformed_remote_meta_finishes_blocked_attempt() {
+        let conn = schema_conn();
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2, runtime = \
+             'ollama'
+             WHERE model_id = ?1",
+            params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
+        )
+        .unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, spec.version).unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
+
+        let report =
+            reconcile_with_options_progress(&conn, ReconcileOptions::default(), |_| {}).unwrap();
+
+        assert_eq!(report.status, "Blocked");
+        let attempt_status: String = conn
+            .query_row(
+                "SELECT status FROM reconcile_attempts ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_status, "Blocked");
     }
 
     #[test]
