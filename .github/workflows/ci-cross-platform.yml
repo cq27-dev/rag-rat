@@ -32,6 +32,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Keep ort-sys' downloaded ONNX Runtime under target/ so rust-cache restores the
+  # native library together with build-script link metadata.
+  ORT_CACHE_DIR: ${{ github.workspace }}/target/ort-cache
 
 jobs:
   clippy:
@@ -81,6 +84,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # rust-cache restore keys can bring back ort-sys link metadata from before ORT_CACHE_DIR was
+      # target-local. Force the build script to re-emit -L for the current cache location.
+      - run: cargo clean -p ort-sys
       # Align the MSVC C runtime so the link succeeds. esaxx-rs (a C++ dep via
       # tokenizers <- model2vec/fastembed) hardcodes cc's .static_crt(true) => /MT, but the ort_sys
       # ONNX Runtime prebuilt is /MD; the mismatch is LNK2038/LNK1319 on Windows. cc appends env

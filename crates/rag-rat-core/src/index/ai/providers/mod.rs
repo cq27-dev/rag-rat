@@ -19,7 +19,12 @@ mod ollama;
 use rusqlite::Connection;
 
 pub(crate) use self::cookbook::provision_and_build;
-pub use self::cookbook::{CookbookInput, CookbookProvisioner, ProvisionedBox};
+// `verify_ephemeral_remote` is the `pub` init-wizard seam (the CLI's Remote step calls it);
+// the underlying `provision_and_build` stays `pub(crate)`.
+pub use self::cookbook::{
+    CookbookInput, CookbookProvisioner, ProvisionedBox, abort_active_provisioning,
+    install_provision_log_sink, verify_ephemeral_remote, verify_ephemeral_remote_cancellable,
+};
 #[cfg(feature = "fastembed")]
 pub use self::fastembed::FastEmbedEmbedder;
 pub use self::hash::HashEmbedder;

@@ -1,6 +1,6 @@
 {
   "name": "@rag-rat/cookbook",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "Ephemeral remote-runtime provisioning recipes for rag-rat. rag-rat (Rust) spawns a recipe as a subprocess, reads a typed JSONL event stream from its stdout (status/log/ready/error), embeds against the endpoint, then signals teardown.",
   "license": "MIT",
   "repository": {
@@ -16,7 +16,9 @@
   },
   "main": "dist/src/contract.js",
   "types": "dist/src/contract.d.ts",
-  "bin": "./dist/cli.mjs",
+  "bin": {
+    "cookbook": "dist/cli.mjs"
+  },
   "exports": {
     ".": {
       "types": "./dist/src/contract.d.ts",

@@ -143,6 +143,9 @@ pub(crate) fn candidate_dirs(scan: &RepoScan, language: Language) -> Vec<DirCand
     let Some(counts) = scan.dir_counts.get(&language) else {
         return Vec::new();
     };
+    // `dir_counts` is populated only by `scan_dir`, whose walk already applies the shared
+    // IgnoreMatcher and skips the hard floor. Do not rebuild that matcher here on every render; the
+    // candidate set is derived from the filtered scan.
     let mut candidates = counts
         .iter()
         .filter(|(path, _)| path_depth(path) <= 4)
@@ -275,14 +278,6 @@ pub(crate) fn directly_contains_source(scan: &RepoScan, language: Language, path
 }
 pub(crate) fn path_depth(path: &Path) -> usize {
     if path == Path::new(".") { 0 } else { path.components().count() }
-}
-pub(crate) fn print_language_summary(scan: &RepoScan) {
-    for language in supported_languages() {
-        let count = scan.language_counts.get(&language).copied().unwrap_or_default();
-        if count > 0 {
-            println!("  {}: {count} files", language.as_str());
-        }
-    }
 }
 
 #[cfg(test)]

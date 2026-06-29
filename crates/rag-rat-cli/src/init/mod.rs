@@ -1,12 +1,13 @@
 mod render;
 mod run;
 mod scan;
+mod wizard;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs, io};
 
-use dialoguer::{Confirm, MultiSelect, Select};
+use dialoguer::Confirm;
 use rag_rat_core::config::EmbeddingBackend;
 use rag_rat_core::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID};
 use rag_rat_core::index::ai::ReconcileOptions;
@@ -21,7 +22,7 @@ use crate::{
     apply_embedding_runtime_env, git_paths, render_index_progress, render_reconcile_progress,
 };
 
-const DEFAULT_DATABASE: &str = ".rag-rat/index.sqlite";
+pub(crate) const DEFAULT_DATABASE: &str = ".rag-rat/index.sqlite";
 const SKIPPED_DIRS: &[&str] = &[
     ".git",
     ".rag-rat",
@@ -43,6 +44,11 @@ const SKIPPED_DIRS: &[&str] = &[
     "dist",
     "node_modules",
     "target",
+    // AI tooling directories — never project source (like .rag-rat above).
+    ".claude",
+    ".codex",
+    ".omc",
+    ".omx",
 ];
 
 #[derive(Debug, Clone)]
@@ -65,7 +71,7 @@ pub(crate) struct InitPlan {
     oracle_auto_run: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct RepoScan {
     language_counts: BTreeMap<Language, usize>,
     dir_counts: BTreeMap<Language, BTreeMap<PathBuf, usize>>,
@@ -84,6 +90,31 @@ pub(crate) struct RepoScan {
     /// (`.cpp`/`.cc`/…), else to **C**. Bare `Language::from_path` calls every `.h` C, which would
     /// bind a C++ library's header tree as `c` and parse it as C — see [`scan::assign_headers`].
     deferred_headers: Vec<PathBuf>,
+}
+
+impl RepoScan {
+    /// Read-only access to language file counts — used by `wizard/draft.rs` to build
+    /// `WizardDraft::from_scan` without re-implementing `default_plan`'s language filtering.
+    pub(crate) fn language_counts(&self) -> &BTreeMap<Language, usize> {
+        &self.language_counts
+    }
+
+    /// Mutable access for tests in `wizard/draft.rs` that construct a `RepoScan` directly.
+    #[cfg(test)]
+    pub(crate) fn language_counts_mut(&mut self) -> &mut BTreeMap<Language, usize> {
+        &mut self.language_counts
+    }
+
+    /// Total source bytes scanned — used by `wizard/draft.rs` to call `estimated_chunks`.
+    pub(crate) fn total_source_bytes(&self) -> u64 {
+        self.total_source_bytes
+    }
+
+    /// Mutable setter for tests in `wizard/draft.rs`.
+    #[cfg(test)]
+    pub(crate) fn set_total_source_bytes(&mut self, n: u64) {
+        self.total_source_bytes = n;
+    }
 }
 
 impl InitOptions {
@@ -301,6 +332,8 @@ mod tests {
         assert!(text.contains("# [watch]"));
         assert!(text.contains("# [version_check]"));
         assert!(text.contains("# [llm.embedding.runtime]"));
+        assert!(text.contains("# [init.cookbooks.modal]"));
+        assert!(text.contains("# [init.cookbooks.my-provider]"));
         assert!(text.contains("`.h`"), "explains the cpp .h-header binding");
 
         std::fs::write(root.join("rag-rat.toml"), &text).unwrap();
@@ -310,6 +343,41 @@ mod tests {
         assert_eq!(config.targets[0].language, Language::Cpp);
         // Commented [watch] falls back to its default (enabled).
         assert!(config.watch.enabled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn config_load_ignores_active_init_cookbook_catalog() {
+        let root = std::env::temp_dir().join(format!("ragrat-init-catalog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("rag-rat.toml"),
+            r#"
+            [index]
+            root = "."
+
+            [target_bindings]
+            rust = ["src"]
+
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+
+            [init.cookbooks.modal]
+            gpus = ["tiny", "huge"]
+
+            [init.cookbooks.custom]
+            label = "Custom"
+            command = "./recipes/custom.mjs"
+            gpus = []
+            "#,
+        )
+        .unwrap();
+
+        let config = Config::load(root.join("rag-rat.toml")).unwrap();
+
+        assert_eq!(config.targets.len(), 1);
+        assert_eq!(config.llm.embedding.backend.as_str(), "sentence-transformers/all-MiniLM-L6-v2");
         let _ = std::fs::remove_dir_all(&root);
     }
 

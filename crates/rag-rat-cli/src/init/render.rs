@@ -50,6 +50,15 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
     );
 
     text.push_str(
+        "# Init wizard cookbook catalog (optional). These entries only affect `rag-rat init` \
+         selectors;\n# runtime uses the selected `[llm.embedding.remote] cookbook` and `gpu` \
+         strings verbatim.\n# [init.cookbooks.modal]\n# label = \"Modal\"\n# command = \
+         \"@rag-rat/cookbook modal\"\n# gpus = [\"T4\", \"L4\", \"A10\", \"H100\"]\n#\n# \
+         [init.cookbooks.my-provider]\n# label = \"My Provider\"\n# command = \
+         \"./recipes/my-provider.mjs\"\n# gpus = [\"small\", \"large\"]\n\n",
+    );
+
+    text.push_str(
         "# Background file watcher — keeps the index fresh as files change (defaults shown).\n# \
          [watch]\n# enabled = true\n# debounce_ms = 400           # quiet window before a reindex \
          pass\n# max_latency_ms = 2500       # force a pass after this much continuous \

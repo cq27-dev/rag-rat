@@ -58,6 +58,8 @@ use crate::index::git_history;
 const FLOOR_DIRS: &[&str] = &[
     ".git",
     ".rag-rat",
+    ".claude",
+    ".codex",
     ".omx",
     ".omc",
     "node_modules",
@@ -406,6 +408,8 @@ mod tests {
         assert!(m.is_ignored(&tmp.join("target"), true));
         assert!(m.is_ignored(&tmp.join("target/debug/foo.rs"), false));
         assert!(m.is_ignored(&tmp.join(".rag-rat"), true));
+        assert!(m.is_ignored(&tmp.join(".claude/settings.json"), false));
+        assert!(m.is_ignored(&tmp.join(".codex/config.toml"), false));
         assert!(m.is_ignored(&tmp.join("node_modules/pkg/index.ts"), false));
         assert!(!m.is_ignored(&tmp.join("src/lib.rs"), false));
         fs::remove_dir_all(&tmp).ok();

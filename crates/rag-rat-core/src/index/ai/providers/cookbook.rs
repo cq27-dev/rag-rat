@@ -33,12 +33,17 @@ use std::io::{BufRead, BufReader};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{OnceLock, mpsc};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+#[cfg(windows)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use super::Embedder;
 use super::ollama::{OllamaEmbedder, ProvisionedEmbedderParams};
 use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::EmbeddingModelSpec;
@@ -67,6 +72,11 @@ const MAX_CAPTURED_LINES: usize = 200;
 /// 1).
 #[cfg(unix)]
 static ACTIVE_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// The active cookbook child on Windows. Windows has no Unix-style process group, so quit-time
+/// abort uses `taskkill /T` to terminate the child and descendants.
+#[cfg(windows)]
+static ACTIVE_CHILD_PID: AtomicU32 = AtomicU32::new(0);
 
 /// One-time install guard for the process-wide SIGINT/SIGTERM handler.
 #[cfg(unix)]
@@ -97,6 +107,25 @@ const SIGNAL_TEARDOWN_POLL_NSEC: i64 = 50 * 1_000_000;
 static mut SAVED_SIGINT: Option<libc::sigaction> = None;
 #[cfg(unix)]
 static mut SAVED_SIGTERM: Option<libc::sigaction> = None;
+
+static PROVISION_LOG_SINK: OnceLock<Mutex<Option<mpsc::Sender<String>>>> = OnceLock::new();
+
+pub struct ProvisionLogSinkGuard {
+    previous: Option<mpsc::Sender<String>>,
+}
+
+impl Drop for ProvisionLogSinkGuard {
+    fn drop(&mut self) {
+        let sink = PROVISION_LOG_SINK.get_or_init(|| Mutex::new(None));
+        *sink.lock().expect("provision log sink poisoned") = self.previous.take();
+    }
+}
+
+pub fn install_provision_log_sink(tx: mpsc::Sender<String>) -> ProvisionLogSinkGuard {
+    let sink = PROVISION_LOG_SINK.get_or_init(|| Mutex::new(None));
+    let previous = sink.lock().expect("provision log sink poisoned").replace(tx);
+    ProvisionLogSinkGuard { previous }
+}
 
 /// The JSON written to `RAG_RAT_COOKBOOK_INPUT` for the cookbook subprocess.
 #[derive(Debug, Clone, Serialize)]
@@ -157,19 +186,33 @@ enum CookbookEvent {
 /// handshake the caller consumes); `error`'s message is ALSO retained by the caller for the
 /// provision-failed context.
 fn handle_event(event: &CookbookEvent) {
-    match event {
+    let line = match event {
         CookbookEvent::Status { phase, provider, detail } => {
             let provider = if provider.is_empty() { String::new() } else { format!("{provider} ") };
             let detail = if detail.is_empty() { String::new() } else { format!(": {detail}") };
-            eprintln!("[cookbook] {provider}{phase}{detail}");
+            format!("[cookbook] {provider}{phase}{detail}")
         },
         CookbookEvent::Log { level, message } => {
             let level = if level.is_empty() { "info" } else { level.as_str() };
-            eprintln!("[cookbook] {level}: {message}");
+            format!("[cookbook] {level}: {message}")
         },
-        CookbookEvent::Error { message } => eprintln!("[cookbook] error: {message}"),
+        CookbookEvent::Error { message } => format!("[cookbook] error: {message}"),
         // `Ready` is the handshake, consumed by the caller — never routed here.
-        CookbookEvent::Ready { .. } => {},
+        CookbookEvent::Ready { .. } => return,
+    };
+    emit_provision_log(line);
+}
+
+fn emit_provision_log(line: String) {
+    let tx = PROVISION_LOG_SINK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("provision log sink poisoned")
+        .clone();
+    if let Some(tx) = tx {
+        let _ = tx.send(line);
+    } else {
+        eprintln!("{line}");
     }
 }
 
@@ -215,15 +258,39 @@ impl CookbookProvisioner {
         Self::provision_with_command(cookbook_command(cookbook), cookbook, input, PROVISION_TIMEOUT)
     }
 
+    fn provision_cancellable(
+        cookbook: &str,
+        input: &CookbookInput,
+        cancel: impl Fn() -> bool,
+    ) -> anyhow::Result<ProvisionedBox> {
+        Self::provision_with_command_cancellable(
+            cookbook_command(cookbook),
+            cookbook,
+            input,
+            PROVISION_TIMEOUT,
+            cancel,
+        )
+    }
+
     /// The provisioning core, given an already-built `Command` (the public `provision` builds it
     /// via `cookbook_command`) and the handshake `timeout`. Split out so tests can drive the
     /// lifecycle with a portable stub recipe + a short timeout, without needing `node`/`npx` on
     /// the test machine; `label` names the cookbook in errors.
     fn provision_with_command(
+        command: Command,
+        label: &str,
+        input: &CookbookInput,
+        timeout: Duration,
+    ) -> anyhow::Result<ProvisionedBox> {
+        Self::provision_with_command_cancellable(command, label, input, timeout, || false)
+    }
+
+    fn provision_with_command_cancellable(
         mut command: Command,
         label: &str,
         input: &CookbookInput,
         timeout: Duration,
+        cancel: impl Fn() -> bool,
     ) -> anyhow::Result<ProvisionedBox> {
         let input_json = serde_json::to_string(input)
             .map_err(|e| anyhow::anyhow!("failed to serialize cookbook input: {e}"))?;
@@ -244,6 +311,10 @@ impl CookbookProvisioner {
         #[cfg(unix)]
         install_signal_handler();
 
+        if cancel() {
+            anyhow::bail!("cookbook `{label}` provisioning cancelled before start");
+        }
+
         let mut child = command.spawn().map_err(|e| {
             anyhow::anyhow!("failed to spawn cookbook `{label}`: {e} (is `node`/`npx` on PATH?)")
         })?;
@@ -254,6 +325,26 @@ impl CookbookProvisioner {
         let pgid = child.id() as i32;
         #[cfg(unix)]
         ACTIVE_PGID.store(pgid, Ordering::SeqCst);
+        #[cfg(windows)]
+        ACTIVE_CHILD_PID.store(child.id(), Ordering::SeqCst);
+
+        if cancel() {
+            #[cfg(unix)]
+            teardown_group(pgid, &mut child);
+            #[cfg(windows)]
+            {
+                let pid = child.id();
+                taskkill_tree(pid);
+                clear_active_child_pid(pid);
+                let _ = child.wait();
+            }
+            #[cfg(all(not(unix), not(windows)))]
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            anyhow::bail!("cookbook `{label}` provisioning cancelled before handshake");
+        }
 
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -270,7 +361,7 @@ impl CookbookProvisioner {
             // is drained, not buffered) — `BufRead::lines()` would allocate the whole
             // line first.
             while let Ok(Some(line)) = read_capped_line(&mut reader) {
-                eprintln!("cookbook: {line}");
+                emit_provision_log(format!("cookbook: {line}"));
                 captured.push_back(line);
                 if captured.len() > MAX_CAPTURED_LINES {
                     captured.pop_front();
@@ -308,7 +399,7 @@ impl CookbookProvisioner {
                     },
                     // Not a typed event (e.g. npx install noise) → forward raw. `line` is already
                     // length-capped by `read_capped_line`, so no further truncation is needed.
-                    Err(_) => eprintln!("cookbook: {line}"),
+                    Err(_) => emit_provision_log(format!("cookbook: {line}")),
                 }
             }
         });
@@ -328,6 +419,8 @@ impl CookbookProvisioner {
                     // (exited).
                     #[cfg(unix)]
                     reap_group(pgid);
+                    #[cfg(windows)]
+                    clear_active_child_pid(child.id());
                     return Err(provision_failed(
                         label,
                         &mut child,
@@ -341,6 +434,8 @@ impl CookbookProvisioner {
                         // Child exited before a `ready` event.
                         #[cfg(unix)]
                         reap_group(pgid);
+                        #[cfg(windows)]
+                        clear_active_child_pid(child.id());
                         return Err(provision_failed(
                             label,
                             &mut child,
@@ -362,6 +457,8 @@ impl CookbookProvisioner {
                             let _ = child.kill();
                             let _ = child.wait();
                         }
+                        #[cfg(windows)]
+                        clear_active_child_pid(child.id());
                         let _ = stdout_handle.join();
                         let _ = stderr_handle.join();
                         anyhow::bail!(
@@ -416,12 +513,20 @@ pub(crate) fn provision_and_build(
     remote: &RemoteEmbeddingConfig,
     spec: &EmbeddingModelSpec,
 ) -> anyhow::Result<(OllamaEmbedder, ProvisionedBox)> {
+    provision_and_build_cancellable(remote, spec, || false)
+}
+
+fn provision_and_build_cancellable(
+    remote: &RemoteEmbeddingConfig,
+    spec: &EmbeddingModelSpec,
+    cancel: impl Fn() -> bool,
+) -> anyhow::Result<(OllamaEmbedder, ProvisionedBox)> {
     let cookbook = remote
         .cookbook
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("ephemeral remote config has no cookbook"))?;
     let input = cookbook_input_for(remote);
-    let provisioned = CookbookProvisioner::provision(cookbook, &input)?;
+    let provisioned = CookbookProvisioner::provision_cancellable(cookbook, &input, cancel)?;
     let embedder = OllamaEmbedder::from_provisioned(ProvisionedEmbedderParams {
         endpoint: &provisioned.endpoint,
         auth_token: provisioned.auth_token.as_deref(),
@@ -433,6 +538,39 @@ pub(crate) fn provision_and_build(
         num_ctx: remote.num_ctx,
     });
     Ok((embedder, provisioned))
+}
+
+/// Init-wizard ephemeral spin-up TEST: provision a cookbook box for `remote` + `spec`, embed a
+/// single `"ping"` to confirm the full provision→handshake→embed chain works, then tear the box
+/// down (the [`ProvisionedBox`] guard's `Drop` at end of scope). Returns `Ok(())` on a clean
+/// round-trip, an error otherwise. Bounded by the same internal [`PROVISION_TIMEOUT`] (300s) that
+/// gates `provision`, so the wizard never has to thread a deadline.
+///
+/// This is the `pub` seam the CLI's Remote step probes against: `provision_and_build` is
+/// `pub(crate)`, so a connection-less verify that the CLI can call lives HERE, not in the wizard.
+/// The box is ALWAYS torn down before this returns (Drop is the teardown), so a passing test leaks
+/// no billing instance. The caller still confirms intent via the type-`provision` gate; this fn
+/// trusts that gate and just runs the round-trip.
+pub fn verify_ephemeral_remote(
+    remote: &RemoteEmbeddingConfig,
+    spec: &EmbeddingModelSpec,
+) -> anyhow::Result<()> {
+    verify_ephemeral_remote_cancellable(remote, spec, || false)
+}
+
+pub fn verify_ephemeral_remote_cancellable(
+    remote: &RemoteEmbeddingConfig,
+    spec: &EmbeddingModelSpec,
+    cancel: impl Fn() -> bool,
+) -> anyhow::Result<()> {
+    // `_box` is bound (not `_`) so it lives to end of scope — `OllamaEmbedder` holds only the
+    // endpoint URL, not the process, so dropping the box early would tear down the server before
+    // the ping. Drop at function exit is the teardown (SIGTERM → grace → SIGKILL on the group).
+    let (embedder, _box) = provision_and_build_cancellable(remote, spec, cancel)?;
+    embedder.embed_batch(&["ping".to_string()]).map_err(|err| {
+        anyhow::anyhow!("ephemeral spin-up test embed failed for `{}`: {err}", spec.model_id)
+    })?;
+    Ok(())
 }
 
 /// The published cookbook npm scope+name. The single-token slash form
@@ -630,6 +768,8 @@ impl Drop for ProvisionedBox {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        #[cfg(windows)]
+        clear_active_child_pid(self.child.id());
     }
 }
 
@@ -765,6 +905,73 @@ fn reap_group(pgid: i32) {
     ACTIVE_PGID.store(0, Ordering::SeqCst);
 }
 
+/// Abort the currently-active provisioning process group from outside the cookbook lifecycle —
+/// used by the init wizard's quit path to tear down an in-flight ephemeral probe (Task 14b).
+///
+/// On unix: if `ACTIVE_PGID` is non-zero (a box is live), runs the same bounded
+/// SIGTERM → grace → SIGKILL teardown as [`ProvisionedBox::drop`] does via `teardown_group`.
+/// On non-unix: no-op (no process group machinery exists on non-unix).
+///
+/// INVARIANT (#330-6 leak fix — same as `teardown_group`/`reap_group`): `ACTIVE_PGID` is LOADED,
+/// not swapped, at the START and stays VISIBLE until the group is FULLY reclaimed; it is cleared
+/// ONLY at the END. Clearing it up front re-opened the money-leak race: a second SIGINT/SIGTERM
+/// arriving during the ≤10s grace would have `handle_terminating_signal` read `ACTIVE_PGID == 0`,
+/// do NOTHING, and `_exit` — interrupting THIS in-progress abort BEFORE its SIGKILL backstop → a
+/// leaked live box. With the pgid kept visible, a mid-teardown signal's `swap(0)` takes OWNERSHIP
+/// and runs its OWN complete SIGTERM→grace→SIGKILL, so the group is reaped either way (the `swap`
+/// also prevents a double-teardown — whoever clears it owns it; our `store(0)` at the end is an
+/// idempotent re-clear if the handler already took it).
+///
+/// Note: `teardown_group` requires a `&mut Child` to reap the leader (avoid a zombie). We don't
+/// hold the `Child` here (the worker owns it), so we run the same bounded teardown inline against
+/// the GROUP — SIGTERM, poll `group_alive`, SIGKILL backstop — and clear `ACTIVE_PGID` at the END.
+/// The worker's detached thread (or the OS at exit) reaps the real leader.
+pub fn abort_active_provisioning() {
+    #[cfg(unix)]
+    {
+        // LOAD, not swap: keep the pgid VISIBLE to the signal handler until teardown finishes, so a
+        // mid-grace signal can take ownership and SIGKILL-backstop rather than reading a cleared 0.
+        let pgid = ACTIVE_PGID.load(Ordering::SeqCst);
+        if pgid > 1 {
+            killpg(pgid, libc::SIGTERM);
+            let deadline = std::time::Instant::now() + TEARDOWN_GRACE;
+            loop {
+                if !group_alive(pgid) {
+                    // The group is gone (graceful teardown finished) → release the pgid at the END.
+                    ACTIVE_PGID.store(0, Ordering::SeqCst);
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Still alive past the grace → force the whole group, THEN clear the pgid (only now is
+            // the group actually gone). Clearing at the END is the load-bearing half of the fix.
+            killpg(pgid, libc::SIGKILL);
+            ACTIVE_PGID.store(0, Ordering::SeqCst);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let pid = ACTIVE_CHILD_PID.swap(0, Ordering::SeqCst);
+        if pid != 0 {
+            taskkill_tree(pid);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clear_active_child_pid(pid: u32) {
+    let _ = ACTIVE_CHILD_PID.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+fn taskkill_tree(pid: u32) {
+    let pid = pid.to_string();
+    let _ = Command::new("taskkill").args(["/PID", &pid, "/T", "/F"]).status();
+}
+
 /// `killpg(pgid, sig)` — signal the whole process group. SAFETY: `killpg(2)` with a valid signal; a
 /// vanished group just returns an ignored error and touches no memory.
 #[cfg(unix)]
@@ -878,7 +1085,7 @@ extern "C" fn handle_terminating_signal(signo: libc::c_int) {
 mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -907,6 +1114,50 @@ mod tests {
             provision_timeout_s: 280,
             gpu: None,
         }
+    }
+
+    #[test]
+    fn provision_cancellation_returns_before_spawning_command() {
+        let err = CookbookProvisioner::provision_with_command_cancellable(
+            Command::new("definitely-missing-rag-rat-cookbook-test-command"),
+            "cancelled",
+            &input(),
+            Duration::from_millis(10),
+            || true,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("cancelled before start"), "{err:#}");
+    }
+
+    #[test]
+    fn provision_cancellation_after_spawn_tears_down_before_handshake() {
+        let calls = AtomicUsize::new(0);
+        let err = CookbookProvisioner::provision_with_command_cancellable(
+            stub_command("stub_hang.sh", &[]),
+            "cancelled",
+            &input(),
+            Duration::from_millis(50),
+            || calls.fetch_add(1, Ordering::SeqCst) > 0,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("cancelled before handshake"), "{err:#}");
+    }
+
+    #[test]
+    fn verify_ephemeral_remote_cancellable_stops_before_recipe_spawn() {
+        let remote = RemoteEmbeddingConfig {
+            model: "all-minilm".to_string(),
+            cookbook: Some("definitely-missing-rag-rat-cookbook-test-command".to_string()),
+            query_endpoint: Some(crate::config::DEFAULT_QUERY_ENDPOINT.to_string()),
+            ..RemoteEmbeddingConfig::default()
+        };
+        let spec = crate::embedding_models::spec("sentence-transformers/all-MiniLM-L6-v2").unwrap();
+
+        let err = verify_ephemeral_remote_cancellable(&remote, spec, || true).unwrap_err();
+
+        assert!(err.to_string().contains("cancelled before start"), "{err:#}");
     }
 
     fn tmp(name: &str) -> PathBuf {

@@ -9,8 +9,9 @@
  * ~/.modal.toml — rag-rat does not pass creds through RAG_RAT_COOKBOOK_INPUT.
  *
  * Mirrors the proven Python provisioning. Provider gotchas, all load-bearing:
- *   - The ollama image ENTRYPOINT is `/bin/ollama`, so the Sandbox command is the bare
- *     subcommand `serve` — NOT `["ollama", "serve"]`, which would exec `ollama ollama serve`.
+ *   - Modal Sandbox `command` is passed as entrypoint args for registry images. The
+ *     `ollama/ollama` image already has `/bin/ollama` as ENTRYPOINT, so use `["serve"]`; passing
+ *     `["/bin/ollama", "serve"]` runs `ollama /bin/ollama serve` and exits with "unknown command".
  *   - ollama binds 127.0.0.1:11434 by default, which the Modal tunnel cannot reach. We set
  *     OLLAMA_HOST=0.0.0.0:11434 so it listens on all interfaces.
  *   - GPU is optional and OFF by default. GPU on Modal must be attached before ollama's
@@ -25,7 +26,8 @@
  * running past the Rust hard timeout and getting SIGKILLed with the box still billing (N2).
  */
 
-import { ModalClient } from "modal";
+import { randomUUID } from "node:crypto";
+import { ModalClient, Probe } from "modal";
 import type { Sandbox } from "modal";
 
 import {
@@ -85,29 +87,54 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   // give the sandbox a recoverable UNIQUE name; on ANY create throw, look it up by name and terminate
   // it before rethrowing. (Unlike RunPod, Modal HAS a provider backstop, so this only shortens the
   // worst case — but a leaked GPU box for up to 30 min is still real money.)
-  const sandboxName = `${APP_NAME}-${Date.now()}`;
+  const sandboxName = `${APP_NAME}-${Date.now()}-${randomUUID().slice(0, 8)}`;
 
-  // `command: ["serve"]` is appended to the image entrypoint (/bin/ollama) → `ollama serve`.
-  // OLLAMA_HOST goes in the sandbox env so the runtime process binds all interfaces.
+  // Modal passes `command` as ENTRYPOINT args for registry images. The ollama image's entrypoint is
+  // `/bin/ollama`, so `["serve"]` starts `ollama serve`; including `/bin/ollama` here would become
+  // `ollama /bin/ollama serve` and fail before readiness.
   let sb: Sandbox;
+  const createRef: { promise?: Promise<Sandbox> } = {};
   try {
-    sb = await withBudget(deadline, "sandboxes.create", () =>
-      modal.sandboxes.create(app, image, {
+    sb = await withBudget(deadline, "sandboxes.create", () => {
+      createRef.promise = modal.sandboxes.create(app, image, {
         name: sandboxName,
         command: ["serve"],
         env: { OLLAMA_HOST: `0.0.0.0:${OLLAMA_PORT}` },
         encryptedPorts: [OLLAMA_PORT],
+        readinessProbe: Probe.withTcp(OLLAMA_PORT, { intervalMs: 1000 }),
         timeoutMs: BOX_MAX_LIFETIME_MS,
         ...(gpu !== null ? { gpu } : {}),
-      }),
-    );
+      });
+      return createRef.promise;
+    });
   } catch (cause) {
+    const pendingCreate = createRef.promise;
+    if (pendingCreate !== undefined) {
+      void pendingCreate.then(
+        (lateSandbox: Sandbox) => terminateOrphanSandbox(lateSandbox, sandboxName, "late create"),
+        (lateCause: unknown) => {
+          log(
+            "info",
+            `orphan sweep: create promise for "${sandboxName}" later rejected: ${errorMessage(lateCause)}`,
+          );
+        },
+      );
+    }
     await sweepOrphanByName(modal, sandboxName);
     throw cause;
   }
-  // Report the box NOW so runRecipe tears it down if anything below throws.
+  // Report the box NOW so runRecipe tears it down if readiness, pull, or verify throws.
   ctx.onBox(sb);
   log("info", `sandbox created: ${sb.sandboxId ?? "(id unavailable)"}`);
+
+  ctx.status("provisioning", `waiting for ollama serve on port ${OLLAMA_PORT}`);
+  const readinessTimeoutMs = assertBudgetRemaining(deadline, "sandbox readiness");
+  await raceWithTimeout(
+    () => sb.waitUntilReady(readinessTimeoutMs),
+    readinessTimeoutMs,
+    "sandbox.waitUntilReady",
+  );
+  log("info", "ollama serve is listening");
 
   // Pull the model. The server (`serve`) is the box's main process; pull runs as an exec
   // against the same ollama install, populating the model store the server reads. Every step
@@ -169,12 +196,7 @@ async function sweepOrphanByName(modal: ModalClient, sandboxName: string): Promi
       TEARDOWN_TIMEOUT_MS,
       "sandboxes.fromName(orphan sweep)",
     );
-    await raceWithTimeout(
-      () => orphan.terminate(),
-      TEARDOWN_TIMEOUT_MS,
-      "orphan.terminate",
-    );
-    log("warn", `orphan sweep: terminated leaked sandbox "${sandboxName}" (${orphan.sandboxId})`);
+    await terminateOrphanSandbox(orphan, sandboxName, "orphan sweep");
   } catch (cause) {
     // fromName raises NotFoundError when no sandbox with that name exists — the common case (create
     // never made one). Distinguish it from a real failure so the log isn't alarming.
@@ -184,6 +206,23 @@ async function sweepOrphanByName(modal: ModalClient, sandboxName: string): Promi
     } else {
       log("error", `orphan sweep: could not reclaim a possible leak "${sandboxName}": ${message}`);
     }
+  }
+}
+
+async function terminateOrphanSandbox(
+  orphan: Sandbox,
+  sandboxName: string,
+  source: string,
+): Promise<void> {
+  try {
+    await raceWithTimeout(
+      () => orphan.terminate(),
+      TEARDOWN_TIMEOUT_MS,
+      `${source}.terminate`,
+    );
+    log("warn", `${source}: terminated leaked sandbox "${sandboxName}" (${orphan.sandboxId})`);
+  } catch (cause) {
+    log("error", `${source}: could not terminate leaked sandbox "${sandboxName}": ${errorMessage(cause)}`);
   }
 }
 

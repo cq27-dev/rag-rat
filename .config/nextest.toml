@@ -1,6 +1,10 @@
 # nextest profiles. The `ci` profile emits a JUnit report for Codecov Test Analytics.
 # Tests are parallel-safe (each uses its own temp DB; the library no longer shells out to `gh`),
 # so this runs at nextest's default per-core parallelism.
+[profile.ci]
+# A wedged test should fail with its test name instead of leaving the whole CI job running.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [profile.ci.junit]
 # Written to target/nextest/ci/junit.xml.
 path = "junit.xml"

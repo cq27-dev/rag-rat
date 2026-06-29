@@ -91,17 +91,41 @@ model = "all-minilm"                        # the Ollama-side model name
 # query_endpoint = "http://localhost:11434" # the LOCAL ollama for QUERY embedding
                                             #   (defaults to http://localhost:11434)
 # auth_env = "OLLAMA_TOKEN"                 # optional bearer-token env var NAME
-# gpu = "A10G"                              # cookbook-only: the GPU the recipe provisions.
+# gpu = "A10"                               # cookbook-only: the GPU the recipe provisions.
                                             #   Provider-specific, validated at provision time:
-                                            #   Modal = a GPU CLASS (A10G / T4 / A100; default CPU
-                                            #     — the modal recipe WARNS that GPU there has an
-                                            #     exit-137 cold-start risk);
-                                            #   RunPod = a gpuTypeId (default: a cheap on-demand GPU).
+                                            #   Modal = a GPU request string (T4 / L4 / A10 / L40S /
+                                            #     A100 / H100 / H200 / B200; default CPU — the modal
+                                            #     recipe WARNS that GPU there has an exit-137
+                                            #     cold-start risk);
+                                            #   RunPod = a gpuTypeId (default: NVIDIA RTX A4000).
 ```
 
 `gpu` applies **only** to the EPHEMERAL `cookbook` path; setting it alongside a connect `endpoint` is
 a config error. Its value is **not** validated by rag-rat — the provider rejects an unknown GPU when
 it tries to provision.
+
+### Init cookbook catalog
+
+`rag-rat init` has a repo-local cookbook catalog for its EPHEMERAL selector. This catalog affects
+only wizard choices; runtime still uses the selected `[llm.embedding.remote] cookbook` and `gpu`
+strings verbatim. Use it to add custom recipes or override provider GPU lists without waiting for a
+new rag-rat release:
+
+```toml
+[init.cookbooks.modal]
+label = "Modal"
+command = "@rag-rat/cookbook modal"
+gpus = ["T4", "L4", "A10", "H100"]
+
+[init.cookbooks.my-provider]
+label = "My Provider"
+command = "./recipes/my-provider.mjs"
+gpus = ["small", "large"]
+```
+
+Built-in keys are `modal` and `runpod`. A table with the same key overrides the wizard entry; a new
+key appends a new choice. `command` is required for new entries. `gpus = []` is valid and means the
+wizard shows no GPU choices for that cookbook.
 
 Provisioning happens **only on an explicit `rag-rat reconcile`** (the deliberate bulk pass) — the
 background watcher/maintenance pass does **not** cold-start a GPU box for a few changed chunks (it

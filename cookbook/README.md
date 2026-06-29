@@ -64,8 +64,9 @@ Hard rules:
   "request_timeout_s": 30,     // optional: positive number — the Rust embedder's per-HTTP-request
                                //   timeout, passed through for completeness. NOT a provisioning
                                //   budget (~30–60s is far too short to boot a box).
-  "gpu": null                  // optional: string or null. For Modal this is "A10G"/"T4" (CPU
-                               //   default); for RunPod a gpuTypeId like "NVIDIA RTX A4000".
+  "gpu": null                  // optional: string or null. For Modal this is a Modal GPU request
+                               //   string like "A10", "L40S", "H100", or "B200+" (CPU default);
+                               //   for RunPod a gpuTypeId like "NVIDIA RTX A4000".
 }
 ```
 
@@ -133,8 +134,10 @@ image, serves an embedding model, and tunnels port `11434`.
 
 Provider gotchas baked into the recipe (each one cost real time to find):
 
-- The ollama image **entrypoint is `/bin/ollama`**, so the sandbox command is the bare subcommand
-  `["serve"]` — `["ollama", "serve"]` would exec `ollama ollama serve`.
+- Modal Sandbox `command` is passed as entrypoint args for registry images. The `ollama/ollama`
+  image already has `/bin/ollama` as its entrypoint, so the recipe uses `["serve"]`, attaches a TCP
+  readiness probe on port `11434`, and explicitly waits for readiness before pulling/verifying the
+  model.
 - ollama defaults to `127.0.0.1:11434`, unreachable by the tunnel — the recipe sets
   `OLLAMA_HOST=0.0.0.0:11434`.
 - **GPU is off by default.** GPU on Modal must attach before ollama's discovery watchdog times out,

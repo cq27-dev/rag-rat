@@ -51,6 +51,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # than compact JSON on uniform-row payloads, neutral on nested ones — see rag_rat_core::output.
 # default-features = false drops its `cli` feature (ratatui/crossterm/arboard/syntect/tiktoken-rs/…)
 # — we only need the library encode/decode surface.
+tempfile = "3"
 toon-format = { version = "0.5.0", default-features = false }
 toml = "1.1"
 # Grammar crates are exact-pinned so parser node coverage changes deliberately.

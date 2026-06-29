@@ -42,6 +42,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Keep ort-sys' downloaded ONNX Runtime under target/ so rust-cache restores the
+  # native library together with build-script link metadata.
+  ORT_CACHE_DIR: ${{ github.workspace }}/target/ort-cache
   # Stable, cacheable location for the MiniLM ONNX download (fastembed honours this env var; see
   # index/ai/helpers.rs::fastembed_cache_dir). The model is immutable, so the cache key is static.
   RAG_RAT_MODEL_CACHE: ${{ github.workspace }}/.rag-rat-models
@@ -57,6 +60,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      # rust-cache restore keys can bring back ort-sys link metadata from before ORT_CACHE_DIR was
+      # target-local. Force the build script to re-emit -L for the current cache location.
+      - run: cargo clean -p ort-sys
       # Cache the MiniLM model download (immutable → static key) so the semantic pass doesn't
       # re-fetch ~90 MB from Hugging Face every run; first run / cache-miss warms it.
       - name: cache embedding model

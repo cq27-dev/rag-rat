@@ -1,16 +1,31 @@
+use super::wizard::{self, HookConflict, WizardResult, render_chained_hook};
 use super::*;
+use crate::{hook_script, install_hook, is_rag_rat_hook, make_executable, write_atomic};
 
 pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Result<()> {
     let options = InitOptions::from_args(args, config_path);
     let _terminal_reset = TerminalResetGuard::install_if_interactive(!options.yes)?;
     let root = env::current_dir()?.canonicalize()?;
-    let scan = scan_repo(&root)?;
-    let root_value = config_root_value(&root, &options.config_path);
-    let plan = if options.yes {
-        default_plan(root_value, &scan)
-    } else {
-        prompt_plan(root, root_value, &scan)?
-    };
+
+    // The interactive path runs the full-screen ratatui wizard. `--yes` keeps the legacy
+    // `default_plan` + `render_config` flow; `--dry-run` remains interactive unless paired with
+    // `--yes`, so the preview reflects the wizard choices.
+    if options.yes {
+        let scan = scan_repo(&root)?;
+        let root_value = config_root_value(&root, &options.config_path);
+        return run_non_interactive(&options, root_value, &scan);
+    }
+    run_interactive(&options)
+}
+
+/// The non-interactive (`--yes`) / `--dry-run` flow: render from `default_plan` and either print
+/// (dry-run) or write + index + install. Unchanged from the pre-wizard implementation.
+fn run_non_interactive(
+    options: &InitOptions,
+    root_value: String,
+    scan: &RepoScan,
+) -> anyhow::Result<()> {
+    let plan = default_plan(root_value, scan);
     // A plan with no bindings would render an empty `[target_bindings]` and index nothing — a
     // useless config. `init -y` can reach this when every detected language drops to a dependency
     // tree (e.g. Python whose only `.py` live under a virtualenv); the interactive path already
@@ -54,130 +69,198 @@ pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Res
     eprintln!("init: complete");
     Ok(())
 }
-pub(crate) fn prompt_plan(
-    root: PathBuf,
-    root_value: String,
-    scan: &RepoScan,
-) -> anyhow::Result<InitPlan> {
-    println!("Repository root: {}", root.display());
-    println!();
-    println!("Detected languages:");
-    print_language_summary(scan);
-    println!();
 
-    let language_items = supported_languages()
-        .iter()
-        .map(|language| {
-            let count = scan.language_counts.get(language).copied().unwrap_or_default();
-            format!("{} ({count} files)", language.as_str())
-        })
-        .collect::<Vec<_>>();
-    let defaults = supported_languages()
-        .iter()
-        .map(|language| scan.language_counts.get(language).copied().unwrap_or_default() > 0)
-        .collect::<Vec<_>>();
-    let selected = MultiSelect::new()
-        .with_prompt("Select languages to index")
-        .items(&language_items)
-        .defaults(&defaults)
-        .interact()?;
-    let languages =
-        selected.into_iter().map(|index| supported_languages()[index]).collect::<Vec<_>>();
-    if languages.is_empty() {
-        anyhow::bail!("init needs at least one selected language");
+/// The interactive flow: run the full-screen ratatui wizard, then write the TOML it returns and
+/// apply the hook selections.
+///
+/// `existing` reconfigure: when a `rag-rat.toml` is already present we load it (and keep its raw
+/// text) so the wizard renders a preserving patch / diff; otherwise it is a fresh init. The model
+/// is downloaded in-wizard (the Embedding step's verify probe), so the post-write reconcile is
+/// fast.
+fn run_interactive(options: &InitOptions) -> anyhow::Result<()> {
+    let existing = load_existing_for_wizard(options)?;
+    let scan_root = interactive_scan_root(Some(&existing))?;
+    let scan = scan_repo(&scan_root)?;
+
+    let Some(result) =
+        wizard::run_wizard(scan, existing.config, &options.config_path, scan_root.clone())?
+    else {
+        // The user quit the wizard — write nothing.
+        eprintln!("init: cancelled");
+        return Ok(());
+    };
+
+    if options.dry_run {
+        println!("{}", result.toml);
+        return Ok(());
     }
 
-    let mut bindings = BTreeMap::new();
-    for language in &languages {
-        let candidates = candidate_dirs(scan, *language);
-        if candidates.is_empty() {
-            bindings.insert(*language, vec![PathBuf::from(".")]);
-            continue;
-        }
-        println!();
-        println!("Candidate paths for {}:", language.as_str());
-        let items = candidates
-            .iter()
-            .map(|candidate| {
-                format!("{} ({} files)", display_rel(&candidate.path), candidate.count)
-            })
-            .collect::<Vec<_>>();
-        let defaults = candidates.iter().map(|candidate| candidate.default).collect::<Vec<_>>();
-        let selected = MultiSelect::new()
-            .with_prompt(format!("Select {} roots", language.as_str()))
-            .items(&items)
-            .defaults(&defaults)
-            .interact()?;
-        let dirs: Vec<_> =
-            selected.into_iter().map(|index| candidates[index].path.clone()).collect();
-        if dirs.is_empty() {
-            // No roots selected — drop the language (don't bind it), matching the non-interactive
-            // plan which omits a language with no safe default (e.g. env-only Python, whose
-            // candidates are all dependency trees and so default to none). Bailing here would make
-            // accepting the offered defaults fail for exactly that case (#181 review).
-            continue;
-        }
-        bindings.insert(*language, dirs);
+    if let Some(parent) = options.config_path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
     }
-    // Keep `languages` consistent with the bindings actually chosen (a dropped language must not
-    // linger and make `render_config` emit an empty list).
-    let languages = languages
-        .into_iter()
-        .filter(|language| bindings.contains_key(language))
-        .collect::<Vec<_>>();
-    if bindings.is_empty() {
-        anyhow::bail!("init needs at least one selected root to index");
-    }
+    fs::write(&options.config_path, &result.toml)?;
+    eprintln!("init: wrote {}", options.config_path.display());
 
-    let backend = prompt_backend(scan)?;
-    let oracle_auto_run = prompt_oracle_auto_run()?;
-    Ok(InitPlan { root_value, languages, bindings, backend, oracle_auto_run })
+    let config = Config::load(&options.config_path)?;
+    apply_embedding_runtime_env(&config.llm.embedding.runtime);
+    let db = setup_index(&config)?;
+    setup_model_and_reconcile(&config, &db, false)?;
+    // `false` = prompt the user — the wizard didn't cover MCP install, so ask after completing.
+    offer_mcp_install(&config, &options.config_path, false)?;
+    apply_wizard_hooks(&config, &result)?;
+    eprintln!("init: complete");
+    Ok(())
 }
 
-/// Offer the opt-in background oracle. Default NO: it needs a language tool (e.g. rust-analyzer) on
-/// PATH and spends CPU on a throttled SCIP pass, so it should be a deliberate choice. Writing
-/// `auto_run = false` either way keeps the knob visible in the generated config.
-pub(crate) fn prompt_oracle_auto_run() -> anyhow::Result<bool> {
-    println!();
-    println!(
-        "Compiler-grade ranking: a background pass can refresh SCIP-based importance ranking as \
-         the"
-    );
-    println!(
-        "repo changes (needs a language tool such as rust-analyzer on PATH; runs only in the MCP"
-    );
-    println!("server, heavily throttled). You can flip `[oracle] auto_run` later.");
-    Ok(Confirm::new()
-        .with_prompt("Enable background compiler-grade ranking refresh?")
-        .default(false)
-        .interact()?)
+struct ExistingWizardConfig {
+    config: Option<(String, Config)>,
+    local_root: Option<PathBuf>,
 }
-pub(crate) fn prompt_backend(scan: &RepoScan) -> anyhow::Result<EmbeddingBackend> {
-    let estimate = estimated_chunks(scan.total_source_bytes);
-    let recommended = recommend_backend(estimate);
-    println!();
-    println!(
-        "Embedding backend (≈{estimate} chunks from {} of source):",
-        human_bytes(scan.total_source_bytes)
-    );
-    println!("  recommended: {}", backend_label(recommended));
-    let choices =
-        [EmbeddingBackend::fast_embed(), EmbeddingBackend::model2vec(), EmbeddingBackend::NONE];
-    let default_index = choices.iter().position(|backend| *backend == recommended).unwrap_or(0);
-    let items = choices.iter().map(|backend| backend_label(*backend)).collect::<Vec<_>>();
-    let selected = Select::new()
-        .with_prompt("Select embedding backend")
-        .items(&items)
-        .default(default_index)
-        .interact()?;
-    Ok(choices[selected])
+
+fn load_existing_for_wizard(options: &InitOptions) -> anyhow::Result<ExistingWizardConfig> {
+    if !options.config_path.exists() || options.force {
+        return Ok(ExistingWizardConfig { config: None, local_root: None });
+    }
+
+    let raw = fs::read_to_string(&options.config_path)?;
+    let local_root = local_config_root_from_raw(&raw, &options.config_path)?;
+    let config = match Config::load(&options.config_path) {
+        Ok(config) => Some((raw, config)),
+        Err(err) => {
+            eprintln!(
+                "init: existing config {} could not be loaded ({err}); starting from a fresh draft",
+                options.config_path.display()
+            );
+            None
+        },
+    };
+    Ok(ExistingWizardConfig { config, local_root })
 }
-pub(crate) fn human_bytes(bytes: u64) -> String {
-    if bytes >= 1 << 20 {
-        format!("{:.1} MB", bytes as f64 / (1u64 << 20) as f64)
+
+fn interactive_scan_root(existing: Option<&ExistingWizardConfig>) -> anyhow::Result<PathBuf> {
+    if let Some(root) = existing.and_then(|existing| existing.local_root.clone()) {
+        return Ok(root);
+    }
+    if let Some((_, config)) = existing.and_then(|existing| existing.config.as_ref()) {
+        return Ok(config.root.clone());
+    }
+    Ok(env::current_dir()?.canonicalize()?)
+}
+
+fn local_config_root_from_raw(raw: &str, config_path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return Ok(None);
+    };
+    let Some(root) = doc
+        .get("index")
+        .and_then(|item| item.as_table_like())
+        .and_then(|table| table.get("root"))
+        .and_then(|item| item.as_str())
+    else {
+        return Ok(None);
+    };
+    let root_path = Path::new(root);
+    let candidate = if root_path.is_absolute() {
+        root_path.to_path_buf()
     } else {
-        format!("{:.0} KB", bytes as f64 / 1024.0)
+        config_dir(config_path)?.join(root_path)
+    };
+    match candidate.canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(_) => Ok(None),
     }
+}
+
+fn config_dir(config_path: &Path) -> anyhow::Result<PathBuf> {
+    let parent = config_path.parent().filter(|path| !path.as_os_str().is_empty());
+    let dir = match (config_path.is_absolute(), parent) {
+        (true, Some(parent)) => parent.to_path_buf(),
+        (true, None) => PathBuf::from("/"),
+        (false, Some(parent)) => env::current_dir()?.join(parent),
+        (false, None) => env::current_dir()?,
+    };
+    Ok(dir.canonicalize().unwrap_or(dir))
+}
+
+/// Apply the hook selections the wizard returned: git maintenance hooks (honoring each foreign-hook
+/// conflict resolution) and/or the Claude Code AI hooks (project-local or global).
+///
+/// Mirrors the install mechanics the `hooks` / `claude_hooks` commands use, but driven by the
+/// wizard's `HooksDraft` + per-hook `HookConflict` map instead of re-prompting.
+fn apply_wizard_hooks(config: &Config, result: &WizardResult) -> anyhow::Result<()> {
+    if result.hooks.git {
+        apply_git_hooks(config, &result.hook_conflicts)?;
+    }
+    if result.hooks.claude {
+        // The Claude install path is identical to `rag-rat hooks install --claude [--global]`.
+        crate::claude_hooks(config, "install", result.hooks.claude_global)?;
+    }
+    Ok(())
+}
+
+/// Install the rag-rat git maintenance hooks per the wizard's foreign-hook conflict resolutions.
+///
+/// For each managed hook: a clean slot (or one already managed by rag-rat) installs normally; a
+/// foreign file is resolved by the user's [`HookConflict`] choice — `Skip` leaves it, `Overwrite`
+/// replaces it, `Chain` wraps it via [`render_chained_hook`], `UninstallRagRatOnly` is a no-op for
+/// a foreign file, and `Abort` skips all hook changes.
+fn apply_git_hooks(
+    config: &Config,
+    conflicts: &std::collections::HashMap<&'static str, HookConflict>,
+) -> anyhow::Result<()> {
+    let git = match git_paths(&config.root) {
+        Ok(git) => git,
+        Err(err) => {
+            eprintln!("init: skipped git hooks (not a git worktree: {err})");
+            return Ok(());
+        },
+    };
+    // `Abort` on any resolved conflict means "don't touch hooks at all".
+    if conflicts.values().any(|c| *c == HookConflict::Abort) {
+        eprintln!("init: skipped git hooks (conflict aborted)");
+        return Ok(());
+    }
+    fs::create_dir_all(&git.hooks_dir)?;
+    let mut installed = Vec::new();
+    for &hook in crate::MANAGED_HOOKS {
+        let path = git.hooks_dir.join(hook);
+        let foreign = path.exists() && !is_rag_rat_hook(&path)?;
+        match conflicts.get(hook).copied() {
+            // A foreign file with an explicit resolution.
+            Some(HookConflict::Skip) | Some(HookConflict::UninstallRagRatOnly) => {
+                // Leave the foreign hook in place; install nothing for this slot.
+            },
+            Some(HookConflict::Overwrite) => {
+                write_atomic(&path, hook_script(hook).as_bytes())?;
+                make_executable(&path)?;
+                installed.push(hook);
+            },
+            Some(HookConflict::Chain) => {
+                let original = fs::read_to_string(&path).unwrap_or_default();
+                write_atomic(&path, render_chained_hook(&original, hook).as_bytes())?;
+                make_executable(&path)?;
+                installed.push(hook);
+            },
+            Some(HookConflict::Abort) => unreachable!("handled above"),
+            // No conflict recorded: a clean slot, or one already managed by rag-rat.
+            None => {
+                if foreign {
+                    // A foreign file with no resolution should have been caught by the wizard's
+                    // unresolved-conflict gate; be conservative and leave it untouched.
+                    eprintln!(
+                        "init: leaving unmanaged hook {} in place (no resolution recorded)",
+                        path.display()
+                    );
+                } else {
+                    // `install_hook` is safe here: the slot is empty or already a rag-rat hook.
+                    install_hook(&git.hooks_dir, hook)?;
+                    installed.push(hook);
+                }
+            },
+        }
+    }
+    eprintln!("init: installed git hooks in {} ({:?})", git.hooks_dir.display(), installed);
+    Ok(())
 }
 pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
     let languages = supported_languages()
@@ -400,6 +483,88 @@ mod default_plan_tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn wizard_git_hook_install_skips_non_git_roots() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        let config_path = root.path().join("rag-rat.toml");
+        std::fs::write(
+            &config_path,
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+
+        apply_git_hooks(&config, &std::collections::HashMap::new()).unwrap();
+
+        assert!(!root.path().join(".git/hooks").exists());
+    }
+
+    #[test]
+    fn interactive_reconfigure_scans_configured_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let config_path = root.path().join("rag-rat.toml");
+        std::fs::write(
+            &config_path,
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        let options = InitOptions {
+            yes: false,
+            dry_run: false,
+            force: false,
+            config_path: config_path.clone(),
+        };
+        let existing = load_existing_for_wizard(&options).unwrap();
+
+        assert_eq!(
+            interactive_scan_root(Some(&existing)).unwrap(),
+            root.path().canonicalize().unwrap()
+        );
+        assert!(existing.config.is_some());
+    }
+
+    #[test]
+    fn local_config_root_resolves_relative_to_config_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("linked");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("rag-rat.toml");
+        let raw = "[index]\nroot = \".\"\n";
+
+        assert_eq!(
+            local_config_root_from_raw(raw, &config_path).unwrap(),
+            Some(config_dir.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn invalid_existing_config_falls_back_to_fresh_draft() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let config_path = root.path().join("rag-rat.toml");
+        std::fs::write(
+            &config_path,
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n\
+             [llm.embedding]\nmodel = \"none\"\n[llm.embedding.remote]\nmodel = \
+             \"all-minilm\"\nendpoint = \"http://localhost:11434\"\n",
+        )
+        .unwrap();
+        let options = InitOptions {
+            yes: false,
+            dry_run: false,
+            force: false,
+            config_path: config_path.clone(),
+        };
+
+        let existing = load_existing_for_wizard(&options).unwrap();
+
+        assert!(existing.config.is_none());
+        assert_eq!(existing.local_root, Some(root.path().canonicalize().unwrap()));
+    }
 
     /// #181: a repo whose only `.py` files live under a dependency tree must NOT get
     /// `python = ["."]` — `default_plan` carries the no-safe-default state through by omitting the
