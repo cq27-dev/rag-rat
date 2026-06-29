@@ -5,7 +5,7 @@
 //!
 //! THE PROCESS CONTRACT (rag-rat ⇄ cookbook — both sides build to this exact shape):
 //! - INPUT via env `RAG_RAT_COOKBOOK_INPUT` = JSON
-//!   `{"model","request_timeout_s","provision_timeout_s","gpu"}`.
+//!   `{"model","request_timeout_s","provision_timeout_s","gpu","ollama_num_parallel"}`.
 //! - The cookbook's STDOUT is a TYPED JSONL event stream — one JSON object per line, each with a
 //!   `"type"` tag and a `"ts"` (epoch-ms) field (see [`CookbookEvent`]). The four `type`s are
 //!   `status` (a provisioning-phase update: `provisioning`/`pulling`/`verifying`/`tearing_down`),
@@ -146,6 +146,9 @@ pub struct CookbookInput {
     /// GPU hint for the recipe (e.g. `"T4"`); `None` lets the recipe decide. Carried as JSON
     /// `null` when absent so the contract field is always present.
     pub gpu: Option<String>,
+    /// Ollama server parallelism the recipe should set as `OLLAMA_NUM_PARALLEL`, aligned to the
+    /// remote client's configured in-flight request count.
+    pub ollama_num_parallel: u32,
 }
 
 /// One line of the cookbook's typed JSONL stdout stream. Tagged on `"type"`; the `"ts"` field and
@@ -500,6 +503,7 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
         // recipe picks its own default when `None`. Config validation guarantees `gpu` is only set
         // in ephemeral mode, which is the only mode reaching this function.
         gpu: remote.gpu.clone(),
+        ollama_num_parallel: remote.concurrency.max(1),
     }
 }
 
@@ -535,6 +539,8 @@ fn provision_and_build_cancellable(
         dim: spec.dim,
         request_timeout_s: remote.request_timeout_s,
         batch_size: remote.batch_size,
+        concurrency: remote.concurrency,
+        max_batch_chars: remote.max_batch_chars,
         num_ctx: remote.num_ctx,
     });
     Ok((embedder, provisioned))
@@ -1113,6 +1119,7 @@ mod tests {
             request_timeout_s: 30,
             provision_timeout_s: 280,
             gpu: None,
+            ollama_num_parallel: 32,
         }
     }
 
@@ -1166,21 +1173,24 @@ mod tests {
     }
 
     #[test]
-    fn cookbook_input_carries_the_configured_gpu() {
-        // The config→CookbookInput mapping must forward the configured `gpu` to the recipe (it's
-        // the only way a user picks a GPU — the contract.ts side reads `input.gpu`). `None`
-        // stays `None` so the recipe keeps its own default.
-        let ephemeral = |gpu: Option<&str>| RemoteEmbeddingConfig {
+    fn cookbook_input_carries_configured_gpu_and_parallelism() {
+        // The config→CookbookInput mapping must forward provider/runtime knobs to the recipe:
+        // `gpu` selects the provider shape, and `ollama_num_parallel` aligns server concurrency
+        // with the client-side remote request window.
+        let ephemeral = |gpu: Option<&str>, concurrency: u32| RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
             cookbook: Some("@rag-rat/cookbook modal".to_string()),
             query_endpoint: Some(crate::config::DEFAULT_QUERY_ENDPOINT.to_string()),
             gpu: gpu.map(str::to_string),
+            concurrency,
             ..RemoteEmbeddingConfig::default()
         };
-        assert_eq!(cookbook_input_for(&ephemeral(Some("A10G"))).gpu.as_deref(), Some("A10G"));
-        assert_eq!(cookbook_input_for(&ephemeral(None)).gpu, None);
+        assert_eq!(cookbook_input_for(&ephemeral(Some("A10G"), 16)).gpu.as_deref(), Some("A10G"));
+        assert_eq!(cookbook_input_for(&ephemeral(None, 16)).gpu, None);
+        assert_eq!(cookbook_input_for(&ephemeral(None, 16)).ollama_num_parallel, 16);
+        assert_eq!(cookbook_input_for(&ephemeral(None, 0)).ollama_num_parallel, 1);
         // The model is trimmed into the input regardless of gpu.
-        assert_eq!(cookbook_input_for(&ephemeral(Some("A100"))).model, "all-minilm");
+        assert_eq!(cookbook_input_for(&ephemeral(Some("A100"), 16)).model, "all-minilm");
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //!
 //! Native, blocking HTTP via `ureq` (v3, rustls) — already a non-optional workspace dep (the
 //! crates.io version check uses it), so this backend ships unconditionally: no cargo feature, no
-//! missing-feature message. The reconcile loop is single-threaded, so the cloneable `ureq::Agent`
-//! is held bare (no `Mutex`).
+//! missing-feature message. The cloneable `ureq::Agent` is held bare (no `Mutex`) and cloned into
+//! bounded blocking worker threads for remote request fan-out.
 
 use std::time::Duration;
 
@@ -59,6 +59,10 @@ pub struct OllamaEmbedder {
     /// exceeds the configured cap regardless of the reconcile/runtime batch size. Clamped to
     /// `>= 1` at construction so the `chunks()` split can't panic on a misconfigured `0`.
     batch_size: usize,
+    /// Max concurrent `/api/embed` requests in one `embed_batch` call.
+    concurrency: usize,
+    /// Max total input characters per `/api/embed` request.
+    max_batch_chars: usize,
     /// Optional Ollama context window (`options.num_ctx`) to avoid context-length 400s without
     /// shrinking rag-rat's chunk size.
     num_ctx: Option<u32>,
@@ -84,6 +88,10 @@ pub struct ProvisionedEmbedderParams<'a> {
     pub request_timeout_s: u64,
     /// Max texts per `/api/embed` request.
     pub batch_size: u32,
+    /// Max concurrent `/api/embed` requests.
+    pub concurrency: u32,
+    /// Max total input characters per `/api/embed` request.
+    pub max_batch_chars: usize,
     /// Optional Ollama context window (`options.num_ctx`) for `/api/embed`.
     pub num_ctx: Option<u32>,
 }
@@ -96,6 +104,8 @@ struct BuildParams<'a> {
     dim: usize,
     request_timeout_s: u64,
     batch_size: u32,
+    concurrency: u32,
+    max_batch_chars: usize,
     num_ctx: Option<u32>,
 }
 
@@ -134,6 +144,8 @@ impl OllamaEmbedder {
             dim,
             request_timeout_s: cfg.request_timeout_s,
             batch_size: cfg.batch_size,
+            concurrency: cfg.concurrency,
+            max_batch_chars: cfg.max_batch_chars,
             num_ctx: cfg.num_ctx,
         }))
     }
@@ -158,6 +170,8 @@ impl OllamaEmbedder {
             dim: params.dim,
             request_timeout_s: params.request_timeout_s,
             batch_size: params.batch_size,
+            concurrency: params.concurrency,
+            max_batch_chars: params.max_batch_chars,
             num_ctx: params.num_ctx,
         })
     }
@@ -173,6 +187,8 @@ impl OllamaEmbedder {
             dim,
             request_timeout_s,
             batch_size,
+            concurrency,
+            max_batch_chars,
             num_ctx,
         } = params;
         let embed_url = format!("{}/api/embed", endpoint.trim_end_matches('/'));
@@ -197,36 +213,63 @@ impl OllamaEmbedder {
             // Clamp to >= 1: a configured 0 would panic `slice::chunks`; treat it as "one per
             // request" rather than failing construction.
             batch_size: (batch_size as usize).max(1),
+            concurrency: (concurrency as usize).max(1),
+            max_batch_chars: max_batch_chars.max(1),
             num_ctx,
             auth_header,
         }
     }
 
-    /// Send ONE `/api/embed` request for `texts` (already sized to `<= self.batch_size` by the
-    /// caller) and return the parsed vectors, enforcing the count + per-vector dim contracts.
-    /// Factored out of `embed_batch` so the sub-batch loop reuses the exact request/validation
-    /// logic.
-    fn embed_one_request(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+    fn sub_batch_ranges(&self, texts: &[String]) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        let mut chars = 0usize;
+        for (idx, text) in texts.iter().enumerate() {
+            let text_chars = text.chars().count();
+            let count_full = idx.saturating_sub(start) >= self.batch_size;
+            let chars_full = idx > start && chars.saturating_add(text_chars) > self.max_batch_chars;
+            if count_full || chars_full {
+                ranges.push((start, idx));
+                start = idx;
+                chars = 0;
+            }
+            chars = chars.saturating_add(text_chars);
+        }
+        if start < texts.len() {
+            ranges.push((start, texts.len()));
+        }
+        ranges
+    }
+
+    fn embed_one_request_with(
+        agent: ureq::Agent,
+        embed_url: &str,
+        server_model: &str,
+        dim: usize,
+        num_ctx: Option<u32>,
+        auth_header: Option<&str>,
+        texts: &[String],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         let payload = EmbedRequest {
-            model: &self.server_model,
+            model: server_model,
             input: texts,
-            options: self.num_ctx.map(|num_ctx| EmbedOptions { num_ctx }),
+            options: num_ctx.map(|num_ctx| EmbedOptions { num_ctx }),
         };
         // The `json` ureq feature is not enabled (workspace ureq is rustls-only), so serialize the
         // body ourselves and send it with an explicit content-type.
         let body = serde_json::to_vec(&payload)
             .map_err(|e| anyhow::anyhow!("failed to serialize ollama embed request: {e}"))?;
 
-        let mut request = self.agent.post(&self.embed_url).content_type("application/json");
-        if let Some(header) = &self.auth_header {
+        let mut request = agent.post(embed_url).content_type("application/json");
+        if let Some(header) = auth_header {
             request = request.header("Authorization", header);
         }
 
         // `http_status_as_error(false)` lets us read Ollama's JSON error body on 4xx/5xx instead
         // of losing the actionable reason behind ureq's bare `http status: N` error.
-        let mut response = request.send(body).map_err(|e| {
-            anyhow::anyhow!("ollama embed request to `{}` failed: {e}", self.embed_url)
-        })?;
+        let mut response = request
+            .send(body)
+            .map_err(|e| anyhow::anyhow!("ollama embed request to `{embed_url}` failed: {e}"))?;
         let status = response.status();
         let raw = response
             .body_mut()
@@ -235,7 +278,7 @@ impl OllamaEmbedder {
         if !status.is_success() {
             anyhow::bail!(
                 "ollama embed request to `{}` failed: http status {}: {}",
-                self.embed_url,
+                embed_url,
                 status.as_u16(),
                 response_excerpt(&raw)
             );
@@ -262,20 +305,36 @@ impl OllamaEmbedder {
         // slipped through would make `store_embedding` bail and ABORT the whole reconcile instead
         // of failing just that chunk, so we name the offending index and reject here.
         for (i, vector) in embeddings.iter().enumerate() {
-            if vector.len() != self.dim {
+            if vector.len() != dim {
                 anyhow::bail!(
                     "ollama embed dim mismatch: server returned a {}-dim vector at index {} but \
                      this model is configured for {} dims (server model `{}`). The selected \
                      registry model and the Ollama server model must match.",
                     vector.len(),
                     i,
-                    self.dim,
-                    self.server_model
+                    dim,
+                    server_model
                 );
             }
         }
 
         Ok(embeddings)
+    }
+
+    /// Send ONE `/api/embed` request for `texts` (already sized to `<= self.batch_size` by the
+    /// caller) and return the parsed vectors, enforcing the count + per-vector dim contracts.
+    /// Factored out of `embed_batch` so the sub-batch loop reuses the exact request/validation
+    /// logic.
+    fn embed_one_request(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Self::embed_one_request_with(
+            self.agent.clone(),
+            &self.embed_url,
+            &self.server_model,
+            self.dim,
+            self.num_ctx,
+            self.auth_header.as_deref(),
+            texts,
+        )
     }
 }
 
@@ -346,14 +405,43 @@ impl Embedder for OllamaEmbedder {
             return Ok(Vec::new());
         }
 
-        // Split into sub-batches of at most the configured `batch_size` and send one `/api/embed`
-        // per sub-batch, concatenating the results IN ORDER. This honors `[remote] batch_size`
-        // regardless of the (larger) reconcile/runtime batch the loop hands us — a user capping it
-        // for a server/proxy request-size limit is respected. The count + per-vector dim checks run
-        // per sub-batch (in `embed_one_request`).
+        // Split into sub-batches by both text count and total input chars, then send up to the
+        // configured concurrency at once. Results are joined in request/input order, so HTTP
+        // completion order cannot reorder vectors.
+        let ranges = self.sub_batch_ranges(texts);
+        if ranges.len() == 1 {
+            return self.embed_one_request(texts);
+        }
         let mut out = Vec::with_capacity(texts.len());
-        for sub_batch in texts.chunks(self.batch_size) {
-            out.extend(self.embed_one_request(sub_batch)?);
+        for window in ranges.chunks(self.concurrency) {
+            let results = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(window.len());
+                for &(start, end) in window {
+                    let agent = self.agent.clone();
+                    let embed_url = self.embed_url.clone();
+                    let server_model = self.server_model.clone();
+                    let auth_header = self.auth_header.clone();
+                    let dim = self.dim;
+                    let num_ctx = self.num_ctx;
+                    let sub_batch = &texts[start..end];
+                    handles.push(scope.spawn(move || {
+                        Self::embed_one_request_with(
+                            agent,
+                            &embed_url,
+                            &server_model,
+                            dim,
+                            num_ctx,
+                            auth_header.as_deref(),
+                            sub_batch,
+                        )
+                    }));
+                }
+                handles.into_iter().map(|handle| handle.join()).collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|_| anyhow::anyhow!("ollama embed worker thread panicked"))?;
+            for result in results {
+                out.extend(result?);
+            }
         }
         Ok(out)
     }
@@ -489,6 +577,8 @@ mod tests {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
             request_timeout_s: timeout_s,
         }
     }
@@ -531,80 +621,222 @@ mod tests {
 
     /// A multi-request HTTP stub: accepts `max_conns` connections, and for each request replies
     /// with one DIM-wide vector PER input text in that request's body (so the per-sub-batch
-    /// count check passes). Each returned vector's first component is a monotonically
-    /// increasing global counter, so the concatenated `embed_batch` output reads `[0.0, 1.0,
-    /// 2.0, ...]` IFF the sub-batches are stitched back in order. Returns the URL, the join
-    /// handle, and the shared request COUNT so the test can assert the configured cap produced
-    /// the expected number of requests.
+    /// count check passes). Each returned vector's first component is the `N` from `text N`, so
+    /// the concatenated `embed_batch` output reads `[0.0, 1.0, 2.0, ...]` iff sub-batches are
+    /// stitched back in input order. Returns the URL, the join handle, and the shared request
+    /// COUNT so the test can assert the configured cap produced the expected number of requests.
     fn spawn_counting_stub(
         max_conns: usize,
     ) -> (String, thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let (url, handle, requests, _) = spawn_parallel_counting_stub(max_conns, Vec::new());
+        (url, handle, requests)
+    }
+
+    fn spawn_parallel_counting_stub(
+        max_conns: usize,
+        delays: Vec<(usize, Duration)>,
+    ) -> (
+        String,
+        thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&requests);
+        let delays = Arc::new(delays);
+        let max_seen = Arc::clone(&max_in_flight);
         let handle = thread::spawn(move || {
-            let mut next_value = 0u32;
+            let mut workers = Vec::new();
             for _ in 0..max_conns {
                 let Ok((mut stream, _)) = listener.accept() else { break };
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                // Read headers, parse Content-Length, then read EXACTLY that many body bytes. A
-                // single `read()` can return just the headers before the body arrives, so reading a
-                // fixed-size buffer once undercounts the inputs; this reads the whole request.
-                let mut raw = Vec::new();
-                let mut buf = [0u8; 8192];
-                let body = loop {
-                    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n");
-                    if let Some(end) = header_end {
-                        let headers = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
-                        let content_len = headers
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        let body_start = end + 4;
-                        while raw.len() < body_start + content_len {
-                            match stream.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => raw.extend_from_slice(&buf[..n]),
-                                Err(_) => break,
-                            }
-                        }
-                        break String::from_utf8_lossy(&raw[body_start..]).to_string();
+                let counter = Arc::clone(&counter);
+                let in_flight = Arc::clone(&in_flight);
+                let max_seen = Arc::clone(&max_seen);
+                let delays = Arc::clone(&delays);
+                workers.push(thread::spawn(move || {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    raise_max(&max_seen, now);
+                    let body = read_request_body(&mut stream);
+                    let indices = request_text_indices(&body);
+                    if let Some(first) = indices.first().copied()
+                        && let Some((_, delay)) = delays.iter().find(|(idx, _)| *idx == first)
+                    {
+                        thread::sleep(*delay);
                     }
-                    match stream.read(&mut buf) {
-                        Ok(0) => break String::new(),
-                        Ok(n) => raw.extend_from_slice(&buf[..n]),
-                        Err(_) => break String::new(),
-                    }
-                };
-                // Count inputs in THIS request by the `"text N"` markers the test sends.
-                let inputs = body.matches("text ").count().max(1);
-                counter.fetch_add(1, Ordering::SeqCst);
-                let vectors: Vec<Vec<f32>> = (0..inputs)
-                    .map(|_| {
-                        let v = vec![next_value as f32; DIM];
-                        // Encode the global order in the FIRST component only.
-                        let mut v = v;
-                        v[0] = next_value as f32;
-                        next_value += 1;
-                        v
-                    })
-                    .collect();
-                let json = embeddings_json(&vectors);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
-                     {}\r\nConnection: close\r\n\r\n{json}",
-                    json.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let vector_ids = if indices.is_empty() { vec![0] } else { indices };
+                    let vectors: Vec<Vec<f32>> = vector_ids
+                        .into_iter()
+                        .map(|idx| {
+                            let mut v = vec![idx as f32; DIM];
+                            v[0] = idx as f32;
+                            v
+                        })
+                        .collect();
+                    let json = embeddings_json(&vectors);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                         {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for worker in workers {
+                let _ = worker.join();
             }
         });
-        (format!("http://127.0.0.1:{port}"), handle, requests)
+        (format!("http://127.0.0.1:{port}"), handle, requests, max_in_flight)
+    }
+
+    fn request_text_indices(body: &str) -> Vec<usize> {
+        body.match_indices("text ")
+            .filter_map(|(start, _)| {
+                body[start + 5..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .collect()
+    }
+
+    fn raise_max(max_seen: &std::sync::atomic::AtomicUsize, value: usize) {
+        use std::sync::atomic::Ordering;
+
+        let mut current = max_seen.load(Ordering::SeqCst);
+        while value > current {
+            match max_seen.compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn indexed_texts(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("text {i}")).collect()
+    }
+
+    fn first_components(vectors: &[Vec<f32>]) -> Vec<f32> {
+        vectors.iter().map(|vector| vector.first().copied().unwrap_or_default()).collect()
+    }
+
+    #[test]
+    fn embed_batch_splits_by_char_budget_as_well_as_count_budget() {
+        use std::sync::atomic::Ordering;
+
+        let (url, handle, requests) = spawn_counting_stub(2);
+        let mut cfg = config_for(&url, 5);
+        cfg.batch_size = 10;
+        cfg.max_batch_chars = 13;
+        let embedder = build(&cfg, DIM).unwrap();
+
+        let got = embedder.embed_batch(&indexed_texts(3)).expect("char-budgeted embed");
+        handle.join().unwrap();
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "three 6-char texts at max_batch_chars 13 → 2 requests"
+        );
+        assert_eq!(first_components(&got), vec![0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn embed_batch_dispatches_sub_batches_concurrently() {
+        use std::sync::atomic::Ordering;
+
+        let delay = Duration::from_millis(120);
+        let all_delayed = (0..8).map(|i| (i, delay)).collect::<Vec<_>>();
+
+        let (seq_url, seq_handle, _, seq_max) =
+            spawn_parallel_counting_stub(8, all_delayed.clone());
+        let mut seq_cfg = config_for(&seq_url, 5);
+        seq_cfg.batch_size = 1;
+        seq_cfg.concurrency = 1;
+        let seq_embedder = build(&seq_cfg, DIM).unwrap();
+        let started = std::time::Instant::now();
+        seq_embedder.embed_batch(&indexed_texts(8)).expect("sequential delayed embed");
+        let sequential = started.elapsed();
+        seq_handle.join().unwrap();
+
+        let (conc_url, conc_handle, _, conc_max) = spawn_parallel_counting_stub(8, all_delayed);
+        let mut conc_cfg = config_for(&conc_url, 5);
+        conc_cfg.batch_size = 1;
+        conc_cfg.concurrency = 4;
+        let conc_embedder = build(&conc_cfg, DIM).unwrap();
+        let started = std::time::Instant::now();
+        conc_embedder.embed_batch(&indexed_texts(8)).expect("concurrent delayed embed");
+        let concurrent = started.elapsed();
+        conc_handle.join().unwrap();
+
+        assert_eq!(seq_max.load(Ordering::SeqCst), 1, "sequential config has one in flight");
+        assert!(conc_max.load(Ordering::SeqCst) > 1, "concurrent config must overlap requests");
+        assert!(
+            concurrent < sequential,
+            "concurrent dispatch should be faster than sequential: {concurrent:?} vs \
+             {sequential:?}"
+        );
+    }
+
+    #[test]
+    fn embed_batch_keeps_output_order_when_later_requests_finish_first() {
+        let (url, handle, _, max_in_flight) =
+            spawn_parallel_counting_stub(2, vec![(0, Duration::from_millis(200))]);
+        let mut cfg = config_for(&url, 5);
+        cfg.batch_size = 1;
+        cfg.concurrency = 2;
+        let embedder = build(&cfg, DIM).unwrap();
+
+        let got = embedder.embed_batch(&indexed_texts(2)).expect("out-of-order responses succeed");
+        handle.join().unwrap();
+
+        assert!(
+            max_in_flight.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "test must overlap the delayed and fast requests"
+        );
+        assert_eq!(first_components(&got), vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn embed_batch_single_over_char_budget_text_is_sent_alone() {
+        use std::sync::atomic::Ordering;
+
+        let (url, handle, requests) = spawn_counting_stub(2);
+        let mut cfg = config_for(&url, 5);
+        cfg.batch_size = 10;
+        cfg.max_batch_chars = 1;
+        let embedder = build(&cfg, DIM).unwrap();
+
+        let got = embedder.embed_batch(&indexed_texts(2)).expect("over-budget singletons embed");
+        handle.join().unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(first_components(&got), vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn sub_batch_ranges_respects_exact_char_budget_boundary() {
+        let embedder = build(&config_for("http://127.0.0.1:1", 5), DIM).unwrap();
+        let mut sized = embedder;
+        sized.batch_size = 10;
+        sized.max_batch_chars = 12;
+        assert_eq!(sized.sub_batch_ranges(&indexed_texts(3)), vec![(0, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn request_text_indices_finds_json_string_markers_in_order() {
+        assert_eq!(request_text_indices(r#"{"input":["text 7","text 2"]}"#), vec![7, 2]);
     }
 
     #[test]

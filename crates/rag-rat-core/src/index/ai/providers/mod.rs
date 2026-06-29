@@ -299,6 +299,8 @@ mod dispatch_tests {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
             request_timeout_s: 5,
         }
     }
@@ -351,6 +353,8 @@ mod dispatch_tests {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
             request_timeout_s: 5,
         }
     }

@@ -284,12 +284,36 @@ pub struct RemoteEmbeddingConfig {
     pub num_ctx: Option<u32>,
     /// How many texts to send per `/api/embed` request.
     pub batch_size: u32,
+    /// How many `/api/embed` requests the remote embedder may keep in flight.
+    ///
+    /// `#[serde(default)]`: this field post-dates the meta round-trip, so a config JSON persisted
+    /// by an older binary (no `concurrency` key) must still deserialize with the default instead
+    /// of erroring.
+    #[serde(default = "default_remote_embedding_concurrency")]
+    pub concurrency: u32,
+    /// Maximum total input characters to include in one `/api/embed` request.
+    ///
+    /// `#[serde(default)]`: this field post-dates the meta round-trip, so a config JSON persisted
+    /// by an older binary (no `max_batch_chars` key) must still deserialize with the default
+    /// instead of erroring.
+    #[serde(default = "default_remote_embedding_max_batch_chars")]
+    pub max_batch_chars: usize,
     /// Per-request HTTP timeout, in seconds.
     pub request_timeout_s: u64,
 }
 
 /// The default LOCAL Ollama URL for ephemeral query embedding when `query_endpoint` is omitted.
 pub const DEFAULT_QUERY_ENDPOINT: &str = "http://localhost:11434";
+const DEFAULT_REMOTE_EMBEDDING_CONCURRENCY: u32 = 32;
+const DEFAULT_REMOTE_EMBEDDING_MAX_BATCH_CHARS: usize = 384_000;
+
+fn default_remote_embedding_concurrency() -> u32 {
+    DEFAULT_REMOTE_EMBEDDING_CONCURRENCY
+}
+
+fn default_remote_embedding_max_batch_chars() -> usize {
+    DEFAULT_REMOTE_EMBEDDING_MAX_BATCH_CHARS
+}
 
 impl Default for RemoteEmbeddingConfig {
     fn default() -> Self {
@@ -302,6 +326,8 @@ impl Default for RemoteEmbeddingConfig {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: DEFAULT_REMOTE_EMBEDDING_CONCURRENCY,
+            max_batch_chars: DEFAULT_REMOTE_EMBEDDING_MAX_BATCH_CHARS,
             request_timeout_s: 60,
         }
     }
@@ -819,6 +845,8 @@ struct RawRemoteEmbedding {
     gpu: Option<String>,
     num_ctx: Option<u32>,
     batch_size: Option<u32>,
+    concurrency: Option<u32>,
+    max_batch_chars: Option<usize>,
     request_timeout_s: Option<u64>,
 }
 
@@ -934,6 +962,8 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
             gpu,
             num_ctx: raw.num_ctx,
             batch_size: raw.batch_size.unwrap_or(default.batch_size),
+            concurrency: raw.concurrency.unwrap_or(default.concurrency).max(1),
+            max_batch_chars: raw.max_batch_chars.unwrap_or(default.max_batch_chars).max(1),
             request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
         })
     }
@@ -1404,6 +1434,8 @@ mod tests {
                 num_ctx: None,
                 // defaults applied when omitted
                 batch_size: 256,
+                concurrency: 32,
+                max_batch_chars: 384_000,
                 request_timeout_s: 60,
             })
         );
@@ -1558,6 +1590,8 @@ mod tests {
             auth_env = "OLLAMA_TOKEN"
             num_ctx = 4096
             batch_size = 512
+            concurrency = 16
+            max_batch_chars = 128000
             request_timeout_s = 120
             "#,
         )
@@ -1574,9 +1608,52 @@ mod tests {
                 gpu: None,
                 num_ctx: Some(4096),
                 batch_size: 512,
+                concurrency: 16,
+                max_batch_chars: 128_000,
                 request_timeout_s: 120,
             })
         );
+    }
+
+    #[test]
+    fn remote_embedding_zero_concurrency_and_char_budget_are_clamped() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+
+            [llm.embedding.remote]
+            model = "all-minilm"
+            endpoint = "http://localhost:11434"
+            concurrency = 0
+            max_batch_chars = 0
+            "#,
+        )
+        .unwrap();
+        let remote = LlmConfig::try_from(raw.llm).unwrap().embedding.remote.unwrap();
+        assert_eq!(remote.concurrency, 1);
+        assert_eq!(remote.max_batch_chars, 1);
+    }
+
+    #[test]
+    fn older_remote_embedding_meta_json_deserializes_with_new_defaults() {
+        let json = r#"{
+            "model": "all-minilm",
+            "endpoint": "http://localhost:11434",
+            "cookbook": null,
+            "query_endpoint": null,
+            "auth_env": null,
+            "gpu": null,
+            "num_ctx": null,
+            "batch_size": 256,
+            "request_timeout_s": 60
+        }"#;
+        let remote: RemoteEmbeddingConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(remote.concurrency, 32);
+        assert_eq!(remote.max_batch_chars, 384_000);
     }
 
     #[test]

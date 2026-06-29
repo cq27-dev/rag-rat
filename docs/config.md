@@ -68,6 +68,9 @@ endpoint = "http://box:11434"     # CONNECT: the Ollama server URL (required)
 model = "all-minilm"              # the Ollama-side model name (the server's own identifier)
 # auth_env = "OLLAMA_TOKEN"       # NAME of an env var holding a bearer token (never the token itself)
 # batch_size = 256                # texts per /api/embed request
+# concurrency = 32                # concurrent /api/embed requests in one reconcile batch
+# max_batch_chars = 384000        # max total input chars per /api/embed request
+# num_ctx = 4096                  # optional Ollama context window (options.num_ctx)
 # request_timeout_s = 60          # per-request HTTP timeout
 ```
 
@@ -98,11 +101,19 @@ model = "all-minilm"                        # the Ollama-side model name
                                             #     recipe WARNS that GPU there has an exit-137
                                             #     cold-start risk);
                                             #   RunPod = a gpuTypeId (default: NVIDIA RTX A4000).
+# batch_size = 256                          # texts per /api/embed request
+# concurrency = 32                          # concurrent /api/embed requests
+# max_batch_chars = 384000                  # max total input chars per /api/embed request
+# request_timeout_s = 60
 ```
 
 `gpu` applies **only** to the EPHEMERAL `cookbook` path; setting it alongside a connect `endpoint` is
 a config error. Its value is **not** validated by rag-rat — the provider rejects an unknown GPU when
 it tries to provision.
+
+For remote Ollama, `batch_size` and `max_batch_chars` cap one HTTP request; `concurrency` controls
+how many of those capped requests reconcile may keep in flight. Candidate chunk order stays
+need-first/id-first; rag-rat does not size-sort chunks.
 
 ### Init cookbook catalog
 

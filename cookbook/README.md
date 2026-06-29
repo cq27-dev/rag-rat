@@ -64,9 +64,12 @@ Hard rules:
   "request_timeout_s": 30,     // optional: positive number — the Rust embedder's per-HTTP-request
                                //   timeout, passed through for completeness. NOT a provisioning
                                //   budget (~30–60s is far too short to boot a box).
-  "gpu": null                  // optional: string or null. For Modal this is a Modal GPU request
+  "gpu": null,                 // optional: string or null. For Modal this is a Modal GPU request
                                //   string like "A10", "L40S", "H100", or "B200+" (CPU default);
                                //   for RunPod a gpuTypeId like "NVIDIA RTX A4000".
+  "ollama_num_parallel": 32    // optional: positive integer — sets OLLAMA_NUM_PARALLEL in the
+                               //   remote Ollama container, normally matching rag-rat's remote
+                               //   embedding concurrency.
 }
 ```
 
@@ -140,6 +143,8 @@ Provider gotchas baked into the recipe (each one cost real time to find):
   model.
 - ollama defaults to `127.0.0.1:11434`, unreachable by the tunnel — the recipe sets
   `OLLAMA_HOST=0.0.0.0:11434`.
+- Ollama defaults to single-request handling — the recipe sets `OLLAMA_NUM_PARALLEL` from
+  `input.ollama_num_parallel` so Modal can serve the client-side remote concurrency window.
 - **GPU is off by default.** GPU on Modal must attach before ollama's discovery watchdog times out,
   or the box dies with exit 137 at cold start. CPU `serve` is the safe v1 path; pass `gpu` only if
   you've accepted that.
@@ -165,7 +170,7 @@ Provider gotchas baked into the recipe:
   (`"ollama serve"` would exec `ollama ollama serve`). `dockerArgs` sets the container CMD,
   appended to the entrypoint.
 - ollama defaults to `127.0.0.1:11434`, unreachable through the proxy — the recipe sets
-  `OLLAMA_HOST=0.0.0.0:11434` in the pod env.
+  `OLLAMA_HOST=0.0.0.0:11434` and `OLLAMA_NUM_PARALLEL` in the pod env.
 - There is **no in-pod exec** in `podFindAndDeployOnDemand`, so the model is pulled **client-side**
   over the proxy URL (`POST /api/pull`, non-streaming, retried until the pod finishes booting),
   then `/api/embed` is probed before the `ready` event.

@@ -102,11 +102,15 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
   }
   const apiKey = rawKey.trim();
   const gpuTypeId = input.gpu ?? DEFAULT_GPU_TYPE_ID;
+  const ollamaNumParallel = String(input.ollama_num_parallel ?? 1);
 
   // Unique pod name so a deploy-timeout orphan sweep can find a pod that RunPod created but whose
   // create-response we lost (see below). The instant suffix makes it unambiguous across runs.
   const podName = `${POD_NAME}-${Date.now()}`;
-  ctx.status("provisioning", `deploying RunPod pod (model=${input.model}, gpu=${gpuTypeId})`);
+  ctx.status(
+    "provisioning",
+    `deploying RunPod pod (model=${input.model}, gpu=${gpuTypeId}, parallel=${ollamaNumParallel})`,
+  );
 
   // Deploy the pod. dockerArgs="serve" → `ollama serve`; OLLAMA_HOST binds all interfaces;
   // ports "11434/http" exposes the proxy. No persistent volume (ephemeral box).
@@ -132,7 +136,10 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
           ports: `${OLLAMA_PORT}/http`,
           containerDiskInGb: CONTAINER_DISK_GB,
           volumeInGb: 0,
-          env: [{ key: "OLLAMA_HOST", value: `0.0.0.0:${OLLAMA_PORT}` }],
+          env: [
+            { key: "OLLAMA_HOST", value: `0.0.0.0:${OLLAMA_PORT}` },
+            { key: "OLLAMA_NUM_PARALLEL", value: ollamaNumParallel },
+          ],
         },
       },
       GRAPHQL_TIMEOUT_MS,

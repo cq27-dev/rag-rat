@@ -50,6 +50,16 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
     );
 
     text.push_str(
+        "# Remote Ollama embedding (optional; defaults shown; uncomment to offload \
+         embedding).\n# [llm.embedding.remote]\n# endpoint = \"http://localhost:11434\"\n# model = \
+         \"all-minilm\"          # Ollama-side model name for the selected embedding model\n# \
+         batch_size = 256          # texts per /api/embed request\n# concurrency = 32          # \
+         concurrent /api/embed requests\n# max_batch_chars = 384000 # max input chars per \
+         /api/embed request\n# request_timeout_s = 60\n# num_ctx = 4096            # optional \
+         Ollama context window\n\n",
+    );
+
+    text.push_str(
         "# Init wizard cookbook catalog (optional). These entries only affect `rag-rat init` \
          selectors;\n# runtime uses the selected `[llm.embedding.remote] cookbook` and `gpu` \
          strings verbatim.\n# [init.cookbooks.modal]\n# label = \"Modal\"\n# command = \

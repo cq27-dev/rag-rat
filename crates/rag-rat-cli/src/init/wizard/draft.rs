@@ -40,6 +40,10 @@ pub(crate) struct RemoteDraft {
     pub num_ctx: Option<u32>,
     /// How many texts per `/api/embed` request.
     pub batch_size: u32,
+    /// How many remote `/api/embed` requests to keep in flight.
+    pub concurrency: u32,
+    /// Maximum total input characters per `/api/embed` request.
+    pub max_batch_chars: usize,
     /// Name of the env-var holding the bearer token, if auth is needed.
     pub auth_env: Option<String>,
 }
@@ -436,6 +440,11 @@ impl WizardDraft {
                     },
                 }
                 t.insert("batch_size", toml_edit::value(i64::from(remote.batch_size)));
+                t.insert("concurrency", toml_edit::value(i64::from(remote.concurrency)));
+                t.insert(
+                    "max_batch_chars",
+                    toml_edit::value(i64::try_from(remote.max_batch_chars).unwrap_or(i64::MAX)),
+                );
                 if let Some(gpu) = &remote.gpu {
                     t.insert("gpu", toml_edit::value(gpu.clone()));
                 } else {
@@ -488,6 +497,8 @@ fn remote_draft_from_config(r: &RemoteEmbeddingConfig) -> RemoteDraft {
         gpu: r.gpu.clone(),
         num_ctx: r.num_ctx,
         batch_size: r.batch_size,
+        concurrency: r.concurrency,
+        max_batch_chars: r.max_batch_chars,
         auth_env: r.auth_env.clone(),
     }
 }
@@ -550,6 +561,18 @@ fn raw_remote_draft(doc: &DocumentMut) -> Option<RemoteDraft> {
         .and_then(Item::as_integer)
         .and_then(|n| u32::try_from(n).ok())
         .unwrap_or_else(|| RemoteEmbeddingConfig::default().batch_size);
+    let concurrency = remote
+        .get("concurrency")
+        .and_then(Item::as_integer)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or_else(|| RemoteEmbeddingConfig::default().concurrency)
+        .max(1);
+    let max_batch_chars = remote
+        .get("max_batch_chars")
+        .and_then(Item::as_integer)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or_else(|| RemoteEmbeddingConfig::default().max_batch_chars)
+        .max(1);
     Some(RemoteDraft {
         model,
         mode,
@@ -559,6 +582,8 @@ fn raw_remote_draft(doc: &DocumentMut) -> Option<RemoteDraft> {
             .and_then(Item::as_integer)
             .and_then(|n| u32::try_from(n).ok()),
         batch_size,
+        concurrency,
+        max_batch_chars,
         auth_env: string("auth_env"),
     })
 }
@@ -674,7 +699,8 @@ mod tests {
              [target_bindings]\nrust = [\"src\"]\n\n\
              [llm.embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\n\n\
              [llm.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
-             \"http://localhost:11434\"\nnum_ctx = 4096\nbatch_size = 64\n",
+             \"http://localhost:11434\"\nnum_ctx = 4096\nbatch_size = 64\nconcurrency = \
+             8\nmax_batch_chars = 96000\n",
         )
         .unwrap();
         let cfg = rag_rat_core::config::Config::load(&config_path).unwrap();
@@ -682,6 +708,8 @@ mod tests {
         let remote = d.remote.expect("remote block should be present");
         assert_eq!(remote.model, "all-minilm");
         assert_eq!(remote.num_ctx, Some(4096));
+        assert_eq!(remote.concurrency, 8);
+        assert_eq!(remote.max_batch_chars, 96_000);
         assert!(
             matches!(remote.mode, RemoteMode::Connect(ref ep) if ep == "http://localhost:11434")
         );
@@ -758,6 +786,8 @@ mod tests {
             gpu: None,
             num_ctx: None,
             batch_size: 128,
+            concurrency: 16,
+            max_batch_chars: 192_000,
             auth_env: Some("OLLAMA_TOKEN".to_string()),
         });
 
@@ -767,6 +797,8 @@ mod tests {
 
         assert_eq!(remote.get("cookbook").and_then(Item::as_str), Some("@rag-rat/cookbook modal"));
         assert_eq!(remote.get("batch_size").and_then(Item::as_integer), Some(128));
+        assert_eq!(remote.get("concurrency").and_then(Item::as_integer), Some(16));
+        assert_eq!(remote.get("max_batch_chars").and_then(Item::as_integer), Some(192_000));
         assert_eq!(remote.get("auth_env").and_then(Item::as_str), Some("OLLAMA_TOKEN"));
         assert_eq!(doc["version_check"]["enabled"].as_bool(), Some(false));
     }
@@ -786,6 +818,8 @@ mod tests {
             gpu: None,
             num_ctx: Some(4096),
             batch_size: 64,
+            concurrency: 12,
+            max_batch_chars: 144_000,
             auth_env: None,
         });
 
@@ -796,6 +830,8 @@ mod tests {
         assert_eq!(remote.get("endpoint").and_then(Item::as_str), Some("http://new:11434"));
         assert_eq!(remote.get("model").and_then(Item::as_str), Some("all-minilm"));
         assert_eq!(remote.get("num_ctx").and_then(Item::as_integer), Some(4096));
+        assert_eq!(remote.get("concurrency").and_then(Item::as_integer), Some(12));
+        assert_eq!(remote.get("max_batch_chars").and_then(Item::as_integer), Some(144_000));
         assert!(remote.get("cookbook").is_none());
     }
 

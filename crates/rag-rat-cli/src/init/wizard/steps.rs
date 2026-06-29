@@ -1747,6 +1747,8 @@ fn new_connect_remote(local_model: &str) -> RemoteDraft {
         gpu: None,
         num_ctx: None,
         batch_size: 256,
+        concurrency: RemoteEmbeddingConfig::default().concurrency,
+        max_batch_chars: RemoteEmbeddingConfig::default().max_batch_chars,
         auth_env: None,
     }
 }
@@ -1757,6 +1759,8 @@ fn new_connect_remote_from(local_model: &str, existing: Option<&RemoteDraft>) ->
         remote.model = preserved_server_model(local_model, existing);
         remote.num_ctx = existing.num_ctx;
         remote.batch_size = existing.batch_size;
+        remote.concurrency = existing.concurrency;
+        remote.max_batch_chars = existing.max_batch_chars;
         remote.auth_env = existing.auth_env.clone();
     }
     remote
@@ -1774,6 +1778,8 @@ fn new_ephemeral_remote_with_command(local_model: &str, cookbook: &str) -> Remot
         gpu: None,
         num_ctx: None,
         batch_size: 256,
+        concurrency: RemoteEmbeddingConfig::default().concurrency,
+        max_batch_chars: RemoteEmbeddingConfig::default().max_batch_chars,
         auth_env: None,
     }
 }
@@ -1789,6 +1795,8 @@ fn new_ephemeral_remote_from(
         remote.gpu = existing.gpu.clone();
         remote.num_ctx = existing.num_ctx;
         remote.batch_size = existing.batch_size;
+        remote.concurrency = existing.concurrency;
+        remote.max_batch_chars = existing.max_batch_chars;
         remote.auth_env = existing.auth_env.clone();
     }
     remote
@@ -2030,6 +2038,8 @@ fn remote_config_for(d: &RemoteDraft) -> RemoteEmbeddingConfig {
         gpu: d.gpu.clone(),
         num_ctx: d.num_ctx,
         batch_size: d.batch_size,
+        concurrency: d.concurrency,
+        max_batch_chars: d.max_batch_chars,
         request_timeout_s: RemoteEmbeddingConfig::default().request_timeout_s,
     }
 }
@@ -2706,6 +2716,8 @@ mod tests {
             gpu: None,
             num_ctx: Some(4096),
             batch_size: 17,
+            concurrency: 9,
+            max_batch_chars: 99_000,
             auth_env: Some("OLLAMA_TOKEN".to_string()),
         });
         state.step = Some(init_step(StepId::Embedding, &state));
@@ -2727,6 +2739,8 @@ mod tests {
         ));
         assert_eq!(remote.num_ctx, Some(4096));
         assert_eq!(remote.batch_size, 17);
+        assert_eq!(remote.concurrency, 9);
+        assert_eq!(remote.max_batch_chars, 99_000);
         assert_eq!(remote.auth_env.as_deref(), Some("OLLAMA_TOKEN"));
         assert!(matches!(state.probes.status(StepId::Embedding), ProbeStatus::Done {
             kind: ProbeKind::ConnectTest,

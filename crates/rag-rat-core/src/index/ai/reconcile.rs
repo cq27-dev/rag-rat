@@ -523,6 +523,9 @@ pub(crate) fn reconcile_with_options_progress(
         dim: embedding_dim,
         max_embedding_chars,
     };
+    let selection_batch_size = active_remote_config(conn)?
+        .map(|remote| remote_reconcile_batch_size(&remote, batch_size))
+        .unwrap_or(batch_size);
 
     // The chunk-embed embedder. For an EPHEMERAL active model on a provisioning reconcile, this
     // PROVISIONS a cookbook box (held by `_provisioned` for the whole loop — its `Drop` tears the
@@ -708,9 +711,9 @@ pub(crate) fn reconcile_with_options_progress(
             break;
         }
         let batch_limit = remaining
-            .map(|value| value.min(u64::try_from(batch_size).unwrap_or(u64::MAX)))
+            .map(|value| value.min(u64::try_from(selection_batch_size).unwrap_or(u64::MAX)))
             .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(batch_size);
+            .unwrap_or(selection_batch_size);
         // Pull the next batch of unprocessed candidate ids.
         let mut batch_ids = Vec::with_capacity(batch_limit);
         while cursor < candidate_ids.len() && batch_ids.len() < batch_limit {
@@ -838,6 +841,12 @@ pub(crate) fn reconcile_with_options_progress(
         blocked_chunks: report.blocked_chunks,
     });
     Ok(report)
+}
+
+fn remote_reconcile_batch_size(remote: &RemoteEmbeddingConfig, batch_size: usize) -> usize {
+    let remote_batch_size = (remote.batch_size as usize).max(1);
+    let concurrency = (remote.concurrency as usize).max(1);
+    batch_size.max(remote_batch_size.saturating_mul(concurrency))
 }
 
 pub(crate) fn embedding_policy_skip_summary(
@@ -1101,8 +1110,11 @@ mod manifest_idempotence_tests {
 #[cfg(test)]
 mod freshness_version_tests {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID};
@@ -1151,8 +1163,144 @@ mod freshness_version_tests {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
             request_timeout_s: 5,
         }
+    }
+
+    fn read_request_body(stream: &mut TcpStream) -> String {
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n");
+            if let Some(end) = header_end {
+                let headers = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                let content_len = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let body_start = end + 4;
+                while raw.len() < body_start + content_len {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                return String::from_utf8_lossy(&raw[body_start..body_start + content_len])
+                    .to_string();
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return String::new(),
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    fn raise_max(max_seen: &AtomicUsize, value: usize) {
+        let mut current = max_seen.load(Ordering::SeqCst);
+        while value > current {
+            match max_seen.compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn spawn_reconcile_embed_stub(
+        dim: usize,
+        max_conns: usize,
+        delay: Duration,
+    ) -> (String, thread::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::clone(&max_in_flight);
+        let handle = thread::spawn(move || {
+            let mut workers = Vec::new();
+            let mut accepted = 0usize;
+            let started = Instant::now();
+            let mut last_accept = started;
+            while accepted < max_conns
+                && started.elapsed() < Duration::from_secs(5)
+                && (accepted == 0 || last_accept.elapsed() < Duration::from_millis(500))
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepted += 1;
+                        last_accept = Instant::now();
+                        let in_flight = Arc::clone(&in_flight);
+                        let max_seen = Arc::clone(&max_seen);
+                        workers.push(thread::spawn(move || {
+                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            raise_max(&max_seen, now);
+                            let body = read_request_body(&mut stream);
+                            thread::sleep(delay);
+                            let inputs = body.matches("path: ").count().max(1);
+                            let vector = vec!["0.1"; dim].join(",");
+                            let rows = (0..inputs)
+                                .map(|_| format!("[{vector}]"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let response_body = format!("{{\"embeddings\":[{rows}]}}");
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: \
+                                 application/json\r\nContent-Length: {}\r\nConnection: \
+                                 close\r\n\r\n{response_body}",
+                                response_body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
+                        }));
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    },
+                    Err(_) => break,
+                }
+            }
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle, max_in_flight)
+    }
+
+    fn seed_embedding_chunk(conn: &Connection, i: i64) {
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES (?1, 'rust', 'source', ?2, 0, 0)",
+            params![format!("src/file_{i}.rs"), format!("sha-{i}")],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        let text = format!(
+            "pub fn item_{i}(input: usize) -> usize {{\n    let mut value = input + {i};\n    for \
+             step in 0..16 {{ value = value.saturating_add(step); }}\n    value\n}}"
+        );
+        conn.execute(
+            "INSERT INTO chunks(
+                 file_id, chunk_kind, symbol_path, start_byte, end_byte, start_line, end_line,
+                 text_hash, source_revision
+             )
+             VALUES (?1, 'code', ?2, 0, ?3, 1, 3, ?4, ?5)",
+            params![
+                file_id,
+                format!("crate::item_{i}"),
+                i64::try_from(text.len()).unwrap(),
+                format!("hash-{i}"),
+                format!("rev-{i}")
+            ],
+        )
+        .unwrap();
+        let chunk_id = conn.last_insert_rowid();
+        crate::index::chunk_text_store::seed_chunk_text(conn, chunk_id, &text).unwrap();
     }
 
     fn active_version(conn: &Connection) -> String {
@@ -1179,6 +1327,52 @@ mod freshness_version_tests {
             active_version(&conn),
             spec.version,
             "remote key differs from the local version"
+        );
+    }
+
+    #[test]
+    fn remote_reconcile_accumulates_enough_work_to_fill_concurrent_embedder_window() {
+        let conn = schema_conn();
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        for i in 0..4 {
+            seed_embedding_chunk(&conn, i);
+        }
+        let (url, handle, max_in_flight) =
+            spawn_reconcile_embed_stub(spec.dim, 4, Duration::from_millis(150));
+        let mut remote = remote_at(&url);
+        remote.batch_size = 1;
+        remote.concurrency = 4;
+        set_active_remote_config(&conn, &remote).unwrap();
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2, runtime = \
+             'ollama'
+             WHERE model_id = ?1",
+            params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
+        )
+        .unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_reconcile_meta(
+            &conn,
+            ACTIVE_EMBEDDING_MODEL_VERSION_META,
+            &remote_freshness_version(spec, &remote),
+        )
+        .unwrap();
+
+        let report = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions { batch_size: Some(1), ..ReconcileOptions::default() },
+            |_| {},
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(report.batch_size, 1, "public/report batch size is preserved");
+        assert_eq!(report.embeddings_written, 4);
+        assert_eq!(report.failed_chunks, 0);
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) > 1,
+            "remote reconcile should hand multiple ordered texts to one concurrent embedder call"
         );
     }
 
@@ -1408,6 +1602,8 @@ mod freshness_version_tests {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
             request_timeout_s: 5,
         };
         set_active_remote_config(conn, &remote).unwrap();

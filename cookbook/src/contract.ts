@@ -92,6 +92,11 @@ export interface CookbookInput {
    * null/omitted for the recipe's default. CPU is the safe default where the provider supports it.
    */
   readonly gpu?: string | null;
+  /**
+   * Ollama server parallelism to set as OLLAMA_NUM_PARALLEL. rag-rat sends this from the remote
+   * embedding `concurrency` knob so server-side request handling can match the client window.
+   */
+  readonly ollama_num_parallel?: number | null;
 }
 
 /**
@@ -205,6 +210,10 @@ export function readInput(): CookbookInput {
   // like "60" would slip through to budget arithmetic as NaN and break every poll loop.
   const provisionTimeout = optionalPositiveNumber(obj["provision_timeout_s"], "provision_timeout_s");
   const requestTimeout = optionalPositiveNumber(obj["request_timeout_s"], "request_timeout_s");
+  const ollamaNumParallel = optionalPositiveInteger(
+    obj["ollama_num_parallel"],
+    "ollama_num_parallel",
+  );
 
   // gpu: optional; if present must be a string (provider spec) or null.
   const gpu = obj["gpu"];
@@ -217,6 +226,7 @@ export function readInput(): CookbookInput {
     ...(provisionTimeout !== undefined ? { provision_timeout_s: provisionTimeout } : {}),
     ...(requestTimeout !== undefined ? { request_timeout_s: requestTimeout } : {}),
     ...(typeof gpu === "string" ? { gpu } : gpu === null ? { gpu: null } : {}),
+    ...(ollamaNumParallel !== undefined ? { ollama_num_parallel: ollamaNumParallel } : {}),
   };
   return result;
 }
@@ -228,6 +238,16 @@ function optionalPositiveNumber(value: unknown, field: string): number | undefin
     throw new Error(`${COOKBOOK_INPUT_ENV}.${field} must be a positive number (got ${describe(value)}).`);
   }
   return value;
+}
+
+/** Validates an optional positive integer field; returns the number, or undefined if absent/null. */
+function optionalPositiveInteger(value: unknown, field: string): number | undefined {
+  const number = optionalPositiveNumber(value, field);
+  if (number === undefined) return undefined;
+  if (!Number.isInteger(number)) {
+    throw new Error(`${COOKBOOK_INPUT_ENV}.${field} must be a positive integer (got ${describe(value)}).`);
+  }
+  return number;
 }
 
 function describe(v: unknown): string {

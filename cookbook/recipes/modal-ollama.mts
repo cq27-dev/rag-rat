@@ -69,8 +69,12 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   // leaked box bills until then.) See N2.
   const deadline = Date.now() + provisionTimeoutMs;
   const gpu = input.gpu ?? null;
+  const ollamaNumParallel = String(input.ollama_num_parallel ?? 1);
 
-  ctx.status("provisioning", `creating Modal sandbox (model=${input.model}, gpu=${gpu ?? "cpu"})`);
+  ctx.status(
+    "provisioning",
+    `creating Modal sandbox (model=${input.model}, gpu=${gpu ?? "cpu"}, parallel=${ollamaNumParallel})`,
+  );
 
   // Creds resolve from env (MODAL_TOKEN_ID/MODAL_TOKEN_SECRET) or ~/.modal.toml.
   const modal = new ModalClient();
@@ -99,7 +103,10 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
       createRef.promise = modal.sandboxes.create(app, image, {
         name: sandboxName,
         command: ["serve"],
-        env: { OLLAMA_HOST: `0.0.0.0:${OLLAMA_PORT}` },
+        env: {
+          OLLAMA_HOST: `0.0.0.0:${OLLAMA_PORT}`,
+          OLLAMA_NUM_PARALLEL: ollamaNumParallel,
+        },
         encryptedPorts: [OLLAMA_PORT],
         readinessProbe: Probe.withTcp(OLLAMA_PORT, { intervalMs: 1000 }),
         timeoutMs: BOX_MAX_LIFETIME_MS,

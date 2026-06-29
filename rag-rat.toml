@@ -18,6 +18,8 @@ endpoint = "http://localhost:11434"   # this box's Ollama server
 model = "all-minilm"                  # the Ollama-side model name
 num_ctx = 4096                        # Ollama context window for code chunks
 batch_size = 32                       # texts per /api/embed request
+concurrency = 32                      # concurrent /api/embed requests
+max_batch_chars = 384000              # max input chars per /api/embed request
 # To EPHEMERALLY provision a box instead, drop `endpoint` and set `cookbook` (see docs/config.md).
 # Only then may you pick the GPU (a connect endpoint + gpu is rejected):
 # gpu = "A10G"                        # cookbook-only; Modal GPU class / RunPod gpuTypeId
