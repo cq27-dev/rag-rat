@@ -120,6 +120,7 @@ pub(crate) fn can_write(checks: &[CheckResult]) -> bool {
 }
 
 const ONE_LINE_FIELD_OUTER_HEIGHT: u16 = 3;
+const REMOTE_BATCH_SIZE_MAX: u32 = 4096;
 
 // ── per-step state ─────────────────────────────────────────────────────────────
 
@@ -132,6 +133,8 @@ pub(crate) enum EmbedFocus {
     ServerModel,
     Gpu,
     BatchSize,
+    Concurrency,
+    MaxBatchChars,
     AuthEnv,
     ProvisionConfirm,
 }
@@ -1108,6 +1111,12 @@ fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
     let m = remote.map_or("", |r| r.model.as_str());
     let g = remote.and_then(|r| r.gpu.as_deref()).unwrap_or("");
     let bs = remote.map_or(256, |r| r.batch_size).to_string();
+    let concurrency = remote
+        .map_or_else(|| RemoteEmbeddingConfig::default().concurrency, |r| r.concurrency)
+        .to_string();
+    let max_batch_chars = remote
+        .map_or_else(|| RemoteEmbeddingConfig::default().max_batch_chars, |r| r.max_batch_chars)
+        .to_string();
     let auth = remote.and_then(|r| r.auth_env.as_deref()).unwrap_or("");
 
     let dim = |f: EmbedFocus| if *focus == f { theme::focused_border() } else { theme::border() };
@@ -1195,28 +1204,55 @@ fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
 
     if rmode == 2 {
         let bottom = Layout::horizontal([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
         ])
         .split(right[3]);
         f.render_widget(one_line_field(&bs, "batch", dim(EmbedFocus::BatchSize)), bottom[0]);
-        f.render_widget(one_line_field(auth, "auth env", dim(EmbedFocus::AuthEnv)), bottom[1]);
+        f.render_widget(
+            one_line_field(&concurrency, "parallel", dim(EmbedFocus::Concurrency)),
+            bottom[1],
+        );
+        f.render_widget(
+            one_line_field(&max_batch_chars, "chars", dim(EmbedFocus::MaxBatchChars)),
+            bottom[2],
+        );
+        f.render_widget(one_line_field(auth, "auth env", dim(EmbedFocus::AuthEnv)), bottom[3]);
         let confirm = if provision_confirm_satisfied(&state.ui) {
             "ready"
         } else {
             state.ui.provision_confirm.as_str()
         };
-        let confirm_title = format!("type: {PROVISION_CONFIRM_WORD}");
+        let confirm_title = if bottom[4].width >= (PROVISION_CONFIRM_WORD.len() as u16 + 8) {
+            format!("type: {PROVISION_CONFIRM_WORD}")
+        } else {
+            PROVISION_CONFIRM_WORD.to_string()
+        };
         f.render_widget(
             one_line_field(confirm, &confirm_title, dim(EmbedFocus::ProvisionConfirm)),
-            bottom[2],
+            bottom[4],
         );
     } else {
-        let bottom =
-            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(right[3]);
+        let bottom = Layout::horizontal([
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+        ])
+        .split(right[3]);
         f.render_widget(one_line_field(&bs, "batch", dim(EmbedFocus::BatchSize)), bottom[0]);
-        f.render_widget(one_line_field(auth, "auth env", dim(EmbedFocus::AuthEnv)), bottom[1]);
+        f.render_widget(
+            one_line_field(&concurrency, "parallel", dim(EmbedFocus::Concurrency)),
+            bottom[1],
+        );
+        f.render_widget(
+            one_line_field(&max_batch_chars, "max chars", dim(EmbedFocus::MaxBatchChars)),
+            bottom[2],
+        );
+        f.render_widget(one_line_field(auth, "auth env", dim(EmbedFocus::AuthEnv)), bottom[3]);
     }
 }
 
@@ -1478,6 +1514,8 @@ fn embed_focus_order(rmode: usize, model_none: bool) -> &'static [EmbedFocus] {
         EmbedFocus::Endpoint,
         EmbedFocus::ServerModel,
         EmbedFocus::BatchSize,
+        EmbedFocus::Concurrency,
+        EmbedFocus::MaxBatchChars,
         EmbedFocus::AuthEnv,
     ];
     const EPHEMERAL: &[EmbedFocus] = &[
@@ -1487,6 +1525,8 @@ fn embed_focus_order(rmode: usize, model_none: bool) -> &'static [EmbedFocus] {
         EmbedFocus::Gpu,
         EmbedFocus::ServerModel,
         EmbedFocus::BatchSize,
+        EmbedFocus::Concurrency,
+        EmbedFocus::MaxBatchChars,
         EmbedFocus::AuthEnv,
         EmbedFocus::ProvisionConfirm,
     ];
@@ -1532,8 +1572,8 @@ fn move_embedding_cursor(state: &mut WizardState, delta: isize) {
         Some(f) => f,
         None => return,
     };
-    if focus == EmbedFocus::BatchSize {
-        adjust_batch_size(state, delta);
+    if remote_numeric_focus(focus) {
+        adjust_remote_numeric(state, focus, delta);
         return;
     }
     let cookbook_len = cookbook_choices(state).len();
@@ -1810,16 +1850,19 @@ fn preserved_server_model(local_model: &str, existing: &RemoteDraft) -> String {
     }
 }
 
-fn adjust_batch_size(state: &mut WizardState, delta: isize) {
+fn remote_numeric_focus(focus: EmbedFocus) -> bool {
+    matches!(focus, EmbedFocus::BatchSize | EmbedFocus::Concurrency | EmbedFocus::MaxBatchChars)
+}
+
+fn adjust_remote_numeric(state: &mut WizardState, focus: EmbedFocus, delta: isize) {
     let changed = {
         let Some(remote) = &mut state.draft.remote else { return };
-        let current = remote.batch_size as isize;
-        let next = current.saturating_add(delta).clamp(1, 4096) as u32;
-        if remote.batch_size == next {
-            false
-        } else {
-            remote.batch_size = next;
-            true
+        match focus {
+            EmbedFocus::BatchSize =>
+                adjust_u32(&mut remote.batch_size, delta, 1, REMOTE_BATCH_SIZE_MAX),
+            EmbedFocus::Concurrency => adjust_u32(&mut remote.concurrency, delta, 1, u32::MAX),
+            EmbedFocus::MaxBatchChars => adjust_usize(&mut remote.max_batch_chars, delta, 1),
+            _ => false,
         }
     };
     if changed {
@@ -1827,11 +1870,35 @@ fn adjust_batch_size(state: &mut WizardState, delta: isize) {
     }
 }
 
+fn adjust_u32(value: &mut u32, delta: isize, min: u32, max: u32) -> bool {
+    let before = *value;
+    let next = if delta >= 0 {
+        value.saturating_add(delta as u32).min(max)
+    } else {
+        let magnitude = u32::try_from(delta.unsigned_abs()).unwrap_or(u32::MAX);
+        value.saturating_sub(magnitude).max(min)
+    };
+    *value = next;
+    before != next
+}
+
+fn adjust_usize(value: &mut usize, delta: isize, min: usize) -> bool {
+    let before = *value;
+    let next = if delta >= 0 {
+        value.saturating_add(delta as usize)
+    } else {
+        value.saturating_sub(delta.unsigned_abs()).max(min)
+    };
+    *value = next;
+    before != next
+}
+
 fn edit_embedding_field(key: KeyEvent, state: &mut WizardState) -> bool {
     let Some(focus) = embed_focus(state) else { return false };
     match focus {
         EmbedFocus::Endpoint => edit_endpoint(key, state),
-        EmbedFocus::BatchSize => edit_batch_size(key, state),
+        EmbedFocus::BatchSize | EmbedFocus::Concurrency | EmbedFocus::MaxBatchChars =>
+            edit_remote_numeric(focus, key, state),
         EmbedFocus::AuthEnv => edit_auth_env(key, state),
         EmbedFocus::ProvisionConfirm => edit_provision_confirm(key, state),
         _ => false,
@@ -1867,26 +1934,63 @@ fn edit_endpoint(key: KeyEvent, state: &mut WizardState) -> bool {
     }
 }
 
-fn edit_batch_size(key: KeyEvent, state: &mut WizardState) -> bool {
+fn edit_remote_numeric(focus: EmbedFocus, key: KeyEvent, state: &mut WizardState) -> bool {
     let Some(remote) = &mut state.draft.remote else { return false };
-    match key.code {
-        KeyCode::Backspace => {
-            remote.batch_size /= 10;
-            if remote.batch_size == 0 {
-                remote.batch_size = 1;
-            }
-            state.probes.bump(StepId::Embedding);
-            true
+    let changed = match key.code {
+        KeyCode::Backspace => match focus {
+            EmbedFocus::BatchSize => {
+                let before = remote.batch_size;
+                remote.batch_size = (remote.batch_size / 10).max(1);
+                before != remote.batch_size
+            },
+            EmbedFocus::Concurrency => {
+                let before = remote.concurrency;
+                remote.concurrency = (remote.concurrency / 10).max(1);
+                before != remote.concurrency
+            },
+            EmbedFocus::MaxBatchChars => {
+                let before = remote.max_batch_chars;
+                remote.max_batch_chars = (remote.max_batch_chars / 10).max(1);
+                before != remote.max_batch_chars
+            },
+            _ => return false,
         },
         KeyCode::Char(c) if c.is_ascii_digit() => {
             let digit = c.to_digit(10).unwrap_or(0);
-            remote.batch_size =
-                remote.batch_size.saturating_mul(10).saturating_add(digit).clamp(1, 4096);
-            state.probes.bump(StepId::Embedding);
-            true
+            match focus {
+                EmbedFocus::BatchSize => {
+                    let before = remote.batch_size;
+                    remote.batch_size = remote
+                        .batch_size
+                        .saturating_mul(10)
+                        .saturating_add(digit)
+                        .clamp(1, REMOTE_BATCH_SIZE_MAX);
+                    before != remote.batch_size
+                },
+                EmbedFocus::Concurrency => {
+                    let before = remote.concurrency;
+                    remote.concurrency =
+                        remote.concurrency.saturating_mul(10).saturating_add(digit).max(1);
+                    before != remote.concurrency
+                },
+                EmbedFocus::MaxBatchChars => {
+                    let before = remote.max_batch_chars;
+                    remote.max_batch_chars = remote
+                        .max_batch_chars
+                        .saturating_mul(10)
+                        .saturating_add(digit as usize)
+                        .max(1);
+                    before != remote.max_batch_chars
+                },
+                _ => return false,
+            }
         },
-        _ => false,
+        _ => return false,
+    };
+    if changed {
+        state.probes.bump(StepId::Embedding);
     }
+    true
 }
 
 fn edit_auth_env(key: KeyEvent, state: &mut WizardState) -> bool {
@@ -2912,6 +3016,37 @@ mod tests {
     }
 
     #[test]
+    fn embedding_remote_tuning_fields_are_focusable_and_editable() {
+        let mut state = empty_state();
+        state.draft.remote = Some(new_connect_remote(&state.draft.model));
+        state.step = Some(init_step(StepId::Embedding, &state));
+        let probe_id = state.probes.current(StepId::Embedding);
+        assert!(state.probes.apply(ProbeMsg {
+            probe_id,
+            kind: ProbeKind::ConnectTest,
+            result: CheckResult::ok(),
+        }));
+
+        while embed_focus(&state) != Some(EmbedFocus::Concurrency) {
+            step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        }
+        step_handle_key(StepId::Embedding, key(KeyCode::Char('4')), &mut state);
+        assert_eq!(state.draft.remote.as_ref().unwrap().concurrency, 324);
+        assert!(matches!(state.probes.status(StepId::Embedding), ProbeStatus::Idle));
+
+        while embed_focus(&state) != Some(EmbedFocus::MaxBatchChars) {
+            step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        }
+        step_handle_key(StepId::Embedding, key(KeyCode::Backspace), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Up), &mut state);
+        assert_eq!(state.draft.remote.as_ref().unwrap().max_batch_chars, 38_399);
+
+        let remote = remote_config_for(state.draft.remote.as_ref().unwrap());
+        assert_eq!(remote.concurrency, 324);
+        assert_eq!(remote.max_batch_chars, 38_399);
+    }
+
+    #[test]
     fn embedding_provision_ignores_duplicate_running_probe() {
         use std::sync::mpsc::sync_channel;
 
@@ -3056,6 +3191,8 @@ mod tests {
             EmbedFocus::Gpu,
             EmbedFocus::ServerModel,
             EmbedFocus::BatchSize,
+            EmbedFocus::Concurrency,
+            EmbedFocus::MaxBatchChars,
             EmbedFocus::AuthEnv,
             EmbedFocus::ProvisionConfirm,
         ] {
@@ -3131,7 +3268,7 @@ mod tests {
     }
 
     #[test]
-    fn embedding_batch_and_auth_fields_have_one_content_row() {
+    fn embedding_remote_fields_have_one_content_row() {
         let mut state = empty_state();
         let mut remote = new_ephemeral_remote(&state.draft.model);
         remote.auth_env = Some("RR_AUTH".to_string());
@@ -3145,10 +3282,12 @@ mod tests {
         let bottom = row_segment(&cells, batch_y + 2, 45, 55);
 
         assert!(content.contains("256"));
+        assert!(content.contains("32"));
+        assert!(content.contains("384000"));
         assert!(content.contains("RR_AUTH"));
         assert!(bottom.contains('└'));
         assert!(bottom.contains('┘'));
-        assert!(screen_text(&cells).contains("type: provision"));
+        assert!(screen_text(&cells).contains("provision"));
     }
 
     #[test]
