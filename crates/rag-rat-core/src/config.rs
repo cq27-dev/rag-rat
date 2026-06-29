@@ -286,10 +286,10 @@ pub struct RemoteEmbeddingConfig {
     pub batch_size: u32,
     /// How many `/api/embed` requests the remote embedder may keep in flight.
     ///
-    /// `#[serde(default)]`: this field post-dates the meta round-trip, so a config JSON persisted
-    /// by an older binary (no `concurrency` key) must still deserialize with the default instead
-    /// of erroring.
-    #[serde(default = "default_remote_embedding_concurrency")]
+    /// `#[serde(default)]`: this field post-dates the meta round-trip. Older persisted remote meta
+    /// has no mode-aware TOML context, so deserialize it as single-flight instead of making an
+    /// existing connect endpoint fan out 32 requests after upgrade.
+    #[serde(default = "legacy_remote_embedding_concurrency")]
     pub concurrency: u32,
     /// Maximum total input characters to include in one `/api/embed` request.
     ///
@@ -305,10 +305,11 @@ pub struct RemoteEmbeddingConfig {
 /// The default LOCAL Ollama URL for ephemeral query embedding when `query_endpoint` is omitted.
 pub const DEFAULT_QUERY_ENDPOINT: &str = "http://localhost:11434";
 const DEFAULT_REMOTE_EMBEDDING_CONCURRENCY: u32 = 32;
+const LEGACY_REMOTE_EMBEDDING_CONCURRENCY: u32 = 1;
 const DEFAULT_REMOTE_EMBEDDING_MAX_BATCH_CHARS: usize = 384_000;
 
-fn default_remote_embedding_concurrency() -> u32 {
-    DEFAULT_REMOTE_EMBEDDING_CONCURRENCY
+fn legacy_remote_embedding_concurrency() -> u32 {
+    LEGACY_REMOTE_EMBEDDING_CONCURRENCY
 }
 
 fn default_remote_embedding_max_batch_chars() -> usize {
@@ -334,6 +335,20 @@ impl Default for RemoteEmbeddingConfig {
 }
 
 impl RemoteEmbeddingConfig {
+    /// Default for a missing TOML `concurrency` field after the mode has been inferred.
+    ///
+    /// Connect-mode configs may point at ordinary Ollama servers that were not started with
+    /// matching `OLLAMA_NUM_PARALLEL`, so omitted connect concurrency stays single-flight. Cookbook
+    /// configs are provisioned by rag-rat recipes that align server-side parallelism, so omitted
+    /// ephemeral configs use the new parallel default.
+    pub fn omitted_concurrency_default(is_connect: bool) -> u32 {
+        if is_connect {
+            LEGACY_REMOTE_EMBEDDING_CONCURRENCY
+        } else {
+            DEFAULT_REMOTE_EMBEDDING_CONCURRENCY
+        }
+    }
+
     /// CONNECT mode: an already-running server at `endpoint`. Exactly one of connect/ephemeral
     /// holds (config validation guarantees it), so `is_connect() == !is_ephemeral()`.
     pub fn is_connect(&self) -> bool {
@@ -953,6 +968,7 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
         if matches!(raw.num_ctx, Some(0)) {
             return Err(ConfigError::RemoteEmbeddingInvalidNumCtx);
         }
+        let is_connect = endpoint.is_some();
         Ok(Self {
             model: model.to_string(),
             endpoint,
@@ -962,7 +978,10 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
             gpu,
             num_ctx: raw.num_ctx,
             batch_size: raw.batch_size.unwrap_or(default.batch_size),
-            concurrency: raw.concurrency.unwrap_or(default.concurrency).max(1),
+            concurrency: raw
+                .concurrency
+                .unwrap_or_else(|| RemoteEmbeddingConfig::omitted_concurrency_default(is_connect))
+                .max(1),
             max_batch_chars: raw.max_batch_chars.unwrap_or(default.max_batch_chars).max(1),
             request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
         })
@@ -1434,7 +1453,7 @@ mod tests {
                 num_ctx: None,
                 // defaults applied when omitted
                 batch_size: 256,
-                concurrency: 32,
+                concurrency: 1,
                 max_batch_chars: 384_000,
                 request_timeout_s: 60,
             })
@@ -1472,6 +1491,7 @@ mod tests {
         assert_eq!(remote.cookbook.as_deref(), Some("@rag-rat/cookbook/modal"));
         assert_eq!(remote.endpoint, None);
         assert_eq!(remote.query_endpoint.as_deref(), Some(DEFAULT_QUERY_ENDPOINT));
+        assert_eq!(remote.concurrency, 32);
     }
 
     #[test]
@@ -1639,7 +1659,7 @@ mod tests {
     }
 
     #[test]
-    fn older_remote_embedding_meta_json_deserializes_with_new_defaults() {
+    fn older_remote_embedding_meta_json_deserializes_with_legacy_safe_defaults() {
         let json = r#"{
             "model": "all-minilm",
             "endpoint": "http://localhost:11434",
@@ -1652,7 +1672,7 @@ mod tests {
             "request_timeout_s": 60
         }"#;
         let remote: RemoteEmbeddingConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(remote.concurrency, 32);
+        assert_eq!(remote.concurrency, 1);
         assert_eq!(remote.max_batch_chars, 384_000);
     }
 

@@ -524,7 +524,7 @@ pub(crate) fn reconcile_with_options_progress(
         max_embedding_chars,
     };
     let selection_batch_size = active_remote_config(conn)?
-        .map(|remote| remote_reconcile_batch_size(&remote, batch_size))
+        .map(|remote| remote_reconcile_batch_size(&remote, batch_size, options.max_seconds))
         .unwrap_or(batch_size);
 
     // The chunk-embed embedder. For an EPHEMERAL active model on a provisioning reconcile, this
@@ -843,7 +843,14 @@ pub(crate) fn reconcile_with_options_progress(
     Ok(report)
 }
 
-fn remote_reconcile_batch_size(remote: &RemoteEmbeddingConfig, batch_size: usize) -> usize {
+fn remote_reconcile_batch_size(
+    remote: &RemoteEmbeddingConfig,
+    batch_size: usize,
+    max_seconds: Option<u64>,
+) -> usize {
+    if max_seconds.is_some() {
+        return batch_size.max(1);
+    }
     let remote_batch_size = (remote.batch_size as usize).max(1);
     let concurrency = (remote.concurrency as usize).max(1);
     batch_size.max(remote_batch_size.saturating_mul(concurrency))
@@ -1374,6 +1381,16 @@ mod freshness_version_tests {
             max_in_flight.load(Ordering::SeqCst) > 1,
             "remote reconcile should hand multiple ordered texts to one concurrent embedder call"
         );
+    }
+
+    #[test]
+    fn remote_reconcile_keeps_caller_batch_size_when_time_bounded() {
+        let mut remote = remote_at("http://localhost:11434");
+        remote.batch_size = 256;
+        remote.concurrency = 32;
+
+        assert_eq!(remote_reconcile_batch_size(&remote, 8, Some(1)), 8);
+        assert_eq!(remote_reconcile_batch_size(&remote, 8, None), 8192);
     }
 
     #[test]

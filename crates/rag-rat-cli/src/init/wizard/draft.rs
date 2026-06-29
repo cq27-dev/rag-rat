@@ -565,7 +565,12 @@ fn raw_remote_draft(doc: &DocumentMut) -> Option<RemoteDraft> {
         .get("concurrency")
         .and_then(Item::as_integer)
         .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or_else(|| RemoteEmbeddingConfig::default().concurrency)
+        .unwrap_or_else(|| {
+            RemoteEmbeddingConfig::omitted_concurrency_default(matches!(
+                &mode,
+                RemoteMode::Connect(_)
+            ))
+        })
         .max(1);
     let max_batch_chars = remote
         .get("max_batch_chars")
@@ -897,7 +902,36 @@ mod tests {
             d.remote.as_ref().map(|remote| &remote.mode),
             Some(RemoteMode::Ephemeral(cookbook)) if cookbook == "./recipe.mjs"
         ));
+        assert_eq!(d.remote.as_ref().map(|remote| remote.concurrency), Some(32));
         assert_eq!(remote.get("cookbook").and_then(Item::as_str), Some("./recipe.mjs"));
+        assert_eq!(remote.get("concurrency").and_then(Item::as_integer), Some(32));
+    }
+
+    #[test]
+    fn from_existing_defaults_legacy_connect_concurrency_to_single_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let config_path = dir.path().join("rag-rat.toml");
+        let raw = "[index]\nroot = \".\"\n[target_bindings]\nrust = \
+                   [\"src\"]\n[llm.embedding]\nmodel = \
+                   \"sentence-transformers/all-MiniLM-L6-v2\"\n[llm.embedding.remote]\nmodel = \
+                   \"all-minilm\"\nendpoint = \"http://localhost:11434\"\n";
+        std::fs::write(&config_path, raw).unwrap();
+        let cfg = Config::load(&config_path).unwrap();
+        assert_eq!(cfg.llm.embedding.remote.as_ref().unwrap().concurrency, 1);
+
+        let d = WizardDraft::from_existing(raw, &cfg, &config_path);
+        let out = d.patch_existing(raw).unwrap();
+        let doc: DocumentMut = out.parse().unwrap();
+        let remote = doc["llm"]["embedding"]["remote"].as_table_like().unwrap();
+
+        assert!(matches!(
+            d.remote.as_ref().map(|remote| &remote.mode),
+            Some(RemoteMode::Connect(endpoint)) if endpoint == "http://localhost:11434"
+        ));
+        assert_eq!(d.remote.as_ref().map(|remote| remote.concurrency), Some(1));
+        assert_eq!(remote.get("endpoint").and_then(Item::as_str), Some("http://localhost:11434"));
+        assert_eq!(remote.get("concurrency").and_then(Item::as_integer), Some(1));
     }
 
     #[test]
