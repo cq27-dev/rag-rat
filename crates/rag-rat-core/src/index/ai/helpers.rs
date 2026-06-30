@@ -524,6 +524,8 @@ mod tests {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
             request_timeout_s: 60,
         }
     }
@@ -619,6 +621,8 @@ mod tests {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
             request_timeout_s: 2,
         };
         set_active_remote_config(&conn, &remote).unwrap();

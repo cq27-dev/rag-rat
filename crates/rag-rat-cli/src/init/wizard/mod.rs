@@ -807,6 +807,8 @@ mod tests {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: rag_rat_core::config::RemoteEmbeddingConfig::default().concurrency,
+            max_batch_chars: rag_rat_core::config::RemoteEmbeddingConfig::default().max_batch_chars,
             auth_env: None,
         });
         w.state.checks[StepId::Embedding.index()] = steps::CheckResult::ok();
@@ -863,6 +865,8 @@ mod tests {
             gpu: None,
             num_ctx: None,
             batch_size: 256,
+            concurrency: rag_rat_core::config::RemoteEmbeddingConfig::default().concurrency,
+            max_batch_chars: rag_rat_core::config::RemoteEmbeddingConfig::default().max_batch_chars,
             auth_env: None,
         });
         w.state.ui.ephemeral_keep_acknowledged = true;
