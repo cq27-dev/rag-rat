@@ -8,6 +8,8 @@ use crate::embedding_models::{Backend, EMBEDDING_MODELS, HASH_MODEL_ID, spec};
 #[cfg(feature = "fastembed")]
 use crate::embedding_models::{FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID};
 
+const RECONCILE_SELECT_ID_BATCH_LIMIT: usize = 900;
+
 pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
     // Read-first: skip the (write-locking) DML entirely when the manifest already matches what we
     // would write. `ensure_model_manifest` runs on EVERY `IndexDatabase::open*`, so issuing
@@ -710,29 +712,44 @@ pub(crate) fn reconcile_with_options_progress(
             ));
             break;
         }
-        let batch_limit = remaining
+        let window_limit = remaining
             .map(|value| value.min(u64::try_from(selection_batch_size).unwrap_or(u64::MAX)))
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(selection_batch_size);
-        // Pull the next batch of unprocessed candidate ids.
-        let mut batch_ids = Vec::with_capacity(batch_limit);
-        while cursor < candidate_ids.len() && batch_ids.len() < batch_limit {
-            let id = candidate_ids[cursor];
-            cursor += 1;
-            if !processed_ids.contains(&id) {
-                batch_ids.push(id);
+        // Pull the next ordered embed window while keeping each DB lookup under SQLite's default
+        // bind-variable limit. Selected jobs are appended in candidate order, so remote reconcile
+        // still hands the embedder one window large enough to fill its HTTP concurrency.
+        let mut window_jobs = Vec::new();
+        let mut ids_seen = 0usize;
+        while cursor < candidate_ids.len() && ids_seen < window_limit {
+            let id_limit = RECONCILE_SELECT_ID_BATCH_LIMIT.min(window_limit - ids_seen);
+            let mut batch_ids = Vec::with_capacity(id_limit);
+            while cursor < candidate_ids.len()
+                && batch_ids.len() < id_limit
+                && ids_seen < window_limit
+            {
+                let id = candidate_ids[cursor];
+                cursor += 1;
+                ids_seen = ids_seen.saturating_add(1);
+                if !processed_ids.contains(&id) {
+                    batch_ids.push(id);
+                }
             }
+            if batch_ids.is_empty() {
+                break;
+            }
+            let selected = select_reconcile_batch(conn, &scan, &batch_ids, &options, &mut decoder)?;
+            window_jobs.extend(selected.jobs);
         }
-        if batch_ids.is_empty() {
-            break; // candidate list exhausted
-        }
-        let selected = select_reconcile_batch(conn, &scan, &batch_ids, &options, &mut decoder)?;
-        if selected.jobs.is_empty() {
-            // Every id in this batch was filtered (ineligible/already current); keep walking the
+        if window_jobs.is_empty() {
+            if cursor >= candidate_ids.len() {
+                break; // candidate list exhausted
+            }
+            // Every id in this window was filtered (ineligible/already current); keep walking the
             // rest of the candidate list rather than stopping.
             continue;
         }
-        for job in &selected.jobs {
+        for job in &window_jobs {
             processed_ids.insert(job.id);
             *report.work_reasons.entry(job.reason.as_str().to_string()).or_default() += 1;
             report.input_chars = report
@@ -742,10 +759,10 @@ pub(crate) fn reconcile_with_options_progress(
                 report.truncated_inputs += 1;
             }
         }
-        let jobs_len = selected.jobs.len();
+        let jobs_len = window_jobs.len();
         let mut reused_jobs = Vec::new();
         let mut to_embed_jobs = Vec::new();
-        for job in selected.jobs {
+        for job in window_jobs {
             match find_existing_embedding(conn, &active_model_id, &job.input_hash, embedding_dim)? {
                 Some(vector) => reused_jobs.push((job, vector)),
                 None => to_embed_jobs.push(job),
@@ -820,7 +837,7 @@ fn remote_reconcile_batch_size(
         return batch_size.max(1);
     }
     let remote_batch_size = (remote.batch_size as usize).max(1);
-    let concurrency = (remote.concurrency as usize).max(1);
+    let concurrency = remote.bounded_concurrency() as usize;
     batch_size.max(remote_batch_size.saturating_mul(concurrency))
 }
 
@@ -863,8 +880,14 @@ fn write_remote_scoped_or_failed(
 
     let mut written = 0u64;
     let mut failed = 0u64;
+    let mut abort_remaining_error = None::<String>;
     for (start, end) in remote_request_job_ranges(jobs, remote) {
         let scoped_jobs = &jobs[start..end];
+        if let Some(error) = abort_remaining_error.as_deref() {
+            write_failed_embedding_batch(conn, embedder, model_version, scoped_jobs, error)?;
+            failed = failed.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
+            continue;
+        }
         let texts = scoped_jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
         match embedder.embed_batch(&texts) {
             Ok(vectors) if vectors.len() == scoped_jobs.len() => {
@@ -891,15 +914,19 @@ fn write_remote_scoped_or_failed(
                     failed.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
             },
             Err(err) => {
+                let scoped_error = err.to_string();
                 write_failed_embedding_batch(
                     conn,
                     embedder,
                     model_version,
                     scoped_jobs,
-                    &err.to_string(),
+                    &scoped_error,
                 )?;
                 failed =
                     failed.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
+                if remote_error_should_abort_scoped_retries(&scoped_error) {
+                    abort_remaining_error = Some(scoped_error);
+                }
             },
         }
     }
@@ -908,6 +935,18 @@ fn write_remote_scoped_or_failed(
 
 fn vector_count_error(embedder: &dyn Embedder, got: usize, expected: usize) -> String {
     format!("embedder {} returned {} vectors for {} texts", embedder.model_id(), got, expected)
+}
+
+fn remote_error_should_abort_scoped_retries(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("failed to connect")
+        || lower.contains("connect error")
+        || lower.contains("http status 504")
 }
 
 fn remote_request_job_ranges(
@@ -1527,6 +1566,46 @@ mod freshness_version_tests {
     }
 
     #[test]
+    fn remote_reconcile_chunks_large_selection_below_sqlite_bind_limit() {
+        let conn = schema_conn();
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        for i in 0..1005 {
+            seed_embedding_chunk(&conn, i);
+        }
+        let (url, handle, _) = spawn_reconcile_embed_stub(spec.dim, 1, Duration::ZERO);
+        let mut remote = remote_at(&url);
+        remote.batch_size = 4096;
+        remote.concurrency = 32;
+        set_active_remote_config(&conn, &remote).unwrap();
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2, runtime = \
+             'ollama'
+             WHERE model_id = ?1",
+            params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
+        )
+        .unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_reconcile_meta(
+            &conn,
+            ACTIVE_EMBEDDING_MODEL_VERSION_META,
+            &remote_freshness_version(spec, &remote),
+        )
+        .unwrap();
+
+        let report = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions { batch_size: Some(64), ..ReconcileOptions::default() },
+            |_| {},
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(report.embeddings_written, 1005);
+        assert_eq!(report.failed_chunks, 0);
+    }
+
+    #[test]
     fn remote_reconcile_scopes_request_failure_to_remote_request_batch() {
         let conn = schema_conn();
         let spec = spec(FASTEMBED_MODEL_ID).unwrap();
@@ -1588,6 +1667,23 @@ mod freshness_version_tests {
 
         assert_eq!(remote_reconcile_batch_size(&remote, 8, Some(1)), 8);
         assert_eq!(remote_reconcile_batch_size(&remote, 8, None), 8192);
+    }
+
+    #[test]
+    fn remote_scoped_retry_aborts_on_endpoint_level_errors_only() {
+        for error in [
+            "request timed out",
+            "timeout",
+            "connection refused",
+            "failed to connect",
+            "http status 504: gateway timeout",
+        ] {
+            assert!(remote_error_should_abort_scoped_retries(error), "{error}");
+        }
+        assert!(!remote_error_should_abort_scoped_retries("http status 500: transient"));
+        assert!(!remote_error_should_abort_scoped_retries(
+            "embedder model returned 2 vectors for 3 texts"
+        ));
     }
 
     #[test]

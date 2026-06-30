@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 
-use rag_rat_core::config::{DEFAULT_QUERY_ENDPOINT, RemoteEmbeddingConfig};
+use rag_rat_core::config::{
+    DEFAULT_QUERY_ENDPOINT, MAX_REMOTE_EMBEDDING_CONCURRENCY, RemoteEmbeddingConfig,
+};
 use rag_rat_core::embedding_models::{Backend, EMBEDDING_MODELS, EmbeddingModelSpec, spec};
 #[cfg(feature = "fastembed")]
 use rag_rat_core::index::ai::FastEmbedEmbedder;
@@ -1799,7 +1801,9 @@ fn new_connect_remote_from(local_model: &str, existing: Option<&RemoteDraft>) ->
         remote.model = preserved_server_model(local_model, existing);
         remote.num_ctx = existing.num_ctx;
         remote.batch_size = existing.batch_size;
-        remote.concurrency = existing.concurrency;
+        if matches!(existing.mode, RemoteMode::Connect(_)) {
+            remote.concurrency = existing.concurrency.min(MAX_REMOTE_EMBEDDING_CONCURRENCY);
+        }
         remote.max_batch_chars = existing.max_batch_chars;
         remote.auth_env = existing.auth_env.clone();
     }
@@ -1835,7 +1839,9 @@ fn new_ephemeral_remote_from(
         remote.gpu = existing.gpu.clone();
         remote.num_ctx = existing.num_ctx;
         remote.batch_size = existing.batch_size;
-        remote.concurrency = existing.concurrency;
+        if matches!(existing.mode, RemoteMode::Ephemeral(_)) {
+            remote.concurrency = existing.concurrency.min(MAX_REMOTE_EMBEDDING_CONCURRENCY);
+        }
         remote.max_batch_chars = existing.max_batch_chars;
         remote.auth_env = existing.auth_env.clone();
     }
@@ -1860,7 +1866,8 @@ fn adjust_remote_numeric(state: &mut WizardState, focus: EmbedFocus, delta: isiz
         match focus {
             EmbedFocus::BatchSize =>
                 adjust_u32(&mut remote.batch_size, delta, 1, REMOTE_BATCH_SIZE_MAX),
-            EmbedFocus::Concurrency => adjust_u32(&mut remote.concurrency, delta, 1, u32::MAX),
+            EmbedFocus::Concurrency =>
+                adjust_u32(&mut remote.concurrency, delta, 1, MAX_REMOTE_EMBEDDING_CONCURRENCY),
             EmbedFocus::MaxBatchChars => adjust_usize(&mut remote.max_batch_chars, delta, 1),
             _ => false,
         }
@@ -1969,8 +1976,11 @@ fn edit_remote_numeric(focus: EmbedFocus, key: KeyEvent, state: &mut WizardState
                 },
                 EmbedFocus::Concurrency => {
                     let before = remote.concurrency;
-                    remote.concurrency =
-                        remote.concurrency.saturating_mul(10).saturating_add(digit).max(1);
+                    remote.concurrency = remote
+                        .concurrency
+                        .saturating_mul(10)
+                        .saturating_add(digit)
+                        .clamp(1, MAX_REMOTE_EMBEDDING_CONCURRENCY);
                     before != remote.concurrency
                 },
                 EmbedFocus::MaxBatchChars => {
@@ -2738,6 +2748,36 @@ mod tests {
         step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
 
         assert_eq!(state.draft.remote.as_ref().and_then(|remote| remote.gpu.as_deref()), None);
+    }
+
+    #[test]
+    fn embedding_mode_switch_resets_mode_specific_concurrency_default() {
+        let mut state = empty_state();
+        state.draft.remote = Some(new_ephemeral_remote(&state.draft.model));
+        state.step = Some(init_step(StepId::Embedding, &state));
+        assert_eq!(
+            state.draft.remote.as_ref().map(|remote| remote.concurrency),
+            Some(RemoteEmbeddingConfig::omitted_concurrency_default(false))
+        );
+
+        if let Some(StepState::Embedding { focus, mode_cursor, .. }) = &mut state.step {
+            *focus = EmbedFocus::Mode;
+            *mode_cursor = 1;
+        }
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+
+        let remote = state.draft.remote.as_ref().unwrap();
+        assert!(matches!(remote.mode, RemoteMode::Connect(_)));
+        assert_eq!(remote.concurrency, RemoteEmbeddingConfig::omitted_concurrency_default(true));
+
+        if let Some(StepState::Embedding { mode_cursor, .. }) = &mut state.step {
+            *mode_cursor = 2;
+        }
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+
+        let remote = state.draft.remote.as_ref().unwrap();
+        assert!(matches!(remote.mode, RemoteMode::Ephemeral(_)));
+        assert_eq!(remote.concurrency, RemoteEmbeddingConfig::omitted_concurrency_default(false));
     }
 
     #[test]

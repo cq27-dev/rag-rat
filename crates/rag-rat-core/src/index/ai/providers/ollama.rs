@@ -213,7 +213,7 @@ impl OllamaEmbedder {
             // Clamp to >= 1: a configured 0 would panic `slice::chunks`; treat it as "one per
             // request" rather than failing construction.
             batch_size: (batch_size as usize).max(1),
-            concurrency: (concurrency as usize).max(1),
+            concurrency: RemoteEmbeddingConfig::bounded_concurrency_value(concurrency) as usize,
             max_batch_chars: max_batch_chars.max(1),
             num_ctx,
             auth_header,

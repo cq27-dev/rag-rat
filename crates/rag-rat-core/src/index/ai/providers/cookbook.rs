@@ -503,7 +503,7 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
         // recipe picks its own default when `None`. Config validation guarantees `gpu` is only set
         // in ephemeral mode, which is the only mode reaching this function.
         gpu: remote.gpu.clone(),
-        ollama_num_parallel: remote.concurrency.max(1),
+        ollama_num_parallel: remote.bounded_concurrency(),
     }
 }
 
@@ -539,7 +539,7 @@ fn provision_and_build_cancellable(
         dim: spec.dim,
         request_timeout_s: remote.request_timeout_s,
         batch_size: remote.batch_size,
-        concurrency: remote.concurrency,
+        concurrency: remote.bounded_concurrency(),
         max_batch_chars: remote.max_batch_chars,
         num_ctx: remote.num_ctx,
     });
@@ -1189,6 +1189,14 @@ mod tests {
         assert_eq!(cookbook_input_for(&ephemeral(None, 16)).gpu, None);
         assert_eq!(cookbook_input_for(&ephemeral(None, 16)).ollama_num_parallel, 16);
         assert_eq!(cookbook_input_for(&ephemeral(None, 0)).ollama_num_parallel, 1);
+        assert_eq!(
+            cookbook_input_for(&ephemeral(
+                None,
+                crate::config::MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
+            ))
+            .ollama_num_parallel,
+            crate::config::MAX_REMOTE_EMBEDDING_CONCURRENCY
+        );
         // The model is trimmed into the input regardless of gpu.
         assert_eq!(cookbook_input_for(&ephemeral(Some("A100"), 16)).model, "all-minilm");
     }

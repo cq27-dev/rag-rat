@@ -304,6 +304,7 @@ pub struct RemoteEmbeddingConfig {
 
 /// The default LOCAL Ollama URL for ephemeral query embedding when `query_endpoint` is omitted.
 pub const DEFAULT_QUERY_ENDPOINT: &str = "http://localhost:11434";
+pub const MAX_REMOTE_EMBEDDING_CONCURRENCY: u32 = 128;
 const DEFAULT_REMOTE_EMBEDDING_CONCURRENCY: u32 = 32;
 const LEGACY_REMOTE_EMBEDDING_CONCURRENCY: u32 = 1;
 const DEFAULT_REMOTE_EMBEDDING_MAX_BATCH_CHARS: usize = 384_000;
@@ -347,6 +348,17 @@ impl RemoteEmbeddingConfig {
         } else {
             DEFAULT_REMOTE_EMBEDDING_CONCURRENCY
         }
+    }
+
+    /// Runtime-safe concurrency for deserialized/persisted configs. TOML parsing rejects explicit
+    /// values above [`MAX_REMOTE_EMBEDDING_CONCURRENCY`], but older or manually-edited DB metadata
+    /// can bypass that validation.
+    pub fn bounded_concurrency(&self) -> u32 {
+        Self::bounded_concurrency_value(self.concurrency)
+    }
+
+    pub fn bounded_concurrency_value(value: u32) -> u32 {
+        value.clamp(1, MAX_REMOTE_EMBEDDING_CONCURRENCY)
     }
 
     /// CONNECT mode: an already-running server at `endpoint`. Exactly one of connect/ephemeral
@@ -969,6 +981,16 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
             return Err(ConfigError::RemoteEmbeddingInvalidNumCtx);
         }
         let is_connect = endpoint.is_some();
+        let concurrency = raw
+            .concurrency
+            .unwrap_or_else(|| RemoteEmbeddingConfig::omitted_concurrency_default(is_connect))
+            .max(1);
+        if concurrency > MAX_REMOTE_EMBEDDING_CONCURRENCY {
+            return Err(ConfigError::RemoteEmbeddingConcurrencyTooHigh {
+                value: concurrency,
+                max: MAX_REMOTE_EMBEDDING_CONCURRENCY,
+            });
+        }
         Ok(Self {
             model: model.to_string(),
             endpoint,
@@ -978,10 +1000,7 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
             gpu,
             num_ctx: raw.num_ctx,
             batch_size: raw.batch_size.unwrap_or(default.batch_size),
-            concurrency: raw
-                .concurrency
-                .unwrap_or_else(|| RemoteEmbeddingConfig::omitted_concurrency_default(is_connect))
-                .max(1),
+            concurrency,
             max_batch_chars: raw.max_batch_chars.unwrap_or(default.max_batch_chars).max(1),
             request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
         })
@@ -1066,6 +1085,10 @@ pub enum ConfigError {
          Ollama's default context, or set a positive context window such as 4096"
     )]
     RemoteEmbeddingInvalidNumCtx,
+    #[error(
+        "[llm.embedding.remote] `concurrency` is {value}, but the maximum supported value is {max}"
+    )]
+    RemoteEmbeddingConcurrencyTooHigh { value: u32, max: u32 },
     #[error(
         "[llm.embedding.remote] can only serve a transformer model over Ollama, but `model = \
          \"{0}\"` is not a transformer (it is a static/hash model, or `none`/disabled) — remove \
@@ -1656,6 +1679,35 @@ mod tests {
         let remote = LlmConfig::try_from(raw.llm).unwrap().embedding.remote.unwrap();
         assert_eq!(remote.concurrency, 1);
         assert_eq!(remote.max_batch_chars, 1);
+    }
+
+    #[test]
+    fn remote_embedding_rejects_oversized_concurrency() {
+        let raw: RawConfig = toml::from_str(&format!(
+            r#"
+            [index]
+            root = "."
+
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+
+            [llm.embedding.remote]
+            model = "all-minilm"
+            endpoint = "http://localhost:11434"
+            concurrency = {}
+            "#,
+            MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
+        ))
+        .unwrap();
+
+        let err = LlmConfig::try_from(raw.llm).expect_err("oversized concurrency should reject");
+        assert!(matches!(
+            err,
+            ConfigError::RemoteEmbeddingConcurrencyTooHigh {
+                value,
+                max: MAX_REMOTE_EMBEDDING_CONCURRENCY
+            } if value == MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
+        ));
     }
 
     #[test]
