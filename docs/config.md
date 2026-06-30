@@ -68,7 +68,7 @@ endpoint = "http://box:11434"     # CONNECT: the Ollama server URL (required)
 model = "all-minilm"              # the Ollama-side model name (the server's own identifier)
 # auth_env = "OLLAMA_TOKEN"       # NAME of an env var holding a bearer token (never the token itself)
 # batch_size = 256                # texts per /api/embed request
-# concurrency = 32                # 1..=128; omitted CONNECT = 1
+# concurrency = 1                 # 1..=128; connect-safe (cookbook/ephemeral default = 32)
 # max_batch_chars = 384000        # max total input chars per /api/embed request
 # num_ctx = 4096                  # optional Ollama context window (options.num_ctx)
 # request_timeout_s = 60          # per-request HTTP timeout

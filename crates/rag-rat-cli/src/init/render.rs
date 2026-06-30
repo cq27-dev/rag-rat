@@ -53,8 +53,8 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
         "# Remote Ollama embedding (optional; defaults shown; uncomment to offload \
          embedding).\n# [llm.embedding.remote]\n# endpoint = \"http://localhost:11434\"\n# model = \
          \"all-minilm\"          # Ollama-side model name for the selected embedding model\n# \
-         batch_size = 256          # texts per /api/embed request\n# concurrency = 32          # \
-         1..=128 concurrent /api/embed requests\n# max_batch_chars = 384000 # max input chars per \
+         batch_size = 256          # texts per /api/embed request\n# concurrency = 1           # \
+         CONNECT-safe; cookbook/ephemeral default = 32\n# max_batch_chars = 384000 # max input chars per \
          /api/embed request\n# request_timeout_s = 60\n# num_ctx = 4096            # optional \
          Ollama context window\n\n",
     );

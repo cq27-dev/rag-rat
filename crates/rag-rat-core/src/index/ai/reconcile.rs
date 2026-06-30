@@ -881,6 +881,7 @@ fn write_remote_scoped_or_failed(
     let mut written = 0u64;
     let mut failed = 0u64;
     let mut abort_remaining_error = None::<String>;
+    let mut consecutive_endpoint_failures = 0usize;
     for (start, end) in remote_request_job_ranges(jobs, remote) {
         let scoped_jobs = &jobs[start..end];
         if let Some(error) = abort_remaining_error.as_deref() {
@@ -891,6 +892,7 @@ fn write_remote_scoped_or_failed(
         let texts = scoped_jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
         match embedder.embed_batch(&texts) {
             Ok(vectors) if vectors.len() == scoped_jobs.len() => {
+                consecutive_endpoint_failures = 0;
                 write_current_embedding_batch(
                     conn,
                     embedder,
@@ -902,6 +904,7 @@ fn write_remote_scoped_or_failed(
                     written.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
             },
             Ok(vectors) => {
+                consecutive_endpoint_failures = 0;
                 let scoped_error = vector_count_error(embedder, vectors.len(), scoped_jobs.len());
                 write_failed_embedding_batch(
                     conn,
@@ -924,8 +927,22 @@ fn write_remote_scoped_or_failed(
                 )?;
                 failed =
                     failed.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
-                if remote_error_should_abort_scoped_retries(&scoped_error) {
-                    abort_remaining_error = Some(scoped_error);
+                match classify_remote_scoped_retry_error(&scoped_error) {
+                    RemoteScopedRetryError::AbortImmediately => {
+                        abort_remaining_error = Some(scoped_error);
+                    },
+                    RemoteScopedRetryError::EndpointFailure => {
+                        consecutive_endpoint_failures =
+                            consecutive_endpoint_failures.saturating_add(1);
+                        if consecutive_endpoint_failures
+                            >= REMOTE_SCOPED_RETRY_CONSECUTIVE_ENDPOINT_FAILURE_LIMIT
+                        {
+                            abort_remaining_error = Some(scoped_error);
+                        }
+                    },
+                    RemoteScopedRetryError::Other => {
+                        consecutive_endpoint_failures = 0;
+                    },
                 }
             },
         }
@@ -937,16 +954,32 @@ fn vector_count_error(embedder: &dyn Embedder, got: usize, expected: usize) -> S
     format!("embedder {} returned {} vectors for {} texts", embedder.model_id(), got, expected)
 }
 
-fn remote_error_should_abort_scoped_retries(error: &str) -> bool {
+const REMOTE_SCOPED_RETRY_CONSECUTIVE_ENDPOINT_FAILURE_LIMIT: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteScopedRetryError {
+    AbortImmediately,
+    EndpointFailure,
+    Other,
+}
+
+fn classify_remote_scoped_retry_error(error: &str) -> RemoteScopedRetryError {
     let lower = error.to_ascii_lowercase();
-    lower.contains("timed out")
-        || lower.contains("timeout")
-        || lower.contains("connection refused")
-        || lower.contains("connection reset")
-        || lower.contains("connection closed")
+    if lower.contains("connection refused")
         || lower.contains("failed to connect")
         || lower.contains("connect error")
+    {
+        return RemoteScopedRetryError::AbortImmediately;
+    }
+    if lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
         || lower.contains("http status 504")
+    {
+        return RemoteScopedRetryError::EndpointFailure;
+    }
+    RemoteScopedRetryError::Other
 }
 
 fn remote_request_job_ranges(
@@ -1295,6 +1328,30 @@ mod freshness_version_tests {
         }
     }
 
+    struct TimeoutsThenOkEmbedder {
+        calls: AtomicUsize,
+        dim: usize,
+        failures: usize,
+    }
+
+    impl Embedder for TimeoutsThenOkEmbedder {
+        fn model_id(&self) -> &str {
+            FASTEMBED_MODEL_ID
+        }
+
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.failures {
+                anyhow::bail!("request timed out");
+            }
+            Ok(vec![vec![0.1; self.dim]; texts.len()])
+        }
+    }
+
     fn read_request_body(stream: &mut TcpStream) -> String {
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
         let mut raw = Vec::new();
@@ -1461,7 +1518,7 @@ mod freshness_version_tests {
         (format!("http://127.0.0.1:{port}"), handle)
     }
 
-    fn seed_embedding_chunk(conn: &Connection, i: i64) {
+    fn seed_embedding_chunk(conn: &Connection, i: i64) -> i64 {
         conn.execute(
             "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
              VALUES (?1, 'rust', 'source', ?2, 0, 0)",
@@ -1490,6 +1547,22 @@ mod freshness_version_tests {
         .unwrap();
         let chunk_id = conn.last_insert_rowid();
         crate::index::chunk_text_store::seed_chunk_text(conn, chunk_id, &text).unwrap();
+        chunk_id
+    }
+
+    fn prepared_job(chunk_id: i64, i: i64) -> PreparedEmbeddingJob {
+        let input_text = format!("path: src/file_{i}.rs\n\npub fn item_{i}() {{}}");
+        PreparedEmbeddingJob {
+            id: chunk_id,
+            text_hash: format!("hash-{i}"),
+            input_hash: format!("input-hash-{i}"),
+            input_chars: input_text.chars().count(),
+            input_text,
+            input_truncated: false,
+            policy: "Embed".to_string(),
+            priority: 0,
+            reason: ReconcileReason::Missing,
+        }
     }
 
     fn active_version(conn: &Connection) -> String {
@@ -1670,20 +1743,123 @@ mod freshness_version_tests {
     }
 
     #[test]
-    fn remote_scoped_retry_aborts_on_endpoint_level_errors_only() {
+    fn remote_scoped_retry_classifies_endpoint_failures() {
+        for error in ["connection refused", "failed to connect", "connect error"] {
+            assert_eq!(
+                classify_remote_scoped_retry_error(error),
+                RemoteScopedRetryError::AbortImmediately,
+                "{error}"
+            );
+        }
         for error in [
             "request timed out",
             "timeout",
-            "connection refused",
-            "failed to connect",
+            "connection reset",
+            "connection closed",
             "http status 504: gateway timeout",
         ] {
-            assert!(remote_error_should_abort_scoped_retries(error), "{error}");
+            assert_eq!(
+                classify_remote_scoped_retry_error(error),
+                RemoteScopedRetryError::EndpointFailure,
+                "{error}"
+            );
         }
-        assert!(!remote_error_should_abort_scoped_retries("http status 500: transient"));
-        assert!(!remote_error_should_abort_scoped_retries(
-            "embedder model returned 2 vectors for 3 texts"
-        ));
+        for error in ["http status 500: transient", "embedder model returned 2 vectors for 3 texts"]
+        {
+            assert_eq!(
+                classify_remote_scoped_retry_error(error),
+                RemoteScopedRetryError::Other,
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_scoped_retry_keeps_later_ranges_after_one_timeout() {
+        let conn = schema_conn();
+        let jobs = (0..3)
+            .map(|i| {
+                let chunk_id = seed_embedding_chunk(&conn, i);
+                prepared_job(chunk_id, i)
+            })
+            .collect::<Vec<_>>();
+        let mut remote = remote_at("http://localhost:11434");
+        remote.batch_size = 1;
+        remote.max_batch_chars = usize::MAX;
+        let embedder = TimeoutsThenOkEmbedder {
+            calls: AtomicUsize::new(0),
+            dim: spec(FASTEMBED_MODEL_ID).unwrap().dim,
+            failures: 1,
+        };
+
+        let (written, failed) = write_remote_scoped_or_failed(
+            &conn,
+            &embedder,
+            "test-version",
+            &jobs,
+            Some(&remote),
+            "initial failure",
+        )
+        .unwrap();
+
+        assert_eq!(written, 2);
+        assert_eq!(failed, 1);
+        assert_eq!(
+            embedder.calls.load(Ordering::SeqCst),
+            3,
+            "a single timeout should not skip later request ranges"
+        );
+        let failed_rows: i64 = conn
+            .query_row("SELECT count(*) FROM chunk_embeddings WHERE status = 'Failed'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let current_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunk_embeddings WHERE status = 'Current'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_rows, 1);
+        assert_eq!(current_rows, 2);
+    }
+
+    #[test]
+    fn remote_scoped_retry_aborts_after_repeated_endpoint_failures() {
+        let conn = schema_conn();
+        let jobs = (0..4)
+            .map(|i| {
+                let chunk_id = seed_embedding_chunk(&conn, i);
+                prepared_job(chunk_id, i)
+            })
+            .collect::<Vec<_>>();
+        let mut remote = remote_at("http://localhost:11434");
+        remote.batch_size = 1;
+        remote.max_batch_chars = usize::MAX;
+        let embedder = TimeoutsThenOkEmbedder {
+            calls: AtomicUsize::new(0),
+            dim: spec(FASTEMBED_MODEL_ID).unwrap().dim,
+            failures: usize::MAX,
+        };
+
+        let (written, failed) = write_remote_scoped_or_failed(
+            &conn,
+            &embedder,
+            "test-version",
+            &jobs,
+            Some(&remote),
+            "initial failure",
+        )
+        .unwrap();
+
+        assert_eq!(written, 0);
+        assert_eq!(failed, 4);
+        assert_eq!(
+            embedder.calls.load(Ordering::SeqCst),
+            REMOTE_SCOPED_RETRY_CONSECUTIVE_ENDPOINT_FAILURE_LIMIT,
+            "repeated timeout-like failures should stop before serially retrying every range"
+        );
     }
 
     #[test]
