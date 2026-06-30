@@ -369,23 +369,6 @@ pub(crate) fn write_current_embedding_batch(
     finish_batch_transaction(conn, write_result)
 }
 
-pub(crate) fn write_failed_embedding_batch(
-    conn: &Connection,
-    embedder: &dyn Embedder,
-    model_version: &str,
-    batch: &[PreparedEmbeddingJob],
-    error: &str,
-) -> anyhow::Result<()> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let write_result = (|| {
-        for chunk in batch {
-            store_failed_embedding(conn, embedder, model_version, chunk, error)?;
-        }
-        Ok(())
-    })();
-    finish_batch_transaction(conn, write_result)
-}
-
 pub(crate) fn finish_batch_transaction(
     conn: &Connection,
     result: anyhow::Result<()>,

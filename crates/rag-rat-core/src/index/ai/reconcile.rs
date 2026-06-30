@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::*;
 use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::{Backend, EMBEDDING_MODELS, HASH_MODEL_ID, spec};
@@ -787,7 +789,7 @@ pub(crate) fn reconcile_with_options_progress(
                 conn,
                 embedder.as_ref(),
                 &model_version,
-                &to_embed_jobs,
+                to_embed_jobs,
                 remote_config.as_deref(),
             )?;
             report.embeddings_written = report.embeddings_written.saturating_add(written);
@@ -841,92 +843,167 @@ fn remote_reconcile_batch_size(
     batch_size.max(remote_batch_size.saturating_mul(concurrency))
 }
 
+struct EmbeddingJobGroup {
+    primary: PreparedEmbeddingJob,
+    duplicates: Vec<PreparedEmbeddingJob>,
+}
+
+impl EmbeddingJobGroup {
+    fn input_text(&self) -> &str {
+        &self.primary.input_text
+    }
+
+    fn jobs(&self) -> impl Iterator<Item = &PreparedEmbeddingJob> {
+        std::iter::once(&self.primary).chain(self.duplicates.iter())
+    }
+}
+
+fn group_embedding_jobs_by_input_hash(jobs: Vec<PreparedEmbeddingJob>) -> Vec<EmbeddingJobGroup> {
+    let mut groups: Vec<EmbeddingJobGroup> = Vec::new();
+    let mut group_by_input_hash: HashMap<String, usize> = HashMap::new();
+    for job in jobs {
+        if let Some(&group_idx) = group_by_input_hash.get(&job.input_hash) {
+            groups[group_idx].duplicates.push(job);
+        } else {
+            let group_idx = groups.len();
+            group_by_input_hash.insert(job.input_hash.clone(), group_idx);
+            groups.push(EmbeddingJobGroup { primary: job, duplicates: Vec::new() });
+        }
+    }
+    groups
+}
+
 fn embed_and_write_jobs(
     conn: &Connection,
     embedder: &dyn Embedder,
     model_version: &str,
-    jobs: &[PreparedEmbeddingJob],
+    jobs: Vec<PreparedEmbeddingJob>,
     remote: Option<&RemoteEmbeddingConfig>,
 ) -> anyhow::Result<(u64, u64)> {
-    let texts = jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
+    let groups = group_embedding_jobs_by_input_hash(jobs);
+    let texts = groups.iter().map(|group| group.input_text().to_string()).collect::<Vec<_>>();
     match embedder.embed_batch(&texts) {
-        Ok(vectors) if vectors.len() == jobs.len() => {
-            write_current_embedding_batch(conn, embedder, model_version, jobs, &vectors)?;
-            Ok((u64::try_from(jobs.len()).unwrap_or(u64::MAX), 0))
+        Ok(vectors) if vectors.len() == groups.len() => {
+            let written =
+                write_current_embedding_groups(conn, embedder, model_version, &groups, &vectors)?;
+            Ok((written, 0))
         },
         Ok(vectors) => {
-            let error = vector_count_error(embedder, vectors.len(), jobs.len());
-            write_remote_scoped_or_failed(conn, embedder, model_version, jobs, remote, &error)
+            let error = vector_count_error(embedder, vectors.len(), groups.len());
+            write_remote_scoped_or_failed(conn, embedder, model_version, &groups, remote, &error)
         },
         Err(err) => {
             let error = err.to_string();
-            write_remote_scoped_or_failed(conn, embedder, model_version, jobs, remote, &error)
+            write_remote_scoped_or_failed(conn, embedder, model_version, &groups, remote, &error)
         },
     }
+}
+
+fn write_current_embedding_groups(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    model_version: &str,
+    groups: &[EmbeddingJobGroup],
+    vectors: &[Vec<f32>],
+) -> anyhow::Result<u64> {
+    let mut written = 0u64;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let write_result = (|| {
+        for (group, vector) in groups.iter().zip(vectors) {
+            for job in group.jobs() {
+                store_embedding(conn, embedder, model_version, job, vector)?;
+                written = written.saturating_add(1);
+            }
+        }
+        Ok(())
+    })();
+    finish_batch_transaction(conn, write_result)?;
+    Ok(written)
+}
+
+fn write_failed_embedding_groups(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    model_version: &str,
+    groups: &[EmbeddingJobGroup],
+    error: &str,
+) -> anyhow::Result<u64> {
+    let mut failed = 0u64;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let write_result = (|| {
+        for group in groups {
+            for job in group.jobs() {
+                store_failed_embedding(conn, embedder, model_version, job, error)?;
+                failed = failed.saturating_add(1);
+            }
+        }
+        Ok(())
+    })();
+    finish_batch_transaction(conn, write_result)?;
+    Ok(failed)
 }
 
 fn write_remote_scoped_or_failed(
     conn: &Connection,
     embedder: &dyn Embedder,
     model_version: &str,
-    jobs: &[PreparedEmbeddingJob],
+    groups: &[EmbeddingJobGroup],
     remote: Option<&RemoteEmbeddingConfig>,
     error: &str,
 ) -> anyhow::Result<(u64, u64)> {
     let Some(remote) = remote else {
-        write_failed_embedding_batch(conn, embedder, model_version, jobs, error)?;
-        return Ok((0, u64::try_from(jobs.len()).unwrap_or(u64::MAX)));
+        let failed = write_failed_embedding_groups(conn, embedder, model_version, groups, error)?;
+        return Ok((0, failed));
     };
 
     let mut written = 0u64;
     let mut failed = 0u64;
     let mut abort_remaining_error = None::<String>;
     let mut consecutive_endpoint_failures = 0usize;
-    for (start, end) in remote_request_job_ranges(jobs, remote) {
-        let scoped_jobs = &jobs[start..end];
+    for (start, end) in remote_request_group_ranges(groups, remote) {
+        let scoped_groups = &groups[start..end];
         if let Some(error) = abort_remaining_error.as_deref() {
-            write_failed_embedding_batch(conn, embedder, model_version, scoped_jobs, error)?;
-            failed = failed.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
+            let scoped_failed =
+                write_failed_embedding_groups(conn, embedder, model_version, scoped_groups, error)?;
+            failed = failed.saturating_add(scoped_failed);
             continue;
         }
-        let texts = scoped_jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
+        let texts =
+            scoped_groups.iter().map(|group| group.input_text().to_string()).collect::<Vec<_>>();
         match embedder.embed_batch(&texts) {
-            Ok(vectors) if vectors.len() == scoped_jobs.len() => {
+            Ok(vectors) if vectors.len() == scoped_groups.len() => {
                 consecutive_endpoint_failures = 0;
-                write_current_embedding_batch(
+                let scoped_written = write_current_embedding_groups(
                     conn,
                     embedder,
                     model_version,
-                    scoped_jobs,
+                    scoped_groups,
                     &vectors,
                 )?;
-                written =
-                    written.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
+                written = written.saturating_add(scoped_written);
             },
             Ok(vectors) => {
                 consecutive_endpoint_failures = 0;
-                let scoped_error = vector_count_error(embedder, vectors.len(), scoped_jobs.len());
-                write_failed_embedding_batch(
+                let scoped_error = vector_count_error(embedder, vectors.len(), scoped_groups.len());
+                let scoped_failed = write_failed_embedding_groups(
                     conn,
                     embedder,
                     model_version,
-                    scoped_jobs,
+                    scoped_groups,
                     &scoped_error,
                 )?;
-                failed =
-                    failed.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
+                failed = failed.saturating_add(scoped_failed);
             },
             Err(err) => {
                 let scoped_error = err.to_string();
-                write_failed_embedding_batch(
+                let scoped_failed = write_failed_embedding_groups(
                     conn,
                     embedder,
                     model_version,
-                    scoped_jobs,
+                    scoped_groups,
                     &scoped_error,
                 )?;
-                failed =
-                    failed.saturating_add(u64::try_from(scoped_jobs.len()).unwrap_or(u64::MAX));
+                failed = failed.saturating_add(scoped_failed);
                 match classify_remote_scoped_retry_error(&scoped_error) {
                     RemoteScopedRetryError::AbortImmediately => {
                         abort_remaining_error = Some(scoped_error);
@@ -982,8 +1059,8 @@ fn classify_remote_scoped_retry_error(error: &str) -> RemoteScopedRetryError {
     RemoteScopedRetryError::Other
 }
 
-fn remote_request_job_ranges(
-    jobs: &[PreparedEmbeddingJob],
+fn remote_request_group_ranges(
+    groups: &[EmbeddingJobGroup],
     remote: &RemoteEmbeddingConfig,
 ) -> Vec<(usize, usize)> {
     let batch_size = (remote.batch_size as usize).max(1);
@@ -991,8 +1068,8 @@ fn remote_request_job_ranges(
     let mut ranges = Vec::new();
     let mut start = 0usize;
     let mut chars = 0usize;
-    for (idx, job) in jobs.iter().enumerate() {
-        let text_chars = job.input_text.chars().count();
+    for (idx, group) in groups.iter().enumerate() {
+        let text_chars = group.input_text().chars().count();
         let count_full = idx.saturating_sub(start) >= batch_size;
         let chars_full = idx > start && chars.saturating_add(text_chars) > max_batch_chars;
         if count_full || chars_full {
@@ -1002,8 +1079,8 @@ fn remote_request_job_ranges(
         }
         chars = chars.saturating_add(text_chars);
     }
-    if start < jobs.len() {
-        ranges.push((start, jobs.len()));
+    if start < groups.len() {
+        ranges.push((start, groups.len()));
     }
     ranges
 }
@@ -1270,8 +1347,8 @@ mod manifest_idempotence_tests {
 mod freshness_version_tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1348,6 +1425,28 @@ mod freshness_version_tests {
             if call < self.failures {
                 anyhow::bail!("request timed out");
             }
+            Ok(vec![vec![0.1; self.dim]; texts.len()])
+        }
+    }
+
+    struct RecordingEmbedder {
+        calls: AtomicUsize,
+        request_sizes: Mutex<Vec<usize>>,
+        dim: usize,
+    }
+
+    impl Embedder for RecordingEmbedder {
+        fn model_id(&self) -> &str {
+            FASTEMBED_MODEL_ID
+        }
+
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.request_sizes.lock().unwrap().push(texts.len());
             Ok(vec![vec![0.1; self.dim]; texts.len()])
         }
     }
@@ -1791,12 +1890,13 @@ mod freshness_version_tests {
             dim: spec(FASTEMBED_MODEL_ID).unwrap().dim,
             failures: 1,
         };
+        let groups = group_embedding_jobs_by_input_hash(jobs);
 
         let (written, failed) = write_remote_scoped_or_failed(
             &conn,
             &embedder,
             "test-version",
-            &jobs,
+            &groups,
             Some(&remote),
             "initial failure",
         )
@@ -1842,12 +1942,13 @@ mod freshness_version_tests {
             dim: spec(FASTEMBED_MODEL_ID).unwrap().dim,
             failures: usize::MAX,
         };
+        let groups = group_embedding_jobs_by_input_hash(jobs);
 
         let (written, failed) = write_remote_scoped_or_failed(
             &conn,
             &embedder,
             "test-version",
-            &jobs,
+            &groups,
             Some(&remote),
             "initial failure",
         )
@@ -1860,6 +1961,51 @@ mod freshness_version_tests {
             REMOTE_SCOPED_RETRY_CONSECUTIVE_ENDPOINT_FAILURE_LIMIT,
             "repeated timeout-like failures should stop before serially retrying every range"
         );
+    }
+
+    #[test]
+    fn embed_and_write_jobs_reuses_same_window_duplicate_input_hashes() {
+        let conn = schema_conn();
+        let first_chunk_id = seed_embedding_chunk(&conn, 0);
+        let duplicate_chunk_id = seed_embedding_chunk(&conn, 1);
+        let first_job = prepared_job(first_chunk_id, 0);
+        let mut duplicate_job = prepared_job(duplicate_chunk_id, 1);
+        duplicate_job.input_hash = first_job.input_hash.clone();
+        duplicate_job.input_text = first_job.input_text.clone();
+        let embedder = RecordingEmbedder {
+            calls: AtomicUsize::new(0),
+            request_sizes: Mutex::new(Vec::new()),
+            dim: spec(FASTEMBED_MODEL_ID).unwrap().dim,
+        };
+        let mut remote = remote_at("http://localhost:11434");
+        remote.batch_size = 1;
+        remote.concurrency = 4;
+
+        let (written, failed) = embed_and_write_jobs(
+            &conn,
+            &embedder,
+            "test-version",
+            vec![first_job, duplicate_job],
+            Some(&remote),
+        )
+        .unwrap();
+
+        assert_eq!(written, 2);
+        assert_eq!(failed, 0);
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *embedder.request_sizes.lock().unwrap(),
+            vec![1],
+            "duplicate input_hashes in one reconcile window should issue one embed text"
+        );
+        let current_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunk_embeddings WHERE status = 'Current'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current_rows, 2);
     }
 
     #[test]
