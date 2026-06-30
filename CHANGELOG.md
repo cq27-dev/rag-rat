@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.10.0...rag-rat-core-v0.11.0) - 2026-06-30
+
+### Added
+
+- *(init)* add extensible ratatui wizard ([#337](https://github.com/cq27-dev/rag-rat/pull/337))
+- *(embed)* user-selectable GPU for ephemeral cookbook provisioning ([llm.embedding.remote] gpu) ([#335](https://github.com/cq27-dev/rag-rat/pull/335))
+- *(embed)* remote Ollama embedding — connect + ephemeral cookbook, hardened (#317/#318) ([#330](https://github.com/cq27-dev/rag-rat/pull/330))
+- *(embed)* wire Ollama end-to-end — connect mode (#317 task 5+6) ([#326](https://github.com/cq27-dev/rag-rat/pull/326))
+- *(embed)* OllamaEmbedder backend (#317 task 4) ([#325](https://github.com/cq27-dev/rag-rat/pull/325))
+- *(embed)* [embedding.remote] config block (#317 task 3) ([#324](https://github.com/cq27-dev/rag-rat/pull/324))
+- *(embed)* register the ollama backend — Backend::Ollama + registry row ([#317](https://github.com/cq27-dev/rag-rat/pull/317)) ([#322](https://github.com/cq27-dev/rag-rat/pull/322))
+
+### Fixed
+
+- *(ollama)* handle local embedding limits ([#340](https://github.com/cq27-dev/rag-rat/pull/340))
+- *(watch)* honor .gitignore in watch placement — stop exhausting inotify watches ([#331](https://github.com/cq27-dev/rag-rat/pull/331)) ([#332](https://github.com/cq27-dev/rag-rat/pull/332))
+- *(embed)* restore the public index::ai::MODEL2VEC_HF_REPO path (#320 review) ([#323](https://github.com/cq27-dev/rag-rat/pull/323))
+
+### Other
+
+- [codex] perf(embed): parallelize remote ollama reconcile ([#341](https://github.com/cq27-dev/rag-rat/pull/341))
+- *(embed)* extract index/ai/providers/ — single resolution chokepoint ([#317](https://github.com/cq27-dev/rag-rat/pull/317)) ([#320](https://github.com/cq27-dev/rag-rat/pull/320))
+
 ## [0.10.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.9.0...rag-rat-core-v0.10.0) - 2026-06-25
 
 ### Added
