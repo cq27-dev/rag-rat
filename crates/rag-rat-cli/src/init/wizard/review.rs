@@ -401,6 +401,7 @@ mod tests {
         let mut st = bare_state();
         st.draft.remote = Some(RemoteDraft {
             model: "all-minilm".to_string(),
+            backend: rag_rat_core::config::RemoteBackend::Ollama,
             mode: RemoteMode::Ephemeral("some-cookbook".to_string()),
             gpu: None,
             num_ctx: None,

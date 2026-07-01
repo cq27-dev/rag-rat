@@ -808,6 +808,7 @@ mod tests {
         let mut w = headless(test_scan(), None);
         w.state.draft.remote = Some(draft::RemoteDraft {
             model: "all-minilm".to_string(),
+            backend: rag_rat_core::config::RemoteBackend::Ollama,
             mode: draft::RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
             gpu: None,
             num_ctx: None,
@@ -846,6 +847,7 @@ mod tests {
         w.state.draft.model = "none".to_string();
         w.state.draft.remote = Some(draft::RemoteDraft {
             model: "all-minilm".to_string(),
+            backend: rag_rat_core::config::RemoteBackend::Ollama,
             mode: draft::RemoteMode::Connect("http://localhost:11434".to_string()),
             gpu: None,
             num_ctx: None,
@@ -904,6 +906,7 @@ mod tests {
             .insert(rag_rat_core::language::Language::Rust, vec![Path::new(".").to_path_buf()]);
         w.state.draft.remote = Some(draft::RemoteDraft {
             model: "all-minilm".to_string(),
+            backend: rag_rat_core::config::RemoteBackend::Ollama,
             mode: draft::RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
             gpu: None,
             num_ctx: None,
