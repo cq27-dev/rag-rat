@@ -62,9 +62,9 @@ pub struct EmbeddingModelSpec {
     /// models with no sequence limit (the char-hash fallback; Model2Vec, which mean-pools token
     /// vectors with no attention). A transformer embedder SILENTLY TRUNCATES input past this —
     /// content beyond it is not represented in the vector, so a short window (all-MiniLM's
-    /// 256) costs precision/recall on long code chunks. Used to cap the embedding input to
-    /// something the model can actually use ([`Self::max_input_chars`]) and to warn when
-    /// chunks exceed it.
+    /// 256) costs precision/recall on long code chunks. Drives [`Self::max_input_chars`], which
+    /// `rag-rat init` + `models install` use to WARN when a short-context model is picked for a
+    /// code repo (steering to a long-context model like jina-code).
     pub max_tokens: Option<usize>,
     /// The reconcile freshness key (formerly `default_model_version`). Bumping it forces a
     /// re-embed of every chunk for this model. MUST be unique across the table and never the
@@ -86,22 +86,17 @@ pub struct EmbeddingModelSpec {
 /// tokenization could fit, saving bytes without changing the embedded content.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-/// The char budget rag-rat allots for `tokens` tokens of embedding input (see
-/// [`CHARS_PER_TOKEN_ESTIMATE`]). Shared so a token window from any source — a model's static
-/// `max_tokens` or an ollama remote's `num_ctx` override — maps to chars the same way.
-pub(crate) fn tokens_to_char_budget(tokens: usize) -> usize {
-    tokens.saturating_mul(CHARS_PER_TOKEN_ESTIMATE)
-}
-
 impl EmbeddingModelSpec {
-    /// The embedding input length (in CHARS) worth sending this model: `max_tokens × ~4`, or `None`
-    /// for a model with no sequence limit. Past this the transformer truncates anyway, so a caller
-    /// caps `max_embedding_chars` to `min(configured, this)` — recall-neutral (the model ignored
-    /// the rest) while saving bandwidth. NOTE: an over-estimate, so it does NOT guarantee a
-    /// strict server (vLLM) won't reject a pathologically dense chunk — it only narrows the
-    /// margin.
+    /// The embedding input length (in CHARS) this model can actually use: `max_tokens × ~4`, or
+    /// `None` for a model with no sequence limit. A rough over-estimate (see
+    /// [`CHARS_PER_TOKEN_ESTIMATE`]) used to judge whether a model is "short-context" for typical
+    /// chunks — `rag-rat init` + `models install` warn when this falls below the default
+    /// chunk-embed budget, steering code repos to a long-context model. NOT used to truncate
+    /// reconcile input: the model truncates past its own window anyway, and forcing a smaller
+    /// cap there interacts badly with the `SkipTooLarge` policy threshold (`max_embedding_chars
+    /// × 4`) and an ollama `num_ctx` override.
     pub fn max_input_chars(&self) -> Option<usize> {
-        self.max_tokens.map(tokens_to_char_budget)
+        self.max_tokens.map(|t| t.saturating_mul(CHARS_PER_TOKEN_ESTIMATE))
     }
 }
 

@@ -341,33 +341,6 @@ pub(crate) fn status(conn: &Connection) -> anyhow::Result<LlmStatus> {
 /// pending count means embeddings were left behind (#219 review). Returns 0 when no embedding model
 /// is ready (nothing to retry) rather than erroring — the watcher must not abort a pass over a
 /// missing embedder.
-/// The embedding-input char cap for the ACTIVE model — the SINGLE source of truth applied
-/// identically by the reconcile scan, `reconcile_plan` (`--plan`), and `pending_embedding_jobs`
-/// (the watcher backlog gate), so all three hash the SAME truncated input. Diverging here made
-/// `--plan` mispredict the real reconcile: it would report a row `Current` while reconcile treated
-/// it as `InputChanged`, because the two hashed inputs were truncated at different lengths.
-///
-/// The window is the LARGER of two token budgets, so it never clamps below either:
-///   - the model's static context (`EmbeddingModelSpec::max_tokens`), and
-///   - an OLLAMA remote's explicit `num_ctx` override, which widens the served context
-///     (infinity/vLLM ignore `num_ctx`, and a local model has no remote, so those use the static
-///     window only).
-///
-/// A model with no sequence limit (hash / Model2Vec, with no `num_ctx`) is left uncapped.
-fn effective_embedding_char_cap(conn: &Connection, model_id: &str, configured: usize) -> usize {
-    let static_cap = spec(model_id).and_then(|s| s.max_input_chars());
-    let ctx_cap = active_remote_config(conn)
-        .ok()
-        .flatten()
-        .filter(|r| r.backend == crate::config::RemoteBackend::Ollama)
-        .and_then(|r| r.num_ctx)
-        .map(|nc| crate::embedding_models::tokens_to_char_budget(nc as usize));
-    match static_cap.into_iter().chain(ctx_cap).max() {
-        Some(window) => configured.min(window),
-        None => configured,
-    }
-}
-
 pub(crate) fn pending_embedding_jobs(conn: &Connection) -> anyhow::Result<u64> {
     ensure_model_manifest(conn)?;
     let model_id = active_embedding_model_id(conn)?;
@@ -381,11 +354,7 @@ pub(crate) fn pending_embedding_jobs(conn: &Connection) -> anyhow::Result<u64> {
         model_id: &model_id,
         model_version: &model_version,
         dim,
-        max_embedding_chars: effective_embedding_char_cap(
-            conn,
-            &model_id,
-            DEFAULT_MAX_EMBEDDING_CHARS,
-        ),
+        max_embedding_chars: DEFAULT_MAX_EMBEDDING_CHARS,
     };
     estimated_reconcile_jobs(conn, &scan, &ReconcileOptions::default())
 }
@@ -423,11 +392,7 @@ pub(crate) fn embedding_reconcile_plan(
     message: Option<String>,
 ) -> anyhow::Result<EmbeddingReconcilePlan> {
     let jobs = embedding_job_candidates(conn, &model.model_id, model_version, dim, None, false)?;
-    // The SAME model-window cap the real reconcile applies, so `--plan`'s current/stale accounting
-    // hashes the identical truncated input (see `effective_embedding_char_cap`).
-    let max_embedding_chars =
-        effective_embedding_char_cap(conn, &model.model_id, DEFAULT_MAX_EMBEDDING_CHARS);
-    let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
+    let skipped_by_policy = embedding_policy_skip_summary(conn, DEFAULT_MAX_EMBEDDING_CHARS)?;
     let mut missing_by_priority = BTreeMap::new();
     let mut current = 0_u64;
     let mut missing = 0_u64;
@@ -438,7 +403,7 @@ pub(crate) fn embedding_reconcile_plan(
     let mut failed_waiting = 0_u64;
     let mut blocked = 0_u64;
     for job in jobs {
-        let policy = policy_for_job(&job, max_embedding_chars);
+        let policy = policy_for_job(&job, DEFAULT_MAX_EMBEDDING_CHARS);
         if !policy.eligible {
             continue;
         }
@@ -448,14 +413,14 @@ pub(crate) fn embedding_reconcile_plan(
             && job.embedding_dim == Some(i64::try_from(dim).unwrap_or(i64::MAX))
             && job.embedding_text_version.as_deref() == Some(EMBEDDING_TEXT_VERSION)
             && job.input_hash.as_deref().is_some_and(|input_hash| {
-                let input = build_embedding_input(&job, max_embedding_chars);
+                let input = build_embedding_input(&job, DEFAULT_MAX_EMBEDDING_CHARS);
                 input_hash == embedding_input_hash(&model.model_id, model_version, &input.text)
             });
         if current_artifact {
             current += 1;
             continue;
         }
-        let reason = job.reason(model_version, dim, now_ms(), max_embedding_chars);
+        let reason = job.reason(model_version, dim, now_ms(), DEFAULT_MAX_EMBEDDING_CHARS);
         match reason {
             ReconcileReason::Missing => missing += 1,
             ReconcileReason::SourceChanged => stale += 1,
@@ -538,9 +503,7 @@ pub(crate) fn reconcile_with_options_progress(
         .transpose()?
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_BATCH_SIZE);
-    let max_embedding_chars =
-        effective_embedding_char_cap(conn, &active_model_id, options.max_embedding_chars)
-            .max(MIN_EMBEDDING_CHARS);
+    let max_embedding_chars = options.max_embedding_chars.max(MIN_EMBEDDING_CHARS);
     let started = now_ms();
     set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_STARTED_META, &started.to_string())?;
     conn.execute(
@@ -1441,31 +1404,6 @@ mod freshness_version_tests {
             max_batch_chars: 384_000,
             request_timeout_s: 5,
         }
-    }
-
-    #[test]
-    fn effective_char_cap_honors_model_window_and_ollama_num_ctx() {
-        let conn = schema_conn();
-        // Local (no remote): capped to all-MiniLM's static 256-token window (256 × 4 = 1024 chars).
-        assert_eq!(effective_embedding_char_cap(&conn, FASTEMBED_MODEL_ID, 4000), 1024);
-
-        // An OLLAMA remote's `num_ctx` widens the served context, so the configured 4000 chars are
-        // NOT clamped below it: window = max(1024, 4096 × 4) = 16384 → min(4000, 16384) = 4000.
-        // (Regression: the cap must respect an explicit num_ctx, not the static window alone.)
-        let mut ollama = remote_at("http://box:11434");
-        ollama.num_ctx = Some(4096);
-        set_active_remote_config(&conn, &ollama).unwrap();
-        assert_eq!(effective_embedding_char_cap(&conn, FASTEMBED_MODEL_ID, 4000), 4000);
-
-        // infinity/vLLM IGNORE `num_ctx` (they don't read it), so the static window still caps.
-        let mut infinity = ollama.clone();
-        infinity.backend = crate::config::RemoteBackend::Infinity;
-        set_active_remote_config(&conn, &infinity).unwrap();
-        assert_eq!(effective_embedding_char_cap(&conn, FASTEMBED_MODEL_ID, 4000), 1024);
-
-        // A no-limit tier (hash / Model2Vec) with no num_ctx is never capped.
-        let bare = schema_conn();
-        assert_eq!(effective_embedding_char_cap(&bare, HASH_MODEL_ID, 4000), 4000);
     }
 
     struct TimeoutsThenOkEmbedder {
