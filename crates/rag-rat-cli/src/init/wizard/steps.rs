@@ -1340,29 +1340,40 @@ fn model_help_lines(model_id: Option<&str>) -> Vec<Line<'static>> {
         385..=512 => "medium",
         _ => "heavy",
     };
+    // The model's context window (in tokens) — the axis this help now leads with, because a short
+    // window silently truncates long code chunks and costs precision/recall.
+    let window = s.max_tokens.map(|t| format!(", {t}-token window")).unwrap_or_default();
     let guidance = match s.backend {
         Backend::Hash =>
             "Dependency-free fallback; very fast, but weak semantic recall. Not recommended for \
              big codebases.",
         Backend::FastEmbed if s.display.contains("MiniLM") =>
-            "Default balanced choice. Good first pick for most repos; measured as hard to beat \
-             here.",
+            "Good default for general text, but its 256-token window TRUNCATES long functions — \
+             their tail is not embedded, so it loses precision/recall on large code chunks. For \
+             code-heavy repos prefer jina (8192 tokens), which embeds whole chunks.",
         Backend::FastEmbed if s.display.contains("bge") =>
-            "General-purpose 384d model. Similar weight to MiniLM; useful for comparison, not a \
-             clear default win.",
+            "General-purpose 384d model with a 512-token window — a bit more context than MiniLM, \
+             but still truncates long code. Useful for comparison.",
         Backend::FastEmbed if s.display.contains("jina") =>
-            "Code-focused 768d model. Heavier storage and reconcile cost; not a measured recall \
-             win here.",
+            "Code-focused 768d model with an 8192-token window: embeds WHOLE functions with no \
+             truncation (unlike MiniLM's 256), so it keeps precision/recall on long chunks. \
+             Heavier storage + reconcile — the best fit for code.",
         Backend::FastEmbed =>
             "Local fastembed model. Good when you want local semantic search without a remote \
              server.",
         Backend::Model2Vec =>
-            "Small and fast local model. Use when speed matters more than maximum semantic recall.",
+            "Small and fast local model (mean-pooled, no token limit). Use when speed matters more \
+             than maximum semantic recall.",
         Backend::Ollama =>
             "Remote runtime. Use only with a configured Ollama endpoint or ephemeral provider.",
     };
     vec![
-        Line::from(format!("{}: {weight}, {}d, {}.", s.display, s.dim, s.backend.runtime())),
+        Line::from(format!(
+            "{}: {weight}, {}d, {}{window}.",
+            s.display,
+            s.dim,
+            s.backend.runtime()
+        )),
         Line::from(guidance),
     ]
 }

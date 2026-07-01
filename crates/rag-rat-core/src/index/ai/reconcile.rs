@@ -504,6 +504,14 @@ pub(crate) fn reconcile_with_options_progress(
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_BATCH_SIZE);
     let max_embedding_chars = options.max_embedding_chars.max(MIN_EMBEDDING_CHARS);
+    // Never send more than the ACTIVE model can read: a transformer silently truncates input past
+    // its context window, so the excess is wasted bytes (and can overflow a strict server like
+    // vLLM). Recall-neutral — the model ignored it anyway. The user-facing "a short-context model
+    // loses recall on long code" guidance lives in `rag-rat init` + `models install`, NOT here
+    // (this runs on every watcher tick — a warning would spam).
+    let max_embedding_chars = crate::embedding_models::spec(&active_model_id)
+        .and_then(|s| s.max_input_chars())
+        .map_or(max_embedding_chars, |model_cap| max_embedding_chars.min(model_cap));
     let started = now_ms();
     set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_STARTED_META, &started.to_string())?;
     conn.execute(
