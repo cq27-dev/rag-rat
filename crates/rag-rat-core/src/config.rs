@@ -257,6 +257,18 @@ impl RemoteBackend {
             _ => None,
         }
     }
+
+    /// The HTTP path (appended to the endpoint) of this backend's embeddings route. The
+    /// request/response SHAPE is identical across backends (OpenAI `{model,input}` →
+    /// `{data:[{embedding,index}]}`); only the PATH differs: ollama and vLLM expose the
+    /// OpenAI-standard `/v1/embeddings`, while michaelfeil/infinity's `v2` server serves it at
+    /// `/embeddings` (verified live against `michaelf34/infinity:latest-cpu`).
+    pub fn embed_path(self) -> &'static str {
+        match self {
+            RemoteBackend::Ollama | RemoteBackend::Vllm => "/v1/embeddings",
+            RemoteBackend::Infinity => "/embeddings",
+        }
+    }
 }
 
 /// Remote-embedding offload (`[llm.embedding.remote]`). Hands embedding work to an
@@ -2025,6 +2037,15 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", b.as_db_str()));
         }
         assert_eq!(RemoteBackend::from_db_str("nope"), None);
+    }
+
+    #[test]
+    fn remote_backend_embed_path_is_per_backend() {
+        // ollama + vLLM expose the OpenAI-standard route; infinity's v2 server serves `/embeddings`
+        // (verified live). Same request/response shape — only the path differs.
+        assert_eq!(RemoteBackend::Ollama.embed_path(), "/v1/embeddings");
+        assert_eq!(RemoteBackend::Vllm.embed_path(), "/v1/embeddings");
+        assert_eq!(RemoteBackend::Infinity.embed_path(), "/embeddings");
     }
 
     #[test]

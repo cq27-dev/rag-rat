@@ -93,6 +93,9 @@ pub struct OpenAiEmbedder {
 pub struct ProvisionedEmbedderParams<'a> {
     /// The serving endpoint from the cookbook handshake (`https://...`).
     pub endpoint: &'a str,
+    /// The backend's embeddings route appended to `endpoint` (`RemoteBackend::embed_path()` —
+    /// `/v1/embeddings` for ollama/vLLM, `/embeddings` for infinity).
+    pub embed_path: &'a str,
     /// A DIRECT bearer token from the handshake (NOT an env-var name), or `None` for an open box.
     pub auth_token: Option<&'a str>,
     /// The Ollama API model name sent in the request body (`[remote] model`).
@@ -113,6 +116,7 @@ pub struct ProvisionedEmbedderParams<'a> {
 
 struct BuildParams<'a> {
     endpoint: &'a str,
+    embed_path: &'a str,
     auth_header: Option<String>,
     selected_model_id: &'a str,
     server_model: &'a str,
@@ -152,6 +156,7 @@ impl OpenAiEmbedder {
             resolve_auth_header(cfg.auth_env.as_deref(), |var| std::env::var(var).ok())?;
         Ok(Self::build(BuildParams {
             endpoint,
+            embed_path: cfg.backend.embed_path(),
             auth_header,
             selected_model_id,
             server_model: cfg.model.trim(),
@@ -177,6 +182,7 @@ impl OpenAiEmbedder {
             .map(|token| format!("Bearer {token}"));
         Self::build(BuildParams {
             endpoint: params.endpoint.trim(),
+            embed_path: params.embed_path,
             auth_header,
             selected_model_id: params.selected_model_id,
             server_model: params.server_model.trim(),
@@ -193,6 +199,7 @@ impl OpenAiEmbedder {
     fn build(params: BuildParams<'_>) -> Self {
         let BuildParams {
             endpoint,
+            embed_path,
             auth_header,
             selected_model_id,
             server_model,
@@ -202,7 +209,7 @@ impl OpenAiEmbedder {
             concurrency,
             max_batch_chars,
         } = params;
-        let embed_url = format!("{}/v1/embeddings", endpoint.trim_end_matches('/'));
+        let embed_url = format!("{}{}", endpoint.trim_end_matches('/'), embed_path);
         let mut builder = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(request_timeout_s)))
             .http_status_as_error(false)

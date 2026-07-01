@@ -577,6 +577,7 @@ fn provision_and_build_cancellable(
     };
     let embedder = OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
         endpoint: &provisioned.endpoint,
+        embed_path: effective_remote.backend.embed_path(),
         auth_token: provisioned.auth_token.as_deref(),
         server_model: effective_remote.model.trim(),
         selected_model_id: spec.model_id,

@@ -148,6 +148,7 @@ pub(crate) fn tune_remote_concurrency(
     let build = |concurrency: u32, request_timeout_s: u64| -> OpenAiEmbedder {
         OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
             endpoint,
+            embed_path: remote.backend.embed_path(),
             auth_token,
             server_model: remote.model.trim(),
             selected_model_id: spec.model_id,
