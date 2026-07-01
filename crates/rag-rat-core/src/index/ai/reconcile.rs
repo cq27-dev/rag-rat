@@ -543,12 +543,15 @@ pub(crate) fn reconcile_with_options_progress(
 
     // SkipEphemeral and NoEphemeralWork are the ONLY paths that return BEFORE the policy scan, and
     // both embed nothing:
-    //  - SkipEphemeral: the watcher/maintenance pass with an ephemeral active model +
-    //    `provision_remote=false`. It fires on every file change, so paying the O(repo)
-    //    `embedding_policy_skip_summary` just to return "Blocked" is pure per-edit waste.
-    //  - NoEphemeralWork: an explicit provisioning reconcile on an already-current ephemeral model.
-    //    `acquire_chunk_embedder` already confirmed ZERO candidates, so it deliberately did NOT
-    //    provision a paid box (#330-6) — and the policy scan would likewise be wasted work.
+    //  - SkipEphemeral: an ephemeral active model on a watcher/maintenance pass
+    //    (`provision_remote=false`) with NO local `query_endpoint` server — defer incremental
+    //    embedding to an explicit reconcile. (WITH a `query_endpoint`, that pass takes the light
+    //    local-embed path → `Ready`, not here.) Returning here avoids paying the O(repo)
+    //    `embedding_policy_skip_summary` just to report a deferral.
+    //  - NoEphemeralWork: nothing pending — either an explicit provisioning reconcile on an
+    //    already-current ephemeral model (never cold-start a paid box for zero work, #330-6) or an
+    //    idle light pass. `acquire_chunk_embedder` confirmed ZERO candidates, so the policy scan
+    //    would likewise be wasted work.
     // Both carry an empty `skipped_by_policy` (no policy counts on these early-return paths). The
     // NotReady path below DOES report policy skips
     // (`blocked_fastembed_reconcile_still_reports_policy_skips` pins that), so it runs the scan
@@ -559,8 +562,9 @@ pub(crate) fn reconcile_with_options_progress(
                 ChunkEmbedder::SkipEphemeral => (
                     "Blocked",
                     Some(
-                        "ephemeral remote embedding needs an explicit `rag-rat reconcile` (the \
-                         watcher does not provision a GPU box for incremental edits)"
+                        "ephemeral remote embedding needs an explicit `rag-rat reconcile`, or a \
+                         local `[remote] query_endpoint` server to embed incremental edits \
+                         against (the watcher does not provision a GPU box)"
                             .to_string(),
                     ),
                 ),
@@ -2246,6 +2250,13 @@ mod freshness_version_tests {
     /// Activate an ephemeral remote config WITHOUT provisioning (mark the model Ready + persist a
     /// cookbook remote config + freshness meta), mirroring a real ephemeral install's DB state.
     fn activate_ephemeral(conn: &Connection) {
+        activate_ephemeral_with_query_endpoint(conn, Some("http://localhost:11434"));
+    }
+
+    /// Activate an ephemeral (`cookbook`) remote config with the given local `query_endpoint`.
+    /// `None` models the "no local query server" case whose light/watcher pass defers
+    /// (`SkipEphemeral`); `Some(..)` models the local light-embed path.
+    fn activate_ephemeral_with_query_endpoint(conn: &Connection, query_endpoint: Option<&str>) {
         let spec = spec(FASTEMBED_MODEL_ID).unwrap();
         conn.execute(
             "UPDATE ai_models
@@ -2261,7 +2272,7 @@ mod freshness_version_tests {
             backend: crate::config::RemoteBackend::Ollama,
             endpoint: None,
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
-            query_endpoint: Some("http://localhost:11434".to_string()),
+            query_endpoint: query_endpoint.map(str::to_string),
             auth_env: None,
             gpu: None,
             num_ctx: None,
@@ -2281,13 +2292,15 @@ mod freshness_version_tests {
 
     #[test]
     fn reconcile_skips_ephemeral_chunk_embed_without_provision_remote() {
-        // The watcher/maintenance pass (`provision_remote: false`) must NOT cold-start a cookbook
-        // box for an ephemeral active model — it returns Blocked with a "needs explicit
-        // reconcile" message and never spawns a subprocess. (No cookbook is actually
-        // runnable here, so a provisioning attempt would error/hang; the skip is what keeps
-        // this test fast + offline.)
+        // The watcher/maintenance pass (`provision_remote: false`) on an ephemeral model with NO
+        // local `query_endpoint` server must NOT cold-start a cookbook box — it returns Blocked
+        // with a "needs explicit reconcile" message and never spawns a subprocess. (No
+        // cookbook is actually runnable here, so a provisioning attempt would error/hang;
+        // the skip is what keeps this test fast + offline.) With a `query_endpoint` set,
+        // the light path embeds locally instead — see
+        // `light_pass_with_query_endpoint_embeds_locally_without_provisioning`.
         let conn = schema_conn();
-        activate_ephemeral(&conn);
+        activate_ephemeral_with_query_endpoint(&conn, None);
 
         let report = reconcile_with_options_progress(
             &conn,
@@ -2303,6 +2316,57 @@ mod freshness_version_tests {
             "skip message: {:?}",
             report.message
         );
+    }
+
+    /// Build the light-path acquire for an ephemeral active model (mirrors the scan
+    /// `reconcile_with_options_progress` builds), on a non-provisioning (watcher) pass.
+    fn ephemeral_light_acquire(conn: &Connection) -> ChunkEmbedder {
+        let model_id = active_embedding_model_id(conn).unwrap();
+        let dim = spec(&model_id).unwrap().dim;
+        let version = active_version(conn);
+        let scan = EmbeddingScan {
+            model_id: &model_id,
+            model_version: &version,
+            dim,
+            max_embedding_chars: 4000,
+        };
+        acquire_chunk_embedder(conn, None, &scan, &ReconcileOptions {
+            provision_remote: false,
+            ..ReconcileOptions::default()
+        })
+    }
+
+    #[test]
+    fn light_pass_without_query_endpoint_defers_to_explicit_reconcile() {
+        // Ephemeral watcher pass with NO local query server → SkipEphemeral (defer), even with
+        // pending work: the "watcher never cold-starts a paid box" guarantee is preserved.
+        let conn = schema_conn();
+        activate_ephemeral_with_query_endpoint(&conn, None);
+        seed_embedding_chunk(&conn, 1);
+        assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::SkipEphemeral));
+    }
+
+    #[test]
+    fn light_pass_with_query_endpoint_embeds_locally_without_provisioning() {
+        // Ephemeral watcher pass, `query_endpoint` set, pending work → Ready with NO provisioned
+        // box: the light path builds the LOCAL query-endpoint embedder, so incremental edits embed
+        // into the SAME vector space as the cookbook-provisioned chunks — no paid cold-start.
+        let conn = schema_conn();
+        activate_ephemeral(&conn);
+        seed_embedding_chunk(&conn, 1);
+        assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::Ready {
+            provisioned: None,
+            ..
+        }));
+    }
+
+    #[test]
+    fn light_pass_with_query_endpoint_but_no_work_is_no_ephemeral_work() {
+        // Ephemeral watcher pass, `query_endpoint` set, nothing pending → NoEphemeralWork: an idle
+        // pass stays cheap (no O(repo) policy summary, no cold-start).
+        let conn = schema_conn();
+        activate_ephemeral(&conn);
+        assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::NoEphemeralWork));
     }
 
     #[test]
