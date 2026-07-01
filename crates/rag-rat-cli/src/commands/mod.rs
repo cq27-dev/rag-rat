@@ -507,9 +507,29 @@ pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     match &args.command {
         None | Some(ModelsCommand::List) => print_output(&db.list_models()?),
         Some(ModelsCommand::Install { model_id }) => {
+            warn_if_short_context(model_id);
             let remote = remote_for_install(config, model_id)?;
             print_output(&db.install_model(model_id, remote)?)
         },
+    }
+}
+
+/// One-line heads-up when installing a SHORT-CONTEXT embedding model — one whose token window is
+/// smaller than the default chunk-embed budget, so typical code chunks get truncated (their tail is
+/// not embedded), costing precision/recall on large functions. `rag-rat init`'s model help covers
+/// this interactively; this catches the `rag-rat models install` CLI path.
+fn warn_if_short_context(model_id: &str) {
+    let Some(spec) = rag_rat_core::embedding_models::spec(model_id) else { return };
+    let (Some(max_tokens), Some(model_chars)) = (spec.max_tokens, spec.max_input_chars()) else {
+        return;
+    };
+    if model_chars < rag_rat_core::index::ai::DEFAULT_MAX_EMBEDDING_CHARS {
+        eprintln!(
+            "note: {model_id} has a {max_tokens}-token context, so code chunks longer than that \
+             are truncated — their tail is not embedded, costing precision/recall on large \
+             functions. For code, a long-context model like jinaai/jina-embeddings-v2-base-code \
+             (8192 tokens) embeds whole chunks."
+        );
     }
 }
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {

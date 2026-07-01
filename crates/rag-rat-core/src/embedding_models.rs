@@ -58,6 +58,14 @@ pub struct EmbeddingModelSpec {
     pub display: &'static str,
     /// Embedding dimension. A change here is a re-embed (new vectors), not a schema migration.
     pub dim: usize,
+    /// The model's maximum input length in TOKENS (its transformer context window), or `None` for
+    /// models with no sequence limit (the char-hash fallback; Model2Vec, which mean-pools token
+    /// vectors with no attention). A transformer embedder SILENTLY TRUNCATES input past this —
+    /// content beyond it is not represented in the vector, so a short window (all-MiniLM's
+    /// 256) costs precision/recall on long code chunks. Drives [`Self::max_input_chars`], which
+    /// `rag-rat init` + `models install` use to WARN when a short-context model is picked for a
+    /// code repo (steering to a long-context model like jina-code).
+    pub max_tokens: Option<usize>,
     /// The reconcile freshness key (formerly `default_model_version`). Bumping it forces a
     /// re-embed of every chunk for this model. MUST be unique across the table and never the
     /// bare `"v1"` fallback — the registry test guards both.
@@ -70,6 +78,26 @@ pub struct EmbeddingModelSpec {
     /// model (e.g. CodeRankEmbed) would set this; `embed_query_with` would prepend it on the
     /// query path only.
     pub query_prefix: &'static str,
+}
+
+/// Rough UPPER-BOUND chars-per-token for deriving a char cap from a token limit. Deliberately an
+/// over-estimate (English prose ≈ 4, code is denser ≈ 3) so the derived char cap never truncates
+/// BEFORE the model's own token limit would — it only trims input clearly beyond what any plausible
+/// tokenization could fit, saving bytes without changing the embedded content.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+impl EmbeddingModelSpec {
+    /// The embedding input length (in CHARS) this model can actually use: `max_tokens × ~4`, or
+    /// `None` for a model with no sequence limit. A rough over-estimate (see
+    /// [`CHARS_PER_TOKEN_ESTIMATE`]) used to judge whether a model is "short-context" for typical
+    /// chunks — `rag-rat init` + `models install` warn when this falls below the default
+    /// chunk-embed budget, steering code repos to a long-context model. NOT used to truncate
+    /// reconcile input: the model truncates past its own window anyway, and forcing a smaller
+    /// cap there interacts badly with the `SkipTooLarge` policy threshold (`max_embedding_chars
+    /// × 4`) and an ollama `num_ctx` override.
+    pub fn max_input_chars(&self) -> Option<usize> {
+        self.max_tokens.map(|t| t.saturating_mul(CHARS_PER_TOKEN_ESTIMATE))
+    }
 }
 
 /// Locality-sensitive hash embedder id — the dependency-free fallback tier.
@@ -118,6 +146,8 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         model_id: HASH_MODEL_ID,
         display: "hash",
         dim: HASH_EMBEDDING_DIM,
+        // A char-level locality hash, not a transformer — no token window.
+        max_tokens: None,
         version: "hash-v1",
         backend: Backend::Hash,
         query_prefix: "",
@@ -126,6 +156,8 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         model_id: FASTEMBED_MODEL_ID,
         display: FASTEMBED_DISPLAY_MODEL,
         dim: FASTEMBED_EMBEDDING_DIM,
+        // all-MiniLM-L6-v2's context is 256 tokens — short for code; long chunks lose their tail.
+        max_tokens: Some(256),
         version: "sentence-transformers/all-MiniLM-L6-v2-v1",
         backend: Backend::FastEmbed,
         query_prefix: "",
@@ -134,6 +166,8 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         model_id: BGE_SMALL_MODEL_ID,
         display: BGE_SMALL_DISPLAY_MODEL,
         dim: BGE_SMALL_EMBEDDING_DIM,
+        // BGE-small-en-v1.5's context is 512 tokens.
+        max_tokens: Some(512),
         version: "BAAI/bge-small-en-v1.5-v1",
         backend: Backend::FastEmbed,
         query_prefix: "",
@@ -142,6 +176,8 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         model_id: JINA_CODE_MODEL_ID,
         display: JINA_CODE_DISPLAY_MODEL,
         dim: JINA_CODE_EMBEDDING_DIM,
+        // jina-v2-base-code handles 8192 tokens (ALiBi) — whole code chunks fit; no tail loss.
+        max_tokens: Some(8192),
         version: "jinaai/jina-embeddings-v2-base-code-v1",
         backend: Backend::FastEmbed,
         query_prefix: "",
@@ -150,6 +186,8 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         model_id: MODEL2VEC_MODEL_ID,
         display: MODEL2VEC_DISPLAY_MODEL,
         dim: MODEL2VEC_EMBEDDING_DIM,
+        // Model2Vec mean-pools token vectors with no attention — no sequence limit to truncate at.
+        max_tokens: None,
         version: "minishlab/potion-retrieval-32M-v1",
         backend: Backend::Model2Vec,
         query_prefix: "",
@@ -215,6 +253,33 @@ mod tests {
         for s in EMBEDDING_MODELS {
             assert_eq!(spec(s.model_id).map(|x| x.model_id), Some(s.model_id));
         }
+    }
+
+    #[test]
+    fn transformer_models_declare_a_token_window_static_ones_do_not() {
+        // A transformer embedder (FastEmbed) has a finite context window that truncates long input;
+        // the char-hash and Model2Vec (mean-pool) tiers have none. `max_input_chars` is derived iff
+        // there's a token limit.
+        for s in EMBEDDING_MODELS {
+            match s.backend {
+                Backend::FastEmbed => {
+                    assert!(
+                        s.max_tokens.is_some(),
+                        "{} (transformer) must declare max_tokens",
+                        s.model_id
+                    )
+                },
+                Backend::Hash | Backend::Model2Vec => {
+                    assert_eq!(s.max_tokens, None, "{} has no token window", s.model_id)
+                },
+                _ => {},
+            }
+            assert_eq!(s.max_input_chars().is_some(), s.max_tokens.is_some());
+        }
+        // The default all-MiniLM is short-context (the init help warns about this); jina-code is
+        // long.
+        assert_eq!(spec(FASTEMBED_MODEL_ID).unwrap().max_tokens, Some(256));
+        assert_eq!(spec(JINA_CODE_MODEL_ID).unwrap().max_tokens, Some(8192));
     }
 
     #[test]
