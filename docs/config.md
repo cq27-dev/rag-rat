@@ -76,9 +76,10 @@ model = "all-minilm"              # the Ollama-side model name (the server's own
 
 **EPHEMERAL** — provision an on-demand GPU box (e.g. Modal) for the bulk reconcile, then tear it
 down. rag-rat spawns the **cookbook** recipe as a subprocess; it provisions a box, prints a handshake
-when it's serving, and is torn down (SIGTERM) when the reconcile finishes. Queries embed against a
-**local** Ollama (`query_endpoint`) running the same model — so the query vectors share the same
-space as the remote-embedded chunks.
+(`ready`, carrying the endpoint) when it's serving, and is torn down (SIGTERM) when the reconcile
+finishes. rag-rat auto-tunes the client concurrency against the box itself (see below). Queries embed
+against a **local** Ollama (`query_endpoint`) running the same model — so the query vectors share the
+same space as the remote-embedded chunks.
 
 ```toml
 [llm.embedding]
@@ -102,7 +103,7 @@ model = "all-minilm"                        # the Ollama-side model name
                                             #     cold-start risk);
                                             #   RunPod = a gpuTypeId (default: NVIDIA RTX A4000).
 # batch_size = 256                          # texts per /api/embed request
-# concurrency = 32                          # 1..=128 concurrent /api/embed requests
+# concurrency = 32                          # 1..=128 — a CAP; rag-rat auto-tunes the client fan-out within it
 # max_batch_chars = 384000                  # max total input chars per /api/embed request
 # request_timeout_s = 60
 ```
@@ -117,8 +118,15 @@ need-first/id-first; rag-rat does not size-sort chunks.
 
 When `concurrency` is omitted, CONNECT configs default to `1` for upgrade safety with ordinary
 Ollama servers. Set it explicitly after starting the server with matching parallelism. EPHEMERAL
-cookbook configs default to `32`; the cookbook recipe is responsible for aligning server-side
-parallelism. Values above `128` are rejected to keep worker threads and reconcile windows bounded.
+cookbook configs default to `32`. For ephemeral configs `concurrency` is a **cap**: after the box
+boots, **rag-rat** (not the recipe) runs a short micro-sweep with its real `OllamaEmbedder` and
+auto-tunes the client fan-out *within* the cap, caching the chosen knee in the index's `index_meta`
+per `(runtime, provider, GPU, model, request-shape)` with a TTL. It uses that knee for the live
+reconcile but never raises it above — or overwrites — your configured value. Lower `concurrency` to
+tighten the cap; the tuner re-tunes within the new limit. `batch_size`/`max_batch_chars` are left
+untouched (the sweep does not vary them). Values above `128` are rejected to keep worker threads and
+reconcile windows bounded. `RAG_RAT_TUNE_MS` overrides the sweep budget, `RAG_RAT_TUNE_TTL_MS` the
+cache TTL (0 = re-sweep every time), and `RAG_RAT_DISABLE_TUNING=1` skips the sweep (uses the cap).
 
 ### Init cookbook catalog
 

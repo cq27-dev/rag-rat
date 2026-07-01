@@ -5,6 +5,7 @@ mod reconcile;
 mod reencode;
 mod status;
 mod store;
+mod throughput_tune;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;

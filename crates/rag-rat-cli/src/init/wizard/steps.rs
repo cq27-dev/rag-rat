@@ -2208,6 +2208,9 @@ fn probe_ephemeral(
     s: &EmbeddingModelSpec,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> CheckResult {
+    // A throwaway spin-up test: provision, embed one "ping", tear down. It passes `tune = None`, so
+    // it does NOT run the throughput sweep (that runs at reconcile, against a box the index keeps);
+    // the probe only reports pass/fail at the user's configured `[remote] concurrency` cap.
     match verify_ephemeral_remote_cancellable(&r, s, || cancel.load(Ordering::Acquire)) {
         Ok(()) => CheckResult::ok(),
         Err(e) => CheckResult::warn(format!("ephemeral: {e}")),

@@ -26,7 +26,7 @@ Rust parser is built against the exact event shapes below; implement them precis
 | spawn | runs `node recipe.mjs` (or `npx tsx recipe.mts`), with `RAG_RAT_COOKBOOK_INPUT` set in env | starts up |
 | input | sets `RAG_RAT_COOKBOOK_INPUT` = JSON `CookbookInput`; provider creds already in env / `~/.modal.toml` | reads + parses that env var |
 | progress | reads `status` / `log` events from **stdout** | emits `status` (provisioning → pulling → verifying) and `log` events as it works |
-| ready | reads the `ready` event → uses `endpoint` | once the box is up **and serving**, emits one `ready` event |
+| ready | reads the `ready` event → uses `endpoint` (+ optional `auth_token`) | once the box is up **and serving**, emits one `ready` event |
 | liveness | uses the endpoint | stays running, holding the box |
 | teardown | sends `SIGTERM` (or `SIGINT`) | emits a `tearing_down` status, destroys the box, exits `0` |
 | failure | sees an `error` event + non-zero exit, no `ready` | on provisioning failure: emits an `error` event, exits non-zero, **before** any `ready` |
@@ -68,8 +68,10 @@ Hard rules:
                                //   string like "A10", "L40S", "H100", or "B200+" (CPU default);
                                //   for RunPod a gpuTypeId like "NVIDIA RTX A4000".
   "ollama_num_parallel": 32    // optional: positive integer — sets OLLAMA_NUM_PARALLEL in the
-                               //   remote Ollama container, normally matching rag-rat's remote
-                               //   embedding concurrency.
+                               //   remote Ollama container. rag-rat sends the user's `[remote]
+                               //   concurrency` CAP so the box can serve up to that many parallel
+                               //   /api/embed requests; rag-rat then auto-tunes the actual client
+                               //   fan-out (within the cap) itself, against the box, after `ready`.
 }
 ```
 
@@ -91,7 +93,8 @@ stdout is JSONL — one of these objects per line. Every event carries `ts` (epo
 // diagnostics: level ∈ {"info","warn","error"}
 {"type":"log","level":"info","message":"pod deployed: abc123","ts":1782489011405}
 
-// the box is serving — REPLACES the old bare handshake line
+// the box is serving — REPLACES the old bare handshake line. Carries only the endpoint and an
+// optional auth token; rag-rat does the throughput tuning itself after this event.
 {"type":"ready","endpoint":"https://abc123.modal.host","auth_token":null,"ts":1782489011405}
 
 // provisioning failed before `ready`
@@ -102,6 +105,22 @@ stdout is JSONL — one of these objects per line. Every event carries `ts` (epo
 normalized to explicit `null`. A run emits zero-or-more `status`/`log` events, then **either** one
 `ready` (success — followed later by a `tearing_down` status on signal) **or** one `error` (failure,
 with exit 1 and no `ready`).
+
+### Throughput tuning lives in rag-rat, not the recipe
+
+The recipe is a **dumb provisioner**: it boots the box, sets `OLLAMA_NUM_PARALLEL` to the user's
+`[remote] concurrency` cap (passed as `ollama_num_parallel`), verifies `/api/embed` serves, and
+emits `ready`. It does **no** throughput sweeping.
+
+rag-rat owns the tuning. After `ready`, rag-rat runs a short client-concurrency micro-sweep against
+the box **with its real `OllamaEmbedder`** — the same request shape (num_ctx, batch size, char
+budget) reconcile will use — so the measured knee can't drift from real load the way a recipe-side
+re-implementation did. The tuned knee is a **hard-clamped-to-cap** client fan-out: rag-rat treats
+`[remote] concurrency` as a ceiling it optimizes *within* and never exceeds or overwrites. The
+result is cached in the index's `index_meta` (keyed by runtime + provider + GPU + model + request
+shape) with a TTL, so routine re-provisions reuse it without re-sweeping. See rag-rat's
+`RAG_RAT_TUNE_MS` / `RAG_RAT_TUNE_TTL_MS` / `RAG_RAT_DISABLE_TUNING` env knobs, not any cookbook-side
+ones.
 
 ## Invoking — provider as a subcommand
 
@@ -144,7 +163,8 @@ Provider gotchas baked into the recipe (each one cost real time to find):
 - ollama defaults to `127.0.0.1:11434`, unreachable by the tunnel — the recipe sets
   `OLLAMA_HOST=0.0.0.0:11434`.
 - Ollama defaults to single-request handling — the recipe sets `OLLAMA_NUM_PARALLEL` from
-  `input.ollama_num_parallel` so Modal can serve the client-side remote concurrency window.
+  `input.ollama_num_parallel` (the user's `[remote] concurrency` cap). rag-rat tunes the actual
+  client fan-out itself after `ready`.
 - **GPU is off by default.** GPU on Modal must attach before ollama's discovery watchdog times out,
   or the box dies with exit 137 at cold start. CPU `serve` is the safe v1 path; pass `gpu` only if
   you've accepted that.
@@ -170,7 +190,8 @@ Provider gotchas baked into the recipe:
   (`"ollama serve"` would exec `ollama ollama serve`). `dockerArgs` sets the container CMD,
   appended to the entrypoint.
 - ollama defaults to `127.0.0.1:11434`, unreachable through the proxy — the recipe sets
-  `OLLAMA_HOST=0.0.0.0:11434` and `OLLAMA_NUM_PARALLEL` in the pod env.
+  `OLLAMA_HOST=0.0.0.0:11434` and `OLLAMA_NUM_PARALLEL` (from `input.ollama_num_parallel`, the user's
+  `[remote] concurrency` cap) in the pod env. rag-rat tunes the client fan-out itself after `ready`.
 - There is **no in-pod exec** in `podFindAndDeployOnDemand`, so the model is pulled **client-side**
   over the proxy URL (`POST /api/pull`, non-streaming, retried until the pod finishes booting),
   then `/api/embed` is probed before the `ready` event.

@@ -69,6 +69,9 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   // leaked box bills until then.) See N2.
   const deadline = Date.now() + provisionTimeoutMs;
   const gpu = input.gpu ?? null;
+  // rag-rat sends the user's `[remote] concurrency` cap as `ollama_num_parallel`; the box's server
+  // parallelism is set to it so rag-rat can fan out up to the cap. rag-rat tunes the actual client
+  // concurrency (within the cap) itself, against the box, after `ready`.
   const ollamaNumParallel = String(input.ollama_num_parallel ?? 1);
 
   ctx.status(

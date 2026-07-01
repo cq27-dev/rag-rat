@@ -36,6 +36,8 @@ pub use self::model2vec::Model2VecEmbedder;
 // visibility (same pattern as the other backends) exempts it from dead-code/unused-import
 // analysis under `-D warnings` until the dispatch arm lands.
 pub use self::ollama::OllamaEmbedder;
+// The tuning sweep (index::ai::throughput_tune) builds embedders at varied concurrencies.
+pub(crate) use self::ollama::ProvisionedEmbedderParams;
 use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
 use crate::index::ai::{
@@ -155,10 +157,13 @@ pub(crate) fn acquire_chunk_embedder(
         // `rag-rat reconcile` on an already-current ephemeral model would otherwise cold-start +
         // tear down a GPU/pod for nothing (#330-6). `--force` makes every chunk a candidate, so a
         // forced reconcile still provisions (count > 0). A count error is non-fatal — fall through
-        // to provisioning rather than skip real work on a transient query failure.
-        if let Ok(0) = estimated_reconcile_jobs(conn, scan, options) {
-            return ChunkEmbedder::NoEphemeralWork;
-        }
+        // to provisioning rather than skip real work on a transient query failure. The estimate is
+        // reused below to decide whether a concurrency sweep is worthwhile.
+        let estimated_jobs = match estimated_reconcile_jobs(conn, scan, options) {
+            Ok(0) => return ChunkEmbedder::NoEphemeralWork,
+            Ok(n) => Some(n),
+            Err(_) => None,
+        };
         let active_model_id = match active_embedding_model_id(conn) {
             Ok(id) => id,
             Err(err) => return ChunkEmbedder::NotReady(err),
@@ -168,11 +173,45 @@ pub(crate) fn acquire_chunk_embedder(
                 "unknown active embedding model `{active_model_id}`"
             ));
         };
-        return match provision_and_build(remote, spec) {
-            Ok((embedder, provisioned)) => ChunkEmbedder::Ready {
-                embedder: Box::new(embedder),
-                provisioned: Some(provisioned),
-                remote: Some(Box::new(remote.clone())),
+        // Tune in Rust against the box before the bulk reconcile: this is the ONLY provision path
+        // with the DB `conn` (for the tune cache) + the configured chunk size, so it's where the
+        // sweep runs. The install probe / wizard verify pass `None` (throwaway boxes — no sweep).
+        // Only sweep when the live run will actually fan out: a `--max-seconds` / maintenance pass
+        // isn't widened (`remote_reconcile_batch_size`), and a tiny `--limit` / few-chunk run sends
+        // one request — tuning either would just burn paid-box time the loop can't use. Use
+        // `scan.max_embedding_chars` (already clamped to MIN_EMBEDDING_CHARS), NOT the raw option,
+        // so the probe texts + tune cache key match the size reconcile actually embeds.
+        // ALWAYS pass a TuneRequest so the tune cache is consulted (a prior tuned knee beats the
+        // raw cap even on a bounded/tiny pass); `allow_sweep` gates only a fresh sweep —
+        // off for a bounded `--max-seconds` run or one too small to fan out
+        // (`sweep_is_worthwhile`).
+        let tune = self::cookbook::TuneRequest {
+            conn,
+            max_embedding_chars: scan.max_embedding_chars,
+            allow_sweep: crate::index::ai::throughput_tune::sweep_is_worthwhile(
+                options.max_seconds,
+                estimated_jobs,
+                remote.bounded_concurrency(),
+                remote.batch_size,
+                remote.max_batch_chars,
+                scan.max_embedding_chars,
+            ),
+        };
+        return match provision_and_build(remote, spec, Some(tune)) {
+            Ok((embedder, provisioned, effective_remote, window_concurrency)) => {
+                // Size the reconcile selection window by the EMBEDDER's real fan-out (the tuned
+                // knee), not the user's cap: `remote_reconcile_batch_size`
+                // multiplies by `concurrency`, so a 128-cap config with a knee of 4
+                // would otherwise load a 32x-too-wide window the embedder only
+                // drains 4-at-a-time. This `remote` is window-sizing only (NOT persisted
+                // — the active-config meta is written from the cap by `install_ollama_model`).
+                let mut window_remote = effective_remote;
+                window_remote.concurrency = window_concurrency;
+                ChunkEmbedder::Ready {
+                    embedder: Box::new(embedder),
+                    provisioned: Some(provisioned),
+                    remote: Some(Box::new(window_remote)),
+                }
             },
             Err(err) => ChunkEmbedder::NotReady(err),
         };

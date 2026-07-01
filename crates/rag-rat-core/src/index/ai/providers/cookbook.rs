@@ -146,8 +146,10 @@ pub struct CookbookInput {
     /// GPU hint for the recipe (e.g. `"T4"`); `None` lets the recipe decide. Carried as JSON
     /// `null` when absent so the contract field is always present.
     pub gpu: Option<String>,
-    /// Ollama server parallelism the recipe should set as `OLLAMA_NUM_PARALLEL`, aligned to the
-    /// remote client's configured in-flight request count.
+    /// Ollama server parallelism the recipe should set as `OLLAMA_NUM_PARALLEL`. rag-rat sends the
+    /// user's `[remote] concurrency` CAP; the box is provisioned to handle up to that many
+    /// parallel requests, and rag-rat tunes the actual client fan-out (within the cap) itself
+    /// against the box.
     pub ollama_num_parallel: u32,
 }
 
@@ -175,7 +177,8 @@ enum CookbookEvent {
         message: String,
     },
     /// The box is SERVING — the handshake. `auth_token` is a DIRECT bearer token (NOT an env-var
-    /// name), or `null` for an unauthenticated box.
+    /// name), or `null` for an unauthenticated box. `ready` carries only the endpoint + token;
+    /// throughput tuning runs in rag-rat (Rust) against the box after this event.
     Ready { endpoint: String, auth_token: Option<String> },
     /// Provisioning failed before `ready`.
     Error { message: String },
@@ -503,6 +506,8 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
         // recipe picks its own default when `None`. Config validation guarantees `gpu` is only set
         // in ephemeral mode, which is the only mode reaching this function.
         gpu: remote.gpu.clone(),
+        // The user's `[remote] concurrency` cap — the box's server parallelism ceiling. rag-rat
+        // fans out up to this many parallel requests and auto-tunes the client knee within it.
         ollama_num_parallel: remote.bounded_concurrency(),
     }
 }
@@ -513,44 +518,85 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
 /// ephemeral chunk path AND the install probe (status.rs) so the model→input→handshake→embedder
 /// chain isn't duplicated. The returned [`ProvisionedBox`] MUST be kept alive for as long as the
 /// embedder is used (its `Drop` is the box teardown).
+/// Returns `(embedder, box, persisted_remote, window_concurrency)`. `persisted_remote` keeps the
+/// user's `concurrency` CAP (for the active-config meta); `window_concurrency` is the tuned client
+/// knee (<= cap) — the embedder's real fan-out, which the reconcile path uses to size its selection
+/// window so it doesn't load a cap-wide window the embedder will only drain `knee`-at-a-time.
+/// Context for the in-Rust throughput sweep (see [`crate::index::ai::throughput_tune`]). Present
+/// only on the reconcile path (which has the DB `conn` for the tune cache and the configured chunk
+/// size); the install probe / wizard verify pass `None` (they just ping — no sweep).
+pub(crate) struct TuneRequest<'a> {
+    pub conn: &'a rusqlite::Connection,
+    pub max_embedding_chars: usize,
+    /// Whether to run a NEW concurrency sweep on a cache miss. The tune cache is ALWAYS consulted
+    /// (a prior knee beats the raw cap); this only gates a fresh sweep — false for a bounded
+    /// `--max-seconds` pass or a run too small to fan out, so we don't spend paid-box time
+    /// measuring a fan-out the live loop can't use. See
+    /// `throughput_tune::sweep_is_worthwhile`.
+    pub allow_sweep: bool,
+}
+
 pub(crate) fn provision_and_build(
     remote: &RemoteEmbeddingConfig,
     spec: &EmbeddingModelSpec,
-) -> anyhow::Result<(OllamaEmbedder, ProvisionedBox)> {
-    provision_and_build_cancellable(remote, spec, || false)
+    tune: Option<TuneRequest<'_>>,
+) -> anyhow::Result<(OllamaEmbedder, ProvisionedBox, RemoteEmbeddingConfig, u32)> {
+    provision_and_build_cancellable(remote, spec, || false, tune)
 }
 
 fn provision_and_build_cancellable(
     remote: &RemoteEmbeddingConfig,
     spec: &EmbeddingModelSpec,
     cancel: impl Fn() -> bool,
-) -> anyhow::Result<(OllamaEmbedder, ProvisionedBox)> {
+    tune: Option<TuneRequest<'_>>,
+) -> anyhow::Result<(OllamaEmbedder, ProvisionedBox, RemoteEmbeddingConfig, u32)> {
     let cookbook = remote
         .cookbook
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("ephemeral remote config has no cookbook"))?;
     let input = cookbook_input_for(remote);
     let provisioned = CookbookProvisioner::provision_cancellable(cookbook, &input, cancel)?;
+    // `effective_remote` PERSISTS the user's `concurrency` CAP unchanged (cap model). The live
+    // embedder + reconcile window use the tuned knee, CLAMPED to that cap. The knee comes from the
+    // in-Rust sweep against the box with the REAL embedder (reconcile path); the install/verify
+    // pings pass `tune = None` and just use the cap.
+    let effective_remote = remote.clone();
+    let cap = remote.bounded_concurrency();
+    let client_concurrency = match tune {
+        Some(t) => crate::index::ai::throughput_tune::tune_ollama_concurrency(
+            t.conn,
+            remote.cookbook.as_deref().unwrap_or("cookbook"),
+            &provisioned.endpoint,
+            provisioned.auth_token.as_deref(),
+            remote,
+            spec,
+            t.max_embedding_chars,
+            t.allow_sweep,
+        ),
+        None => cap,
+    };
     let embedder = OllamaEmbedder::from_provisioned(ProvisionedEmbedderParams {
         endpoint: &provisioned.endpoint,
         auth_token: provisioned.auth_token.as_deref(),
-        server_model: remote.model.trim(),
+        server_model: effective_remote.model.trim(),
         selected_model_id: spec.model_id,
         dim: spec.dim,
-        request_timeout_s: remote.request_timeout_s,
-        batch_size: remote.batch_size,
-        concurrency: remote.bounded_concurrency(),
-        max_batch_chars: remote.max_batch_chars,
-        num_ctx: remote.num_ctx,
+        request_timeout_s: effective_remote.request_timeout_s,
+        batch_size: effective_remote.batch_size,
+        concurrency: client_concurrency,
+        max_batch_chars: effective_remote.max_batch_chars,
+        num_ctx: effective_remote.num_ctx,
     });
-    Ok((embedder, provisioned))
+    Ok((embedder, provisioned, effective_remote, client_concurrency))
 }
 
 /// Init-wizard ephemeral spin-up TEST: provision a cookbook box for `remote` + `spec`, embed a
 /// single `"ping"` to confirm the full provision→handshake→embed chain works, then tear the box
-/// down (the [`ProvisionedBox`] guard's `Drop` at end of scope). Returns `Ok(())` on a clean
-/// round-trip, an error otherwise. Bounded by the same internal [`PROVISION_TIMEOUT`] (300s) that
-/// gates `provision`, so the wizard never has to thread a deadline.
+/// down (the [`ProvisionedBox`] guard's `Drop` at end of scope). `Ok(())` on a clean round-trip, an
+/// error otherwise. This path passes `tune = None`, so it does NOT run the throughput sweep (a
+/// throwaway box wouldn't warm the reconcile cache) — it just verifies the round-trip at the user's
+/// `[remote] concurrency` cap. Bounded by the same internal [`PROVISION_TIMEOUT`] (300s) that gates
+/// `provision`.
 ///
 /// This is the `pub` seam the CLI's Remote step probes against: `provision_and_build` is
 /// `pub(crate)`, so a connection-less verify that the CLI can call lives HERE, not in the wizard.
@@ -572,7 +618,8 @@ pub fn verify_ephemeral_remote_cancellable(
     // `_box` is bound (not `_`) so it lives to end of scope — `OllamaEmbedder` holds only the
     // endpoint URL, not the process, so dropping the box early would tear down the server before
     // the ping. Drop at function exit is the teardown (SIGTERM → grace → SIGKILL on the group).
-    let (embedder, _box) = provision_and_build_cancellable(remote, spec, cancel)?;
+    let (embedder, _box, _effective_remote, _knee) =
+        provision_and_build_cancellable(remote, spec, cancel, None)?;
     embedder.embed_batch(&["ping".to_string()]).map_err(|err| {
         anyhow::anyhow!("ephemeral spin-up test embed failed for `{}`: {err}", spec.model_id)
     })?;
@@ -1418,7 +1465,9 @@ mod tests {
             parse(r#"{"type":"ready","endpoint":"http://x","auth_token":"tok","ts":1}"#),
             CookbookEvent::Ready { auth_token: Some(_), .. }
         ));
-        // Unknown extra field is tolerated.
+        // Unknown extra fields (a `ts`, or anything a future recipe adds) are tolerated — the
+        // variants intentionally don't `deny_unknown_fields` so the contract stays
+        // forward-compatible.
         assert!(matches!(
             parse(
                 r#"{"type":"status","phase":"pulling","provider":"modal","detail":"d","ts":2,"extra":true}"#

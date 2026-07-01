@@ -59,17 +59,25 @@ pub(crate) fn install_ollama_model(
     // dim). EPHEMERAL has no static endpoint, so the probe PROVISIONS a box (via the shared
     // `provision_and_build`), pings it, then tears it down (the `_box` guard's Drop at the end of
     // this fn) — exactly the connection the reconcile will later provision.
-    let (embedder, _box): (OllamaEmbedder, Option<ProvisionedBox>) = if remote.is_ephemeral() {
-        let (embedder, provisioned) = provision_and_build(remote, spec).map_err(|err| {
-            anyhow::anyhow!("failed to provision ephemeral box for `{model_id}`: {err}")
-        })?;
-        (embedder, Some(provisioned))
+    let (embedder, _box, effective_remote): (
+        OllamaEmbedder,
+        Option<ProvisionedBox>,
+        RemoteEmbeddingConfig,
+    ) = if remote.is_ephemeral() {
+        // The install probe just provisions + pings + tears down (a throwaway box), so it passes
+        // `None` (no throughput sweep — that runs at reconcile). It PERSISTS `tuned_remote`, which
+        // keeps the user's `concurrency` cap (the cap model never persists a tuned knee).
+        let (embedder, provisioned, tuned_remote, _knee) = provision_and_build(remote, spec, None)
+            .map_err(|err| {
+                anyhow::anyhow!("failed to provision ephemeral box for `{model_id}`: {err}")
+            })?;
+        (embedder, Some(provisioned), tuned_remote)
     } else {
         let embedder = OllamaEmbedder::from_remote_config(remote, spec.model_id, spec.dim)
             .map_err(|err| {
                 anyhow::anyhow!("failed to construct ollama embedder for `{model_id}`: {err}")
             })?;
-        (embedder, None)
+        (embedder, None, remote.clone())
     };
     embedder.embed_batch(&["ping".to_string()]).map_err(|err| {
         anyhow::anyhow!(
@@ -86,7 +94,7 @@ pub(crate) fn install_ollama_model(
          WHERE model_id = ?1",
         params![model_id, now_ms(), i64::try_from(spec.dim).unwrap_or(i64::MAX)],
     )?;
-    set_active_remote_config(conn, remote)?;
+    set_active_remote_config(conn, &effective_remote)?;
     Ok(())
 }
 

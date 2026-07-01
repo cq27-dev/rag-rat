@@ -20,11 +20,16 @@ teardown() {
 }
 trap teardown TERM
 
+throughput=""
+if [ -n "$STUB_THROUGHPUT" ]; then
+  throughput=',"throughput":{"concurrency":4,"batch_size":128,"ollama_num_parallel":4,"max_batch_chars":96000}'
+fi
+
 # The `ready` event (the handshake) — type-tagged JSONL with a ts field.
 if [ -n "$STUB_AUTH" ]; then
-  printf '{"type":"ready","endpoint":"%s","auth_token":"%s","ts":1}\n' "$STUB_ENDPOINT" "$STUB_AUTH"
+  printf '{"type":"ready","endpoint":"%s","auth_token":"%s","ts":1%s}\n' "$STUB_ENDPOINT" "$STUB_AUTH" "$throughput"
 else
-  printf '{"type":"ready","endpoint":"%s","auth_token":null,"ts":1}\n' "$STUB_ENDPOINT"
+  printf '{"type":"ready","endpoint":"%s","auth_token":null,"ts":1%s}\n' "$STUB_ENDPOINT" "$throughput"
 fi
 
 # Stay alive until SIGTERM. `wait` lets the trap fire promptly; the background sleep loop keeps the

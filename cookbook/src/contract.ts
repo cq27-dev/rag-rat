@@ -93,8 +93,9 @@ export interface CookbookInput {
    */
   readonly gpu?: string | null;
   /**
-   * Ollama server parallelism to set as OLLAMA_NUM_PARALLEL. rag-rat sends this from the remote
-   * embedding `concurrency` knob so server-side request handling can match the client window.
+   * Ollama server parallelism to set as `OLLAMA_NUM_PARALLEL` on the box. rag-rat sends the user's
+   * `[remote] concurrency` CAP so the server can handle up to that many parallel `/api/embed`
+   * requests. rag-rat then tunes the actual client fan-out (within the cap) itself, against the box.
    */
   readonly ollama_num_parallel?: number | null;
 }
@@ -143,8 +144,8 @@ export interface ProvisionContext<H> {
   readonly onBox: (handle: H) => void;
   /**
    * Emit a `status` event tagged with this recipe's provider. Call it at each lifecycle phase:
-   * `provisioning` when creating the box, `pulling` around the model pull, `verifying` around the
-   * embed probe. (`tearing_down` is emitted by `runRecipe`, not the recipe.)
+   * `provisioning` when creating the box, `pulling` around the model pull, and `verifying` around
+   * the embed probe. (`tearing_down` is emitted by `runRecipe`, not the recipe.)
    */
   readonly status: (phase: Phase, detail: string) => void;
 }
@@ -459,6 +460,16 @@ export interface VerifyEmbedOptions {
   readonly perAttemptTimeoutMs?: number;
 }
 
+/** Builds an endpoint-relative API URL without a regex over provider/user input. */
+export function endpointPath(endpoint: string, path: string): string {
+  let endpointEnd = endpoint.length;
+  while (endpointEnd > 0 && endpoint.charCodeAt(endpointEnd - 1) === 47) {
+    endpointEnd -= 1;
+  }
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${endpoint.slice(0, endpointEnd)}${normalizedPath}`;
+}
+
 /**
  * Polls `<endpoint>/api/embed` until it returns a real embedding vector, or the budget runs out.
  *
@@ -467,11 +478,14 @@ export interface VerifyEmbedOptions {
  * `embeddings[0]` vector is the readiness signal. Throws if the budget elapses with no vector.
  */
 export function verifyEmbed(endpoint: string, options: VerifyEmbedOptions): Promise<void> {
-  const url = `${endpoint.replace(/\/+$/, "")}/api/embed`;
+  const url = endpointPath(endpoint, "/api/embed");
   return pollUntil<{ embeddings?: unknown }>(url, {
     label: "embed probe",
     budgetMs: options.budgetMs,
-    body: { model: options.model, input: "rag-rat embed readiness probe" },
+    body: {
+      model: options.model,
+      input: "rag-rat embed readiness probe",
+    },
     pollIntervalMs: options.pollIntervalMs ?? VERIFY_EMBED_POLL_INTERVAL_MS,
     perAttemptTimeoutMs: options.perAttemptTimeoutMs ?? VERIFY_EMBED_ATTEMPT_TIMEOUT_MS,
     ...(options.headers !== undefined ? { headers: options.headers } : {}),

@@ -41,6 +41,7 @@ import {
   type Provisioned,
   type Recipe,
   assertBudgetRemaining,
+  endpointPath,
   errorMessage,
   fetchWithTimeout,
   log,
@@ -102,6 +103,9 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
   }
   const apiKey = rawKey.trim();
   const gpuTypeId = input.gpu ?? DEFAULT_GPU_TYPE_ID;
+  // rag-rat sends the user's `[remote] concurrency` cap as `ollama_num_parallel`; the box's server
+  // parallelism is set to it so rag-rat can fan out up to the cap. rag-rat tunes the actual client
+  // concurrency (within the cap) itself, against the box, after `ready`.
   const ollamaNumParallel = String(input.ollama_num_parallel ?? 1);
 
   // Unique pod name so a deploy-timeout orphan sweep can find a pod that RunPod created but whose
@@ -189,7 +193,7 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
  * stalled proxy aborts rather than hanging past the budget.
  */
 function pullModel(endpoint: string, model: string, budgetMs: number): Promise<void> {
-  const url = `${endpoint.replace(/\/+$/, "")}/api/pull`;
+  const url = endpointPath(endpoint, "/api/pull");
   return pollUntil<{ status?: unknown; error?: unknown }>(url, {
     label: `pull "${model}"`,
     budgetMs,

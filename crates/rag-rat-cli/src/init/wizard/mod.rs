@@ -354,6 +354,9 @@ impl Wizard {
     }
 
     fn poll_probes_into_checks(&mut self) {
+        // The ephemeral provision test is a throwaway pass/fail spin-up (`tune = None`); it runs no
+        // throughput sweep and never touches the user's configured `[remote] concurrency` cap, so
+        // there is nothing to apply back to the draft here.
         for (step, _kind, _result) in self.state.probes.poll() {
             self.refresh_check(step);
         }
@@ -795,6 +798,46 @@ mod tests {
         }
 
         panic!("probe result did not update Integration check");
+    }
+
+    #[test]
+    fn ephemeral_probe_does_not_overwrite_the_concurrency_cap() {
+        // Cap model: a passing ephemeral provision test must NOT change the user's configured
+        // `[remote] concurrency` (the cap) — the tuned knee is surfaced in the provision log and
+        // the host cache, never baked back over the cap.
+        let mut w = headless(test_scan(), None);
+        w.state.draft.remote = Some(draft::RemoteDraft {
+            model: "all-minilm".to_string(),
+            mode: draft::RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
+            gpu: None,
+            num_ctx: None,
+            batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: rag_rat_core::config::RemoteEmbeddingConfig::default().max_batch_chars,
+            auth_env: None,
+        });
+        w.state.probes.spawn(
+            StepId::Embedding,
+            probe::ProbeKind::EphemeralTest,
+            steps::CheckResult::ok,
+        );
+
+        for _ in 0..100 {
+            w.poll_probes_into_checks();
+            if matches!(w.state.probes.status(StepId::Embedding), probe::ProbeStatus::Done {
+                kind: probe::ProbeKind::EphemeralTest,
+                ..
+            }) {
+                assert_eq!(
+                    w.state.draft.remote.as_ref().unwrap().concurrency,
+                    32,
+                    "the configured concurrency cap must be left untouched",
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("ephemeral probe never completed");
     }
 
     #[test]
