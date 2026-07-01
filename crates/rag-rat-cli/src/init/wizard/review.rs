@@ -403,6 +403,7 @@ mod tests {
             model: "all-minilm".to_string(),
             backend: rag_rat_core::config::RemoteBackend::Ollama,
             mode: RemoteMode::Ephemeral("some-cookbook".to_string()),
+            query_endpoint: None,
             gpu: None,
             num_ctx: None,
             batch_size: 32,

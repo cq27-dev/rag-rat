@@ -1040,6 +1040,18 @@ fn draft_backend(state: &WizardState) -> RemoteBackend {
     state.draft.remote.as_ref().map_or(RemoteBackend::Ollama, |r| r.backend)
 }
 
+/// Re-sync the Embedding step's `backend_cursor` to the position of the draft's current backend in
+/// `BACKENDS_BY_EFFICIENCY` — mirrors how `init_embedding_step` seeds it. Call after any change
+/// that replaces `state.draft.remote` (a mode switch), so the picker cursor tracks the selected
+/// backend.
+fn sync_backend_cursor(state: &mut WizardState) {
+    let backend = draft_backend(state);
+    let cursor = BACKENDS_BY_EFFICIENCY.iter().position(|&b| b == backend).unwrap_or(0);
+    if let Some(StepState::Embedding { backend_cursor, .. }) = &mut state.step {
+        *backend_cursor = cursor;
+    }
+}
+
 fn current_ephemeral_cookbook(state: &WizardState) -> Option<&str> {
     match state.draft.remote.as_ref().map(|r| &r.mode) {
         Some(RemoteMode::Ephemeral(cookbook)) => Some(cookbook.trim()),
@@ -1252,13 +1264,18 @@ fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
         picker[0],
     );
 
-    // vLLM needs a GPU and strictly enforces the model's max_model_len; surface a short note.
+    // vLLM needs a GPU and rejects any chunk over the model's context. The relevant knob is the
+    // per-text cap `[llm.embedding.runtime] max_embedding_chars` (NOT the wizard's max_batch_chars,
+    // which is a batch TOTAL) — surface a short, actionable note.
     let server_area = if backend == RemoteBackend::Vllm {
         let split = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(picker[1]);
         f.render_widget(
-            Paragraph::new("vLLM: GPU required; enforces max_model_len (lower max chars).")
-                .style(theme::base())
-                .wrap(Wrap { trim: true }),
+            Paragraph::new(
+                "vLLM: GPU required; rejects chunks past model context. Lower [runtime] \
+                 max_embedding_chars or use a long-context model.",
+            )
+            .style(theme::base())
+            .wrap(Wrap { trim: true }),
             split[1],
         );
         split[0]
@@ -1829,6 +1846,11 @@ fn select_embedding_focus(state: &mut WizardState) {
                     )),
                     _ => None,
                 };
+                // A new remote may default to a different backend than the cursor points at (e.g.
+                // ephemeral defaults to infinity while the fresh cursor is on ollama). Re-sync the
+                // backend_cursor so the picker `>` sits on the actually-selected backend — else
+                // Space on Backend would silently flip to whatever the stale cursor pointed at.
+                sync_backend_cursor(state);
                 changed = true;
             }
             state.ui.show_remote_mode_help_once(cursor);
@@ -1848,12 +1870,16 @@ fn select_embedding_focus(state: &mut WizardState) {
                 remote.model = default_remote_model_for(&state.draft.model, selected).to_string();
                 // Keep a wizard-default connect endpoint coherent with the new backend's
                 // route/port; a custom endpoint the user typed is left alone.
-                // (Ephemeral's query_endpoint is derived from the backend at write
-                // time, so it needs no draft update here.)
                 if let RemoteMode::Connect(ep) = &mut remote.mode
                     && is_default_backend_endpoint(ep)
                 {
                     *ep = default_backend_endpoint(selected).to_string();
+                }
+                // Track the ephemeral query_endpoint to the new backend when it is unset or a known
+                // wizard default; a custom value the user set is left alone.
+                if remote.query_endpoint.as_deref().is_none_or(is_default_backend_endpoint) {
+                    remote.query_endpoint =
+                        wizard_query_endpoint(&remote.mode, selected).map(str::to_string);
                 }
                 changed = true;
             }
@@ -1915,6 +1941,8 @@ fn new_connect_remote(local_model: &str) -> RemoteDraft {
         model: default_remote_model_for(local_model, backend).to_string(),
         backend,
         mode: RemoteMode::Connect(DEFAULT_QUERY_ENDPOINT.to_string()),
+        // CONNECT ignores query_endpoint (queries hit the endpoint directly).
+        query_endpoint: None,
         gpu: None,
         num_ctx: None,
         batch_size: 256,
@@ -1930,14 +1958,19 @@ fn new_connect_remote_from(local_model: &str, existing: Option<&RemoteDraft>) ->
         // Carry the previously chosen backend across a mode switch.
         remote.backend = existing.backend;
         remote.model = preserved_server_model(local_model, existing);
-        // Keep a CUSTOM connect endpoint the user typed; otherwise default to one matching the
-        // (preserved) backend — so a mode switch never leaves e.g. an infinity backend pointed at
-        // the ollama default port.
-        remote.mode = match &existing.mode {
-            RemoteMode::Connect(ep) if !is_default_backend_endpoint(ep) =>
-                RemoteMode::Connect(ep.clone()),
-            _ => RemoteMode::Connect(default_backend_endpoint(remote.backend).to_string()),
+        // Pick the connect endpoint in priority order: (a) a CUSTOM connect endpoint the user
+        // typed; (b) a CUSTOM ephemeral query_endpoint (the user's reachable LOCAL query server —
+        // switching ephemeral→connect should reuse it, not fall back to a localhost default); (c)
+        // the (preserved) backend's default local endpoint — so a mode switch never leaves e.g. an
+        // infinity backend pointed at the ollama default port.
+        let connect_endpoint = match &existing.mode {
+            RemoteMode::Connect(ep) if !is_default_backend_endpoint(ep) => ep.clone(),
+            _ => match &existing.query_endpoint {
+                Some(qe) if !is_default_backend_endpoint(qe) => qe.clone(),
+                _ => default_backend_endpoint(remote.backend).to_string(),
+            },
         };
+        remote.mode = RemoteMode::Connect(connect_endpoint);
         remote.num_ctx = existing.num_ctx;
         remote.batch_size = existing.batch_size;
         if matches!(existing.mode, RemoteMode::Connect(_)) {
@@ -1958,10 +1991,13 @@ fn new_ephemeral_remote_with_command(local_model: &str, cookbook: &str) -> Remot
     // Ephemeral default = the fastest measured backend (infinity, ~1517 texts/s on L4 vs vLLM
     // ~1029 and ollama ~299 for all-MiniLM).
     let backend = RemoteBackend::Infinity;
+    let mode = RemoteMode::Ephemeral(cookbook.to_string());
     RemoteDraft {
         model: default_remote_model_for(local_model, backend).to_string(),
         backend,
-        mode: RemoteMode::Ephemeral(cookbook.to_string()),
+        // The backend's default LOCAL query endpoint (None for ollama → config default 11434).
+        query_endpoint: wizard_query_endpoint(&mode, backend).map(str::to_string),
+        mode,
         gpu: None,
         num_ctx: None,
         batch_size: 256,
@@ -1981,6 +2017,13 @@ fn new_ephemeral_remote_from(
         // Carry the previously chosen backend across a mode switch.
         remote.backend = existing.backend;
         remote.model = preserved_server_model(local_model, existing);
+        // Carry a CUSTOM query_endpoint the user set; otherwise recompute the (preserved) backend's
+        // default — a value left over from a different backend would point queries at the wrong
+        // local server.
+        remote.query_endpoint = match &existing.query_endpoint {
+            Some(qe) if !is_default_backend_endpoint(qe) => Some(qe.clone()),
+            _ => wizard_query_endpoint(&remote.mode, remote.backend).map(str::to_string),
+        };
         remote.gpu = existing.gpu.clone();
         remote.num_ctx = existing.num_ctx;
         remote.batch_size = existing.batch_size;
@@ -2293,10 +2336,9 @@ fn remote_config_for(d: &RemoteDraft) -> RemoteEmbeddingConfig {
         backend: d.backend,
         endpoint: ep,
         cookbook: cb,
-        // Non-ollama ephemeral needs an explicit local query endpoint (see
-        // `wizard_query_endpoint`); ollama/connect fall back to the config default, so
-        // `None` here.
-        query_endpoint: wizard_query_endpoint(&d.mode, d.backend).map(str::to_string),
+        // The draft is the single source of truth: for EPHEMERAL it carries the backend default
+        // (or a preserved custom value); for CONNECT it is `None` (queries hit the endpoint).
+        query_endpoint: d.query_endpoint.clone(),
         auth_env: d.auth_env.clone(),
         gpu: d.gpu.clone(),
         num_ctx: d.num_ctx,
@@ -3077,6 +3119,101 @@ mod tests {
     }
 
     #[test]
+    fn connect_from_ephemeral_custom_query_endpoint_uses_it_as_connect_endpoint() {
+        // Switching an EPHEMERAL config that had a CUSTOM query_endpoint (the user's reachable
+        // LOCAL query server) to CONNECT must reuse that endpoint, not fall back to the backend's
+        // localhost default. The backend is preserved across the switch.
+        let mut existing = new_ephemeral_remote("sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(existing.backend, RemoteBackend::Infinity);
+        existing.query_endpoint = Some("http://gpu-box.local:9999".to_string());
+
+        let connect =
+            new_connect_remote_from("sentence-transformers/all-MiniLM-L6-v2", Some(&existing));
+
+        assert_eq!(connect.backend, RemoteBackend::Infinity, "backend must be preserved");
+        assert!(
+            matches!(connect.mode, RemoteMode::Connect(ref ep) if ep == "http://gpu-box.local:9999"),
+            "custom ephemeral query_endpoint must become the connect endpoint, got {:?}",
+            connect.mode,
+        );
+    }
+
+    #[test]
+    fn mode_select_ephemeral_syncs_backend_cursor_to_infinity() {
+        // A fresh wizard seeds backend_cursor from the ollama default (position of Ollama in
+        // BACKENDS_BY_EFFICIENCY). Selecting Ephemeral mode creates a remote defaulting to Infinity
+        // — the cursor MUST move to Infinity so an immediate Space on Backend keeps infinity,
+        // rather than silently re-selecting whatever the stale cursor pointed at (ollama).
+        let mut state = empty_state();
+        state.step = Some(init_step(StepId::Embedding, &state));
+
+        // Tab to Mode, cursor down to ephemeral (index 2), Space to select.
+        step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        assert_eq!(embed_focus(&state), Some(EmbedFocus::Mode));
+        step_handle_key(StepId::Embedding, key(KeyCode::Down), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Down), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+        assert_eq!(state.draft.remote.as_ref().unwrap().backend, RemoteBackend::Infinity);
+
+        // The cursor must now sit on Infinity (position 0 in BACKENDS_BY_EFFICIENCY).
+        let cursor = match &state.step {
+            Some(StepState::Embedding { backend_cursor, .. }) => *backend_cursor,
+            _ => panic!("expected embedding step"),
+        };
+        assert_eq!(BACKENDS_BY_EFFICIENCY[cursor], RemoteBackend::Infinity);
+
+        // Focus Backend and press Space immediately: the backend must STAY infinity, not flip.
+        while embed_focus(&state) != Some(EmbedFocus::Backend) {
+            step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        }
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+        assert_eq!(
+            state.draft.remote.as_ref().unwrap().backend,
+            RemoteBackend::Infinity,
+            "Space on Backend right after selecting ephemeral must keep infinity, not flip to \
+             ollama",
+        );
+    }
+
+    #[test]
+    fn backend_pick_tracks_ephemeral_query_endpoint_to_new_backend() {
+        // On an ephemeral config, switching the backend must re-point the wizard-default
+        // query_endpoint at the new backend's local port (a stale value points queries at the wrong
+        // server). Start on infinity (7997), switch to vLLM (8000).
+        let mut state = empty_state();
+        state.draft.remote = Some(new_ephemeral_remote(&state.draft.model));
+        assert_eq!(
+            state.draft.remote.as_ref().unwrap().query_endpoint.as_deref(),
+            Some("http://localhost:7997"),
+        );
+        state.step = Some(init_step(StepId::Embedding, &state));
+
+        while embed_focus(&state) != Some(EmbedFocus::Backend) {
+            step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        }
+        // Cursor 1 is vLLM in BACKENDS_BY_EFFICIENCY = [Infinity, Vllm, Ollama].
+        step_handle_key(StepId::Embedding, key(KeyCode::Home), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Down), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+
+        let remote = state.draft.remote.as_ref().unwrap();
+        assert_eq!(remote.backend, RemoteBackend::Vllm);
+        assert_eq!(remote.query_endpoint.as_deref(), Some("http://localhost:8000"));
+
+        // A CUSTOM query_endpoint is preserved across a backend switch.
+        state.draft.remote.as_mut().unwrap().query_endpoint =
+            Some("http://gpu-box.local:9999".to_string());
+        step_handle_key(StepId::Embedding, key(KeyCode::Home), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state); // → infinity
+        assert_eq!(state.draft.remote.as_ref().unwrap().backend, RemoteBackend::Infinity);
+        assert_eq!(
+            state.draft.remote.as_ref().unwrap().query_endpoint.as_deref(),
+            Some("http://gpu-box.local:9999"),
+            "a custom query_endpoint must survive a backend switch",
+        );
+    }
+
+    #[test]
     fn embedding_backend_pick_switches_to_vllm() {
         let mut state = empty_state();
         state.draft.remote = Some(new_connect_remote(&state.draft.model));
@@ -3112,8 +3249,9 @@ mod tests {
         // The backend picker renders in connect mode too.
         assert!(screen.contains("backend"), "{screen}");
         assert!(screen.contains("[*] vllm"), "{screen}");
-        // The vLLM caveat is surfaced near the picker.
-        assert!(screen.contains("max_model_len"), "{screen}");
+        // The vLLM caveat is surfaced near the picker and points at the ACTUAL per-text knob
+        // (`max_embedding_chars`), not the wizard's batch-total `max_batch_chars`.
+        assert!(screen.contains("max_embedding_chars"), "{screen}");
     }
 
     #[test]
@@ -3145,6 +3283,7 @@ mod tests {
             model: "custom-model".to_string(),
             backend: RemoteBackend::Ollama,
             mode: RemoteMode::Connect("http://remote:11434".to_string()),
+            query_endpoint: None,
             gpu: None,
             num_ctx: Some(4096),
             batch_size: 17,
