@@ -86,6 +86,13 @@ pub struct EmbeddingModelSpec {
 /// tokenization could fit, saving bytes without changing the embedded content.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
+/// The char budget rag-rat allots for `tokens` tokens of embedding input (see
+/// [`CHARS_PER_TOKEN_ESTIMATE`]). Shared so a token window from any source — a model's static
+/// `max_tokens` or an ollama remote's `num_ctx` override — maps to chars the same way.
+pub(crate) fn tokens_to_char_budget(tokens: usize) -> usize {
+    tokens.saturating_mul(CHARS_PER_TOKEN_ESTIMATE)
+}
+
 impl EmbeddingModelSpec {
     /// The embedding input length (in CHARS) worth sending this model: `max_tokens × ~4`, or `None`
     /// for a model with no sequence limit. Past this the transformer truncates anyway, so a caller
@@ -94,7 +101,7 @@ impl EmbeddingModelSpec {
     /// strict server (vLLM) won't reject a pathologically dense chunk — it only narrows the
     /// margin.
     pub fn max_input_chars(&self) -> Option<usize> {
-        self.max_tokens.map(|t| t.saturating_mul(CHARS_PER_TOKEN_ESTIMATE))
+        self.max_tokens.map(tokens_to_char_budget)
     }
 }
 
