@@ -10,9 +10,10 @@ for coding agents. It keeps source files read-only, writes only its own SQLite d
 with provenance on every result — current source, the code graph, git/GitHub history, and durable,
 source-anchored repo memories that persist across sessions and agents.
 
-Every harness already has `grep` and read. rag-rat is the layer they can't be: it carries the
-*rationale* — the invariants, decisions, and risks bound to the code you're touching — and labels
-every hit with confidence and coverage so you can judge it instead of trusting it.
+Every coding harness already has `grep` and file reads. rag-rat adds the layer they do not provide:
+source-anchored *rationale*. It connects the code an agent is about to touch to its callers, callees,
+tests, git/GitHub history, prior decisions, invariants, risks, and duplicate-code signals — and
+labels every result with confidence and coverage, so an agent can judge it instead of trusting it.
 
 ```mermaid
 sequenceDiagram
@@ -33,7 +34,9 @@ sequenceDiagram
 - **Provenance, not guesses.** Every result carries a confidence label, coverage warnings, and the
   raw evidence — so a partial index or an ambiguous edge reads as exactly that.
 - **Repo memories.** Typed, source-anchored notes (`Invariant`, `Decision`, `Risk`, …) that survive
-  refactors and surface automatically during future queries — the signal grep can't give you.
+  refactors and surface automatically during future queries — the signal grep can't give you. They
+  are *not* assistant memory: they are versioned, local, source-anchored facts about **this**
+  repository that any future agent retrieves with evidence.
 - **A real code graph.** tree-sitter callers/callees/imports across Rust, TypeScript/TSX, Kotlin,
   C/C++, and Python — with an optional [compiler-grade SCIP oracle](docs/oracle.md) that upgrades
   edges to `Compiler` confidence and ranks the load-bearing symbols.
@@ -62,28 +65,6 @@ Add `--no-default-features` for a smaller hash-only build without real embedding
 (compiled in via `rusqlite`), so there is no system-library prerequisite — see
 [Platform support](#platform-support) for the per-OS C-toolchain note.
 
-## Platform support
-
-rag-rat builds and tests on Linux, macOS, and Windows. Linux is covered on every PR and on every
-push to main; macOS and Windows are exercised on release, so `cargo install rag-rat` builds and
-links on all three.
-SQLite is bundled (compiled from source via `rusqlite`), so there's no system-library prerequisite,
-but each platform needs a C toolchain: Linux ships one; on macOS install the Xcode Command Line
-Tools (`xcode-select --install`); on Windows install the Visual Studio Build Tools with the C++
-workload (MSVC). Requires **Rust 1.95+** (the bundled SQLite build uses the `cfg_select!` macro,
-stabilized in 1.95).
-
-A few maintenance conveniences are Unix- or Linux-only by design and degrade quietly elsewhere — no
-feature of the index, query, or MCP surface is affected:
-
-- **Hot-upgrade of a running MCP server** (the `SIGUSR1` in-place re-exec) is Unix-only. On Windows,
-  restart `rag-rat mcp` to pick up a new binary.
-- **Fleet auto-upgrade** (signalling other running servers when a new binary lands) is Linux-only —
-  it walks `/proc` — and is a no-op elsewhere.
-- **The grep-augmentation hook** uses a warm Unix-socket listener (with per-session dedupe) on
-  Linux and macOS; on Windows it falls back to a per-call read-only query straight against the
-  index, which works the same but without cross-call dedupe.
-
 ## Quickstart
 
 From the repository you want to index:
@@ -97,12 +78,8 @@ rag-rat init
 offers to install the local embedding model, and can register the MCP server and git hooks. Preview
 without writing anything with `rag-rat init --dry-run`; `--yes` runs the non-interactive defaults.
 
-For a large repo where the local embedder is too slow, a `[llm.embedding.remote]` block can serve a
-stronger transformer model over Ollama instead — either connect to a server you already run, or have
-rag-rat provision an ephemeral GPU box for the backfill via the bundled cookbook (Modal / RunPod).
-See [`docs/config.md`](docs/config.md) for the setup.
-
-Manual setup and every config knob live in [`docs/config.md`](docs/config.md).
+Manual setup and every config knob live in [`docs/config.md`](docs/config.md). For a large repo where
+the default local embedder is too slow, see [Embedding backends](#embedding-backends).
 
 ## Connect it to your agent (MCP)
 
@@ -135,20 +112,115 @@ or a project `.mcp.json` / equivalent:
 Pass `rag-rat mcp --json` if your client must parse tool text as JSON (results are
 [TOON](#output) by default). Full tool schemas: [`docs/mcp-tools.md`](docs/mcp-tools.md).
 
+## Try it
+
+Right after `rag-rat init` the code graph, symbols, git history, semantic search, and clone
+detection are ready — these answer on the first query. Repo memories start **empty**: they accrue as
+agents record findings with `memory_create` and then surface automatically in later answers. (GitHub
+issue/PR rationale needs a `rag-rat github sync`.)
+
+Ask your MCP client:
+
+- "Run `impact_surface` on the function I'm about to edit — its callers, callees, tests, and recent
+  commits."
+- "Where is config reload handled?" — hybrid `semantic_search` over source and docs.
+- "What are the most load-bearing symbols in this repo?" — `important_symbols`.
+- "Does this helper duplicate anything already in the codebase?" — `find_clones` (and the write-time
+  hook warns as you write it).
+- "Record an invariant on `parse_config`: reload must not allocate after the scheduler starts." —
+  `memory_create` writes your first repo memory; it then rides along in future `impact_surface` /
+  `symbol_lookup` results.
+
+Or from the CLI:
+
+```bash
+rag-rat query "where is config reload handled?"
+rag-rat important-symbols --limit 20
+rag-rat brief --mode spine
+rag-rat clusters --limit 10
+```
+
+## The agent loop
+
+The point isn't the tool catalog — it's the loop an agent runs *around* an edit, so it changes code
+with the callers, tests, rationale, and prior art in front of it instead of guessing:
+
+1. **Before editing a symbol, ask `impact_surface`.** One call returns the current source anchor,
+   callers and callees, related tests, git/GitHub rationale, the repo memories bound to that
+   symbol / path / call-path, and confidence + coverage warnings.
+2. **Read the blast radius, then edit.** The invariant a previous agent recorded, the caller three
+   hops away, the test that pins the behavior — all surfaced before the change, not discovered after.
+3. **The clone hook catches duplication at write time.** If the new function reimplements code that
+   already exists, the Write/Edit hook says so, with the existing symbol to reuse.
+4. **Record what you learned.** When the edit reveals a durable invariant, decision, or footgun,
+   `memory_create` stores it as a source-anchored repo memory — so the next agent (or the next
+   session) gets it in one call instead of re-deriving it.
+
+A trimmed `impact_surface` answer (TOON — the default output; abbreviated here) — every field is
+evidence, not prose:
+
+```text
+query:
+  ref: "crates/config/src/config.rs::parse_config"
+  resolution: syntactic
+direct_semantic_callers[12]:
+  - from_symbol: "crates/runtime/src/boot.rs::start"
+    edge_kind: calls_name
+    confidence: syntactic
+    callsite:
+      path: "crates/runtime/src/boot.rs"
+      line: 88
+    importance:
+      label: local structural load
+      score: 6.8
+      bucket: high
+tests_touching_symbol_path[4]:
+  - path: "crates/config/src/config_tests.rs"
+    reason: test_mentions_symbol_or_path
+recent_commits_touching_symbol_path[1]:
+  - evidence[1]: "a1b2c3d touched crates/config/src/config.rs: fix reload race during startup (#141)"
+repo_memories:
+  direct[2]:
+    - kind: Invariant
+      title: "Config reload must not allocate after the scheduler starts"
+      confidence: high
+      anchor_status: current
+      binding_kind: symbol
+    - kind: Decision
+      title: "TOML over JSON5 for the config surface (#88)"
+      anchor_status: current
+      binding_kind: path
+completeness_and_caveats:
+  exact_graph_callers: 12
+  memory_status:
+    active: 2
+    stale: 0
+  caveats[1]: "Graph evidence is tree-sitter/syntactic, not compiler-grade name resolution."
+```
+
+And the write-time clone warning an agent sees before it duplicates logic — verbatim hook output:
+
+```text
+▶ rag-rat clone check — code you're writing duplicates existing functions:
+  • `normalize_path_for_lookup` (line 42) is ~91% similar to crates/index/src/paths.rs::canonicalize_lookup_path
+Prefer reusing the existing function(s) over duplicating — impact_surface / symbol_lookup to inspect them.
+```
+
 ## The tools
 
 The highest-leverage ones (full catalog + JSON schemas in [`docs/mcp-tools.md`](docs/mcp-tools.md)):
 
+- **`impact_surface`** — the coding preflight from the loop above: callers, callees, tests, git
+  history, GitHub papertrail, and repo memories for a symbol in one call. `repo_memories` defaults to
+  a compact, scannable per-memory header (kind, title, confidence, anchor status, and where it's
+  bound); pass `full_memories: true` (or use `memory_for_symbol|path|call_path`) for full bodies +
+  bindings.
 - **`semantic_search`** — hybrid BM25 + vector recall over source/docs, validated against current
   source. Every hit reports `retrieval_mode`; `explain=true` breaks down the score.
 - **`symbol_lookup`** — exact/fuzzy symbol resolution; cfg/overload duplicates grouped as one
   logical symbol.
 - **`find_callers` / `trace_callees`** — reverse/forward graph traversal (low-signal std/macro noise
   filtered by default).
-- **`impact_surface`** — the coding preflight: callers, callees, tests, git history, GitHub
-  papertrail, and repo memories for a symbol in one call. `repo_memories` defaults to a compact,
-  scannable per-memory header (kind, title, confidence, anchor status, and where it's bound); pass
-  `full_memories: true` (or use `memory_for_symbol|path|call_path`) for the full bodies + bindings.
 - **`important_symbols`** — load-bearing symbols by (SCIP-aware) PageRank; see
   [`docs/oracle.md`](docs/oracle.md).
 - **`repo_brief` / `repo_clusters`** — orientation: spine / churn / god-modules / ownership clusters.
@@ -162,7 +234,8 @@ The highest-leverage ones (full catalog + JSON schemas in [`docs/mcp-tools.md`](
 
 ## Repo memories
 
-Repo memories are first-class local evidence — not chat memory. They are typed
+Repo memories are first-class local evidence — **not chat memory, not cloud personalization.** They
+are versioned, local, source-anchored facts about this repository. Each is typed
 (`Invariant`, `Decision`, `RejectedAlternative`, `Risk`, `BugPattern`, `PerformanceNote`, …) and
 **source-anchored**: bound to a logical symbol, concrete symbol, chunk, path+span, graph edge,
 call-path, commit, or GitHub ref. rag-rat tracks each anchor as `current`, `relocated`, `stale`,
@@ -174,9 +247,11 @@ hard-won context reaches the *next* agent in one call instead of evaporating.
 
 The graph is heuristic by default. The opt-in **SCIP oracle** (`rag-rat oracle run`) upgrades edges
 to a `Compiler` tier from a real language tool, recovers calls tree-sitter missed, flags external
-edges, and makes `important_symbols` surface the genuine god-modules. Turn on `[oracle] auto_run` and
-the MCP server keeps it fresh on its own (throttled, watcher-safe). Full details:
-[`docs/oracle.md`](docs/oracle.md).
+edges, and makes `important_symbols` surface the genuine god-modules. For C/C++ the `scip-clang`
+oracle distinguishes declarations from definitions and sharpens call/type edges in macro-heavy or
+multi-target code — the difference between usable and noisy graphs on firmware, kernels, drivers, and
+SDKs. Turn on `[oracle] auto_run` and the MCP server keeps it fresh on its own (throttled,
+watcher-safe). Full details: [`docs/oracle.md`](docs/oracle.md).
 
 ## Freshness
 
@@ -197,6 +272,94 @@ encoding that renders uniform rows as a dense `[N]{cols}:` table (~30% smaller t
 those payloads, never larger in practice). Pass `--json` (CLI, either position) or launch
 `rag-rat mcp --json` (MCP) when a JSON parser must read the output.
 
+## Embedding backends
+
+The default local embedder (FastEmbed) needs no setup, but a large repo or a stronger model is worth
+offloading. rag-rat speaks the **OpenAI-compatible `/v1/embeddings` API**, so a `[llm.embedding.remote]`
+block can serve embeddings from **Ollama, vLLM, or michaelfeil/infinity** — one client, one place to
+audit and secure. Two modes:
+
+- **Connect** to a server you already run (set `endpoint`).
+- **Ephemeral** — let the bundled cookbook provision a GPU worker (**Modal / RunPod**) just for the
+  backfill and tear it down afterward (set `cookbook`); pick the backend and GPU class in config.
+
+The init flow warns when a **short-context model would truncate long code chunks** and steers you to a
+long-context code embedder, and rag-rat **auto-tunes the client concurrency** against the chosen
+backend so the sweep finds its throughput knee. Setup and every knob: [`docs/config.md`](docs/config.md).
+
+## Retrieval quality
+
+Search quality is measurable, not guesswork. rag-rat ships a **commit-replay evaluation harness**
+(`rag-rat eval --replay`): each recent commit becomes a case — its message is the query, the files it
+touched are the gold set — and search is scored on how well it recovers them. It reports **recall@3**
+(did the right chunk land in the first three reads?), recall@10, and MRR@10, and CI tracks the trend
+on [Bencher](https://bencher.dev/perf/rag-rat/plots) on `main` so a regression is caught before it
+ships.
+
+Reach for it when comparing embedding models, changing chunking, enabling int8 vector storage
+(smaller on disk), or tuning a remote backend — you can prove the change didn't cost recall instead
+of hoping. (`rag-rat eval` requires a `--features eval` build; it is absent from the released binary.)
+
+## Benchmarks
+
+The headline workload is indexing the whole Linux kernel (v7.0, ~63k C/H files, 11.2M graph edges).
+Full numbers — wall-clock, throughput, peak RSS, on-disk size, unresolved-edge taxonomy — are in
+[`docs/benchmarks.md`](docs/benchmarks.md). Performance is tracked per-push and gated per-PR; the live
+history is at [bencher.dev/perf/rag-rat/plots](https://bencher.dev/perf/rag-rat/plots) (wiring:
+[`docs/bencher.md`](docs/bencher.md)).
+
+## Security
+
+The MCP server exposes read-only source tools. It never executes shell commands or writes your source
+files. It writes only the configured SQLite index — during indexing, migration, maintenance,
+reconciliation, repo-memory operations, and automatic stale-index healing. GitHub sync is explicit
+and uses `gh api`; normal query tools read only the local cache.
+
+### Local vs remote embedding
+
+With the **default local embedder, nothing leaves the machine** — indexing and querying are entirely
+local. Configuring a `[llm.embedding.remote]` backend is what sends text off the box, in two places:
+the **chunk text** selected at index time, and the **query text** of each semantic search (a search
+embeds your query to compare it against the indexed vectors). A CONNECT backend embeds both against
+the configured `endpoint`; an ephemeral backend embeds queries against the local `query_endpoint`.
+
+What the endpoint *is* decides how much that matters:
+
+- **Your own server** (self-hosted Ollama / vLLM / infinity) — the text stays in infrastructure you
+  control.
+- **Ephemeral Modal / RunPod workers** (the cookbook path) are ephemeral *compute* providers running
+  *your* open-source embedder, not data services that train on inputs. Both are SOC 2 Type II, encrypt
+  in transit and at rest, isolate tenants, and tear the box and its storage down after the backfill —
+  a data-processor relationship, reasonable for proprietary code the same way a cloud VM is.
+- **A third-party embedding API** you don't control is the one to actually read the terms on
+  (retention, training on inputs).
+
+Sensible hygiene regardless of backend: exclude secrets, generated files, and vendor trees from the
+indexed targets so they're never chunked or embedded, and keep secrets out of query text. Details:
+[`docs/config.md`](docs/config.md).
+
+## Platform support
+
+rag-rat builds and tests on Linux, macOS, and Windows. Linux is covered on every PR and on every
+push to main; macOS and Windows are exercised on release, so `cargo install rag-rat` builds and
+links on all three.
+SQLite is bundled (compiled from source via `rusqlite`), so there's no system-library prerequisite,
+but each platform needs a C toolchain: Linux ships one; on macOS install the Xcode Command Line
+Tools (`xcode-select --install`); on Windows install the Visual Studio Build Tools with the C++
+workload (MSVC). Requires **Rust 1.95+** (the bundled SQLite build uses the `cfg_select!` macro,
+stabilized in 1.95).
+
+A few maintenance conveniences are Unix- or Linux-only by design and degrade quietly elsewhere — no
+feature of the index, query, or MCP surface is affected:
+
+- **Hot-upgrade of a running MCP server** (the `SIGUSR1` in-place re-exec) is Unix-only. On Windows,
+  restart `rag-rat mcp` to pick up a new binary.
+- **Fleet auto-upgrade** (signalling other running servers when a new binary lands) is Linux-only —
+  it walks `/proc` — and is a no-op elsewhere.
+- **The grep-augmentation hook** uses a warm Unix-socket listener (with per-session dedupe) on
+  Linux and macOS; on Windows it falls back to a per-call read-only query straight against the
+  index, which works the same but without cross-call dedupe.
+
 ## Commands
 
 ```bash
@@ -216,21 +379,6 @@ rag-rat gc                         # prune rows for dead git contexts
 rag-rat eval [--json|--update-baseline]   # CI search-quality gate; requires a `--features eval` build (absent from the released binary)
 rag-rat mcp                        # start the STDIO server
 ```
-
-## Benchmarks
-
-The headline workload is indexing the whole Linux kernel (v7.0, ~63k C/H files, 11.2M graph edges).
-Full numbers — wall-clock, throughput, peak RSS, on-disk size, unresolved-edge taxonomy — are in
-[`docs/benchmarks.md`](docs/benchmarks.md). Performance is tracked per-push and gated per-PR; the live
-history is at [bencher.dev/perf/rag-rat/plots](https://bencher.dev/perf/rag-rat/plots) (wiring:
-[`docs/bencher.md`](docs/bencher.md)).
-
-## Security
-
-The MCP server exposes read-only source tools. It never executes shell commands or writes your source
-files. It writes only the configured SQLite index — during indexing, migration, maintenance,
-reconciliation, repo-memory operations, and automatic stale-index healing. GitHub sync is explicit
-and uses `gh api`; normal query tools read only the local cache.
 
 ## Releasing & license
 
