@@ -242,11 +242,6 @@ pub(crate) fn collect_rows<T>(
     }
     Ok(out)
 }
-pub(crate) fn count_table(conn: &Connection, table: &str) -> anyhow::Result<u64> {
-    let count =
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get::<_, i64>(0))?;
-    Ok(u64::try_from(count).unwrap_or(0))
-}
 pub(crate) fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))

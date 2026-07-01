@@ -969,7 +969,7 @@ struct RawRemoteEmbedding {
 /// everything after `scheme://` up to the next `/`, `?`, or `#`, and reports an `@` in it. A bare
 /// host, an `@` in the path/query, or a URL with no scheme separator all return false. Used to keep
 /// credentials out of the endpoint string before it is persisted into the index meta.
-fn endpoint_authority_has_userinfo(endpoint: &str) -> bool {
+pub fn endpoint_authority_has_userinfo(endpoint: &str) -> bool {
     let after_scheme = endpoint.split_once("://").map_or(endpoint, |(_, rest)| rest);
     let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
     authority.contains('@')

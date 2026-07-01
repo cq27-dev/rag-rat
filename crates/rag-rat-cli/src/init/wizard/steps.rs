@@ -9,6 +9,7 @@ use std::sync::mpsc::Sender;
 
 use rag_rat_core::config::{
     DEFAULT_QUERY_ENDPOINT, MAX_REMOTE_EMBEDDING_CONCURRENCY, RemoteBackend, RemoteEmbeddingConfig,
+    endpoint_authority_has_userinfo,
 };
 use rag_rat_core::embedding_models::{Backend, EMBEDDING_MODELS, EmbeddingModelSpec, spec};
 #[cfg(feature = "fastembed")]
@@ -2318,12 +2319,6 @@ fn validate_remote_auth_env(auth_env: &str) -> Option<CheckResult> {
         Ok(value) if !value.trim().is_empty() => None,
         _ => Some(CheckResult::block(format!("remote auth env `{auth_env}` is not set"))),
     }
-}
-
-fn endpoint_authority_has_userinfo(endpoint: &str) -> bool {
-    let after_scheme = endpoint.split_once("://").map_or(endpoint, |(_, rest)| rest);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
-    authority.contains('@')
 }
 
 fn remote_config_for(d: &RemoteDraft) -> RemoteEmbeddingConfig {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::index::table_row_count;
 
 pub(crate) fn sync_from_refs<C: GitHubClient>(
     conn: &Connection,
@@ -74,12 +75,12 @@ pub(crate) fn sync_issue<C: GitHubClient>(
 }
 pub(crate) fn status(conn: &Connection, ctx: &GitHubContext) -> anyhow::Result<GitHubStatus> {
     Ok(GitHubStatus {
-        refs: count_table(conn, "github_refs")?,
-        issues: count_table(conn, "github_issues")?,
-        comments: count_table(conn, "github_comments")?,
-        pulls: count_table(conn, "github_pull_requests")?,
-        reviews: count_table(conn, "github_reviews")?,
-        review_comments: count_table(conn, "github_review_comments")?,
+        refs: table_row_count(conn, "github_refs")?,
+        issues: table_row_count(conn, "github_issues")?,
+        comments: table_row_count(conn, "github_comments")?,
+        pulls: table_row_count(conn, "github_pull_requests")?,
+        reviews: table_row_count(conn, "github_reviews")?,
+        review_comments: table_row_count(conn, "github_review_comments")?,
         last_sync_ms: meta(conn, "github_last_sync_ms")?.and_then(|value| value.parse().ok()),
         capability: if ctx.gh_available {
             "gh_cli_available".to_string()

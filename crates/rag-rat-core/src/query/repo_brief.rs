@@ -4,6 +4,8 @@ use std::fmt;
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::Serialize;
 
+use crate::index::table_row_count;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoBriefMode {
     Spine,
@@ -502,9 +504,9 @@ pub(crate) fn summary_counts(conn: &Connection) -> anyhow::Result<SummaryCounts>
         conn.query_row("SELECT COUNT(*), COALESCE(SUM(generated), 0) FROM files", [], |row| {
             Ok((row_u64(row, 0)?, row_u64(row, 1)?))
         })?;
-    let graph_edges = count_table(conn, "edges")?;
-    let git_commits = count_table(conn, "git_commits")?;
-    let git_file_changes = count_table(conn, "git_file_changes")?;
+    let graph_edges = table_row_count(conn, "edges")?;
+    let git_commits = table_row_count(conn, "git_commits")?;
+    let git_file_changes = table_row_count(conn, "git_file_changes")?;
     let memories = memory_counts(conn, None)?;
     Ok(SummaryCounts {
         total_files,
@@ -514,11 +516,6 @@ pub(crate) fn summary_counts(conn: &Connection) -> anyhow::Result<SummaryCounts>
         git_file_changes,
         memories,
     })
-}
-
-fn count_table(conn: &Connection, table: &str) -> anyhow::Result<u64> {
-    let sql = format!("SELECT COUNT(*) FROM {table}");
-    Ok(conn.query_row(&sql, [], |row| row_u64(row, 0))?)
 }
 
 pub(crate) fn file_rows(

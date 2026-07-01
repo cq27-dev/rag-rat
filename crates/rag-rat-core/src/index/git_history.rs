@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::index::table_row_count;
 use crate::search::lexical::SearchHit;
 
 #[derive(Debug, Clone, Serialize)]
@@ -214,8 +215,8 @@ pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexSt
 
 pub fn status(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {
     let repo = git_repo(root);
-    let commit_count = count_table(conn, "git_commits")?;
-    let file_change_count = count_table(conn, "git_file_changes")?;
+    let commit_count = table_row_count(conn, "git_commits")?;
+    let file_change_count = table_row_count(conn, "git_file_changes")?;
     Ok(GitHistoryIndexStatus {
         available: repo.is_some(),
         head: repo.map(|repo| repo.head),
@@ -864,12 +865,6 @@ fn collect_rows<T>(
     Ok(out)
 }
 
-fn count_table(conn: &Connection, table: &str) -> anyhow::Result<u64> {
-    let count =
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get::<_, i64>(0))?;
-    Ok(u64::try_from(count).unwrap_or(0))
-}
-
 /// The enclosing Git worktree root for `root` (the directory `git rev-parse --show-toplevel`
 /// reports), or `None` when `root` is not inside a Git worktree (or `git` is unavailable). This is
 /// the single place the codebase shells `--show-toplevel`; reuse it rather than adding a parallel
@@ -923,7 +918,7 @@ pub(crate) fn is_history_current(conn: &Connection, root: &Path) -> bool {
         // not shallow even if HEAD is unchanged.
         let prior_was_full = meta(conn, "git_history_indexed_shallow")?.as_deref() == Some("0");
         // Guard against a torn/empty prior reload writing the meta without rows.
-        let has_rows = count_table(conn, "git_commits")? > 0;
+        let has_rows = table_row_count(conn, "git_commits")? > 0;
         Ok(head_matches && root_matches && prior_was_full && has_rows)
     };
     probe().unwrap_or(false)
