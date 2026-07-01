@@ -329,12 +329,13 @@ pub fn default_benchmark_budget_ms() -> u64 {
 
 /// EVAL-ONLY (#346): the smallest `--budget-ms` that lets `measure_candidates` actually measure
 /// every candidate. `per_candidate_ms` floors at 1000ms and the sweep stops once <1s of the budget
-/// remains, so a budget below `1s × candidates` (never under the tuner's `MIN_TUNE_BUDGET_MS`)
-/// provisions a box and then measures ZERO rows. The CLI validates against this BEFORE provisioning
-/// so a too-small `--budget-ms` never silently burns a box.
+/// remains, so a budget of exactly `1s × candidates` loses the LAST row to loop/request overhead.
+/// Require ONE extra 1s slice of slack (`(candidates + 1) × 1s`, never under the tuner's
+/// `MIN_TUNE_BUDGET_MS`). The CLI validates against this BEFORE provisioning so a too-small
+/// `--budget-ms` never burns a box for a partial (or empty) sweep.
 #[cfg(feature = "eval")]
 pub fn min_benchmark_budget_ms(num_candidates: usize) -> u64 {
-    (num_candidates.max(1) as u64 * 1_000).max(MIN_TUNE_BUDGET_MS)
+    ((num_candidates.max(1) as u64 + 1) * 1_000).max(MIN_TUNE_BUDGET_MS)
 }
 
 /// Whether a client-concurrency sweep is worth running for THIS reconcile — only when the live run
@@ -998,12 +999,13 @@ mod tests {
     #[cfg(feature = "eval")]
     #[test]
     fn min_benchmark_budget_scales_with_candidates_but_floors_at_the_tuner_min() {
-        // ~1s per candidate, never below MIN_TUNE_BUDGET_MS (the sweep stops when <1s of the budget
-        // remains, so a smaller budget provisions a box and measures ZERO rows).
-        assert_eq!(min_benchmark_budget_ms(0), MIN_TUNE_BUDGET_MS);
-        assert_eq!(min_benchmark_budget_ms(1), MIN_TUNE_BUDGET_MS);
-        assert_eq!(min_benchmark_budget_ms(5), MIN_TUNE_BUDGET_MS); // 5 * 1000 == the 5000 floor
-        assert_eq!(min_benchmark_budget_ms(9), 9_000); // above the floor → 1s per candidate
+        // (candidates + 1) * 1s of slack (the extra slice covers loop/request overhead so the LAST
+        // candidate isn't skipped), never below MIN_TUNE_BUDGET_MS.
+        assert_eq!(min_benchmark_budget_ms(0), MIN_TUNE_BUDGET_MS); // (1+1)*1000=2000 → floor 5000
+        assert_eq!(min_benchmark_budget_ms(1), MIN_TUNE_BUDGET_MS); // (1+1)*1000=2000 → floor
+        assert_eq!(min_benchmark_budget_ms(4), MIN_TUNE_BUDGET_MS); // (4+1)*1000=5000 == the floor
+        assert_eq!(min_benchmark_budget_ms(5), 6_000); // (5+1)*1000, above the floor + slack
+        assert_eq!(min_benchmark_budget_ms(9), 10_000); // (9+1)*1000
     }
 
     #[cfg(feature = "eval")]

@@ -586,13 +586,32 @@ pub(crate) fn benchmark_embedding(
         budget_ms,
     );
 
-    // Peak = the highest-throughput row among rows that actually measured something (`requests >
-    // 0`). If EVERY row failed (a reachable box but every probe errored — wrong `--model`, bad
-    // auth/path, dim mismatch), peak is `null`, not a misleading 0-TPS "result" a consumer
-    // would treat as a valid backend comparison.
+    // Surface any REQUESTED candidates the sweep did NOT measure. `measure_candidates` drops a
+    // candidate (and every higher one) when its probe window exceeds `MAX_PROBE_WINDOW_BYTES` or
+    // the budget runs out, rather than caching a partial sweep — fine for the auto-tuner, but
+    // the benchmark would otherwise exit successfully with rows silently missing after starting
+    // a paid box. Report them (and warn on stderr) so the JSON is honest about coverage.
+    let measured_set: std::collections::BTreeSet<u32> =
+        measured.iter().map(|m| m.concurrency).collect();
+    let skipped: Vec<u32> =
+        candidates.iter().copied().filter(|c| !measured_set.contains(c)).collect();
+    if !skipped.is_empty() {
+        eprintln!(
+            "benchmark-embedding: WARNING — {} requested candidate(s) not measured (probe window \
+             / budget limit): {skipped:?}. Lower --candidates or [runtime] max_embedding_chars, \
+             or raise --budget-ms.",
+            skipped.len(),
+        );
+    }
+
+    // Peak = the highest-throughput row among rows that actually measured something AND stayed
+    // stable (`requests > 0 && !aborted`). A failed row (`requests == 0`) or a breaker-tripped
+    // overloaded row (`aborted`) must not be advertised as the best result — `peak` is the
+    // machine-readable backend/concurrency selector, so an all-failed or all-unstable run reports
+    // `peak: null` rather than a misleading number.
     let peak = measured
         .iter()
-        .filter(|m| m.requests > 0)
+        .filter(|m| m.requests > 0 && !m.aborted)
         .max_by(|a, b| a.texts_per_second.total_cmp(&b.texts_per_second))
         .map(|m| serde_json::json!({ "concurrency": m.concurrency, "texts_per_second": m.texts_per_second }));
 
@@ -604,6 +623,7 @@ pub(crate) fn benchmark_embedding(
         "dim": dim,
         "budget_ms": budget_ms,
         "candidates": measured,
+        "skipped_candidates": skipped,
         "peak": peak,
     });
 
