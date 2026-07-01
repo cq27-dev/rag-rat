@@ -44,11 +44,12 @@ pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyh
 /// reconcile loop will use. A probe failure REFUSES the install loudly (the row is left
 /// not-installed); we do not write a half-ready model that would then fail every reconcile batch.
 ///
-/// On success: toggle the SAME `ai_models` row to `runtime='ollama'`, Ready, and persist the remote
-/// config to the secret-free meta so `active_embedder` can reconstruct the embedder. The freshness
-/// version is NOT written here — it is stamped centrally by the caller (`install_model`) for every
-/// runtime (see [`remote_freshness_version`] + the `install_model` single-writer comment).
-pub(crate) fn install_ollama_model(
+/// On success: toggle the SAME `ai_models` row to `runtime = remote.backend` (`ollama`/`infinity`/
+/// `vllm`), Ready, and persist the remote config to the secret-free meta so `active_embedder` can
+/// reconstruct the embedder. The freshness version is NOT written here — it is stamped centrally by
+/// the caller (`install_model`) for every runtime (see [`remote_freshness_version`] + the
+/// `install_model` single-writer comment).
+pub(crate) fn install_remote_model(
     conn: &Connection,
     model_id: &str,
     spec: &EmbeddingModelSpec,
@@ -75,14 +76,15 @@ pub(crate) fn install_ollama_model(
     } else {
         let embedder = OpenAiEmbedder::from_remote_config(remote, spec.model_id, spec.dim)
             .map_err(|err| {
-                anyhow::anyhow!("failed to construct ollama embedder for `{model_id}`: {err}")
+                anyhow::anyhow!("failed to construct remote embedder for `{model_id}`: {err}")
             })?;
         (embedder, None, remote.clone())
     };
     embedder.embed_batch(&["ping".to_string()]).map_err(|err| {
         anyhow::anyhow!(
-            "ollama reachability/dim probe failed for `{model_id}` (endpoint `{}`, model `{}`): \
-             {err}",
+            "remote reachability/dim probe failed for `{model_id}` (backend `{}`, endpoint `{}`, \
+             model `{}`): {err}",
+            remote.backend.as_db_str(),
             remote.endpoint.as_deref().unwrap_or("<ephemeral>"),
             remote.model
         )
@@ -90,24 +92,37 @@ pub(crate) fn install_ollama_model(
     conn.execute(
         "UPDATE ai_models
          SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
-             embedding_dim = ?3, runtime = 'ollama', last_error = NULL
+             embedding_dim = ?3, runtime = ?4, last_error = NULL
          WHERE model_id = ?1",
-        params![model_id, now_ms(), i64::try_from(spec.dim).unwrap_or(i64::MAX)],
+        params![
+            model_id,
+            now_ms(),
+            i64::try_from(spec.dim).unwrap_or(i64::MAX),
+            effective_remote.backend.as_db_str()
+        ],
     )?;
     set_active_remote_config(conn, &effective_remote)?;
     Ok(())
 }
 
-/// The reconcile freshness key for the SELECTED model when served over Ollama. Distinct from the
-/// static `spec.version` (the local key) so a local↔remote flip re-embeds, and folds in the
-/// server-side `remote.model` plus vector-affecting Ollama options so switching THOSE re-embeds
-/// too.
+/// Salt bumped whenever the remote WIRE PROTOCOL changes in a way that can shift vectors even for
+/// an unchanged model+config. `openai-v1` marks the move off ollama's native `/api/embed`
+/// (per-request `num_ctx`) onto the OpenAI-compatible `/v1/embeddings` (no per-request context):
+/// folding it into the freshness key forces ONE clean re-embed on upgrade for existing
+/// `num_ctx`-set configs whose vectors could otherwise silently drift. Bump the suffix on any
+/// future protocol-affecting change.
+const REMOTE_EMBED_PROTOCOL: &str = "openai-v1";
+
+/// The reconcile freshness key for the SELECTED model when served remotely. Distinct from the
+/// static `spec.version` (the local key) so a local↔remote flip re-embeds, and folds in the BACKEND
+/// (ollama/infinity/vLLM — different servers can pool/normalize differently), the wire-protocol
+/// salt, the server-side `remote.model`, and `num_ctx` so switching any of THOSE re-embeds too.
 ///
 /// DELIBERATELY ENDPOINT-INDEPENDENT (#317 rework — the key fix). The endpoint does NOT define the
-/// vector space; the model + runtime do. Folding the endpoint host would re-embed the WHOLE repo on
-/// every run for ephemeral/cookbook boxes (each gets a fresh URL). So: new URL + same
-/// `remote.model` + `num_ctx` → SAME freshness → no re-embed; a different `remote.model`, a
-/// different vector-affecting Ollama option, or a local↔remote flip → re-embed.
+/// vector space; the model + backend + protocol do. Folding the endpoint host would re-embed the
+/// WHOLE repo on every run for ephemeral/cookbook boxes (each gets a fresh URL). So: new URL + same
+/// `backend` + `remote.model` + `num_ctx` → SAME freshness → no re-embed; a different `backend`,
+/// `remote.model`, or vector-affecting option, or a local↔remote flip → re-embed.
 pub(crate) fn remote_freshness_version(
     spec: &EmbeddingModelSpec,
     remote: &RemoteEmbeddingConfig,
@@ -115,10 +130,12 @@ pub(crate) fn remote_freshness_version(
     let mut hasher = Sha256::new();
     hasher.update(spec.version.as_bytes());
     hasher.update([0]);
-    // The "ollama" runtime marker is what distinguishes this remote key from the local
-    // `spec.version` even when `remote.model` happens to be empty — a local↔remote flip always
-    // re-embeds.
-    hasher.update(Backend::Ollama.runtime().as_bytes());
+    // The wire-protocol salt + the backend marker distinguish this remote key from the local
+    // `spec.version` (a local↔remote flip always re-embeds) AND from a different remote backend
+    // serving the same model (whose vectors may differ).
+    hasher.update(REMOTE_EMBED_PROTOCOL.as_bytes());
+    hasher.update([0]);
+    hasher.update(remote.backend.as_db_str().as_bytes());
     hasher.update([0]);
     hasher.update(remote.model.trim().as_bytes());
     hasher.update([0]);
@@ -326,7 +343,7 @@ mod ollama_install_tests {
     }
 
     #[test]
-    fn install_ollama_model_toggles_the_selected_models_row_to_ollama_runtime() {
+    fn install_remote_model_toggles_the_selected_models_row_to_ollama_runtime() {
         // #317 rework: serving a real model (fastembed all-minilm) over Ollama toggles ITS row's
         // runtime to `ollama` — the same model_id + dim, transport overridden.
         let selected = spec(FASTEMBED_MODEL_ID).unwrap();
@@ -334,7 +351,7 @@ mod ollama_install_tests {
         let conn = schema_conn();
         let remote = remote_at(&url);
 
-        install_ollama_model(&conn, FASTEMBED_MODEL_ID, selected, &remote).expect("probe succeeds");
+        install_remote_model(&conn, FASTEMBED_MODEL_ID, selected, &remote).expect("probe succeeds");
         handle.join().unwrap();
 
         let model = model(&conn, FASTEMBED_MODEL_ID).unwrap();
@@ -352,7 +369,7 @@ mod ollama_install_tests {
     }
 
     #[test]
-    fn install_ollama_model_refuses_on_a_dim_mismatch() {
+    fn install_remote_model_refuses_on_a_dim_mismatch() {
         // The server returns a 512-dim vector; the selected model is 384 — the probe's per-batch
         // dim contract rejects it, so the install must refuse and leave the row not
         // flipped.
@@ -360,7 +377,7 @@ mod ollama_install_tests {
         let (url, handle) = spawn_embed_stub(512);
         let conn = schema_conn();
 
-        let err = install_ollama_model(&conn, FASTEMBED_MODEL_ID, selected, &remote_at(&url))
+        let err = install_remote_model(&conn, FASTEMBED_MODEL_ID, selected, &remote_at(&url))
             .expect_err("dim mismatch must refuse the install");
         handle.join().unwrap();
         assert!(err.to_string().contains("384") || err.to_string().contains("512"), "{err}");
@@ -411,5 +428,24 @@ mod ollama_install_tests {
             remote_freshness_version(spec, &wider_ctx),
             "changing Ollama's context window can change long-input embeddings and must refresh",
         );
+    }
+
+    #[test]
+    fn remote_freshness_version_differs_by_backend() {
+        use crate::config::RemoteBackend;
+        // The SAME model served by a DIFFERENT backend can pool/normalize differently, so the
+        // backend is part of the vector-space identity — switching it must re-embed.
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        let ollama = remote_at("http://localhost:11434");
+        let mut infinity = ollama.clone();
+        infinity.backend = RemoteBackend::Infinity;
+        let mut vllm = ollama.clone();
+        vllm.backend = RemoteBackend::Vllm;
+        let f_ollama = remote_freshness_version(spec, &ollama);
+        let f_infinity = remote_freshness_version(spec, &infinity);
+        let f_vllm = remote_freshness_version(spec, &vllm);
+        assert_ne!(f_ollama, f_infinity, "ollama vs infinity must differ");
+        assert_ne!(f_ollama, f_vllm, "ollama vs vLLM must differ");
+        assert_ne!(f_infinity, f_vllm, "infinity vs vLLM must differ");
     }
 }

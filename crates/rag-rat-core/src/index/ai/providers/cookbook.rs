@@ -563,7 +563,7 @@ fn provision_and_build_cancellable(
     let effective_remote = remote.clone();
     let cap = remote.bounded_concurrency();
     let client_concurrency = match tune {
-        Some(t) => crate::index::ai::throughput_tune::tune_ollama_concurrency(
+        Some(t) => crate::index::ai::throughput_tune::tune_remote_concurrency(
             t.conn,
             remote.cookbook.as_deref().unwrap_or("cookbook"),
             &provisioned.endpoint,

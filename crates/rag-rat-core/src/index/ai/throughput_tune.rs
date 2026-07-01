@@ -7,7 +7,7 @@
 //!
 //! BACKEND-AGNOSTIC. The sweep engine ([`run_sweep`]) knows nothing about ollama — it measures
 //! texts/s for each candidate over the `Embedder` trait and picks the knee. A per-backend adapter
-//! (today [`tune_ollama_concurrency`]) supplies the candidate list, a `build(candidate) ->
+//! (today [`tune_remote_concurrency`]) supplies the candidate list, a `build(candidate) ->
 //! Embedder` closure, and a RUNTIME discriminator folded into the cache key so an ollama tune and a
 //! future infinity/vLLM tune for the same model never collide.
 //!
@@ -56,7 +56,7 @@ struct SweepResult {
 }
 
 /// The result of a sweep, so the caller can distinguish "measured a knee" from "ran but nothing was
-/// stable" from "didn't run" — each wants a DIFFERENT fallback (see [`tune_ollama_concurrency`]).
+/// stable" from "didn't run" — each wants a DIFFERENT fallback (see [`tune_remote_concurrency`]).
 #[cfg_attr(test, derive(Debug))]
 enum SweepOutcome {
     /// A knee (already clamped to the cap) and its measured texts/s. `complete` is false if the
@@ -92,7 +92,7 @@ struct TuneCacheFile {
 /// `endpoint`/`auth_token` from the handshake. Never errors — any failure falls back to the cap
 /// (tuning is best-effort).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn tune_ollama_concurrency(
+pub(crate) fn tune_remote_concurrency(
     conn: &Connection,
     provider: &str,
     endpoint: &str,
@@ -112,7 +112,11 @@ pub(crate) fn tune_ollama_concurrency(
     // fan-out.
     let batch_size = remote.batch_size.max(1);
     let key = tune_cache_key(TuneKey {
-        runtime: "ollama",
+        // The backend discriminator keeps an ollama tune from colliding with an infinity/vLLM tune
+        // for the same box shape (each server has its own throughput curve). Server-launch knobs
+        // (vLLM `--max-num-seqs`, infinity batch) are set at PROVISION time — fold them in here
+        // once the cookbook input carries them (Phase 2).
+        runtime: remote.backend.as_db_str(),
         provider,
         gpu: remote.gpu.as_deref().unwrap_or("cpu"),
         model: remote.model.trim(),
@@ -748,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn tune_ollama_concurrency_returns_a_fresh_cached_knee_without_probing() {
+    fn tune_remote_concurrency_returns_a_fresh_cached_knee_without_probing() {
         let conn = mem_conn();
         let remote = tune_remote(32);
         let spec =
@@ -768,7 +772,7 @@ mod tests {
         });
         write_cached_knee(&conn, &key, 6, 32, 100.0);
         // The endpoint is never contacted: the cache hits first, even with `allow_sweep = false`.
-        let knee = tune_ollama_concurrency(
+        let knee = tune_remote_concurrency(
             &conn,
             "modal",
             "http://127.0.0.1:1",
@@ -782,14 +786,14 @@ mod tests {
     }
 
     #[test]
-    fn tune_ollama_concurrency_uses_the_cap_on_a_miss_when_sweep_disallowed() {
+    fn tune_remote_concurrency_uses_the_cap_on_a_miss_when_sweep_disallowed() {
         let conn = mem_conn();
         let remote = tune_remote(8);
         let spec =
             crate::embedding_models::spec(crate::embedding_models::FASTEMBED_MODEL_ID).unwrap();
         // No cache entry + `allow_sweep = false` (a bounded / non-fan-out run) → the raw cap, and
         // the unreachable endpoint is never probed (no sweep runs).
-        let knee = tune_ollama_concurrency(
+        let knee = tune_remote_concurrency(
             &conn,
             "modal",
             "http://127.0.0.1:1",
@@ -804,14 +808,14 @@ mod tests {
     }
 
     #[test]
-    fn tune_ollama_concurrency_falls_back_conservatively_when_every_probe_fails() {
+    fn tune_remote_concurrency_falls_back_conservatively_when_every_probe_fails() {
         let conn = mem_conn();
         // Small cap → few candidates; unreachable endpoint → every probe fails fast (connection
         // refused), so the sweep finds no stable candidate.
         let remote = tune_remote(2);
         let spec =
             crate::embedding_models::spec(crate::embedding_models::FASTEMBED_MODEL_ID).unwrap();
-        let knee = tune_ollama_concurrency(
+        let knee = tune_remote_concurrency(
             &conn,
             "modal",
             "http://127.0.0.1:1",

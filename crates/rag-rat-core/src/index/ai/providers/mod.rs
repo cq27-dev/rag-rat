@@ -204,7 +204,7 @@ pub(crate) fn acquire_chunk_embedder(
                 // multiplies by `concurrency`, so a 128-cap config with a knee of 4
                 // would otherwise load a 32x-too-wide window the embedder only
                 // drains 4-at-a-time. This `remote` is window-sizing only (NOT persisted
-                // — the active-config meta is written from the cap by `install_ollama_model`).
+                // — the active-config meta is written from the cap by `install_remote_model`).
                 let mut window_remote = effective_remote;
                 window_remote.concurrency = window_concurrency;
                 ChunkEmbedder::Ready {

@@ -245,12 +245,12 @@ pub(crate) fn install_model(
         if spec.backend != Backend::FastEmbed {
             anyhow::bail!(
                 "remote embedding requires a transformer model, but `{model_id}` is a {} model — \
-                 remove the [llm.embedding.remote] block to install it locally, or install a \
-                 transformer model over Ollama",
+                 remove the [llm.embedding.remote] block to install it locally, or select a \
+                 transformer model to serve over the remote backend",
                 spec.backend.runtime()
             );
         }
-        install_ollama_model(conn, model_id, spec, remote)?;
+        install_remote_model(conn, model_id, spec, remote)?;
     } else {
         match spec.backend {
             Backend::Hash => {
