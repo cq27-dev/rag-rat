@@ -777,6 +777,9 @@ pub(crate) fn reconcile_with_options_progress(
         if !reused_jobs.is_empty() {
             let (reused_jobs_slice, reused_vectors_slice): (Vec<_>, Vec<_>) =
                 reused_jobs.into_iter().unzip();
+            // The reused vectors were decoded from the content cache (int8 -> f32); writing them
+            // back re-encodes to int8 — a negligible re-quantization (codes shift at most one
+            // level), well within the int8 scheme's accepted recall cost.
             write_current_embedding_batch(
                 conn,
                 embedder.as_ref(),
@@ -2010,6 +2013,68 @@ mod freshness_version_tests {
             )
             .unwrap();
         assert_eq!(current_rows, 2);
+    }
+
+    #[test]
+    fn embedding_cache_reuse_survives_chunk_deletion_and_gc_respects_grace() {
+        // #357: the content-addressed embedding_cache decouples the vector from chunk_id, so a
+        // reindex/branch-switch that deletes a chunk does NOT lose its vector.
+        let conn = schema_conn();
+        let dim = spec(FASTEMBED_MODEL_ID).unwrap().dim;
+        let embedder = RecordingEmbedder {
+            calls: AtomicUsize::new(0),
+            request_sizes: Mutex::new(Vec::new()),
+            dim,
+        };
+        let mut remote = remote_at("http://localhost:11434");
+        remote.batch_size = 8;
+
+        // Embed a chunk → writes chunk_embeddings AND the content-addressed embedding_cache.
+        let chunk_id = seed_embedding_chunk(&conn, 0);
+        let job = prepared_job(chunk_id, 0);
+        let input_hash = job.input_hash.clone();
+        let (written, failed) =
+            embed_and_write_jobs(&conn, &embedder, "v", vec![job], Some(&remote)).unwrap();
+        assert_eq!((written, failed), (1, 0));
+        assert!(
+            find_existing_embedding(&conn, embedder.model_id(), &input_hash, dim)
+                .unwrap()
+                .is_some(),
+            "embedding_cache is populated on write"
+        );
+
+        // REINDEX: deleting the chunk cascade-deletes its chunk_embeddings row (the pre-fix
+        // behavior that lost the vector). The content-addressed cache is NOT chunk-scoped.
+        conn.execute("DELETE FROM chunks WHERE id = ?1", params![chunk_id]).unwrap();
+        let live: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |r| r.get(0)).unwrap();
+        assert_eq!(live, 0, "chunk deletion cascade-deleted the embedding");
+        assert!(
+            find_existing_embedding(&conn, embedder.model_id(), &input_hash, dim)
+                .unwrap()
+                .is_some(),
+            "reuse survives reindex: the vector is still found in the durable cache"
+        );
+
+        // GC keeps a recently-used vector even with no live chunk (fast branch switch-back)...
+        assert_eq!(
+            prune_embedding_cache_unreferenced(&conn).unwrap(),
+            0,
+            "recently-used unreferenced entry is kept within the grace"
+        );
+        // ...and prunes it once it is past the grace with no live chunk referencing it.
+        conn.execute("UPDATE embedding_cache SET last_used_at_ms = 0", []).unwrap();
+        assert_eq!(
+            prune_embedding_cache_unreferenced(&conn).unwrap(),
+            1,
+            "stale unreferenced entry is pruned"
+        );
+        assert!(
+            find_existing_embedding(&conn, embedder.model_id(), &input_hash, dim)
+                .unwrap()
+                .is_none(),
+            "pruned entry is no longer reusable"
+        );
     }
 
     #[test]

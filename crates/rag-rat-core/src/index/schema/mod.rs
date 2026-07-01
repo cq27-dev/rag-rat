@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 35;
+pub const LATEST_SCHEMA_VERSION: u32 = 36;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -224,6 +224,12 @@ const MIGRATION_035_DESCRIPTION: &str = "Add symbols.is_test (cross-language tes
                                          test-file path, Rust #[test]/#[cfg(test)], Kotlin @Test, \
                                          Python test_*/TestCase) so clone detection can exclude \
                                          tests from the corpus";
+const MIGRATION_036_ID: &str = "036_embedding_content_cache";
+const MIGRATION_036_CHECKSUM: &str = "sha256:rag-rat-embedding-content-cache-v36";
+const MIGRATION_036_DESCRIPTION: &str =
+    "Add embedding_cache (content-addressed vectors keyed by input_hash) so embeddings survive \
+     reindex / branch-switch and reconcile reuses unchanged content across contexts instead of \
+     re-embedding; seeded from current chunk_embeddings (#357)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -533,6 +539,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_035_CHECKSUM,
         description: MIGRATION_035_DESCRIPTION,
         apply: apply_symbols_is_test,
+    },
+    Migration {
+        id: MIGRATION_036_ID,
+        checksum: MIGRATION_036_CHECKSUM,
+        description: MIGRATION_036_DESCRIPTION,
+        apply: apply_embedding_content_cache,
     },
 ];
 

@@ -446,7 +446,51 @@ pub(crate) fn store_embedding(
             now_ms()
         ],
     )?;
+    // Content-address the vector so it survives this chunk's deletion on the next reindex (#357):
+    // keep it in `embedding_cache` keyed by input_hash (which folds model + version + input text),
+    // so reconcile can reuse it for identical content across reindexes / branches / worktrees
+    // instead of re-embedding. An empty input_hash is not cacheable; a repeat write of the same
+    // content just bumps last_used for GC.
+    if !chunk.input_hash.is_empty() {
+        conn.execute(
+            "INSERT INTO embedding_cache(
+                 input_hash, model_id, embedding_dim, vector_blob, computed_at_ms, last_used_at_ms
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(input_hash) DO UPDATE SET last_used_at_ms = excluded.last_used_at_ms",
+            params![
+                chunk.input_hash,
+                embedder.model_id(),
+                i64::try_from(embedder.dim()).unwrap_or(i64::MAX),
+                encode_vector(vector),
+                now_ms()
+            ],
+        )?;
+    }
     Ok(())
+}
+
+/// GC grace for `embedding_cache` (#357): a content vector referenced by no live chunk is kept this
+/// long past its last use, so switching back to a branch you left recently reuses it instead of
+/// re-embedding. Vectors are small (int8-encoded), so a generous window costs little storage.
+const EMBEDDING_CACHE_GRACE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Prune `embedding_cache` vectors that BOTH (a) are referenced by no Current `chunk_embeddings` in
+/// ANY context — a sibling branch / worktree still using the content keeps it, matching the
+/// oracle's global-sweep rule — AND (b) haven't been used within [`EMBEDDING_CACHE_GRACE_MS`]. The
+/// content key is `input_hash`. Called from gc; returns rows deleted.
+pub(crate) fn prune_embedding_cache_unreferenced(conn: &Connection) -> anyhow::Result<u64> {
+    let cutoff = now_ms().saturating_sub(EMBEDDING_CACHE_GRACE_MS);
+    let deleted = conn.execute(
+        "DELETE FROM embedding_cache
+         WHERE last_used_at_ms < ?1
+           AND input_hash NOT IN (
+               SELECT input_hash FROM chunk_embeddings
+               WHERE status = 'Current' AND input_hash != ''
+           )",
+        params![cutoff],
+    )?;
+    Ok(u64::try_from(deleted).unwrap_or(0))
 }
 
 pub(crate) fn store_failed_embedding(

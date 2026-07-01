@@ -113,6 +113,15 @@ impl IndexDatabase {
         // edges it produced are dropped together.
         oracle::prune_edge_oracle_without_live_edge(conn)?;
         oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
+        // #357: `embedding_cache` is content-keyed too (survives reindex, like the oracle above),
+        // so it needs the SAME global sweep — drop vectors no live chunk references in ANY
+        // context (a sibling worktree / branch may still use one, so this must not be
+        // checkout-scoped) that are also past the switch-back grace. ORDERING: this MUST stay AFTER
+        // `delete_staged_files_cascade` above, so a just-removed dead context's chunk_embeddings
+        // are already gone and this cycle also reclaims their now-unreferenced vectors.
+        // (Running it before the cascade is still safe — it would just keep dead vectors
+        // one extra cycle.)
+        crate::index::ai::prune_embedding_cache_unreferenced(conn)?;
         // Dictionary hygiene (#79, extended #224): drop `name_strings` values nothing references
         // any more. The pool has NO FKs by design (see the schema comment), so orphans
         // accumulate as edges/symbols are pruned; the vocabulary is small, but gc is the

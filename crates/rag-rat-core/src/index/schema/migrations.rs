@@ -1170,6 +1170,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_033_ID => Some(33),
             MIGRATION_034_ID => Some(34),
             MIGRATION_035_ID => Some(35),
+            MIGRATION_036_ID => Some(36),
             _ => None,
         })
         .max()
@@ -1214,6 +1215,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_033_ID
             | MIGRATION_034_ID
             | MIGRATION_035_ID
+            | MIGRATION_036_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1255,6 +1257,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_033_ID => migration.checksum != MIGRATION_033_CHECKSUM,
         MIGRATION_034_ID => migration.checksum != MIGRATION_034_CHECKSUM,
         MIGRATION_035_ID => migration.checksum != MIGRATION_035_CHECKSUM,
+        MIGRATION_036_ID => migration.checksum != MIGRATION_036_CHECKSUM,
         _ => false,
     }
 }
@@ -1502,6 +1505,39 @@ pub(crate) fn apply_clone_graph_tables(conn: &Connection) -> rusqlite::Result<()
 /// repopulates them — accurate `is_test` needs a reindex with this binary.
 pub(crate) fn apply_symbols_is_test(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "symbols", "is_test", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
+/// V036 (#357): content-address embeddings so they SURVIVE reindex. `chunk_embeddings` is keyed by
+/// `chunk_id` with `ON DELETE CASCADE`, so every reindex / branch-switch deletes a chunk and its
+/// embedding — even when the content is unchanged — forcing a re-embed. `embedding_cache` keys the
+/// vector by `input_hash` alone (which already folds model id + model version + the exact embedding
+/// input text), so it is context-INDEPENDENT: reconcile reuses a vector for identical content
+/// across reindexes, branches, and worktrees instead of paying the embedder. Seeded from the
+/// current embeddings so existing vectors are preserved through the first post-migration reindex.
+/// Idempotent (`CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE`); seeding an empty table is a
+/// no-op on a fresh DB.
+pub(crate) fn apply_embedding_content_cache(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS embedding_cache(
+             input_hash TEXT NOT NULL PRIMARY KEY,
+             model_id TEXT NOT NULL,
+             embedding_dim INTEGER NOT NULL,
+             vector_blob BLOB NOT NULL,
+             computed_at_ms INTEGER NOT NULL,
+             last_used_at_ms INTEGER NOT NULL
+         ) STRICT;
+         -- Preserve existing vectors: seed the cache from the current embeddings by content so the
+         -- first reindex after this migration reuses instead of re-embedding.
+         INSERT OR IGNORE INTO embedding_cache(
+             input_hash, model_id, embedding_dim, vector_blob, computed_at_ms, last_used_at_ms
+         )
+         SELECT input_hash, model_id, embedding_dim, vector_blob,
+                COALESCE(computed_at_ms, created_at_ms, 0), COALESCE(computed_at_ms, \
+         created_at_ms, 0)
+         FROM chunk_embeddings
+         WHERE status = 'Current' AND input_hash != '' AND length(vector_blob) > 0;",
+    )?;
     Ok(())
 }
 

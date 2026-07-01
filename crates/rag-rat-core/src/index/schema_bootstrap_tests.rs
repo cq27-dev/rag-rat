@@ -12489,11 +12489,38 @@ fn migration_035_adds_symbols_is_test() {
     let _: i64 = conn
         .query_row("SELECT COUNT(*) FROM symbols WHERE is_test = 0", [], |r| r.get(0))
         .expect("SELECT is_test must succeed after V035");
+}
+
+/// V036 (#357): `embedding_cache` (content-addressed vectors) is added by the forward migration and
+/// is the schema tip; a DB at V035 gains the table on `migrate_forward`, and it seeds from existing
+/// current embeddings so vectors survive the next reindex.
+#[test]
+fn migration_036_adds_content_addressed_embedding_cache() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply");
     assert_eq!(
         crate::index::schema::LATEST_SCHEMA_VERSION,
-        35,
-        "LATEST_SCHEMA_VERSION is 35 after V035"
+        36,
+        "LATEST_SCHEMA_VERSION is 36 after V036"
     );
+
+    conn.execute_batch("DROP TABLE embedding_cache;").expect("revert to V035 shape");
+    truncate_schema_to(&conn, 35);
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Older,
+        "schema is Older after removing the V036 ledger row"
+    );
+
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    assert!(
+        conn_table_columns(&conn, "embedding_cache").contains(&"input_hash".to_string()),
+        "V036 adds the embedding_cache table"
+    );
+    // Content-keyed by input_hash: a lookup query is valid after the migration.
+    let _: i64 = conn
+        .query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r.get(0))
+        .expect("SELECT from embedding_cache must succeed after V036");
 }
 
 /// Regression test for the P1 schema bug (#215 Plan 4a): an index recorded at V029 WITHOUT
@@ -12554,11 +12581,6 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
         crate::index::schema::status(&conn).unwrap().current_version,
         crate::index::schema::LATEST_SCHEMA_VERSION,
         "schema is at LATEST_SCHEMA_VERSION after V030 migration"
-    );
-    assert_eq!(
-        crate::index::schema::LATEST_SCHEMA_VERSION,
-        35,
-        "LATEST_SCHEMA_VERSION is 35 after V035"
     );
     // Idempotency: running migrate_forward again must not error.
     crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");

@@ -476,17 +476,25 @@ pub(crate) fn collect_rows<T>(
     Ok(out)
 }
 
+/// Reuse an existing vector for content we've already embedded. Reads the CONTENT-ADDRESSED
+/// `embedding_cache` (keyed by `input_hash`, which folds model id + model version + the exact
+/// embedding input text), NOT `chunk_embeddings` — so a vector survives its chunk's deletion on
+/// reindex and is reusable across reindexes, branches, and worktrees (#357). An empty `input_hash`
+/// is never cacheable, so it never reuses.
 pub(crate) fn find_existing_embedding(
     conn: &Connection,
     model_id: &str,
     input_hash: &str,
     dim: usize,
 ) -> anyhow::Result<Option<Vec<f32>>> {
+    if input_hash.is_empty() {
+        return Ok(None);
+    }
     let vector: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT vector_blob FROM chunk_embeddings
-         WHERE model_id = ?1 AND input_hash = ?2 AND status = 'Current' AND embedding_dim = ?3
-         LIMIT 1",
+            "SELECT vector_blob FROM embedding_cache
+             WHERE input_hash = ?2 AND model_id = ?1 AND embedding_dim = ?3
+             LIMIT 1",
             params![model_id, input_hash, i64::try_from(dim).unwrap_or(i64::MAX)],
             |row| row.get(0),
         )
