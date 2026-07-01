@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use rag_rat_core::config::{
-    Config, EmbeddingBackend, OracleConfig, RemoteBackend, RemoteEmbeddingConfig,
-    VersionCheckConfig,
+    Config, DEFAULT_QUERY_ENDPOINT, EmbeddingBackend, OracleConfig, RemoteBackend,
+    RemoteEmbeddingConfig, VersionCheckConfig,
 };
 use rag_rat_core::language::Language;
 use toml_edit::{Array, DocumentMut, Item, Table};
@@ -160,10 +160,30 @@ pub(crate) fn wizard_query_endpoint(
     backend: RemoteBackend,
 ) -> Option<&'static str> {
     match (mode, backend) {
-        (RemoteMode::Ephemeral(_), RemoteBackend::Infinity) => Some("http://localhost:7997"),
-        (RemoteMode::Ephemeral(_), RemoteBackend::Vllm) => Some("http://localhost:8000"),
+        (RemoteMode::Ephemeral(_), RemoteBackend::Infinity | RemoteBackend::Vllm) =>
+            Some(default_backend_endpoint(backend)),
         _ => None,
     }
+}
+
+/// The default LOCAL endpoint the wizard uses for a backend: ollama 11434, infinity 7997, vLLM
+/// 8000. The single source for BOTH the connect `endpoint` default and the ephemeral
+/// `query_endpoint` default, so the endpoint always matches the selected backend's route + port.
+pub(crate) fn default_backend_endpoint(backend: RemoteBackend) -> &'static str {
+    match backend {
+        RemoteBackend::Ollama => DEFAULT_QUERY_ENDPOINT,
+        RemoteBackend::Infinity => "http://localhost:7997",
+        RemoteBackend::Vllm => "http://localhost:8000",
+    }
+}
+
+/// Whether `url` is one of the wizard's known default LOCAL endpoints (any backend's) — a value the
+/// wizard itself wrote, so it is safe to REPLACE when the backend or mode changes. A URL outside
+/// this set is a user customization and is preserved.
+pub(crate) fn is_default_backend_endpoint(url: &str) -> bool {
+    [RemoteBackend::Ollama, RemoteBackend::Infinity, RemoteBackend::Vllm]
+        .into_iter()
+        .any(|b| default_backend_endpoint(b) == url)
 }
 
 /// Hook installation selections.
@@ -462,13 +482,24 @@ impl WizardDraft {
                         t.remove("endpoint");
                     },
                 }
-                // A non-ollama EPHEMERAL config needs an explicit `query_endpoint` to LOAD (config
-                // validation rejects the ollama-default for infinity/vLLM). Write the backend's
-                // default local port when absent — never clobber a value the user already set.
-                if t.get("query_endpoint").is_none()
-                    && let Some(qe) = wizard_query_endpoint(&remote.mode, remote.backend)
-                {
-                    t.insert("query_endpoint", toml_edit::value(qe));
+                // `query_endpoint` is wizard-managed for EPHEMERAL and must TRACK the backend: a
+                // non-ollama config needs it to LOAD, and a value left over from a previous backend
+                // would point queries at the wrong local server. Recompute it from the current
+                // backend when the stored value is absent or a KNOWN wizard default; a truly custom
+                // endpoint the user set is preserved. (Connect ignores query_endpoint — left
+                // as-is.)
+                if let RemoteMode::Ephemeral(_) = &remote.mode {
+                    let current = t.get("query_endpoint").and_then(Item::as_str);
+                    if current.is_none_or(is_default_backend_endpoint) {
+                        match wizard_query_endpoint(&remote.mode, remote.backend) {
+                            Some(qe) => {
+                                t.insert("query_endpoint", toml_edit::value(qe));
+                            },
+                            None => {
+                                t.remove("query_endpoint"); // ollama → config default (11434)
+                            },
+                        }
+                    }
                 }
                 t.insert("batch_size", toml_edit::value(i64::from(remote.batch_size)));
                 t.insert("concurrency", toml_edit::value(i64::from(remote.concurrency)));
@@ -992,6 +1023,60 @@ mod tests {
         let r = cfg.llm.embedding.remote.expect("remote present");
         assert_eq!(r.backend, RemoteBackend::Infinity);
         assert_eq!(r.query_endpoint.as_deref(), Some("http://localhost:7997"));
+    }
+
+    #[test]
+    fn patch_recomputes_ephemeral_query_endpoint_from_backend() {
+        // Switching an ephemeral config's backend must update the wizard-DEFAULT query_endpoint — a
+        // stale value from the previous backend would point queries at the wrong local server. A
+        // truly custom endpoint is preserved.
+        let infinity = "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n\
+                        [llm.embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\n\
+                        [llm.embedding.remote]\nmodel = \"x\"\nbackend = \"infinity\"\ncookbook = \
+                        \"@rag-rat/cookbook modal\"\nquery_endpoint = \"http://localhost:7997\"\n";
+        let mut d = WizardDraft::from_scan(&RepoScan::default(), ".".into(), PathBuf::from("."));
+        d.bindings.insert(Language::Rust, vec!["src".into()]);
+        let mut remote = RemoteDraft {
+            model: "all-minilm".to_string(),
+            backend: RemoteBackend::Ollama,
+            mode: RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
+            gpu: None,
+            num_ctx: None,
+            batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
+            auth_env: None,
+        };
+        d.remote = Some(remote.clone());
+        let q = |out: &str| -> Option<String> {
+            let doc: DocumentMut = out.parse().unwrap();
+            doc["llm"]["embedding"]["remote"]
+                .as_table_like()
+                .unwrap()
+                .get("query_endpoint")
+                .and_then(Item::as_str)
+                .map(str::to_string)
+        };
+
+        // infinity(7997) → ollama: the known default is dropped (ollama uses the config default).
+        assert_eq!(q(&d.patch_existing(infinity).unwrap()), None);
+
+        // infinity(7997) → vLLM: the default updates to vLLM's port.
+        remote.backend = RemoteBackend::Vllm;
+        d.remote = Some(remote.clone());
+        assert_eq!(
+            q(&d.patch_existing(infinity).unwrap()),
+            Some("http://localhost:8000".to_string())
+        );
+
+        // A CUSTOM query_endpoint (not a known default) is preserved across a backend change.
+        let custom = infinity.replace("http://localhost:7997", "http://gpu-box.local:9999");
+        remote.backend = RemoteBackend::Ollama;
+        d.remote = Some(remote);
+        assert_eq!(
+            q(&d.patch_existing(&custom).unwrap()),
+            Some("http://gpu-box.local:9999".to_string())
+        );
     }
 
     #[test]

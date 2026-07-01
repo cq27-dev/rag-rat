@@ -30,8 +30,8 @@ use tui_tree_widget::{Tree, TreeItem, TreeState};
 
 use super::catalog::CookbookEntry;
 use super::draft::{
-    OLLAMA_EMBEDDING_MODELS, RemoteDraft, RemoteMode, ollama_model_dim, ollama_model_for,
-    wizard_query_endpoint,
+    OLLAMA_EMBEDDING_MODELS, RemoteDraft, RemoteMode, default_backend_endpoint,
+    is_default_backend_endpoint, ollama_model_dim, ollama_model_for, wizard_query_endpoint,
 };
 use super::probe::{ProbeKind, ProbeStatus};
 use super::state::{PROVISION_CONFIRM_WORD, WizardState, provision_confirm_satisfied};
@@ -1846,6 +1846,15 @@ fn select_embedding_focus(state: &mut WizardState) {
                 // The server-side model NAME differs by backend (an ollama name vs the HF id), so
                 // reset it to the new backend's default rather than leave a mismatched name.
                 remote.model = default_remote_model_for(&state.draft.model, selected).to_string();
+                // Keep a wizard-default connect endpoint coherent with the new backend's
+                // route/port; a custom endpoint the user typed is left alone.
+                // (Ephemeral's query_endpoint is derived from the backend at write
+                // time, so it needs no draft update here.)
+                if let RemoteMode::Connect(ep) = &mut remote.mode
+                    && is_default_backend_endpoint(ep)
+                {
+                    *ep = default_backend_endpoint(selected).to_string();
+                }
                 changed = true;
             }
         },
@@ -1921,6 +1930,14 @@ fn new_connect_remote_from(local_model: &str, existing: Option<&RemoteDraft>) ->
         // Carry the previously chosen backend across a mode switch.
         remote.backend = existing.backend;
         remote.model = preserved_server_model(local_model, existing);
+        // Keep a CUSTOM connect endpoint the user typed; otherwise default to one matching the
+        // (preserved) backend — so a mode switch never leaves e.g. an infinity backend pointed at
+        // the ollama default port.
+        remote.mode = match &existing.mode {
+            RemoteMode::Connect(ep) if !is_default_backend_endpoint(ep) =>
+                RemoteMode::Connect(ep.clone()),
+            _ => RemoteMode::Connect(default_backend_endpoint(remote.backend).to_string()),
+        };
         remote.num_ctx = existing.num_ctx;
         remote.batch_size = existing.batch_size;
         if matches!(existing.mode, RemoteMode::Connect(_)) {
@@ -3014,6 +3031,23 @@ mod tests {
         assert_eq!(connect.backend, RemoteBackend::Ollama);
         // Ollama uses its own model name.
         assert_eq!(connect.model, "all-minilm");
+    }
+
+    #[test]
+    fn connect_from_ephemeral_infinity_keeps_backend_with_matching_endpoint() {
+        // A mode switch ephemeral→connect PRESERVES the backend, so the connect endpoint default
+        // must MATCH it (infinity → 7997), not fall back to the ollama default (11434) — otherwise
+        // the connect probe posts infinity's route to a local ollama server.
+        let existing = new_ephemeral_remote("sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(existing.backend, RemoteBackend::Infinity, "ephemeral defaults to infinity");
+        let connect =
+            new_connect_remote_from("sentence-transformers/all-MiniLM-L6-v2", Some(&existing));
+        assert_eq!(connect.backend, RemoteBackend::Infinity);
+        assert!(
+            matches!(connect.mode, RemoteMode::Connect(ref ep) if ep == "http://localhost:7997"),
+            "connect endpoint must match the preserved backend, got {:?}",
+            connect.mode,
+        );
     }
 
     #[test]
