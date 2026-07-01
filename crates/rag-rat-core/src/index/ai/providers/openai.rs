@@ -373,6 +373,69 @@ impl OpenAiEmbedder {
             texts,
         )
     }
+
+    /// EVAL-ONLY (#346): embed a single probe text and return the server's response vector LENGTH,
+    /// WITHOUT enforcing the dim-parity contract. The `benchmark-embedding` CLI uses this to learn
+    /// the dimension of an OFF-REGISTRY HF model (no registry `spec.dim` to check against) before
+    /// the throughput sweep. It calls the shared request path with `dim = observed` — i.e. it
+    /// reads the first vector's length and validates against ITSELF, so no mismatch is
+    /// possible; the point is to LEARN the dim, not enforce a known one.
+    #[cfg(feature = "eval")]
+    pub(crate) fn probe_dim(&self) -> anyhow::Result<usize> {
+        let probe = ["rag-rat benchmark dim probe".to_string()];
+        // Two-phase: send the request with the dim guard DISABLED (a sentinel `0` never equals a
+        // real vector width, so `embed_one_request_with` would reject it — instead we read
+        // the raw length directly here via a guard-free variant).
+        let vectors = Self::embed_first_vector_unchecked(
+            self.agent.clone(),
+            &self.embed_url,
+            &self.server_model,
+            self.auth_header.as_deref(),
+            &probe,
+        )?;
+        vectors.first().map(Vec::len).ok_or_else(|| anyhow::anyhow!("dim probe returned no vector"))
+    }
+
+    /// EVAL-ONLY (#346): the request + parse of [`Self::embed_one_request_with`] WITHOUT the
+    /// per-vector dim-parity check — the guard-free path [`Self::probe_dim`] uses to LEARN an
+    /// off-registry model's dim. Enforces the count contract still (one embedding per input), just
+    /// not the dim (there is no known dim to enforce yet).
+    #[cfg(feature = "eval")]
+    fn embed_first_vector_unchecked(
+        agent: ureq::Agent,
+        embed_url: &str,
+        server_model: &str,
+        auth_header: Option<&str>,
+        texts: &[String],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let payload = EmbedRequest { model: server_model, input: texts, encoding_format: "float" };
+        let body = serde_json::to_vec(&payload)
+            .map_err(|e| anyhow::anyhow!("failed to serialize embed request: {e}"))?;
+        let mut request = agent.post(embed_url).content_type("application/json");
+        if let Some(header) = auth_header {
+            request = request.header("Authorization", header);
+        }
+        let mut response = request
+            .send(body)
+            .map_err(|e| anyhow::anyhow!("dim probe request to `{embed_url}` failed: {e}"))?;
+        let status = response.status();
+        let raw = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| anyhow::anyhow!("reading dim probe response failed: {e}"))?;
+        if !status.is_success() {
+            let detail = serde_json::from_str::<ErrorResponse>(&raw)
+                .map(|e| e.error.message)
+                .unwrap_or_else(|_| response_excerpt(&raw));
+            anyhow::bail!(
+                "dim probe request to `{embed_url}` failed: http status {}: {detail}",
+                status.as_u16(),
+            );
+        }
+        let parsed: EmbedResponse = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("malformed dim probe response: {e}"))?;
+        Ok(parsed.data.into_iter().map(|item| item.embedding).collect())
+    }
 }
 
 fn response_excerpt(body: &str) -> String {

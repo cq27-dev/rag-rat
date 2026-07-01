@@ -18,6 +18,13 @@ pub use providers::FastEmbedEmbedder;
 pub use providers::MockEmbedder;
 #[cfg(feature = "model2vec")]
 pub use providers::Model2VecEmbedder;
+// EVAL-ONLY seam for the `rag-rat benchmark-embedding` subcommand (#346): the CLI (a separate
+// crate) provisions an ephemeral box (`provision_box_for_benchmark`, holding the
+// `ProvisionedBox` for teardown) and runs its OWN measured concurrency sweep
+// (`benchmark_remote_concurrency`), emitting every per-candidate `MeasuredCandidate`. No knee
+// selection, no tune-cache write — those stay on the reconcile path.
+#[cfg(feature = "eval")]
+pub use providers::provision_box_for_benchmark;
 pub(crate) use providers::{
     ChunkEmbedder, acquire_chunk_embedder, active_embedder, provision_and_build,
 };
@@ -44,6 +51,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 pub(crate) use status::*;
 pub(crate) use store::*;
+#[cfg(feature = "eval")]
+pub use throughput_tune::{
+    MeasuredCandidate, benchmark_remote_concurrency, default_benchmark_budget_ms,
+    default_benchmark_candidates, measure_remote_dim,
+};
 
 use crate::index::now_ms;
 use crate::language::Language;

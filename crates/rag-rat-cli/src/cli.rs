@@ -95,6 +95,12 @@ pub(crate) enum Command {
     #[cfg(feature = "eval")]
     Eval(EvalArgs),
 
+    /// Benchmark ephemeral remote embedding throughput across concurrency candidates, emitting
+    /// per-candidate texts/s as JSON (requires the `eval` build feature). Provisions an ephemeral
+    /// cookbook box, runs the sweep, and tears it down.
+    #[cfg(feature = "eval")]
+    BenchmarkEmbedding(BenchmarkEmbeddingArgs),
+
     /// SCIP-oracle pass: compiler-grade edge resolution from a language indexer.
     Oracle(OracleArgs),
 
@@ -366,6 +372,50 @@ pub(crate) struct EvalArgs {
     /// change.
     #[arg(long, default_value_t = 10)]
     pub search_limit: usize,
+}
+
+/// `benchmark-embedding` (#346): provision an ephemeral cookbook box and sweep embedding throughput
+/// across concurrency candidates, emitting per-candidate texts/s as JSON. The PRIMARY output is
+/// JSON regardless of the global render flag (the point of the command is machine-readable
+/// backend/concurrency comparison).
+#[cfg(feature = "eval")]
+#[derive(Debug, Args)]
+pub(crate) struct BenchmarkEmbeddingArgs {
+    /// The ephemeral cookbook provider spec that provisions the on-demand box (e.g.
+    /// `"@rag-rat/cookbook modal"`). Required — this command only benchmarks ephemeral boxes.
+    #[arg(long)]
+    pub cookbook: String,
+    /// Which OpenAI-compatible backend to provision + benchmark (`ollama` | `infinity` | `vllm`).
+    #[arg(long, default_value = "ollama", value_parser = parse_remote_backend)]
+    pub backend: rag_rat_core::config::RemoteBackend,
+    /// The server-side model to serve: an ollama model name (ollama backend) or a HuggingFace id
+    /// (infinity/vLLM). Required. Off-registry HF models fall back to a measured dim (one probe
+    /// embed) since they have no registry spec.
+    #[arg(long)]
+    pub model: String,
+    /// GPU hint for the recipe (provider-specific, e.g. `A10G`/`T4`). Omit to let the recipe pick.
+    #[arg(long)]
+    pub gpu: Option<String>,
+    /// Concurrency candidates to measure, comma-separated (e.g. `1,2,4,8,16,32`). Omit to sweep
+    /// the tuner's default ladder (powers of two up to the config's concurrency cap, plus the
+    /// cap).
+    #[arg(long, value_delimiter = ',')]
+    pub candidates: Vec<u32>,
+    /// Total sweep budget in milliseconds (split across candidates). Omit for the tuner default.
+    #[arg(long)]
+    pub budget_ms: Option<u64>,
+    /// Write the JSON report to this path instead of stdout.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+/// clap `value_parser` for `--backend`: parse the backend selector via the SAME
+/// [`RemoteBackend::from_db_str`](rag_rat_core::config::RemoteBackend::from_db_str) the config
+/// layer uses, so the CLI and config accept identical spellings.
+#[cfg(feature = "eval")]
+fn parse_remote_backend(s: &str) -> Result<rag_rat_core::config::RemoteBackend, String> {
+    rag_rat_core::config::RemoteBackend::from_db_str(s)
+        .ok_or_else(|| format!("unknown backend `{s}` (expected ollama, infinity, or vllm)"))
 }
 
 #[derive(Debug, Args)]
@@ -745,6 +795,84 @@ mod tests {
             },
             other => panic!("expected clones-for, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn benchmark_embedding_parses_candidates_and_backend() {
+        let cli = Cli::try_parse_from([
+            "rag-rat",
+            "benchmark-embedding",
+            "--cookbook",
+            "@rag-rat/cookbook modal",
+            "--backend",
+            "infinity",
+            "--model",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "--candidates",
+            "1,2,4",
+            "--budget-ms",
+            "30000",
+            "--gpu",
+            "A10G",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::BenchmarkEmbedding(args) => {
+                assert_eq!(args.cookbook, "@rag-rat/cookbook modal");
+                assert_eq!(args.backend, rag_rat_core::config::RemoteBackend::Infinity);
+                assert_eq!(args.model, "sentence-transformers/all-MiniLM-L6-v2");
+                assert_eq!(args.candidates, vec![1, 2, 4]);
+                assert_eq!(args.budget_ms, Some(30_000));
+                assert_eq!(args.gpu.as_deref(), Some("A10G"));
+                assert!(args.output.is_none());
+            },
+            other => panic!("expected benchmark-embedding, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn benchmark_embedding_defaults_backend_ollama_and_omits_candidates() {
+        // `--cookbook` + `--model` are the only required flags; backend defaults to ollama and the
+        // candidate list is empty (→ the handler uses the default ladder).
+        let cli = Cli::try_parse_from([
+            "rag-rat",
+            "benchmark-embedding",
+            "--cookbook",
+            "@rag-rat/cookbook modal",
+            "--model",
+            "all-minilm",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::BenchmarkEmbedding(args) => {
+                assert_eq!(args.backend, rag_rat_core::config::RemoteBackend::Ollama);
+                assert!(args.candidates.is_empty());
+                assert!(args.budget_ms.is_none());
+            },
+            other => panic!("expected benchmark-embedding, got {other:?}"),
+        }
+        // An unknown backend is rejected by the value_parser.
+        assert!(
+            Cli::try_parse_from([
+                "rag-rat",
+                "benchmark-embedding",
+                "--cookbook",
+                "cb",
+                "--model",
+                "m",
+                "--backend",
+                "bogus",
+            ])
+            .is_err(),
+            "an unknown --backend must be rejected"
+        );
+        // `--cookbook` and `--model` are both required.
+        assert!(Cli::try_parse_from(["rag-rat", "benchmark-embedding", "--model", "m"]).is_err());
+        assert!(
+            Cli::try_parse_from(["rag-rat", "benchmark-embedding", "--cookbook", "cb"]).is_err()
+        );
     }
 
     #[test]

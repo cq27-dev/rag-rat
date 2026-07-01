@@ -19,6 +19,11 @@ mod openai;
 use rusqlite::Connection;
 
 pub(crate) use self::cookbook::provision_and_build;
+// EVAL-ONLY `pub` seam (#346): the `benchmark-embedding` subcommand (a separate crate)
+// provisions an ephemeral box and runs its own measured sweep against it; re-exported `pub`
+// under `eval` so it reaches the CLI through `index::ai`.
+#[cfg(feature = "eval")]
+pub use self::cookbook::provision_box_for_benchmark;
 // `verify_ephemeral_remote` is the `pub` init-wizard seam (the CLI's Remote step calls it);
 // the underlying `provision_and_build` stays `pub(crate)`.
 pub use self::cookbook::{

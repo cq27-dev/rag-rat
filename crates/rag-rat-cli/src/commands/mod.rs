@@ -4,7 +4,7 @@ use rag_rat_core::OutputFormat;
 
 use super::*;
 #[cfg(feature = "eval")]
-use crate::cli::EvalArgs;
+use crate::cli::{BenchmarkEmbeddingArgs, EvalArgs};
 use crate::cli::{
     BriefArgs, ClonesArgs, ClonesForArgs, ClustersArgs, DreamArgs, GithubArgs, GithubCommand,
     HookAction, HooksArgs, ImportantSymbolsArgs, IndexArgs, MaintenanceArgs, MemoryArgs,
@@ -469,6 +469,141 @@ pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
 #[cfg(feature = "eval")]
 pub(crate) fn default_eval_path(config: &Config, file_name: &str) -> PathBuf {
     config.root.join("evals").join(file_name)
+}
+
+/// `benchmark-embedding` (#346): provision an ephemeral cookbook box, sweep embedding throughput
+/// across concurrency candidates, and emit per-candidate texts/s as JSON — then tear the box down.
+/// The point is a machine-readable comparison of backends (ollama/infinity/vLLM) and concurrency
+/// levels, so the PRIMARY output is JSON regardless of the global `--json` render flag.
+///
+/// This runs its OWN measured sweep (`benchmark_remote_concurrency`), NOT the caching auto-tuner:
+/// every candidate is measured and reported (no knee selection, no tune-cache write). The box is
+/// provisioned with `tune = None` and kept bound for the whole sweep — `ProvisionedBox::drop` is
+/// the teardown, so letting it live to the end of scope is what tears it down cleanly.
+#[cfg(feature = "eval")]
+pub(crate) fn benchmark_embedding(
+    config: &Config,
+    args: &BenchmarkEmbeddingArgs,
+) -> anyhow::Result<()> {
+    use rag_rat_core::config::RemoteEmbeddingConfig;
+
+    // Build an EPHEMERAL remote config directly (no rag-rat.toml round-trip): `cookbook` set,
+    // `endpoint` None. Struct construction bypasses the config layer's connect/ephemeral
+    // validation, which is fine — the benchmark only provisions + sweeps, it never reconciles,
+    // so the only knobs that matter are the provisioning inputs (cookbook/backend/gpu/model)
+    // and the request shape (batch_size/max_batch_chars/concurrency/timeout), which come from
+    // the defaults.
+    let cap = config.llm.embedding.remote.as_ref().map_or_else(
+        || RemoteEmbeddingConfig::default().bounded_concurrency(),
+        RemoteEmbeddingConfig::bounded_concurrency,
+    );
+    let remote = RemoteEmbeddingConfig {
+        model: args.model.clone(),
+        backend: args.backend,
+        endpoint: None,
+        cookbook: Some(args.cookbook.clone()),
+        query_endpoint: None,
+        auth_env: None,
+        gpu: args.gpu.clone(),
+        // The benchmark measures the request shape from the config defaults; `concurrency` here is
+        // only the CAP that sizes the default candidate ladder, not a live fan-out.
+        concurrency: cap,
+        ..RemoteEmbeddingConfig::default()
+    };
+
+    let max_embedding_chars = config.llm.embedding.runtime.max_embedding_chars;
+    // The candidate ladder: explicit `--candidates` when given, else the tuner's default ladder for
+    // the config's concurrency cap (powers of two up to the cap, plus the exact cap).
+    let candidates: Vec<u32> = if args.candidates.is_empty() {
+        rag_rat_core::index::ai::default_benchmark_candidates(cap)
+    } else {
+        args.candidates.clone()
+    };
+    let budget_ms =
+        args.budget_ms.unwrap_or_else(rag_rat_core::index::ai::default_benchmark_budget_ms);
+
+    // Registry model → trust `spec.dim`. Off-registry HF model → provision, measure the dim from
+    // one probe embed, then benchmark. Either way the ProvisionedBox is kept bound for the
+    // whole sweep.
+    let spec = rag_rat_core::embedding_models::spec(&args.model);
+    let provisioned = rag_rat_core::index::ai::provision_box_for_benchmark(
+        &remote,
+        spec_or_measure_placeholder(spec),
+    )?;
+    let (selected_model_id, dim) = match spec {
+        Some(spec) => (spec.model_id.to_string(), spec.dim),
+        None => {
+            // Off-registry: learn the dim from the server's first response.
+            let dim = rag_rat_core::index::ai::measure_remote_dim(
+                &provisioned.endpoint,
+                provisioned.auth_token.as_deref(),
+                &remote,
+            )?;
+            (args.model.clone(), dim)
+        },
+    };
+
+    let measured = rag_rat_core::index::ai::benchmark_remote_concurrency(
+        &provisioned.endpoint,
+        provisioned.auth_token.as_deref(),
+        &remote,
+        &selected_model_id,
+        dim,
+        max_embedding_chars,
+        &candidates,
+        budget_ms,
+    );
+
+    // Peak = the highest measured texts/s row (informational; the benchmark reports every row and
+    // lets the reader compare). `None` only if no candidate was measured (empty ladder).
+    let peak = measured
+        .iter()
+        .max_by(|a, b| a.texts_per_second.total_cmp(&b.texts_per_second))
+        .map(|m| serde_json::json!({ "concurrency": m.concurrency, "texts_per_second": m.texts_per_second }));
+
+    let report = serde_json::json!({
+        "backend": args.backend.as_db_str(),
+        "model": args.model,
+        "cookbook": args.cookbook,
+        "gpu": args.gpu,
+        "dim": dim,
+        "budget_ms": budget_ms,
+        "candidates": measured,
+        "peak": peak,
+    });
+
+    // JSON is the PRIMARY output (#346), regardless of the global render flag. To a file when
+    // `--output` is set, else stdout.
+    let json = serde_json::to_string_pretty(&report)?;
+    match &args.output {
+        Some(path) => {
+            write_atomic(path, json.as_bytes())?;
+            eprintln!(
+                "benchmark-embedding: wrote {} candidate rows to {}",
+                measured.len(),
+                path.display()
+            );
+        },
+        None => println!("{json}"),
+    }
+    // `provisioned` drops here → the box is torn down (SIGTERM → grace → SIGKILL on its group).
+    Ok(())
+}
+
+/// The `spec` param `provision_box_for_benchmark` needs is `&EmbeddingModelSpec`; an off-registry
+/// model has none, so provisioning uses the FALLBACK all-MiniLM spec purely to satisfy the type —
+/// it only feeds `spec.model_id`/`spec.dim` into the built-but-discarded probe embedder inside
+/// `provision_and_build`, which the benchmark never uses (it constructs its own per-candidate
+/// embedders against the box). The real server-side model is `remote.model`; the real dim is
+/// measured separately via `measure_remote_dim`.
+#[cfg(feature = "eval")]
+fn spec_or_measure_placeholder(
+    spec: Option<&'static rag_rat_core::embedding_models::EmbeddingModelSpec>,
+) -> &'static rag_rat_core::embedding_models::EmbeddingModelSpec {
+    spec.unwrap_or_else(|| {
+        rag_rat_core::embedding_models::spec(rag_rat_core::embedding_models::FASTEMBED_MODEL_ID)
+            .expect("the fallback all-MiniLM spec is always registered")
+    })
 }
 
 /// Decide whether a `models install <model_id>` should use the configured `[llm.embedding.remote]`

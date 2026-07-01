@@ -568,6 +568,25 @@ pub(crate) fn provision_and_build(
     provision_and_build_cancellable(remote, spec, || false, tune)
 }
 
+/// EVAL-ONLY (#346): provision an ephemeral cookbook box for `remote` + `spec` and hand the caller
+/// the live [`ProvisionedBox`] — the `pub` seam the `benchmark-embedding` subcommand uses. It calls
+/// [`provision_and_build`] with `tune = None` (the benchmark runs its OWN measured concurrency
+/// sweep via [`crate::index::ai::benchmark_remote_concurrency`]; it must NOT warm the reconcile
+/// tune cache), discards the built embedder (the benchmark builds its own per-candidate embedders
+/// against the box's `endpoint`/`auth_token`), and returns ONLY the box. The caller MUST keep the
+/// returned box bound for the whole sweep — its `Drop` is the teardown, so an early drop kills the
+/// server mid-benchmark. `TuneRequest` stays crate-private: this seam never names it (always
+/// `None`).
+#[cfg(feature = "eval")]
+pub fn provision_box_for_benchmark(
+    remote: &RemoteEmbeddingConfig,
+    spec: &EmbeddingModelSpec,
+) -> anyhow::Result<ProvisionedBox> {
+    let (_embedder, provisioned, _effective_remote, _knee) =
+        provision_and_build_cancellable(remote, spec, || false, None)?;
+    Ok(provisioned)
+}
+
 fn provision_and_build_cancellable(
     remote: &RemoteEmbeddingConfig,
     spec: &EmbeddingModelSpec,

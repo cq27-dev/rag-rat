@@ -192,6 +192,141 @@ pub(crate) fn tune_remote_concurrency(
     }
 }
 
+/// One measured concurrency candidate from [`benchmark_remote_concurrency`] — the eval-gated,
+/// machine-readable analogue of a [`SweepResult`], carrying the full per-candidate throughput row
+/// (NOT a single knee) so the `benchmark-embedding` CLI can compare backends/concurrencies (#346).
+#[cfg(feature = "eval")]
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct MeasuredCandidate {
+    /// The client fan-out (in-flight `/v1/embeddings` requests) measured for this row.
+    pub concurrency: u32,
+    /// Texts embedded per second at this concurrency (raw, un-penalized — the benchmark reports
+    /// the measured number and lets the caller compare; it does NOT run the knee's failure
+    /// penalty).
+    pub texts_per_second: f64,
+    /// Successful probe requests during this candidate's budget slice.
+    pub requests: u64,
+    /// Failed probe requests during this candidate's budget slice.
+    pub failures: u64,
+    /// Whether the failure breaker tripped (this fan-out was unstable — informational for the
+    /// benchmark, which reports it rather than dropping the row like `select_knee` does).
+    pub aborted: bool,
+}
+
+/// EVAL-ONLY (#346): benchmark a provisioned box at every concurrency candidate and return the FULL
+/// per-candidate throughput table — no knee selection, no caching. The measured counterpart to
+/// [`tune_remote_concurrency`]: it builds the probe params + per-candidate `build` closure the SAME
+/// way (so each probe request matches a live reconcile request's weight), runs the shared
+/// [`measure_candidates`] loop, and maps every [`SweepResult`] to a [`MeasuredCandidate`]. The
+/// caller owns the [`crate::index::ai::ProvisionedBox`] (keep it alive for the whole call — the
+/// embedders only hold the endpoint URL). `endpoint`/`auth_token` come from the cookbook handshake.
+///
+/// Takes `selected_model_id` + `dim` DIRECTLY rather than an [`EmbeddingModelSpec`]: an
+/// off-registry HF model (`--model` naming something with no registry row) has no `spec`, and the
+/// CLI supplies a MEASURED dim (one probe embed) for that case — an `EmbeddingModelSpec`'s
+/// `'static` fields can't carry a runtime-chosen model id/dim. For a registry model the caller
+/// passes `spec.model_id` / `spec.dim`.
+#[cfg(feature = "eval")]
+#[allow(clippy::too_many_arguments)]
+pub fn benchmark_remote_concurrency(
+    endpoint: &str,
+    auth_token: Option<&str>,
+    remote: &RemoteEmbeddingConfig,
+    selected_model_id: &str,
+    dim: usize,
+    max_embedding_chars: usize,
+    candidates: &[u32],
+    budget_ms: u64,
+) -> Vec<MeasuredCandidate> {
+    // Mirror `tune_remote_concurrency`'s probe construction so a benchmarked candidate embeds the
+    // SAME per-request weight the live reconcile would: `batch_size` normalized to >=1 like the
+    // embedder, probe texts sized to the live chunk cap, request texts split by BOTH the count and
+    // char budgets.
+    let batch_size = remote.batch_size.max(1);
+    let per_text_chars = probe_text_chars(max_embedding_chars);
+    let request_texts =
+        effective_request_texts(batch_size, remote.max_batch_chars, max_embedding_chars);
+    let build = |concurrency: u32, request_timeout_s: u64| -> OpenAiEmbedder {
+        OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
+            endpoint,
+            embed_path: remote.backend.embed_path(),
+            auth_token,
+            server_model: remote.model.trim(),
+            selected_model_id,
+            dim,
+            request_timeout_s,
+            batch_size,
+            concurrency,
+            max_batch_chars: remote.max_batch_chars,
+        })
+    };
+    measure_candidates(MeasureParams {
+        candidates: candidates.to_vec(),
+        per_text_chars,
+        request_texts,
+        request_timeout_s: remote.request_timeout_s,
+        budget_ms,
+        build,
+    })
+    .into_iter()
+    .map(|r| MeasuredCandidate {
+        concurrency: r.candidate,
+        texts_per_second: r.texts_per_second,
+        requests: r.requests,
+        failures: r.failures,
+        aborted: r.aborted,
+    })
+    .collect()
+}
+
+/// EVAL-ONLY (#346): measure the embedding DIMENSION a provisioned box serves for `remote.model`,
+/// by embedding a single probe text and returning the response vector's length. Used by the
+/// `benchmark-embedding` CLI for an OFF-REGISTRY HF model (`--model` with no registry spec): there
+/// is no `spec.dim` to trust, so the dim comes from the server's first response. The probe goes
+/// through [`OpenAiEmbedder::probe_dim`], which reads the raw response length WITHOUT the
+/// dim-parity guard (the guard needs a known dim, which is exactly what we don't have yet). Errors
+/// if the probe embed fails or returns no vector.
+#[cfg(feature = "eval")]
+pub fn measure_remote_dim(
+    endpoint: &str,
+    auth_token: Option<&str>,
+    remote: &RemoteEmbeddingConfig,
+) -> anyhow::Result<usize> {
+    let embedder = OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
+        endpoint,
+        embed_path: remote.backend.embed_path(),
+        auth_token,
+        server_model: remote.model.trim(),
+        selected_model_id: remote.model.trim(),
+        // A placeholder dim: `probe_dim` never checks against it (it reads the true length off the
+        // response), so any non-zero value is fine.
+        dim: 1,
+        request_timeout_s: remote.request_timeout_s,
+        batch_size: remote.batch_size.max(1),
+        concurrency: 1,
+        max_batch_chars: remote.max_batch_chars,
+    });
+    embedder
+        .probe_dim()
+        .map_err(|err| anyhow::anyhow!("dim probe failed for `{}`: {err}", remote.model))
+}
+
+/// EVAL-ONLY (#346): the default concurrency ladder the `benchmark-embedding` CLI sweeps when
+/// `--candidates` is omitted — the SAME powers-of-two-plus-exact-cap list the auto-tuner uses, so a
+/// benchmark with no explicit list mirrors what a real reconcile would tune over. Exposed so the
+/// CLI need not duplicate the ladder logic.
+#[cfg(feature = "eval")]
+pub fn default_benchmark_candidates(cap: u32) -> Vec<u32> {
+    sweep_candidates(cap)
+}
+
+/// EVAL-ONLY (#346): the auto-tuner's default sweep budget (ms), so the `benchmark-embedding` CLI
+/// defaults `--budget-ms` to the same value a real reconcile tune would use.
+#[cfg(feature = "eval")]
+pub fn default_benchmark_budget_ms() -> u64 {
+    DEFAULT_TUNE_BUDGET_MS
+}
+
 /// Whether a client-concurrency sweep is worth running for THIS reconcile — only when the live run
 /// can actually fan out. Skip when:
 /// - `max_seconds` is set — a bounded `--max-seconds`/maintenance pass is NOT widened
@@ -234,29 +369,42 @@ fn effective_request_texts(
     by_count.min(by_chars as u32)
 }
 
-/// GENERIC sweep engine (backend-agnostic): measure texts/s at each `candidate` (built via `build`)
-/// against a representative workload, then pick the knee via [`select_knee`]. `build(concurrency,
-/// request_timeout_s)` gets a per-request HTTP timeout bounded by the tune budget so no single
-/// probe can hold the box past the budget.
-fn run_sweep<E: Embedder>(
+/// Inputs to the per-candidate MEASUREMENT loop ([`measure_candidates`]) — the workload shape and
+/// the per-candidate embedder builder, grouped so both the auto-tuner ([`run_sweep`]) and the
+/// eval-gated benchmark ([`benchmark_remote_concurrency`]) drive the SAME loop with one struct.
+struct MeasureParams<E: Embedder, F: Fn(u32, u64) -> E> {
     candidates: Vec<u32>,
-    cap: u32,
     per_text_chars: usize,
     request_texts: u32,
     request_timeout_s: u64,
     budget_ms: u64,
-    build: impl Fn(u32, u64) -> E,
-) -> SweepOutcome {
-    if budget_ms < MIN_TUNE_BUDGET_MS {
-        return SweepOutcome::NotRun;
-    }
+    build: F,
+}
+
+/// The per-candidate MEASUREMENT loop, extracted from [`run_sweep`] so the eval-gated
+/// [`benchmark_remote_concurrency`] can reuse it and emit EVERY measured row (no knee selection).
+/// Measures texts/s for each `candidate` (built via `build`) against a representative workload,
+/// returning one [`SweepResult`] per ATTEMPTED candidate. Candidates are ascending; the loop stops
+/// early on the overall budget deadline or the first over-allocation window (every higher candidate
+/// would over-allocate too), so a short/allocation-bounded run returns FEWER rows than candidates —
+/// which is exactly how [`run_sweep`] detects an incomplete (non-cacheable) sweep. This function
+/// owns NONE of the selection/caching/breaker/knee policy — it only measures.
+fn measure_candidates<E: Embedder>(
+    params: MeasureParams<E, impl Fn(u32, u64) -> E>,
+) -> Vec<SweepResult> {
+    let MeasureParams {
+        candidates,
+        per_text_chars,
+        request_texts,
+        request_timeout_s,
+        budget_ms,
+        build,
+    } = params;
     let per_candidate_ms = (budget_ms / candidates.len().max(1) as u64).max(1_000);
     // Bound each blocking probe by its budget slice: a short RAG_RAT_TUNE_MS with a long configured
     // request_timeout_s must not let one probe hold the paid box for the full HTTP timeout.
     let probe_timeout = probe_timeout_s(request_timeout_s, per_candidate_ms);
     let deadline = Instant::now() + std::time::Duration::from_millis(budget_ms);
-    let total_candidates = candidates.len();
-    let mut attempted = 0usize;
     let mut results: Vec<SweepResult> = Vec::new();
     for candidate in candidates {
         if deadline.saturating_duration_since(Instant::now()).as_millis() < 1_000 {
@@ -273,7 +421,6 @@ fn run_sweep<E: Embedder>(
         if window.saturating_mul(per_text_chars) > MAX_PROBE_WINDOW_BYTES {
             break;
         }
-        attempted += 1;
         let embedder = build(candidate, probe_timeout);
         let texts = probe_texts(window, per_text_chars);
         let candidate_deadline =
@@ -305,6 +452,39 @@ fn run_sweep<E: Embedder>(
             aborted: failures > u64::from(candidate) * 2,
         });
     }
+    results
+}
+
+/// GENERIC sweep engine (backend-agnostic): measure texts/s at each `candidate` (built via `build`)
+/// against a representative workload, then pick the knee via [`select_knee`]. `build(concurrency,
+/// request_timeout_s)` gets a per-request HTTP timeout bounded by the tune budget so no single
+/// probe can hold the box past the budget.
+fn run_sweep<E: Embedder>(
+    candidates: Vec<u32>,
+    cap: u32,
+    per_text_chars: usize,
+    request_texts: u32,
+    request_timeout_s: u64,
+    budget_ms: u64,
+    build: impl Fn(u32, u64) -> E,
+) -> SweepOutcome {
+    if budget_ms < MIN_TUNE_BUDGET_MS {
+        return SweepOutcome::NotRun;
+    }
+    let total_candidates = candidates.len();
+    let results = measure_candidates(MeasureParams {
+        candidates,
+        per_text_chars,
+        request_texts,
+        request_timeout_s,
+        budget_ms,
+        build,
+    });
+    // Every attempted candidate pushes exactly one result (nothing between `attempted += 1` and the
+    // push in the loop short-circuits), so the measured-row count IS the attempt count — the gate
+    // `select_knee`'s caller uses to decide `complete` (a budget-truncated / allocation-skipped
+    // sweep left fewer rows than candidates).
+    let attempted = results.len();
 
     let outcome = match select_knee(&results, cap) {
         // `complete` gates caching: a budget-truncated sweep (didn't attempt every candidate) is
@@ -781,6 +961,70 @@ mod tests {
             },
             other => panic!("expected a Knee, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn measure_candidates_returns_a_row_per_attempted_candidate_not_just_a_knee() {
+        // The benchmark path measures EVERY candidate (no knee selection). With a stub embedder
+        // that fails above concurrency 2, every candidate is still ATTEMPTED and returns a
+        // row — the high fan-outs simply come back `aborted` (breaker tripped), rather than
+        // being dropped the way `select_knee` drops them.
+        let results = measure_candidates(MeasureParams {
+            candidates: vec![1, 2, 4, 8],
+            per_text_chars: 16,
+            request_texts: 4,
+            request_timeout_s: 1,
+            budget_ms: MIN_TUNE_BUDGET_MS,
+            build: |concurrency, _timeout| FakeEmbedder { concurrency, fail_above: 2 },
+        });
+        // One row per candidate, in ascending order — the whole table, not a single winner.
+        assert_eq!(results.iter().map(|r| r.candidate).collect::<Vec<_>>(), vec![1, 2, 4, 8]);
+        // Low fan-outs served; high ones tripped the breaker (aborted) but are STILL reported.
+        assert!(results[0].requests > 0 && !results[0].aborted, "c=1 served");
+        assert!(results[3].aborted, "c=8 (> fail_above 2) breaker-tripped, but row is present");
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn benchmark_maps_sweep_rows_to_measured_candidates_one_to_one() {
+        // `benchmark_remote_concurrency` builds real OpenAiEmbedders against an UNREACHABLE
+        // endpoint, so every probe fails fast (connection refused) — but the mapping
+        // contract still holds: one `MeasuredCandidate` per requested candidate, in order,
+        // each carrying the per-candidate counters (here: all failures, no successes). We
+        // assert the SHAPE (per-candidate rows), not throughput.
+        let remote = tune_remote(4);
+        let spec =
+            crate::embedding_models::spec(crate::embedding_models::FASTEMBED_MODEL_ID).unwrap();
+        let candidates = [1u32, 2, 4];
+        let measured = benchmark_remote_concurrency(
+            "http://127.0.0.1:1",
+            None,
+            &remote,
+            spec.model_id,
+            spec.dim,
+            4_000,
+            &candidates,
+            MIN_TUNE_BUDGET_MS,
+        );
+        assert_eq!(
+            measured.iter().map(|m| m.concurrency).collect::<Vec<_>>(),
+            candidates.to_vec(),
+            "every requested candidate maps to exactly one measured row, in order"
+        );
+        for m in &measured {
+            // Unreachable endpoint → no successful request; the row still reports its counters.
+            assert_eq!(m.requests, 0, "no successful request against a closed port");
+            assert!(m.failures > 0, "the closed port produced probe failures");
+        }
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn default_benchmark_candidates_matches_the_sweep_ladder() {
+        // The no-`--candidates` default is the SAME ladder the auto-tuner sweeps.
+        assert_eq!(default_benchmark_candidates(32), sweep_candidates(32));
+        assert_eq!(default_benchmark_candidates(24), vec![1, 2, 4, 8, 16, 24]);
     }
 
     fn tune_remote(cap: u32) -> RemoteEmbeddingConfig {
