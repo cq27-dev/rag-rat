@@ -544,14 +544,13 @@ pub(crate) fn reconcile_with_options_progress(
     // SkipEphemeral and NoEphemeralWork are the ONLY paths that return BEFORE the policy scan, and
     // both embed nothing:
     //  - SkipEphemeral: an ephemeral active model on a watcher/maintenance pass
-    //    (`provision_remote=false`) with NO local `query_endpoint` server — defer incremental
-    //    embedding to an explicit reconcile. (WITH a `query_endpoint`, that pass takes the light
-    //    local-embed path → `Ready`, not here.) Returning here avoids paying the O(repo)
-    //    `embedding_policy_skip_summary` just to report a deferral.
-    //  - NoEphemeralWork: nothing pending — either an explicit provisioning reconcile on an
-    //    already-current ephemeral model (never cold-start a paid box for zero work, #330-6) or an
-    //    idle light pass. `acquire_chunk_embedder` confirmed ZERO candidates, so the policy scan
-    //    would likewise be wasted work.
+    //    (`provision_remote=false`) whose local `query_endpoint` is absent or UNREACHABLE — defer
+    //    incremental embedding to an explicit reconcile. (WITH a REACHABLE `query_endpoint`, that
+    //    pass takes the light local-embed path → `Ready`, not here.) Returning here avoids paying
+    //    the O(repo) `embedding_policy_skip_summary` just to report a deferral.
+    //  - NoEphemeralWork: an explicit provisioning reconcile on an already-current ephemeral model
+    //    (never cold-start a paid box for zero work, #330-6). `acquire_chunk_embedder` confirmed
+    //    ZERO candidates, so the policy scan would likewise be wasted work.
     // Both carry an empty `skipped_by_policy` (no policy counts on these early-return paths). The
     // NotReady path below DOES report policy skips
     // (`blocked_fastembed_reconcile_still_reports_policy_skips` pins that), so it runs the scan
@@ -563,8 +562,8 @@ pub(crate) fn reconcile_with_options_progress(
                     "Blocked",
                     Some(
                         "ephemeral remote embedding needs an explicit `rag-rat reconcile`, or a \
-                         local `[remote] query_endpoint` server to embed incremental edits \
-                         against (the watcher does not provision a GPU box)"
+                         REACHABLE local `[remote] query_endpoint` server to embed incremental \
+                         edits against (the watcher does not provision a GPU box)"
                             .to_string(),
                     ),
                 ),
@@ -2347,26 +2346,43 @@ mod freshness_version_tests {
     }
 
     #[test]
-    fn light_pass_with_query_endpoint_embeds_locally_without_provisioning() {
-        // Ephemeral watcher pass, `query_endpoint` set, pending work → Ready with NO provisioned
-        // box: the light path builds the LOCAL query-endpoint embedder, so incremental edits embed
-        // into the SAME vector space as the cookbook-provisioned chunks — no paid cold-start.
+    fn light_pass_with_reachable_query_endpoint_embeds_locally_single_flight() {
+        // Ephemeral watcher pass, `query_endpoint` REACHABLE → Ready with NO provisioned box: the
+        // light path builds the LOCAL query-endpoint embedder (same vector space as the cookbook
+        // box, no cold-start) and clamps it to SINGLE-FLIGHT concurrency so a background edit can't
+        // overload the local server.
         let conn = schema_conn();
-        activate_ephemeral(&conn);
+        let (endpoint, _stub) = spawn_embed_stub(fastembed_dim());
+        activate_ephemeral_with_query_endpoint(&conn, Some(&endpoint));
         seed_embedding_chunk(&conn, 1);
-        assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::Ready {
-            provisioned: None,
-            ..
-        }));
+        match ephemeral_light_acquire(&conn) {
+            ChunkEmbedder::Ready { provisioned: None, remote: Some(r), .. } => {
+                assert_eq!(r.concurrency, 1, "light path must be single-flight");
+                assert_eq!(
+                    r.endpoint.as_deref(),
+                    Some(endpoint.as_str()),
+                    "embeds against the query_endpoint"
+                );
+            },
+            _ => panic!("expected a local Ready with provisioned=None"),
+        }
     }
 
     #[test]
-    fn light_pass_with_query_endpoint_but_no_work_is_no_ephemeral_work() {
-        // Ephemeral watcher pass, `query_endpoint` set, nothing pending → NoEphemeralWork: an idle
-        // pass stays cheap (no O(repo) policy summary, no cold-start).
+    fn light_pass_with_unreachable_query_endpoint_defers() {
+        // Ephemeral watcher pass, `query_endpoint` set but NOT reachable (a closed port) → defer
+        // (SkipEphemeral), NOT embed-and-fail into `Failed` chunk_embeddings — and without paying
+        // an O(repo) candidate scan first.
         let conn = schema_conn();
-        activate_ephemeral(&conn);
-        assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::NoEphemeralWork));
+        let closed = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener); // the port now refuses connections
+            format!("http://127.0.0.1:{port}")
+        };
+        activate_ephemeral_with_query_endpoint(&conn, Some(&closed));
+        seed_embedding_chunk(&conn, 1);
+        assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::SkipEphemeral));
     }
 
     #[test]

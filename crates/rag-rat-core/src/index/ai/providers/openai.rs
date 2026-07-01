@@ -11,6 +11,7 @@
 //! missing-feature message. The cloneable `ureq::Agent` is held bare (no `Mutex`) and cloned into
 //! bounded blocking worker threads for remote request fan-out.
 
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -424,6 +425,51 @@ fn endpoint_is_loopback(endpoint: &str) -> bool {
         || host.starts_with("127.")
 }
 
+/// Best-effort reachability probe for a query/connect endpoint: resolve the URL's `host:port` and
+/// attempt a short TCP connect. GATES the ephemeral light-embed path — an unreachable local query
+/// server must DEFER (never embed-and-fail into `Failed` chunk_embeddings), and the fast refusal
+/// keeps a watcher/maintenance pass cheap when no local server is running (it returns before any
+/// O(repo) scan). A refused connection returns at once; only an unroutable host waits out the ~1s
+/// timeout. An endpoint we can't parse a `host:port` from is treated as unreachable.
+pub(crate) fn endpoint_reachable(endpoint: &str) -> bool {
+    let Some(host_port) = endpoint_host_port(endpoint) else {
+        return false;
+    };
+    host_port
+        .to_socket_addrs()
+        .map(|addrs| {
+            addrs.into_iter().any(|addr| {
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Extract `host:port` from an endpoint URL for a socket connect, defaulting the port by scheme
+/// (`https` → 443, else 80) when the authority omits it. Mirrors the host parse in
+/// `endpoint_is_loopback` but keeps the port.
+fn endpoint_host_port(endpoint: &str) -> Option<String> {
+    let (scheme, after_scheme) =
+        endpoint.split_once("://").map_or(("http", endpoint), |(s, rest)| (s, rest));
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority).trim();
+    if host_port.is_empty() {
+        return None;
+    }
+    let has_port = match host_port.strip_prefix('[') {
+        // Bracketed IPv6 (`[::1]:8000`) has a port iff `]` is followed by `:`.
+        Some(rest) => rest.split_once(']').is_some_and(|(_, tail)| tail.starts_with(':')),
+        // Bare host / IPv4: exactly one `:` separates host and port.
+        None => host_port.matches(':').count() == 1,
+    };
+    if has_port {
+        Some(host_port.to_string())
+    } else {
+        let port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
+        Some(format!("{host_port}:{port}"))
+    }
+}
+
 impl Embedder for OpenAiEmbedder {
     fn model_id(&self) -> &str {
         // The SELECTED model's registry id (e.g. `fastembed-all-minilm-l6-v2`), NOT the server-side
@@ -494,6 +540,49 @@ mod tests {
     const DIM: usize = 384;
     // The SELECTED model's registry id — what `model_id()` must return regardless of the runtime.
     const SELECTED_ID: &str = crate::embedding_models::FASTEMBED_MODEL_ID;
+
+    #[test]
+    fn endpoint_host_port_keeps_explicit_ports_and_defaults_by_scheme() {
+        // Explicit port preserved.
+        assert_eq!(endpoint_host_port("http://localhost:7997").as_deref(), Some("localhost:7997"));
+        assert_eq!(
+            endpoint_host_port("http://127.0.0.1:11434").as_deref(),
+            Some("127.0.0.1:11434")
+        );
+        // Bracketed IPv6 with a port.
+        assert_eq!(endpoint_host_port("http://[::1]:8000").as_deref(), Some("[::1]:8000"));
+        // No port → default by scheme.
+        assert_eq!(endpoint_host_port("http://example.com").as_deref(), Some("example.com:80"));
+        assert_eq!(endpoint_host_port("https://example.com").as_deref(), Some("example.com:443"));
+        // Userinfo stripped; trailing path ignored.
+        assert_eq!(
+            endpoint_host_port("http://user:pass@host:9000/v1").as_deref(),
+            Some("host:9000")
+        );
+    }
+
+    #[test]
+    fn endpoint_reachable_is_false_for_a_closed_port() {
+        // Bind then drop → the port refuses connections; the probe must return false FAST (a
+        // refusal returns immediately, it does not wait out the timeout).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(!endpoint_reachable(&format!("http://127.0.0.1:{port}")));
+        assert!(!endpoint_reachable("not a url"));
+    }
+
+    #[test]
+    fn endpoint_reachable_is_true_for_a_live_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            // Accept one connection (the probe) so the listener stays bound for the check.
+            let _ = listener.accept();
+        });
+        assert!(endpoint_reachable(&format!("http://127.0.0.1:{port}")));
+        let _ = handle.join();
+    }
 
     /// Construct the embedder for the selected model over the given remote config + dim. Thin
     /// wrapper so the many tests don't repeat the `selected_model_id` arg.
