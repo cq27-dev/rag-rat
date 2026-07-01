@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.10.0...rag-rat-core-v0.11.0) - 2026-07-01
+
+### Added
+
+- *(embed)* content-address the vector cache so embeddings survive reindex ([#357](https://github.com/cq27-dev/rag-rat/pull/357)) ([#358](https://github.com/cq27-dev/rag-rat/pull/358))
+- *(embed)* benchmark-embedding CLI behind the eval feature (Phase 3) ([#354](https://github.com/cq27-dev/rag-rat/pull/354))
+- *(embed)* embed light/incremental reconciles against the local query_endpoint ([#356](https://github.com/cq27-dev/rag-rat/pull/356))
+- *(embed)* model context-awareness — warn short-context models truncate long code, steer to a long-context model ([#351](https://github.com/cq27-dev/rag-rat/pull/351))
+- *(cookbook)* infinity + vLLM ephemeral recipes over OpenAI /v1/embeddings (Phase 2) ([#349](https://github.com/cq27-dev/rag-rat/pull/349))
+- *(embed)* centralize remote embedding on OpenAI /v1/embeddings + backend selector (Phase 1) ([#348](https://github.com/cq27-dev/rag-rat/pull/348))
+- *(embed)* auto-tune ephemeral remote embedding concurrency ([#342](https://github.com/cq27-dev/rag-rat/pull/342))
+- *(init)* add extensible ratatui wizard ([#337](https://github.com/cq27-dev/rag-rat/pull/337))
+- *(embed)* user-selectable GPU for ephemeral cookbook provisioning ([llm.embedding.remote] gpu) ([#335](https://github.com/cq27-dev/rag-rat/pull/335))
+- *(embed)* remote Ollama embedding — connect + ephemeral cookbook, hardened (#317/#318) ([#330](https://github.com/cq27-dev/rag-rat/pull/330))
+- *(embed)* wire Ollama end-to-end — connect mode (#317 task 5+6) ([#326](https://github.com/cq27-dev/rag-rat/pull/326))
+- *(embed)* OllamaEmbedder backend (#317 task 4) ([#325](https://github.com/cq27-dev/rag-rat/pull/325))
+- *(embed)* [embedding.remote] config block (#317 task 3) ([#324](https://github.com/cq27-dev/rag-rat/pull/324))
+- *(embed)* register the ollama backend — Backend::Ollama + registry row ([#317](https://github.com/cq27-dev/rag-rat/pull/317)) ([#322](https://github.com/cq27-dev/rag-rat/pull/322))
+
+### Fixed
+
+- *(ollama)* handle local embedding limits ([#340](https://github.com/cq27-dev/rag-rat/pull/340))
+- *(watch)* honor .gitignore in watch placement — stop exhausting inotify watches ([#331](https://github.com/cq27-dev/rag-rat/pull/331)) ([#332](https://github.com/cq27-dev/rag-rat/pull/332))
+- *(embed)* restore the public index::ai::MODEL2VEC_HF_REPO path (#320 review) ([#323](https://github.com/cq27-dev/rag-rat/pull/323))
+
+### Other
+
+- *(readme)* reframe as an agent-workflow conversion path ([#359](https://github.com/cq27-dev/rag-rat/pull/359))
+- *(embed)* unlock GPU-backend throughput — sweep visibility, higher cap, backend-aware provision timeout ([#350](https://github.com/cq27-dev/rag-rat/pull/350))
+- *(embed)* parallelize remote ollama reconcile ([#341](https://github.com/cq27-dev/rag-rat/pull/341))
+- *(embed)* extract index/ai/providers/ — single resolution chokepoint ([#317](https://github.com/cq27-dev/rag-rat/pull/317)) ([#320](https://github.com/cq27-dev/rag-rat/pull/320))
+
 ## [0.10.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.9.0...rag-rat-core-v0.10.0) - 2026-06-25
 
 ### Added
