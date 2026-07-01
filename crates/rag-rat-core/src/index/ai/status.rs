@@ -38,7 +38,7 @@ pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyh
 
 /// Install (activate) the SELECTED model served over Ollama (#317 rework). Unlike the local
 /// backends there is NO download: the "install" is a reachability + dim-parity PROBE. We construct
-/// the real [`OllamaEmbedder`] for the selected model and embed a single `"ping"` — that one call
+/// the real [`OpenAiEmbedder`] for the selected model and embed a single `"ping"` — that one call
 /// validates the endpoint is reachable, auth resolves, AND the server's vector width matches the
 /// selected model's dim (the embedder's per-batch dim contract), reusing the exact connection the
 /// reconcile loop will use. A probe failure REFUSES the install loudly (the row is left
@@ -60,7 +60,7 @@ pub(crate) fn install_ollama_model(
     // `provision_and_build`), pings it, then tears it down (the `_box` guard's Drop at the end of
     // this fn) — exactly the connection the reconcile will later provision.
     let (embedder, _box, effective_remote): (
-        OllamaEmbedder,
+        OpenAiEmbedder,
         Option<ProvisionedBox>,
         RemoteEmbeddingConfig,
     ) = if remote.is_ephemeral() {
@@ -73,7 +73,7 @@ pub(crate) fn install_ollama_model(
             })?;
         (embedder, Some(provisioned), tuned_remote)
     } else {
-        let embedder = OllamaEmbedder::from_remote_config(remote, spec.model_id, spec.dim)
+        let embedder = OpenAiEmbedder::from_remote_config(remote, spec.model_id, spec.dim)
             .map_err(|err| {
                 anyhow::anyhow!("failed to construct ollama embedder for `{model_id}`: {err}")
             })?;
@@ -277,8 +277,9 @@ mod ollama_install_tests {
     use super::*;
     use crate::embedding_models::FASTEMBED_MODEL_ID;
 
-    /// One-shot HTTP/1.1 stub on an ephemeral port that replies to the probe's single `/api/embed`
-    /// POST with `{"embeddings":[[<dim floats>]]}`. Returns the base URL + the server join handle.
+    /// One-shot HTTP/1.1 stub on an ephemeral port that replies to the probe's single
+    /// `/v1/embeddings` POST with `{"data":[{"embedding":[<dim floats>],"index":0}]}`. Returns the
+    /// base URL + the server join handle.
     fn spawn_embed_stub(dim: usize) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -287,7 +288,7 @@ mod ollama_install_tests {
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf);
                 let nums = vec!["0.1"; dim].join(",");
-                let body = format!("{{\"embeddings\":[[{nums}]]}}");
+                let body = format!("{{\"data\":[{{\"embedding\":[{nums}],\"index\":0}}]}}");
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
                      {}\r\nConnection: close\r\n\r\n{body}",

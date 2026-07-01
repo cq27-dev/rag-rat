@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::Embedder;
-use super::ollama::{OllamaEmbedder, ProvisionedEmbedderParams};
+use super::openai::{OpenAiEmbedder, ProvisionedEmbedderParams};
 use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::EmbeddingModelSpec;
 
@@ -133,7 +133,7 @@ pub struct CookbookInput {
     /// The Ollama server-side model name the box should serve (the `[remote] model`).
     pub model: String,
     /// Per-REQUEST HTTP timeout the cookbook may forward to its box config — the
-    /// `OllamaEmbedder`'s per-`/api/embed` budget. UNRELATED to provisioning; do NOT use it as
+    /// `OpenAiEmbedder`'s per-`/api/embed` budget. UNRELATED to provisioning; do NOT use it as
     /// the boot budget.
     pub request_timeout_s: u64,
     /// The cookbook's PROVISIONING budget (seconds): how long the recipe may spend booting the
@@ -513,8 +513,8 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
 }
 
 /// Provision an ephemeral cookbook box for the selected `spec` over `remote` and build an
-/// [`OllamaEmbedder`] against it. The single place that wires `cookbook` → `CookbookInput` →
-/// `CookbookProvisioner::provision` → `OllamaEmbedder::from_provisioned`; shared by the reconcile
+/// [`OpenAiEmbedder`] against it. The single place that wires `cookbook` → `CookbookInput` →
+/// `CookbookProvisioner::provision` → `OpenAiEmbedder::from_provisioned`; shared by the reconcile
 /// ephemeral chunk path AND the install probe (status.rs) so the model→input→handshake→embedder
 /// chain isn't duplicated. The returned [`ProvisionedBox`] MUST be kept alive for as long as the
 /// embedder is used (its `Drop` is the box teardown).
@@ -540,7 +540,7 @@ pub(crate) fn provision_and_build(
     remote: &RemoteEmbeddingConfig,
     spec: &EmbeddingModelSpec,
     tune: Option<TuneRequest<'_>>,
-) -> anyhow::Result<(OllamaEmbedder, ProvisionedBox, RemoteEmbeddingConfig, u32)> {
+) -> anyhow::Result<(OpenAiEmbedder, ProvisionedBox, RemoteEmbeddingConfig, u32)> {
     provision_and_build_cancellable(remote, spec, || false, tune)
 }
 
@@ -549,7 +549,7 @@ fn provision_and_build_cancellable(
     spec: &EmbeddingModelSpec,
     cancel: impl Fn() -> bool,
     tune: Option<TuneRequest<'_>>,
-) -> anyhow::Result<(OllamaEmbedder, ProvisionedBox, RemoteEmbeddingConfig, u32)> {
+) -> anyhow::Result<(OpenAiEmbedder, ProvisionedBox, RemoteEmbeddingConfig, u32)> {
     let cookbook = remote
         .cookbook
         .as_deref()
@@ -575,7 +575,7 @@ fn provision_and_build_cancellable(
         ),
         None => cap,
     };
-    let embedder = OllamaEmbedder::from_provisioned(ProvisionedEmbedderParams {
+    let embedder = OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
         endpoint: &provisioned.endpoint,
         auth_token: provisioned.auth_token.as_deref(),
         server_model: effective_remote.model.trim(),
@@ -585,7 +585,6 @@ fn provision_and_build_cancellable(
         batch_size: effective_remote.batch_size,
         concurrency: client_concurrency,
         max_batch_chars: effective_remote.max_batch_chars,
-        num_ctx: effective_remote.num_ctx,
     });
     Ok((embedder, provisioned, effective_remote, client_concurrency))
 }
@@ -615,7 +614,7 @@ pub fn verify_ephemeral_remote_cancellable(
     spec: &EmbeddingModelSpec,
     cancel: impl Fn() -> bool,
 ) -> anyhow::Result<()> {
-    // `_box` is bound (not `_`) so it lives to end of scope — `OllamaEmbedder` holds only the
+    // `_box` is bound (not `_`) so it lives to end of scope — `OpenAiEmbedder` holds only the
     // endpoint URL, not the process, so dropping the box early would tear down the server before
     // the ping. Drop at function exit is the teardown (SIGTERM → grace → SIGKILL on the group).
     let (embedder, _box, _effective_remote, _knee) =

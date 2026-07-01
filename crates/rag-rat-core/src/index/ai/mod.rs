@@ -32,7 +32,7 @@ pub(crate) use providers::{
 // warnings`.
 pub use providers::{
     CookbookInput, CookbookProvisioner, Embedder, FASTEMBED_MISSING_FEATURE_MESSAGE, HashEmbedder,
-    MODEL2VEC_HF_REPO, MODEL2VEC_MISSING_FEATURE_MESSAGE, OllamaEmbedder, ProvisionedBox,
+    MODEL2VEC_HF_REPO, MODEL2VEC_MISSING_FEATURE_MESSAGE, OpenAiEmbedder, ProvisionedBox,
     abort_active_provisioning, install_provision_log_sink, verify_ephemeral_remote,
     verify_ephemeral_remote_cancellable,
 };

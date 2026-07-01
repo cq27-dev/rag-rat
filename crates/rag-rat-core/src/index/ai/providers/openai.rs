@@ -1,7 +1,10 @@
-//! The Ollama HTTP embedding backend: the ONLY code that connects to an Ollama server. All HTTP to
-//! `/api/embed` lives in [`OllamaEmbedder::embed_batch`]; everything else (install-time
-//! reachability probes, the dispatch in `providers/mod.rs`) reaches Ollama by constructing and
-//! calling one of these. One connection implementation, one place to audit/secure/retry.
+//! The OpenAI-compatible HTTP embedding backend: the ONLY code that connects to a remote embedding
+//! server. All HTTP to `/v1/embeddings` lives in [`OpenAiEmbedder::embed_batch`]; everything else
+//! (install-time reachability probes, the dispatch in `providers/mod.rs`) reaches the server by
+//! constructing and calling one of these. ONE client for every OpenAI-speaking backend — ollama
+//! (its `/v1/embeddings` compatibility route), michaelfeil/infinity, and vLLM — so there is one
+//! place to audit/secure/retry. The `[remote] backend` selector routes provisioning + the
+//! freshness/tune markers, NOT the wire call (identical across backends).
 //!
 //! Native, blocking HTTP via `ureq` (v3, rustls) — already a non-optional workspace dep (the
 //! crates.io version check uses it), so this backend ships unconditionally: no cargo feature, no
@@ -15,35 +18,52 @@ use serde::{Deserialize, Serialize};
 use super::Embedder;
 use crate::config::RemoteEmbeddingConfig;
 
-/// Request body for Ollama's `/api/embed`. `input` is an array — the batch endpoint embeds every
-/// text in one request.
+/// Request body for the OpenAI-compatible `POST /v1/embeddings`. `input` is an array — the batch
+/// endpoint embeds every text in one request. `encoding_format: "float"` is the OpenAI default,
+/// sent explicitly so a server that might otherwise emit base64 stays on plain `f32` arrays. NOTE:
+/// the OpenAI schema has no `options`/`num_ctx` — context length is a model-load setting on the
+/// server (a Modelfile for ollama), not a per-request field (see `RemoteEmbeddingConfig::num_ctx`).
 #[derive(Serialize)]
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [String],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    options: Option<EmbedOptions>,
+    encoding_format: &'static str,
 }
 
-/// Ollama runtime options for `/api/embed`.
-#[derive(Clone, Copy, Serialize)]
-struct EmbedOptions {
-    num_ctx: u32,
+/// One item of the `/v1/embeddings` response `data` array. `index` is the position of this
+/// embedding's input WITHIN the request (0-based); a server may return items out of order, so we
+/// reorder by it and require the indices to cover exactly `0..len` (see `embed_one_request_with`).
+#[derive(Deserialize)]
+struct EmbedData {
+    embedding: Vec<f32>,
+    index: usize,
 }
 
-/// Response body from Ollama's `/api/embed`: one vector per input, in order.
+/// Success response body from `POST /v1/embeddings`: `{ "data": [ { embedding, index }, ... ] }`.
 #[derive(Deserialize)]
 struct EmbedResponse {
-    embeddings: Vec<Vec<f32>>,
+    data: Vec<EmbedData>,
 }
 
-/// A native HTTP embedder that offloads embedding work to an Ollama server's `/api/embed`. The dim
-/// is the SELECTED model's registry dim (the parity contract); every response vector is checked
-/// against it on each batch.
+/// Error body most OpenAI-compatible servers return on 4xx/5xx (`{ "error": { "message" } }`),
+/// parsed on non-2xx for a clearer message than the raw excerpt.
+#[derive(Deserialize)]
+struct ErrorResponse {
+    error: ErrorDetail,
+}
+
+#[derive(Deserialize)]
+struct ErrorDetail {
+    message: String,
+}
+
+/// A native HTTP embedder that offloads embedding work to an OpenAI-compatible `/v1/embeddings`
+/// server (ollama/infinity/vLLM). The dim is the SELECTED model's registry dim (the parity
+/// contract); every response vector is checked against it on each batch.
 #[derive(Debug)]
-pub struct OllamaEmbedder {
+pub struct OpenAiEmbedder {
     agent: ureq::Agent,
-    /// `<endpoint>/api/embed`, precomputed once at construction.
+    /// `<endpoint>/v1/embeddings`, precomputed once at construction.
     embed_url: String,
     /// The SELECTED model's persisted registry id (e.g. `fastembed-all-minilm-l6-v2`).
     /// `model_id()` returns THIS — chunk_embeddings key by the selected model regardless of
@@ -61,16 +81,13 @@ pub struct OllamaEmbedder {
     batch_size: usize,
     /// Max concurrent `/api/embed` requests in one `embed_batch` call.
     concurrency: usize,
-    /// Max total input characters per `/api/embed` request.
+    /// Max total input characters per `/v1/embeddings` request.
     max_batch_chars: usize,
-    /// Optional Ollama context window (`options.num_ctx`) to avoid context-length 400s without
-    /// shrinking rag-rat's chunk size.
-    num_ctx: Option<u32>,
     /// `Some("Bearer <token>")` when the server needs auth, read from `auth_env` at construction.
     auth_header: Option<String>,
 }
 
-/// Construction params for [`OllamaEmbedder::from_provisioned`] — groups the handshake outputs
+/// Construction params for [`OpenAiEmbedder::from_provisioned`] — groups the handshake outputs
 /// (`endpoint`, `auth_token`) with the model identity + transport knobs so the constructor takes
 /// one struct instead of positional args.
 pub struct ProvisionedEmbedderParams<'a> {
@@ -90,10 +107,8 @@ pub struct ProvisionedEmbedderParams<'a> {
     pub batch_size: u32,
     /// Max concurrent `/api/embed` requests.
     pub concurrency: u32,
-    /// Max total input characters per `/api/embed` request.
+    /// Max total input characters per `/v1/embeddings` request.
     pub max_batch_chars: usize,
-    /// Optional Ollama context window (`options.num_ctx`) for `/api/embed`.
-    pub num_ctx: Option<u32>,
 }
 
 struct BuildParams<'a> {
@@ -106,10 +121,9 @@ struct BuildParams<'a> {
     batch_size: u32,
     concurrency: u32,
     max_batch_chars: usize,
-    num_ctx: Option<u32>,
 }
 
-impl OllamaEmbedder {
+impl OpenAiEmbedder {
     /// Build the embedder for the SELECTED model served over Ollama. `selected_model_id` + `dim`
     /// come from the model the user picked (`model = "sentence-transformers/all-MiniLM-L6-v2"`,
     /// 384): `model_id()` returns that id so chunk_embeddings key by the model regardless of
@@ -146,7 +160,6 @@ impl OllamaEmbedder {
             batch_size: cfg.batch_size,
             concurrency: cfg.concurrency,
             max_batch_chars: cfg.max_batch_chars,
-            num_ctx: cfg.num_ctx,
         }))
     }
 
@@ -172,7 +185,6 @@ impl OllamaEmbedder {
             batch_size: params.batch_size,
             concurrency: params.concurrency,
             max_batch_chars: params.max_batch_chars,
-            num_ctx: params.num_ctx,
         })
     }
 
@@ -189,13 +201,12 @@ impl OllamaEmbedder {
             batch_size,
             concurrency,
             max_batch_chars,
-            num_ctx,
         } = params;
-        let embed_url = format!("{}/api/embed", endpoint.trim_end_matches('/'));
+        let embed_url = format!("{}/v1/embeddings", endpoint.trim_end_matches('/'));
         let mut builder = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(request_timeout_s)))
             .http_status_as_error(false)
-            .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (ollama-embed)"));
+            .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (openai-embed)"));
         // ureq's default config inherits `HTTP_PROXY`/`HTTPS_PROXY` from the env. A local Ollama
         // (`http://127.0.0.1:11434`) routed through a corporate proxy 403s, so disable the proxy for
         // loopback endpoints only — a non-loopback (truly remote) endpoint may legitimately need
@@ -215,7 +226,6 @@ impl OllamaEmbedder {
             batch_size: (batch_size as usize).max(1),
             concurrency: RemoteEmbeddingConfig::bounded_concurrency_value(concurrency) as usize,
             max_batch_chars: max_batch_chars.max(1),
-            num_ctx,
             auth_header,
         }
     }
@@ -246,57 +256,78 @@ impl OllamaEmbedder {
         embed_url: &str,
         server_model: &str,
         dim: usize,
-        num_ctx: Option<u32>,
         auth_header: Option<&str>,
         texts: &[String],
     ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let payload = EmbedRequest {
-            model: server_model,
-            input: texts,
-            options: num_ctx.map(|num_ctx| EmbedOptions { num_ctx }),
-        };
+        let payload = EmbedRequest { model: server_model, input: texts, encoding_format: "float" };
         // The `json` ureq feature is not enabled (workspace ureq is rustls-only), so serialize the
         // body ourselves and send it with an explicit content-type.
         let body = serde_json::to_vec(&payload)
-            .map_err(|e| anyhow::anyhow!("failed to serialize ollama embed request: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to serialize embed request: {e}"))?;
 
         let mut request = agent.post(embed_url).content_type("application/json");
         if let Some(header) = auth_header {
             request = request.header("Authorization", header);
         }
 
-        // `http_status_as_error(false)` lets us read Ollama's JSON error body on 4xx/5xx instead
-        // of losing the actionable reason behind ureq's bare `http status: N` error.
+        // `http_status_as_error(false)` lets us read the server's JSON error body on 4xx/5xx
+        // instead of losing the actionable reason behind ureq's bare `http status: N`
+        // error.
         let mut response = request
             .send(body)
-            .map_err(|e| anyhow::anyhow!("ollama embed request to `{embed_url}` failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("embed request to `{embed_url}` failed: {e}"))?;
         let status = response.status();
         let raw = response
             .body_mut()
             .read_to_string()
-            .map_err(|e| anyhow::anyhow!("reading ollama embed response failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("reading embed response failed: {e}"))?;
         if !status.is_success() {
+            // OpenAI-compatible servers usually return `{"error":{"message":...}}`; surface that
+            // clean message when present, else a bounded raw excerpt.
+            let detail = serde_json::from_str::<ErrorResponse>(&raw)
+                .map(|e| e.error.message)
+                .unwrap_or_else(|_| response_excerpt(&raw));
             anyhow::bail!(
-                "ollama embed request to `{}` failed: http status {}: {}",
+                "embed request to `{}` failed: http status {}: {}",
                 embed_url,
                 status.as_u16(),
-                response_excerpt(&raw)
+                detail
             );
         }
 
         let parsed: EmbedResponse = serde_json::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("malformed ollama embed response: {e}"))?;
-        let embeddings = parsed.embeddings;
+            .map_err(|e| anyhow::anyhow!("malformed embed response: {e}"))?;
 
-        // Count contract: one vector per input, retryable on violation (a transient server fault
+        // Count contract: one embedding per input, retryable on violation (a transient server fault
         // can drop rows).
-        if embeddings.len() != texts.len() {
+        let n = texts.len();
+        if parsed.data.len() != n {
             anyhow::bail!(
-                "ollama embed count mismatch: requested {} texts but server returned {} vectors",
-                texts.len(),
-                embeddings.len()
+                "embed count mismatch: requested {n} texts but server returned {} embeddings",
+                parsed.data.len()
             );
         }
+
+        // The OpenAI `data[]` carries a per-request `index`; a server MAY return items out of
+        // order. Place each embedding at its `index` and require the indices to cover
+        // EXACTLY `0..n` with no duplicate or out-of-range — sorting alone would silently
+        // accept a dup/gap and misalign vectors with their chunks.
+        let mut ordered: Vec<Option<Vec<f32>>> = std::iter::repeat_with(|| None).take(n).collect();
+        for item in parsed.data {
+            let idx = item.index;
+            if idx >= n {
+                anyhow::bail!("embed response index {idx} out of range for {n} inputs");
+            }
+            if ordered[idx].is_some() {
+                anyhow::bail!("embed response has a duplicate index {idx}");
+            }
+            ordered[idx] = Some(item.embedding);
+        }
+        let embeddings = ordered
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| v.ok_or_else(|| anyhow::anyhow!("embed response is missing index {i}")))
+            .collect::<anyhow::Result<Vec<Vec<f32>>>>()?;
 
         // Dim contract (LOUD): the int8 encoding, per-family centroids, and the linked-entries rail
         // all assume a fixed dim. A server returning a different-width vector means the configured
@@ -307,9 +338,9 @@ impl OllamaEmbedder {
         for (i, vector) in embeddings.iter().enumerate() {
             if vector.len() != dim {
                 anyhow::bail!(
-                    "ollama embed dim mismatch: server returned a {}-dim vector at index {} but \
-                     this model is configured for {} dims (server model `{}`). The selected \
-                     registry model and the Ollama server model must match.",
+                    "embed dim mismatch: server returned a {}-dim vector at index {} but this \
+                     model is configured for {} dims (server model `{}`). The selected registry \
+                     model and the server model must match.",
                     vector.len(),
                     i,
                     dim,
@@ -321,7 +352,7 @@ impl OllamaEmbedder {
         Ok(embeddings)
     }
 
-    /// Send ONE `/api/embed` request for `texts` (already sized to `<= self.batch_size` by the
+    /// Send ONE `/v1/embeddings` request for `texts` (already sized to `<= self.batch_size` by the
     /// caller) and return the parsed vectors, enforcing the count + per-vector dim contracts.
     /// Factored out of `embed_batch` so the sub-batch loop reuses the exact request/validation
     /// logic.
@@ -331,7 +362,6 @@ impl OllamaEmbedder {
             &self.embed_url,
             &self.server_model,
             self.dim,
-            self.num_ctx,
             self.auth_header.as_deref(),
             texts,
         )
@@ -387,7 +417,7 @@ fn endpoint_is_loopback(endpoint: &str) -> bool {
         || host.starts_with("127.")
 }
 
-impl Embedder for OllamaEmbedder {
+impl Embedder for OpenAiEmbedder {
     fn model_id(&self) -> &str {
         // The SELECTED model's registry id (e.g. `fastembed-all-minilm-l6-v2`), NOT the server-side
         // Ollama model name (`self.server_model`): chunk_embeddings key by the selected model, so
@@ -422,7 +452,6 @@ impl Embedder for OllamaEmbedder {
                     let server_model = self.server_model.clone();
                     let auth_header = self.auth_header.clone();
                     let dim = self.dim;
-                    let num_ctx = self.num_ctx;
                     let sub_batch = &texts[start..end];
                     handles.push(scope.spawn(move || {
                         Self::embed_one_request_with(
@@ -430,7 +459,6 @@ impl Embedder for OllamaEmbedder {
                             &embed_url,
                             &server_model,
                             dim,
-                            num_ctx,
                             auth_header.as_deref(),
                             sub_batch,
                         )
@@ -438,7 +466,7 @@ impl Embedder for OllamaEmbedder {
                 }
                 handles.into_iter().map(|handle| handle.join()).collect::<Result<Vec<_>, _>>()
             })
-            .map_err(|_| anyhow::anyhow!("ollama embed worker thread panicked"))?;
+            .map_err(|_| anyhow::anyhow!("embed worker thread panicked"))?;
             for result in results {
                 out.extend(result?);
             }
@@ -462,8 +490,8 @@ mod tests {
 
     /// Construct the embedder for the selected model over the given remote config + dim. Thin
     /// wrapper so the many tests don't repeat the `selected_model_id` arg.
-    fn build(cfg: &RemoteEmbeddingConfig, dim: usize) -> anyhow::Result<OllamaEmbedder> {
-        OllamaEmbedder::from_remote_config(cfg, SELECTED_ID, dim)
+    fn build(cfg: &RemoteEmbeddingConfig, dim: usize) -> anyhow::Result<OpenAiEmbedder> {
+        OpenAiEmbedder::from_remote_config(cfg, SELECTED_ID, dim)
     }
 
     /// Spawn a one-shot HTTP/1.1 server on `127.0.0.1:0` that accepts a single connection, drains
@@ -555,16 +583,19 @@ mod tests {
         let _ = stream.read(&mut buf);
     }
 
+    /// OpenAI `/v1/embeddings` success body: `{"data":[{"embedding":[..],"index":i}, ...]}` where
+    /// `index` is the position within THIS request (0-based).
     fn embeddings_json(vectors: &[Vec<f32>]) -> String {
         let rows = vectors
             .iter()
-            .map(|v| {
+            .enumerate()
+            .map(|(i, v)| {
                 let nums = v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",");
-                format!("[{nums}]")
+                format!("{{\"embedding\":[{nums}],\"index\":{i}}}")
             })
             .collect::<Vec<_>>()
             .join(",");
-        format!("{{\"embeddings\":[{rows}]}}")
+        format!("{{\"data\":[{rows}]}}")
     }
 
     fn config_for(endpoint: &str, timeout_s: u64) -> RemoteEmbeddingConfig {
@@ -604,10 +635,12 @@ mod tests {
     }
 
     #[test]
-    fn embed_request_includes_num_ctx_when_configured() {
+    fn embed_request_uses_the_openai_shape_and_omits_num_ctx() {
         let want = vec![vec![1.0f32; DIM]];
         let (url, handle) = spawn_body_capture_stub(embeddings_json(&want));
         let mut cfg = config_for(&url, 5);
+        // `num_ctx` stays a config field (freshness + model-load) but has NO per-request wire form
+        // on `/v1/embeddings` — it must NOT appear in the request body.
         cfg.num_ctx = Some(4096);
         let embedder = build(&cfg, DIM).unwrap();
 
@@ -616,7 +649,12 @@ mod tests {
 
         let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(payload["model"], "all-minilm");
-        assert_eq!(payload["options"]["num_ctx"], 4096);
+        assert!(payload["input"].is_array());
+        assert_eq!(payload["encoding_format"], "float");
+        assert!(
+            payload.get("options").is_none(),
+            "num_ctx/options must not be sent to /v1/embeddings"
+        );
     }
 
     /// A multi-request HTTP stub: accepts `max_conns` connections, and for each request replies

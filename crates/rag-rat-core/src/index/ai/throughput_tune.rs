@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::EmbeddingModelSpec;
 use crate::index::ai::helpers::{meta, set_meta};
-use crate::index::ai::providers::{Embedder, OllamaEmbedder, ProvisionedEmbedderParams};
+use crate::index::ai::providers::{Embedder, OpenAiEmbedder, ProvisionedEmbedderParams};
 use crate::index::util::now_ms;
 
 /// `index_meta` key holding the throughput-tune cache (a JSON map, so no schema migration).
@@ -106,7 +106,7 @@ pub(crate) fn tune_ollama_concurrency(
     if tuning_disabled() {
         return cap;
     }
-    // Normalize `batch_size` the SAME way `OllamaEmbedder` does (clamp to >=1): a configured 0
+    // Normalize `batch_size` the SAME way `OpenAiEmbedder` does (clamp to >=1): a configured 0
     // serves one text per request live, so the probe (and cache key) must treat it as 1 —
     // otherwise every candidate window collapses to a single text and the sweep never exercises
     // fan-out.
@@ -141,8 +141,8 @@ pub(crate) fn tune_ollama_concurrency(
     // is cacheable) except: `concurrency` is the fan-out being measured, and
     // `request_timeout_s` is bounded by the tune budget so one blocking probe can't hold the
     // box for the full HTTP timeout.
-    let build = |concurrency: u32, request_timeout_s: u64| -> OllamaEmbedder {
-        OllamaEmbedder::from_provisioned(ProvisionedEmbedderParams {
+    let build = |concurrency: u32, request_timeout_s: u64| -> OpenAiEmbedder {
+        OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
             endpoint,
             auth_token,
             server_model: remote.model.trim(),
@@ -152,7 +152,6 @@ pub(crate) fn tune_ollama_concurrency(
             batch_size,
             concurrency,
             max_batch_chars: remote.max_batch_chars,
-            num_ctx: remote.num_ctx,
         })
     };
 
@@ -215,7 +214,7 @@ pub(crate) fn sweep_is_worthwhile(
     estimated_jobs.is_none_or(|jobs| jobs > u64::from(per_request))
 }
 
-/// Texts the live `OllamaEmbedder` puts in ONE `/api/embed` request: bounded by BOTH the count cap
+/// Texts the live `OpenAiEmbedder` puts in ONE `/api/embed` request: bounded by BOTH the count cap
 /// (`batch_size`, clamped to >=1 like the embedder) and the char budget (`max_batch_chars` / a
 /// representative per-text size), whichever is smaller. A small `max_batch_chars` splits work into
 /// many small requests, so the fan-out threshold must use the smaller of the two.

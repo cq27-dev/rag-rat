@@ -16,7 +16,7 @@ use rag_rat_core::index::ai::FastEmbedEmbedder;
 #[cfg(feature = "model2vec")]
 use rag_rat_core::index::ai::Model2VecEmbedder;
 use rag_rat_core::index::ai::{
-    Embedder, HashEmbedder, OllamaEmbedder, verify_ephemeral_remote_cancellable,
+    Embedder, HashEmbedder, OpenAiEmbedder, verify_ephemeral_remote_cancellable,
 };
 use rag_rat_core::index::oracle::{OracleTool, ToolAvailability, ToolManifest, probe_oracle_tool};
 use rag_rat_core::language::Language;
@@ -2193,7 +2193,7 @@ fn probe_download(id: String, log_tx: Sender<String>) -> CheckResult {
 }
 
 fn probe_connect(r: RemoteEmbeddingConfig, s: &EmbeddingModelSpec) -> CheckResult {
-    match OllamaEmbedder::from_remote_config(&r, s.model_id, s.dim) {
+    match OpenAiEmbedder::from_remote_config(&r, s.model_id, s.dim) {
         Ok(e) => match e.embed_batch(&["ping".to_string()]) {
             Ok(v) if v.first().is_some_and(|x| !x.is_empty()) => CheckResult::ok(),
             Ok(_) => CheckResult::warn("empty embedding"),
