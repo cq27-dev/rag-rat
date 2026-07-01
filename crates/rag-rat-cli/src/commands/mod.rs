@@ -505,7 +505,20 @@ pub(crate) fn benchmark_embedding(
     let candidates: Vec<u32> = if args.candidates.is_empty() {
         rag_rat_core::index::ai::default_benchmark_candidates(cap)
     } else {
-        args.candidates.clone()
+        // Normalize explicit `--candidates`: clamp each to the effective range (the server +
+        // embedder cap concurrency at 1..=MAX, so a raw 1024 would measure the 512 cap
+        // while labeled 1024), then sort + dedupe — the sweep assumes ASCENDING candidates
+        // (it stops on the first over-allocation window). Without this, `--candidates
+        // 1024,1` could stop before the valid `1` row or mislabel a row after starting a
+        // paid box.
+        let mut c: Vec<u32> = args
+            .candidates
+            .iter()
+            .map(|&c| RemoteEmbeddingConfig::bounded_concurrency_value(c))
+            .collect();
+        c.sort_unstable();
+        c.dedup();
+        c
     };
 
     // Size the provisioned server for the HIGHEST fan-out the sweep will test: `concurrency` is
@@ -529,6 +542,17 @@ pub(crate) fn benchmark_embedding(
     };
     let budget_ms =
         args.budget_ms.unwrap_or_else(rag_rat_core::index::ai::default_benchmark_budget_ms);
+
+    // Reject a budget too small to measure ANY candidate BEFORE provisioning a paid box: the sweep
+    // floors each candidate at a ~1s slice and stops once <1s of the budget remains, so a tiny
+    // `--budget-ms` would provision + tear down a box while measuring zero rows.
+    let min_budget = rag_rat_core::index::ai::min_benchmark_budget_ms(candidates.len());
+    anyhow::ensure!(
+        budget_ms >= min_budget,
+        "--budget-ms {budget_ms} is too small to benchmark {} candidate(s): need at least \
+         {min_budget} ms (~1s per candidate). Raise --budget-ms or pass fewer --candidates.",
+        candidates.len(),
+    );
 
     // Registry model → trust `spec.dim`. Off-registry HF model → provision, measure the dim from
     // one probe embed, then benchmark. Either way the ProvisionedBox is kept bound for the
@@ -562,10 +586,13 @@ pub(crate) fn benchmark_embedding(
         budget_ms,
     );
 
-    // Peak = the highest measured texts/s row (informational; the benchmark reports every row and
-    // lets the reader compare). `None` only if no candidate was measured (empty ladder).
+    // Peak = the highest-throughput row among rows that actually measured something (`requests >
+    // 0`). If EVERY row failed (a reachable box but every probe errored — wrong `--model`, bad
+    // auth/path, dim mismatch), peak is `null`, not a misleading 0-TPS "result" a consumer
+    // would treat as a valid backend comparison.
     let peak = measured
         .iter()
+        .filter(|m| m.requests > 0)
         .max_by(|a, b| a.texts_per_second.total_cmp(&b.texts_per_second))
         .map(|m| serde_json::json!({ "concurrency": m.concurrency, "texts_per_second": m.texts_per_second }));
 

@@ -327,6 +327,16 @@ pub fn default_benchmark_budget_ms() -> u64 {
     DEFAULT_TUNE_BUDGET_MS
 }
 
+/// EVAL-ONLY (#346): the smallest `--budget-ms` that lets `measure_candidates` actually measure
+/// every candidate. `per_candidate_ms` floors at 1000ms and the sweep stops once <1s of the budget
+/// remains, so a budget below `1s × candidates` (never under the tuner's `MIN_TUNE_BUDGET_MS`)
+/// provisions a box and then measures ZERO rows. The CLI validates against this BEFORE provisioning
+/// so a too-small `--budget-ms` never silently burns a box.
+#[cfg(feature = "eval")]
+pub fn min_benchmark_budget_ms(num_candidates: usize) -> u64 {
+    (num_candidates.max(1) as u64 * 1_000).max(MIN_TUNE_BUDGET_MS)
+}
+
 /// Whether a client-concurrency sweep is worth running for THIS reconcile — only when the live run
 /// can actually fan out. Skip when:
 /// - `max_seconds` is set — a bounded `--max-seconds`/maintenance pass is NOT widened
@@ -983,6 +993,17 @@ mod tests {
         // Low fan-outs served; high ones tripped the breaker (aborted) but are STILL reported.
         assert!(results[0].requests > 0 && !results[0].aborted, "c=1 served");
         assert!(results[3].aborted, "c=8 (> fail_above 2) breaker-tripped, but row is present");
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn min_benchmark_budget_scales_with_candidates_but_floors_at_the_tuner_min() {
+        // ~1s per candidate, never below MIN_TUNE_BUDGET_MS (the sweep stops when <1s of the budget
+        // remains, so a smaller budget provisions a box and measures ZERO rows).
+        assert_eq!(min_benchmark_budget_ms(0), MIN_TUNE_BUDGET_MS);
+        assert_eq!(min_benchmark_budget_ms(1), MIN_TUNE_BUDGET_MS);
+        assert_eq!(min_benchmark_budget_ms(5), MIN_TUNE_BUDGET_MS); // 5 * 1000 == the 5000 floor
+        assert_eq!(min_benchmark_budget_ms(9), 9_000); // above the floor → 1s per candidate
     }
 
     #[cfg(feature = "eval")]

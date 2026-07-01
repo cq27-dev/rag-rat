@@ -54,7 +54,7 @@ pub(crate) use store::*;
 #[cfg(feature = "eval")]
 pub use throughput_tune::{
     MeasuredCandidate, benchmark_remote_concurrency, default_benchmark_budget_ms,
-    default_benchmark_candidates, measure_remote_dim,
+    default_benchmark_candidates, measure_remote_dim, min_benchmark_budget_ms,
 };
 
 use crate::index::now_ms;
