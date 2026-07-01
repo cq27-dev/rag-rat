@@ -85,6 +85,12 @@ pub(crate) fn active_embedder(
 /// `query_endpoint`, so the query embeds against the local box (same model) rather than
 /// provisioning a remote GPU. Used only on the query/connect-chunk path; the ephemeral CHUNK path
 /// provisions.
+///
+/// The `backend` is PRESERVED (via `..remote.clone()`) — the query embedder uses the same route +
+/// server-side model name as the chunk backend — so `query_endpoint` must point at a LOCAL server
+/// running that backend + model. Config parsing enforces this for non-ollama backends (an ephemeral
+/// infinity/vLLM config must set `query_endpoint` explicitly; there is no ollama-shaped default —
+/// see `ConfigError::RemoteQueryEndpointRequiredForBackend`).
 fn query_embed_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingConfig {
     if remote.is_ephemeral() {
         RemoteEmbeddingConfig {

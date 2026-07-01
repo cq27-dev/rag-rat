@@ -316,9 +316,12 @@ pub struct RemoteEmbeddingConfig {
     /// package spec (`"@rag-rat/cookbook/modal"`, run via `npx -y`) or a recipe file path
     /// (`.mjs`/`.js` → `node`, `.ts` → `npx tsx`). Mutually exclusive with `endpoint`.
     pub cookbook: Option<String>,
-    /// EPHEMERAL: the LOCAL Ollama used for QUERY embedding (queries embed the same model as the
-    /// remote-embedded chunks → identical vector space). Defaults to `http://localhost:11434` when
-    /// ephemeral and omitted. Ignored in connect mode.
+    /// EPHEMERAL: the LOCAL server used for QUERY embedding after the box is torn down (queries
+    /// embed the same model on the same `backend` → identical vector space). Defaults to
+    /// `http://localhost:11434` (local Ollama) ONLY for `backend = ollama`; a non-ollama backend
+    /// must set this explicitly (its route/model differ, so the Ollama default would silently
+    /// break query embedding — see `ConfigError::RemoteQueryEndpointRequiredForBackend`).
+    /// Ignored in connect mode.
     pub query_endpoint: Option<String>,
     /// Name of the environment variable holding the bearer token, if the server needs auth. Local
     /// Ollama needs none, so this is optional; the embedder reads the var once at construction.
@@ -1015,10 +1018,26 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
         // into the SQLite index — reject it and direct the user to `auth_env`. Checked against the
         // URL authority only (between `scheme://` and the next `/`), so an `@` in a path/query is
         // fine. `cookbook` is a recipe spec, not a URL, so it is not checked.
-        // EPHEMERAL: the LOCAL query box. Defaults to `DEFAULT_QUERY_ENDPOINT`; ignored for
-        // connect.
+        // EPHEMERAL: the LOCAL query box. Ephemeral chunks embed on the provisioned box, but that
+        // box is torn down after reconcile, so QUERIES embed against `query_endpoint` (a local
+        // server running the same model) — and `query_embed_config` PRESERVES the backend when it
+        // rewrites the ephemeral config to a connect-shaped query config. `DEFAULT_QUERY_ENDPOINT`
+        // is a local OLLAMA URL, so it only fits `backend = ollama`. For a non-ollama backend the
+        // default would build a query embedder posting the wrong route (`/embeddings`) / an HF
+        // model id at local Ollama → every query embed fails → silent, permanent BM25
+        // fallback. So require an explicit `query_endpoint` there. Ignored for connect
+        // (queries hit the connect endpoint).
         let query_endpoint = if cookbook.is_some() {
-            Some(trimmed(raw.query_endpoint).unwrap_or_else(|| DEFAULT_QUERY_ENDPOINT.to_string()))
+            match trimmed(raw.query_endpoint) {
+                Some(qe) => Some(qe),
+                None if backend == RemoteBackend::Ollama =>
+                    Some(DEFAULT_QUERY_ENDPOINT.to_string()),
+                None => {
+                    return Err(ConfigError::RemoteQueryEndpointRequiredForBackend {
+                        backend: backend.as_db_str(),
+                    });
+                },
+            }
         } else {
             None
         };
@@ -1134,6 +1153,13 @@ pub enum ConfigError {
          `{0}`)"
     )]
     RemoteBackendUnknown(String),
+    #[error(
+        "[llm.embedding.remote] `backend = \"{backend}\"` with an ephemeral `cookbook` requires \
+         an explicit `query_endpoint` — queries embed against a LOCAL server after the box is \
+         torn down, and the default (a local Ollama URL) only fits `backend = \"ollama\"`. Point \
+         `query_endpoint` at a local `{backend}` server serving the same model"
+    )]
+    RemoteQueryEndpointRequiredForBackend { backend: &'static str },
     #[error(
         "[llm.embedding.remote] requires EXACTLY ONE of `endpoint` (connect to a running server) \
          or `cookbook` (provision an ephemeral box) — set neither both nor zero"
@@ -1613,6 +1639,55 @@ mod tests {
         .unwrap();
         let remote = LlmConfig::try_from(raw.llm).unwrap().embedding.remote.unwrap();
         assert_eq!(remote.query_endpoint.as_deref(), Some("http://127.0.0.1:11999"));
+    }
+
+    #[test]
+    fn ephemeral_non_ollama_backend_requires_an_explicit_query_endpoint() {
+        // The DEFAULT_QUERY_ENDPOINT is a local OLLAMA URL; it only fits `backend = ollama`. A
+        // non-ollama ephemeral backend that omits `query_endpoint` must be REJECTED (not silently
+        // defaulted), or after teardown queries embed against local Ollama with the wrong route /
+        // model → silent BM25 fallback. See `RemoteQueryEndpointRequiredForBackend`.
+        let build = |backend: &str, query_line: &str| {
+            let raw: RawConfig = toml::from_str(&format!(
+                r#"
+                [index]
+                root = "."
+
+                [llm.embedding]
+                model = "sentence-transformers/all-MiniLM-L6-v2"
+
+                [llm.embedding.remote]
+                model = "sentence-transformers/all-MiniLM-L6-v2"
+                backend = "{backend}"
+                cookbook = "@rag-rat/cookbook modal"
+                {query_line}
+                "#,
+            ))
+            .unwrap();
+            LlmConfig::try_from(raw.llm).map(|l| l.embedding.remote.unwrap())
+        };
+
+        for backend in ["infinity", "vllm"] {
+            let err = build(backend, "").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::RemoteQueryEndpointRequiredForBackend { backend: b } if b == backend
+                ),
+                "{backend} ephemeral without query_endpoint → \
+                 RemoteQueryEndpointRequiredForBackend, got {err:?}",
+            );
+            // An explicit query_endpoint is accepted, and the backend is preserved for the query
+            // path.
+            let remote = build(backend, r#"query_endpoint = "http://127.0.0.1:7997""#).unwrap();
+            assert_eq!(remote.query_endpoint.as_deref(), Some("http://127.0.0.1:7997"));
+            assert_eq!(remote.backend.as_db_str(), backend);
+        }
+        // ollama still defaults (its default IS a local Ollama).
+        assert_eq!(
+            build("ollama", "").unwrap().query_endpoint.as_deref(),
+            Some(DEFAULT_QUERY_ENDPOINT),
+        );
     }
 
     #[test]

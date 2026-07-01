@@ -91,9 +91,19 @@ cookbook = "@rag-rat/cookbook modal"        # EPHEMERAL: an npm package + a prov
                                             #   First token picks the runner: .mjs/.js → node,
                                             #   .ts/.mts → npx tsx, else → npx -y. The value is split
                                             #   on whitespace — paths with spaces are unsupported.
-model = "all-minilm"                        # the Ollama-side model name
-# query_endpoint = "http://localhost:11434" # the LOCAL ollama for QUERY embedding
-                                            #   (defaults to http://localhost:11434)
+backend = "ollama"                          # "ollama" | "infinity" | "vllm" (default "ollama").
+                                            #   Selects the box image/launch/route; the embed wire
+                                            #   call is the OpenAI shape for all three. vLLM requires
+                                            #   a GPU (its image is CUDA-only).
+model = "all-minilm"                        # server-side model NAME: an ollama name for ollama, a
+                                            #   HuggingFace id (e.g.
+                                            #   sentence-transformers/all-MiniLM-L6-v2) for
+                                            #   infinity/vLLM (auto-downloaded on the box).
+# query_endpoint = "http://localhost:11434" # LOCAL server for QUERY embedding (the box is torn down
+                                            #   after reconcile). Defaults to local Ollama ONLY for
+                                            #   backend="ollama"; REQUIRED for infinity/vLLM — point
+                                            #   it at a local server of the SAME backend + model.
+# num_ctx = 4096                            # ollama-only: baked as OLLAMA_CONTEXT_LENGTH on the box
 # auth_env = "OLLAMA_TOKEN"                 # optional bearer-token env var NAME
 # gpu = "A10"                               # cookbook-only: the GPU the recipe provisions.
                                             #   Provider-specific, validated at provision time:
