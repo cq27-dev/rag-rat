@@ -2347,10 +2347,11 @@ mod freshness_version_tests {
 
     #[test]
     fn light_pass_with_reachable_query_endpoint_embeds_locally_single_flight() {
-        // Ephemeral watcher pass, `query_endpoint` REACHABLE → Ready with NO provisioned box: the
-        // light path builds the LOCAL query-endpoint embedder (same vector space as the cookbook
-        // box, no cold-start) and clamps it to SINGLE-FLIGHT concurrency so a background edit can't
-        // overload the local server.
+        // Ephemeral watcher pass, `query_endpoint` answers a probe embed → Ready with NO
+        // provisioned box: the light path builds the LOCAL query-endpoint embedder (same
+        // vector space as the cookbook box, no cold-start), the probe embed succeeds, and
+        // concurrency is clamped to SINGLE-FLIGHT so a background edit can't overload the
+        // local server.
         let conn = schema_conn();
         let (endpoint, _stub) = spawn_embed_stub(fastembed_dim());
         activate_ephemeral_with_query_endpoint(&conn, Some(&endpoint));
@@ -2370,9 +2371,9 @@ mod freshness_version_tests {
 
     #[test]
     fn light_pass_with_unreachable_query_endpoint_defers() {
-        // Ephemeral watcher pass, `query_endpoint` set but NOT reachable (a closed port) → defer
-        // (SkipEphemeral), NOT embed-and-fail into `Failed` chunk_embeddings — and without paying
-        // an O(repo) candidate scan first.
+        // Ephemeral watcher pass, `query_endpoint` set but the server is DOWN (a closed port) → the
+        // probe embed's connect is refused, so defer (SkipEphemeral), NOT embed-and-fail into
+        // `Failed` chunk_embeddings, and without paying an O(repo) candidate scan first.
         let conn = schema_conn();
         let closed = {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2381,6 +2382,19 @@ mod freshness_version_tests {
             format!("http://127.0.0.1:{port}")
         };
         activate_ephemeral_with_query_endpoint(&conn, Some(&closed));
+        seed_embedding_chunk(&conn, 1);
+        assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::SkipEphemeral));
+    }
+
+    #[test]
+    fn light_pass_with_wrong_model_on_the_endpoint_defers() {
+        // The port ACCEPTS connections but the embeddings route returns the WRONG dim (a different
+        // service, or the configured model not pulled) — a bare TCP connect would pass, but the
+        // probe embed catches the dim mismatch and defers (SkipEphemeral) instead of persisting
+        // `Failed` chunk rows.
+        let conn = schema_conn();
+        let (endpoint, _stub) = spawn_embed_stub(fastembed_dim() + 1); // wrong dim on the route
+        activate_ephemeral_with_query_endpoint(&conn, Some(&endpoint));
         seed_embedding_chunk(&conn, 1);
         assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::SkipEphemeral));
     }
