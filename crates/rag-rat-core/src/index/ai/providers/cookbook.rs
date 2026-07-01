@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Embedder;
 use super::openai::{OpenAiEmbedder, ProvisionedEmbedderParams};
-use crate::config::RemoteEmbeddingConfig;
+use crate::config::{RemoteBackend, RemoteEmbeddingConfig};
 use crate::embedding_models::EmbeddingModelSpec;
 
 /// The env var carrying the cookbook's JSON input. The recipe reads + parses it at startup.
@@ -274,19 +274,24 @@ impl CookbookProvisioner {
     /// `cookbook` resolution: a `.mjs`/`.js` path → `node <path>`; a `.ts` path → `npx tsx <path>`;
     /// anything else → `npx -y <cookbook>` (an npm package spec).
     pub fn provision(cookbook: &str, input: &CookbookInput) -> anyhow::Result<ProvisionedBox> {
-        Self::provision_with_command(cookbook_command(cookbook), cookbook, input, PROVISION_TIMEOUT)
+        // Backend-aware handshake deadline (vLLM's huge image needs longer than ollama/infinity);
+        // fall back to the default if `input.backend` is somehow unrecognized.
+        let timeout = RemoteBackend::from_db_str(input.backend)
+            .map_or(PROVISION_TIMEOUT, RemoteBackend::provision_timeout);
+        Self::provision_with_command(cookbook_command(cookbook), cookbook, input, timeout)
     }
 
     fn provision_cancellable(
         cookbook: &str,
         input: &CookbookInput,
+        provision_timeout: Duration,
         cancel: impl Fn() -> bool,
     ) -> anyhow::Result<ProvisionedBox> {
         Self::provision_with_command_cancellable(
             cookbook_command(cookbook),
             cookbook,
             input,
-            PROVISION_TIMEOUT,
+            provision_timeout,
             cancel,
         )
     }
@@ -514,10 +519,10 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
         // identical across all three.
         backend: remote.backend.as_db_str(),
         request_timeout_s: remote.request_timeout_s,
-        // Give the recipe a provisioning budget just under the Rust hard ceiling, so ITS budget
-        // runs out first (clean provider-side teardown) before the Rust SIGKILL backstop
-        // fires.
-        provision_timeout_s: PROVISION_TIMEOUT.as_secs().saturating_sub(20),
+        // Give the recipe a provisioning budget just under the Rust hard ceiling (backend-aware:
+        // vLLM's large image needs longer), so ITS budget runs out first (clean provider-side
+        // teardown) before the Rust SIGKILL backstop fires.
+        provision_timeout_s: remote.backend.provision_timeout().as_secs().saturating_sub(20),
         // The configured GPU (provider-specific; validated by the provider at provision time). The
         // recipe picks its own default when `None`. Config validation guarantees `gpu` is only set
         // in ephemeral mode, which is the only mode reaching this function.
@@ -574,7 +579,12 @@ fn provision_and_build_cancellable(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("ephemeral remote config has no cookbook"))?;
     let input = cookbook_input_for(remote);
-    let provisioned = CookbookProvisioner::provision_cancellable(cookbook, &input, cancel)?;
+    let provisioned = CookbookProvisioner::provision_cancellable(
+        cookbook,
+        &input,
+        remote.backend.provision_timeout(),
+        cancel,
+    )?;
     // `effective_remote` PERSISTS the user's `concurrency` CAP unchanged (cap model). The live
     // embedder + reconcile window use the tuned knee, CLAMPED to that cap. The knee comes from the
     // in-Rust sweep against the box with the REAL embedder (reconcile path); the install/verify
@@ -614,7 +624,8 @@ fn provision_and_build_cancellable(
 /// down (the [`ProvisionedBox`] guard's `Drop` at end of scope). `Ok(())` on a clean round-trip, an
 /// error otherwise. This path passes `tune = None`, so it does NOT run the throughput sweep (a
 /// throwaway box wouldn't warm the reconcile cache) — it just verifies the round-trip at the user's
-/// `[remote] concurrency` cap. Bounded by the same internal [`PROVISION_TIMEOUT`] (300s) that gates
+/// `[remote] concurrency` cap. Bounded by the same backend-aware provisioning deadline
+/// (`RemoteBackend::provision_timeout` — 300s ollama/infinity, longer for vLLM) that gates
 /// `provision`.
 ///
 /// This is the `pub` seam the CLI's Remote step probes against: `provision_and_build` is

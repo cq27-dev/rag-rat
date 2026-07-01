@@ -30,13 +30,13 @@ use crate::index::util::now_ms;
 /// `index_meta` key holding the throughput-tune cache (a JSON map, so no schema migration).
 const TUNE_CACHE_META_KEY: &str = "embedding_throughput_tune_v1";
 /// Powers of two the concurrency sweep tries (plus the exact cap; filtered to `<= cap`).
-const CONCURRENCY_CANDIDATES: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+const CONCURRENCY_CANDIDATES: [u32; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 /// Byte budget on the synthetic probe texts a single candidate may allocate, so a huge
 /// `max_batch_chars` (or per-text `max_embedding_chars`) can't balloon the sweep to GBs. A
 /// candidate whose window bytes exceed this is SKIPPED (leaving the sweep incomplete → not cached);
-/// since the window bytes are `candidate * min(batch_size * per_text_chars, max_batch_chars)`, 128
-/// MB covers every sane config at full fan-out (e.g. the default 128 × 384 KB ≈ 49 MB).
-const MAX_PROBE_WINDOW_BYTES: usize = 128 * 1024 * 1024;
+/// since the window bytes are `candidate * min(batch_size * per_text_chars, max_batch_chars)`, 256
+/// MB covers every sane config at full fan-out up to the 512 cap (e.g. 512 × 384 KB ≈ 196 MB).
+const MAX_PROBE_WINDOW_BYTES: usize = 256 * 1024 * 1024;
 /// Fan-out to reconcile with when the sweep RAN but found no stable candidate (every concurrency
 /// was lossy/failed): the safest value, NOT the cap — reconcile's scoped-retry handles the rest,
 /// and blasting a struggling box at the full cap would just write failed chunk groups.
@@ -306,12 +306,45 @@ fn run_sweep<E: Embedder>(
         });
     }
 
-    match select_knee(&results, cap) {
+    let outcome = match select_knee(&results, cap) {
         // `complete` gates caching: a budget-truncated sweep (didn't attempt every candidate) is
         // usable for this run but must not be persisted as the tuned knee for the full cap.
         Some((knee, texts_per_second)) =>
             SweepOutcome::Knee { knee, texts_per_second, complete: attempted == total_candidates },
         None => SweepOutcome::NoStableCandidate,
+    };
+    if tune_log_enabled() {
+        log_sweep(&results, &outcome, attempted, total_candidates);
+    }
+    outcome
+}
+
+/// Print the sweep's per-candidate throughput table + the selected knee to stderr (opt-in via
+/// `RAG_RAT_TUNE_LOG`). The visible-benchmark surface over the auto-tuner: each row is one
+/// concurrency candidate's measured texts/s at the LIVE per-request size (so it reflects the real
+/// reconcile load, not a synthetic micro-benchmark), and the footer names the chosen knee.
+fn log_sweep(results: &[SweepResult], outcome: &SweepOutcome, attempted: usize, total: usize) {
+    eprintln!("rag-rat tune: concurrency sweep — {attempted}/{total} candidates measured");
+    for r in results {
+        eprintln!(
+            "rag-rat tune:   c={:<4} {:>8.1} texts/s   requests={:<4} failures={}{}",
+            r.candidate,
+            r.texts_per_second,
+            r.requests,
+            r.failures,
+            if r.aborted { "   [aborted: breaker tripped]" } else { "" },
+        );
+    }
+    match outcome {
+        SweepOutcome::Knee { knee, texts_per_second, complete } => eprintln!(
+            "rag-rat tune: selected knee c={knee} ({texts_per_second:.1} texts/s){}",
+            if *complete { "" } else { "   [budget-truncated: not cached]" },
+        ),
+        SweepOutcome::NoStableCandidate => {
+            eprintln!("rag-rat tune: no stable candidate — reconcile falls back to the cap");
+        },
+        // NotRun is returned before any measurement, so it never reaches this logger.
+        SweepOutcome::NotRun => {},
     }
 }
 
@@ -362,7 +395,7 @@ fn select_knee(results: &[SweepResult], cap: u32) -> Option<(u32, f64)> {
 /// Powers of two `<= cap`, plus the EXACT cap (a non-power-of-two cap like 24/127 must be tested so
 /// the tuner can use all the capacity the user allowed).
 fn sweep_candidates(cap: u32) -> Vec<u32> {
-    let cap = cap.clamp(1, 128);
+    let cap = cap.clamp(1, crate::config::MAX_REMOTE_EMBEDDING_CONCURRENCY);
     let mut values: Vec<u32> = CONCURRENCY_CANDIDATES.into_iter().filter(|c| *c <= cap).collect();
     if values.last() != Some(&cap) {
         values.push(cap);
@@ -493,6 +526,15 @@ fn tuning_disabled() -> bool {
     matches!(std::env::var("RAG_RAT_DISABLE_TUNING").ok().as_deref(), Some("1") | Some("true"))
 }
 
+/// When set (`RAG_RAT_TUNE_LOG=1`), the concurrency sweep prints its per-candidate throughput table
+/// and the chosen knee to stderr — turning the (otherwise silent) auto-tuner into a visible
+/// benchmark. Off by default so a normal reconcile stays quiet; pair it with
+/// `RAG_RAT_TUNE_TTL_MS=0` (force a fresh sweep) + `RAG_RAT_TUNE_MS` (budget) to benchmark a
+/// provisioned box.
+fn tune_log_enabled() -> bool {
+    matches!(std::env::var("RAG_RAT_TUNE_LOG").ok().as_deref(), Some("1") | Some("true"))
+}
+
 fn tune_budget_ms() -> u64 {
     env_ms("RAG_RAT_TUNE_MS", DEFAULT_TUNE_BUDGET_MS)
 }
@@ -525,6 +567,9 @@ mod tests {
         assert_eq!(sweep_candidates(24), vec![1, 2, 4, 8, 16, 24]);
         assert_eq!(sweep_candidates(127), vec![1, 2, 4, 8, 16, 32, 64, 127]);
         assert_eq!(sweep_candidates(1), vec![1]);
+        // GPU-backend headroom: the cap can now reach 512, adding the 256/512 rungs.
+        assert_eq!(sweep_candidates(256), vec![1, 2, 4, 8, 16, 32, 64, 128, 256]);
+        assert_eq!(sweep_candidates(512), vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512]);
     }
 
     #[test]

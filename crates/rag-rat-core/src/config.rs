@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -232,7 +233,7 @@ pub enum RemoteBackend {
     Ollama,
     /// michaelfeil/infinity (`infinity_emb v2 --model-id <hf>`).
     Infinity,
-    /// vLLM in embedding mode (`vllm serve <hf> --task embed`).
+    /// vLLM in embedding mode (`vllm serve <hf> --runner pooling --host 0.0.0.0`).
     Vllm,
 }
 
@@ -267,6 +268,21 @@ impl RemoteBackend {
         match self {
             RemoteBackend::Ollama | RemoteBackend::Vllm => "/v1/embeddings",
             RemoteBackend::Infinity => "/embeddings",
+        }
+    }
+
+    /// How long the ephemeral cookbook may take to provision + serve a box for this backend before
+    /// rag-rat gives up — BOTH the Rust-side handshake deadline and (minus a margin) the
+    /// `provision_timeout_s` the recipe budgets against.
+    ///
+    /// vLLM's published image (`vllm/vllm-openai`, a ~10–15 GB CUDA image) is an order of magnitude
+    /// larger than ollama's or infinity's, so its cold start (image pull + GPU model load) needs a
+    /// much longer ceiling: 300s times it out on Modal (the create alone can eat most of it,
+    /// leaving too little for `waitUntilReady`). ollama/infinity cold-start in well under 300s.
+    pub fn provision_timeout(self) -> Duration {
+        match self {
+            RemoteBackend::Ollama | RemoteBackend::Infinity => Duration::from_secs(300),
+            RemoteBackend::Vllm => Duration::from_secs(900),
         }
     }
 }
@@ -368,7 +384,13 @@ pub struct RemoteEmbeddingConfig {
 
 /// The default LOCAL Ollama URL for ephemeral query embedding when `query_endpoint` is omitted.
 pub const DEFAULT_QUERY_ENDPOINT: &str = "http://localhost:11434";
-pub const MAX_REMOTE_EMBEDDING_CONCURRENCY: u32 = 128;
+/// Upper bound a user may set for `[remote] concurrency`. Headroom for GPU backends
+/// (infinity/vLLM), which do real dynamic-batched inference and keep scaling with client fan-out
+/// well past 128 (an L4 serving all-MiniLM via infinity was still climbing at 128 with zero
+/// failures). ollama is server-bound (a higher value doesn't help it), so this is opt-in per
+/// config; the defaults stay low. The auto-tuner sweeps within whatever cap the user sets and
+/// clamps the knee to it.
+pub const MAX_REMOTE_EMBEDDING_CONCURRENCY: u32 = 512;
 const DEFAULT_REMOTE_EMBEDDING_CONCURRENCY: u32 = 32;
 const LEGACY_REMOTE_EMBEDDING_CONCURRENCY: u32 = 1;
 const DEFAULT_REMOTE_EMBEDDING_MAX_BATCH_CHARS: usize = 384_000;
@@ -2121,6 +2143,20 @@ mod tests {
         assert_eq!(RemoteBackend::Ollama.embed_path(), "/v1/embeddings");
         assert_eq!(RemoteBackend::Vllm.embed_path(), "/v1/embeddings");
         assert_eq!(RemoteBackend::Infinity.embed_path(), "/embeddings");
+    }
+
+    #[test]
+    fn remote_backend_provision_timeout_is_longer_for_vllm() {
+        // vLLM's ~10-15 GB image needs a longer cold-start ceiling than ollama/infinity, or it
+        // times out on Modal. ollama/infinity share the shorter default.
+        assert_eq!(
+            RemoteBackend::Ollama.provision_timeout(),
+            RemoteBackend::Infinity.provision_timeout()
+        );
+        assert!(
+            RemoteBackend::Vllm.provision_timeout() > RemoteBackend::Infinity.provision_timeout(),
+            "vLLM must get a longer provisioning ceiling than infinity",
+        );
     }
 
     #[test]
