@@ -8,7 +8,10 @@
  * It reads the provider from argv[2] and dynamically imports the matching recipe. Recipes
  * self-run on import (each ends with `await runRecipe(...)`), so importing one IS running it —
  * the dispatcher adds no logic to the contract beyond routing. The recipe files stay directly
- * runnable too (`node dist/recipes/<provider>-ollama.mjs`); the dispatcher is just sugar.
+ * runnable too (`node dist/recipes/<provider>.mjs`); the dispatcher is just sugar.
+ *
+ * The BACKEND (ollama/infinity/vLLM) is NOT a subcommand — it arrives in the JSON input
+ * (`RAG_RAT_COOKBOOK_INPUT.backend`), so one `<provider>` recipe serves every backend.
  *
  * Unknown or missing provider → an `error` event (pre-`ready` failure) + exit 1. Like the recipes,
  * the dispatcher writes ONLY JSONL events to stdout.
@@ -18,8 +21,8 @@ import { emit, log } from "./src/contract.js";
 
 /** provider keyword → recipe module specifier (relative to this file's location in dist/). */
 const PROVIDERS: Readonly<Record<string, string>> = {
-  modal: "./recipes/modal-ollama.mjs",
-  runpod: "./recipes/runpod-ollama.mjs",
+  modal: "./recipes/modal.mjs",
+  runpod: "./recipes/runpod.mjs",
 };
 
 function fail(message: string): never {

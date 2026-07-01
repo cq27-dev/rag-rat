@@ -1,27 +1,32 @@
 /**
- * Recipe: provision an ephemeral Ollama box on Modal, serve an embedding model, hand rag-rat
- * the tunnel endpoint, and tear the box down on signal.
+ * Recipe: provision an ephemeral embedding box on Modal, serve the model with the selected backend
+ * (ollama, infinity, or vLLM), hand rag-rat the tunnel endpoint, and tear the box down on signal.
  *
- * Run (post-build):  RAG_RAT_COOKBOOK_INPUT='{"model":"all-minilm"}' node dist/recipes/modal-ollama.mjs
- * Run (dev):         RAG_RAT_COOKBOOK_INPUT='{"model":"all-minilm"}' npx tsx recipes/modal-ollama.mts
+ * Run (post-build):  RAG_RAT_COOKBOOK_INPUT='{"model":"all-minilm"}' node dist/recipes/modal.mjs
+ * Run (dev):         RAG_RAT_COOKBOOK_INPUT='{"model":"all-minilm","backend":"infinity"}' npx tsx recipes/modal.mts
  *
  * Modal auth comes from the ambient process env (MODAL_TOKEN_ID / MODAL_TOKEN_SECRET) or
  * ~/.modal.toml — rag-rat does not pass creds through RAG_RAT_COOKBOOK_INPUT.
  *
- * Mirrors the proven Python provisioning. Provider gotchas, all load-bearing:
- *   - Modal Sandbox `command` is passed as entrypoint args for registry images. The
- *     `ollama/ollama` image already has `/bin/ollama` as ENTRYPOINT, so use `["serve"]`; passing
- *     `["/bin/ollama", "serve"]` runs `ollama /bin/ollama serve` and exits with "unknown command".
- *   - ollama binds 127.0.0.1:11434 by default, which the Modal tunnel cannot reach. We set
- *     OLLAMA_HOST=0.0.0.0:11434 so it listens on all interfaces.
- *   - GPU is optional and OFF by default. GPU on Modal must be attached before ollama's
- *     discovery watchdog times out, or the box dies with exit 137 at cold start; CPU `serve`
- *     is the safe v1 path. Pass input.gpu only when you've accepted that risk.
+ * WHAT VARIES BY BACKEND lives in {@link selectBackendSpec} (image, entrypoint args, env, port, the
+ * embeddings route, and whether a post-boot model pull is needed). THIS file owns only the Modal box
+ * lifecycle, which is backend-independent.
+ *
+ * Modal gotchas, all load-bearing:
+ *   - Modal Sandbox `command` is passed as ENTRYPOINT ARGS for registry images (the spec supplies
+ *     exactly those, never the entrypoint itself: ollama's is `/bin/ollama` so args are `["serve"]`;
+ *     infinity's is `infinity_emb` so args start `["v2", …]`; vLLM's is `vllm serve` so the first
+ *     arg is the model id).
+ *   - The box must listen on 0.0.0.0 for the tunnel to reach it — ollama needs OLLAMA_HOST (set in
+ *     its spec env); infinity binds 0.0.0.0 by default; vLLM gets an explicit `--host 0.0.0.0`.
+ *   - GPU: ollama/infinity default to CPU (GPU is opt-in and, for ollama, must attach before its
+ *     discovery watchdog times out or the box dies exit 137). vLLM's image is CUDA-only, so when the
+ *     backend `requiresGpu` and the caller passed none we default one in ({@link MODAL_DEFAULT_GPU}).
  *   - timeout=1800s (30 min) is the provider-side max-lifetime backstop: if rag-rat dies or
  *     SIGKILLs us before teardown runs, Modal self-destructs the box. (RunPod has no equivalent.)
  *
  * The harness ({@link runRecipe}) owns the terminate-on-error wrapper and the provision-timeout
- * clamp, so this recipe is just: create the box, report it via `ctx.onBox`, pull, verify, return.
+ * clamp, so this recipe is just: create the box, report it via `ctx.onBox`, (pull,) verify, return.
  * Every Modal SDK await here is wrapped in `withBudget` so a hang aborts into teardown rather than
  * running past the Rust hard timeout and getting SIGKILLed with the box still billing (N2).
  */
@@ -42,15 +47,16 @@ import {
   verifyEmbed,
   withBudget,
 } from "../src/contract.js";
+import { selectBackendSpec } from "./backends.mjs";
 
-/** Port ollama serves on inside the box; the one port we tunnel out. */
-const OLLAMA_PORT = 11434;
 /** Provider-side max-lifetime backstop in ms — a leaked box self-destructs after this. */
 const BOX_MAX_LIFETIME_MS = 1_800_000; // 30 minutes
 /** Default provisioning budget (boot + pull + first serving response) when input omits it. */
 const DEFAULT_PROVISION_TIMEOUT_S = 600;
 /** Modal app the sandboxes are grouped under (created on first use). */
 const APP_NAME = "rag-rat-cookbook";
+/** GPU attached when a backend REQUIRES one (vLLM) and the caller passed no `gpu`. */
+const MODAL_DEFAULT_GPU = "A10G";
 /**
  * Bound on the teardown `sb.terminate()` — kept under the Rust side's ~10s teardown grace (like
  * RunPod's `TEARDOWN_TIMEOUT_MS`) so terminate completes-or-aborts BEFORE rag-rat SIGKILLs us; a
@@ -58,9 +64,11 @@ const APP_NAME = "rag-rat-cookbook";
  */
 const TEARDOWN_TIMEOUT_MS = 8_000;
 
-/** Provision an Ollama box serving `input.model` and return its tunnel endpoint. */
+/** Provision an embedding box serving `input.model` on the selected backend; return its endpoint. */
 async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sandbox>> {
   const { input, provisionTimeoutMs } = ctx;
+  const spec = selectBackendSpec(input.backend ?? "ollama");
+  const port = spec.port;
   // ONE deadline for the WHOLE sequence (create + pull + verify). EVERY SDK await below — none of
   // which has a native timeout — is raced against the time REMAINING until this deadline via
   // `withBudget`, so a single hung Modal call can't run past the Rust provisioner's hard timeout
@@ -68,15 +76,12 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   // which tears the box down gracefully. (Modal's `timeoutMs` is only a last-resort backstop; a
   // leaked box bills until then.) See N2.
   const deadline = Date.now() + provisionTimeoutMs;
-  const gpu = input.gpu ?? null;
-  // rag-rat sends the user's `[remote] concurrency` cap as `ollama_num_parallel`; the box's server
-  // parallelism is set to it so rag-rat can fan out up to the cap. rag-rat tunes the actual client
-  // concurrency (within the cap) itself, against the box, after `ready`.
-  const ollamaNumParallel = String(input.ollama_num_parallel ?? 1);
+  // ollama/infinity default to CPU; a GPU-required backend (vLLM) gets a default GPU when none given.
+  const gpu = input.gpu ?? (spec.requiresGpu ? MODAL_DEFAULT_GPU : null);
 
   ctx.status(
     "provisioning",
-    `creating Modal sandbox (model=${input.model}, gpu=${gpu ?? "cpu"}, parallel=${ollamaNumParallel})`,
+    `creating Modal sandbox (backend=${spec.backend}, model=${input.model}, gpu=${gpu ?? "cpu"})`,
   );
 
   // Creds resolve from env (MODAL_TOKEN_ID/MODAL_TOKEN_SECRET) or ~/.modal.toml.
@@ -85,7 +90,7 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
     modal.apps.fromName(APP_NAME, { createIfMissing: true }),
   );
 
-  const image = modal.images.fromRegistry("ollama/ollama:latest");
+  const image = modal.images.fromRegistry(spec.image(input));
 
   // CREATE-TIMEOUT ORPHAN (#330-1, the Modal analog of RunPod's N3 deploy-orphan sweep): the create
   // is `withBudget`-bounded, but Modal can REACH the backend and CREATE the sandbox and then have the
@@ -96,22 +101,17 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   // worst case — but a leaked GPU box for up to 30 min is still real money.)
   const sandboxName = `${APP_NAME}-${Date.now()}-${randomUUID().slice(0, 8)}`;
 
-  // Modal passes `command` as ENTRYPOINT args for registry images. The ollama image's entrypoint is
-  // `/bin/ollama`, so `["serve"]` starts `ollama serve`; including `/bin/ollama` here would become
-  // `ollama /bin/ollama serve` and fail before readiness.
+  // The backend spec supplies the entrypoint ARGS (never the entrypoint) + env + the served port.
   let sb: Sandbox;
   const createRef: { promise?: Promise<Sandbox> } = {};
   try {
     sb = await withBudget(deadline, "sandboxes.create", () => {
       createRef.promise = modal.sandboxes.create(app, image, {
         name: sandboxName,
-        command: ["serve"],
-        env: {
-          OLLAMA_HOST: `0.0.0.0:${OLLAMA_PORT}`,
-          OLLAMA_NUM_PARALLEL: ollamaNumParallel,
-        },
-        encryptedPorts: [OLLAMA_PORT],
-        readinessProbe: Probe.withTcp(OLLAMA_PORT, { intervalMs: 1000 }),
+        command: [...spec.entrypointArgs(input)],
+        env: spec.env(input),
+        encryptedPorts: [port],
+        readinessProbe: Probe.withTcp(port, { intervalMs: 1000 }),
         timeoutMs: BOX_MAX_LIFETIME_MS,
         ...(gpu !== null ? { gpu } : {}),
       });
@@ -137,34 +137,26 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   ctx.onBox(sb);
   log("info", `sandbox created: ${sb.sandboxId ?? "(id unavailable)"}`);
 
-  ctx.status("provisioning", `waiting for ollama serve on port ${OLLAMA_PORT}`);
+  ctx.status("provisioning", `waiting for ${spec.backend} to listen on port ${port}`);
   const readinessTimeoutMs = assertBudgetRemaining(deadline, "sandbox readiness");
   await raceWithTimeout(
     () => sb.waitUntilReady(readinessTimeoutMs),
     readinessTimeoutMs,
     "sandbox.waitUntilReady",
   );
-  log("info", "ollama serve is listening");
+  log("info", `${spec.backend} is listening`);
 
-  // Pull the model. The server (`serve`) is the box's main process; pull runs as an exec
-  // against the same ollama install, populating the model store the server reads. Every step
-  // (exec dispatch, wait, stderr read) is budget-bounded.
-  ctx.status("pulling", `pulling model "${input.model}" (cold-start cost)`);
-  const pull = await withBudget(deadline, "exec(ollama pull)", () =>
-    sb.exec(["ollama", "pull", input.model], { mode: "text", stdout: "pipe", stderr: "pipe" }),
-  );
-  const pullCode = await withBudget(deadline, "pull.wait", () => pull.wait());
-  if (pullCode !== 0) {
-    const err = await withBudget(deadline, "pull.stderr.readText", () => pull.stderr.readText());
-    throw new Error(`"ollama pull ${input.model}" exited ${pullCode}: ${err.trim()}`);
+  // Load the model. infinity/vLLM auto-download on boot (nothing to do); ollama boots empty, so pull
+  // the model into the running server via an in-box exec.
+  if (spec.modelLoad === "ollama-pull") {
+    await pullOllamaModel(sb, input.model, deadline, ctx);
   }
-  log("info", `model "${input.model}" pulled`);
 
   // Resolve the public tunnel URL for the served port.
   const tunnels = await withBudget(deadline, "sb.tunnels", () => sb.tunnels());
-  const tunnel = tunnels[OLLAMA_PORT];
+  const tunnel = tunnels[port];
   if (tunnel === undefined) {
-    throw new Error(`no tunnel for port ${OLLAMA_PORT}; got ports [${Object.keys(tunnels).join(", ")}]`);
+    throw new Error(`no tunnel for port ${port}; got ports [${Object.keys(tunnels).join(", ")}]`);
   }
   const endpoint = tunnel.url;
   log("info", `tunnel up: ${endpoint}`);
@@ -172,15 +164,39 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   // Verify the server actually embeds before we emit `ready`. This catches a box that booted but
   // isn't serving (the whole point of waiting before the ready event). Budget = the time REMAINING
   // until the shared deadline (create + pull already consumed some); throws if it's spent.
-  ctx.status("verifying", "probing /api/embed for a real vector");
+  ctx.status("verifying", `probing ${spec.embedPath} for a real vector`);
   await verifyEmbed(endpoint, {
     model: input.model,
+    embedPath: spec.embedPath,
     budgetMs: assertBudgetRemaining(deadline, "embed verification"),
   });
   log("info", "embed verification passed; box is serving");
 
   // Open tunnel via encryptedPorts → no per-request token needed. auth_token stays null.
   return { handle: sb, endpoint, auth_token: null };
+}
+
+/**
+ * Pull `model` into the running ollama via an in-box exec (the server `serve` is the main process;
+ * the pull populates the model store it reads). Every step (exec dispatch, wait, stderr read) is
+ * budget-bounded. ollama-only — infinity/vLLM auto-download on boot.
+ */
+async function pullOllamaModel(
+  sb: Sandbox,
+  model: string,
+  deadline: number,
+  ctx: ProvisionContext<Sandbox>,
+): Promise<void> {
+  ctx.status("pulling", `pulling model "${model}" (cold-start cost)`);
+  const pull = await withBudget(deadline, "exec(ollama pull)", () =>
+    sb.exec(["ollama", "pull", model], { mode: "text", stdout: "pipe", stderr: "pipe" }),
+  );
+  const pullCode = await withBudget(deadline, "pull.wait", () => pull.wait());
+  if (pullCode !== 0) {
+    const err = await withBudget(deadline, "pull.stderr.readText", () => pull.stderr.readText());
+    throw new Error(`"ollama pull ${model}" exited ${pullCode}: ${err.trim()}`);
+  }
+  log("info", `model "${model}" pulled`);
 }
 
 /**

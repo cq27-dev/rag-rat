@@ -1,11 +1,12 @@
 //! The EPHEMERAL cookbook lifecycle (#318): rag-rat spawns a "cookbook" recipe as a subprocess that
-//! provisions an on-demand Ollama box (e.g. a Modal GPU sandbox), prints a one-line handshake when
-//! the box is serving, then stays alive until rag-rat tears it down at the end of the bulk
-//! reconcile.
+//! provisions an on-demand embedding box (ollama, infinity, or vLLM — selected by `backend`; e.g. a
+//! Modal GPU sandbox), prints a one-line handshake when the box is serving, then stays alive until
+//! rag-rat tears it down at the end of the bulk reconcile.
 //!
 //! THE PROCESS CONTRACT (rag-rat ⇄ cookbook — both sides build to this exact shape):
 //! - INPUT via env `RAG_RAT_COOKBOOK_INPUT` = JSON
-//!   `{"model","request_timeout_s","provision_timeout_s","gpu","ollama_num_parallel"}`.
+//!   `{"model","backend","request_timeout_s","provision_timeout_s","gpu","num_ctx",
+//!   "server_concurrency"}`.
 //! - The cookbook's STDOUT is a TYPED JSONL event stream — one JSON object per line, each with a
 //!   `"type"` tag and a `"ts"` (epoch-ms) field (see [`CookbookEvent`]). The four `type`s are
 //!   `status` (a provisioning-phase update: `provisioning`/`pulling`/`verifying`/`tearing_down`),
@@ -130,11 +131,17 @@ pub fn install_provision_log_sink(tx: mpsc::Sender<String>) -> ProvisionLogSinkG
 /// The JSON written to `RAG_RAT_COOKBOOK_INPUT` for the cookbook subprocess.
 #[derive(Debug, Clone, Serialize)]
 pub struct CookbookInput {
-    /// The Ollama server-side model name the box should serve (the `[remote] model`).
+    /// The server-side model name the box should serve (the `[remote] model`): an ollama model
+    /// name for the ollama backend, or a HuggingFace model id for infinity/vLLM.
     pub model: String,
+    /// Which embedding backend the recipe should provision — the `RemoteBackend::as_db_str` of the
+    /// configured backend (`ollama`/`infinity`/`vllm`). Selects the recipe's image, launch
+    /// command, port, embeddings route, and model-load strategy; the embed WIRE CALL is
+    /// identical across all three (OpenAI `/v1/embeddings` shape).
+    pub backend: &'static str,
     /// Per-REQUEST HTTP timeout the cookbook may forward to its box config — the
-    /// `OpenAiEmbedder`'s per-`/api/embed` budget. UNRELATED to provisioning; do NOT use it as
-    /// the boot budget.
+    /// `OpenAiEmbedder`'s per-request budget. UNRELATED to provisioning; do NOT use it as the
+    /// boot budget.
     pub request_timeout_s: u64,
     /// The cookbook's PROVISIONING budget (seconds): how long the recipe may spend booting the
     /// box, pulling the model, and verifying it serves before giving up. Decoupled from
@@ -146,11 +153,17 @@ pub struct CookbookInput {
     /// GPU hint for the recipe (e.g. `"T4"`); `None` lets the recipe decide. Carried as JSON
     /// `null` when absent so the contract field is always present.
     pub gpu: Option<String>,
-    /// Ollama server parallelism the recipe should set as `OLLAMA_NUM_PARALLEL`. rag-rat sends the
-    /// user's `[remote] concurrency` CAP; the box is provisioned to handle up to that many
-    /// parallel requests, and rag-rat tunes the actual client fan-out (within the cap) itself
-    /// against the box.
-    pub ollama_num_parallel: u32,
+    /// Context window (`num_ctx`) to bake into the ephemeral box for the OLLAMA backend
+    /// (`OLLAMA_CONTEXT_LENGTH`), so chunk vectors match the freshness key that folds `num_ctx`
+    /// in. `None` → the server default; ignored by infinity/vLLM. Carried as JSON `null` when
+    /// absent.
+    pub num_ctx: Option<u32>,
+    /// Server-side request parallelism the box should accept. rag-rat sends the user's `[remote]
+    /// concurrency` CAP; the box is provisioned to handle up to that many parallel requests, and
+    /// rag-rat tunes the actual client fan-out (within the cap) itself against the box. Each
+    /// backend maps it to its own knob (ollama → `OLLAMA_NUM_PARALLEL`; vLLM →
+    /// `--max-num-seqs`; infinity ignores it).
+    pub server_concurrency: u32,
 }
 
 /// One line of the cookbook's typed JSONL stdout stream. Tagged on `"type"`; the `"ts"` field and
@@ -493,10 +506,13 @@ impl CookbookProvisioner {
 
 /// Build the `CookbookInput` (the env-passed provisioning request) from an ephemeral remote config.
 /// Split out from `provision_and_build` so the config→input mapping — notably that the configured
-/// `gpu` is forwarded — is unit-testable without spawning a real recipe.
+/// `backend`, `gpu`, and `num_ctx` are forwarded — is unit-testable without spawning a real recipe.
 fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
     CookbookInput {
         model: remote.model.trim().to_string(),
+        // The selected backend routes the recipe's image/launch/port/route; the embed wire call is
+        // identical across all three.
+        backend: remote.backend.as_db_str(),
         request_timeout_s: remote.request_timeout_s,
         // Give the recipe a provisioning budget just under the Rust hard ceiling, so ITS budget
         // runs out first (clean provider-side teardown) before the Rust SIGKILL backstop
@@ -506,9 +522,12 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
         // recipe picks its own default when `None`. Config validation guarantees `gpu` is only set
         // in ephemeral mode, which is the only mode reaching this function.
         gpu: remote.gpu.clone(),
+        // The configured context window, baked into the ephemeral ollama box so chunk vectors match
+        // the freshness key (ignored by infinity/vLLM). `None` → the server default.
+        num_ctx: remote.num_ctx,
         // The user's `[remote] concurrency` cap — the box's server parallelism ceiling. rag-rat
         // fans out up to this many parallel requests and auto-tunes the client knee within it.
-        ollama_num_parallel: remote.bounded_concurrency(),
+        server_concurrency: remote.bounded_concurrency(),
     }
 }
 
@@ -1163,10 +1182,12 @@ mod tests {
     fn input() -> CookbookInput {
         CookbookInput {
             model: "all-minilm".to_string(),
+            backend: "ollama",
             request_timeout_s: 30,
             provision_timeout_s: 280,
             gpu: None,
-            ollama_num_parallel: 32,
+            num_ctx: None,
+            server_concurrency: 32,
         }
     }
 
@@ -1220,10 +1241,10 @@ mod tests {
     }
 
     #[test]
-    fn cookbook_input_carries_configured_gpu_and_parallelism() {
+    fn cookbook_input_carries_configured_gpu_parallelism_backend_and_num_ctx() {
         // The config→CookbookInput mapping must forward provider/runtime knobs to the recipe:
-        // `gpu` selects the provider shape, and `ollama_num_parallel` aligns server concurrency
-        // with the client-side remote request window.
+        // `gpu` selects the provider shape, `server_concurrency` aligns the server-side parallelism
+        // with the client-side remote request window, and `backend`/`num_ctx` route provisioning.
         let ephemeral = |gpu: Option<&str>, concurrency: u32| RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
             cookbook: Some("@rag-rat/cookbook modal".to_string()),
@@ -1234,18 +1255,32 @@ mod tests {
         };
         assert_eq!(cookbook_input_for(&ephemeral(Some("A10G"), 16)).gpu.as_deref(), Some("A10G"));
         assert_eq!(cookbook_input_for(&ephemeral(None, 16)).gpu, None);
-        assert_eq!(cookbook_input_for(&ephemeral(None, 16)).ollama_num_parallel, 16);
-        assert_eq!(cookbook_input_for(&ephemeral(None, 0)).ollama_num_parallel, 1);
+        assert_eq!(cookbook_input_for(&ephemeral(None, 16)).server_concurrency, 16);
+        assert_eq!(cookbook_input_for(&ephemeral(None, 0)).server_concurrency, 1);
         assert_eq!(
             cookbook_input_for(&ephemeral(
                 None,
                 crate::config::MAX_REMOTE_EMBEDDING_CONCURRENCY + 1
             ))
-            .ollama_num_parallel,
+            .server_concurrency,
             crate::config::MAX_REMOTE_EMBEDDING_CONCURRENCY
         );
         // The model is trimmed into the input regardless of gpu.
         assert_eq!(cookbook_input_for(&ephemeral(Some("A100"), 16)).model, "all-minilm");
+        // Backend defaults to ollama and `num_ctx` is absent unless configured.
+        assert_eq!(cookbook_input_for(&ephemeral(None, 16)).backend, "ollama");
+        assert_eq!(cookbook_input_for(&ephemeral(None, 16)).num_ctx, None);
+        // A configured backend + context window are forwarded verbatim.
+        let infinity = RemoteEmbeddingConfig {
+            model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            cookbook: Some("@rag-rat/cookbook modal".to_string()),
+            query_endpoint: Some(crate::config::DEFAULT_QUERY_ENDPOINT.to_string()),
+            backend: crate::config::RemoteBackend::Infinity,
+            num_ctx: Some(4096),
+            ..RemoteEmbeddingConfig::default()
+        };
+        assert_eq!(cookbook_input_for(&infinity).backend, "infinity");
+        assert_eq!(cookbook_input_for(&infinity).num_ctx, Some(4096));
     }
 
     #[test]

@@ -31,6 +31,23 @@ export const COOKBOOK_INPUT_ENV = "RAG_RAT_COOKBOOK_INPUT";
 /** The providers a recipe can target. Tags every `status` event. */
 export type Provider = "modal" | "runpod";
 
+/**
+ * The embedding server a recipe provisions. All three speak the OpenAI-compatible embeddings API
+ * (`POST <embedPath>` with `{model, input:[…]}` → `{data:[{embedding,index}]}`), so the Rust client
+ * and {@link verifyEmbed} are backend-independent; the backend only selects the container image,
+ * launch command, port, model-load strategy, and the embeddings ROUTE (ollama/vLLM serve
+ * `/v1/embeddings`; michaelfeil/infinity's `v2` server serves `/embeddings`).
+ */
+export type Backend = "ollama" | "infinity" | "vllm";
+
+/** The backends a recipe understands, for input validation. Keep in sync with {@link Backend}. */
+export const BACKENDS: readonly Backend[] = ["ollama", "infinity", "vllm"] as const;
+
+/** Narrows an arbitrary string to a known {@link Backend}, or `undefined` if unrecognized. */
+export function asBackend(value: string): Backend | undefined {
+  return (BACKENDS as readonly string[]).includes(value) ? (value as Backend) : undefined;
+}
+
 /** Provisioning lifecycle phases reported by a `status` event. */
 export type Phase = "provisioning" | "pulling" | "verifying" | "tearing_down";
 
@@ -69,8 +86,24 @@ export function emit(event: CookbookEvent): void {
  * fields off the same object, but every recipe must honor at least `model`.
  */
 export interface CookbookInput {
-  /** Embedding model to pull and serve, e.g. "all-minilm". */
+  /**
+   * Embedding model to serve. Its meaning is BACKEND-specific: an ollama model name (`all-minilm`)
+   * for ollama, or a HuggingFace model id (`sentence-transformers/all-MiniLM-L6-v2`) for infinity
+   * and vLLM, which auto-download it from HF on server start.
+   */
   readonly model: string;
+  /**
+   * Which embedding server to provision. Omitted/null → `ollama` (the default backend, e.g. a bare
+   * hand-run dev invocation). {@link readInput} validates it against {@link BACKENDS}.
+   */
+  readonly backend?: Backend | null;
+  /**
+   * Ollama context window (`OLLAMA_CONTEXT_LENGTH`) to bake into the ephemeral box for the OLLAMA
+   * backend, so chunk vectors match the freshness key that folds `num_ctx` in. Ignored by
+   * infinity/vLLM (context length is a model/server property there, not a per-box knob). Omitted/null
+   * → the server default. See `RemoteEmbeddingConfig::num_ctx` on the Rust side.
+   */
+  readonly num_ctx?: number | null;
   /**
    * Wall-clock budget (seconds) for the WHOLE provisioning sequence — box boot + model pull +
    * first serving response. A remote box's cold start takes MINUTES, so this is generous (the Rust
@@ -93,11 +126,13 @@ export interface CookbookInput {
    */
   readonly gpu?: string | null;
   /**
-   * Ollama server parallelism to set as `OLLAMA_NUM_PARALLEL` on the box. rag-rat sends the user's
-   * `[remote] concurrency` CAP so the server can handle up to that many parallel `/api/embed`
-   * requests. rag-rat then tunes the actual client fan-out (within the cap) itself, against the box.
+   * Server-side request parallelism the box should accept. rag-rat sends the user's `[remote]
+   * concurrency` CAP so the server can handle up to that many parallel embed requests; rag-rat then
+   * tunes the actual client fan-out (within the cap) itself, against the box. Each backend maps it
+   * to its own knob (ollama → `OLLAMA_NUM_PARALLEL`; vLLM → `--max-num-seqs`; infinity ignores it —
+   * its async engine batches dynamically).
    */
-  readonly ollama_num_parallel?: number | null;
+  readonly server_concurrency?: number | null;
 }
 
 /**
@@ -211,10 +246,16 @@ export function readInput(): CookbookInput {
   // like "60" would slip through to budget arithmetic as NaN and break every poll loop.
   const provisionTimeout = optionalPositiveNumber(obj["provision_timeout_s"], "provision_timeout_s");
   const requestTimeout = optionalPositiveNumber(obj["request_timeout_s"], "request_timeout_s");
-  const ollamaNumParallel = optionalPositiveInteger(
-    obj["ollama_num_parallel"],
-    "ollama_num_parallel",
+  const serverConcurrency = optionalPositiveInteger(
+    obj["server_concurrency"],
+    "server_concurrency",
   );
+  const numCtx = optionalPositiveInteger(obj["num_ctx"], "num_ctx");
+
+  // backend: optional; if present must be a KNOWN backend string. Absent/null → ollama (the default
+  // backend, e.g. a bare hand-run dev invocation). A malformed value is a hard error (a typo'd
+  // config beats a silent wrong-backend provision).
+  const backend = optionalBackend(obj["backend"]);
 
   // gpu: optional; if present must be a string (provider spec) or null.
   const gpu = obj["gpu"];
@@ -224,12 +265,32 @@ export function readInput(): CookbookInput {
 
   const result: CookbookInput = {
     model: obj["model"],
+    backend,
     ...(provisionTimeout !== undefined ? { provision_timeout_s: provisionTimeout } : {}),
     ...(requestTimeout !== undefined ? { request_timeout_s: requestTimeout } : {}),
     ...(typeof gpu === "string" ? { gpu } : gpu === null ? { gpu: null } : {}),
-    ...(ollamaNumParallel !== undefined ? { ollama_num_parallel: ollamaNumParallel } : {}),
+    ...(serverConcurrency !== undefined ? { server_concurrency: serverConcurrency } : {}),
+    ...(numCtx !== undefined ? { num_ctx: numCtx } : {}),
   };
   return result;
+}
+
+/**
+ * Validate the optional `backend` field: absent/null → `"ollama"` (the default backend); a known
+ * {@link Backend} string passes through; anything else is a hard error naming the accepted values.
+ */
+function optionalBackend(value: unknown): Backend {
+  if (value === undefined || value === null) return "ollama";
+  if (typeof value !== "string") {
+    throw new Error(`${COOKBOOK_INPUT_ENV}.backend must be a string or null (got ${describe(value)}).`);
+  }
+  const backend = asBackend(value);
+  if (backend === undefined) {
+    throw new Error(
+      `${COOKBOOK_INPUT_ENV}.backend "${value}" is not a known backend (one of: ${BACKENDS.join(", ")}).`,
+    );
+  }
+  return backend;
 }
 
 /** Validates an optional positive-number field; returns the number, or undefined if absent/null. */
@@ -450,6 +511,13 @@ const VERIFY_EMBED_ATTEMPT_TIMEOUT_MS = 30_000;
 export interface VerifyEmbedOptions {
   /** Embedding model name to probe with (the value the server keys on). */
   readonly model: string;
+  /**
+   * Backend-specific embeddings route to probe, e.g. `/v1/embeddings` (ollama/vLLM) or `/embeddings`
+   * (infinity). MUST match the route the Rust client posts to (`RemoteBackend::embed_path`) — the
+   * probe and the real embed call have to hit the same URL, or a box that passes verification still
+   * 404s under load.
+   */
+  readonly embedPath: string;
   /** Wall-clock budget in ms to keep retrying before giving up. Use the provisioning budget. */
   readonly budgetMs: number;
   /** Extra headers (e.g. an auth bearer) to send with each probe. Defaults to none. */
@@ -471,32 +539,40 @@ export function endpointPath(endpoint: string, path: string): string {
 }
 
 /**
- * Polls `<endpoint>/api/embed` until it returns a real embedding vector, or the budget runs out.
+ * Polls `<endpoint><options.embedPath>` with the OpenAI-compatible embeddings request until it
+ * returns a real vector, or the budget runs out.
  *
  * Every recipe must call this BEFORE handing rag-rat the endpoint: a box can be reachable (tunnel
- * up) while ollama is still loading the model, so "box created" is not "box serving". A non-empty
- * `embeddings[0]` vector is the readiness signal. Throws if the budget elapses with no vector.
+ * up) while the server is still loading/downloading the model, so "box created" is not "box
+ * serving". The probe posts the SAME shape the Rust client uses — `{model, input:["…"],
+ * encoding_format:"float"}` — so a server that rejects the array/encoding_format form fails HERE, at
+ * provision time, not later on the reconcile hot path. A non-empty `data[0].embedding` vector is the
+ * readiness signal. Throws if the budget elapses with no vector.
  */
 export function verifyEmbed(endpoint: string, options: VerifyEmbedOptions): Promise<void> {
-  const url = endpointPath(endpoint, "/api/embed");
-  return pollUntil<{ embeddings?: unknown }>(url, {
+  const url = endpointPath(endpoint, options.embedPath);
+  return pollUntil<{ data?: unknown }>(url, {
     label: "embed probe",
     budgetMs: options.budgetMs,
     body: {
       model: options.model,
-      input: "rag-rat embed readiness probe",
+      // ARRAY input (not a bare string) to match the Rust client's batch shape exactly — see the
+      // per-backend embed_path invariant in `RemoteBackend`.
+      input: ["rag-rat embed readiness probe"],
+      encoding_format: "float",
     },
     pollIntervalMs: options.pollIntervalMs ?? VERIFY_EMBED_POLL_INTERVAL_MS,
     perAttemptTimeoutMs: options.perAttemptTimeoutMs ?? VERIFY_EMBED_ATTEMPT_TIMEOUT_MS,
     ...(options.headers !== undefined ? { headers: options.headers } : {}),
     isReady: (body) => {
-      const embeddings = body.embeddings;
-      if (
-        Array.isArray(embeddings) &&
-        embeddings.length > 0 &&
-        Array.isArray(embeddings[0]) &&
-        embeddings[0].length > 0
-      ) {
+      // OpenAI shape: {data:[{embedding:[…], index:0}, …]}. A non-empty first vector = serving.
+      const data = body.data;
+      const first = Array.isArray(data) && data.length > 0 ? data[0] : undefined;
+      const embedding =
+        typeof first === "object" && first !== null
+          ? (first as { embedding?: unknown }).embedding
+          : undefined;
+      if (Array.isArray(embedding) && embedding.length > 0) {
         return { ready: true };
       }
       return {

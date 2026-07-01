@@ -22,7 +22,7 @@ trap teardown TERM
 
 throughput=""
 if [ -n "$STUB_THROUGHPUT" ]; then
-  throughput=',"throughput":{"concurrency":4,"batch_size":128,"ollama_num_parallel":4,"max_batch_chars":96000}'
+  throughput=',"throughput":{"concurrency":4,"batch_size":128,"server_concurrency":4,"max_batch_chars":96000}'
 fi
 
 # The `ready` event (the handshake) — type-tagged JSONL with a ts field.
