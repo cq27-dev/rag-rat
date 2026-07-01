@@ -489,13 +489,32 @@ pub(crate) fn benchmark_embedding(
 
     // Build an EPHEMERAL remote config directly (no rag-rat.toml round-trip): `cookbook` set,
     // `endpoint` None. Struct construction bypasses the config layer's connect/ephemeral
-    // validation, which is fine — the benchmark only provisions + sweeps, it never reconciles,
-    // so the only knobs that matter are the provisioning inputs (cookbook/backend/gpu/model)
-    // and the request shape (batch_size/max_batch_chars/concurrency/timeout), which come from
-    // the defaults.
-    let cap = config.llm.embedding.remote.as_ref().map_or_else(
-        || RemoteEmbeddingConfig::default().bounded_concurrency(),
-        RemoteEmbeddingConfig::bounded_concurrency,
+    // validation, which is fine — the benchmark only provisions + sweeps, it never reconciles.
+    //
+    // Base it on the repo's configured `[remote]` block (or defaults) so the benchmark mirrors the
+    // LIVE reconcile REQUEST SHAPE — `batch_size` / `max_batch_chars` / `request_timeout_s` /
+    // `num_ctx` are carried over via `..base`; only the provisioning + CLI-selected fields are
+    // overridden. Filling the request shape from `default()` instead would benchmark a different
+    // request than this repo's reconcile actually sends.
+    let base = config.llm.embedding.remote.clone().unwrap_or_default();
+    let cap = base.bounded_concurrency();
+
+    let max_embedding_chars = config.llm.embedding.runtime.max_embedding_chars;
+    // The candidate ladder: explicit `--candidates` when given, else the tuner's default ladder for
+    // the config's concurrency cap (powers of two up to the cap, plus the exact cap).
+    let candidates: Vec<u32> = if args.candidates.is_empty() {
+        rag_rat_core::index::ai::default_benchmark_candidates(cap)
+    } else {
+        args.candidates.clone()
+    };
+
+    // Size the provisioned server for the HIGHEST fan-out the sweep will test: `concurrency` is
+    // forwarded as `server_concurrency` (ollama `OLLAMA_NUM_PARALLEL` / vLLM `--max-num-seqs`;
+    // infinity ignores it). Explicit `--candidates` above the cap would otherwise drive client
+    // fan-outs the server was NOT launched to handle, so those rows would look slow / fail for the
+    // wrong reason. Take the max candidate (never below the cap), clamped to the global ceiling.
+    let provision_concurrency = RemoteEmbeddingConfig::bounded_concurrency_value(
+        candidates.iter().copied().max().unwrap_or(cap).max(cap),
     );
     let remote = RemoteEmbeddingConfig {
         model: args.model.clone(),
@@ -505,19 +524,8 @@ pub(crate) fn benchmark_embedding(
         query_endpoint: None,
         auth_env: None,
         gpu: args.gpu.clone(),
-        // The benchmark measures the request shape from the config defaults; `concurrency` here is
-        // only the CAP that sizes the default candidate ladder, not a live fan-out.
-        concurrency: cap,
-        ..RemoteEmbeddingConfig::default()
-    };
-
-    let max_embedding_chars = config.llm.embedding.runtime.max_embedding_chars;
-    // The candidate ladder: explicit `--candidates` when given, else the tuner's default ladder for
-    // the config's concurrency cap (powers of two up to the cap, plus the exact cap).
-    let candidates: Vec<u32> = if args.candidates.is_empty() {
-        rag_rat_core::index::ai::default_benchmark_candidates(cap)
-    } else {
-        args.candidates.clone()
+        concurrency: provision_concurrency,
+        ..base
     };
     let budget_ms =
         args.budget_ms.unwrap_or_else(rag_rat_core::index::ai::default_benchmark_budget_ms);
