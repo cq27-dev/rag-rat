@@ -311,6 +311,7 @@ mod ollama_install_tests {
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,

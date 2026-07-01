@@ -219,16 +219,56 @@ impl Default for EmbeddingRuntimeConfig {
     }
 }
 
-/// Remote-embedding offload (`[llm.embedding.remote]`). Hands embedding work to an HTTP
-/// server (Ollama's `/api/embed`) instead of running the model in-process — the lever for huge
-/// repos whose in-process backfill is too slow on the indexing box. Optional: absent → in-process
-/// embedding only.
+/// Which OpenAI-compatible embedding server serves a `[remote]` block. All three speak the SAME
+/// wire API (`POST /v1/embeddings`), so the embedding client is IDENTICAL regardless of backend —
+/// the selector only routes ephemeral provisioning (which cookbook container), the freshness /
+/// vector- identity marker (different backends can produce slightly different vectors), the tune
+/// cache key, and the `ai_models.runtime` install marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteBackend {
+    /// ollama, via its `/v1/embeddings` OpenAI-compatibility route (the default; back-compat).
+    #[default]
+    Ollama,
+    /// michaelfeil/infinity (`infinity_emb v2 --model-id <hf>`).
+    Infinity,
+    /// vLLM in embedding mode (`vllm serve <hf> --task embed`).
+    Vllm,
+}
+
+impl RemoteBackend {
+    /// The stable wire/DB string (matches the serde repr): the `ai_models.runtime` marker, and the
+    /// backend discriminator folded into the freshness key + the tune cache key.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            RemoteBackend::Ollama => "ollama",
+            RemoteBackend::Infinity => "infinity",
+            RemoteBackend::Vllm => "vllm",
+        }
+    }
+
+    /// Parse a config `backend = "..."` value (case-insensitive). `None` for an unknown value — the
+    /// config layer turns that into `ConfigError::RemoteBackendUnknown`.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ollama" => Some(RemoteBackend::Ollama),
+            "infinity" => Some(RemoteBackend::Infinity),
+            "vllm" => Some(RemoteBackend::Vllm),
+            _ => None,
+        }
+    }
+}
+
+/// Remote-embedding offload (`[llm.embedding.remote]`). Hands embedding work to an
+/// OpenAI-compatible HTTP server (`POST /v1/embeddings` on ollama/infinity/vLLM) instead of running
+/// the model in-process — the lever for huge repos whose in-process backfill is too slow on the
+/// indexing box. Optional: absent → in-process embedding only.
 ///
-/// Deliberately carries NO `dim` or `backend` field. The vector dimension comes from the registry
-/// spec of the SELECTED model (`model = "sentence-transformers/all-MiniLM-L6-v2"`, dim 384) and is
-/// validated against the server's first response at runtime by the embedder; the runtime is implied
-/// by this block's mere PRESENCE (#317 rework). Duplicating either here would be redundant and
-/// drift-prone.
+/// Carries NO `dim` field: the vector dimension comes from the registry spec of the SELECTED model
+/// (`model = "sentence-transformers/all-MiniLM-L6-v2"`, dim 384) and is validated against the
+/// server's first response at runtime by the embedder; duplicating it here would be redundant and
+/// drift-prone. The `backend` selector (default `ollama`) picks WHICH server; the runtime is
+/// implied by this block's mere PRESENCE (#317 rework).
 ///
 /// The mode is INFERRED, not configured — there is no `mode` field (#318). EXACTLY ONE of
 /// `endpoint` / `cookbook` is set:
@@ -244,10 +284,19 @@ impl Default for EmbeddingRuntimeConfig {
 /// the serialized JSON holds no secret. `Deserialize` is the read side of that meta round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEmbeddingConfig {
-    /// The Ollama API model name sent to `/api/embed` (e.g. `"all-minilm"`). This is the server's
-    /// own model identifier, NOT a `rag-rat` registry alias — the registry only supplies the dim
-    /// parity contract.
+    /// The SERVER-side model name sent in the `/v1/embeddings` request body — the server's own
+    /// identifier, NOT a `rag-rat` registry alias (the registry only supplies the dim parity
+    /// contract). For `backend = "ollama"` this is the ollama model name (e.g. `"all-minilm"`);
+    /// for infinity/vLLM it is the HuggingFace id the server was launched with (e.g.
+    /// `"sentence-transformers/all-MiniLM-L6-v2"`).
     pub model: String,
+    /// Which OpenAI-compatible server serves this block (`ollama` | `infinity` | `vllm`). The wire
+    /// call is identical across backends; this only routes provisioning + the
+    /// freshness/tune/install markers. `#[serde(default)]` → `Ollama` so config JSON persisted
+    /// before this field (and any omitted TOML) still deserializes as the pre-existing ollama
+    /// behavior.
+    #[serde(default)]
+    pub backend: RemoteBackend,
     /// CONNECT: base URL of an already-running Ollama (e.g. `"http://localhost:11434"`);
     /// `/api/embed` is appended by the embedder. Mutually exclusive with `cookbook`.
     pub endpoint: Option<String>,
@@ -321,6 +370,7 @@ impl Default for RemoteEmbeddingConfig {
     fn default() -> Self {
         Self {
             model: String::new(),
+            backend: RemoteBackend::Ollama,
             endpoint: None,
             cookbook: None,
             query_endpoint: None,
@@ -865,6 +915,7 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
 #[derive(Debug, Default, Deserialize)]
 struct RawRemoteEmbedding {
     model: Option<String>,
+    backend: Option<String>,
     endpoint: Option<String>,
     cookbook: Option<String>,
     query_endpoint: Option<String>,
@@ -924,12 +975,19 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
     fn try_from(raw: RawRemoteEmbedding) -> Result<Self, Self::Error> {
         let default = RemoteEmbeddingConfig::default();
         let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        // The Ollama API model name (e.g. `all-minilm`) — required, non-empty.
+        // The SERVER-side model name — required, non-empty. For ollama the ollama model name; for
+        // infinity/vLLM the HF id the server was launched with.
         let model = raw.model.unwrap_or_default();
         let model = model.trim();
         if model.is_empty() {
             return Err(ConfigError::RemoteEmbeddingMissingModel);
         }
+        // Which OpenAI-compatible server serves this block. Omitted → `ollama` (back-compat).
+        let backend = match trimmed(raw.backend) {
+            None => RemoteBackend::default(),
+            Some(raw_backend) => RemoteBackend::from_db_str(&raw_backend)
+                .ok_or(ConfigError::RemoteBackendUnknown(raw_backend))?,
+        };
         // The MODE is INFERRED from which URL field is set (#318): EXACTLY ONE of `endpoint`
         // (connect) / `cookbook` (ephemeral). Both → ambiguous; neither → no server to reach.
         let endpoint = trimmed(raw.endpoint);
@@ -993,6 +1051,7 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
         }
         Ok(Self {
             model: model.to_string(),
+            backend,
             endpoint,
             cookbook,
             query_endpoint,
@@ -1059,7 +1118,12 @@ pub enum ConfigError {
     )]
     RemoteEmbeddingMissingModel,
     #[error(
-        "[llm.embedding.remote] requires EXACTLY ONE of `endpoint` (connect to a running Ollama) \
+        "[llm.embedding.remote] `backend` must be one of `ollama`, `infinity`, or `vllm` (got \
+         `{0}`)"
+    )]
+    RemoteBackendUnknown(String),
+    #[error(
+        "[llm.embedding.remote] requires EXACTLY ONE of `endpoint` (connect to a running server) \
          or `cookbook` (provision an ephemeral box) — set neither both nor zero"
     )]
     RemoteEmbeddingModeAmbiguous,
@@ -1468,6 +1532,7 @@ mod tests {
             llm.embedding.remote,
             Some(RemoteEmbeddingConfig {
                 model: "all-minilm".to_string(),
+                backend: RemoteBackend::Ollama,
                 endpoint: Some("http://localhost:11434".to_string()),
                 cookbook: None,
                 query_endpoint: None, // connect mode: no local query box
@@ -1644,6 +1709,7 @@ mod tests {
             llm.embedding.remote,
             Some(RemoteEmbeddingConfig {
                 model: "all-minilm".to_string(),
+                backend: RemoteBackend::Ollama,
                 endpoint: Some("http://localhost:11434".to_string()),
                 cookbook: None,
                 query_endpoint: None,
@@ -1917,6 +1983,48 @@ mod tests {
             matches!(err, ConfigError::RemoteEmbeddingMissingModel),
             "whitespace-only [remote] model → RemoteEmbeddingMissingModel, got {err:?}",
         );
+    }
+
+    #[test]
+    fn remote_backend_parses_defaults_to_ollama_and_rejects_unknown() {
+        let parse = |backend_line: &str| -> Result<RemoteEmbeddingConfig, ConfigError> {
+            let raw: RawConfig = toml::from_str(&format!(
+                r#"
+                [index]
+                root = "."
+
+                [llm.embedding]
+                model = "sentence-transformers/all-MiniLM-L6-v2"
+
+                [llm.embedding.remote]
+                model = "all-minilm"
+                endpoint = "http://localhost:11434"
+                {backend_line}
+                "#
+            ))
+            .unwrap();
+            LlmConfig::try_from(raw.llm).map(|llm| llm.embedding.remote.unwrap())
+        };
+        // Omitted → ollama (back-compat with pre-selector configs).
+        assert_eq!(parse("").unwrap().backend, RemoteBackend::Ollama);
+        // Explicit, case-insensitive.
+        assert_eq!(parse(r#"backend = "infinity""#).unwrap().backend, RemoteBackend::Infinity);
+        assert_eq!(parse(r#"backend = "VLLM""#).unwrap().backend, RemoteBackend::Vllm);
+        // Unknown → a clear config error naming the bad value.
+        let err = parse(r#"backend = "tgi""#).unwrap_err();
+        assert!(matches!(&err, ConfigError::RemoteBackendUnknown(v) if v == "tgi"), "got {err:?}");
+    }
+
+    #[test]
+    fn remote_backend_db_str_round_trips_and_matches_serde() {
+        for b in [RemoteBackend::Ollama, RemoteBackend::Infinity, RemoteBackend::Vllm] {
+            assert_eq!(RemoteBackend::from_db_str(b.as_db_str()), Some(b));
+            // The serde repr (persisted into the index meta) MUST equal `as_db_str` (the runtime
+            // marker + freshness/tune-key discriminator) so the two representations never drift.
+            let json = serde_json::to_string(&b).unwrap();
+            assert_eq!(json, format!("\"{}\"", b.as_db_str()));
+        }
+        assert_eq!(RemoteBackend::from_db_str("nope"), None);
     }
 
     #[test]

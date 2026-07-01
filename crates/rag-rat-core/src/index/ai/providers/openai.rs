@@ -601,6 +601,7 @@ mod tests {
     fn config_for(endpoint: &str, timeout_s: u64) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,

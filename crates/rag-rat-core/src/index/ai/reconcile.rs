@@ -1392,6 +1392,7 @@ mod freshness_version_tests {
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -2257,6 +2258,7 @@ mod freshness_version_tests {
         set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: None,
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
             query_endpoint: Some("http://localhost:11434".to_string()),

@@ -338,6 +338,7 @@ mod dispatch_tests {
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -392,6 +393,7 @@ mod dispatch_tests {
     fn ephemeral_at(query_endpoint: &str, auth_env: Option<&str>) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: None,
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
             query_endpoint: Some(query_endpoint.to_string()),

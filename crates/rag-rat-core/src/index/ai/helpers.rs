@@ -515,6 +515,7 @@ mod tests {
     fn sample_remote() -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some("http://localhost:11434".to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -614,6 +615,7 @@ mod tests {
         activate_model(&conn, FASTEMBED_MODEL_ID);
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some(format!("http://127.0.0.1:{port}")),
             cookbook: None,
             query_endpoint: None,

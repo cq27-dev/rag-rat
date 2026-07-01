@@ -2145,6 +2145,10 @@ fn remote_config_for(d: &RemoteDraft) -> RemoteEmbeddingConfig {
     };
     RemoteEmbeddingConfig {
         model: d.model.clone(),
+        // The wizard's Remote step does not yet offer a backend picker (follow-up), so it drafts
+        // the default `ollama` backend; a user wanting infinity/vLLM sets `[remote]
+        // backend` in the TOML.
+        backend: rag_rat_core::config::RemoteBackend::Ollama,
         endpoint: ep,
         cookbook: cb,
         query_endpoint: None,
