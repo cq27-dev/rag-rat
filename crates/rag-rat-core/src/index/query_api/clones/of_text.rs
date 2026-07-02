@@ -94,10 +94,12 @@ impl IndexDatabase {
         min_similarity: f64,
     ) -> anyhow::Result<Vec<TextCloneMatch>> {
         let conn = self.storage.connection();
-        let Some(corpus) = self.load_clone_corpus(conn)? else {
-            return Ok(Vec::new());
-        };
-        check_against(corpus.as_ref(), conn, text, language, path, min_similarity)
+        with_clone_read_snapshot(conn, || {
+            let Some(corpus) = self.load_clone_corpus(conn)? else {
+                return Ok(Vec::new());
+            };
+            check_against(corpus.as_ref(), conn, text, language, path, min_similarity)
+        })
     }
 
     /// Cheap count of fingerprinted baseline functions — a write-time hook reads it to BOUND its
@@ -155,21 +157,23 @@ impl IndexDatabase {
         min_similarity: f64,
     ) -> anyhow::Result<Vec<TextCloneMatch>> {
         let conn = self.storage.connection();
-        let Some(corpus) = self.load_clone_corpus(conn)? else {
-            return Ok(Vec::new());
-        };
-        let mut all = Vec::new();
-        for input in inputs {
-            all.extend(check_against(
-                corpus.as_ref(),
-                conn,
-                &input.text,
-                input.language,
-                &input.path,
-                min_similarity,
-            )?);
-        }
-        Ok(all)
+        with_clone_read_snapshot(conn, || {
+            let Some(corpus) = self.load_clone_corpus(conn)? else {
+                return Ok(Vec::new());
+            };
+            let mut all = Vec::new();
+            for input in inputs {
+                all.extend(check_against(
+                    corpus.as_ref(),
+                    conn,
+                    &input.text,
+                    input.language,
+                    &input.path,
+                    min_similarity,
+                )?);
+            }
+            Ok(all)
+        })
     }
 
     /// Pick the clone-check corpus: the BOUNDED postings fast path when a live clone-graph
@@ -456,6 +460,25 @@ impl CloneCorpus for IndexedCorpus {
         }
         Ok(out)
     }
+}
+
+/// Run a clone-check read `f` inside a deferred READ transaction (one WAL snapshot) when the
+/// connection is idle, so the eligibility decision and the postings/exact reads see a CONSISTENT
+/// view. Without it, a concurrent writer that completes a new clone generation between the
+/// eligibility read and `near_candidate_bags` would GC the current generation's postings out from
+/// under the fast path, silently dropping near matches. A no-op when a transaction is already open
+/// (the caller's snapshot governs). The check is read-only, so the snapshot is only ever released.
+fn with_clone_read_snapshot<T>(
+    conn: &Connection,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if !conn.is_autocommit() {
+        return f();
+    }
+    conn.execute_batch("BEGIN DEFERRED")?;
+    let result = f();
+    let _ = conn.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
+    result
 }
 
 /// Clone-check one file's `text` against a `corpus` (RAM fallback or postings fast path), resolving
@@ -1087,6 +1110,24 @@ mod tests {
         assert!(
             db2.clone_check_indexed_generation().unwrap().is_none(),
             "a postings-less generation disqualifies the fast path"
+        );
+    }
+
+    /// The postings are built in BASE scope, so the fast path must be disabled under a
+    /// linked-worktree OVERLAY scope — else it would serve base-only postings and miss the overlay's
+    /// branch-only near-clones that the RAM fallback (which reads the overlay scope) would find.
+    /// Overlays fall back to RAM.
+    #[test]
+    fn clone_check_fast_path_disabled_under_worktree_overlay() {
+        let (mut db, _path) = parity_fixture("overlay-scope");
+        assert!(
+            db.clone_check_indexed_generation().unwrap().is_some(),
+            "base scope (empty worktree id) is fast-path eligible"
+        );
+        db.active_worktree_id = "linked-worktree-1".to_string();
+        assert!(
+            db.clone_check_indexed_generation().unwrap().is_none(),
+            "a linked-worktree overlay scope disqualifies the base-built postings fast path"
         );
     }
 }

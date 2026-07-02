@@ -167,6 +167,16 @@ impl IndexDatabase {
     /// - `postings_written` (a postings-complete, postings-aware generation — review R2), AND
     /// - `source_revision == content_revision()` EXACTLY (not merely present).
     pub(crate) fn clone_check_indexed_generation(&self) -> anyhow::Result<Option<i64>> {
+        // BASE-SCOPE ONLY. The clone graph (edges + postings) is built in the BASE scope —
+        // maintenance restores it before the clone-graph pass, and `content_revision()` is GLOBAL
+        // over `main.files` so it CANNOT encode which scope produced the postings. Under a
+        // linked-worktree OVERLAY the postings cover only base-scope symbols, while the RAM
+        // fallback reads the overlay's branch-only symbols; serving the fast path there
+        // would silently miss overlay near-clones. So disable it under a linked overlay —
+        // those scopes fall back to the correct, overlay-scoped RAM build.
+        if self.active_scope_is_linked_overlay() {
+            return Ok(None);
+        }
         let conn = self.storage.connection();
         let Some(live) = live_generation_row(conn)? else {
             return Ok(None);
