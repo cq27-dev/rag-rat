@@ -7,6 +7,7 @@ pub mod fleet;
 pub mod index;
 pub mod language;
 pub mod locks;
+pub mod logging;
 pub mod output;
 pub mod query;
 pub mod search;

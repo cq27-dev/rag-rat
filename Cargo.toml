@@ -54,6 +54,11 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 tempfile = "3"
 toon-format = { version = "0.5.0", default-features = false }
 toml = "1.1"
+# Structured debug logging (config-gated `[log]`; off by default). Native-only crate, so the
+# thread/file-based appender is unrestricted. See rag-rat-core/src/logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "registry"] }
+tracing-appender = "0.2"
 # Grammar crates are exact-pinned so parser node coverage changes deliberately.
 tree-sitter = "=0.26.9"
 tree-sitter-c = "=0.24.2"
