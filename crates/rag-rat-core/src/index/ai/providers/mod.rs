@@ -229,6 +229,7 @@ pub(crate) fn acquire_chunk_embedder(
             // pays. The probe (and every light embed) is bounded by the transport's clamped
             // timeout, so a hung server can't stall the watcher.
             if remote.query_endpoint.is_none() {
+                tracing::debug!(target: "rag_rat_core::index::ai::providers", path = "skip_ephemeral", reason = "no_query_endpoint", "light reconcile: no local query_endpoint, deferring to explicit reconcile");
                 return ChunkEmbedder::SkipEphemeral;
             }
             let transport = light_incremental_config(remote);
@@ -239,8 +240,12 @@ pub(crate) fn acquire_chunk_embedder(
                 Err(_) => return ChunkEmbedder::SkipEphemeral,
             };
             if embedder.embed_batch(&["ping".to_string()]).is_err() {
+                tracing::debug!(target: "rag_rat_core::index::ai::providers", path = "skip_ephemeral", reason = "local_probe_failed", "light reconcile: query_endpoint probe failed, deferring");
                 return ChunkEmbedder::SkipEphemeral;
             }
+            // The #356 light path: this is the "local embedding after a git action" the maintenance
+            // hook triggers — embeds changed chunks against the LOCAL query_endpoint, no paid box.
+            tracing::debug!(target: "rag_rat_core::index::ai::providers", path = "local_query_endpoint", endpoint = remote.query_endpoint.as_deref().unwrap_or(""), "light/incremental reconcile embeds locally against query_endpoint");
             return ChunkEmbedder::Ready {
                 embedder,
                 provisioned: None,
@@ -254,7 +259,10 @@ pub(crate) fn acquire_chunk_embedder(
         // to provisioning rather than skip real work on a transient query failure. The estimate is
         // reused below to decide whether a concurrency sweep is worthwhile.
         let estimated_jobs = match estimated_reconcile_jobs(conn, scan, options) {
-            Ok(0) => return ChunkEmbedder::NoEphemeralWork,
+            Ok(0) => {
+                tracing::debug!(target: "rag_rat_core::index::ai::providers", path = "no_ephemeral_work", "explicit reconcile: no candidate work, skipping paid-box provisioning");
+                return ChunkEmbedder::NoEphemeralWork;
+            },
             Ok(n) => Some(n),
             Err(_) => None,
         };
@@ -291,6 +299,7 @@ pub(crate) fn acquire_chunk_embedder(
                 scan.max_embedding_chars,
             ),
         };
+        tracing::info!(target: "rag_rat_core::index::ai::providers", path = "provision_ephemeral", estimated_jobs = ?estimated_jobs, "explicit reconcile: provisioning ephemeral embedding box");
         return match provision_and_build(remote, spec, Some(tune)) {
             Ok((embedder, provisioned, effective_remote, window_concurrency)) => {
                 // Size the reconcile selection window by the EMBEDDER's real fan-out (the tuned

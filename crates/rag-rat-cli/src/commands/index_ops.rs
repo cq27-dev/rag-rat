@@ -264,12 +264,19 @@ fn run_maintenance_pass(
     let max_seconds = args.max_seconds.unwrap_or(DEFAULT_MAINTENANCE_SECONDS);
     let started = Instant::now();
 
+    // Debug-log span for the whole pass (off unless `[log]`/`RAG_RAT_LOG`). This is the entry point
+    // for "git action → maintenance → embedding"; the per-phase events below make it legible.
+    let _span = tracing::info_span!("maintenance_pass", %trigger, max_seconds).entered();
+    tracing::info!(target: "rag_rat_core::maintenance", "maintenance pass started");
+
     // Serialize with the background watcher (and other writers). The hook backgrounds this command,
     // so blocking here never holds up the git operation; busy_timeout backstops the query-path
     // heal.
     let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
+    tracing::debug!(target: "rag_rat_core::maintenance", phase = "lock_acquired", elapsed_ms = started.elapsed().as_millis() as u64, "write lock acquired");
 
     let mut db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
+    tracing::debug!(target: "rag_rat_core::maintenance", phase = "index_discover", elapsed_ms = started.elapsed().as_millis() as u64, "phase complete");
     // One-time on upgrade: re-encode any legacy f32 vector blobs to the compact int8 format (#312).
     // Meta-gated, so this runs once and then skips the table scan cheaply on every later pass; run
     // on the BASE index (not per-overlay) before the worktree refresh re-scopes the connection.
@@ -333,9 +340,17 @@ fn run_maintenance_pass(
     // at all), so skip it rather than start a fresh full-budget reconcile.
     let reconcile_report =
         match budget.as_ref().and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
-            Some(options) =>
-                Some(db.reconcile_with_options_progress(options, render_reconcile_progress)?),
-            None => None,
+            Some(options) => {
+                let report = db.reconcile_with_options_progress(options, render_reconcile_progress)?;
+                tracing::info!(target: "rag_rat_core::maintenance", phase = "reconcile", ran = true, status = %report.status, "phase complete");
+                Some(report)
+            },
+            None => {
+                // No budget left (overlays/reencode consumed it) or a 0-cap "skip embedding" pass —
+                // this is a common reason the base backlog stays non-empty across hook passes.
+                tracing::info!(target: "rag_rat_core::maintenance", phase = "reconcile", ran = false, skip_reason = "no_budget_remaining", "phase skipped");
+                None
+            },
         };
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
@@ -356,7 +371,19 @@ fn run_maintenance_pass(
     // rename, or change, so relocate symbol/chunk bindings (or flag them) here rather than
     // leaving stale anchors until a manual memory_validate.
     let memory_validation = db.memory_validate().ok();
+    tracing::debug!(target: "rag_rat_core::maintenance", phase = "gc_clone_memory", gc = gc_report.is_some(), clone_graph = clone_graph_report.is_some(), memory_validated = memory_validation.is_some(), "post-reconcile phases complete");
     let plan = db.reconcile_plan()?;
+    // Remaining backlog. NOTE: these plan counts are UNSCOPED (global `files`, all worktrees — see
+    // #360), so a non-zero `missing` here can be sibling-worktree chunks, not the active branch.
+    tracing::info!(
+        target: "rag_rat_core::maintenance",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        current = plan.embeddings.current,
+        missing = plan.embeddings.missing,
+        stale = plan.embeddings.stale,
+        skipped = plan.embeddings.skipped_total,
+        "maintenance pass complete (remaining backlog is unscoped/cross-worktree, #360)"
+    );
     Ok(serde_json::json!({
         "trigger": trigger,
         "status": "complete",

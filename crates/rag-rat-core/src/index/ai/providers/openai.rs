@@ -509,8 +509,11 @@ impl Embedder for OpenAiEmbedder {
         // configured concurrency at once. Results are joined in request/input order, so HTTP
         // completion order cannot reorder vectors.
         let ranges = self.sub_batch_ranges(texts);
+        let started = std::time::Instant::now();
         if ranges.len() == 1 {
-            return self.embed_one_request(texts);
+            let result = self.embed_one_request(texts);
+            tracing::debug!(target: "rag_rat_core::index::ai::embed", endpoint = %self.embed_url, model = %self.server_model, texts = texts.len(), sub_batches = 1usize, dim = self.dim, ok = result.is_ok(), duration_ms = started.elapsed().as_millis() as u64, "embed request");
+            return result;
         }
         let mut out = Vec::with_capacity(texts.len());
         for window in ranges.chunks(self.concurrency) {
@@ -541,6 +544,7 @@ impl Embedder for OpenAiEmbedder {
                 out.extend(result?);
             }
         }
+        tracing::debug!(target: "rag_rat_core::index::ai::embed", endpoint = %self.embed_url, model = %self.server_model, texts = texts.len(), sub_batches = ranges.len(), dim = self.dim, ok = true, duration_ms = started.elapsed().as_millis() as u64, "embed request (fan-out)");
         Ok(out)
     }
 }

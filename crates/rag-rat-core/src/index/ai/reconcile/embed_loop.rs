@@ -377,6 +377,19 @@ pub(crate) fn reconcile_with_options_progress(
         failed_chunks: report.failed_chunks,
         blocked_chunks: report.blocked_chunks,
     });
+    // `report.status` is the stop-reason (Current | Partial | Failed | Blocked); `remote` shows
+    // whether an offload backend was configured (a local light/incremental pass has none). The
+    // active-scope proof for #360 (commit/worktree/view-installed, raw-vs-scoped counts) is a
+    // deferred follow-up — it needs a conn-level scope introspection helper.
+    tracing::info!(
+        target: "rag_rat_core::index::ai::reconcile",
+        status = %report.status,
+        embedded = report.embeddings_written,
+        processed = report.processed_chunks,
+        failed = report.failed_chunks,
+        remote = remote_config.is_some(),
+        "reconcile complete"
+    );
     Ok(report)
 }
 

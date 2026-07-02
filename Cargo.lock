@@ -3332,6 +3332,7 @@ dependencies = [
  "tokio",
  "toml_edit",
  "toon-format",
+ "tracing",
  "tui-tree-widget",
 ]
 

@@ -57,10 +57,15 @@ pub(crate) fn mem_trace(label: &str) {
     // the 1 s sampler's spike window falls inside.
     static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let elapsed = FIRST.get_or_init(std::time::Instant::now).elapsed().as_secs_f64();
+    let rss_gb = vmrss_kb as f64 / 1024.0 / 1024.0;
+    let sqlite_gb = sqlite_bytes as f64 / 1_073_741_824.0;
+    let sqlite_peak_gb = sqlite_peak as f64 / 1_073_741_824.0;
     eprintln!(
-        "MEMTRACE {label}: t+{elapsed:.0}s rss={:.2}GB sqlite={:.2}GB sqlite_peak={:.2}GB",
-        vmrss_kb as f64 / 1024.0 / 1024.0,
-        sqlite_bytes as f64 / 1_073_741_824.0,
-        sqlite_peak as f64 / 1_073_741_824.0,
+        "MEMTRACE {label}: t+{elapsed:.0}s rss={rss_gb:.2}GB sqlite={sqlite_gb:.2}GB \
+         sqlite_peak={sqlite_peak_gb:.2}GB"
     );
+    // Also capture in the debug log (when `[log]` is on). The `RAG_RAT_MEM_TRACE` env gate above
+    // still guards whether this runs at all, so a broad `debug` filter never enables memtrace spam;
+    // the dedicated `rag_rat_core::index::mem_diag` target keeps it filterable on its own.
+    tracing::debug!(target: "rag_rat_core::index::mem_diag", label, elapsed_s = elapsed, rss_gb, sqlite_gb, sqlite_peak_gb, "memtrace");
 }
