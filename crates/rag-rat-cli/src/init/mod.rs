@@ -331,6 +331,7 @@ mod tests {
         assert!(text.contains("# [[target]]"), "documents the expanded target form");
         assert!(text.contains("# [watch]"));
         assert!(text.contains("# [version_check]"));
+        assert!(text.contains("# [log]"));
         assert!(text.contains("# [llm.embedding.runtime]"));
         assert!(text.contains("# [init.cookbooks.modal]"));
         assert!(text.contains("# [init.cookbooks.my-provider]"));
@@ -343,6 +344,8 @@ mod tests {
         assert_eq!(config.targets[0].language, Language::Cpp);
         // Commented [watch] falls back to its default (enabled).
         assert!(config.watch.enabled);
+        // Commented [log] falls back to its default (disabled).
+        assert!(!config.log.enabled);
         let _ = std::fs::remove_dir_all(&root);
     }
 

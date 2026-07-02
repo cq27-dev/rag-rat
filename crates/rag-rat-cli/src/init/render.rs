@@ -80,6 +80,17 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
          blocks.\n# [version_check]\n# enabled = true\n\n",
     );
 
+    text.push_str(
+        "# Debug logging — per-process files under `.rag-rat/logs/` (off by default). Traces the \
+         git-hook\n# maintenance / reconcile / embedding lifecycle. `RAG_RAT_LOG` \
+         (RUST_LOG-style) overrides\n# `level`/`filter` and can force-enable it for a single \
+         command.\n# [log]\n# enabled = false\n# level = \"info\"              # off | error | \
+         warn | info | debug | trace\n# filter = \"rag_rat_core::index::ai=debug\"   # optional \
+         per-subsystem directives\n# format = \"text\"             # text | json\n# \
+         retention_days = 7          # prune log files older than this on startup\n# max_files = \
+         200             # cap on files kept (oldest pruned first)\n\n",
+    );
+
     text.push_str("[oracle]\n");
     text.push_str(
         "# Background auto-refresh of compiler-grade (SCIP) importance ranking. Needs a \
