@@ -125,21 +125,40 @@ pub(crate) fn clear_active_embedding_model_provisional(conn: &Connection) -> any
     set_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META, "0")
 }
 
+/// Clear the active embedding model entirely — the inverse of [`activate_model_with_version`].
+/// Removes the model id, its freshness version, the provenance flag, AND any remote-config meta, so
+/// `active_embedding_model_id` returns to the hash fallback and no stale version / endpoint lingers
+/// to mislead a later activation. Called when the config disables embeddings (`model = "none"`)
+/// while a PROVISIONAL model was active: the embeddings-off choice must supersede an automatic
+/// activation, restoring the "embeddings-off ⇒ active model unset" invariant (#394 review).
+/// Idempotent (each delete is a no-op when its key is absent).
+pub(crate) fn clear_active_embedding_model(conn: &Connection) -> anyhow::Result<()> {
+    delete_meta(conn, ACTIVE_EMBEDDING_MODEL_META)?;
+    clear_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?;
+    delete_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META)?;
+    clear_active_remote_config(conn)
+}
+
 /// Seed the active embedding model from the CONFIG's selection when the index has none yet (#394),
 /// so a fresh index adopts the configured model instead of silently defaulting to the hash fallback
 /// (`active_embedding_model_id`'s `HASH_MODEL_ID` default — which the config never selects, since
 /// `EmbeddingBackend::default()` is all-MiniLM). Read-first via
 /// [`active_embedding_model_seed_owed`]: a no-op once the active model is EXPLICIT (an
 /// `install_model`) or CONFIRMED (a reconcile committed embeddings under it) — that model is
-/// respected — and for the embeddings-off choice (`configured_model_id == None`). While the active
-/// model is PROVISIONAL (a prior seed or a fastembed-cache recovery) config stays authoritative — a
-/// config-model edit is adopted.
+/// respected. While the active model is PROVISIONAL (a prior seed or a fastembed-cache recovery)
+/// config stays authoritative — a config-model edit is adopted, and the embeddings-off case below
+/// clears it.
 ///
 /// This does NOT install the model — reconcile still blocks with an accurate
 /// `models install <configured>` hint until it is — it only makes the index's active model reflect
 /// the config so that hint (and every model-scoped read) names the RIGHT model rather than the hash
 /// fallback. Runs on the write-bearing `open_config`, so any write-bearing open heals an index
 /// built before this fix.
+///
+/// The embeddings-off choice (`configured_model_id == None`) is symmetric: it CLEARS a still-active
+/// PROVISIONAL model via [`clear_active_embedding_model`] (an explicit / confirmed install is
+/// preserved), so switching the config to `model = "none"` stops reconcile / status naming a model
+/// the config no longer wants — restoring the "embeddings-off ⇒ active model unset" invariant.
 pub(crate) fn seed_active_embedding_model(
     conn: &Connection,
     configured_model_id: Option<&str>,
@@ -147,7 +166,11 @@ pub(crate) fn seed_active_embedding_model(
     if !active_embedding_model_seed_owed(conn, configured_model_id)? {
         return Ok(());
     }
-    let model_id = configured_model_id.expect("seed_owed is true only when the id is Some");
+    let Some(model_id) = configured_model_id else {
+        // Embeddings-off, and `seed_owed` already confirmed a PROVISIONAL model is still active:
+        // clear it so the meta stops naming a model the config disabled.
+        return clear_active_embedding_model(conn);
+    };
     let Some(spec) = spec(model_id) else {
         return Ok(()); // unknown id (defensive) — leave unset so the hash fallback stands
     };
@@ -173,12 +196,20 @@ pub(crate) fn seed_active_embedding_model(
 /// An absent provenance flag (a pre-#394 index, or a committed / explicit model) reads as
 /// non-provisional → respected. Provenance is an O(1) meta read — no per-open embedding scan, and a
 /// RECOVERED cache no longer masquerades as an explicit install (#394 review).
+///
+/// The embeddings-off choice (`None`) owes a write only to CLEAR a still-active PROVISIONAL model
+/// (an explicit / confirmed install is preserved; an already-unset active model needs nothing) —
+/// symmetric with the model-selected case, where a provisional active always yields to config.
 pub(crate) fn active_embedding_model_seed_owed(
     conn: &Connection,
     configured_model_id: Option<&str>,
 ) -> anyhow::Result<bool> {
     let Some(configured) = configured_model_id else {
-        return Ok(false); // embeddings-off — nothing to seed
+        // Embeddings-off: a write is owed only when a PROVISIONAL model is still active and must be
+        // cleared. An unset active (nothing to clear) or an explicit / confirmed one (preserved)
+        // owes nothing.
+        return Ok(meta(conn, ACTIVE_EMBEDDING_MODEL_META)?.is_some()
+            && active_embedding_model_is_provisional(conn)?);
     };
     match meta(conn, ACTIVE_EMBEDDING_MODEL_META)? {
         None => Ok(true),
@@ -408,5 +439,50 @@ mod seed_active_embedding_model_tests {
             meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none(),
             "the embeddings-off choice leaves the active model unset (hash fallback stands)"
         );
+    }
+
+    #[test]
+    fn embeddings_off_clears_a_provisional_active_model() {
+        let conn = fresh_conn();
+        // A prior open seeded jina PROVISIONALLY, and a remote-config meta was left behind. The
+        // user then edits the config to `model = "none"`.
+        seed_active_embedding_model(&conn, Some(JINA)).unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{\"stale\":true}").unwrap();
+        assert!(active_embedding_model_is_provisional(&conn).unwrap());
+
+        assert!(
+            active_embedding_model_seed_owed(&conn, None).unwrap(),
+            "clearing a still-active provisional model is owed on the switch to embeddings-off"
+        );
+        seed_active_embedding_model(&conn, None).unwrap();
+
+        // The active model, its freshness version, the provenance flag, and the stale remote config
+        // are all gone — `active_embedding_model_id` returns to the hash fallback.
+        assert!(meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none());
+        assert!(reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap().is_none());
+        assert!(meta(&conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META).unwrap().is_none());
+        assert!(meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META).unwrap().is_none());
+        assert_eq!(active_embedding_model_id(&conn).unwrap(), HASH);
+        assert!(
+            !active_embedding_model_seed_owed(&conn, None).unwrap(),
+            "idempotent — nothing left to clear"
+        );
+    }
+
+    #[test]
+    fn embeddings_off_preserves_an_explicit_active_model() {
+        let conn = fresh_conn();
+        // An EXPLICIT install is a deliberate user choice (NON-provisional). Switching the config
+        // to embeddings-off must NOT wipe it — only automatic (provisional) activations
+        // yield.
+        install_model(&conn, HASH, None).unwrap();
+        assert!(!active_embedding_model_is_provisional(&conn).unwrap());
+
+        assert!(
+            !active_embedding_model_seed_owed(&conn, None).unwrap(),
+            "an explicit install is preserved across a switch to embeddings-off"
+        );
+        seed_active_embedding_model(&conn, None).unwrap();
+        assert_eq!(active_embedding_model_id(&conn).unwrap(), HASH, "explicit model kept");
     }
 }

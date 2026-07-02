@@ -398,6 +398,13 @@ pub(crate) fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String
         .optional()?)
 }
 
+/// Delete an `index_meta` key (a no-op when absent) — the `index_meta` counterpart of
+/// [`clear_reconcile_meta`].
+pub(crate) fn delete_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM index_meta WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
 /// Persist the active remote-embedding connection params as secret-free JSON in the
 /// [`ACTIVE_EMBEDDING_REMOTE_CONFIG_META`] meta (#317 task 5). Written at install when an Ollama
 /// model is activated; the `conn`-based `active_embedder` reads it back via
@@ -438,10 +445,7 @@ pub(crate) fn active_remote_config(
 /// `active_embedder` stops reconstructing an `OpenAiEmbedder` from a stale prior remote install of
 /// the same model (a no-op when the meta is already absent).
 pub(crate) fn clear_active_remote_config(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM index_meta WHERE key = ?1", params![
-        ACTIVE_EMBEDDING_REMOTE_CONFIG_META
-    ])?;
-    Ok(())
+    delete_meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META)
 }
 
 pub(crate) fn set_reconcile_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
