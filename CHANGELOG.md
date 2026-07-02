@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.11.0...rag-rat-core-v0.12.0) - 2026-07-02
+
+### Added
+
+- *(clones)* make the write-time clone-check size guard mode-aware (#296 phase 4) ([#393](https://github.com/cq27-dev/rag-rat/pull/393))
+- *(clones)* bounded postings fast path in the write-time clone check (#296 phase 3) ([#392](https://github.com/cq27-dev/rag-rat/pull/392))
+- *(clones)* populate clone_subblock_postings in the generation-staged precompute (#296 phase 2) ([#391](https://github.com/cq27-dev/rag-rat/pull/391))
+- *(schema)* V037 — clone_subblock_postings + postings_written gate (#296 phase 1) ([#390](https://github.com/cq27-dev/rag-rat/pull/390))
+- *(log)* config-gated tracing debug log + hook-embedding repro harness ([#377](https://github.com/cq27-dev/rag-rat/pull/377))
+
+### Fixed
+
+- *(embed)* a fresh index adopts the configured embedding model, not the hash fallback ([#394](https://github.com/cq27-dev/rag-rat/pull/394)) ([#395](https://github.com/cq27-dev/rag-rat/pull/395))
+
+### Other
+
+- *(clones)* BFS the subject's component in clones_for_symbol on the live path ([#270](https://github.com/cq27-dev/rag-rat/pull/270)) ([#384](https://github.com/cq27-dev/rag-rat/pull/384))
+- *(store)* rewrap two doc comments to satisfy nightly rustfmt ([#385](https://github.com/cq27-dev/rag-rat/pull/385))
+- *(reconcile)* stream estimated_reconcile_jobs — the last materialize-everything site ([#64](https://github.com/cq27-dev/rag-rat/pull/64)) ([#383](https://github.com/cq27-dev/rag-rat/pull/383))
+- *(reconcile)* stream embedding_reconcile_plan candidate materialization ([#379](https://github.com/cq27-dev/rag-rat/pull/379)) ([#382](https://github.com/cq27-dev/rag-rat/pull/382))
+- *(embed)* split index/ai/reconcile.rs god-module into cohesive siblings ([#375](https://github.com/cq27-dev/rag-rat/pull/375))
+- *(clones)* split god-module query_api/clones.rs into cohesive siblings ([#368](https://github.com/cq27-dev/rag-rat/pull/368))
+- extract oversized inline test modules into sibling files ([#366](https://github.com/cq27-dev/rag-rat/pull/366))
+- dedup credential and row-count helpers ([#364](https://github.com/cq27-dev/rag-rat/pull/364))
+
 ## [0.11.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.10.0...rag-rat-core-v0.11.0) - 2026-07-01
 
 ### Added
