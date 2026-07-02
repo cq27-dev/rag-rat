@@ -1,0 +1,15 @@
+# Coverage runs with `--no-default-features` (see the `coverage` job in .github/workflows/ci.yml), so
+# code behind the fastembed / model2vec feature gates is never exercised and always reports as
+# uncovered. Combined with routine module-split refactors — which make relocated, already-tested
+# lines look "new" to the patch status — patch coverage is a noisy merge signal rather than a real
+# regression indicator. Keep the patch status as an informational report and let the project status
+# be the enforced gate (with a small drift threshold so a sub-percent move doesn't flip it red).
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        informational: true
