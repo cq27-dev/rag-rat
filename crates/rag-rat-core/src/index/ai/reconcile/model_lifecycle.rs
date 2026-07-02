@@ -112,10 +112,11 @@ pub(crate) fn activate_model_with_version(
 /// so a fresh index adopts the configured model instead of silently defaulting to the hash fallback
 /// (`active_embedding_model_id`'s `HASH_MODEL_ID` default — which the config never selects, since
 /// `EmbeddingBackend::default()` is all-MiniLM). Read-first via
-/// [`active_embedding_model_seed_owed`]: a no-op once an INSTALLED model is active (an explicit
-/// `models install <other>` is respected) and for the embeddings-off choice (`configured_model_id
-/// == None`); an uninstalled seed PLACEHOLDER is re-adopted when the config model changes before
-/// install.
+/// [`active_embedding_model_seed_owed`]: a no-op once embeddings are COMMITTED under the active model
+/// (that model is respected) and for the embeddings-off choice (`configured_model_id == None`).
+/// While nothing is committed (a seed placeholder, a recovered cache, or an
+/// installed-but-unreconciled model) config stays authoritative — a config-model edit made before
+/// reconcile is adopted.
 ///
 /// This does NOT install the model — reconcile still blocks with an accurate
 /// `models install <configured>` hint until it is — it only makes the index's active model reflect
@@ -143,12 +144,14 @@ pub(crate) fn seed_active_embedding_model(
 /// Read-only test of whether [`seed_active_embedding_model`] would WRITE. The read-only open
 /// consults it to fall back to the write path so the seed heals once (same posture as the
 /// model-manifest / generated-flags gates). A seed is owed when the config selects a model AND
-/// either (a) no active model is set yet, or (b) the active model differs from config AND is an
-/// uninstalled SEED PLACEHOLDER — `install_model` / `recover_cached_fastembed_model` both mark the
-/// `ai_models` row installed, so an uninstalled active model can only have come from a prior seed.
-/// (b) lets a config-model edit made BEFORE install be adopted (the placeholder tracks config),
-/// while an installed / explicitly-activated model is respected — switching an INSTALLED model on a
-/// config change is a separate re-embed concern, out of scope here (#394 review).
+/// either (a) no active model is set yet, or (b) the active model DIFFERS from config AND has NO
+/// embeddings committed under it. CONFIG is authoritative until embeddings are committed: a seed
+/// placeholder, a `recover_cached_fastembed_model` cache activation, and an installed-but-not-yet-
+/// reconciled model all read `current_embedding_count == 0`, so config wins over any of them on a
+/// fresh index. Once embeddings exist under the active model it is respected (switching a committed
+/// model on a config change is a separate re-embed concern, out of scope here). Using the embedding
+/// count — not the `ai_models.installed` flag — is what keeps a RECOVERED cache from masquerading
+/// as an explicit user install (#394 review).
 pub(crate) fn active_embedding_model_seed_owed(
     conn: &Connection,
     configured_model_id: Option<&str>,
@@ -159,18 +162,8 @@ pub(crate) fn active_embedding_model_seed_owed(
     match meta(conn, ACTIVE_EMBEDDING_MODEL_META)? {
         None => Ok(true),
         Some(active) if active == configured => Ok(false),
-        Some(active) => Ok(!active_model_is_installed(conn, &active)?),
+        Some(active) => Ok(current_embedding_count(conn, &active)? == 0),
     }
-}
-
-/// Whether the given model's `ai_models` row is installed. A missing row counts as not installed.
-fn active_model_is_installed(conn: &Connection, model_id: &str) -> anyhow::Result<bool> {
-    Ok(conn
-        .query_row("SELECT installed FROM ai_models WHERE model_id = ?1", [model_id], |r| {
-            r.get::<_, i64>(0)
-        })
-        .optional()?
-        .is_some_and(|installed: i64| installed != 0))
 }
 
 pub(crate) fn install_model(
@@ -320,19 +313,20 @@ mod seed_active_embedding_model_tests {
     }
 
     #[test]
-    fn respects_an_installed_model() {
+    fn reseeds_over_an_installed_but_uncommitted_model() {
         let conn = fresh_conn();
-        // An EXPLICIT install (hash is a no-download local install) activates + marks it installed.
+        // A model installed but with NO embeddings yet — a recovered fastembed cache, or an install
+        // before reconcile. Config is authoritative until something is committed, so it wins.
         install_model(&conn, HASH, None).unwrap();
         assert_eq!(active_embedding_model_id(&conn).unwrap(), HASH);
+        assert_eq!(current_embedding_count(&conn, HASH).unwrap(), 0, "nothing committed yet");
 
-        // A config selecting a DIFFERENT model must NOT override an INSTALLED selection.
-        assert!(!active_embedding_model_seed_owed(&conn, Some(JINA)).unwrap());
+        assert!(active_embedding_model_seed_owed(&conn, Some(JINA)).unwrap());
         seed_active_embedding_model(&conn, Some(JINA)).unwrap();
         assert_eq!(
             active_embedding_model_id(&conn).unwrap(),
-            HASH,
-            "an installed model is kept — the seed never overrides an explicit install"
+            JINA,
+            "config wins over an installed-but-uncommitted model (e.g. a recovered cache)"
         );
     }
 

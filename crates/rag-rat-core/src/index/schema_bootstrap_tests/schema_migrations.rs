@@ -452,7 +452,10 @@ fn full_rebuild_preserves_github_papertrail_cache() {
 
 #[test]
 fn full_rebuild_preserves_installed_model_manifest() {
-    let (root, config) = markdown_config("alpha token with enough detail for embeddings\n");
+    let (root, mut config) = markdown_config("alpha token with enough detail for embeddings\n");
+    // Select the hash embedder (the model this test installs) so config and the install agree — a
+    // fresh index seeds the CONFIGURED model (#394), so a mismatched default would be re-seeded.
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
     let db = IndexDatabase::rebuild(&config).unwrap();
     db.install_model(HASH_MODEL_ID, None).unwrap();
     let before = db.llm_status().unwrap();
