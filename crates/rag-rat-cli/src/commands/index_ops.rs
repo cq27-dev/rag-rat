@@ -502,6 +502,83 @@ mod tests {
     }
 
     #[test]
+    fn embedding_counts_scope_to_the_active_checkout() {
+        // #360 regression guard: reconcile --plan / llm_status embedding coverage must count the
+        // ACTIVE checkout, not the aggregate across sibling worktrees. Those surfaces open via
+        // `open_config`, which base-scopes the connection (set_context, #219); a bare `open` stays
+        // UNSCOPED. This pins that difference so #360 can't silently regress: with a sibling
+        // overlay present, `open_config` must report FEWER missing chunks than `open`. (No
+        // embedder needed — with zero embeddings every chunk is `missing`, so `missing`
+        // tracks the scoped chunk count.)
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-scope360-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "base"]);
+        let config = Config {
+            root: main.clone(),
+            database: main.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            llm: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+            search: Default::default(),
+            log: Default::default(),
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        // Linked worktree on a branch that ADDS a file → chunks that belong only to the sibling.
+        let linked = root.join("wt");
+        git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+        std::fs::write(linked.join("src/b.rs"), "pub fn sibling_fn() {}\n").unwrap();
+        git(&linked, &["add", "-A"]);
+        git(&linked, &["commit", "-qm", "sibling"]);
+        let args = super::MaintenanceArgs {
+            trigger: Some("post-merge".to_string()),
+            max_seconds: Some(0),
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+        super::maintenance(&config, &args).unwrap(); // populates the linked overlay
+
+        // `open` leaves the connection UNSCOPED (all worktrees); `open_config` pre-scopes to the
+        // base checkout. With the sibling overlay present, base scope must count FEWER
+        // missing chunks.
+        let unscoped =
+            IndexDatabase::open(&config.database).unwrap().llm_status().unwrap().artifacts.missing;
+        let scoped =
+            IndexDatabase::open_config(&config).unwrap().llm_status().unwrap().artifacts.missing;
+        assert!(
+            scoped < unscoped,
+            "open_config must base-scope embedding counts (open does not): scoped={scoped} \
+             unscoped={unscoped}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn maintenance_coalesces_a_concurrent_trigger() {
         use rag_rat_core::locks::{FileLock, maintenance_lock_path, maintenance_pending_path};
 
