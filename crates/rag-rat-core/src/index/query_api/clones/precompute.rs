@@ -405,7 +405,7 @@ impl IndexDatabase {
               WHERE generation = ?3",
             params![now_ms(), edges_written as i64, generation],
         )?;
-        self.set_meta("clone_graph_live_generation", &generation.to_string())?;
+        self.set_repo_meta("clone_graph_live_generation", &generation.to_string())?;
         conn.execute("DELETE FROM clone_graph_generations WHERE generation != ?1", params![
             generation
         ])?;
@@ -691,7 +691,8 @@ fn flush_batch(
 
 /// The live (Complete) generation row, if one is published.
 fn live_generation_row(conn: &Connection) -> anyhow::Result<Option<GenerationRow>> {
-    let Some(live) = read_meta(conn, "clone_graph_live_generation")? else {
+    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    let Some(live) = crate::index::repo_meta(conn, &repo_id, "clone_graph_live_generation")? else {
         return Ok(None);
     };
     let Ok(generation) = live.parse::<i64>() else {
@@ -774,14 +775,6 @@ fn map_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GenerationRow
         edges_written: row.get::<_, i64>(4)? as u64,
         postings_written: row.get::<_, i64>(5)? != 0,
     })
-}
-
-fn read_meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM index_meta WHERE key = ?1", params![key], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok())
 }
 
 #[cfg(test)]
@@ -874,7 +867,7 @@ mod tests {
         let conn = db.storage.connection();
         let live: i64 = conn
             .query_row(
-                "SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = \
+                "SELECT CAST(value AS INTEGER) FROM repo_meta WHERE key = \
                  'clone_graph_live_generation'",
                 [],
                 |r| r.get(0),

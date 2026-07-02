@@ -30,7 +30,7 @@ impl IndexDatabase {
         include_tests: bool,
     ) -> anyhow::Result<Vec<crate::query::graph::TextOnlyHit>> {
         let Some(root) = self.storage.source_root() else {
-            anyhow::bail!("cannot compare graph to text: source_root is missing from index_meta");
+            anyhow::bail!("cannot compare graph to text: source_root is missing from repo_meta");
         };
         let mut stmt = self.storage.connection().prepare("SELECT path FROM files ORDER BY path")?;
         let paths =

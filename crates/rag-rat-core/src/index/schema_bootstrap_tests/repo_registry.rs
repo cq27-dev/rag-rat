@@ -20,15 +20,36 @@ fn root_count(conn: &rusqlite::Connection, repo_id: &str) -> i64 {
         .unwrap()
 }
 
+/// Upsert a key into a `(key, value)` k/v table (`index_meta` / `reconcile_meta`) — seeds the
+/// pre-relocation state a legacy DB carries.
+fn upsert_meta(conn: &rusqlite::Connection, table: &str, key: &str, value: &str) {
+    conn.execute(
+        &format!(
+            "INSERT INTO {table}(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        ),
+        [key, value],
+    )
+    .unwrap();
+}
+
+/// Whether `table` still holds `key` (used to assert relocated keys are gone / retained keys stay).
+fn meta_present(conn: &rusqlite::Connection, table: &str, key: &str) -> bool {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE key = ?1"), [key], |r| {
+        r.get::<_, i64>(0)
+    })
+    .unwrap()
+        > 0
+}
+
 /// Fresh `apply` creates the three registry tables with their exact columns, STRICT, and seeds the
-/// single adoption placeholder whose id MUST equal `LEGACY_REPO_ID`. This is also the current
-/// schema-tip test, so it owns the absolute `LATEST_SCHEMA_VERSION` pin (V037's test relinquished
-/// it — see the hardcoded-LATEST footgun).
+/// single adoption placeholder whose id MUST equal `LEGACY_REPO_ID`. The absolute
+/// `LATEST_SCHEMA_VERSION` pin moved to the new tip's test (`migration_039_*`); this one uses only
+/// the symbolic `current_version == LATEST_SCHEMA_VERSION` check (the hardcoded-LATEST footgun).
 #[test]
 fn migration_038_creates_repos_registry_tables() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     schema::apply(&conn).expect("apply");
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 38, "V038 is the schema tip");
 
     assert_eq!(conn_table_columns(&conn, "repos"), vec![
         "repo_id",
@@ -170,6 +191,57 @@ fn reapplying_schema_after_adoption_does_not_resurrect_the_placeholder() {
     assert_eq!(repo_row_count(&conn, "repo-abc"), 1, "the adopted repo survives the re-apply");
 }
 
+/// The cross-phase interaction of V038's conditional seed, the one-repos-row invariant, and V039's
+/// per-repo `repo_meta`: an ADOPTED DB carrying relocated meta must survive a full `schema::apply`
+/// re-run (the `create_or_migrate`/`rebuild` path) with its identity and meta intact. If the V038
+/// seed regressed to an unconditional `INSERT OR IGNORE`, the re-apply would re-mint the
+/// placeholder beside the real row — two `repos` rows — which trips `single_repo_id`'s one-row
+/// `debug_assert` AND leaves it resolving an arbitrary repo, so the per-repo `repo_meta` accessors
+/// would read the wrong scope. This pins BOTH sides at once: after re-apply `single_repo_id` still
+/// returns the real id, and the meta rows stay under it (never resurrected under the placeholder).
+#[test]
+fn reapplying_schema_after_adoption_keeps_single_repo_id_and_repo_meta_under_the_real_id() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    // As V039 leaves a not-yet-adopted DB: per-repo meta under the placeholder.
+    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
+    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
+
+    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1).unwrap();
+    // Adoption re-pointed the meta to the real id and `single_repo_id` resolves it.
+    assert_eq!(
+        schema::single_repo_id(&conn).unwrap(),
+        "repo-abc",
+        "adopted: real id is the sole repo"
+    );
+
+    // The exact re-run `create_or_migrate` (hence `rebuild`) performs on an existing index.
+    schema::apply(&conn).expect("re-apply is idempotent on an already-migrated DB");
+
+    // `single_repo_id` still resolves the real id — its internal one-row `debug_assert` also fires
+    // if the conditional seed regressed and resurrected the placeholder beside the real row.
+    assert_eq!(
+        schema::single_repo_id(&conn).unwrap(),
+        "repo-abc",
+        "re-apply leaves the real id as the sole repo (no placeholder resurrected)"
+    );
+    // The relocated meta stays scoped to the real id, with its values, across the re-apply.
+    assert_eq!(
+        crate::index::meta::repo_meta(&conn, "repo-abc", "source_root").unwrap().as_deref(),
+        Some("/src/repo"),
+    );
+    assert_eq!(
+        crate::index::meta::repo_meta(&conn, "repo-abc", "indexed_at_ms").unwrap().as_deref(),
+        Some("9"),
+    );
+    let placeholder_meta: i64 = conn
+        .query_row("SELECT COUNT(*) FROM repo_meta WHERE repo_id = ?1", [LEGACY_REPO_ID], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(placeholder_meta, 0, "no repo_meta rows resurrected under the placeholder");
+}
+
 /// Defense in depth (FINDING 3): even though the resolver refuses a pinned placeholder, a
 /// hand-built `RepoIdentity` carrying the reserved marker must be REFUSED by `register_repo` —
 /// otherwise adoption degenerates: `real_repo_ids` filters the marker, the adoption UPDATE rewrites
@@ -263,4 +335,241 @@ fn register_repo_refuses_a_different_real_repo() {
     // The incumbent is untouched; the intruder never landed.
     assert_eq!(repo_row_count(&conn, "repo-abc"), 1);
     assert_eq!(repo_row_count(&conn, "repo-xyz"), 0);
+}
+
+// --- V039: per-repo meta relocation (memory-sync phase A2) ---
+
+/// Fresh `apply` runs V039; it relocates the listed per-repo singleton keys into `repo_meta` under
+/// the placeholder and leaves the machine-level keys in their global tables. This is the schema
+/// tip, so it owns the absolute `LATEST_SCHEMA_VERSION` pin.
+#[test]
+fn migration_039_relocates_per_repo_meta_and_leaves_global_keys() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 39, "V039 is the schema tip");
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST after V039"
+    );
+
+    // Seed the SOURCE tables as a legacy DB carries them: relocated keys plus, to prove
+    // selectivity, one machine-level key in EACH table that MUST stay put.
+    upsert_meta(&conn, "index_meta", "source_root", "/src/repo");
+    upsert_meta(&conn, "index_meta", "git_commit", "abc123");
+    upsert_meta(&conn, "index_meta", "active_embedding_model", "embedding-hash");
+    upsert_meta(&conn, "index_meta", "generated_flags_version", "1"); // machine-level, stays
+    upsert_meta(&conn, "reconcile_meta", "embedding_active_model_version", "hash-v1");
+    upsert_meta(&conn, "reconcile_meta", "vector_int8_reencode_cursor", "42\nmodel-a");
+    upsert_meta(&conn, "reconcile_meta", "last_embedding_reconcile_started_at_ms", "1000"); // stays
+
+    // Re-run the relocation (the tables were empty when apply() first ran it).
+    schema::apply_move_per_repo_meta(&conn).expect("relocate");
+
+    for (key, value) in [
+        ("source_root", "/src/repo"),
+        ("git_commit", "abc123"),
+        ("active_embedding_model", "embedding-hash"),
+        ("embedding_active_model_version", "hash-v1"),
+        ("vector_int8_reencode_cursor", "42\nmodel-a"),
+    ] {
+        assert_eq!(
+            crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, key).unwrap().as_deref(),
+            Some(value),
+            "{key} relocated to repo_meta under the placeholder"
+        );
+        assert!(!meta_present(&conn, "index_meta", key), "{key} removed from index_meta");
+        assert!(!meta_present(&conn, "reconcile_meta", key), "{key} removed from reconcile_meta");
+    }
+
+    // Machine-level keys are untouched: they stay in their global tables and never enter repo_meta.
+    assert!(meta_present(&conn, "index_meta", "generated_flags_version"), "index_meta key stays");
+    assert!(
+        meta_present(&conn, "reconcile_meta", "last_embedding_reconcile_started_at_ms"),
+        "reconcile timing key stays"
+    );
+    assert!(
+        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "generated_flags_version")
+            .unwrap()
+            .is_none(),
+        "machine-level key did not leak into repo_meta"
+    );
+}
+
+/// A legacy V038 index (per-repo keys still in the global tables, ledger at 38) gains the
+/// relocation on `migrate_forward`.
+#[test]
+fn migration_039_forward_migrates_a_v038_index() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+
+    // Simulate the V038 state: per-repo keys still in the GLOBAL tables, ledger reverted to 38.
+    upsert_meta(&conn, "index_meta", "indexed_at_ms", "5000");
+    upsert_meta(&conn, "reconcile_meta", "embedding_active_model_version", "hash-v1");
+    truncate_schema_to(&conn, 38);
+    assert_eq!(
+        schema::status(&conn).unwrap().state,
+        schema::SchemaState::Older,
+        "schema is Older after removing the V039 ledger row"
+    );
+
+    schema::migrate_forward(&conn).expect("migrate_forward");
+
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST after forward migrate"
+    );
+    assert_eq!(
+        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms").unwrap().as_deref(),
+        Some("5000"),
+        "index_meta key relocated on forward migrate"
+    );
+    assert_eq!(
+        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "embedding_active_model_version")
+            .unwrap()
+            .as_deref(),
+        Some("hash-v1"),
+        "reconcile_meta key relocated on forward migrate"
+    );
+    assert!(!meta_present(&conn, "index_meta", "indexed_at_ms"));
+    assert!(!meta_present(&conn, "reconcile_meta", "embedding_active_model_version"));
+}
+
+/// V039 in ISOLATION: on a bare conn carrying only the source meta tables + the V038 registry, the
+/// migration function relocates the keys — anchored to the migration function, not the full ladder
+/// (the directory's "assert behavior in isolation" rule). It also proves the run is idempotent.
+#[test]
+fn v039_relocation_runs_standalone_and_is_idempotent() {
+    let bare = rusqlite::Connection::open_in_memory().expect("open");
+    bare.execute_batch(
+        "CREATE TABLE index_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE reconcile_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    )
+    .unwrap();
+    schema::apply_repos_registry(&bare).expect("V038 registry");
+    upsert_meta(&bare, "index_meta", "fts_dirty", "true");
+    upsert_meta(&bare, "reconcile_meta", "vector_int8_reencode_cursor", "7\nm");
+
+    schema::apply_move_per_repo_meta(&bare).expect("V039 relocation standalone");
+    schema::apply_move_per_repo_meta(&bare).expect("V039 relocation is idempotent");
+
+    assert_eq!(
+        crate::index::meta::repo_meta(&bare, LEGACY_REPO_ID, "fts_dirty").unwrap().as_deref(),
+        Some("true"),
+    );
+    assert_eq!(
+        crate::index::meta::repo_meta(&bare, LEGACY_REPO_ID, "vector_int8_reencode_cursor")
+            .unwrap()
+            .as_deref(),
+        Some("7\nm"),
+    );
+    assert!(!meta_present(&bare, "index_meta", "fts_dirty"));
+    assert!(!meta_present(&bare, "reconcile_meta", "vector_int8_reencode_cursor"));
+    // Re-run left exactly one relocated row (no duplicate from the second pass).
+    let count: i64 = bare
+        .query_row(
+            "SELECT COUNT(*) FROM repo_meta WHERE repo_id = ?1 AND key = 'fts_dirty'",
+            [LEGACY_REPO_ID],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "re-run does not duplicate the relocated row");
+}
+
+/// V039 leaves the relocated meta under the placeholder repo_id; `register_repo` adoption MUST
+/// carry those rows over to the real repo_id (Step 4), so a post-migration open does not orphan
+/// them.
+#[test]
+fn register_repo_adoption_relocates_repo_meta_rows() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    // As V039 leaves it: per-repo meta under the placeholder.
+    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
+    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
+
+    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1).unwrap();
+
+    assert_eq!(
+        crate::index::meta::repo_meta(&conn, "repo-abc", "source_root").unwrap().as_deref(),
+        Some("/src/repo"),
+    );
+    assert_eq!(
+        crate::index::meta::repo_meta(&conn, "repo-abc", "indexed_at_ms").unwrap().as_deref(),
+        Some("9"),
+    );
+    let placeholder_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM repo_meta WHERE repo_id = ?1", [LEGACY_REPO_ID], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        placeholder_rows, 0,
+        "no repo_meta rows remain under the placeholder after adoption"
+    );
+}
+
+/// `single_repo_id` returns the sole `repos` row — the placeholder before adoption, the real id
+/// after — the connection-level stand-in the per-repo accessors resolve until A3.
+#[test]
+fn single_repo_id_returns_the_sole_repo() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    assert_eq!(
+        schema::single_repo_id(&conn).unwrap(),
+        LEGACY_REPO_ID,
+        "the placeholder is the sole repo before adoption"
+    );
+
+    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1).unwrap();
+    assert_eq!(
+        schema::single_repo_id(&conn).unwrap(),
+        "repo-abc",
+        "the adopted real id is the sole repo after registration"
+    );
+}
+
+/// The `repo_meta` accessors: upsert, read, no-op-if-unchanged, and delete — each scoped by
+/// `(repo_id, key)` so the same key under a different repo is independent.
+#[test]
+fn repo_meta_accessors_round_trip_and_scope_by_repo() {
+    use crate::index::meta::{
+        delete_repo_meta, repo_meta, set_repo_meta, set_repo_meta_if_changed,
+    };
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    // A second repos row so the (repo_id, key) scoping is observable (inserted directly — the
+    // phase-A single-repo invariant is about register_repo, not the storage layer).
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-b', 'b', 0)",
+        [],
+    )
+    .unwrap();
+
+    // Upsert + read + overwrite.
+    assert!(repo_meta(&conn, LEGACY_REPO_ID, "k").unwrap().is_none());
+    set_repo_meta(&conn, LEGACY_REPO_ID, "k", "v1").unwrap();
+    assert_eq!(repo_meta(&conn, LEGACY_REPO_ID, "k").unwrap().as_deref(), Some("v1"));
+    set_repo_meta(&conn, LEGACY_REPO_ID, "k", "v2").unwrap();
+    assert_eq!(repo_meta(&conn, LEGACY_REPO_ID, "k").unwrap().as_deref(), Some("v2"));
+
+    // Scoped by repo_id: the same key under a different repo is independent.
+    set_repo_meta(&conn, "repo-b", "k", "other").unwrap();
+    assert_eq!(repo_meta(&conn, LEGACY_REPO_ID, "k").unwrap().as_deref(), Some("v2"));
+    assert_eq!(repo_meta(&conn, "repo-b", "k").unwrap().as_deref(), Some("other"));
+
+    // if_changed: no write when equal, write when different.
+    assert!(!set_repo_meta_if_changed(&conn, LEGACY_REPO_ID, "k", "v2").unwrap());
+    assert!(set_repo_meta_if_changed(&conn, LEGACY_REPO_ID, "k", "v3").unwrap());
+    assert_eq!(repo_meta(&conn, LEGACY_REPO_ID, "k").unwrap().as_deref(), Some("v3"));
+
+    // Delete is scoped and idempotent.
+    delete_repo_meta(&conn, LEGACY_REPO_ID, "k").unwrap();
+    assert!(repo_meta(&conn, LEGACY_REPO_ID, "k").unwrap().is_none());
+    assert_eq!(
+        repo_meta(&conn, "repo-b", "k").unwrap().as_deref(),
+        Some("other"),
+        "delete does not cross repos"
+    );
+    delete_repo_meta(&conn, LEGACY_REPO_ID, "k").unwrap(); // no-op when already absent
 }

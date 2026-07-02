@@ -18,22 +18,21 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use super::{ImportScopeRange, MOD_FILE_ROOT};
 
-/// Load the persisted GLOBAL local-crate-root set — newline-joined under `local_crate_roots` in
-/// `index_meta`, written at rebuild by [`local_crate_roots`]. Empty when absent (a non-Cargo corpus
-/// or a pre-V021 index), which makes [`ImportScope`] suppress nothing.
+/// Load the persisted per-repo local-crate-root set — newline-joined under `local_crate_roots` in
+/// `repo_meta` (V039 relocated it there), written at rebuild by [`local_crate_roots`]. Empty when
+/// absent (a non-Cargo corpus, a pre-V021 index, or a raw conn without the registry), which makes
+/// [`ImportScope`] suppress nothing.
 pub(crate) fn load_local_roots(conn: &Connection) -> HashSet<String> {
-    conn.query_row("SELECT value FROM index_meta WHERE key = 'local_crate_roots'", [], |row| {
-        row.get::<_, String>(0)
-    })
-    .optional()
-    .ok()
-    .flatten()
-    .map(|value| value.lines().filter(|line| !line.is_empty()).map(str::to_string).collect())
-    .unwrap_or_default()
+    crate::index::schema::single_repo_id(conn)
+        .and_then(|repo_id| crate::index::repo_meta(conn, &repo_id, "local_crate_roots"))
+        .ok()
+        .flatten()
+        .map(|value| value.lines().filter(|line| !line.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// One Cargo package discovered in the corpus: the directory of its manifest and the set of crate

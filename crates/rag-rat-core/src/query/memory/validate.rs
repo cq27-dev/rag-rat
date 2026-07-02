@@ -408,24 +408,20 @@ pub(crate) fn validate_path_binding(
         _ => Ok("current".to_string()),
     }
 }
-/// The persisted `source_root` (the on-disk repo root recorded in `index_meta` at
+/// The persisted `source_root` (the on-disk repo root recorded in `repo_meta` at
 /// open/rebuild/incremental). `None` on a raw connection that never recorded it (some test
 /// fixtures). This is a SINGLE shared value — under a shared DB across git worktrees it reflects
 /// whichever worktree last indexed, which is why [`validate_memories`] prefers the caller-supplied
 /// active checkout root and only falls back to this (#98 review).
 fn persisted_source_root(conn: &Connection) -> Option<PathBuf> {
-    conn.query_row("SELECT value FROM index_meta WHERE key = 'source_root'", [], |row| {
-        row.get::<_, String>(0)
-    })
-    .optional()
-    .ok()
-    .flatten()
-    .map(PathBuf::from)
+    // `source_root` moved to `repo_meta` (V039); resolve the active repo (the lone one in phase A).
+    let repo_id = crate::index::schema::single_repo_id(conn).ok()?;
+    crate::index::repo_meta(conn, &repo_id, "source_root").ok().flatten().map(PathBuf::from)
 }
 
 /// The filesystem root the off-index existence checks resolve against: the caller-supplied ACTIVE
 /// checkout root (`storage.source_root`, correct under a multi-worktree shared DB) when known, else
-/// the single persisted `index_meta.source_root` (#98 review).
+/// the single persisted `repo_meta.source_root` (#98 review).
 pub(crate) fn effective_fs_root(conn: &Connection, active_root: Option<&Path>) -> Option<PathBuf> {
     active_root.map(Path::to_path_buf).or_else(|| persisted_source_root(conn))
 }

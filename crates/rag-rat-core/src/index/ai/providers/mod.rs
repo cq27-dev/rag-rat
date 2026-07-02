@@ -454,7 +454,7 @@ mod dispatch_tests {
             rusqlite::params![model_id, i64::try_from(spec.dim).unwrap()],
         )
         .unwrap();
-        crate::index::ai::set_meta(&conn, "active_embedding_model", model_id).unwrap();
+        crate::index::ai::set_repo_meta(&conn, "active_embedding_model", model_id).unwrap();
         conn
     }
 

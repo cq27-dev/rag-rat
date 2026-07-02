@@ -775,7 +775,7 @@ fn worktree_overlay_fts_freshness_revision_is_scope_invariant() {
     // And it matches the stored `fts_source_revision` `sync_fts` wrote during the overlay refresh,
     // so a base read sees FTS as fresh (no rebuild) rather than perpetually stale.
     assert_eq!(
-        db.meta("fts_source_revision").unwrap().as_deref(),
+        db.repo_meta("fts_source_revision").unwrap().as_deref(),
         Some(base_revision.as_str()),
         "fts_source_revision recorded during the overlay pass matches the global digest",
     );

@@ -4017,7 +4017,8 @@ fn memory_attention_count_reads_file_db_and_fails_open() {
 fn set_source_root(h: &Harness) {
     h.conn
         .execute(
-            "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('source_root', ?1)",
+            "INSERT OR REPLACE INTO repo_meta(repo_id, key, value)
+             VALUES ('__unassigned__', 'source_root', ?1)",
             params![h.root().to_string_lossy()],
         )
         .unwrap();
@@ -4210,7 +4211,8 @@ fn validate_prefers_active_root_over_persisted_meta() {
     // h.root(), where the file actually lives.
     h.conn
         .execute(
-            "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('source_root', ?1)",
+            "INSERT OR REPLACE INTO repo_meta(repo_id, key, value)
+             VALUES ('__unassigned__', 'source_root', ?1)",
             params![h.root().join("nonexistent-worktree").to_string_lossy()],
         )
         .unwrap();

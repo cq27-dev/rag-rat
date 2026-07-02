@@ -50,19 +50,21 @@ impl IndexDatabase {
         }
 
         let content_revision = self.content_revision()?;
-        let fts_source_revision = self.meta("fts_source_revision")?;
+        let fts_source_revision = self.repo_meta("fts_source_revision")?;
         let fts_dirty = self.fts_dirty()?;
 
         Ok(IndexStatus {
             database: database.display().to_string(),
             exists: database.exists(),
             schema: schema::status(self.storage.connection())?,
-            git_commit: self.meta("git_commit")?,
-            git_dirty: self.meta("git_dirty")?.map(|value| value == "true"),
-            indexed_at_ms: self.meta("indexed_at_ms")?.and_then(|value| value.parse::<i64>().ok()),
+            git_commit: self.repo_meta("git_commit")?,
+            git_dirty: self.repo_meta("git_dirty")?.map(|value| value == "true"),
+            indexed_at_ms: self
+                .repo_meta("indexed_at_ms")?
+                .and_then(|value| value.parse::<i64>().ok()),
             content_revision: content_revision.clone(),
             fts_synced_at_ms: self
-                .meta("fts_synced_at_ms")?
+                .repo_meta("fts_synced_at_ms")?
                 .and_then(|value| value.parse::<i64>().ok()),
             fts_dirty,
             fts_fresh: !fts_dirty

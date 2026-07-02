@@ -407,7 +407,8 @@ fn same_file_same_scope_variants_still_bind_via_logical_variant() {
 
 fn set_local_crate_roots(conn: &Connection, roots: &str) {
     conn.execute(
-        "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('local_crate_roots', ?1)",
+        "INSERT OR REPLACE INTO repo_meta(repo_id, key, value)
+         VALUES ('__unassigned__', 'local_crate_roots', ?1)",
         params![roots],
     )
     .unwrap();

@@ -1173,6 +1173,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_036_ID => Some(36),
             MIGRATION_037_ID => Some(37),
             MIGRATION_038_ID => Some(38),
+            MIGRATION_039_ID => Some(39),
             _ => None,
         })
         .max()
@@ -1220,6 +1221,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_036_ID
             | MIGRATION_037_ID
             | MIGRATION_038_ID
+            | MIGRATION_039_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1264,6 +1266,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_036_ID => migration.checksum != MIGRATION_036_CHECKSUM,
         MIGRATION_037_ID => migration.checksum != MIGRATION_037_CHECKSUM,
         MIGRATION_038_ID => migration.checksum != MIGRATION_038_CHECKSUM,
+        MIGRATION_039_ID => migration.checksum != MIGRATION_039_CHECKSUM,
         _ => false,
     }
 }
@@ -1622,6 +1625,74 @@ pub(crate) const REPOS_REGISTRY_DDL: &str = "
         SELECT '__unassigned__', '', 0
         WHERE NOT EXISTS (SELECT 1 FROM repos WHERE repo_id != '__unassigned__');
 ";
+
+/// The `index_meta` keys V039 relocates into `repo_meta` (memory-sync phase A2) — the per-repo
+/// singletons that were global-by-accident under the one-DB-per-repo assumption. Kept as ONE list
+/// so the copy and the matching delete cannot drift. Machine/db-level keys
+/// (`generated_flags_version`, the reencode DONE gate, the active-model provenance flag + remote
+/// config, the throughput-tune cache) deliberately STAY in `index_meta` — they are not per-repo, or
+/// are scoped by a later workstream.
+const V039_INDEX_META_KEYS: &[&str] = &[
+    "source_root",
+    "content_revision",
+    "git_commit",
+    "git_dirty",
+    "graph_index_version",
+    "active_embedding_model",
+    "clone_graph_live_generation",
+    "github_last_sync_ms",
+    "git_history_indexed_head",
+    "git_history_indexed_root",
+    "git_history_indexed_shallow",
+    "local_crate_roots",
+    "indexed_at_ms",
+    "fts_dirty",
+    "fts_source_revision",
+    "fts_synced_at_ms",
+];
+
+/// The `reconcile_meta` keys V039 relocates into `repo_meta`. The `reconcile_meta` TABLE is
+/// intentionally NOT dropped here — a later cleanup migration owns that (the remaining reconcile
+/// timing keys still live in it); only these two per-repo keys move.
+const V039_RECONCILE_META_KEYS: &[&str] =
+    &["embedding_active_model_version", "vector_int8_reencode_cursor"];
+
+/// V039 (memory-sync phase A2): relocate the per-repo singleton meta keys out of the global
+/// `index_meta` / `reconcile_meta` into `repo_meta`, under the `LEGACY_REPO_ID` placeholder (the
+/// only repo a phase-A DB holds). [`super::register_repo`] re-points these rows to the real repo_id
+/// at adoption. The read/write call sites move to the `repo_meta` accessors in the same change, so
+/// a moved key is never read from the table it was deleted from.
+///
+/// Idempotent (`INSERT OR IGNORE` deduped by the `(repo_id, key)` PK + `DELETE` of the source
+/// rows): a fresh DB has empty meta tables → the copy/delete are no-ops, and a forward-migrated
+/// legacy DB converges on the identical shape. Copy-before-delete on each table means even a torn
+/// run (crash between the copy and the delete) re-converges: the re-run's copy is ignored and the
+/// delete finishes, and readers already read `repo_meta` (the authoritative side).
+pub(crate) fn apply_move_per_repo_meta(conn: &Connection) -> rusqlite::Result<()> {
+    relocate_meta_keys(conn, "index_meta", V039_INDEX_META_KEYS)?;
+    relocate_meta_keys(conn, "reconcile_meta", V039_RECONCILE_META_KEYS)?;
+    Ok(())
+}
+
+/// Copy the listed keys from `source_table` (a `(key, value)` k/v table) into `repo_meta` under the
+/// placeholder repo_id, then delete them from the source. `source_table` and `keys` are internal
+/// string literals (never user input), so interpolating them into the SQL is safe.
+fn relocate_meta_keys(
+    conn: &Connection,
+    source_table: &str,
+    keys: &[&str],
+) -> rusqlite::Result<()> {
+    let in_list = keys.iter().map(|key| format!("'{key}'")).collect::<Vec<_>>().join(", ");
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO repo_meta(repo_id, key, value)
+             SELECT ?1, key, value FROM {source_table} WHERE key IN ({in_list})"
+        ),
+        [super::LEGACY_REPO_ID],
+    )?;
+    conn.execute(&format!("DELETE FROM {source_table} WHERE key IN ({in_list})"), [])?;
+    Ok(())
+}
 
 /// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see
 /// `parser::detect_is_test`) so clone detection can keep tests out of the corpus. Idempotent via

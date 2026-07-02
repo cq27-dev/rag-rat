@@ -99,11 +99,9 @@ fn git_history_test_config(root: &Path) -> Config {
 }
 
 fn read_meta(db: &IndexDatabase, key: &str) -> Option<String> {
-    db.storage
-        .connection()
-        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
-        .optional()
-        .unwrap()
+    // Reads the per-repo `repo_meta` (V039 relocated the singleton keys there); the only caller
+    // reads `indexed_at_ms`, which moved.
+    db.repo_meta(key).unwrap()
 }
 
 /// The callee identifier byte range (#67) stored on the single edge matching

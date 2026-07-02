@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::index::table_row_count;
+use crate::index::{delete_repo_meta, repo_meta, schema, set_repo_meta, table_row_count};
 use crate::search::lexical::SearchHit;
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,9 +202,15 @@ pub(crate) fn apply_prepared(
     )?;
     // Reload-gate key: head + root + shallow flag. `is_history_current` skips the next reload
     // only when all three still match and git_commits is non-empty.
-    set_meta(conn, "git_history_indexed_head", &repo.head)?;
-    set_meta(conn, "git_history_indexed_root", &root_key(root))?;
-    set_meta(conn, "git_history_indexed_shallow", if repo.shallow { "1" } else { "0" })?;
+    let repo_id = schema::single_repo_id(conn)?;
+    set_repo_meta(conn, &repo_id, "git_history_indexed_head", &repo.head)?;
+    set_repo_meta(conn, &repo_id, "git_history_indexed_root", &root_key(root))?;
+    set_repo_meta(
+        conn,
+        &repo_id,
+        "git_history_indexed_shallow",
+        if repo.shallow { "1" } else { "0" },
+    )?;
     status(conn, root)
 }
 
@@ -217,10 +223,11 @@ pub fn status(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexS
     let repo = git_repo(root);
     let commit_count = table_row_count(conn, "git_commits")?;
     let file_change_count = table_row_count(conn, "git_file_changes")?;
+    let repo_id = schema::single_repo_id(conn)?;
     Ok(GitHistoryIndexStatus {
         available: repo.is_some(),
         head: repo.map(|repo| repo.head),
-        indexed_head: meta(conn, "git_history_indexed_head")?,
+        indexed_head: repo_meta(conn, &repo_id, "git_history_indexed_head")?,
         commit_count,
         file_change_count,
     })
@@ -588,11 +595,15 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
         DELETE FROM git_chunk_blame;
         DELETE FROM git_file_changes;
         DELETE FROM git_commits;
-        DELETE FROM index_meta
-        WHERE key IN ('git_history_indexed_head', 'git_history_indexed_root',
-                      'git_history_indexed_shallow');
         ",
     )?;
+    // The reload-gate keys moved to `repo_meta` (V039); clear them for the active repo.
+    let repo_id = schema::single_repo_id(conn)?;
+    for key in
+        ["git_history_indexed_head", "git_history_indexed_root", "git_history_indexed_shallow"]
+    {
+        delete_repo_meta(conn, &repo_id, key)?;
+    }
     Ok(())
 }
 
@@ -910,13 +921,15 @@ pub(crate) fn is_history_current(conn: &Connection, root: &Path) -> bool {
         return false;
     }
     let probe = || -> anyhow::Result<bool> {
-        let head_matches =
-            meta(conn, "git_history_indexed_head")?.as_deref() == Some(repo.head.as_str());
-        let root_matches =
-            meta(conn, "git_history_indexed_root")?.as_deref() == Some(root_key(root).as_str());
+        let repo_id = schema::single_repo_id(conn)?;
+        let head_matches = repo_meta(conn, &repo_id, "git_history_indexed_head")?.as_deref()
+            == Some(repo.head.as_str());
+        let root_matches = repo_meta(conn, &repo_id, "git_history_indexed_root")?.as_deref()
+            == Some(root_key(root).as_str());
         // A prior reload done while shallow only saw truncated history; redo it now that we are
         // not shallow even if HEAD is unchanged.
-        let prior_was_full = meta(conn, "git_history_indexed_shallow")?.as_deref() == Some("0");
+        let prior_was_full =
+            repo_meta(conn, &repo_id, "git_history_indexed_shallow")?.as_deref() == Some("0");
         // Guard against a torn/empty prior reload writing the meta without rows.
         let has_rows = table_row_count(conn, "git_commits")? > 0;
         Ok(head_matches && root_matches && prior_was_full && has_rows)
@@ -931,21 +944,6 @@ fn fts_query(query: &str) -> String {
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>();
     if terms.is_empty() { "\"\"".to_string() } else { terms.join(" OR ") }
-}
-
-fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
-        .optional()?)
-}
-
-fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "INSERT INTO index_meta(key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
-    Ok(())
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

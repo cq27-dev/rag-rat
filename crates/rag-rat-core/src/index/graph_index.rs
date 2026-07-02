@@ -247,7 +247,7 @@ impl IndexDatabase {
     }
 
     pub(super) fn ensure_graph_index_current(&self) -> anyhow::Result<()> {
-        if self.meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION) {
+        if self.repo_meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION) {
             return Ok(());
         }
         let Some(root) = self.storage.source_root().map(Path::to_path_buf) else {
@@ -298,7 +298,7 @@ impl IndexDatabase {
     }
 
     pub(super) fn mark_graph_index_current(&self) -> anyhow::Result<()> {
-        self.set_meta("graph_index_version", GRAPH_INDEX_VERSION)
+        self.set_repo_meta("graph_index_version", GRAPH_INDEX_VERSION)
     }
 
     fn graph_reindex_files(&self) -> anyhow::Result<Vec<GraphReindexFile>> {

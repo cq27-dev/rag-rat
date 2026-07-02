@@ -3,11 +3,12 @@ mod migrations;
 mod registry;
 pub(crate) use baseline::*;
 pub(crate) use migrations::*;
+pub(crate) use registry::single_repo_id;
 pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 38;
+pub const LATEST_SCHEMA_VERSION: u32 = 39;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -245,6 +246,11 @@ const MIGRATION_038_DESCRIPTION: &str =
     "Add repos registry + repo_roots + repo_meta (per-machine repo identity registry and per-repo \
      key/value store) with the __unassigned__ adoption placeholder — the substrate for the global \
      consolidated database and repo_id scoping (memory-sync phase A)";
+const MIGRATION_039_ID: &str = "039_per_repo_meta";
+const MIGRATION_039_CHECKSUM: &str = "sha256:rag-rat-per-repo-meta-v39";
+const MIGRATION_039_DESCRIPTION: &str = "Relocate the per-repo singleton meta keys from the \
+                                         global index_meta / reconcile_meta into repo_meta under \
+                                         the __unassigned__ placeholder (memory-sync phase A2)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -572,6 +578,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_038_CHECKSUM,
         description: MIGRATION_038_DESCRIPTION,
         apply: apply_repos_registry,
+    },
+    Migration {
+        id: MIGRATION_039_ID,
+        checksum: MIGRATION_039_CHECKSUM,
+        description: MIGRATION_039_DESCRIPTION,
+        apply: apply_move_per_repo_meta,
     },
 ];
 

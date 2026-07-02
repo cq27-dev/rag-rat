@@ -90,8 +90,9 @@ fn idle_discover_sweep_does_not_rewrite_indexed_at_ms() {
     db.storage
         .connection()
         .execute(
-            "INSERT INTO index_meta(key, value) VALUES('indexed_at_ms', 'SENTINEL')
-             ON CONFLICT(key) DO UPDATE SET value = 'SENTINEL'",
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES('__unassigned__', 'indexed_at_ms', \
+             'SENTINEL')
+             ON CONFLICT(repo_id, key) DO UPDATE SET value = 'SENTINEL'",
             [],
         )
         .unwrap();

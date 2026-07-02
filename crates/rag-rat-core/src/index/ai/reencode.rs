@@ -118,7 +118,7 @@ fn reencode_legacy_f32_blobs_batched(
 /// back to the sentinel — re-walking from the head is correct (already-int8 rows are skipped),
 /// never wrong.
 fn load_cursor(conn: &Connection) -> anyhow::Result<(i64, String)> {
-    let Some(raw) = reconcile_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)? else {
+    let Some(raw) = repo_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)? else {
         return Ok((i64::MIN, String::new()));
     };
     let Some((chunk_id, model_id)) = raw.split_once('\n') else {
@@ -132,11 +132,7 @@ fn load_cursor(conn: &Connection) -> anyhow::Result<(i64, String)> {
 
 /// Persist the keyset cursor as `"<chunk_id>\n<model_id>"` (model ids never contain a newline).
 fn save_cursor(conn: &Connection, cursor: &(i64, String)) -> anyhow::Result<()> {
-    set_reconcile_meta(
-        conn,
-        VECTOR_INT8_REENCODE_CURSOR_META,
-        &format!("{}\n{}", cursor.0, cursor.1),
-    )
+    set_repo_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META, &format!("{}\n{}", cursor.0, cursor.1))
 }
 
 /// Read up to `limit` legacy f32 rows past `cursor`, in `(chunk_id, model_id)` order (the UNIQUE
@@ -270,9 +266,7 @@ fn reencode_and_mark_if_complete(
 
 /// Drop the persisted keyset cursor once the conversion is complete (it is no longer meaningful).
 fn clear_cursor(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM reconcile_meta WHERE key = ?1", params![
-        VECTOR_INT8_REENCODE_CURSOR_META
-    ])?;
+    delete_repo_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)?;
     Ok(())
 }
 
@@ -297,7 +291,16 @@ mod tests {
                  UNIQUE(chunk_id, model_id)
              );
              CREATE TABLE index_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE reconcile_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+             CREATE TABLE reconcile_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             -- The reencode cursor moved to `repo_meta` (V039), read/written through
+             -- `single_repo_id` → the `repos` registry; seed the placeholder so the cursor path
+             -- resolves the same lone repo production does.
+             CREATE TABLE repos(repo_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, \
+             registered_at_ms INTEGER NOT NULL);
+             INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('__unassigned__', \
+             '', 0);
+             CREATE TABLE repo_meta(repo_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY \
+             KEY(repo_id, key));",
         )
         .unwrap();
         conn
@@ -490,7 +493,7 @@ mod tests {
     }
 
     fn stored_cursor(conn: &Connection) -> Option<String> {
-        reconcile_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META).unwrap()
+        repo_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META).unwrap()
     }
 
     #[test]
@@ -535,7 +538,7 @@ mod tests {
             )
             .unwrap();
         }
-        set_reconcile_meta(&conn, VECTOR_INT8_REENCODE_CURSOR_META, "1\nmodel-a").unwrap();
+        set_repo_meta(&conn, VECTOR_INT8_REENCODE_CURSOR_META, "1\nmodel-a").unwrap();
         assert_eq!(count_remaining_f32(&conn), 4, "4 f32 rows remain past the cursor");
 
         // A follow-up call with NO deadline resumes from the persisted cursor and finishes the

@@ -4,9 +4,9 @@ use super::*;
 
 impl IndexDatabase {
     /// Rewrite the `packages` rows for the ACTIVE scope from the corpus's Cargo manifests, then
-    /// persist the GLOBAL local-crate-root union to `index_meta.local_crate_roots` (#61 per-package
-    /// import scope). Returns whether the package map changed (so an incremental pass can trigger a
-    /// re-resolve only when it must).
+    /// persist the per-repo local-crate-root union to `repo_meta.local_crate_roots` (#61
+    /// per-package import scope). Returns whether the package map changed (so an incremental
+    /// pass can trigger a re-resolve only when it must).
     ///
     /// "Changed" is reported when EITHER the global union changed OR any package's per-scope
     /// `(manifest_dir, local_roots_json)` set changed. Reporting only the global union missed a
@@ -75,7 +75,7 @@ impl IndexDatabase {
             sorted.sort_unstable();
             sorted.join("\n")
         };
-        let union_changed = self.set_meta_if_changed("local_crate_roots", &serialized)?;
+        let union_changed = self.set_repo_meta_if_changed("local_crate_roots", &serialized)?;
         Ok(union_changed || package_map_changed)
     }
 }

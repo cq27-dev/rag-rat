@@ -51,7 +51,7 @@ impl IndexDatabase {
             db.storage.execute_batch("BEGIN IMMEDIATE")?;
             db.clear_full_rebuild_tables()?;
             mem_trace("after clear_full_rebuild_tables (purge)");
-            db.set_meta("source_root", &config.root.display().to_string())?;
+            db.set_repo_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             // Per-package import scope (#61): the `packages` rows + the global `local_crate_roots`
             // union are written by `refresh_packages`, called inside `index_targets_with_progress`
@@ -95,7 +95,7 @@ impl IndexDatabase {
             // input — but keeping it exact maximizes the rare-first sub-block prune.
             db.refresh_clone_token_df()?;
             mem_trace("after refresh_clone_token_df");
-            db.set_meta("indexed_at_ms", &now_ms().to_string())?;
+            db.set_repo_meta("indexed_at_ms", &now_ms().to_string())?;
             // Adopt the configured embedding model as this index's active model INSIDE the rebuild
             // transaction, so reconcile targets it (and read-only opens serve immediately) rather
             // than the hash fallback (#394) — and a failed rebuild rolls the seed back with the

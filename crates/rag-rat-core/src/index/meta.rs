@@ -5,18 +5,35 @@ use super::*;
 impl IndexDatabase {
     pub(super) fn record_content_revision(&self) -> anyhow::Result<String> {
         let revision = self.content_revision()?;
-        self.set_meta("content_revision", &revision)?;
+        self.set_repo_meta("content_revision", &revision)?;
         Ok(revision)
     }
 
-    /// Write a meta key only if the stored value differs. Returns whether a write happened — so a
-    /// no-change incremental/sweep pass can avoid dirtying a WAL page (see issue #63).
-    pub(super) fn set_meta_if_changed(&self, key: &str, value: &str) -> anyhow::Result<bool> {
-        if self.meta(key)?.as_deref() == Some(value) {
-            return Ok(false);
-        }
-        self.set_meta(key, value)?;
-        Ok(true)
+    /// Read a per-repo meta value (`repo_meta`) for the repo owning this connection — the ergonomic
+    /// per-connection twin of the [`repo_meta`] free primitive, resolving the active repo via
+    /// [`schema::single_repo_id`] (A3 replaces that with a real scope context).
+    pub(super) fn repo_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.storage.connection();
+        let repo_id = schema::single_repo_id(conn)?;
+        // Bare call → the free `repo_meta` primitive below, never this method (methods need a
+        // receiver); the two share a name intentionally (primitive + per-connection wrapper).
+        Ok(repo_meta(conn, &repo_id, key)?)
+    }
+
+    /// Upsert a per-repo meta value for the repo owning this connection.
+    pub(super) fn set_repo_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        let repo_id = schema::single_repo_id(conn)?;
+        set_repo_meta(conn, &repo_id, key, value)?;
+        Ok(())
+    }
+
+    /// Upsert a per-repo meta value only when it changes — returns whether a write happened, so a
+    /// no-change incremental/sweep pass avoids dirtying a WAL page (issue #63).
+    pub(super) fn set_repo_meta_if_changed(&self, key: &str, value: &str) -> anyhow::Result<bool> {
+        let conn = self.storage.connection();
+        let repo_id = schema::single_repo_id(conn)?;
+        Ok(set_repo_meta_if_changed(conn, &repo_id, key, value)?)
     }
 
     pub(super) fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
@@ -57,4 +74,64 @@ impl IndexDatabase {
         )?;
         Ok(hex_sha256(value.as_bytes()))
     }
+}
+
+/// Read a per-repo meta value from the `repo_meta` table — the repo-scoped twin of
+/// [`read_meta`](crate::index::read_meta) (which reads the global `index_meta`). `repo_id` is the
+/// owning repo; until phase A3 threads a real active-repo context, callers pass
+/// [`schema::single_repo_id`]. Returns `None` when the key is unset for that repo.
+pub(crate) fn repo_meta(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    key: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
+        params![repo_id, key],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Upsert a per-repo meta value into `repo_meta` (keyed by `(repo_id, key)`). The repo-scoped twin
+/// of [`IndexDatabase::set_meta`].
+pub(crate) fn set_repo_meta(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    key: &str,
+    value: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, ?3)
+         ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
+        params![repo_id, key, value],
+    )?;
+    Ok(())
+}
+
+/// Upsert a per-repo meta value only when it differs from the stored value — returns whether a
+/// write happened, so a no-change pass avoids dirtying a WAL page (the #63 property, mirrored from
+/// [`IndexDatabase::set_meta_if_changed`]).
+pub(crate) fn set_repo_meta_if_changed(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    key: &str,
+    value: &str,
+) -> rusqlite::Result<bool> {
+    if repo_meta(conn, repo_id, key)?.as_deref() == Some(value) {
+        return Ok(false);
+    }
+    set_repo_meta(conn, repo_id, key, value)?;
+    Ok(true)
+}
+
+/// Delete a per-repo meta key (a no-op when absent) — the `repo_meta` counterpart of `delete_meta`,
+/// needed by the clear paths of the relocated model / reencode-cursor keys.
+pub(crate) fn delete_repo_meta(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    key: &str,
+) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM repo_meta WHERE repo_id = ?1 AND key = ?2", params![repo_id, key])?;
+    Ok(())
 }

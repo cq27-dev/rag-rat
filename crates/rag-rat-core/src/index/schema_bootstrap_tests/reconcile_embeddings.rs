@@ -77,7 +77,7 @@ fn rebuild_populates_revision_metadata_and_fresh_fts_state() {
     assert!(!status.content_revision.is_empty());
     assert_eq!(status.fts_source_revision.as_deref(), Some(status.content_revision.as_str()));
     assert_eq!(
-        db.meta("content_revision").unwrap().as_deref(),
+        db.repo_meta("content_revision").unwrap().as_deref(),
         Some(status.content_revision.as_str())
     );
     assert!(!status.fts_dirty);
@@ -271,7 +271,7 @@ fn an_incremental_pass_heals_a_missing_active_model_atomically() {
     // Simulate a pre-#394 index: drop the seeded active-model meta.
     db.storage
         .connection()
-        .execute("DELETE FROM index_meta WHERE key = 'active_embedding_model'", [])
+        .execute("DELETE FROM repo_meta WHERE key = 'active_embedding_model'", [])
         .unwrap();
     drop(db);
 
@@ -305,8 +305,8 @@ fn cached_fastembed_model_recovers_ready_state() {
     // `model_version`).
     {
         let conn = db.storage.connection();
-        conn.execute("DELETE FROM index_meta WHERE key = 'active_embedding_model'", []).unwrap();
-        ai::set_reconcile_meta(conn, "embedding_active_model_version", "legacy-stale-key").unwrap();
+        conn.execute("DELETE FROM repo_meta WHERE key = 'active_embedding_model'", []).unwrap();
+        ai::set_repo_meta(conn, "embedding_active_model_version", "legacy-stale-key").unwrap();
     }
 
     ai::recover_cached_fastembed_model_at(db.storage.connection(), &cache_dir).unwrap();
@@ -685,8 +685,9 @@ fn reconcile_plan_reports_policy_skips_for_fastembed_model() {
     db.storage
         .connection()
         .execute(
-            "INSERT INTO index_meta(key, value) VALUES ('active_embedding_model', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "INSERT INTO repo_meta(repo_id, key, value)
+                 VALUES ('__unassigned__', 'active_embedding_model', ?1)
+                 ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
             [FASTEMBED_MODEL_ID],
         )
         .unwrap();
@@ -708,8 +709,9 @@ fn blocked_fastembed_reconcile_still_reports_policy_skips() {
     db.storage
         .connection()
         .execute(
-            "INSERT INTO index_meta(key, value) VALUES ('active_embedding_model', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "INSERT INTO repo_meta(repo_id, key, value)
+                 VALUES ('__unassigned__', 'active_embedding_model', ?1)
+                 ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
             [FASTEMBED_MODEL_ID],
         )
         .unwrap();

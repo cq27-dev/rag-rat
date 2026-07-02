@@ -415,7 +415,7 @@ impl IndexDatabase {
             lim > UNLIMITED_REFINE_BUDGET && total_classes_built > UNLIMITED_REFINE_BUDGET
         });
 
-        let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
+        let freshness = self.repo_meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
 
         // Count DISTINCT member file paths whose on-disk content no longer matches the indexed
         // sha256 (read-only signal; Plan 2 does not heal-before-return).
@@ -613,7 +613,7 @@ impl IndexDatabase {
             }
         };
 
-        let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
+        let freshness = self.repo_meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
 
         let resolved_id = resolve_selector_to_symbol_id(conn, &selector)?;
         let Some(symbol_id) = resolved_id else {

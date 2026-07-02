@@ -31,12 +31,14 @@ pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
 /// write path (#143) and to let the read-only MCP open refuse to serve when a manifest write is
 /// still owed (falling back to the read-write open, which heals once).
 pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<bool> {
+    // The active-model meta moved to `repo_meta` (V039); check the active repo's row there.
+    let repo_id = crate::index::schema::single_repo_id(conn)?;
     for model_id in LEGACY_MODEL_IDS {
         let lingering: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM ai_models WHERE model_id = ?1)
                  OR EXISTS(SELECT 1 FROM chunk_embeddings WHERE model_id = ?1)
-                 OR EXISTS(SELECT 1 FROM index_meta WHERE key = ?2 AND value = ?1)",
-            params![model_id, ACTIVE_EMBEDDING_MODEL_META],
+                 OR EXISTS(SELECT 1 FROM repo_meta WHERE repo_id = ?3 AND key = ?2 AND value = ?1)",
+            params![model_id, ACTIVE_EMBEDDING_MODEL_META, repo_id],
             |row| row.get(0),
         )?;
         if lingering {
@@ -68,6 +70,8 @@ pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<boo
 }
 
 pub(crate) fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
+    // The active-model meta moved to `repo_meta` (V039); clear it for the active repo.
+    let repo_id = crate::index::schema::single_repo_id(conn)?;
     for model_id in LEGACY_MODEL_IDS {
         conn.execute("DELETE FROM chunk_embeddings WHERE model_id = ?1", params![model_id])?;
         conn.execute("DELETE FROM ai_models WHERE model_id = ?1", params![model_id])?;
@@ -76,18 +80,17 @@ pub(crate) fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
         // Leaving the remote config behind would let `active_embedder` keep reconstructing an
         // `OpenAiEmbedder` against a now-removed endpoint after the active model fell back to hash,
         // so clear it whenever we delete the matching active-model meta.
-        let was_active =
-            conn.execute("DELETE FROM index_meta WHERE key = ?1 AND value = ?2", params![
-                ACTIVE_EMBEDDING_MODEL_META,
-                model_id
-            ])?;
+        let was_active = conn.execute(
+            "DELETE FROM repo_meta WHERE repo_id = ?1 AND key = ?2 AND value = ?3",
+            params![repo_id, ACTIVE_EMBEDDING_MODEL_META, model_id],
+        )?;
         if was_active > 0 {
             clear_active_remote_config(conn)?;
             // ALSO drop the legacy model's freshness-version meta (R3a): otherwise the hash
             // fallback inherits the removed model's `model_version` key and reports the
             // wrong freshness. The next install re-stamps it; clearing here keeps the
             // gap correct.
-            clear_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?;
+            delete_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?;
         }
     }
     Ok(())

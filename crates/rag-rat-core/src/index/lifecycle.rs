@@ -45,7 +45,8 @@ impl IndexDatabase {
             schema::ensure_compatible_or_migrate(storage.connection())?;
         }
         ai::ensure_model_manifest(storage.connection())?;
-        if let Some(root) = read_meta(storage.connection(), "source_root")? {
+        let repo_id = schema::single_repo_id(storage.connection())?;
+        if let Some(root) = repo_meta(storage.connection(), &repo_id, "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
         let db = Self {
@@ -108,7 +109,8 @@ impl IndexDatabase {
         if schema::status(storage.connection())?.state != schema::SchemaState::Compatible {
             return Ok(None);
         }
-        if read_meta(storage.connection(), "graph_index_version")?.as_deref()
+        let repo_id = schema::single_repo_id(storage.connection())?;
+        if repo_meta(storage.connection(), &repo_id, "graph_index_version")?.as_deref()
             != Some(GRAPH_INDEX_VERSION)
         {
             return Ok(None);
@@ -187,7 +189,8 @@ impl IndexDatabase {
         let mut storage = IndexConnection::open(path)?;
         schema::apply(storage.connection())?;
         ai::ensure_model_manifest(storage.connection())?;
-        if let Some(root) = read_meta(storage.connection(), "source_root")? {
+        let repo_id = schema::single_repo_id(storage.connection())?;
+        if let Some(root) = repo_meta(storage.connection(), &repo_id, "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
         Ok(Self {

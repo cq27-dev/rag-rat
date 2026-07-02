@@ -482,7 +482,7 @@ fn read_only_open_serves_current_index_and_declines_when_heal_is_owed() {
     // Mark the graph index stale (a heal write is now owed). open() already ran and left it
     // current, so set it afterward; the read-only path does not heal, so it must decline.
     let db = IndexDatabase::open(&config.database).unwrap();
-    db.set_meta("graph_index_version", "0").unwrap();
+    db.set_repo_meta("graph_index_version", "0").unwrap();
     drop(db);
     assert!(
         IndexDatabase::try_open_config_read_only(&config).unwrap().is_none(),

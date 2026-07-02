@@ -692,7 +692,7 @@ fn execute_one() {
     let db = IndexDatabase::rebuild(&config).unwrap();
     db.storage
         .connection()
-        .execute("UPDATE index_meta SET value = 'old' WHERE key = 'graph_index_version'", [])
+        .execute("UPDATE repo_meta SET value = 'old' WHERE key = 'graph_index_version'", [])
         .unwrap();
     db.storage
         .connection()

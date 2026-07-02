@@ -1,5 +1,5 @@
 use super::*;
-use crate::index::table_row_count;
+use crate::index::{repo_meta, schema, set_repo_meta, table_row_count};
 
 pub(crate) fn sync_from_refs<C: GitHubClient>(
     conn: &Connection,
@@ -25,7 +25,8 @@ pub(crate) fn sync_from_refs_with_progress<C: GitHubClient>(
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
         sync_refs(conn, client, refs.iter(), &mut progress)?
     };
-    set_meta(conn, "github_last_sync_ms", &now_ms().to_string())?;
+    let repo_id = schema::single_repo_id(conn)?;
+    set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
     Ok(GitHubSyncReport {
         offline,
         discovered_refs: refs.len(),
@@ -62,7 +63,8 @@ pub(crate) fn sync_issue<C: GitHubClient>(
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
         sync_refs(conn, client, refs.iter().filter(|r| r.number == parsed.number), &mut |_| {})?
     };
-    set_meta(conn, "github_last_sync_ms", &now_ms().to_string())?;
+    let repo_id = schema::single_repo_id(conn)?;
+    set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
     Ok(GitHubSyncReport {
         offline,
         discovered_refs: refs.len(),
@@ -81,7 +83,8 @@ pub(crate) fn status(conn: &Connection, ctx: &GitHubContext) -> anyhow::Result<G
         pulls: table_row_count(conn, "github_pull_requests")?,
         reviews: table_row_count(conn, "github_reviews")?,
         review_comments: table_row_count(conn, "github_review_comments")?,
-        last_sync_ms: meta(conn, "github_last_sync_ms")?.and_then(|value| value.parse().ok()),
+        last_sync_ms: repo_meta(conn, &schema::single_repo_id(conn)?, "github_last_sync_ms")?
+            .and_then(|value| value.parse().ok()),
         capability: if ctx.gh_available {
             "gh_cli_available".to_string()
         } else {

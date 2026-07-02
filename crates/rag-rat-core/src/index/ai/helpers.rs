@@ -54,7 +54,7 @@ pub(crate) fn embed_query_with(
 
 pub(crate) fn active_embedding_model_id(conn: &Connection) -> anyhow::Result<String> {
     ensure_model_manifest(conn)?;
-    if let Some(model_id) = meta(conn, ACTIVE_EMBEDDING_MODEL_META)? {
+    if let Some(model_id) = repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META)? {
         return Ok(model_id);
     }
     Ok(HASH_MODEL_ID.to_string())
@@ -72,7 +72,7 @@ pub(crate) fn active_embedding_model_version(
     // return its OWN static `spec.version`. The reconcile/active path always queries the active
     // model, so it still gets the dynamic meta.
     if model_id == active_embedding_model_id(conn)?
-        && let Some(version) = reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?
+        && let Some(version) = repo_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?
     {
         return Ok(version);
     }
@@ -399,9 +399,33 @@ pub(crate) fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String
 }
 
 /// Delete an `index_meta` key (a no-op when absent) — the `index_meta` counterpart of
-/// [`clear_reconcile_meta`].
+/// [`delete_repo_meta`].
 pub(crate) fn delete_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM index_meta WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
+/// Read a per-repo meta value (`repo_meta`) for the repo owning `conn` — the repo-scoped twin of
+/// [`meta`], resolving the active repo via `single_repo_id` (phase A3 replaces that with a real
+/// scope context). Used for the per-repo keys V039 relocated out of `index_meta` /
+/// `reconcile_meta`: the active embedding model and its freshness version, and the int8 reencode
+/// cursor.
+pub(crate) fn repo_meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    Ok(crate::index::repo_meta(conn, &repo_id, key)?)
+}
+
+/// Upsert a per-repo meta value — the repo-scoped twin of [`set_meta`].
+pub(crate) fn set_repo_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
+    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    crate::index::set_repo_meta(conn, &repo_id, key, value)?;
+    Ok(())
+}
+
+/// Delete a per-repo meta key (a no-op when absent) — the repo-scoped twin of [`delete_meta`].
+pub(crate) fn delete_repo_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
+    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    crate::index::delete_repo_meta(conn, &repo_id, key)?;
     Ok(())
 }
 
@@ -454,19 +478,6 @@ pub(crate) fn set_reconcile_meta(conn: &Connection, key: &str, value: &str) -> a
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![key, value],
     )?;
-    Ok(())
-}
-
-pub(crate) fn reconcile_meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM reconcile_meta WHERE key = ?1", [key], |row| row.get(0))
-        .optional()?)
-}
-
-/// Delete a `reconcile_meta` key (a no-op when absent). Used to clear the stale freshness-version
-/// meta when the active model goes away, so the hash fallback doesn't inherit a legacy model's key.
-pub(crate) fn clear_reconcile_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM reconcile_meta WHERE key = ?1", params![key])?;
     Ok(())
 }
 
@@ -587,7 +598,7 @@ mod tests {
             params![model_id, i64::try_from(dim).unwrap()],
         )
         .unwrap();
-        set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id).unwrap();
+        set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id).unwrap();
     }
 
     #[test]
@@ -599,7 +610,7 @@ mod tests {
         let conn = schema_conn();
         activate_model(&conn, FASTEMBED_MODEL_ID);
         let dynamic_key = "fastembed-all-minilm-l6-v2-v1-deadbeefcafef00d";
-        set_reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, dynamic_key).unwrap();
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, dynamic_key).unwrap();
 
         // The ACTIVE model gets the dynamic meta...
         assert_eq!(active_embedding_model_version(&conn, FASTEMBED_MODEL_ID).unwrap(), dynamic_key,);

@@ -1082,7 +1082,7 @@ mod freshness_version_tests {
     }
 
     fn active_version(conn: &Connection) -> String {
-        reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap().unwrap()
+        repo_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap().unwrap()
     }
 
     #[test]
@@ -1129,8 +1129,8 @@ mod freshness_version_tests {
             params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
         )
         .unwrap();
-        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
-        set_reconcile_meta(
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_repo_meta(
             &conn,
             ACTIVE_EMBEDDING_MODEL_VERSION_META,
             &remote_freshness_version(spec, &remote),
@@ -1174,8 +1174,8 @@ mod freshness_version_tests {
             params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
         )
         .unwrap();
-        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
-        set_reconcile_meta(
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_repo_meta(
             &conn,
             ACTIVE_EMBEDDING_MODEL_VERSION_META,
             &remote_freshness_version(spec, &remote),
@@ -1214,8 +1214,8 @@ mod freshness_version_tests {
             params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
         )
         .unwrap();
-        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
-        set_reconcile_meta(
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_repo_meta(
             &conn,
             ACTIVE_EMBEDDING_MODEL_VERSION_META,
             &remote_freshness_version(spec, &remote),
@@ -1499,8 +1499,8 @@ mod freshness_version_tests {
             params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
         )
         .unwrap();
-        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
-        set_reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, spec.version).unwrap();
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, spec.version).unwrap();
         set_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
 
         let report =
@@ -1575,7 +1575,7 @@ mod freshness_version_tests {
             params![LEGACY_OLLAMA_ID],
         )
         .unwrap();
-        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, LEGACY_OLLAMA_ID).unwrap();
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, LEGACY_OLLAMA_ID).unwrap();
         set_active_remote_config(&conn, &remote_at("http://box:11434")).unwrap();
         assert!(!model_manifest_is_current(&conn).unwrap(), "a lingering legacy active id is work");
 
@@ -1590,7 +1590,11 @@ mod freshness_version_tests {
             )
             .unwrap();
         assert!(!row_present, "the legacy ai_models row is removed");
-        assert_eq!(meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap(), None, "active meta cleared");
+        assert_eq!(
+            repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap(),
+            None,
+            "active meta cleared"
+        );
         assert!(
             active_remote_config(&conn).unwrap().is_none(),
             "the stale remote config is cleared so no OpenAiEmbedder is reconstructed",
@@ -1623,13 +1627,9 @@ mod freshness_version_tests {
             params![LEGACY_OLLAMA_ID],
         )
         .unwrap();
-        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, LEGACY_OLLAMA_ID).unwrap();
-        set_reconcile_meta(
-            &conn,
-            ACTIVE_EMBEDDING_MODEL_VERSION_META,
-            "ollama-all-minilm-v1-deadbeef",
-        )
-        .unwrap();
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, LEGACY_OLLAMA_ID).unwrap();
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, "ollama-all-minilm-v1-deadbeef")
+            .unwrap();
 
         ensure_model_manifest(&conn).unwrap();
 
@@ -1637,7 +1637,7 @@ mod freshness_version_tests {
         // `active_embedding_model_version(HASH)` falls back to the hash spec's static version — NOT
         // the legacy key.
         assert_eq!(
-            reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap(),
+            repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap(),
             None,
             "the legacy freshness-version meta is cleared",
         );
@@ -1656,7 +1656,7 @@ mod freshness_version_tests {
         let conn = schema_conn();
         activate_model_with_version(&conn, HASH_MODEL_ID, "hash-v1", false).unwrap();
         assert_eq!(
-            meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().as_deref(),
+            repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().as_deref(),
             Some(HASH_MODEL_ID)
         );
         assert_eq!(active_version(&conn), "hash-v1");
@@ -1742,7 +1742,7 @@ mod freshness_version_tests {
             params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
         )
         .unwrap();
-        set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
             backend: crate::config::RemoteBackend::Ollama,
@@ -1758,7 +1758,7 @@ mod freshness_version_tests {
             request_timeout_s: 5,
         };
         set_active_remote_config(conn, &remote).unwrap();
-        set_reconcile_meta(
+        set_repo_meta(
             conn,
             ACTIVE_EMBEDDING_MODEL_VERSION_META,
             &remote_freshness_version(spec, &remote),

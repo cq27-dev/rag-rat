@@ -46,6 +46,7 @@ pub(crate) use git_context::*;
 pub(crate) use lifecycle::install_scope_view;
 pub use lifecycle::install_worktree_scope_view;
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
+pub(crate) use meta::{delete_repo_meta, repo_meta, set_repo_meta};
 pub use parser_failures::ParserFailure;
 pub(crate) use prep::*;
 pub use query_api::{

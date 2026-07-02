@@ -66,7 +66,7 @@ pub(crate) fn recover_cached_fastembed_model_at(
 
 #[cfg(feature = "fastembed")]
 pub(crate) fn active_embedding_model_is_missing(conn: &Connection) -> anyhow::Result<bool> {
-    let Some(active_model_id) = meta(conn, ACTIVE_EMBEDDING_MODEL_META)? else {
+    let Some(active_model_id) = repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META)? else {
         return Ok(true);
     };
     let active = conn
@@ -107,8 +107,11 @@ pub(crate) fn activate_model_with_version(
     version: &str,
     provisional: bool,
 ) -> anyhow::Result<()> {
-    set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
-    set_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, version)?;
+    // Model id + freshness version are per-repo (V039 → repo_meta); the provenance flag is NOT in
+    // the phase-A2 move list, so it stays in the global `index_meta` (A3/A5 scope it later). Split
+    // across tables but still stamped together in this single writer's one call.
+    set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
+    set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, version)?;
     set_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META, if provisional { "1" } else { "0" })?;
     Ok(())
 }
@@ -133,8 +136,8 @@ pub(crate) fn clear_active_embedding_model_provisional(conn: &Connection) -> any
 /// activation, restoring the "embeddings-off ⇒ active model unset" invariant (#394 review).
 /// Idempotent (each delete is a no-op when its key is absent).
 pub(crate) fn clear_active_embedding_model(conn: &Connection) -> anyhow::Result<()> {
-    delete_meta(conn, ACTIVE_EMBEDDING_MODEL_META)?;
-    clear_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?;
+    delete_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META)?;
+    delete_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?;
     delete_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META)?;
     clear_active_remote_config(conn)
 }
@@ -208,10 +211,10 @@ pub(crate) fn active_embedding_model_seed_owed(
         // Embeddings-off: a write is owed only when a PROVISIONAL model is still active and must be
         // cleared. An unset active (nothing to clear) or an explicit / confirmed one (preserved)
         // owes nothing.
-        return Ok(meta(conn, ACTIVE_EMBEDDING_MODEL_META)?.is_some()
+        return Ok(repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META)?.is_some()
             && active_embedding_model_is_provisional(conn)?);
     };
-    match meta(conn, ACTIVE_EMBEDDING_MODEL_META)? {
+    match repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META)? {
         None => Ok(true),
         Some(active) if active == configured => Ok(false),
         Some(_) => active_embedding_model_is_provisional(conn),
@@ -348,7 +351,7 @@ mod seed_active_embedding_model_tests {
     fn seeds_the_configured_model_when_active_is_unset() {
         let conn = fresh_conn();
         assert!(
-            meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none(),
+            repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none(),
             "a fresh index has no active embedding model"
         );
         assert!(
@@ -436,7 +439,7 @@ mod seed_active_embedding_model_tests {
         assert!(!active_embedding_model_seed_owed(&conn, None).unwrap(), "off ⇒ nothing to seed");
         seed_active_embedding_model(&conn, None).unwrap();
         assert!(
-            meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none(),
+            repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none(),
             "the embeddings-off choice leaves the active model unset (hash fallback stands)"
         );
     }
@@ -458,8 +461,8 @@ mod seed_active_embedding_model_tests {
 
         // The active model, its freshness version, the provenance flag, and the stale remote config
         // are all gone — `active_embedding_model_id` returns to the hash fallback.
-        assert!(meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none());
-        assert!(reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap().is_none());
+        assert!(repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none());
+        assert!(repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap().is_none());
         assert!(meta(&conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META).unwrap().is_none());
         assert!(meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META).unwrap().is_none());
         assert_eq!(active_embedding_model_id(&conn).unwrap(), HASH);

@@ -76,7 +76,7 @@ impl IndexDatabase {
             // is also exactly the false signal the watcher-loop diagnostic keys on
             // (indexed_at_ms advancing while content is unchanged).
             let source_root_changed =
-                db.set_meta_if_changed("source_root", &config.root.display().to_string())?;
+                db.set_repo_meta_if_changed("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             let git_meta_changed = db.write_git_meta(&config.root)?;
             // Heal the active embedding model from config INSIDE the txn: the incremental /
@@ -156,7 +156,7 @@ impl IndexDatabase {
                 db.sync_fts()?;
             }
             if mutated {
-                db.set_meta("indexed_at_ms", &now_ms().to_string())?;
+                db.set_repo_meta("indexed_at_ms", &now_ms().to_string())?;
                 db.storage.execute_batch("COMMIT")?;
             } else {
                 // Nothing changed since the last pass — close the (empty) transaction without

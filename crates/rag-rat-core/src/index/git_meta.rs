@@ -8,9 +8,9 @@ impl IndexDatabase {
     pub(super) fn write_git_meta(&self, root: &Path) -> anyhow::Result<bool> {
         let commit = head_sha(root);
         let dirty = is_worktree_dirty(root);
-        let commit_changed = self.set_meta_if_changed("git_commit", &commit)?;
+        let commit_changed = self.set_repo_meta_if_changed("git_commit", &commit)?;
         let dirty_changed =
-            self.set_meta_if_changed("git_dirty", if dirty { "true" } else { "false" })?;
+            self.set_repo_meta_if_changed("git_dirty", if dirty { "true" } else { "false" })?;
         Ok(commit_changed || dirty_changed)
     }
 
