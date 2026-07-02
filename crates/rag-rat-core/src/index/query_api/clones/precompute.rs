@@ -154,6 +154,29 @@ impl IndexDatabase {
             || !live.postings_written)
     }
 
+    /// The live clone-graph generation the write-time postings fast path may read from —
+    /// `Some(gen)` ONLY when the persisted postings are safe to serve, `None` otherwise (→ the
+    /// caller uses the RAM fallback). Eligibility is EXACT-freshness, deliberately STRICTER
+    /// than the `find_clones` edge fast path's "mildly-stale-OK" (review R1): the persisted
+    /// sub-block token set for a symbol depends on `sub_block_tokens`' ordering by the CURRENT
+    /// `clone_token_df`, so a generation whose `source_revision` has drifted from
+    /// `content_revision()` could disagree with what the live index would compute — a silent
+    /// missed near-clone. So require:
+    /// - a `Complete` live generation (the meta live-pointer only ever names a Complete one),
+    /// - `normalizer_version == NORM_VERSION`,
+    /// - `postings_written` (a postings-complete, postings-aware generation — review R2), AND
+    /// - `source_revision == content_revision()` EXACTLY (not merely present).
+    pub(crate) fn clone_check_indexed_generation(&self) -> anyhow::Result<Option<i64>> {
+        let conn = self.storage.connection();
+        let Some(live) = live_generation_row(conn)? else {
+            return Ok(None);
+        };
+        let eligible = live.normalizer_version == NORM_VERSION
+            && live.postings_written
+            && live.source_revision == self.content_revision()?;
+        Ok(eligible.then_some(live.generation))
+    }
+
     /// ONE precompute pass: resume (or start) the building generation toward the current content
     /// revision, stream symbols from the resume cursor emitting verified clone edges, checkpoint
     /// per batch, and — if the walk finishes within budget — publish the generation as live.

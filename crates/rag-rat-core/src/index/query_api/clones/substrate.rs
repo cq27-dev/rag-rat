@@ -52,6 +52,7 @@ pub(crate) const DF_FALLBACK: i64 = i64::MAX;
 pub(crate) const HOT_TOKEN_POSTINGS_CAP: usize = 256;
 
 /// One scoped baseline symbol's fingerprint, loaded for the candidate read.
+#[derive(Clone)]
 pub(crate) struct SymbolBag {
     pub(crate) symbol_id: i64,
     pub(crate) language: String,
@@ -61,6 +62,7 @@ pub(crate) struct SymbolBag {
     pub(crate) tokens: Vec<TokenPosting>,
 }
 
+#[derive(Clone)]
 pub(crate) struct TokenPosting {
     pub(crate) token_hash: i64,
     pub(crate) freq: i64,
