@@ -1576,9 +1576,13 @@ pub(crate) fn apply_clone_subblock_postings_tables(conn: &Connection) -> rusqlit
 /// `repo_roots`/`repo_meta` carry an `ON DELETE CASCADE` FK to `repos` (NOT to a reindex-volatile
 /// parent), so the volatile-FK trip-wire does not flag them and they need no allowlist entry.
 ///
-/// Idempotent: `CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE` the placeholder, so a fresh DB
-/// (the full `apply` ladder) and a forward-migrated V037 index converge on the identical shape,
-/// and a re-run is a no-op.
+/// Idempotent AND adoption-safe: `CREATE TABLE IF NOT EXISTS` + a placeholder seed guarded by "no
+/// real repo row exists yet". `schema::apply` re-runs every additive migration, and
+/// `IndexDatabase::rebuild` takes that path (via `create_or_migrate`) on an ALREADY-adopted DB — so
+/// the seed must not re-mint the placeholder after `register_repo` UPDATE'd its PK to the real id.
+/// A fresh DB (empty `repos`), a forward-migrated V037 index (empty `repos`), and a re-apply of an
+/// adopted DB (a real row present) all converge correctly: the first two seed the placeholder, the
+/// last leaves the real row untouched.
 pub(crate) fn apply_repos_registry(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(REPOS_REGISTRY_DDL)
 }
@@ -1606,8 +1610,17 @@ pub(crate) const REPOS_REGISTRY_DDL: &str = "
     ) STRICT;
     -- Adoption placeholder (MUST equal schema::LEGACY_REPO_ID). A legacy single-repo DB carries
     -- exactly this one row until register_repo() rewrites it to the real content-derived repo_id.
+    -- Seed ONLY when no real (non-placeholder) repo already owns the DB: schema::apply re-runs \
+                                             every
+    -- additive migration, and IndexDatabase::rebuild reaches it (via create_or_migrate) on an
+    -- ALREADY-adopted DB — where the placeholder's PK has been UPDATE'd to the real id, so a plain
+    -- INSERT OR IGNORE would find no conflict and resurrect the marker beside the real row. The
+    -- WHERE NOT EXISTS guard makes the seed a no-op once a real repo exists; INSERT OR IGNORE \
+                                             keeps
+    -- it idempotent when only the placeholder is present (fresh / forward-migrated re-apply).
     INSERT OR IGNORE INTO repos(repo_id, display_name, registered_at_ms)
-        VALUES ('__unassigned__', '', 0);
+        SELECT '__unassigned__', '', 0
+        WHERE NOT EXISTS (SELECT 1 FROM repos WHERE repo_id != '__unassigned__');
 ";
 
 /// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see

@@ -147,6 +147,29 @@ fn register_repo_adopts_the_placeholder() {
     assert_eq!(root, "/src/myrepo");
 }
 
+/// Re-applying the full schema AFTER adoption must NOT resurrect the `__unassigned__` placeholder.
+/// `schema::apply` re-runs every additive migration (this is the exact path
+/// `IndexDatabase::rebuild` takes via `create_or_migrate` on an already-migrated DB), so the V038
+/// seed is conditional on "no real repo row yet". An unconditional `INSERT OR IGNORE` would re-mint
+/// the placeholder after adoption UPDATE'd its PK away — leaving both the real repo and the legacy
+/// marker. A3 extends adoption to more direct-scoped tables, so this invariant has to hold before
+/// then.
+#[test]
+fn reapplying_schema_after_adoption_does_not_resurrect_the_placeholder() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/myrepo"), 1).unwrap();
+    assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "adopted: placeholder gone");
+
+    // The exact re-run `create_or_migrate` (hence `rebuild`) performs on an existing index.
+    schema::apply(&conn).expect("re-apply is idempotent on an already-migrated DB");
+
+    assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "placeholder must NOT reappear");
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0)).unwrap();
+    assert_eq!(total, 1, "exactly one repos row (the real one) remains");
+    assert_eq!(repo_row_count(&conn, "repo-abc"), 1, "the adopted repo survives the re-apply");
+}
+
 /// Re-registering the same repo+root is a no-op (no duplicate rows).
 #[test]
 fn register_repo_is_idempotent() {
