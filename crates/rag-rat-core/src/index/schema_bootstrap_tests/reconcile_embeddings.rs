@@ -125,10 +125,15 @@ fn fastembed_missing_feature_reports_rebuild_command() {
 
 #[test]
 fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
-    let (root, config) = markdown_config(
+    let (root, mut config) = markdown_config(
         "alpha token\nsecond line with enough detail for the semantic embedding policy to keep \
          this chunk\nthird line with runtime context\n",
     );
+    // Select the deterministic hash embedder explicitly — this test exercises the reconcile flow
+    // with the no-download test embedder. A fresh index adopts the CONFIGURED model (#394), so
+    // without this it would adopt the default all-MiniLM and the HASH_MODEL_ID assertions below
+    // would not hold.
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
     let db = IndexDatabase::rebuild(&config).unwrap();
     let chunk_id = first_chunk_id(&db);
 

@@ -16,6 +16,12 @@ impl IndexDatabase {
         let mut db = Self::create_or_migrate(&config.database)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
+        // Adopt the configured embedding model as this fresh index's active model, so reconcile
+        // targets it (and read-only opens serve immediately) rather than the hash fallback (#394).
+        ai::seed_active_embedding_model(
+            db.storage.connection(),
+            config.llm.embedding.backend.model_id(),
+        )?;
         progress(IndexProgress::IndexingGitHistory);
         let mut git_history = Some(spawn_git_history_prepare(&config.root));
         // RAM-first bulk build: a full rebuild is one big atomic write, so skip per-commit fsyncs

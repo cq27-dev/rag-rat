@@ -108,6 +108,47 @@ pub(crate) fn activate_model_with_version(
     Ok(())
 }
 
+/// Seed the active embedding model from the CONFIG's selection when the index has none yet (#394),
+/// so a fresh index adopts the configured model instead of silently defaulting to the hash fallback
+/// (`active_embedding_model_id`'s `HASH_MODEL_ID` default — which the config never selects, since
+/// `EmbeddingBackend::default()` is all-MiniLM). Read-first via
+/// [`active_embedding_model_seed_owed`]: a no-op once an active model is set (so an explicit
+/// `models install <other>` is respected) and for the embeddings-off choice (`configured_model_id
+/// == None`).
+///
+/// This does NOT install the model — reconcile still blocks with an accurate
+/// `models install <configured>` hint until it is — it only makes the index's active model reflect
+/// the config so that hint (and every model-scoped read) names the RIGHT model rather than the hash
+/// fallback. Runs on the write-bearing `open_config`, so any write-bearing open heals an index
+/// built before this fix.
+pub(crate) fn seed_active_embedding_model(
+    conn: &Connection,
+    configured_model_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if !active_embedding_model_seed_owed(conn, configured_model_id)? {
+        return Ok(());
+    }
+    let model_id = configured_model_id.expect("seed_owed is true only when the id is Some");
+    let Some(spec) = spec(model_id) else {
+        return Ok(()); // unknown id (defensive) — leave unset so the hash fallback stands
+    };
+    // Activate + stamp the freshness version through the single writer (never the active meta
+    // alone, per the R3b footgun). The static `spec.version` is correct pre-install;
+    // `install_model` re-stamps the runtime-accurate version, and a fresh index has no
+    // embeddings to re-embed.
+    activate_model_with_version(conn, spec.model_id, spec.version)
+}
+
+/// Read-only test of whether [`seed_active_embedding_model`] would WRITE — the config selects a
+/// model AND the active-model meta is unset. The read-only open consults it to fall back to the
+/// write path so the seed heals once (same posture as the model-manifest / generated-flags gates).
+pub(crate) fn active_embedding_model_seed_owed(
+    conn: &Connection,
+    configured_model_id: Option<&str>,
+) -> anyhow::Result<bool> {
+    Ok(configured_model_id.is_some() && meta(conn, ACTIVE_EMBEDDING_MODEL_META)?.is_none())
+}
+
 pub(crate) fn install_model(
     conn: &Connection,
     model_id: &str,
@@ -212,5 +253,85 @@ pub(crate) fn install_model2vec_model(conn: &Connection, model_id: &str) -> anyh
             params![model_id, MODEL2VEC_MISSING_FEATURE_MESSAGE],
         )?;
         anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
+    }
+}
+
+#[cfg(test)]
+mod seed_active_embedding_model_tests {
+    use super::*;
+    use crate::storage::IndexConnection;
+
+    const JINA: &str = "jinaai/jina-embeddings-v2-base-code";
+    const MINILM: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
+    /// A fresh, schema-applied index connection with the model manifest seeded (no active model).
+    fn fresh_index() -> (std::path::PathBuf, IndexConnection) {
+        let dir = std::env::temp_dir().join(format!(
+            "ragrat-seed-model-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = IndexConnection::open(&dir.join("index.db")).unwrap();
+        crate::index::schema::apply(conn.connection()).unwrap();
+        ensure_model_manifest(conn.connection()).unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn seeds_the_configured_model_when_active_is_unset() {
+        let (dir, conn) = fresh_index();
+        let conn = conn.connection();
+        assert!(
+            meta(conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none(),
+            "a fresh index has no active embedding model"
+        );
+        assert!(
+            active_embedding_model_seed_owed(conn, Some(JINA)).unwrap(),
+            "seed owed when unset"
+        );
+
+        seed_active_embedding_model(conn, Some(JINA)).unwrap();
+
+        // The fresh index adopts the CONFIGURED model, NOT the HASH_MODEL_ID fallback.
+        assert_eq!(active_embedding_model_id(conn).unwrap(), JINA);
+        assert!(
+            !active_embedding_model_seed_owed(conn, Some(JINA)).unwrap(),
+            "no longer owed once seeded"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn respects_an_already_selected_model() {
+        let (dir, conn) = fresh_index();
+        let conn = conn.connection();
+        // Simulate an explicit `models install all-MiniLM` having activated a model.
+        let minilm = spec(MINILM).expect("registry has all-MiniLM");
+        activate_model_with_version(conn, minilm.model_id, minilm.version).unwrap();
+
+        // A config selecting a DIFFERENT model must NOT override the explicit selection.
+        assert!(!active_embedding_model_seed_owed(conn, Some(JINA)).unwrap());
+        seed_active_embedding_model(conn, Some(JINA)).unwrap();
+        assert_eq!(
+            active_embedding_model_id(conn).unwrap(),
+            minilm.model_id,
+            "an already-active model is kept — the seed only fills an EMPTY selection"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn embeddings_off_leaves_the_active_model_unset() {
+        let (dir, conn) = fresh_index();
+        let conn = conn.connection();
+        assert!(!active_embedding_model_seed_owed(conn, None).unwrap(), "off ⇒ nothing to seed");
+        seed_active_embedding_model(conn, None).unwrap();
+        assert!(
+            meta(conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none(),
+            "the embeddings-off choice leaves the active model unset (hash fallback stands)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

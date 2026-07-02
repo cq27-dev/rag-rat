@@ -73,6 +73,13 @@ impl IndexDatabase {
         db.config = Some(config.clone());
         db.ensure_graph_index_current()?;
         db.ensure_generated_flags_current()?;
+        // Adopt the configured embedding model as the index's active model when it has none yet, so
+        // reconcile targets it (and its "install" hint names it) instead of the hash fallback
+        // (#394).
+        ai::seed_active_embedding_model(
+            db.storage.connection(),
+            config.llm.embedding.backend.model_id(),
+        )?;
         Ok(db)
     }
 
@@ -114,6 +121,14 @@ impl IndexDatabase {
             return Ok(None);
         }
         if !ai::model_manifest_is_current(storage.connection())? {
+            return Ok(None);
+        }
+        // A fresh index owes an active-embedding-model seed from config (a write); fall back to the
+        // read-write open so it heals once (#394, same posture as the manifest / graph gates).
+        if ai::active_embedding_model_seed_owed(
+            storage.connection(),
+            config.llm.embedding.backend.model_id(),
+        )? {
             return Ok(None);
         }
         storage.set_source_root(config.root.clone());
