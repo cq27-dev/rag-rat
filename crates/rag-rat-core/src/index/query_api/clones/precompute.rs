@@ -82,12 +82,29 @@ struct EdgeRow {
     edge_source: &'static str,
 }
 
+/// The sub-block postings for ONE walked symbol (#296 phase 2): its content anchor plus its
+/// `sub_block_tokens` set. Each `PostingGroup` expands to one `clone_subblock_postings` row per
+/// token at flush time. Grouping is deliberate — it clones the `(path, file_sha)` strings ONCE per
+/// symbol instead of once per token (a large function has hundreds of sub-block tokens).
+struct PostingGroup {
+    anchor: Anchor,
+    tokens: Vec<i64>,
+}
+
 struct GenerationRow {
     generation: i64,
     source_revision: String,
     normalizer_version: i64,
     cursor_symbol_id: i64,
     edges_written: u64,
+    /// Whether this generation is POSTINGS-AWARE (#296 phase 2): its `clone_subblock_postings` are
+    /// written in-band by a postings-aware binary. Set to 1 at Building creation and preserved
+    /// through `Complete`. A generation created before the feature has `postings_written = 0`.
+    /// Because a postings-aware binary writes every walked symbol's postings BEFORE advancing the
+    /// cursor, a *Complete* postings-aware generation is fully populated — so the live-generation
+    /// completeness gate (`pending_clone_graph` / the Phase-0 skip) reads this as "postings
+    /// complete", and a `Building` one reads it as "resumable without a postings gap" (review R2).
+    postings_written: bool,
 }
 
 impl IndexDatabase {
@@ -130,7 +147,11 @@ impl IndexDatabase {
             return Ok(true); // no completed generation yet
         };
         Ok(live.source_revision != self.content_revision()?
-            || live.normalizer_version != NORM_VERSION)
+            || live.normalizer_version != NORM_VERSION
+            // A live generation built before postings existed (`postings_written = 0`) is pending
+            // so one rebuild pass fills `clone_subblock_postings` — else an upgraded DB with an
+            // already-Complete clone graph would keep an empty postings table forever (review R2).
+            || !live.postings_written)
     }
 
     /// ONE precompute pass: resume (or start) the building generation toward the current content
@@ -152,6 +173,10 @@ impl IndexDatabase {
             && let Some(live) = live_generation_row(conn)?
             && live.source_revision == source_revision
             && live.normalizer_version == NORM_VERSION
+            // Also require postings-completeness, so an upgrade from a pre-postings graph does not
+            // skip forever with an empty `clone_subblock_postings` (review R2). A postings-less
+            // live generation falls through and rebuilds a postings-full one.
+            && live.postings_written
         {
             return Ok(CloneEdgeReport {
                 status: "Current".to_string(),
@@ -184,6 +209,7 @@ impl IndexDatabase {
         let mut edges_written = building.edges_written;
         let mut processed: u64 = 0;
         let mut batch: Vec<EdgeRow> = Vec::with_capacity(options.batch_size);
+        let mut postings: Vec<PostingGroup> = Vec::with_capacity(options.batch_size);
         let mut budget_tripped = false;
 
         for bag in bags.iter().filter(|b| b.symbol_id > building.cursor_symbol_id) {
@@ -217,9 +243,13 @@ impl IndexDatabase {
             // Sub-block candidates (t > s, same language, sharing a sub-block token) — verified. A
             // pair already emitted as a struct-hash exact pair is skipped (it would
             // re-verify to sim 1.0).
+            // This symbol's sub-block tokens, computed ONCE: they drive both candidate generation
+            // (below) and the persisted postings (further below). They are exactly what
+            // `build_sub_block_index` stores per symbol, so the persisted set is parity-identical.
+            let sub_tokens = sub_block_tokens(bag, CLONE_PRECOMPUTE_THETA);
             let mut candidates: BTreeSet<i64> = BTreeSet::new();
-            for token in sub_block_tokens(bag, CLONE_PRECOMPUTE_THETA) {
-                if let Some(ids) = inverted.get(&token) {
+            for token in &sub_tokens {
+                if let Some(ids) = inverted.get(token) {
                     for &t in ids {
                         if t > s
                             && !struct_partners.contains(&t)
@@ -249,12 +279,31 @@ impl IndexDatabase {
                 }
             }
 
+            // Persist this symbol's sub-block postings, content-anchored, in the SAME generation as
+            // its edges. Emitted for EVERY walked symbol — including one with zero verified
+            // partners (no edges) — and staged BEFORE the cursor advances, so a
+            // budget-split resume can never leave a walked symbol without postings
+            // (review R6). Idempotent under the content-key PK.
+            if !sub_tokens.is_empty() {
+                postings.push(PostingGroup { anchor: s_anchor.clone(), tokens: sub_tokens });
+            }
+
             processed += 1;
             cursor = s;
 
-            if batch.len() >= options.batch_size {
-                edges_written +=
-                    flush_batch(conn, building.generation, &mut batch, cursor, edges_written)?;
+            // Flush on EITHER accumulator filling: postings are per-symbol (far more numerous than
+            // per-pair edges), so a run of high-posting / low-edge symbols must still checkpoint
+            // and bound RAM. Both accumulators flush together in one transaction with
+            // the cursor.
+            if batch.len() >= options.batch_size || postings.len() >= options.batch_size {
+                edges_written += flush_batch(
+                    conn,
+                    building.generation,
+                    &mut batch,
+                    &mut postings,
+                    cursor,
+                    edges_written,
+                )?;
                 if let Some(dl) = deadline
                     && Instant::now() >= dl
                 {
@@ -264,7 +313,14 @@ impl IndexDatabase {
             }
         }
         // Flush the remainder + checkpoint the final cursor for this pass.
-        edges_written += flush_batch(conn, building.generation, &mut batch, cursor, edges_written)?;
+        edges_written += flush_batch(
+            conn,
+            building.generation,
+            &mut batch,
+            &mut postings,
+            cursor,
+            edges_written,
+        )?;
 
         let status = if budget_tripped {
             "Partial"
@@ -292,7 +348,8 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         conn.execute(
             "UPDATE clone_graph_generations
-                SET status = 'Complete', finished_at_ms = ?1, edges_written = ?2
+                SET status = 'Complete', finished_at_ms = ?1, edges_written = ?2,
+                    postings_written = 1
               WHERE generation = ?3",
             params![now_ms(), edges_written as i64, generation],
         )?;
@@ -506,13 +563,16 @@ fn make_edge(
     }
 }
 
-/// Insert a batch of edges (idempotent under resume via `INSERT OR IGNORE` on the content-key PK)
-/// and checkpoint the generation's cursor + edge count, in one transaction. Returns the rows
-/// actually inserted (dedup-ignored rows don't count).
+/// Insert a batch of edges AND the walked symbols' sub-block postings (both idempotent under resume
+/// via `INSERT OR IGNORE` on their content-key PKs) and checkpoint the generation's cursor + edge
+/// count — all in ONE transaction, so postings, edges, and the cursor advance atomically together
+/// (review R6: a symbol's postings are durable before its symbol id is checkpointed as done).
+/// Returns the EDGE rows actually inserted (dedup-ignored rows don't count).
 fn flush_batch(
     conn: &Connection,
     generation: i64,
     batch: &mut Vec<EdgeRow>,
+    postings: &mut Vec<PostingGroup>,
     cursor: i64,
     cumulative_edges: u64,
 ) -> anyhow::Result<u64> {
@@ -543,6 +603,19 @@ fn flush_batch(
                 ])? as u64;
             }
         }
+        {
+            let mut stmt = conn.prepare_cached(
+                "INSERT OR IGNORE INTO clone_subblock_postings
+                    (build_generation, token_hash, path, start_byte, file_sha)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for g in postings.iter() {
+                let (path, start_byte, file_sha) = &g.anchor;
+                for &token_hash in &g.tokens {
+                    stmt.execute(params![generation, token_hash, path, start_byte, file_sha])?;
+                }
+            }
+        }
         conn.execute(
             "UPDATE clone_graph_generations SET cursor_symbol_id = ?1, edges_written = ?2
               WHERE generation = ?3",
@@ -554,6 +627,7 @@ fn flush_batch(
         Ok(inserted) => {
             conn.execute_batch("COMMIT")?;
             batch.clear();
+            postings.clear();
             Ok(inserted)
         },
         Err(err) => {
@@ -583,7 +657,7 @@ fn open_building_generation(
     let existing: Option<GenerationRow> = conn
         .query_row(
             "SELECT generation, source_revision, normalizer_version, cursor_symbol_id, \
-             edges_written
+             edges_written, postings_written
                FROM clone_graph_generations WHERE status = 'Building'
               ORDER BY generation DESC LIMIT 1",
             [],
@@ -591,10 +665,18 @@ fn open_building_generation(
         )
         .ok();
     if let Some(row) = existing {
-        if row.source_revision == source_revision && row.normalizer_version == NORM_VERSION {
+        if row.source_revision == source_revision
+            && row.normalizer_version == NORM_VERSION
+            // Resume only a POSTINGS-AWARE partial. A pre-feature Building generation
+            // (`postings_written = 0`) has no postings for its already-walked symbols; resuming it
+            // would Complete a generation with a permanent postings gap. Discard it instead so the
+            // fresh generation below writes postings from symbol 0 (review R2).
+            && row.postings_written
+        {
             return Ok(row);
         }
-        // Stale partial (a reindex landed): discard it (CASCADE drops its edges) and start over.
+        // Stale partial (a reindex landed) OR a pre-feature postings-less partial: discard it
+        // (CASCADE drops its edges + postings) and start over.
         conn.execute("DELETE FROM clone_graph_generations WHERE status = 'Building'", [])?;
     }
     let generation: i64 = conn.query_row(
@@ -605,8 +687,8 @@ fn open_building_generation(
     conn.execute(
         "INSERT INTO clone_graph_generations
             (generation, status, theta_floor, normalizer_kind, normalizer_version, source_revision,
-             cursor_symbol_id, edges_written, started_at_ms)
-         VALUES (?1, 'Building', ?2, 'baseline', ?3, ?4, 0, 0, ?5)",
+             cursor_symbol_id, edges_written, postings_written, started_at_ms)
+         VALUES (?1, 'Building', ?2, 'baseline', ?3, ?4, 0, 0, 1, ?5)",
         params![generation, CLONE_PRECOMPUTE_THETA, NORM_VERSION, source_revision, now_ms()],
     )?;
     Ok(GenerationRow {
@@ -615,6 +697,7 @@ fn open_building_generation(
         normalizer_version: NORM_VERSION,
         cursor_symbol_id: 0,
         edges_written: 0,
+        postings_written: true,
     })
 }
 
@@ -622,7 +705,7 @@ fn read_generation(conn: &Connection, generation: i64) -> anyhow::Result<Option<
     Ok(conn
         .query_row(
             "SELECT generation, source_revision, normalizer_version, cursor_symbol_id, \
-             edges_written
+             edges_written, postings_written
                FROM clone_graph_generations WHERE generation = ?1",
             params![generation],
             map_generation_row,
@@ -637,6 +720,7 @@ fn map_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GenerationRow
         normalizer_version: row.get(2)?,
         cursor_symbol_id: row.get(3)?,
         edges_written: row.get::<_, i64>(4)? as u64,
+        postings_written: row.get::<_, i64>(5)? != 0,
     })
 }
 
@@ -830,5 +914,138 @@ mod tests {
 
             assert_eq!(fast, live, "precomputed find_clones must equal live at θ={theta}");
         }
+    }
+
+    /// The content-key set of the live generation's postings, sorted — the build-stable identity of
+    /// the persisted postings (symbol-id-independent, the postings analogue of [`edge_keys`]).
+    fn posting_keys(db: &crate::IndexDatabase) -> Vec<(i64, String, i64, String)> {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT token_hash, path, start_byte, file_sha FROM clone_subblock_postings
+                 ORDER BY token_hash, path, start_byte, file_sha",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// PARITY (design §Invariants #2): every persisted posting resolves to a symbol that
+    /// `build_sub_block_index` — the RAM index the live candidate-gen uses — places under the SAME
+    /// token, and vice versa. Pinning the persisted set as a byte-for-byte mirror of the RAM index
+    /// is what will make the Phase-C postings fast path return the same candidates as the fallback.
+    #[test]
+    fn precompute_postings_match_sub_block_index() {
+        let db = build_clone_fixture("postings-parity");
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+
+        let conn = db.storage.connection();
+        // Expected: token_hash -> {symbol_id} from the in-RAM sub-block index over the scoped bags.
+        let bags = load_scoped_baseline_bags(conn).unwrap();
+        assert!(!bags.is_empty(), "the fixture has scoped bags");
+        let expected: BTreeMap<i64, BTreeSet<i64>> =
+            build_sub_block_index(&bags, CLONE_PRECOMPUTE_THETA)
+                .into_iter()
+                .map(|(token, ids)| (token, ids.into_iter().collect()))
+                .collect();
+
+        // Actual: token_hash -> {symbol_id} from the persisted postings, resolving each content
+        // anchor (path, start_byte) back to its live symbol id (the read-path resolution shape).
+        let by_anchor: HashMap<(String, i64), i64> = resolve_symbol_anchors(conn)
+            .unwrap()
+            .into_iter()
+            .map(|(id, (path, start_byte, _sha))| ((path, start_byte), id))
+            .collect();
+        let mut actual: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+        let mut stmt = conn
+            .prepare("SELECT token_hash, path, start_byte FROM clone_subblock_postings")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })
+            .unwrap();
+        for row in rows {
+            let (token, path, start_byte) = row.unwrap();
+            actual.entry(token).or_default().insert(by_anchor[&(path, start_byte)]);
+        }
+
+        assert_eq!(actual, expected, "persisted postings mirror the RAM sub-block index exactly");
+    }
+
+    /// RESUME IDEMPOTENCY (review R6): a budget-split precompute (one symbol per pass) yields the
+    /// SAME postings as a single uninterrupted pass. Guards the "postings staged before the cursor
+    /// advances" contract — a split between "postings written" and "cursor advanced" would drop a
+    /// symbol's postings on resume. Mirrors [`precompute_resume_matches_single_pass`] for edges.
+    #[test]
+    fn precompute_postings_resume_matches_single_pass() {
+        let single = build_clone_fixture("postings-single");
+        single.precompute_clone_graph(None).unwrap();
+        let expected = posting_keys(&single);
+        assert!(!expected.is_empty(), "the fixture writes postings");
+
+        let resumed = build_clone_fixture("postings-resume");
+        let mut passes = 0;
+        loop {
+            let report = resumed
+                .reconcile_clone_edges_pass(&CloneEdgeOptions {
+                    max_seconds: Some(0),
+                    batch_size: 1,
+                    force: false,
+                })
+                .unwrap();
+            passes += 1;
+            assert!(passes < 10_000, "must converge");
+            if report.status != "Partial" {
+                assert_eq!(report.status, "Complete");
+                break;
+            }
+        }
+        assert!(passes >= 2, "a tiny budget forces multiple resumable passes, got {passes}");
+        assert_eq!(
+            posting_keys(&resumed),
+            expected,
+            "the resumed (checkpointed) postings equal the single-pass postings"
+        );
+    }
+
+    /// UPGRADE REPOPULATION (review R2): a DB whose clone graph was already `Complete` BEFORE
+    /// postings existed (`postings_written = 0`, empty `clone_subblock_postings`) is treated as
+    /// pending and rebuilt ONCE to fill the postings — instead of skip-when-current leaving the
+    /// table empty forever. Self-correcting: no `content_revision` change or manual rebuild needed.
+    #[test]
+    fn precompute_repopulates_postings_on_upgrade() {
+        let db = build_clone_fixture("postings-upgrade");
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+
+        // Simulate the pre-feature on-disk state: a Complete live generation that predates
+        // postings.
+        db.storage
+            .connection()
+            .execute_batch(
+                "UPDATE clone_graph_generations SET postings_written = 0;
+                 DELETE FROM clone_subblock_postings;",
+            )
+            .unwrap();
+        assert!(db.pending_clone_graph().unwrap(), "a postings-less live generation is pending");
+
+        // One reconcile pass rebuilds a postings-full generation and clears the pending state.
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        let postings: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM clone_subblock_postings", [], |r| r.get(0))
+            .unwrap();
+        assert!(postings > 0, "the upgrade rebuild fills clone_subblock_postings");
+        assert!(!db.pending_clone_graph().unwrap(), "no longer pending after the rebuild");
     }
 }
