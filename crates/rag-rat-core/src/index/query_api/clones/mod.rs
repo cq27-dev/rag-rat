@@ -117,7 +117,7 @@ use self::scoring::{
 };
 use self::substrate::{
     SymbolBag, bucket_edges_by_component, components_from_pairs, load_scoped_baseline_bags,
-    overlap, pairs_for_query,
+    overlap, pairs_for_query, subject_component_bfs,
 };
 use crate::index::IndexDatabase;
 use crate::index::clones::refine::cache::{
@@ -631,20 +631,40 @@ impl IndexDatabase {
         }
 
         let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
-        let pairs = pairs_for_query(conn, &bags, THETA)?;
-        let components = components_from_pairs(&pairs);
-
-        // Find the component that contains this symbol_id (with its index so we can pull its edge
-        // bucket).
-        let Some(comp_idx) = components.iter().position(|comp| comp.contains(&symbol_id)) else {
-            return Ok(make_result(None, CloneEligibility::Eligible, 0, freshness));
-        };
-        let component = components[comp_idx].clone();
-        // The θ-verified edge subset for THIS component (#256) — feeds the scalable clique cover so
-        // a giant over-merged component the subject lands in splits instead of being returned
-        // whole.
-        let mut edges_by_component = bucket_edges_by_component(&pairs, &components);
-        let component_edges = std::mem::take(&mut edges_by_component[comp_idx]);
+        // #270 (+ PR #384 review): drill into the SAME clone graph `find_clones` reads, or a
+        // stale-but-eligible PUBLISHED graph could make reverse lookup disagree with the listing.
+        // So mirror `pairs_for_query`'s source choice exactly:
+        //  - persisted graph eligible (the documented "mildly-stale-OK" fast path) → find the
+        //    subject's component from THOSE pairs, identical to `find_clones`;
+        //  - NO eligible persisted graph (a live recompute) → BFS only the subject's component
+        //    (#270's win); both paths recompute the same live graph, so they stay consistent.
+        let (component, component_edges) =
+            match precompute::precomputed_pairs_if_eligible(conn, &by_id, THETA)? {
+                Some(pairs) => {
+                    let components = components_from_pairs(&pairs);
+                    let Some(comp_idx) = components.iter().position(|c| c.contains(&symbol_id))
+                    else {
+                        return Ok(make_result(None, CloneEligibility::Eligible, 0, freshness));
+                    };
+                    let mut edges_by_component = bucket_edges_by_component(&pairs, &components);
+                    (
+                        components[comp_idx].clone(),
+                        std::mem::take(&mut edges_by_component[comp_idx]),
+                    )
+                },
+                None => {
+                    // Live recompute: BFS the subject's component + its θ-edges directly, instead
+                    // of generating EVERY pair + EVERY component. Same
+                    // (component, edges) as the full live scan (equivalence
+                    // test pins it). A component < 2 means the subject cohered
+                    // with no peer → it is in no clone class (the `.position`-miss analog).
+                    let (comp, edges) = subject_component_bfs(&by_id, symbol_id, THETA);
+                    if comp.len() < 2 {
+                        return Ok(make_result(None, CloneEligibility::Eligible, 0, freshness));
+                    }
+                    (comp, edges)
+                },
+            };
 
         // Plan 4a: coherence-split the component, then serve the coherent sub-class that contains
         // the subject. If the subject is a SINGLETON after the split (it cohered with no peer at

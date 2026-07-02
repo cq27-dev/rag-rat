@@ -3,7 +3,7 @@
 //! substrate, `build_class`'s canonical ordering, and the refine loaders — against the shared
 //! types. Each test reaches into the specific sibling module that owns the symbol it exercises.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::scoring::{
     COVERAGE_MILD_PENALTY, COVERAGE_STRONG_PENALTY, apply_refinement, canonical_member_order_key,
@@ -11,8 +11,8 @@ use super::scoring::{
 };
 use super::substrate::{
     DF_FALLBACK, METRIC_SAMPLE_CAP, SymbolBag, TokenPosting, add_struct_hash_pairs,
-    bucket_edges_by_component, candidate_pairs, components_from_pairs, load_scoped_baseline_bags,
-    overlap, sub_block_candidate_pairs,
+    bucket_edges_by_component, candidate_pairs, candidate_pairs_from_bags, components_from_pairs,
+    load_scoped_baseline_bags, overlap, sub_block_candidate_pairs, subject_component_bfs,
 };
 use super::types::{CandidateCloneClass, RoiFactors};
 use super::{MEMBER_VALUE_CAP, THETA};
@@ -290,6 +290,59 @@ fn make_bag_with_tokens(id: i64, tokens: Vec<(i64, i64)>) -> SymbolBag {
         struct_hash: format!("hash{id}"),
         token_len: postings.iter().map(|t| t.freq).sum(),
         tokens: postings,
+    }
+}
+
+/// #270: `subject_component_bfs` (the reverse-lookup BFS) must return the EXACT `(component, edges)`
+/// the full `candidate_pairs_from_bags` → `components_from_pairs` (subject's component) +
+/// `bucket_edges_by_component` path produces — for every subject, across BOTH edge rules
+/// (struct-hash and verified sub-block) and a singleton. This is the guard that lets the BFS
+/// replace the full scan without changing results.
+#[test]
+fn subject_component_bfs_matches_full_scan() {
+    let theta = THETA;
+    // {1,2,3}: sub-block clones (near-identical token multisets → overlap ≥ θ, disjoint from the
+    // rest). {10,11}: struct-hash clones (same struct_hash, DISJOINT tokens → connected only by the
+    // struct-hash rule). 20: a singleton (disjoint tokens, unique struct_hash → no peer).
+    let mut bags = vec![
+        make_bag_with_tokens(1, vec![(1, 3), (2, 3), (3, 3), (4, 3)]),
+        make_bag_with_tokens(2, vec![(1, 3), (2, 3), (3, 3), (4, 3)]),
+        make_bag_with_tokens(3, vec![(1, 3), (2, 3), (3, 3), (4, 2)]),
+        make_bag_with_tokens(20, vec![(90, 5), (91, 5), (92, 5), (93, 5)]),
+    ];
+    let mut b10 = make_bag_with_tokens(10, vec![(50, 4), (51, 4), (52, 4)]);
+    let mut b11 = make_bag_with_tokens(11, vec![(60, 4), (61, 4), (62, 4)]);
+    b10.struct_hash = "shared".to_string();
+    b11.struct_hash = "shared".to_string();
+    bags.push(b10);
+    bags.push(b11);
+
+    let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
+
+    // Full-scan reference (the pre-#270 path), computed ONCE — bags are fixed.
+    let pairs = candidate_pairs_from_bags(&bags, theta);
+    let comps = components_from_pairs(&pairs);
+    let buckets = bucket_edges_by_component(&pairs, &comps);
+
+    for subject in [1_i64, 2, 3, 10, 11, 20] {
+        let (mut bfs_comp, mut bfs_edges) = subject_component_bfs(&by_id, subject, theta);
+        bfs_comp.sort_unstable();
+        bfs_edges.sort_unstable();
+        // `None` (subject in no size-≥2 component) is the singleton case the BFS reports as a
+        // length-<2 component.
+        match comps.iter().position(|c| c.contains(&subject)) {
+            None => assert!(
+                bfs_comp.len() < 2,
+                "subject {subject} is a singleton in the full scan; BFS must report no component, \
+                 got {bfs_comp:?}"
+            ),
+            Some(idx) => {
+                let mut edges = buckets[idx].clone();
+                edges.sort_unstable();
+                assert_eq!(bfs_comp, comps[idx], "component mismatch for subject {subject}");
+                assert_eq!(bfs_edges, edges, "edge set mismatch for subject {subject}");
+            },
+        }
     }
 }
 
