@@ -1171,6 +1171,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_034_ID => Some(34),
             MIGRATION_035_ID => Some(35),
             MIGRATION_036_ID => Some(36),
+            MIGRATION_037_ID => Some(37),
             _ => None,
         })
         .max()
@@ -1216,6 +1217,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_034_ID
             | MIGRATION_035_ID
             | MIGRATION_036_ID
+            | MIGRATION_037_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1258,6 +1260,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_034_ID => migration.checksum != MIGRATION_034_CHECKSUM,
         MIGRATION_035_ID => migration.checksum != MIGRATION_035_CHECKSUM,
         MIGRATION_036_ID => migration.checksum != MIGRATION_036_CHECKSUM,
+        MIGRATION_037_ID => migration.checksum != MIGRATION_037_CHECKSUM,
         _ => false,
     }
 }
@@ -1496,6 +1499,63 @@ pub(crate) const CLONE_GRAPH_DDL: &str = "
 /// V034: create the precomputed clone-graph tables (see [`CLONE_GRAPH_DDL`]).
 pub(crate) fn apply_clone_graph_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CLONE_GRAPH_DDL)?;
+    Ok(())
+}
+
+/// V037 (#296): PERSIST the sub-block postings the write-time clone check reads, so that check
+/// SCALES past the 40k-function guard. `clones_of_text` (the write-time hook engine) today rebuilds
+/// the whole `(sub_block_token -> symbol)` inverted index in RAM on every call (O(functions)), so
+/// the hook no-ops above `MAX_CLONE_CHECK_FUNCTIONS`; persisting the postings lets it do a bounded
+/// indexed lookup per new function instead. This is the follow-up the V034 doc named: the slot was
+/// deliberately DEFERRED there (see [`CLONE_GRAPH_DDL`]) and is filled here.
+///
+/// CONTENT-ANCHORED endpoints (the #248 bug-class rule, enforced by
+/// `no_table_has_a_reindex_cascading_fk_to_a_volatile_parent`): a posting anchors to the
+/// reindex-stable `(path, start_byte)` of a symbol plus the `file_sha` (`files.sha256`) at compute
+/// time — NEVER a `symbol_id` FK (`symbols` is a `REINDEX_VOLATILE_PARENT` whose ids are reassigned
+/// on reindex; keying on `symbol_id` is the exact #248 bug that wiped `edge_oracle` verdicts). The
+/// read resolves an anchor by joining live `symbols`/`files` on `(path, start_byte)` and drops any
+/// row whose `file_sha` no longer matches the last-indexed `files.sha256`, so a stale posting is
+/// silently ignored rather than matched against changed content. The ONLY FK is the `ON DELETE
+/// CASCADE` to the DURABLE `clone_graph_generations` (precompute metadata, not a
+/// `REINDEX_VOLATILE_PARENT`, so that CASCADE is allowed): postings live and die with their build
+/// generation, and a superseded generation's postings are GC'd by that cascade — the same
+/// generation-staged lifecycle `clone_edges` uses, no independent freshness key.
+///
+/// The write-time lookup is `WHERE build_generation = ? AND token_hash IN (…)`, which
+/// `idx_clone_subblock_postings_token` covers directly. This migration only CREATEs the empty table
+/// (population + the read-path switch land in later phases of #296); until then the write-time
+/// check keeps its RAM-index fallback unchanged.
+pub(crate) const CLONE_SUBBLOCK_POSTINGS_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS clone_subblock_postings(
+        build_generation INTEGER NOT NULL REFERENCES clone_graph_generations(generation) ON DELETE \
+                                                      CASCADE,
+        token_hash       INTEGER NOT NULL,
+        -- Content anchor (reindex-stable), NOT symbol_id (the #248 rule).
+        path             TEXT    NOT NULL,
+        start_byte       INTEGER NOT NULL,
+        file_sha         TEXT    NOT NULL,              -- files.sha256 at compute; read-time \
+                                                      staleness key
+        PRIMARY KEY (build_generation, token_hash, path, start_byte)
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS idx_clone_subblock_postings_token
+        ON clone_subblock_postings(build_generation, token_hash);
+";
+
+/// V037 (#296): create the persisted sub-block postings table (see
+/// [`CLONE_SUBBLOCK_POSTINGS_DDL`]) and add `clone_graph_generations.postings_written` — the
+/// upgrade-repopulation gate (review R2). A clone-graph generation built before this feature has
+/// `postings_written = 0`, which the (phase-2) precompute reads as "not postings-complete" and uses
+/// to force one rebuild pass that fills the postings, instead of leaving an upgraded DB with an
+/// empty table forever. Idempotent: `CREATE TABLE IF NOT EXISTS` + `add_column_if_missing`.
+pub(crate) fn apply_clone_subblock_postings_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(CLONE_SUBBLOCK_POSTINGS_DDL)?;
+    add_column_if_missing(
+        conn,
+        "clone_graph_generations",
+        "postings_written",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 

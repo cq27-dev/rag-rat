@@ -87,10 +87,16 @@ fn migration_034_adds_content_anchored_clone_graph_tables() {
         "V034 adds clone_graph_generations"
     );
     assert!(conn_table_exists(&conn, "clone_edges"), "V034 adds clone_edges");
+    // V034 DEFERS the persisted postings table (it lands in V037, #296). Assert the V034 DDL itself
+    // does NOT create it — checked in ISOLATION on a bare connection, so a later migration (V037)
+    // that DOES add it cannot mask the deferral. (`conn` above was migrated to LATEST and therefore
+    // now HAS the table — that is V037's job, verified by
+    // `migration_037_adds_content_anchored_clone_subblock_postings`.)
+    let v034_only = rusqlite::Connection::open_in_memory().expect("open v034-only conn");
+    crate::index::schema::apply_clone_graph_tables(&v034_only).expect("apply V034 clone-graph DDL");
     assert!(
-        !conn_table_exists(&conn, "clone_subblock_postings"),
-        "the persisted postings table is deferred to the incremental follow-up — not created in \
-         V034"
+        !conn_table_exists(&v034_only, "clone_subblock_postings"),
+        "the persisted postings table is deferred to V037 — the V034 DDL must NOT create it"
     );
 
     // Content-anchored: clone_edges must carry NO foreign key to a reindex-volatile parent
@@ -178,11 +184,6 @@ fn migration_035_adds_symbols_is_test() {
 fn migration_036_adds_content_addressed_embedding_cache() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     crate::index::schema::apply(&conn).expect("apply");
-    assert_eq!(
-        crate::index::schema::LATEST_SCHEMA_VERSION,
-        36,
-        "LATEST_SCHEMA_VERSION is 36 after V036"
-    );
 
     conn.execute_batch("DROP TABLE embedding_cache;").expect("revert to V035 shape");
     truncate_schema_to(&conn, 35);
@@ -201,6 +202,136 @@ fn migration_036_adds_content_addressed_embedding_cache() {
     let _: i64 = conn
         .query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r.get(0))
         .expect("SELECT from embedding_cache must succeed after V036");
+}
+
+/// V037 (#296): after the FULL migration ladder, the persisted sub-block postings table exists, is
+/// STRICT, is CONTENT-ANCHORED (its only FK is the CASCADE to the DURABLE `clone_graph_generations`
+/// — NO `symbol_id` column/FK, the #248 rule), carries the anchor PK
+/// `(build_generation, token_hash, path, start_byte)` + the `(build_generation, token_hash)` lookup
+/// index, and `clone_graph_generations` gained the `postings_written` upgrade-repopulation gate
+/// (review R2). Also drives the forward-migration path from a V036 index.
+#[test]
+fn migration_037_adds_content_anchored_clone_subblock_postings() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply");
+    assert_eq!(
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        37,
+        "LATEST_SCHEMA_VERSION is 37 after V037"
+    );
+
+    // The full ladder creates the postings table + the generation completeness column.
+    assert!(
+        conn_table_exists(&conn, "clone_subblock_postings"),
+        "V037 creates clone_subblock_postings"
+    );
+    assert!(
+        conn_table_columns(&conn, "clone_graph_generations")
+            .contains(&"postings_written".to_string()),
+        "V037 adds clone_graph_generations.postings_written (upgrade-repopulation gate, R2)"
+    );
+
+    // STRICT mode (the schema convention for every new table).
+    let create_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='clone_subblock_postings'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read clone_subblock_postings DDL");
+    assert!(
+        create_sql.to_ascii_uppercase().contains("STRICT"),
+        "clone_subblock_postings is STRICT: {create_sql}"
+    );
+
+    // CONTENT-ANCHORED (#248): the PK is (path, start_byte)-based, never symbol_id.
+    let pk_cols: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM pragma_table_info('clone_subblock_postings') WHERE pk > 0 ORDER \
+                 BY pk",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(
+        pk_cols,
+        vec!["build_generation", "token_hash", "path", "start_byte"],
+        "content-anchored PK (path/start_byte, never symbol_id)"
+    );
+    let cols = conn_table_columns(&conn, "clone_subblock_postings");
+    for expected in ["build_generation", "token_hash", "path", "start_byte", "file_sha"] {
+        assert!(cols.contains(&expected.to_string()), "clone_subblock_postings has {expected}");
+    }
+    assert!(
+        !cols.contains(&"symbol_id".to_string()),
+        "clone_subblock_postings is content-anchored — no symbol_id column (#248)"
+    );
+
+    // The ONLY FK is the CASCADE to the DURABLE clone_graph_generations, NEVER to a
+    // reindex-volatile parent (symbols). The volatile-FK trip-wire enforces this at the
+    // whole-schema level too.
+    let fk_parents: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT \"table\" FROM pragma_foreign_key_list('clone_subblock_postings')")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(
+        fk_parents,
+        vec!["clone_graph_generations"],
+        "the only FK is to the durable generations table; got {fk_parents:?}"
+    );
+
+    // The lookup index the write-time check queries exists.
+    assert!(
+        conn_index_exists(&conn, "idx_clone_subblock_postings_token"),
+        "V037 creates idx_clone_subblock_postings_token"
+    );
+
+    // Forward-migration path: a V036 index gains the table + column on migrate_forward.
+    conn.execute_batch(
+        "DROP TABLE clone_subblock_postings;
+         ALTER TABLE clone_graph_generations DROP COLUMN postings_written;",
+    )
+    .expect("revert to V036 shape");
+    truncate_schema_to(&conn, 36);
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Older,
+        "schema is Older after removing the V037 ledger row"
+    );
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+    assert!(
+        conn_table_exists(&conn, "clone_subblock_postings"),
+        "V037 recreates clone_subblock_postings on forward migrate"
+    );
+    assert!(
+        conn_table_columns(&conn, "clone_graph_generations")
+            .contains(&"postings_written".to_string()),
+        "V037 re-adds postings_written on forward migrate"
+    );
+
+    // The table is usable + generation-staged: a posting anchored under a generation round-trips.
+    conn.execute_batch(
+        "INSERT INTO clone_graph_generations
+             (generation, status, theta_floor, normalizer_kind, normalizer_version, \
+         source_revision, started_at_ms)
+         VALUES (1, 'Building', 0.7, 'baseline', 3, 'rev', 0);
+         INSERT INTO clone_subblock_postings
+             (build_generation, token_hash, path, start_byte, file_sha)
+         VALUES (1, 42, 'a.rs', 10, 'sha_a');",
+    )
+    .expect("clone_subblock_postings is usable");
+    let postings: i64 = conn
+        .query_row("SELECT COUNT(*) FROM clone_subblock_postings", [], |r| r.get(0))
+        .expect("count postings");
+    assert_eq!(postings, 1, "round-tripped one posting");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().current_version,
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST_SCHEMA_VERSION after V037"
+    );
 }
 
 /// Regression test for the P1 schema bug (#215 Plan 4a): an index recorded at V029 WITHOUT

@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 36;
+pub const LATEST_SCHEMA_VERSION: u32 = 37;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -230,6 +230,13 @@ const MIGRATION_036_DESCRIPTION: &str =
     "Add embedding_cache (content-addressed vectors keyed by input_hash) so embeddings survive \
      reindex / branch-switch and reconcile reuses unchanged content across contexts instead of \
      re-embedding; seeded from current chunk_embeddings (#357)";
+const MIGRATION_037_ID: &str = "037_clone_subblock_postings";
+const MIGRATION_037_CHECKSUM: &str = "sha256:rag-rat-clone-subblock-postings-v37";
+const MIGRATION_037_DESCRIPTION: &str =
+    "Add clone_subblock_postings (persisted content-anchored sub-block postings, \
+     generation-staged like clone_edges) + clone_graph_generations.postings_written so the \
+     write-time clone check does a bounded indexed lookup instead of rebuilding the RAM index and \
+     scales past the 40k guard (#296)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -545,6 +552,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_036_CHECKSUM,
         description: MIGRATION_036_DESCRIPTION,
         apply: apply_embedding_content_cache,
+    },
+    Migration {
+        id: MIGRATION_037_ID,
+        checksum: MIGRATION_037_CHECKSUM,
+        description: MIGRATION_037_DESCRIPTION,
+        apply: apply_clone_subblock_postings_tables,
     },
 ];
 
