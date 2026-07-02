@@ -22,10 +22,11 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::{
-    DF_FALLBACK, HYDRATION_CHUNK, SymbolBag, THETA, TokenPosting, load_scoped_baseline_bags,
-    overlap, sub_block_tokens, verified_clone,
+use super::substrate::{
+    DF_FALLBACK, SymbolBag, TokenPosting, load_scoped_baseline_bags, overlap, sub_block_tokens,
+    verified_clone,
 };
+use super::{HYDRATION_CHUNK, THETA};
 use crate::index::clones::{NORM_VERSION, SymbolFingerprint, fingerprint_symbols};
 use crate::index::{IndexDatabase, parser, symbols};
 use crate::language::Language;

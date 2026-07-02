@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use super::{
-    SymbolBag, THETA, load_scoped_baseline_bags, overlap, sub_block_tokens, verified_clone,
+use super::THETA;
+use super::substrate::{
+    SymbolBag, load_scoped_baseline_bags, overlap, sub_block_tokens, verified_clone,
 };
 use crate::index::IndexDatabase;
 use crate::index::clones::NORM_VERSION;
