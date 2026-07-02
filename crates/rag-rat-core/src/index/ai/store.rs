@@ -122,9 +122,9 @@ pub(crate) fn for_each_embedding_candidate(
 }
 
 /// Ordered candidate chunk ids for one reconcile run, fetched ONCE (ids only, no text), need-first
-/// exactly like `for_each_embedding_candidate`. The loop walks this list in batches and loads text per
-/// batch via [`current_chunks_by_ids`], so each chunk's text is read at most once per run. The old
-/// path re-queried *every* candidate's text on *every* batch — O(n²) SQLite work that dominated
+/// exactly like `for_each_embedding_candidate`. The loop walks this list in batches and loads text
+/// per batch via [`current_chunks_by_ids`], so each chunk's text is read at most once per run. The
+/// old path re-queried *every* candidate's text on *every* batch — O(n²) SQLite work that dominated
 /// reconcile on large repos (it looked like model time but was query/row-materialization CPU).
 pub(crate) fn embedding_candidate_ids(
     conn: &Connection,
@@ -202,8 +202,8 @@ pub(crate) fn current_chunks_by_ids(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(bind), current_chunk_row)?;
     // Decompress in a post-loop — decompress's anyhow::Result can't cross the rusqlite closure.
-    // Mirror for_each_embedding_candidate: a non-empty model_id means this is a real (non-force) run,
-    // so the default reason is Missing (the precise reason is recomputed in
+    // Mirror for_each_embedding_candidate: a non-empty model_id means this is a real (non-force)
+    // run, so the default reason is Missing (the precise reason is recomputed in
     // select_reconcile_batch).
     let mut by_id: std::collections::HashMap<i64, CurrentChunk> =
         std::collections::HashMap::with_capacity(ids.len());
