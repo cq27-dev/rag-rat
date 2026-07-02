@@ -95,6 +95,12 @@ case "$db" in
   "$source_root"/*) echo "refusing: db '$db' resolves into the source checkout" >&2; exit 1 ;;
 esac
 
+# Activate the configured embedding model + persist its remote config. A fresh `index` only builds
+# the SOURCE index; it does not install/activate the embedding model, so without this the git-hook
+# `maintenance` reconcile would fall back to the not-ready default and never take the light/embed
+# path this harness is meant to reproduce.
+rag-rat --config rag-rat.toml models install "jinaai/jina-embeddings-v2-base-code"
+
 rag-rat index --config rag-rat.toml
 rag-rat hooks install
 
