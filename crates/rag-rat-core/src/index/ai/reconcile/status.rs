@@ -89,7 +89,6 @@ pub(crate) fn embedding_reconcile_plan(
     available: bool,
     message: Option<String>,
 ) -> anyhow::Result<EmbeddingReconcilePlan> {
-    let jobs = embedding_job_candidates(conn, &model.model_id, model_version, dim, None, false)?;
     let skipped_by_policy = embedding_policy_skip_summary(conn, DEFAULT_MAX_EMBEDDING_CHARS)?;
     let mut missing_by_priority = BTreeMap::new();
     let mut current = 0_u64;
@@ -100,10 +99,14 @@ pub(crate) fn embedding_reconcile_plan(
     let mut failed_retryable = 0_u64;
     let mut failed_waiting = 0_u64;
     let mut blocked = 0_u64;
-    for job in jobs {
+    // STREAM the candidates (need-first) and count — never materialize every candidate's
+    // decompressed text at once (#379). Same per-job classification as the old `for job in jobs`
+    // over `embedding_job_candidates(None)`, so the counts are identical; only the peak memory
+    // drops.
+    for_each_embedding_candidate(conn, &model.model_id, model_version, dim, None, false, |job| {
         let policy = policy_for_job(&job, DEFAULT_MAX_EMBEDDING_CHARS);
         if !policy.eligible {
-            continue;
+            return Ok(());
         }
         let current_artifact = job.embedding_status.as_deref() == Some("Current")
             && job.source_text_hash.as_deref() == Some(job.text_hash.as_str())
@@ -116,7 +119,7 @@ pub(crate) fn embedding_reconcile_plan(
             });
         if current_artifact {
             current += 1;
-            continue;
+            return Ok(());
         }
         let reason = job.reason(model_version, dim, now_ms(), DEFAULT_MAX_EMBEDDING_CHARS);
         match reason {
@@ -137,7 +140,8 @@ pub(crate) fn embedding_reconcile_plan(
         if job.embedding_status.as_deref() == Some("Blocked") {
             blocked += 1;
         }
-    }
+        Ok(())
+    })?;
     Ok(EmbeddingReconcilePlan {
         model_id: model.model_id.clone(),
         model_version: model_version.to_string(),

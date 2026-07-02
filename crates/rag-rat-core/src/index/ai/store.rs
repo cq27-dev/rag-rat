@@ -40,14 +40,21 @@ pub(crate) fn current_chunk_row(
     Ok((chunk, text_row))
 }
 
-pub(crate) fn embedding_job_candidates(
+/// Stream ordered embedding candidates one at a time (need-first), decompressing each chunk's text
+/// on the fly and handing the owned [`CurrentChunk`] to `f` — WITHOUT collecting the whole set into
+/// a `Vec`. This bounds the resident memory of a full-index pass to one chunk's text at a time.
+/// `embedding_reconcile_plan` counts over it so a plan on a kernel-scale index never materializes
+/// every candidate's decompressed text at once (#379, mirroring the already-streamed
+/// `embedding_policy_skip_summary`). `limit == None` walks every candidate.
+pub(crate) fn for_each_embedding_candidate(
     conn: &Connection,
     model_id: &str,
     model_version: &str,
     dim: usize,
     limit: Option<u32>,
     changed_first: bool,
-) -> anyhow::Result<Vec<CurrentChunk>> {
+    mut f: impl FnMut(CurrentChunk) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let changed_order = if changed_first {
         "chunks.source_revision DESC,"
     } else {
@@ -93,6 +100,10 @@ pub(crate) fn embedding_job_candidates(
         LIMIT ?5
     "
     );
+    // One dict decoder for the whole stream (dict versions loaded once, reused per row). Loaded
+    // BEFORE the candidate statement so no second query runs while that statement is mid-iteration.
+    let dicts = crate::query::chunk_text_dicts(conn)?;
+    let mut decoder = ChunkTextDecoder::new(&dicts);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         params![
@@ -104,19 +115,43 @@ pub(crate) fn embedding_job_candidates(
         ],
         current_chunk_row,
     )?;
-    // Decompress in a post-loop with a single dict decoder (versions loaded once per call, not per
-    // row) — decompress's anyhow::Result can't cross the rusqlite closure above.
-    let collected = collect_rows(rows)?;
-    let dicts = crate::query::chunk_text_dicts(conn)?;
-    let mut decoder = ChunkTextDecoder::new(&dicts);
-    let mut chunks = Vec::with_capacity(collected.len());
-    for (mut chunk, text_row) in collected {
+    // Decompress per row in the loop body (not inside the rusqlite closure above — decompress's
+    // `anyhow::Result` can't cross it), so only one chunk's text is resident at a time.
+    for row in rows {
+        let (mut chunk, text_row) = row?;
         chunk.text = text_row.resolve(&mut decoder)?;
         if !model_id.is_empty() {
             chunk.reason = ReconcileReason::Missing;
         }
-        chunks.push(chunk);
+        f(chunk)?;
     }
+    Ok(())
+}
+
+pub(crate) fn embedding_job_candidates(
+    conn: &Connection,
+    model_id: &str,
+    model_version: &str,
+    dim: usize,
+    limit: Option<u32>,
+    changed_first: bool,
+) -> anyhow::Result<Vec<CurrentChunk>> {
+    // Collector over the streaming iterator: identical rows/order, materialized for callers that
+    // want the whole (bounded) set. The unbounded `limit == None` counting path uses
+    // `for_each_embedding_candidate` directly so it never collects (#379).
+    let mut chunks = Vec::new();
+    for_each_embedding_candidate(
+        conn,
+        model_id,
+        model_version,
+        dim,
+        limit,
+        changed_first,
+        |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        },
+    )?;
     Ok(chunks)
 }
 
