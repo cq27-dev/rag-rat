@@ -241,11 +241,13 @@ pub(crate) fn acquire_chunk_embedder(
             //  - probe OK → embed locally, same backend + model as the box, so the vectors share
             //    ONE space (freshness is endpoint-independent) and semantic search stays current
             //    between big reindexes.
-            // NO work-count gate here on purpose: `estimated_reconcile_jobs` decompresses the whole
-            // repo, so it is NOT a cheap idle-pass guard — the fast-failing probe is. A reachable
-            // server's no-work pass then costs the same policy summary a connect-mode pass already
-            // pays. The probe (and every light embed) is bounded by the transport's clamped
-            // timeout, so a hung server can't stall the watcher.
+            // NO work-count gate here on purpose: `estimated_reconcile_jobs` still decompresses
+            // every candidate's text to count (its policy-size + freshness checks read the text) —
+            // streamed now so it no longer PEAKS memory (#64), but still O(repo) CPU, so NOT a
+            // cheap idle-pass guard. The fast-failing probe is. A reachable server's
+            // no-work pass then costs the same policy summary a connect-mode pass
+            // already pays. The probe (and every light embed) is bounded by the
+            // transport's clamped timeout, so a hung server can't stall the watcher.
             if remote.query_endpoint.is_none() {
                 tracing::debug!(target: "rag_rat_core::index::ai::providers", path = "skip_ephemeral", reason = "no_query_endpoint", "light reconcile: no local query_endpoint, deferring to explicit reconcile");
                 return ChunkEmbedder::SkipEphemeral;

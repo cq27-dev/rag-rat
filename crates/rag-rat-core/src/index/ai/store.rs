@@ -1,13 +1,6 @@
 use super::*;
 use crate::index::text_compression::{ChunkTextDecoder, ChunkTextRow};
 
-pub(crate) fn current_chunks(
-    conn: &Connection,
-    limit: Option<u32>,
-) -> anyhow::Result<Vec<CurrentChunk>> {
-    embedding_job_candidates(conn, "", "", 0, limit, false)
-}
-
 /// Map one candidate row to its `CurrentChunk` (with a placeholder `text`) plus the
 /// [`ChunkTextRow`] carrying the chunk's stored text (the compressed `chunk_text` blob + `raw_len`;
 /// the `chunks.text` column is gone, so the SELECT INNER JOINs `chunk_text`). The real `text` is
@@ -128,35 +121,8 @@ pub(crate) fn for_each_embedding_candidate(
     Ok(())
 }
 
-pub(crate) fn embedding_job_candidates(
-    conn: &Connection,
-    model_id: &str,
-    model_version: &str,
-    dim: usize,
-    limit: Option<u32>,
-    changed_first: bool,
-) -> anyhow::Result<Vec<CurrentChunk>> {
-    // Collector over the streaming iterator: identical rows/order, materialized for callers that
-    // want the whole (bounded) set. The unbounded `limit == None` counting path uses
-    // `for_each_embedding_candidate` directly so it never collects (#379).
-    let mut chunks = Vec::new();
-    for_each_embedding_candidate(
-        conn,
-        model_id,
-        model_version,
-        dim,
-        limit,
-        changed_first,
-        |chunk| {
-            chunks.push(chunk);
-            Ok(())
-        },
-    )?;
-    Ok(chunks)
-}
-
 /// Ordered candidate chunk ids for one reconcile run, fetched ONCE (ids only, no text), need-first
-/// exactly like `embedding_job_candidates`. The loop walks this list in batches and loads text per
+/// exactly like `for_each_embedding_candidate`. The loop walks this list in batches and loads text per
 /// batch via [`current_chunks_by_ids`], so each chunk's text is read at most once per run. The old
 /// path re-queried *every* candidate's text on *every* batch — O(n²) SQLite work that dominated
 /// reconcile on large repos (it looked like model time but was query/row-materialization CPU).
@@ -236,7 +202,7 @@ pub(crate) fn current_chunks_by_ids(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(bind), current_chunk_row)?;
     // Decompress in a post-loop — decompress's anyhow::Result can't cross the rusqlite closure.
-    // Mirror embedding_job_candidates: a non-empty model_id means this is a real (non-force) run,
+    // Mirror for_each_embedding_candidate: a non-empty model_id means this is a real (non-force) run,
     // so the default reason is Missing (the precise reason is recomputed in
     // select_reconcile_batch).
     let mut by_id: std::collections::HashMap<i64, CurrentChunk> =
@@ -256,33 +222,45 @@ pub(crate) fn estimated_reconcile_jobs(
     scan: &EmbeddingScan<'_>,
     options: &ReconcileOptions,
 ) -> anyhow::Result<u64> {
-    let candidates = if options.force {
-        current_chunks(conn, options.limit)?
+    // STREAM the candidates and count — never materialize EVERY candidate's decompressed text into
+    // a `Vec` just to size the backlog (#64 audit; mirrors the streamed
+    // `embedding_reconcile_plan`, #379). This runs on the watcher/maintenance gate
+    // (`pending_embedding_jobs`), so materializing the whole index here was a per-pass memory
+    // peak. The `force` branch queries with an empty model_id (no embedding rows join, so every
+    // chunk is a candidate — matching the old `current_chunks`); otherwise use the active model
+    // so `needs_embedding` sees each chunk's embedding row. Text is still decompressed per row
+    // (both `policy_for_job` and `needs_embedding` read it), but only ONE chunk is resident at
+    // a time now.
+    let (model_id, model_version, dim, changed_first) = if options.force {
+        ("", "", 0, false)
     } else {
-        embedding_job_candidates(
-            conn,
-            scan.model_id,
-            scan.model_version,
-            scan.dim,
-            options.limit,
-            options.changed_first,
-        )?
+        (scan.model_id, scan.model_version, scan.dim, options.changed_first)
     };
-    let count = candidates
-        .iter()
-        .filter(|candidate| {
-            policy_for_job(candidate, scan.max_embedding_chars).eligible
+    let mut count = 0_u64;
+    for_each_embedding_candidate(
+        conn,
+        model_id,
+        model_version,
+        dim,
+        options.limit,
+        changed_first,
+        |candidate| {
+            let eligible = policy_for_job(&candidate, scan.max_embedding_chars).eligible
                 && (options.force
                     || needs_embedding(
-                        candidate,
+                        &candidate,
                         scan.model_id,
                         scan.model_version,
                         scan.dim,
                         scan.max_embedding_chars,
-                    ))
-        })
-        .count();
-    Ok(u64::try_from(count).unwrap_or(u64::MAX))
+                    ));
+            if eligible {
+                count = count.saturating_add(1);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(count)
 }
 
 /// Build the embedding jobs for one batch of candidate ids. Text is loaded only for `ids` (the
