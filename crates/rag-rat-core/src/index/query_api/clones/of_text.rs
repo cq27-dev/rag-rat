@@ -1114,9 +1114,9 @@ mod tests {
     }
 
     /// The postings are built in BASE scope, so the fast path must be disabled under a
-    /// linked-worktree OVERLAY scope — else it would serve base-only postings and miss the overlay's
-    /// branch-only near-clones that the RAM fallback (which reads the overlay scope) would find.
-    /// Overlays fall back to RAM.
+    /// linked-worktree OVERLAY scope — else it would serve base-only postings and miss the
+    /// overlay's branch-only near-clones that the RAM fallback (which reads the overlay scope)
+    /// would find. Overlays fall back to RAM.
     #[test]
     fn clone_check_fast_path_disabled_under_worktree_overlay() {
         let (mut db, _path) = parity_fixture("overlay-scope");

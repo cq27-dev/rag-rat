@@ -154,6 +154,25 @@ impl IndexDatabase {
             || !live.postings_written)
     }
 
+    /// Invalidate the persisted clone-graph postings — mark EVERY generation postings-stale
+    /// (`postings_written = 0`) so `pending_clone_graph` reports pending and the next maintenance
+    /// pass rebuilds the graph. Called when `clone_token_df` is recomputed (a full rebuild): the
+    /// postings freeze `sub_block_tokens`' ordering by the df table AS OF their build, but a full
+    /// rebuild corrects df drift WITHOUT changing file content, so `content_revision()` (the
+    /// clone-graph freshness key) stays equal and nothing else would catch the drift. Serving those
+    /// postings would rank a new function with the current df while reading postings ordered by the
+    /// old df, silently missing near-clones whose selected sub-block token shifted. Until the
+    /// rebuild, the write-time fast path falls back to the RAM build; `find_clones`' edges are
+    /// df-INDEPENDENT (they store the verified overlap) and are unaffected. Incremental indexing
+    /// bumps df alongside file-content changes, so `content_revision()` already gates that path —
+    /// only this content-invariant refresh needs the explicit nudge.
+    pub(crate) fn invalidate_clone_graph_postings(&self) -> anyhow::Result<()> {
+        self.storage
+            .connection()
+            .execute("UPDATE clone_graph_generations SET postings_written = 0", [])?;
+        Ok(())
+    }
+
     /// The live clone-graph generation the write-time postings fast path may read from —
     /// `Some(gen)` ONLY when the persisted postings are safe to serve, `None` otherwise (→ the
     /// caller uses the RAM fallback). Eligibility is EXACT-freshness, deliberately STRICTER
@@ -769,10 +788,12 @@ fn read_meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
 mod tests {
     use super::*;
 
-    /// A fixed two-file fixture with two renamed-clone groups (load_user/load_order +
-    /// compute_totals/tally_amounts). Identical file CONTENT across tags → identical content-key
-    /// edges, so two builds are directly comparable.
-    fn build_clone_fixture(tag: &str) -> crate::IndexDatabase {
+    /// The config for a fixed two-file fixture with two renamed-clone groups
+    /// (load_user/load_order and compute_totals/tally_amounts). Identical file CONTENT across tags
+    /// → identical content-key edges, so two builds are directly comparable. Split out so a
+    /// test can `rebuild` the SAME config twice (identical content) to exercise the
+    /// full-rebuild df refresh.
+    fn clone_fixture_config(tag: &str) -> crate::Config {
         let root = std::env::temp_dir().join(format!(
             "rag-rat-precompute-{tag}-{}-{}",
             std::process::id(),
@@ -794,7 +815,7 @@ mod tests {
              t += v * 2; } t + 1 }\n",
         )
         .unwrap();
-        let config = crate::Config {
+        crate::Config {
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![crate::config::ResolvedTarget {
@@ -811,8 +832,12 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             log: Default::default(),
-        };
-        crate::IndexDatabase::rebuild(&config).unwrap()
+        }
+    }
+
+    /// A fixed two-file fixture (see [`clone_fixture_config`]), rebuilt fresh.
+    fn build_clone_fixture(tag: &str) -> crate::IndexDatabase {
+        crate::IndexDatabase::rebuild(&clone_fixture_config(tag)).unwrap()
     }
 
     /// The content-key set of the live-or-only generation's edges, sorted — the build-stable
@@ -1080,5 +1105,41 @@ mod tests {
             .unwrap();
         assert!(postings > 0, "the upgrade rebuild fills clone_subblock_postings");
         assert!(!db.pending_clone_graph().unwrap(), "no longer pending after the rebuild");
+    }
+
+    /// A full rebuild recomputes `clone_token_df` authoritatively (correcting incremental drift)
+    /// WITHOUT changing file content, so `content_revision()` — the clone-graph freshness key —
+    /// stays equal. The persisted postings freeze the OLD df ordering, so serving them under
+    /// the fresh df could silently miss near-clones; the rebuild must therefore INVALIDATE the
+    /// postings (mark the generation stale) so they rebuild against the fresh df. The
+    /// write-time fast path falls back to RAM until then. Self-heals on the next precompute.
+    #[test]
+    fn full_rebuild_invalidates_postings_for_df_freshness() {
+        let config = clone_fixture_config("df-refresh");
+        let db1 = crate::IndexDatabase::rebuild(&config).unwrap();
+        db1.precompute_clone_graph(None).unwrap();
+        assert!(!db1.pending_clone_graph().unwrap(), "a fresh precompute is current");
+        assert!(
+            db1.clone_check_indexed_generation().unwrap().is_some(),
+            "and the write-time fast path is eligible"
+        );
+        drop(db1); // release the DB file before the second rebuild takes the write lock
+
+        // Second FULL rebuild over IDENTICAL content: the clone graph survives (it is content-
+        // anchored), but `refresh_clone_token_df` runs, so the postings must be invalidated.
+        let db2 = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert!(
+            db2.pending_clone_graph().unwrap(),
+            "the full-rebuild df refresh invalidates the postings, so the graph is pending"
+        );
+        assert!(
+            db2.clone_check_indexed_generation().unwrap().is_none(),
+            "and the write-time fast path falls back to RAM until the postings are rebuilt"
+        );
+
+        // Self-heals: re-precompute rebuilds the postings against the fresh df.
+        assert_eq!(db2.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert!(!db2.pending_clone_graph().unwrap(), "current again after the rebuild");
+        assert!(db2.clone_check_indexed_generation().unwrap().is_some(), "eligible again");
     }
 }

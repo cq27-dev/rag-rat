@@ -169,6 +169,12 @@ impl IndexDatabase {
                 .execute(params![normalizer_kind, token_hash, count])?;
             }
         }
+        // The recomputed df may reorder `sub_block_tokens`, so the persisted clone-graph postings
+        // (frozen at their build-time df) can no longer be served against the current df without
+        // silently missing near-clones. Invalidate them so the next maintenance pass rebuilds the
+        // graph; this refresh keeps file content (and `content_revision()`) unchanged, so nothing
+        // else would catch it. See `invalidate_clone_graph_postings`.
+        self.invalidate_clone_graph_postings()?;
         Ok(())
     }
 
