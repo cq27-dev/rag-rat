@@ -23,6 +23,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        log: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();

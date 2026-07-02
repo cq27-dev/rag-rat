@@ -853,6 +853,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         }
     }
 
@@ -874,6 +875,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         let worktree = PathBuf::from("/wt/feat");
         let registry = PathBuf::from("/main/.git/worktrees");
@@ -970,6 +972,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         // A linked checkout mirrors the layout: `<checkout>/crate/src/a.rs`.
         let checkout =
@@ -1013,6 +1016,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         let ignore = IgnoreMatcher::compile(&root, &[]);
 
@@ -1074,6 +1078,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
 
         let ignore = IgnoreMatcher::compile(&root, &[]);
@@ -1146,6 +1151,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
 
         // Before: a source file under the subdir fires.
@@ -1290,6 +1296,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
 
         let (roots, _registry) = worktree_watch_targets(&config);
@@ -1551,6 +1558,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from("src")]);
         let dir_create =

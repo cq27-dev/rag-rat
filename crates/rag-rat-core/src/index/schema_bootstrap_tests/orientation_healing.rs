@@ -169,6 +169,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        log: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();

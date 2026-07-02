@@ -308,6 +308,7 @@ fn parser_failures_report_paths() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        log: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();

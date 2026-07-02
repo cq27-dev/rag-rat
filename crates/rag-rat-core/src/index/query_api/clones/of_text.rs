@@ -442,6 +442,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         crate::IndexDatabase::rebuild(&config).unwrap()
     }
@@ -551,6 +552,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
 
@@ -614,6 +616,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
 

@@ -64,6 +64,7 @@ iai-callgrind = "0.16"
 # Wall-clock benchmarking (full-index time on a larger corpus). default-features off to skip the
 # plotting deps — Bencher parses criterion's stdout estimates.
 criterion = { version = "0.8", default-features = false }
+tempfile.workspace = true
 
 # iai-callgrind: deterministic instruction counts (index + cold/warm query).
 [[bench]]

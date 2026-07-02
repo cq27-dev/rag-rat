@@ -19,6 +19,7 @@ pub struct Config {
     pub targets: Vec<ResolvedTarget>,
     pub llm: LlmConfig,
     pub watch: WatchConfig,
+    pub log: LogConfig,
     pub version_check: VersionCheckConfig,
     pub oracle: OracleConfig,
     pub search: SearchConfig,
@@ -96,6 +97,89 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self { enabled: true, debounce_ms: 400, max_latency_ms: 2500, periodic_sweep_secs: 300 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Self::Off,
+            "error" => Self::Error,
+            "warn" => Self::Warn,
+            "info" => Self::Info,
+            "debug" => Self::Debug,
+            "trace" => Self::Trace,
+            _ => return None,
+        })
+    }
+
+    /// The EnvFilter directive string for this level.
+    pub fn as_filter_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogConfig {
+    /// Master switch (default false). `RAG_RAT_LOG` can force-enable at init even when false.
+    pub enabled: bool,
+    pub level: LogLevel,
+    /// Optional per-subsystem EnvFilter directives (e.g. `rag_rat_core::index::ai=debug`).
+    pub filter: Option<String>,
+    /// Resolved absolute log dir (finalized in `load()` to the db sibling by default).
+    pub dir: PathBuf,
+    pub format: LogFormat,
+    /// Roll/prune a file once it exceeds this many bytes (0 disables the size check).
+    pub max_file_bytes: u64,
+    pub retention_days: u64,
+    pub max_files: u64,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            level: LogLevel::Info,
+            filter: None,
+            dir: PathBuf::from(".rag-rat/logs"),
+            format: LogFormat::Text,
+            max_file_bytes: 50 * 1024 * 1024,
+            retention_days: 7,
+            max_files: 200,
+        }
     }
 }
 
@@ -647,8 +731,18 @@ impl Config {
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();
         let search = raw.search.into();
+        let mut log = LogConfig::try_from(raw.log)?;
+        // Finalize `dir`: empty (unset) → sibling of the db (`<db_parent>/logs`); a set value is
+        // resolved relative to the config dir (absolute honored). Mirrors the cookbook-path rule.
+        log.dir = if log.dir.as_os_str().is_empty() {
+            database.parent().map(|p| p.join("logs")).unwrap_or_else(|| PathBuf::from("logs"))
+        } else if log.dir.is_absolute() {
+            log.dir.clone()
+        } else {
+            config_dir.join(&log.dir)
+        };
 
-        Ok(Self { root, database, targets, llm, watch, version_check, oracle, search })
+        Ok(Self { root, database, targets, llm, watch, version_check, oracle, search, log })
     }
 }
 
@@ -809,6 +903,8 @@ struct RawConfig {
     #[serde(default)]
     watch: RawWatch,
     #[serde(default)]
+    log: RawLog,
+    #[serde(default)]
     version_check: RawVersionCheck,
     #[serde(default)]
     oracle: RawOracle,
@@ -837,6 +933,45 @@ impl From<RawWatch> for WatchConfig {
             max_latency_ms: raw.max_latency_ms.unwrap_or(default.max_latency_ms),
             periodic_sweep_secs: raw.periodic_sweep_secs.unwrap_or(default.periodic_sweep_secs),
         }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawLog {
+    enabled: Option<bool>,
+    level: Option<String>,
+    filter: Option<String>,
+    dir: Option<String>,
+    format: Option<String>,
+    max_file_bytes: Option<u64>,
+    retention_days: Option<u64>,
+    max_files: Option<u64>,
+}
+
+impl TryFrom<RawLog> for LogConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawLog) -> Result<Self, Self::Error> {
+        let d = LogConfig::default();
+        let level = match raw.level {
+            Some(s) => LogLevel::parse(&s).ok_or(ConfigError::UnknownLogLevel(s))?,
+            None => d.level,
+        };
+        let format = match raw.format {
+            Some(s) => LogFormat::parse(&s).ok_or(ConfigError::UnknownLogFormat(s))?,
+            None => d.format,
+        };
+        Ok(Self {
+            enabled: raw.enabled.unwrap_or(d.enabled),
+            level,
+            filter: raw.filter.filter(|s| !s.trim().is_empty()),
+            // `dir` is finalized in `load()` (needs the db path); raw value passed through as-is.
+            dir: raw.dir.map(PathBuf::from).unwrap_or_default(),
+            format,
+            max_file_bytes: raw.max_file_bytes.unwrap_or(d.max_file_bytes),
+            retention_days: raw.retention_days.unwrap_or(d.retention_days),
+            max_files: raw.max_files.unwrap_or(d.max_files),
+        })
     }
 }
 
@@ -1231,6 +1366,10 @@ pub enum ConfigError {
     DuplicateTarget(String),
     #[error("configured directory does not exist: {0}")]
     MissingDirectory(PathBuf),
+    #[error("[log] `level` must be one of off|error|warn|info|debug|trace (got `{0}`)")]
+    UnknownLogLevel(String),
+    #[error("[log] `format` must be `text` or `json` (got `{0}`)")]
+    UnknownLogFormat(String),
 }
 
 #[cfg(test)]
@@ -2310,5 +2449,44 @@ mod tests {
         let err = resolve_targets(&root, simple, Vec::new()).unwrap_err();
 
         assert!(err.to_string().contains("unknown language"));
+    }
+
+    #[test]
+    fn log_config_defaults_off() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let log: LogConfig = raw.log.try_into().unwrap();
+        assert!(!log.enabled);
+        assert_eq!(log.level, LogLevel::Info);
+        assert_eq!(log.format, LogFormat::Text);
+        assert_eq!(log.retention_days, 7);
+        assert_eq!(log.max_files, 200);
+    }
+
+    #[test]
+    fn log_config_parses_and_rejects_unknown_level_and_format() {
+        let raw: RawConfig = toml::from_str(
+            "[log]\nenabled=true\nlevel=\"debug\"\nformat=\"json\"\nfilter=\"\
+             rag_rat_core::index::ai=trace\"\nmax_files=10",
+        )
+        .unwrap();
+        let log: LogConfig = raw.log.try_into().unwrap();
+        assert!(log.enabled);
+        assert_eq!(log.level, LogLevel::Debug);
+        assert_eq!(log.format, LogFormat::Json);
+        assert_eq!(log.filter.as_deref(), Some("rag_rat_core::index::ai=trace"));
+        assert_eq!(log.max_files, 10);
+
+        let bad_level: RawConfig = toml::from_str("[log]\nlevel=\"loud\"").unwrap();
+        assert!(matches!(LogConfig::try_from(bad_level.log), Err(ConfigError::UnknownLogLevel(_))));
+        let bad_fmt: RawConfig = toml::from_str("[log]\nformat=\"xml\"").unwrap();
+        assert!(matches!(LogConfig::try_from(bad_fmt.log), Err(ConfigError::UnknownLogFormat(_))));
+    }
+
+    #[test]
+    fn log_dir_defaults_to_db_sibling_and_custom_is_config_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rag-rat.toml"), "[log]\nenabled=true\n").unwrap();
+        let cfg = Config::load(dir.path().join("rag-rat.toml")).unwrap();
+        assert_eq!(cfg.log.dir, cfg.database.parent().unwrap().join("logs"));
     }
 }
