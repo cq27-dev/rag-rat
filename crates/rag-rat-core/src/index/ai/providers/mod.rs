@@ -197,6 +197,24 @@ pub(crate) enum ChunkEmbedder {
 /// usual `active_embedder`. Provisioning happens ONCE here, not per batch. `provision_remote` gates
 /// the cold-start (only an explicit `rag-rat reconcile` sets it); `scan`/`options` size the
 /// provision-path pending-work check.
+/// Strip credentials + path from an endpoint URL before logging it: keep `scheme://host[:port]`
+/// only. A debug log is a shared, greppable on-disk artifact, and an endpoint may carry inline
+/// `user:pass@` userinfo (the connect/query endpoints support it — see `endpoint_is_loopback`), so
+/// the raw URL must never land in a log line.
+pub(crate) fn sanitize_endpoint(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
+    };
+    // Authority is up to the first path/query/fragment delimiter; drop any `user:pass@` userinfo.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host_port)| host_port);
+    match scheme {
+        Some(scheme) => format!("{scheme}://{host_port}"),
+        None => host_port.to_string(),
+    }
+}
+
 pub(crate) fn acquire_chunk_embedder(
     conn: &Connection,
     intra_threads: Option<usize>,
@@ -245,7 +263,7 @@ pub(crate) fn acquire_chunk_embedder(
             }
             // The #356 light path: this is the "local embedding after a git action" the maintenance
             // hook triggers — embeds changed chunks against the LOCAL query_endpoint, no paid box.
-            tracing::debug!(target: "rag_rat_core::index::ai::providers", path = "local_query_endpoint", endpoint = remote.query_endpoint.as_deref().unwrap_or(""), "light/incremental reconcile embeds locally against query_endpoint");
+            tracing::debug!(target: "rag_rat_core::index::ai::providers", path = "local_query_endpoint", endpoint = %sanitize_endpoint(remote.query_endpoint.as_deref().unwrap_or("")), "light/incremental reconcile embeds locally against query_endpoint");
             return ChunkEmbedder::Ready {
                 embedder,
                 provisioned: None,
@@ -549,5 +567,16 @@ mod dispatch_tests {
         let connect = remote_at("http://box:11434");
         let q = query_embed_config(&connect);
         assert_eq!(q, connect, "connect query config is the config unchanged");
+    }
+
+    #[test]
+    fn sanitize_endpoint_strips_credentials_and_path() {
+        assert_eq!(sanitize_endpoint("http://u:p@h:7997/embeddings"), "http://h:7997");
+        assert_eq!(sanitize_endpoint("http://localhost:7997"), "http://localhost:7997");
+        assert_eq!(
+            sanitize_endpoint("https://user:secret@gpu.host/v1/embeddings"),
+            "https://gpu.host"
+        );
+        assert_eq!(sanitize_endpoint(""), "");
     }
 }

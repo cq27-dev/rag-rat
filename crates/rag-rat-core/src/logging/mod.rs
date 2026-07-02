@@ -154,6 +154,9 @@ mod tests {
         assert!(empty, "disabled logging must not create any file");
     }
 
+    // NOTE: `init_logging` installs a PROCESS-GLOBAL subscriber guarded by `INIT` (a `OnceLock`),
+    // so there can be only ONE enabled-logging test per test binary — a second would get a
+    // guard-less no-op handle and see no file. Keep this the sole enabled case in this module.
     #[test]
     fn enabled_config_writes_a_per_process_file_with_startup_event() {
         let dir = tempfile::tempdir().unwrap();

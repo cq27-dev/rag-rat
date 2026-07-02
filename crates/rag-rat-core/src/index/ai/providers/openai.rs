@@ -512,7 +512,7 @@ impl Embedder for OpenAiEmbedder {
         let started = std::time::Instant::now();
         if ranges.len() == 1 {
             let result = self.embed_one_request(texts);
-            tracing::debug!(target: "rag_rat_core::index::ai::embed", endpoint = %self.embed_url, model = %self.server_model, texts = texts.len(), sub_batches = 1usize, dim = self.dim, ok = result.is_ok(), duration_ms = started.elapsed().as_millis() as u64, "embed request");
+            tracing::debug!(target: "rag_rat_core::index::ai::embed", endpoint = %super::sanitize_endpoint(&self.embed_url), model = %self.server_model, texts = texts.len(), sub_batches = 1usize, dim = self.dim, ok = result.is_ok(), duration_ms = started.elapsed().as_millis() as u64, "embed request");
             return result;
         }
         let mut out = Vec::with_capacity(texts.len());
@@ -544,7 +544,7 @@ impl Embedder for OpenAiEmbedder {
                 out.extend(result?);
             }
         }
-        tracing::debug!(target: "rag_rat_core::index::ai::embed", endpoint = %self.embed_url, model = %self.server_model, texts = texts.len(), sub_batches = ranges.len(), dim = self.dim, ok = true, duration_ms = started.elapsed().as_millis() as u64, "embed request (fan-out)");
+        tracing::debug!(target: "rag_rat_core::index::ai::embed", endpoint = %super::sanitize_endpoint(&self.embed_url), model = %self.server_model, texts = texts.len(), sub_batches = ranges.len(), dim = self.dim, ok = true, duration_ms = started.elapsed().as_millis() as u64, "embed request (fan-out)");
         Ok(out)
     }
 }

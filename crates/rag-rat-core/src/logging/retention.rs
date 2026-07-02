@@ -22,6 +22,15 @@ pub(super) fn sweep_retention(
         Err(_) => return,
     };
 
+    // Never prune a file a sibling process is likely still writing: an mcp server's active log can
+    // exceed `max_file_bytes` or fall outside `max_files`, and unlinking it here would leave the
+    // server writing to a now-deleted inode (lost logs, unreclaimed disk). Skip anything touched in
+    // the last few minutes — retention only ever reaps clearly-idle files.
+    const RECENT_SECS: u64 = 300;
+    if let Some(recent_cutoff) = SystemTime::now().checked_sub(Duration::from_secs(RECENT_SECS)) {
+        entries.retain(|(_, mtime, _)| *mtime < recent_cutoff);
+    }
+
     if retention_days > 0
         && let Some(cutoff) = SystemTime::now()
             .checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)))
@@ -58,22 +67,33 @@ pub(super) fn sweep_retention(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::sweep_retention;
+
+    /// Backdate a file's mtime `secs` into the past (clear of the RECENT_SECS protection window) so
+    /// the sweep treats it as an idle prune candidate.
+    fn age_file(path: &std::path::Path, secs: u64) {
+        let when = SystemTime::now() - Duration::from_secs(secs);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+    }
 
     #[test]
     fn prunes_by_age_then_count() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..5 {
-            std::fs::write(dir.path().join(format!("mcp-{i}.log")), "x").unwrap();
+            let path = dir.path().join(format!("mcp-{i}.log"));
+            std::fs::write(&path, "x").unwrap();
+            age_file(&path, 3600); // all past the recent window → eligible
         }
         // Age out the first two via an mtime deep in the past.
-        let old = std::time::SystemTime::UNIX_EPOCH;
         for i in 0..2 {
-            let file = std::fs::File::options()
+            std::fs::File::options()
                 .write(true)
                 .open(dir.path().join(format!("mcp-{i}.log")))
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH)
                 .unwrap();
-            file.set_modified(old).unwrap();
         }
         sweep_retention(
             dir.path(),
@@ -93,6 +113,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("mcp-big.log"), vec![b'x'; 4096]).unwrap();
         std::fs::write(dir.path().join("mcp-small.log"), b"x").unwrap();
+        age_file(&dir.path().join("mcp-big.log"), 3600);
+        age_file(&dir.path().join("mcp-small.log"), 3600);
         sweep_retention(dir.path(), 0, 0, /* max_bytes */ 1024);
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -100,5 +122,20 @@ mod tests {
             .map(|e| e.file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["mcp-small.log".to_string()], "oversize pruned, small kept");
+    }
+
+    #[test]
+    fn keeps_recently_modified_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // A large, freshly-written file (mtime ~= now) may be a live sibling's active log — even an
+        // aggressive sweep must leave it alone.
+        std::fs::write(dir.path().join("mcp-live.log"), vec![b'x'; 8192]).unwrap();
+        sweep_retention(
+            dir.path(),
+            /* days */ 1,
+            /* max_files */ 1,
+            /* max_bytes */ 1,
+        );
+        assert!(dir.path().join("mcp-live.log").exists(), "recent file must not be pruned");
     }
 }
