@@ -259,6 +259,34 @@ fn reconcile_confirms_a_provisional_model_against_a_config_change() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn an_incremental_pass_heals_a_missing_active_model_atomically() {
+    // A pre-#394 index (active model unset) opened on the config-blind incremental / maintenance /
+    // watch path must re-seed the active model from config — and, because the seed lives INSIDE the
+    // incremental transaction and counts as a mutation, the heal is COMMITTED rather than rolled
+    // back as an idle no-write pass (#394 review).
+    let (root, mut config) = markdown_config("alpha token\nenough detail for a chunk to survive\n");
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // Simulate a pre-#394 index: drop the seeded active-model meta.
+    db.storage
+        .connection()
+        .execute("DELETE FROM index_meta WHERE key = 'active_embedding_model'", [])
+        .unwrap();
+    drop(db);
+
+    // An incremental discover pass re-seeds inside its transaction and commits the heal (had it
+    // been treated as an idle pass, the ROLLBACK would leave the active model unset).
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    assert_eq!(
+        ai::active_embedding_model_id(db.storage.connection()).unwrap(),
+        HASH_MODEL_ID,
+        "the incremental pass healed the active model and committed it"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(feature = "fastembed")]
 #[test]
 fn cached_fastembed_model_recovers_ready_state() {

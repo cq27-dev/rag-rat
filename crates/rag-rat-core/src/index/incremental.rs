@@ -50,14 +50,6 @@ impl IndexDatabase {
         let mut db = Self::open(&config.database)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
-        // The incremental/maintenance/watch path opens config-blind (`Self::open`), so seed the
-        // active embedding model from config here too — else a pre-fix index (active unset) would
-        // keep reconciling via the hash fallback on watcher/maintenance passes until some other
-        // `open_config` command heals it (#394 review).
-        ai::seed_active_embedding_model(
-            db.storage.connection(),
-            config.llm.embedding.backend.model_id(),
-        )?;
         if db.indexed_file_count()? == 0 {
             return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
@@ -87,6 +79,25 @@ impl IndexDatabase {
                 db.set_meta_if_changed("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             let git_meta_changed = db.write_git_meta(&config.root)?;
+            // Heal the active embedding model from config INSIDE the txn: the incremental /
+            // maintenance / watch path opens config-blind via `Self::open` and can't seed on its
+            // own, so a pre-#394 index (active unset or still provisional) would
+            // otherwise keep reconciling via the hash fallback here. Doing it in-txn
+            // means a failed pass rolls the reseed back with everything else, rather
+            // than stranding the active model on a possibly-uninstalled configured
+            // model (#394 review). A no-op unless a seed is owed, preserving the idle-pass
+            // no-write invariant (#63); when owed it counts as a mutation so the COMMIT persists
+            // it.
+            let embedding_model_seeded = ai::active_embedding_model_seed_owed(
+                db.storage.connection(),
+                config.llm.embedding.backend.model_id(),
+            )?;
+            if embedding_model_seeded {
+                ai::seed_active_embedding_model(
+                    db.storage.connection(),
+                    config.llm.embedding.backend.model_id(),
+                )?;
+            }
             let (indexed, manifest_in_change_set) = match mode {
                 IndexMode::Changed => db.index_changed_files_with_progress(config, progress)?,
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
@@ -102,7 +113,11 @@ impl IndexDatabase {
                 // Non-git roots have no commit scope; overlays are their canonical rows.
                 Err(_) => 0,
             };
-            let mut mutated = indexed > 0 || healed > 0 || source_root_changed || git_meta_changed;
+            let mut mutated = indexed > 0
+                || healed > 0
+                || source_root_changed
+                || git_meta_changed
+                || embedding_model_seeded;
             // None when the gate above found git history already current — skip the reload.
             if let Some(handle) = git_history.take() {
                 db.apply_prepared_git_history(&config.root, handle)?;
