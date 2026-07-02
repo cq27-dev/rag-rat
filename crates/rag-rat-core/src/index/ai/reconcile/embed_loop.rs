@@ -368,6 +368,12 @@ pub(crate) fn reconcile_with_options_progress(
         report.message =
             Some(format!("{} chunks failed; retry after backoff", report.failed_chunks));
     }
+    // Embeddings committed under the active model CONFIRM it as the working choice — clear the
+    // provisional flag so a later config-model edit no longer reseeds away from it (that would
+    // strand these vectors). The active model is what `embed_and_write_jobs` wrote under (#394).
+    if report.embeddings_written > 0 {
+        clear_active_embedding_model_provisional(conn)?;
+    }
     finalize_reconcile_throughput(&mut report, timer.elapsed().as_millis());
 
     finish_reconcile_attempt(conn, attempt_id, &report)?;
@@ -1643,16 +1649,18 @@ mod freshness_version_tests {
     }
 
     #[test]
-    fn activate_model_with_version_writes_both_metas() {
-        // R3b centralization: the helper every activation site goes through stamps BOTH the active
-        // model AND its version — so no site can activate without a version (the recovery bug).
+    fn activate_model_with_version_writes_all_metas() {
+        // R3b centralization: the helper every activation site goes through stamps the active
+        // model, its version, AND its provenance — so no site can activate without any of
+        // them (the recovery bug for the version; the #394 masquerade bug for provenance).
         let conn = schema_conn();
-        activate_model_with_version(&conn, HASH_MODEL_ID, "hash-v1").unwrap();
+        activate_model_with_version(&conn, HASH_MODEL_ID, "hash-v1", false).unwrap();
         assert_eq!(
             meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().as_deref(),
             Some(HASH_MODEL_ID)
         );
         assert_eq!(active_version(&conn), "hash-v1");
+        assert!(!active_embedding_model_is_provisional(&conn).unwrap(), "false ⇒ non-provisional");
     }
 
     // Needs a real fastembed install (the no-default-features CI build bails without the feature);

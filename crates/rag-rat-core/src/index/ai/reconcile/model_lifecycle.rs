@@ -57,7 +57,9 @@ pub(crate) fn recover_cached_fastembed_model_at(
         // re-embed.
         let spec = spec(FASTEMBED_MODEL_ID)
             .ok_or_else(|| anyhow::anyhow!("unknown model `{FASTEMBED_MODEL_ID}`"))?;
-        activate_model_with_version(conn, FASTEMBED_MODEL_ID, spec.version)?;
+        // PROVISIONAL: a cache recovery is automatic, not a user choice — a differing config seed
+        // must still win over it on a fresh index (#394 review).
+        activate_model_with_version(conn, FASTEMBED_MODEL_ID, spec.version, true)?;
     }
     Ok(())
 }
@@ -94,29 +96,44 @@ pub(crate) fn fastembed_cache_ready(cache_dir: &Path) -> bool {
     !revision.is_empty() && repo.join("snapshots").join(revision).is_dir()
 }
 
-/// Activate `model_id` as the active embedding model AND stamp its freshness `version` in ONE call
-/// — the SINGLE place that writes both metas, so no activation site can set the active model
-/// without its version (the bug R3b fixed in recovery). `install_model` and
-/// `recover_cached_fastembed_model` both go through here.
+/// Activate `model_id` as the active embedding model, stamp its freshness `version`, and record its
+/// PROVENANCE — all in ONE call, the SINGLE place that writes these metas, so no activation site
+/// can set the active model without its version (the bug R3b fixed in recovery) or its provenance.
+/// `provisional = true` for an AUTOMATIC activation (config seed, fastembed-cache recovery),
+/// `false` for an EXPLICIT one (`install_model`). See [`ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META`].
 pub(crate) fn activate_model_with_version(
     conn: &Connection,
     model_id: &str,
     version: &str,
+    provisional: bool,
 ) -> anyhow::Result<()> {
     set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
     set_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, version)?;
+    set_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META, if provisional { "1" } else { "0" })?;
     Ok(())
+}
+
+/// Whether the active embedding model is PROVISIONAL — set automatically (seed / cache recovery)
+/// and not yet confirmed by an explicit install or a committed reconcile. Absent ⇒ non-provisional.
+pub(crate) fn active_embedding_model_is_provisional(conn: &Connection) -> anyhow::Result<bool> {
+    Ok(meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META)?.as_deref() == Some("1"))
+}
+
+/// Clear the provisional flag — the active model is now the CONFIRMED choice (an explicit install,
+/// or a reconcile that committed embeddings under it). Idempotent.
+pub(crate) fn clear_active_embedding_model_provisional(conn: &Connection) -> anyhow::Result<()> {
+    set_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META, "0")
 }
 
 /// Seed the active embedding model from the CONFIG's selection when the index has none yet (#394),
 /// so a fresh index adopts the configured model instead of silently defaulting to the hash fallback
 /// (`active_embedding_model_id`'s `HASH_MODEL_ID` default — which the config never selects, since
 /// `EmbeddingBackend::default()` is all-MiniLM). Read-first via
-/// [`active_embedding_model_seed_owed`]: a no-op once embeddings are COMMITTED under the active model
-/// (that model is respected) and for the embeddings-off choice (`configured_model_id == None`).
-/// While nothing is committed (a seed placeholder, a recovered cache, or an
-/// installed-but-unreconciled model) config stays authoritative — a config-model edit made before
-/// reconcile is adopted.
+/// [`active_embedding_model_seed_owed`]: a no-op once the active model is EXPLICIT (an
+/// `install_model`) or CONFIRMED (a reconcile committed embeddings under it) — that model is
+/// respected — and for the embeddings-off choice (`configured_model_id == None`). While the active
+/// model is PROVISIONAL (a prior seed or a fastembed-cache recovery) config stays authoritative — a
+/// config-model edit is adopted.
 ///
 /// This does NOT install the model — reconcile still blocks with an accurate
 /// `models install <configured>` hint until it is — it only makes the index's active model reflect
@@ -134,24 +151,28 @@ pub(crate) fn seed_active_embedding_model(
     let Some(spec) = spec(model_id) else {
         return Ok(()); // unknown id (defensive) — leave unset so the hash fallback stands
     };
-    // Activate + stamp the freshness version through the single writer (never the active meta
-    // alone, per the R3b footgun). The static `spec.version` is correct pre-install;
-    // `install_model` re-stamps the runtime-accurate version, and a fresh index has no
-    // embeddings to re-embed.
-    activate_model_with_version(conn, spec.model_id, spec.version)
+    // Drop any remote-config meta a prior remote install left behind: the seed activates the model
+    // as a LOCAL placeholder, so without this `active_embedder` would build an OpenAiEmbedder for
+    // the new active model against the STALE endpoint / server-side model — vectors in the
+    // wrong embedding space (#394 review). `install_model`'s local branch clears it the same
+    // way.
+    clear_active_remote_config(conn)?;
+    // Activate as PROVISIONAL (an automatic config seed, not a user choice) + stamp the freshness
+    // version through the single writer (never the active meta alone, per the R3b footgun). The
+    // static `spec.version` is correct pre-install; `install_model` re-stamps the runtime-accurate
+    // version and clears the provisional flag.
+    activate_model_with_version(conn, spec.model_id, spec.version, true)
 }
 
 /// Read-only test of whether [`seed_active_embedding_model`] would WRITE. The read-only open
 /// consults it to fall back to the write path so the seed heals once (same posture as the
 /// model-manifest / generated-flags gates). A seed is owed when the config selects a model AND
-/// either (a) no active model is set yet, or (b) the active model DIFFERS from config AND has NO
-/// embeddings committed under it. CONFIG is authoritative until embeddings are committed: a seed
-/// placeholder, a `recover_cached_fastembed_model` cache activation, and an installed-but-not-yet-
-/// reconciled model all read `current_embedding_count == 0`, so config wins over any of them on a
-/// fresh index. Once embeddings exist under the active model it is respected (switching a committed
-/// model on a config change is a separate re-embed concern, out of scope here). Using the embedding
-/// count — not the `ai_models.installed` flag — is what keeps a RECOVERED cache from masquerading
-/// as an explicit user install (#394 review).
+/// either (a) no active model is set yet, or (b) the active model DIFFERS from config AND is
+/// PROVISIONAL — set automatically by a prior seed or a fastembed-cache recovery, NOT by an
+/// explicit `models install` and NOT confirmed by a reconcile that committed embeddings under it.
+/// An absent provenance flag (a pre-#394 index, or a committed / explicit model) reads as
+/// non-provisional → respected. Provenance is an O(1) meta read — no per-open embedding scan, and a
+/// RECOVERED cache no longer masquerades as an explicit install (#394 review).
 pub(crate) fn active_embedding_model_seed_owed(
     conn: &Connection,
     configured_model_id: Option<&str>,
@@ -162,7 +183,7 @@ pub(crate) fn active_embedding_model_seed_owed(
     match meta(conn, ACTIVE_EMBEDDING_MODEL_META)? {
         None => Ok(true),
         Some(active) if active == configured => Ok(false),
-        Some(active) => Ok(current_embedding_count(conn, &active)? == 0),
+        Some(_) => active_embedding_model_is_provisional(conn),
     }
 }
 
@@ -230,7 +251,9 @@ pub(crate) fn install_model(
         Some(remote) => remote_freshness_version(spec, remote),
         None => spec.version.to_string(),
     };
-    activate_model_with_version(conn, model_id, &freshness)?;
+    // EXPLICIT: `models install` is a user choice — not provisional, so the config seed never
+    // overrides it (#394 review).
+    activate_model_with_version(conn, model_id, &freshness, false)?;
     model(conn, model_id)
 }
 
@@ -313,36 +336,67 @@ mod seed_active_embedding_model_tests {
     }
 
     #[test]
-    fn reseeds_over_an_installed_but_uncommitted_model() {
+    fn respects_an_explicitly_installed_model() {
         let conn = fresh_conn();
-        // A model installed but with NO embeddings yet — a recovered fastembed cache, or an install
-        // before reconcile. Config is authoritative until something is committed, so it wins.
+        // An EXPLICIT install (hash is a no-download local install) is a user choice →
+        // NON-provisional provenance, so the config seed must not override it even before
+        // any reconcile (#394 review).
         install_model(&conn, HASH, None).unwrap();
         assert_eq!(active_embedding_model_id(&conn).unwrap(), HASH);
-        assert_eq!(current_embedding_count(&conn, HASH).unwrap(), 0, "nothing committed yet");
+        assert!(
+            !active_embedding_model_is_provisional(&conn).unwrap(),
+            "install is not provisional"
+        );
 
-        assert!(active_embedding_model_seed_owed(&conn, Some(JINA)).unwrap());
+        assert!(!active_embedding_model_seed_owed(&conn, Some(JINA)).unwrap());
         seed_active_embedding_model(&conn, Some(JINA)).unwrap();
         assert_eq!(
             active_embedding_model_id(&conn).unwrap(),
-            JINA,
-            "config wins over an installed-but-uncommitted model (e.g. a recovered cache)"
+            HASH,
+            "an explicitly installed model is respected — the seed never overrides it"
         );
     }
 
     #[test]
-    fn reseeds_an_uninstalled_placeholder_when_the_config_changes() {
+    fn config_wins_over_a_provisionally_recovered_model() {
         let conn = fresh_conn();
-        // Seed jina — a PLACEHOLDER (activated by the seed, but NOT installed).
+        // Simulate a fastembed-cache recovery: activated, but PROVISIONAL (automatic, not a user
+        // choice). A `models install` would be non-provisional; this must NOT masquerade as one.
+        let minilm = spec(MINILM).expect("registry has all-MiniLM");
+        activate_model_with_version(&conn, minilm.model_id, minilm.version, true).unwrap();
+        assert!(active_embedding_model_is_provisional(&conn).unwrap());
+
+        assert!(active_embedding_model_seed_owed(&conn, Some(JINA)).unwrap());
+        seed_active_embedding_model(&conn, Some(JINA)).unwrap();
+        assert_eq!(active_embedding_model_id(&conn).unwrap(), JINA, "config wins over a recovery");
+    }
+
+    #[test]
+    fn reseeds_a_provisional_model_when_the_config_changes() {
+        let conn = fresh_conn();
+        // Seed jina — PROVISIONAL (an automatic config seed, not confirmed).
         seed_active_embedding_model(&conn, Some(JINA)).unwrap();
         assert_eq!(active_embedding_model_id(&conn).unwrap(), JINA);
+        assert!(active_embedding_model_is_provisional(&conn).unwrap());
 
-        // The config is edited to all-MiniLM BEFORE jina is installed → the placeholder is
-        // re-adopted (#394 review: a seeded placeholder must not masquerade as an explicit
-        // selection).
+        // The config is edited to all-MiniLM BEFORE jina is confirmed → the provisional model
+        // yields.
         assert!(active_embedding_model_seed_owed(&conn, Some(MINILM)).unwrap());
         seed_active_embedding_model(&conn, Some(MINILM)).unwrap();
         assert_eq!(active_embedding_model_id(&conn).unwrap(), MINILM);
+    }
+
+    #[test]
+    fn a_confirmed_model_is_respected_over_a_config_change() {
+        let conn = fresh_conn();
+        // Seed jina (provisional), then CONFIRM it (as a reconcile committing embeddings would).
+        seed_active_embedding_model(&conn, Some(JINA)).unwrap();
+        clear_active_embedding_model_provisional(&conn).unwrap();
+
+        // A later config change is now respected — a confirmed model is not reseeded.
+        assert!(!active_embedding_model_seed_owed(&conn, Some(MINILM)).unwrap());
+        seed_active_embedding_model(&conn, Some(MINILM)).unwrap();
+        assert_eq!(active_embedding_model_id(&conn).unwrap(), JINA, "a confirmed model is kept");
     }
 
     #[test]

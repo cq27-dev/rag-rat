@@ -62,6 +62,14 @@ use crate::language::Language;
 
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
 const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";
+/// `"1"` when the active embedding model was set AUTOMATICALLY — a config seed
+/// (`seed_active_embedding_model`) or a fastembed-cache recovery (`recover_cached_fastembed_model`)
+/// — and NOT confirmed by the user. Set to `"0"` when the user selects it explicitly
+/// (`install_model`) or a reconcile commits embeddings under it. A PROVISIONAL active model yields
+/// to a differing config on the next config-aware open; an explicit / committed one is respected.
+/// Absent ⇒ treated as non-provisional (a pre-#394 index, or an explicit choice), so the seed never
+/// clobbers it (#394).
+const ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META: &str = "active_embedding_model_provisional";
 /// Secret-free JSON of the active [`RemoteEmbeddingConfig`] (#317 task 5). Written at install when
 /// an Ollama model is activated; read by `active_embedder` to reconstruct the remote embedder for
 /// BOTH chunk-embed (reconcile) and query-embed (search), so the `conn`-based construction path

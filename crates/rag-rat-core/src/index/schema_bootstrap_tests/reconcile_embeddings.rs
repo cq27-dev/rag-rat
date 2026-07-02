@@ -217,12 +217,11 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
 }
 
 #[test]
-fn a_committed_embedding_model_is_respected_over_a_config_change() {
-    // #394 review: the config seed makes a fresh index adopt the configured model, but once
-    // embeddings are COMMITTED under the active model a later config-model edit must NOT silently
-    // switch it (that would strand the vectors and force a re-embed) — the seed yields to the
-    // committed model. (Uncommitted actives — placeholders / recovered caches — DO yield to config;
-    // that is covered by the model_lifecycle unit tests.)
+fn reconcile_confirms_a_provisional_model_against_a_config_change() {
+    // #394 review: a PROVISIONAL active model (a config seed or a fastembed-cache recovery) yields
+    // to a differing config — but once a reconcile COMMITS embeddings under it, the model is
+    // confirmed (provisional flag cleared) and a later config-model edit must NOT silently switch
+    // it (that would strand the vectors and force a re-embed).
     let (root, mut config) = markdown_config(
         "alpha token\nsecond line with enough detail for the semantic embedding policy to keep \
          this chunk\nthird line with runtime context\n",
@@ -230,20 +229,31 @@ fn a_committed_embedding_model_is_respected_over_a_config_change() {
     config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
     let db = IndexDatabase::rebuild(&config).unwrap();
     db.install_model(HASH_MODEL_ID, None).unwrap();
+    // Simulate a PROVISIONAL-but-Ready active model, as a fastembed-cache recovery produces: Ready
+    // to embed, but not yet user-confirmed. (Mirrors ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META.)
+    db.storage
+        .connection()
+        .execute(
+            "INSERT OR REPLACE INTO index_meta(key, value) VALUES \
+             ('active_embedding_model_provisional', '1')",
+            [],
+        )
+        .unwrap();
+    // A reconcile that commits embeddings CONFIRMS the model — it clears the provisional flag.
     assert!(
         db.reconcile(None, Some(8)).unwrap().embeddings_written >= 1,
         "hash embeddings are committed"
     );
     drop(db);
 
-    // Edit the config to a DIFFERENT model, then reopen: the active model stays hash because its
-    // embeddings are committed — the seed only fills an empty / uncommitted selection.
+    // Edit the config to a DIFFERENT model, then reopen: the active model stays hash because the
+    // reconcile confirmed it — the seed only reseeds a still-provisional model.
     config.llm.embedding.backend = "sentence-transformers/all-MiniLM-L6-v2".parse().unwrap();
     let db = IndexDatabase::open_config(&config).unwrap();
     assert_eq!(
         ai::active_embedding_model_id(db.storage.connection()).unwrap(),
         HASH_MODEL_ID,
-        "a model with committed embeddings is not switched by a config change"
+        "a reconcile-confirmed model is not switched by a config change"
     );
 
     let _ = fs::remove_dir_all(root);
