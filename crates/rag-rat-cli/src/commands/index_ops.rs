@@ -374,16 +374,27 @@ fn run_maintenance_pass(
     // leaving stale anchors until a manual memory_validate.
     let memory_validation = db.memory_validate().ok();
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "gc_clone_memory", gc = gc_report.is_some(), clone_graph = clone_graph_report.is_some(), memory_validated = memory_validation.is_some(), "post-reconcile phases complete");
-    let plan = db.reconcile_plan()?;
-    // Remaining backlog. NOTE: these plan counts are UNSCOPED (global `files`, all worktrees — see
-    // #360), so a non-zero `missing` here can be sibling-worktree chunks, not the active branch.
+    // Remaining backlog for the ACTIVE embedding model from the CHEAP persisted counts
+    // (`status.embedding` / `status.artifacts`, #285), NOT `reconcile_plan` — which rebuilds +
+    // re-hashes EVERY chunk's embedding input (O(repo)) on every hook pass. #378 measured that plan
+    // dominating the maintenance pass (~10s on this index). Use the ACTIVE-model fields, NOT
+    // `status.fastembed`: the latter reports the FastEmbed identity when the active model is
+    // non-FastEmbed (Model2Vec / hash / embeddings-off), which would show a different model +
+    // phantom counts (PR #380 review). Only fields the cheap counts compute EXACTLY are exported;
+    // `missing`, the exact per-policy `skipped`, the failed retryable/waiting split, and the
+    // by-priority/by-policy breakdown all need the O(repo) per-chunk scan — run `reconcile --plan`
+    // (see the `remaining_backlog` comment for why `missing` in particular can't be trusted
+    // cheaply). NOTE: these counts are still UNSCOPED (all worktrees — see #360).
+    let status = db.llm_status()?;
+    let embedding = &status.embedding;
+    let artifacts = &status.artifacts;
     tracing::info!(
         target: "rag_rat_core::maintenance",
         elapsed_ms = started.elapsed().as_millis() as u64,
-        current = plan.embeddings.current,
-        missing = plan.embeddings.missing,
-        stale = plan.embeddings.stale,
-        skipped = plan.embeddings.skipped_total,
+        model = %embedding.model_id,
+        current = artifacts.current,
+        stale = artifacts.stale,
+        total_chunks = artifacts.total_chunks,
         "maintenance pass complete (remaining backlog is unscoped/cross-worktree, #360)"
     );
     Ok(serde_json::json!({
@@ -403,16 +414,19 @@ fn run_maintenance_pass(
         "gc": gc_report,
         "memory_validation": memory_validation,
         "remaining_backlog": {
-            "model": plan.embeddings.model_id,
-            "current": plan.embeddings.current,
-            "missing": plan.embeddings.missing,
-            "stale": plan.embeddings.stale,
-            "failed_retryable": plan.embeddings.failed_retryable,
-            "failed_waiting": plan.embeddings.failed_waiting,
-            "blocked": plan.embeddings.blocked,
-            "skipped": plan.embeddings.skipped_total,
-            "missing_by_priority": plan.embeddings.missing_by_priority,
-            "skipped_by_policy": plan.embeddings.skipped_by_policy,
+            "model": embedding.model_id,
+            "current": artifacts.current,
+            "stale": artifacts.stale,
+            "failed": artifacts.failed,
+            "blocked": artifacts.blocked,
+            "total_chunks": artifacts.total_chunks,
+            // `missing` is intentionally OMITTED: `artifacts.missing` is `total - current - stale -
+            // failed - blocked` with policy-skipped chunks (generated / tiny) treated as zero, so it
+            // would report a PERMANENT backlog even after a clean reconcile (PR #380 review) — and the
+            // exact eligible-missing can't be computed without the O(repo) per-chunk scan. Coverage
+            // reads off `current`/`total_chunks`; `stale`/`failed`/`blocked` are exact remaining-work
+            // signals. The precise missing + per-policy `skipped` + by-priority breakdown live in
+            // `reconcile --plan`, along with the failed retryable/waiting split.
         }
     }))
 }
@@ -574,6 +588,81 @@ mod tests {
             "open_config must base-scope embedding counts (open does not): scoped={scoped} \
              unscoped={unscoped}"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maintenance_backlog_uses_cheap_counts_not_reconcile_plan() {
+        // #378: `run_maintenance_pass` must build `remaining_backlog` from the CHEAP `llm_status`
+        // counts, never the O(repo) `reconcile_plan` (which rebuilds + re-hashes every chunk's
+        // embedding input on every hook pass). Assert the exact cheap coverage fields are present,
+        // and the approximate ones (skipped, the retryable/waiting split) + expensive per-chunk
+        // breakdowns are ABSENT — those need `reconcile --plan`.
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-maint-backlog-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "t"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "base"]);
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            llm: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+            search: Default::default(),
+            log: Default::default(),
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        let args = super::MaintenanceArgs {
+            trigger: Some("post-commit".to_string()),
+            max_seconds: Some(0), // skip the reconcile; we only assert the backlog shape
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+        let report = super::run_maintenance_pass(&config, &args, "post-commit").unwrap();
+        let backlog = &report["remaining_backlog"];
+
+        // Fields the cheap ACTIVE-model counts compute exactly.
+        for key in ["current", "stale", "failed", "blocked", "total_chunks"] {
+            assert!(backlog[key].is_number(), "cheap backlog count `{key}` present: {backlog}");
+        }
+        // Fields the cheap counts CAN'T compute exactly are omitted (reconcile --plan's job):
+        // `missing` (would count policy-skipped chunks as a permanent backlog), the exact policy
+        // `skipped`, the failed retryable/waiting split, and the per-chunk breakdowns (PR #380
+        // review).
+        for key in [
+            "missing",
+            "skipped",
+            "failed_retryable",
+            "failed_waiting",
+            "missing_by_priority",
+            "skipped_by_policy",
+        ] {
+            assert!(backlog.get(key).is_none(), "`{key}` must be omitted from the cheap backlog");
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
