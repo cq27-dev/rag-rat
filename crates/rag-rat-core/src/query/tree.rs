@@ -229,13 +229,17 @@ fn file_counts_by_dir(conn: &Connection) -> anyhow::Result<HashMap<String, u32>>
 ///
 /// Returns only `status = 'active'` memories with `binding_kind = 'dir'`.
 fn dir_memory_titles(conn: &Connection) -> anyhow::Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare(
+    // Scoped to the active repo (V042): a sibling repo's `dir` memory must not annotate this repo's
+    // tree. `{repo_clause}` empty pre-A5 — see `schema::periphery_repo_scope`.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let mut stmt = conn.prepare(&format!(
         // Only active dir memories; binding_id is the normalized dir path (or "" for repo root).
         "SELECT b.binding_id, m.title
          FROM repo_memory_bindings b
          JOIN repo_memories m ON m.id = b.memory_id
-         WHERE b.binding_kind = 'dir' AND m.status = 'active'",
-    )?;
+         WHERE b.binding_kind = 'dir' AND m.status = 'active'{repo_clause}"
+    ))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     rows.collect::<Result<_, _>>().map_err(Into::into)
 }

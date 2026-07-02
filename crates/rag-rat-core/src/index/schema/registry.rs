@@ -38,6 +38,33 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
     "github_fts",
 ];
 
+/// The periphery tables that gain a `repo_id` column in the phase-A5 periphery-scoping migration
+/// (V042, `apply_repo_id_periphery_scoping`) and therefore also need their [`LEGACY_REPO_ID`]
+/// placeholder rows re-pointed at the real id when [`register_repo`] adopts a legacy DB — the A5
+/// continuation of the A1/A3 adoption contract. `repo_memory_fts` is the standalone FTS mirror of
+/// `repo_memories` (its `repo_id` snapshots the parent's at rebuild time), re-pointed alongside.
+///
+/// COLUMN GUARD: several of these tables predate V042 — they exist at earlier schema versions
+/// WITHOUT a `repo_id` column, which V042 adds or rebuilds in. `register_repo` runs on every open,
+/// including against partial-schema bootstrap fixtures that stop before V042, so each re-point is
+/// guarded by `column_exists`: a no-op when the column is absent (a table present without its
+/// `repo_id` column), the real backfill once V042 has run (every normal open applies the full
+/// ladder). The `DIRECT_SCOPED_ADOPTION_TABLES` loop above guards on table-presence instead; a
+/// periphery table can exist without the column, so it needs the stronger column-level guard.
+const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
+    "clone_graph_generations",
+    "clone_token_df",
+    "clone_refinements",
+    "oracle_runs",
+    "edge_oracle",
+    "logical_symbol_monikers",
+    "reconcile_attempts",
+    "dream_findings",
+    "repo_memories",
+    "repo_memory_bindings",
+    "repo_memory_fts",
+];
+
 /// The placeholder `repo_id` a freshly-migrated single-repo DB carries until it is adopted (see the
 /// V038 DDL) — and the backfill value every direct-scoped table gets when later migrations add
 /// `repo_id` columns (phase A3). A consolidated DB holding more than one repo NEVER carries this id
@@ -213,6 +240,29 @@ pub fn register_repo(
                 source_id
             ])?;
         }
+        // A5 periphery tables (clones/oracle/reconcile/memories). Their `repo_id` column lands in
+        // V042; several of these tables predate it, so a partial-schema bootstrap fixture that
+        // stops before V042 can have the table without the column. Guard each re-point with
+        // `column_exists` (no-op when the column is absent, real backfill once V042 has run — every
+        // normal open applies the full ladder) so this adoption never trips "no such column". Uses
+        // `source_id` (not the placeholder literal) so a shallow-clone upgrade re-points periphery
+        // rows off the `local:` incumbent too, exactly like the core/github loop above.
+        for table in A5_PERIPHERY_DIRECT_SCOPED_TABLES {
+            if super::column_exists(&tx, table, "repo_id")? {
+                tx.execute(
+                    &format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"),
+                    params![identity.repo_id, source_id],
+                )?;
+            }
+        }
+        // `dream_findings.id` folds `repo_id` (the `logical_symbols.stable_id` precedent), so the
+        // periphery re-point above changed the id every finding SHOULD have — re-derive them (and
+        // the in-table `superseded_by` references) under the adopted id: the dream twin of the
+        // `realign_logical_symbol_ids` call below. Guarded like the loop above (a partial-schema
+        // bootstrap fixture can lack the table or the V042 column); idempotent.
+        if super::column_exists(&tx, "dream_findings", "repo_id")? {
+            crate::dream::rederive_finding_ids(&tx)?;
+        }
         // Move the source id's recorded roots onto the new id BEFORE the source `repos` row is
         // deleted (its FK is `ON DELETE CASCADE`, so the roots would otherwise be dropped). A
         // shallow-clone upgrade carries the local id's roots; the placeholder never has any.
@@ -345,6 +395,46 @@ pub(crate) fn active_repo_id(conn: &Connection) -> rusqlite::Result<String> {
         return Ok(repo_id);
     }
     sole_repo_id(conn)
+}
+
+/// The active `repo_id` to scope a PERIPHERY table (clones / oracle / reconcile / memories) by, or
+/// `None` when that subsystem is not repo-scoped on this connection.
+///
+/// Those `repo_id` columns are added by the phase-A5 periphery-scoping migration (V042,
+/// `apply_repo_id_periphery_scoping`). A normal open applies the full ladder, so the column is
+/// present and this returns `Some(active_repo_id)` — the scoped path. The `None` branch is the
+/// defensive path for a connection that never ran the ladder (a raw connection, or the
+/// pre-migration schema in a forward-migration bootstrap fixture): a `repo_id` predicate would
+/// reference a column that does not exist, so the caller instead runs its original unscoped SQL —
+/// the pre-A5 repo-global behavior. Gating on the probe lets scoped and raw-connection callers
+/// share one code path without a separate unscoped variant.
+///
+/// `probe_table` is the subsystem's representative table (`repo_memories`,
+/// `clone_graph_generations`, `oracle_runs`, …). V042 adds `repo_id` to every table in a subsystem
+/// in the SAME migration, so one probe per subsystem is authoritative for the set.
+pub(crate) fn periphery_repo_scope(
+    conn: &Connection,
+    probe_table: &str,
+) -> rusqlite::Result<Option<String>> {
+    if super::column_exists(conn, probe_table, "repo_id")? {
+        Ok(Some(active_repo_id(conn)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// A ` AND <qualifier>.repo_id = '<escaped>'` SQL fragment for a periphery read, or `""` when
+/// `scope` is `None` (the periphery is not yet repo-scoped — see [`periphery_repo_scope`]). The id
+/// is embedded as an escaped string literal, NOT a bind parameter: these reads carry positional
+/// params and dynamic `IN (…)` placeholder lists where re-slotting a bound id is error-prone, and
+/// the id is a registry-validated content-derived value (never user free-text at query time) — the
+/// same posture `oracle::store::sql_quoted_list` takes for the commit/worktree `IN`-lists. Doubling
+/// any single quote keeps it a safe literal regardless.
+pub(crate) fn periphery_repo_scope_clause(scope: &Option<String>, qualifier: &str) -> String {
+    match scope {
+        Some(repo_id) => format!(" AND {qualifier}.repo_id = '{}'", repo_id.replace('\'', "''")),
+        None => String::new(),
+    }
 }
 
 /// Read the active repo id from the per-connection scope context, tolerating the common absence of

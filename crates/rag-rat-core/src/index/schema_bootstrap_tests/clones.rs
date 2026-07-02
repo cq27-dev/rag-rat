@@ -685,6 +685,9 @@ fn indexing_writes_baseline_fingerprints_for_functions() {
 /// persisted `clone_token_df` row-for-row.
 #[test]
 fn clone_token_df_recomputed_from_blobs_matches_postings_era() {
+    // Asserts the whole-DB `clone_token_df` contents; opt out of the poison harness whose sibling
+    // seeds a df row under its own repo_id.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -1970,6 +1973,9 @@ fn refinement_key_is_content_addressed_and_distinct_from_read_key() {
 /// NOT grow the row count.
 #[test]
 fn refine_cache_is_read_through() {
+    // Asserts whole-DB `clone_refinements` counts (0 before the run, N after); opt out of the
+    // poison harness whose sibling seeds a refinement under its own repo_id.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let root = unique_temp_root();
     let db = write_four_renamed_clones(&root);
 
@@ -2086,6 +2092,9 @@ fn find_clones_warm_cache_metrics_sampled_consistent() {
 /// the persisted-row count is the observable proof that only the top-N were refined.)
 #[test]
 fn unrefined_class_outside_top_n_keeps_plan2_shape() {
+    // Asserts a whole-DB `clone_refinements` count; opt out of the poison harness whose sibling
+    // seeds a refinement under its own repo_id.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();

@@ -424,21 +424,24 @@ fn full_ladder_replay_on_a_two_repo_db_is_idempotent() {
     let _ = fs::remove_dir_all(fx.root_a);
 }
 
-/// #413 finding #5: `oracle_runs` has NO `repo_id` yet (V042 seam), so its GLOBAL prune must be
-/// SKIPPED on a consolidated multi-repo DB — else GC for repo A wipes repo B's run rows whenever
-/// B's context is absent from A's live sets.
+/// #413 finding #5 (now V042): `oracle_runs.repo_id` scopes the prune to the ACTIVE repo, so GC for
+/// repo A leaves repo B's run rows intact whenever B's context is absent from A's live sets — the
+/// per-repo predicate that superseded the old `multiple_real_repos` seam guard.
 #[test]
 fn gc_skips_the_global_oracle_prune_on_a_multi_repo_db() {
     let fx = two_repo_fixture();
-    // A dead-context oracle run: its commit/worktree are not in repo A's live sets.
+    // A dead-context oracle run belonging to the SIBLING repo B (its commit/worktree are not in
+    // repo A's live sets, and its `repo_id` is REPO_B). Repo A's gc runs a repo-scoped oracle prune
+    // (V042 `oracle_runs.repo_id` predicate, superseding the old `multiple_real_repos` guard), so
+    // it must spare repo B's run.
     fx.db
         .storage
         .connection()
         .execute(
             "INSERT INTO oracle_runs(tool, tool_version, commit_sha, worktree_id, started_at, \
-             status, stats_json)
-             VALUES ('rust-analyzer', 'v1', 'dead-commit', 'dead-wt', 0, 'Completed', '{}')",
-            [],
+             status, stats_json, repo_id)
+             VALUES ('rust-analyzer', 'v1', 'dead-commit', 'dead-wt', 0, 'Completed', '{}', ?1)",
+            [REPO_B],
         )
         .unwrap();
 
@@ -452,12 +455,13 @@ fn gc_skips_the_global_oracle_prune_on_a_multi_repo_db() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(surviving, 1, "the multi-repo guard spares sibling oracle runs");
+    assert_eq!(surviving, 1, "repo A's repo-scoped oracle prune spares repo B's run");
     let _ = fs::remove_dir_all(fx.root_a);
 }
 
-/// The complement: a single-repo DB has no sibling to protect, so the global oracle prune runs and
-/// drops the dead-context run — unchanged behavior.
+/// The complement: the ACTIVE repo's OWN dead-context run IS pruned. The dead run is stamped the
+/// active (adopted) repo id — exactly as `record_oracle_run` stamps it in production — so the V042
+/// repo-scoped prune (`oracle_runs.repo_id = active`) reaches it.
 #[test]
 fn gc_prunes_a_dead_oracle_run_on_a_single_repo_db() {
     let root = unique_temp_root();
@@ -471,13 +475,14 @@ fn gc_prunes_a_dead_oracle_run_on_a_single_repo_db() {
     run_git(&root, &["commit", "-q", "-m", "init"]);
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
+    let active = db.active_repo_id.clone();
     db.storage
         .connection()
         .execute(
             "INSERT INTO oracle_runs(tool, tool_version, commit_sha, worktree_id, started_at, \
-             status, stats_json)
-             VALUES ('rust-analyzer', 'v1', 'dead-commit', 'dead-wt', 0, 'Completed', '{}')",
-            [],
+             status, stats_json, repo_id)
+             VALUES ('rust-analyzer', 'v1', 'dead-commit', 'dead-wt', 0, 'Completed', '{}', ?1)",
+            [&active],
         )
         .unwrap();
 
@@ -848,6 +853,679 @@ fn papertrail_queries_never_surface_the_other_repo() {
     assert!(leaked_refs.is_empty(), "repo B github ref leaked: {leaked_refs:?}");
     let own_refs = crate::index::github::refs_for_path(conn, "src/a_only.rs", 10).unwrap();
     assert!(!own_refs.is_empty(), "repo A must still see its own github ref");
+
+    let _ = fs::remove_dir_all(fx.root_a);
+}
+
+// ================================================================================================
+// Phase A5 periphery scoping (clones / oracle / reconcile / memories).
+//
+// The A5 periphery-scoping migration is V042 (in the ladder), so a plain `schema::apply` scopes the
+// periphery — these tests reach the scoped schema through the ladder, then seed two repos and
+// switch the active repo through the scope-context row (the per-repo drive A7 will own). Every
+// periphery query gates its `repo_id` predicate on `schema::periphery_repo_scope`, so a raw
+// connection with no ladder applied runs unscoped (the pre-A5 behavior). The migration-shape
+// assertions (fresh-tip, deferred-absence / rebuild in isolation, forward path) live in
+// `repo_registry.rs`; these tests pin the cross-repo SCOPING BEHAVIOR of the query sweeps.
+// ================================================================================================
+
+use crate::query::memory::{
+    RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryCreateResult, create_memory, memory_search,
+};
+
+const A5_REPO_A: &str = "a5-repo-a";
+const A5_REPO_B: &str = "a5-repo-b";
+
+/// A raw connection at the periphery-scoped schema (`schema::apply` runs the ladder through V042),
+/// holding two real repos beside the `__unassigned__` placeholder V038 seeds.
+fn a5_scoped_two_repo_conn() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    schema::apply(&conn).unwrap();
+    for repo in [A5_REPO_A, A5_REPO_B] {
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
+            [repo],
+        )
+        .unwrap();
+    }
+    conn
+}
+
+/// Point the connection's periphery scope at `repo_id` — the value `schema::active_repo_id` reads
+/// (what A7 drives per repo). Mirrors `install_scope_view`'s `temp.connection_context` write.
+fn a5_set_active_repo(conn: &rusqlite::Connection, repo_id: &str) {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
+        [repo_id],
+    )
+    .unwrap();
+}
+
+/// Create a memory under the connection's active repo, bound to a commit (no `files` row needed).
+fn a5_create_memory(
+    conn: &rusqlite::Connection,
+    title: &str,
+    body: &str,
+    commit: &str,
+) -> RepoMemoryCreateResult {
+    create_memory(conn, RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: title.to_string(),
+        body: body.to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget { commit_hash: Some(commit.to_string()), ..Default::default() },
+    })
+    .unwrap()
+}
+
+fn a5_repo_memory_count(conn: &rusqlite::Connection, repo_id: &str) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM repo_memories WHERE repo_id = ?1", [repo_id], |r| r.get(0))
+        .unwrap()
+}
+
+/// An identically-titled memory created under each repo is a DISTINCT live memory, and
+/// `memory_search` from one repo's scope never surfaces the other's — the cross-repo memory-search
+/// leak guard (the FTS MATCH spans both repos, so the post-MATCH `repo_id` filter is what
+/// isolates).
+#[test]
+fn identical_titled_memories_live_in_both_repos_and_search_isolates() {
+    let conn = a5_scoped_two_repo_conn();
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let a =
+        a5_create_memory(&conn, "shared reentrancy invariant", "repo A body about widgets", "ca");
+    assert!(!a.duplicate);
+
+    a5_set_active_repo(&conn, A5_REPO_B);
+    let b =
+        a5_create_memory(&conn, "shared reentrancy invariant", "repo B body about widgets", "cb");
+    assert!(!b.duplicate, "the same title under a DIFFERENT repo is not a duplicate");
+
+    assert_eq!(a5_repo_memory_count(&conn, A5_REPO_A), 1, "repo A holds exactly its memory");
+    assert_eq!(a5_repo_memory_count(&conn, A5_REPO_B), 1, "repo B holds exactly its memory");
+    assert_ne!(a.memory.memory_id, b.memory.memory_id, "the two are distinct memories");
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let hits_a = memory_search(&conn, "reentrancy", 10).unwrap();
+    assert_eq!(hits_a.len(), 1, "repo A search returns exactly its own memory: {hits_a:?}");
+    assert_eq!(hits_a[0].memory_id, a.memory.memory_id);
+
+    a5_set_active_repo(&conn, A5_REPO_B);
+    let hits_b = memory_search(&conn, "reentrancy", 10).unwrap();
+    assert_eq!(hits_b.len(), 1, "repo B search returns exactly its own memory: {hits_b:?}");
+    assert_eq!(hits_b[0].memory_id, b.memory.memory_id);
+}
+
+/// Dedupe NEVER crosses repos: identical title+body+binding is a duplicate WITHIN a repo, but the
+/// same content under a sibling repo is a fresh memory.
+#[test]
+fn memory_dedupe_does_not_cross_repos() {
+    let conn = a5_scoped_two_repo_conn();
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let first = a5_create_memory(&conn, "dedupe title", "dedupe body", "sha-shared");
+    assert!(!first.duplicate);
+    let again = a5_create_memory(&conn, "dedupe title", "dedupe body", "sha-shared");
+    assert!(again.duplicate, "same content in the SAME repo dedupes");
+    assert_eq!(again.memory.memory_id, first.memory.memory_id);
+    assert_eq!(a5_repo_memory_count(&conn, A5_REPO_A), 1);
+
+    a5_set_active_repo(&conn, A5_REPO_B);
+    let cross = a5_create_memory(&conn, "dedupe title", "dedupe body", "sha-shared");
+    assert!(!cross.duplicate, "identical content in a DIFFERENT repo is never a duplicate");
+    assert_ne!(cross.memory.memory_id, first.memory.memory_id);
+    assert_eq!(a5_repo_memory_count(&conn, A5_REPO_B), 1);
+}
+
+fn a5_seed_oracle_run(conn: &rusqlite::Connection, repo_id: &str, commit: &str, worktree: &str) {
+    conn.execute(
+        "INSERT INTO oracle_runs(
+             repo_id, tool, tool_version, commit_sha, worktree_id, started_at, status, stats_json)
+         VALUES (?1, 'scip', 'v1', ?2, ?3, 0, 'ok', '{}')",
+        rusqlite::params![repo_id, commit, worktree],
+    )
+    .unwrap();
+}
+
+fn a5_oracle_run_count(conn: &rusqlite::Connection, repo_id: &str) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM oracle_runs WHERE repo_id = ?1", [repo_id], |r| r.get(0))
+        .unwrap()
+}
+
+/// `prune_oracle_runs_outside_scope` is per-repo: gc of repo A prunes only repo A's dead runs and
+/// leaves every one of repo B's — even though repo B's `(commit, worktree)` is equally "not live"
+/// from repo A's live set (the pre-A5 unscoped sweep would have deleted it too).
+#[test]
+fn oracle_run_prune_is_per_repo() {
+    let conn = a5_scoped_two_repo_conn();
+    a5_seed_oracle_run(&conn, A5_REPO_A, "a-dead", "a-wt");
+    a5_seed_oracle_run(&conn, A5_REPO_B, "b-commit", "b-wt");
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    // Repo A's live set names neither run's (commit, worktree), so repo A's run is dead. The prune
+    // is scoped to repo A, so repo B's run (equally not-live here) is untouched.
+    let live_commits = vec!["a-live".to_string()];
+    let live_worktrees = vec!["a-live-wt".to_string()];
+    let deleted = crate::index::oracle::prune_oracle_runs_outside_scope(
+        &conn,
+        &live_commits,
+        &live_worktrees,
+    )
+    .unwrap();
+    assert_eq!(deleted, 1, "only repo A's dead run is pruned");
+    assert_eq!(a5_oracle_run_count(&conn, A5_REPO_A), 0, "repo A's dead run is gone");
+    assert_eq!(a5_oracle_run_count(&conn, A5_REPO_B), 1, "repo B's run survives repo A's prune");
+}
+
+/// A clone-graph precompute on repo A completes a fresh generation and GCs its OWN superseded
+/// generations, but leaves a sibling repo's generation row intact — the per-repo generation sweep
+/// (`complete_generation`'s scoped DELETE). The pre-A5 unscoped `DELETE WHERE generation != live`
+/// would have wiped repo B's row.
+#[test]
+fn clone_precompute_leaves_sibling_repo_generation_untouched() {
+    let mut fx = two_repo_fixture();
+    {
+        let conn = fx.db.storage.connection();
+        // V042 already ran at OPEN time (before `install_scope_view`), so the periphery is scoped
+        // here; `two_repo_fixture` left the connection on repo A's scope.
+        // Clean slate: drop whatever generation the rebuild may have left and clear repo A's live
+        // pointer so the precompute below is not skipped as already-current.
+        conn.execute_batch("DELETE FROM clone_graph_generations;").unwrap();
+        conn.execute(
+            "DELETE FROM repo_meta WHERE repo_id = ?1 AND key = 'clone_graph_live_generation'",
+            [fx.repo_a_id.as_str()],
+        )
+        .unwrap();
+        // Seed a COMPLETE generation owned by repo B (a high number, so repo A's MAX+1 is
+        // distinct).
+        conn.execute(
+            "INSERT INTO clone_graph_generations(
+                 generation, status, theta_floor, normalizer_kind, normalizer_version,
+                 source_revision, cursor_symbol_id, edges_written, postings_written, started_at_ms,
+                 finished_at_ms, repo_id)
+             VALUES (5000, 'Complete', 0.7, 'baseline', ?1, 'revB', 0, 0, 1, 0, 0, ?2)",
+            rusqlite::params![crate::index::clones::NORM_VERSION, REPO_B],
+        )
+        .unwrap();
+    }
+
+    // Re-install the scope view (dropped for the migration) so the precompute reads repo A's scoped
+    // symbols, and drive a REAL precompute on repo A (the active scope). It allocates gen 5001
+    // (global MAX+1), completes it, and runs `complete_generation`'s scoped DELETE.
+    fx.db.set_context(&fx.shared_commit, "").unwrap();
+    fx.db.precompute_clone_graph(None).unwrap();
+
+    let conn = fx.db.storage.connection();
+    let repo_b_gen: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM clone_graph_generations WHERE repo_id = ?1 AND generation = 5000",
+            [REPO_B],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(repo_b_gen, 1, "repo A's precompute must NOT delete repo B's generation");
+    let repo_a_complete: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM clone_graph_generations WHERE repo_id = ?1 AND status = \
+             'Complete'",
+            [fx.repo_a_id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(repo_a_complete >= 1, "repo A published its own fresh Complete generation");
+
+    let _ = fs::remove_dir_all(fx.root_a);
+}
+
+/// A5 finding 2: `refresh_clone_token_df` reads `symbol_fingerprints` scoped to the active repo
+/// (joining `symbols` → `files.repo_id`, since the table is content-addressed with no `repo_id`),
+/// so a consolidated DB's SIBLING repo's fingerprints never pool their token frequencies into THIS
+/// repo's df — which would inflate document frequencies and reorder SourcererCC candidate
+/// selection.
+#[test]
+fn clone_token_df_recompute_excludes_a_sibling_repos_fingerprints() {
+    // A sentinel token far outside any real `FNV-1a(token)` the fixture produces.
+    const SENTINEL_TOKEN: i64 = 9_900_000_333;
+    let fx = two_repo_fixture();
+    {
+        let conn = fx.db.storage.connection();
+        // Hang a symbol + a baseline fingerprint (carrying the sentinel token) off repo B's live
+        // file. An UNSCOPED df recompute would pool the sentinel into repo A's df.
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM main.files WHERE repo_id = ?1 AND path = 'src/b_only.rs'",
+                [REPO_B],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+             end_byte, start_line, end_line, is_test)
+             VALUES (?1, 'rust', 'b_fn', NULL, 'function', 0, 0, 0, 0, 0)",
+            [file_id],
+        )
+        .unwrap();
+        let symbol_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO symbol_fingerprints(symbol_id, normalizer_kind, normalizer_version, \
+             oracle_run_id, struct_hash, token_len, token_bag, created_at_ms)
+             VALUES (?1, 'baseline', 1, NULL, 'bstruct', 1, ?2, 0)",
+            rusqlite::params![
+                symbol_id,
+                crate::index::clones::bag_blob::encode_token_bag(&[(SENTINEL_TOKEN, 1)])
+            ],
+        )
+        .unwrap();
+    }
+
+    // Recompute df scoped to repo A (as `two_repo_fixture` left the connection). The sibling's
+    // fingerprint must NOT pool in.
+    fx.db.refresh_clone_token_df().unwrap();
+    let conn = fx.db.storage.connection();
+    let leaked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM clone_token_df WHERE token_hash = ?1 AND repo_id = ?2",
+            rusqlite::params![SENTINEL_TOKEN, fx.repo_a_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        leaked, 0,
+        "a sibling repo's fingerprint token leaked into the active repo's clone_token_df",
+    );
+
+    let _ = fs::remove_dir_all(fx.root_a);
+}
+
+/// A5 finding: `memory_by_id` is the guard for `memory_get` / `update_memory` / `mark_obsolete` /
+/// `rebind_memory`. Scoped to the active repo, so a caller holding a SIBLING repo's memory id can
+/// neither READ nor MUTATE it — the by-id lookup returns `None` (surfaced as "not found") and the
+/// sibling memory is left untouched.
+#[test]
+fn memory_by_id_read_and_mutations_refuse_a_sibling_repos_memory() {
+    use crate::query::memory::{
+        RepoMemoryUpdate, mark_obsolete, memory_by_id, rebind_memory, update_memory,
+    };
+    let conn = a5_scoped_two_repo_conn();
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let a = a5_create_memory(&conn, "repo A only", "body a", "ca");
+
+    // Switch to repo B and try to reach repo A's memory by its id.
+    a5_set_active_repo(&conn, A5_REPO_B);
+    assert!(
+        memory_by_id(&conn, &a.memory.memory_id).unwrap().is_none(),
+        "memory_get must not read a sibling repo's memory by id",
+    );
+    assert!(
+        update_memory(&conn, RepoMemoryUpdate {
+            memory_id: a.memory.memory_id.clone(),
+            kind: None,
+            title: Some("hijacked".to_string()),
+            body: None,
+            confidence: None,
+            status: None,
+            tags: None,
+        })
+        .is_err(),
+        "update_memory must refuse a sibling repo's memory id",
+    );
+    assert!(
+        mark_obsolete(&conn, &a.memory.memory_id).is_err(),
+        "mark_obsolete must refuse a sibling repo's memory id",
+    );
+    assert!(
+        rebind_memory(&conn, &a.memory.memory_id, RepoMemoryBindTarget {
+            commit_hash: Some("cx".to_string()),
+            ..Default::default()
+        })
+        .is_err(),
+        "rebind_memory must refuse a sibling repo's memory id",
+    );
+
+    // Repo A's memory is untouched: back under repo A it is still active with its original title.
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let still = memory_by_id(&conn, &a.memory.memory_id).unwrap().expect("repo A still owns it");
+    assert_eq!(still.status, "active");
+    assert_eq!(still.title, "repo A only", "a sibling-scoped update must not have landed");
+}
+
+/// A5 finding: `rebind_memory` deletes + re-inserts bindings; the re-inserted rows must inherit the
+/// PARENT memory's `repo_id` (not strand at the `__unassigned__` placeholder), or they drop out of
+/// the binding-scoped sweeps while the parent memory stays in its repo.
+#[test]
+fn rebind_keeps_bindings_on_the_parent_memorys_repo() {
+    use crate::query::memory::rebind_memory;
+    let conn = a5_scoped_two_repo_conn();
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let a = a5_create_memory(&conn, "rebind me", "body", "c-old");
+
+    rebind_memory(&conn, &a.memory.memory_id, RepoMemoryBindTarget {
+        commit_hash: Some("c-new".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let stranded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM repo_memory_bindings WHERE memory_id = ?1 AND repo_id != ?2",
+            rusqlite::params![a.memory.memory_id, A5_REPO_A],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stranded, 0, "every rebound binding must carry the parent memory's repo_id");
+    let owned: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM repo_memory_bindings WHERE memory_id = ?1 AND repo_id = ?2",
+            rusqlite::params![a.memory.memory_id, A5_REPO_A],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(owned >= 1, "the rebound commit binding is stamped under repo A");
+}
+
+/// A5 finding: `resolve_moniker` scans `logical_symbol_monikers` and joins `logical_symbols`. BOTH
+/// sides are scoped, so a SIBLING repo carrying the SAME SCIP moniker string cannot capture this
+/// repo's re-resolution — turning a unique match ambiguous, or relocating onto the sibling symbol.
+#[test]
+fn resolve_moniker_ignores_a_sibling_repos_moniker_row() {
+    use crate::query::memory::{MonikerResolution, resolve_moniker};
+    let conn = a5_scoped_two_repo_conn();
+
+    // The same moniker string "M" under the same tool in BOTH repos, each with a live logical
+    // symbol (`logical_symbol_id` is content-derived + repo-folded, so the two ids differ).
+    for (lsid, repo) in [(111_i64, A5_REPO_A), (222_i64, A5_REPO_B)] {
+        conn.execute(
+            "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id, \
+             kind, variant_count, group_reason, repo_id)
+             VALUES (?1, 'rust', 'src/x.rs', 'x', NULL, 'function', 1, 'g', ?2)",
+            rusqlite::params![lsid, repo],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO logical_symbol_monikers(logical_symbol_id, tool, tool_version, moniker, \
+             computed_at, repo_id)
+             VALUES (?1, 'scip-rust', 'v1', 'M', 0, ?2)",
+            rusqlite::params![lsid, repo],
+        )
+        .unwrap();
+    }
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    match resolve_moniker(&conn, "M", "scip-rust").unwrap() {
+        MonikerResolution::Unique { logical_symbol_id, .. } => assert_eq!(
+            logical_symbol_id, 111,
+            "moniker resolution must bind repo A's symbol, not the sibling's",
+        ),
+        other => panic!(
+            "expected a unique repo-A resolution, got {other:?} (a sibling leak reads as \
+             ambiguous)"
+        ),
+    }
+}
+
+/// A5 finding: `dream_run`'s lifecycle (lookup / supersede / resolve / list) is scoped, so a run in
+/// one repo never resolves or emits a SIBLING repo's worklist rows on a consolidated DB.
+#[test]
+fn dream_run_leaves_a_sibling_repos_findings_untouched() {
+    use crate::dream::{DreamOptions, dream_run};
+    let conn = a5_scoped_two_repo_conn();
+
+    // An OPEN finding owned by each repo.
+    for (id, subject, repo) in
+        [("a-open", "a::subject", A5_REPO_A), ("b-open", "b::subject", A5_REPO_B)]
+    {
+        conn.execute(
+            "INSERT INTO dream_findings(id, kind, subject, claim_hash, evidence, base_rank, \
+             status, first_seen_at_ms, last_seen_at_ms, repo_id)
+             VALUES (?1, 'coverage_gap', ?2, 'ch', 'ev', 1.0, 'open', 0, 0, ?3)",
+            rusqlite::params![id, subject, repo],
+        )
+        .unwrap();
+    }
+
+    // Run dream on repo A. Its (empty) index reports nothing this run, so the resolve pass resolves
+    // repo A's own unreported finding — but repo B's finding must be left OPEN and unemitted.
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let report = dream_run(&conn, DreamOptions { limit: 50, now_ms: 1_000 }).unwrap();
+
+    let a_status: String = conn
+        .query_row("SELECT status FROM dream_findings WHERE id = 'a-open'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(a_status, "resolved", "repo A's own unreported finding is resolved");
+    let b_status: String = conn
+        .query_row("SELECT status FROM dream_findings WHERE id = 'b-open'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(b_status, "open", "repo A's dream run must NOT resolve repo B's finding");
+    assert!(
+        !report.findings.iter().any(|f| f.subject == "b::subject"),
+        "the emitted worklist must not include a sibling repo's finding",
+    );
+}
+
+/// A5 finding: the dream CANDIDATE BUILDERS are repo-scoped, not just the lifecycle. A sibling
+/// repo's path-bound memory at a path this repo also has must NOT suppress this repo's
+/// coverage-gap finding (a false negative via the unscoped `repo_memory_bindings` exclusion
+/// subquery), and a sibling repo's memory referencing a gone path must NOT surface as this repo's
+/// stale_reference finding.
+#[test]
+fn dream_candidate_builders_ignore_a_sibling_repos_memories() {
+    use crate::dream::{DreamOptions, dream_run};
+    let conn = a5_scoped_two_repo_conn();
+
+    // Repo A: a load-bearing symbol (one caller edge) in `src/shared.rs`, with NO memory of its
+    // own — the coverage-gap candidate.
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id, repo_id)
+         VALUES ('src/shared.rs', 'rust', 'source', 'asha', 0, 0, '', '', ?1)",
+        [A5_REPO_A],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    let mut symbol_ids = Vec::new();
+    for name in ["shared_fn", "caller_fn"] {
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+             end_byte, start_line, end_line, is_test)
+             VALUES (?1, 'rust', ?2, NULL, 'function', 0, 0, 0, 0, 0)",
+            rusqlite::params![file_id, name],
+        )
+        .unwrap();
+        symbol_ids.push(conn.last_insert_rowid());
+    }
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO name_strings(value)
+             VALUES ('caller_fn'), ('shared_fn'), ('calls_name'), ('Exact');",
+    )
+    .unwrap();
+    let name_id = |value: &str| -> i64 {
+        conn.query_row("SELECT id FROM name_strings WHERE value = ?1", [value], |r| r.get(0))
+            .unwrap()
+    };
+    conn.execute(
+        "INSERT INTO edges_data(source_file_id, from_symbol_id, to_symbol_id, from_name_id, \
+         to_name_id, edge_kind_id, confidence_id, resolution_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        rusqlite::params![
+            file_id,
+            symbol_ids[1],
+            symbol_ids[0],
+            name_id("caller_fn"),
+            name_id("shared_fn"),
+            name_id("calls_name"),
+            name_id("Exact"),
+        ],
+    )
+    .unwrap();
+
+    // Repo B: a memory whose PATH BINDING collides with repo A's file (the suppression vector) and
+    // whose body references a path that resolves nowhere (the stale_reference vector).
+    conn.execute(
+        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms, \
+         updated_at_ms, source, memory_version, repo_id)
+         VALUES ('bmem', 'Invariant', 'b title', 'refs crates/ghost/src/vanished.rs', 'high', \
+         'active', 0, 0, 'agent', 'v1', ?1)",
+        [A5_REPO_B],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+         anchor_status, created_at_ms, repo_id)
+         VALUES ('bmem', 'path', 'b-bind', 'src/shared.rs', 'current', 0, ?1)",
+        [A5_REPO_B],
+    )
+    .unwrap();
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let report = dream_run(&conn, DreamOptions { limit: 10, now_ms: 1_000 }).unwrap();
+
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == "coverage_gap" && f.subject == "src/shared.rs::shared_fn"),
+        "a sibling repo's same-path memory binding must NOT suppress the active repo's \
+         coverage-gap finding: {:?}",
+        report.findings,
+    );
+    assert!(
+        !report.findings.iter().any(|f| f.kind == "stale_reference" && f.subject == "bmem"),
+        "a sibling repo's memory must NOT surface as the active repo's stale_reference: {:?}",
+        report.findings,
+    );
+}
+
+/// A5 finding: `memory_id` folds the owning repo into its hash suffix, so two repos creating
+/// IDENTICAL content in the SAME millisecond derive distinct ids (the repo-scoped dedupe correctly
+/// passes both — a repo-blind id would explode on the global PK). Pre-A5 (`None` scope) keeps the
+/// original derivation. Memory ids stay globally unique and coordination-free either way — folding
+/// the repo INTO the hash strengthens that (phase B replication relies on it).
+#[test]
+fn memory_ids_fold_the_repo_so_same_millisecond_identical_content_cannot_collide() {
+    use crate::query::memory::memory_id;
+    let input_hash = "0123456789abcdef0123456789abcdef";
+    let a = memory_id(1_000, input_hash, &Some(A5_REPO_A.to_string()));
+    let b = memory_id(1_000, input_hash, &Some(A5_REPO_B.to_string()));
+    assert_ne!(a, b, "same content + same millisecond under two repos derive DISTINCT ids");
+    assert!(a.starts_with("mem_3e8_") && b.starts_with("mem_3e8_"), "id shape unchanged: {a} {b}");
+    assert_eq!(
+        memory_id(1_000, input_hash, &None),
+        format!("mem_3e8_{}", &input_hash[..12]),
+        "the pre-A5 (unscoped) derivation is byte-identical to the original",
+    );
+}
+
+/// A5 finding: `reconcile_attempts` is a global append-only log; the `last_reconcile` status read
+/// must scope by `repo_id`, or a sibling repo's NEWER attempt is reported as this repo's status.
+#[test]
+fn reconcile_status_ignores_a_sibling_repos_attempt() {
+    let fx = two_repo_fixture();
+    {
+        let conn = fx.db.storage.connection();
+        // Repo A's attempt (older) + repo B's attempt (NEWER — wins an unscoped ORDER BY).
+        conn.execute(
+            "INSERT INTO reconcile_attempts(started_at_ms, status, batch_size, repo_id)
+             VALUES (100, 'Ok', 8, ?1)",
+            [fx.repo_a_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reconcile_attempts(started_at_ms, status, batch_size, repo_id)
+             VALUES (999, 'Blocked', 8, ?1)",
+            [REPO_B],
+        )
+        .unwrap();
+    }
+    let status =
+        fx.db.llm_status().unwrap().last_reconcile.expect("repo A has a reconcile attempt");
+    assert_eq!(status.status, "Ok", "the status must be repo A's, not repo B's newer attempt");
+    assert_eq!(status.started_at_ms, 100);
+    let _ = fs::remove_dir_all(fx.root_a);
+}
+
+/// A5 finding: the raw memory-summary readers (`repo_brief::memory_counts` /
+/// `memory_counts_by_path`, `orientation`'s `active_non_dir_memory_*`, `tree::dir_memory_titles`)
+/// bypass the scoped memory API. Scoped now, so a sibling repo's memory — even one whose path or
+/// dir collides with ours — never inflates this repo's brief or shows in its orientation / tree.
+#[test]
+fn memory_summary_readers_exclude_a_sibling_repos_memory() {
+    let fx = two_repo_fixture();
+    {
+        let conn = fx.db.storage.connection();
+        // Repo B's ACTIVE memory: a path binding at repo A's REAL file path (collision), plus a
+        // ROOT `dir` binding (so `tree`'s `root_memory_title` would leak it if unscoped).
+        conn.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms, \
+             updated_at_ms, source, memory_version, repo_id)
+             VALUES ('bmem', 'Invariant', 'REPO B SECRET', 'b body', 'high', 'active', 0, 0, \
+             'agent', 'v1', ?1)",
+            [REPO_B],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id)
+             VALUES ('bmem', 'path', 'b-path', 'src/a_only.rs', 'current', 0, ?1)",
+            [REPO_B],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id)
+             VALUES ('bmem', 'dir', '', NULL, 'current', 0, ?1)",
+            [REPO_B],
+        )
+        .unwrap();
+    }
+    let conn = fx.db.storage.connection();
+
+    // (a) repo_brief: the summary + per-path memory counts exclude the sibling.
+    let brief = fx
+        .db
+        .repo_brief(crate::query::repo_brief::RepoBriefOptions {
+            mode: crate::query::repo_brief::RepoBriefMode::Spine,
+            limit: 50,
+            include_generated: true,
+            include_memories: true,
+        })
+        .unwrap();
+    assert_eq!(
+        brief.summary.repo_memories.active, 0,
+        "repo_brief summary counted a sibling repo's memory",
+    );
+    if let Some(candidate) = brief.candidates.iter().find(|c| c.path == "src/a_only.rs") {
+        assert_eq!(
+            candidate.metrics.memories.active, 0,
+            "per-path memory count leaked the sibling at the shared path src/a_only.rs",
+        );
+    }
+
+    // (b) tree: the root dir-memory title is not the sibling's.
+    let tree =
+        crate::query::tree::dir_tree(conn, &crate::query::tree::TreeOpts::default()).unwrap();
+    assert_ne!(
+        tree.root_memory_title.as_deref(),
+        Some("REPO B SECRET"),
+        "dir_memory_titles leaked a sibling repo's root dir memory",
+    );
+
+    // (c) orientation: the active non-dir memory titles do not include the sibling. (Runs last —
+    // it re-installs the scope view on the connection.)
+    let orient =
+        crate::query::orientation::orientation(conn, &fx.root_a, &fx.root_a, None).unwrap();
+    assert!(
+        !orient.active_memory_titles.iter().any(|t| t == "REPO B SECRET"),
+        "orientation leaked a sibling repo's active memory title",
+    );
 
     let _ = fs::remove_dir_all(fx.root_a);
 }

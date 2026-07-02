@@ -1176,6 +1176,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_039_ID => Some(39),
             MIGRATION_040_ID => Some(40),
             MIGRATION_041_ID => Some(41),
+            MIGRATION_042_ID => Some(42),
             _ => None,
         })
         .max()
@@ -1226,6 +1227,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_039_ID
             | MIGRATION_040_ID
             | MIGRATION_041_ID
+            | MIGRATION_042_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1273,6 +1275,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_039_ID => migration.checksum != MIGRATION_039_CHECKSUM,
         MIGRATION_040_ID => migration.checksum != MIGRATION_040_CHECKSUM,
         MIGRATION_041_ID => migration.checksum != MIGRATION_041_CHECKSUM,
+        MIGRATION_042_ID => migration.checksum != MIGRATION_042_CHECKSUM,
         _ => false,
     }
 }
@@ -2266,6 +2269,403 @@ fn backfill_github_repo_id_to_sole_repo(conn: &Connection) -> rusqlite::Result<(
         super::LEGACY_REPO_ID,
     ])?;
     Ok(())
+}
+
+// ============================================================================================
+// Memory-sync phase A5 (periphery scoping) — V042.
+//
+// Registered in `ADDITIVE_MIGRATIONS` as V042 (id `042_repo_id_periphery_scoping`): the whole
+// schema change is `apply_repo_id_periphery_scoping` below, shaped like every other ladder step
+// (idempotent, atomic, torn-state re-convergent, placeholder-backfilled). It stacks on V041 (the
+// GitHub papertrail scoping); the two were authored in parallel workstreams and consolidated here.
+//
+// GATING (why the queries still probe): every periphery query sweep gates its `repo_id` predicate
+// on [`super::periphery_repo_scope`] — column present ⇒ scope by the active repo, column absent ⇒
+// the original unscoped SQL. On a normal open `schema::apply` runs the full ladder including V042,
+// so the column is always present and the scoped path always taken. The absent branch is the
+// defensive path for a raw connection that never ran the ladder (and the pre-migration schema in
+// forward-migration bootstrap tests): it degrades to the pre-A5 repo-global behavior instead of
+// referencing a column that does not exist. Keeping the probe is what lets raw-connection callers
+// and partial-schema fixtures share these code paths without a separate unscoped variant.
+// ============================================================================================
+
+/// The periphery tables A5 scopes DIRECTLY by `repo_id` via an ADDITIVE `repo_id` column (no PK /
+/// UNIQUE change — [`add_column_if_missing`] suffices, idempotent + AUTOCOMMIT-safe). Adoption
+/// re-points their placeholder rows (see `registry::A5_PERIPHERY_DIRECT_SCOPED_TABLES`).
+const A5_ADDITIVE_SCOPED_TABLES: &[&str] = &[
+    // Per-repo generation counter (the generation integer stays globally unique — see the apply
+    // fn — so the transitive `clone_edges`/`clone_subblock_postings` need no `repo_id`).
+    "clone_graph_generations",
+    // Oracle run log; the read "key" (repo_id, tool, tool_version, commit_sha, worktree_id) is a
+    // query predicate, not a UNIQUE, so a plain column is enough.
+    "oracle_runs",
+    // Reconcile run log (no UNIQUE); the "latest attempt" read scopes by repo_id.
+    "reconcile_attempts",
+    // Memories + per-binding repo_id (spec §4.5 cross-repo bindings default to the parent memory's
+    // repo; the PK id TEXT / (memory_id, binding_kind, binding_id) are unchanged).
+    "repo_memories",
+    "repo_memory_bindings",
+];
+
+/// V042 (memory-sync phase A5, see the block comment above): add `repo_id`
+/// scoping to the clone / oracle / reconcile / memory PERIPHERY tables — every direct-scoped table
+/// left after A3's core sweep (per the plan's disposition table). Two shapes:
+///
+///  * ADDITIVE column ([`A5_ADDITIVE_SCOPED_TABLES`]): `clone_graph_generations`, `oracle_runs`,
+///    `reconcile_attempts`, `repo_memories`, `repo_memory_bindings` — no key change, so
+///    `add_column_if_missing` (self-guarding) is all that is needed.
+///  * KEY REBUILD (`repo_id` joins the PK / UNIQUE, so SQLite forces a table rebuild):
+///    `clone_token_df` (PK `(repo_id, normalizer_kind, token_hash)` — df must not pool across
+///    repos), `clone_refinements` (PK `(repo_id, class_key)` — content class-keys collide across
+///    repos), `edge_oracle` (content-key PK gains a leading `repo_id`), `logical_symbol_monikers`
+///    (PK `(repo_id, logical_symbol_id, tool)`), `dream_findings` (UNIQUE `(repo_id, kind, subject,
+///    claim_hash)`).
+///  * STANDALONE FTS rebuild: `repo_memory_fts` gains `repo_id UNINDEXED` and a mandatory filter —
+///    rebuilt from `repo_memories` (the same content `upsert_memory_fts` writes), so `repo_id`
+///    comes from each memory's freshly-added column.
+///
+/// `clone_edges` / `clone_subblock_postings` are NOT scoped directly (disposition: transitive via
+/// the generations FK). The generation integer stays GLOBALLY unique (allocated `MAX(generation) +
+/// 1` over ALL repos), so a `build_generation` value belongs to exactly one repo and those children
+/// are scoped for free; only the generation SWEEPS (`complete_generation`, the Building cleanup,
+/// the postings invalidation) must add a `repo_id` predicate so a repo's precompute never deletes a
+/// sibling's generations. `symbol_fingerprints` / `symbol_token_postings` stay `symbol_id`-keyed
+/// (transitive via `symbols -> files.repo_id`) — the "NEVER add scope columns here" rule in
+/// [`CLONE_FINGERPRINT_DDL`] is about the COMMIT/WORKTREE scope axis; `repo_id` is a different
+/// (cross-repo) axis and only `clone_token_df` / `clone_refinements` there take it.
+///
+/// MECHANICS (identical to V040): the key rebuilds RENAME/DROP tables, which needs FK enforcement
+/// OFF; a PRAGMA toggle is a no-op inside a transaction, so it is set BEFORE `BEGIN IMMEDIATE`. The
+/// whole migration runs under ONE atomic transaction (the ladder runs apply fns in AUTOCOMMIT, so a
+/// multi-statement rebuild must self-wrap), and `repo_memories.repo_id` existing is the
+/// all-or-nothing sentinel: because every statement commits together, that column is present iff
+/// the whole migration committed, so a re-apply (fresh DB already transformed, or an `index --full`
+/// re-run once this is registered) short-circuits before taking the write lock. Each rebuild starts
+/// `DROP TABLE IF EXISTS <scratch>_new` so a prior pass killed mid-rebuild (bypassing a clean
+/// rollback) re-converges from a clean slate rather than failing on `CREATE`.
+pub(crate) fn apply_repo_id_periphery_scoping(conn: &Connection) -> rusqlite::Result<()> {
+    // All-or-nothing sentinel (see the doc comment): everything below commits atomically, so
+    // `repo_memories.repo_id` present means the whole migration already ran.
+    if column_exists(conn, "repo_memories", "repo_id")? {
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> rusqlite::Result<()> {
+        // --- Additive columns (no key change): idempotent, placeholder-backfilled. ---
+        for table in A5_ADDITIVE_SCOPED_TABLES {
+            add_column_if_missing(conn, table, "repo_id", REPO_ID_COLUMN_DEF)?;
+        }
+
+        // --- Key rebuilds (repo_id joins the PK / UNIQUE). ---
+        rebuild_clone_token_df_with_repo_id(conn)?;
+        rebuild_clone_refinements_with_repo_id(conn)?;
+        rebuild_edge_oracle_with_repo_id(conn)?;
+        rebuild_logical_symbol_monikers_with_repo_id(conn)?;
+        rebuild_dream_findings_with_repo_id(conn)?;
+
+        // --- Standalone FTS rebuild (repo_id UNINDEXED), rebuilt from `repo_memories`. ---
+        rebuild_repo_memory_fts_with_repo_id(conn)?;
+        // P1 (the V039/V040 class): the additive columns' static `DEFAULT '__unassigned__'`, the
+        // rebuilds' literal `'__unassigned__'` copy, and the FTS repopulated from those rows all
+        // stamp the placeholder — and on an ALREADY-ADOPTED DB `register_repo`'s fast path never
+        // re-points, so the scoped periphery reads (clones / oracle / memories) would miss this
+        // repo's rows. Resolve the sole `repos` row and re-point them onto it (no-op on an
+        // un-adopted DB, where the rows correctly wait for `register_repo`). Atomic with the
+        // sentinel-setting steps because it runs inside this same txn.
+        backfill_periphery_repo_id_to_sole_repo(conn)?;
+        // Finding ids now FOLD `repo_id` (`dream::repo_folded_finding_id` — the stable_id
+        // precedent), so re-derive every persisted id under its post-backfill `repo_id`. Runs
+        // AFTER the backfill so an adopted DB's ids fold the real repo, not the placeholder.
+        // `superseded_by` (the only persisted reference to a finding id, in-table) is remapped by
+        // the helper. Replay-safe: the sentinel short-circuits a re-apply, and the re-derivation
+        // is idempotent anyway.
+        crate::dream::rederive_finding_ids(conn)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+        return result;
+    }
+    conn.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?;
+    Ok(())
+}
+
+/// P1 backfill (the V040 [`backfill_repo_id_to_sole_repo`] pattern, periphery edition): re-point
+/// every V042 periphery row — the additive-column tables, the PK-rebuilt tables, AND the
+/// `repo_memory_fts` mirror — from the placeholder onto the sole `repos` id when the DB is ALREADY
+/// ADOPTED, so the scoped clone / oracle / memory reads see this repo's rows immediately after the
+/// upgrade. No-op on an un-adopted DB (`sole_repo_id` == the placeholder — the rows correctly wait
+/// for `register_repo`). Runs inside the V042 txn (FK OFF), so it is atomic with the sentinel. The
+/// sentinel short-circuit keeps a replay off this path entirely; the explicit `repos`-cardinality
+/// gate below additionally makes the FIRST apply safe on a CONSOLIDATED DB (leave-at-placeholder
+/// instead of `sole_repo_id`'s one-row hard error aborting the upgrade). The table set mirrors
+/// `A5_PERIPHERY_DIRECT_SCOPED_TABLES` (registry.rs), the same rows adoption re-points.
+fn backfill_periphery_repo_id_to_sole_repo(conn: &Connection) -> rusqlite::Result<()> {
+    // Cardinality gate (the V041 github-backfill twin): on `!= 1` repos rows there is no single
+    // owner to re-point onto, so the periphery rows stay under the placeholder rather than
+    // aborting the forward-migration. One nuance vs the github edition: placeholder-stranded
+    // `repo_memories` would be USER-AUTHORED data invisible to scoped reads, not a refetchable
+    // cache. That state is only reachable by hand-driving `register_repo` pre-consolidation
+    // (phase A refuses a second real repo; the real multi-repo entry path arrives with the
+    // consolidate importer, which attributes memories at import) — and `memory doctor` surfaces
+    // any placeholder-scoped memories (one `placeholder_repo` entry each, `doctor_report`) so
+    // they are visible, not silently lost. The clone / oracle / reconcile tables are derived
+    // caches the next rebuild / oracle run / reconcile re-populates under the proper stamp.
+    //
+    // No github-style RECLAIM is needed here (audited per table): unlike the V041 github tables,
+    // whose natural keys exclude `repo_id` and whose stranded rows therefore OCCUPY the key the
+    // next sync writes to (see the upsert-reclaim invariant in `github/store.rs`), every V042
+    // periphery key either LEADS with `repo_id` (clone_token_df, clone_refinements, edge_oracle,
+    // logical_symbol_monikers, dream_findings' UNIQUE), is an append-only autoincrement log
+    // (oracle_runs, reconcile_attempts), a fresh generated id (repo_memories + its bindings/fts,
+    // keyed by the repo-unique memory id), or a globally-unique counter (clone_graph_generations,
+    // allocated MAX(generation)+1 across ALL repos). New writes under the real repo can never
+    // conflict with a placeholder row — stranded rows merely LINGER invisibly until a later gc
+    // sweep reclaims the space (acceptable; nothing blocks repopulation).
+    let repos_rows: i64 = conn.query_row("SELECT COUNT(*) FROM repos", [], |row| row.get(0))?;
+    if repos_rows != 1 {
+        return Ok(());
+    }
+    let target = sole_repo_id(conn)?;
+    if target == super::LEGACY_REPO_ID {
+        return Ok(());
+    }
+    for table in [
+        "clone_graph_generations",
+        "clone_token_df",
+        "clone_refinements",
+        "oracle_runs",
+        "edge_oracle",
+        "logical_symbol_monikers",
+        "reconcile_attempts",
+        "dream_findings",
+        "repo_memories",
+        "repo_memory_bindings",
+        "repo_memory_fts",
+    ] {
+        conn.execute(&format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"), [
+            target.as_str(),
+            super::LEGACY_REPO_ID,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Rebuild `clone_token_df` with a leading `repo_id` in the PK so document-frequency stats never
+/// pool across repos (a shared df corrupts the SourcererCC selectivity ordering for both repos).
+/// No FK children; STRICT preserved.
+fn rebuild_clone_token_df_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS clone_token_df_new;
+        CREATE TABLE clone_token_df_new(
+            repo_id         TEXT    NOT NULL DEFAULT '__unassigned__',
+            normalizer_kind TEXT    NOT NULL,
+            token_hash      INTEGER NOT NULL,
+            df              INTEGER NOT NULL,
+            PRIMARY KEY (repo_id, normalizer_kind, token_hash)
+        ) STRICT;
+        INSERT OR IGNORE INTO clone_token_df_new(repo_id, normalizer_kind, token_hash, df)
+        SELECT '__unassigned__', normalizer_kind, token_hash, df FROM clone_token_df;
+        DROP TABLE clone_token_df;
+        ALTER TABLE clone_token_df_new RENAME TO clone_token_df;
+        ",
+    )
+}
+
+/// Rebuild `clone_refinements` with a leading `repo_id` in the PK — `class_key` is content-derived
+/// (normalized code shape), so two repos with the same clone shape would otherwise clobber each
+/// other's cached refinement. STRICT preserved; the full V030 column set (incl. `lcs_sampled`) is
+/// reproduced.
+fn rebuild_clone_refinements_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS clone_refinements_new;
+        CREATE TABLE clone_refinements_new(
+            repo_id                 TEXT    NOT NULL DEFAULT '__unassigned__',
+            class_key               TEXT    NOT NULL,
+            language                TEXT    NOT NULL,
+            refine_mode             TEXT    NOT NULL,
+            template                TEXT    NOT NULL,
+            variation_points_json   TEXT    NOT NULL CHECK (json_valid(variation_points_json)),
+            proposed_signature_json TEXT    NOT NULL CHECK (json_valid(proposed_signature_json)),
+            confidence              TEXT    NOT NULL,
+            anti_unify_coverage     REAL    NOT NULL,
+            lcs_ratio               REAL    NOT NULL,
+            refactorability         REAL    NOT NULL,
+            norm_version            INTEGER NOT NULL,
+            alignment_version       INTEGER NOT NULL,
+            created_at_ms           INTEGER NOT NULL,
+            lcs_sampled             INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (repo_id, class_key)
+        ) STRICT;
+        INSERT OR IGNORE INTO clone_refinements_new(
+            repo_id, class_key, language, refine_mode, template, variation_points_json,
+            proposed_signature_json, confidence, anti_unify_coverage, lcs_ratio, refactorability,
+            norm_version, alignment_version, created_at_ms, lcs_sampled
+        )
+        SELECT
+            '__unassigned__', class_key, language, refine_mode, template, variation_points_json,
+            proposed_signature_json, confidence, anti_unify_coverage, lcs_ratio, refactorability,
+            norm_version, alignment_version, created_at_ms, lcs_sampled
+        FROM clone_refinements;
+        DROP TABLE clone_refinements;
+        ALTER TABLE clone_refinements_new RENAME TO clone_refinements;
+        ",
+    )
+}
+
+/// Rebuild `edge_oracle` with a leading `repo_id` in the content-key PK. It stays content-anchored
+/// with NO FK to `edges_data` (the #248 rule — the read join to live edges filters dangling rows),
+/// so prepending `repo_id` is a pure PK-widening rebuild; the three indexes are recreated. STRICT
+/// preserved. A cross-repo content-key collision (same source span in two repos) would otherwise
+/// surface one repo's verdict for the other; the scoped reads (store.rs) filter `repo_id`.
+fn rebuild_edge_oracle_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS edge_oracle_new;
+        CREATE TABLE edge_oracle_new(
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            source_path TEXT NOT NULL,
+            source_start_byte INTEGER NOT NULL,
+            source_end_byte INTEGER NOT NULL,
+            callee_start_byte INTEGER NOT NULL,
+            callee_end_byte INTEGER NOT NULL,
+            edge_kind TEXT NOT NULL,
+            file_sha TEXT NOT NULL,
+            tool TEXT NOT NULL,
+            tool_version TEXT NOT NULL,
+            resolved_symbol_id INTEGER,
+            scip_symbol TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            computed_at INTEGER NOT NULL,
+            PRIMARY KEY(
+                repo_id, tool, tool_version, source_path,
+                source_start_byte, source_end_byte,
+                callee_start_byte, callee_end_byte, edge_kind
+            )
+        ) STRICT;
+        INSERT OR IGNORE INTO edge_oracle_new(
+            repo_id, source_path, source_start_byte, source_end_byte, callee_start_byte,
+            callee_end_byte, edge_kind, file_sha, tool, tool_version, resolved_symbol_id,
+            scip_symbol, kind, computed_at
+        )
+        SELECT
+            '__unassigned__', source_path, source_start_byte, source_end_byte, callee_start_byte,
+            callee_end_byte, edge_kind, file_sha, tool, tool_version, resolved_symbol_id,
+            scip_symbol, kind, computed_at
+        FROM edge_oracle;
+        DROP TABLE edge_oracle;
+        ALTER TABLE edge_oracle_new RENAME TO edge_oracle;
+        CREATE INDEX IF NOT EXISTS idx_edge_oracle_staleness
+            ON edge_oracle(file_sha, tool, tool_version);
+        CREATE INDEX IF NOT EXISTS idx_edge_oracle_symbol
+            ON edge_oracle(resolved_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_edge_oracle_anchor
+            ON edge_oracle(source_path, callee_start_byte, callee_end_byte, edge_kind);
+        ",
+    )
+}
+
+/// Rebuild `logical_symbol_monikers` with a leading `repo_id` in the PK. The id is content-derived
+/// (`LogicalSymbolKey::stable_id`) so it collides across repos; NO FK to `logical_symbols` (the #70
+/// rule — reads join live logical symbols). The moniker index is recreated. STRICT preserved.
+fn rebuild_logical_symbol_monikers_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS logical_symbol_monikers_new;
+        CREATE TABLE logical_symbol_monikers_new(
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            logical_symbol_id INTEGER NOT NULL,
+            tool TEXT NOT NULL,
+            tool_version TEXT NOT NULL,
+            moniker TEXT NOT NULL,
+            computed_at INTEGER NOT NULL,
+            PRIMARY KEY(repo_id, logical_symbol_id, tool)
+        ) STRICT;
+        INSERT OR IGNORE INTO logical_symbol_monikers_new(
+            repo_id, logical_symbol_id, tool, tool_version, moniker, computed_at
+        )
+        SELECT '__unassigned__', logical_symbol_id, tool, tool_version, moniker, computed_at
+        FROM logical_symbol_monikers;
+        DROP TABLE logical_symbol_monikers;
+        ALTER TABLE logical_symbol_monikers_new RENAME TO logical_symbol_monikers;
+        CREATE INDEX IF NOT EXISTS idx_logical_symbol_monikers_moniker
+            ON logical_symbol_monikers(moniker, tool);
+        ",
+    )
+}
+
+/// Rebuild `dream_findings` with `repo_id` in the UNIQUE `(repo_id, kind, subject, claim_hash)` —
+/// the dream worklist's identity key is content-derived (subject + claim hash of a memory-anchored
+/// finding), so it must not merge two repos' findings. The `id TEXT PRIMARY KEY` is unchanged; both
+/// indexes are recreated. STRICT preserved.
+fn rebuild_dream_findings_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS dream_findings_new;
+        CREATE TABLE dream_findings_new(
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            claim_hash TEXT NOT NULL,
+            evidence TEXT NOT NULL,
+            base_rank REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            superseded_by TEXT,
+            first_seen_at_ms INTEGER NOT NULL,
+            last_seen_at_ms INTEGER NOT NULL,
+            reviewed_at_ms INTEGER,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            UNIQUE(repo_id, kind, subject, claim_hash)
+        ) STRICT;
+        INSERT OR IGNORE INTO dream_findings_new(
+            id, kind, subject, claim_hash, evidence, base_rank, status, superseded_by,
+            first_seen_at_ms, last_seen_at_ms, reviewed_at_ms, repo_id
+        )
+        SELECT
+            id, kind, subject, claim_hash, evidence, base_rank, status, superseded_by,
+            first_seen_at_ms, last_seen_at_ms, reviewed_at_ms, '__unassigned__'
+        FROM dream_findings;
+        DROP TABLE dream_findings;
+        ALTER TABLE dream_findings_new RENAME TO dream_findings;
+        CREATE INDEX IF NOT EXISTS idx_dream_findings_status ON dream_findings(status);
+        CREATE INDEX IF NOT EXISTS idx_dream_findings_subject ON dream_findings(kind, subject);
+        ",
+    )
+}
+
+/// Rebuild the standalone `repo_memory_fts` with a leading `repo_id UNINDEXED` column and
+/// repopulate it from `repo_memories` (the same title/body/kind/tags content `upsert_memory_fts`
+/// writes, tags space-joined). Rebuilding from source — rather than copying the old FTS rows — lets
+/// `repo_id` come from each memory's freshly-added column and needs no FTS `RENAME` (which has
+/// historically been fragile on shadow tables); the DROP + CREATE keeps the canonical table name.
+/// `memory_search` then filters `repo_id` after the MATCH.
+fn rebuild_repo_memory_fts_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS repo_memory_fts;
+        CREATE VIRTUAL TABLE repo_memory_fts USING fts5(
+            repo_id UNINDEXED,
+            memory_id UNINDEXED,
+            title,
+            body,
+            kind,
+            tags,
+            tokenize='porter'
+        );
+        INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)
+        SELECT
+            m.repo_id, m.id, m.title, m.body, m.kind,
+            COALESCE(
+                (SELECT group_concat(t.tag, ' ')
+                 FROM repo_memory_tags t WHERE t.memory_id = m.id),
+                ''
+            )
+        FROM repo_memories m;
+        ",
+    )
 }
 
 /// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see

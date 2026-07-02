@@ -26,7 +26,12 @@ pub(crate) fn create_memory(
     }
 
     let now = now_ms();
-    let id = memory_id(now, &input_hash);
+    // The active-repo scope is folded into the id derivation (post-A5): without it, two repos
+    // creating IDENTICAL content in the same millisecond derive the same id — the repo-scoped
+    // dedupe above correctly passes, and the INSERT explodes on the global PK. The same resolved
+    // scope drives the repo stamp below.
+    let scope = memory_repo_scope(conn)?;
+    let id = memory_id(now, &input_hash, &scope);
     conn.execute(
         "
         INSERT INTO repo_memories(
@@ -52,6 +57,16 @@ pub(crate) fn create_memory(
     // A symbol-bound memory whose logical symbol has a known SCIP moniker gets the moniker anchor
     // automatically (#70) — the relocation fallback the hash anchors can't provide.
     insert_auto_moniker_binding(conn, &id, &binding, now)?;
+    // Stamp the active repo on the new memory, then stamp its bindings FROM the (now-stamped)
+    // parent memory (spec §4.5: a binding defaults to its memory's repo). Gated on the
+    // periphery scope — a no-op on the pre-A5 schema (no `repo_id` column). MUST run before
+    // `upsert_memory_fts`, which mirrors `repo_memories.repo_id` into the FTS row.
+    // `repo_memory_tags` / `repo_memory_call_paths` are transitive (scoped via the
+    // `repo_memories` FK), so they are not stamped here.
+    if let Some(repo_id) = &scope {
+        conn.execute("UPDATE repo_memories SET repo_id = ?1 WHERE id = ?2", params![repo_id, id])?;
+    }
+    stamp_bindings_from_parent_repo(conn, &id)?;
     replace_tags(conn, &id, &request.tags)?;
     upsert_memory_fts(conn, &id)?;
     let memory = memory_by_id(conn, &id)?
@@ -124,9 +139,20 @@ pub(crate) fn memory_by_id(
     conn: &Connection,
     memory_id: &str,
 ) -> anyhow::Result<Option<RepoMemory>> {
+    // Scoped to the active repo (V042): this by-id read guards `memory_get` / `update_memory` /
+    // `mark_obsolete` / `rebind_memory`, so an unscoped lookup would let any caller holding a
+    // SIBLING repo's memory id read OR mutate that sibling on a consolidated DB (the mutation
+    // guards all key on the row this returns). A sibling id resolves to `None` here — "not
+    // found" — which the mutation callers surface as a refusal. The upstream list/search
+    // readers already scope, so adding the predicate is a no-op there. Phase E's explicit
+    // cross-repo READ surfaces arrive with their own APIs; mutation stays repo-bound.
+    // `{repo_clause}` empty pre-A5.
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
     let Some(mut memory) = conn
         .query_row(
-            "
+            &format!(
+                "
             SELECT id AS memory_id,
                    kind AS kind,
                    title AS title,
@@ -141,8 +167,9 @@ pub(crate) fn memory_by_id(
                    input_hash AS input_hash,
                    memory_version AS memory_version
             FROM repo_memories
-            WHERE id = ?1
-            ",
+            WHERE id = ?1{repo_clause}
+            "
+            ),
             [memory_id],
             memory_row,
         )
@@ -158,22 +185,24 @@ pub(crate) fn memories_for_chunk(
     chunk_id: i64,
     limit: u32,
 ) -> anyhow::Result<Vec<RepoMemory>> {
-    let mut stmt = conn.prepare(
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
         LEFT JOIN chunks ON chunks.id = ?1
         LEFT JOIN files ON files.id = chunks.file_id
-        WHERE repo_memories.status IN ('active', 'stale')
+        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND (
               repo_memory_bindings.chunk_id = ?1
               OR (files.path IS NOT NULL AND repo_memory_bindings.path = files.path)
           )
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?2
-        ",
-    )?;
+        "
+    ))?;
     ids_to_memories(
         conn,
         stmt.query_map(params![chunk_id, i64::from(limit)], |row| {
@@ -186,17 +215,19 @@ pub(crate) fn memories_for_path(
     path: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<RepoMemory>> {
-    let mut stmt = conn.prepare(
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-        WHERE repo_memories.status IN ('active', 'stale')
+        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND repo_memory_bindings.path = ?1
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?2
-        ",
-    )?;
+        "
+    ))?;
     ids_to_memories(
         conn,
         stmt.query_map(params![path, i64::from(limit)], |row| row.get("memory_id"))?,
@@ -209,12 +240,14 @@ pub(crate) fn memories_for_symbol(
 ) -> anyhow::Result<Vec<RepoMemory>> {
     let chunk_ids = chunk_ids_for_symbol(conn, symbol)?;
     let mut candidate_ids = BTreeSet::new();
-    let mut stmt = conn.prepare(
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-        WHERE repo_memories.status IN ('active', 'stale')
+        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND (
               repo_memory_bindings.logical_symbol_id = ?1
               OR repo_memory_bindings.symbol_id = ?2
@@ -226,8 +259,8 @@ pub(crate) fn memories_for_symbol(
           )
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?5
-        ",
-    )?;
+        "
+    ))?;
     let rows = stmt.query_map(
         params![
             symbol.logical_symbol_id,
@@ -248,7 +281,7 @@ pub(crate) fn memories_for_symbol(
             SELECT DISTINCT repo_memories.id AS memory_id
             FROM repo_memories
             JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-            WHERE repo_memories.status IN ('active', 'stale')
+            WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
               AND repo_memory_bindings.chunk_id IN ({placeholders})
             ORDER BY repo_memories.updated_at_ms DESC
             LIMIT ?
@@ -354,12 +387,14 @@ pub(crate) fn call_path_memories_for_crossed(
     }
 
     let placeholders = std::iter::repeat_n("?", hashes.len()).collect::<Vec<_>>().join(",");
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
     let sql = format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_call_paths ON repo_memory_call_paths.memory_id = repo_memories.id
-        WHERE repo_memories.status IN ('active', 'stale')
+        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND repo_memory_call_paths.edge_sequence_hash IN ({placeholders})
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?
@@ -387,12 +422,14 @@ pub(crate) fn memories_for_edges(
     unique_edge_ids.dedup();
     let placeholders =
         std::iter::repeat_n("?", unique_edge_ids.len()).collect::<Vec<_>>().join(",");
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
     let sql = format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-        WHERE repo_memories.status IN ('active', 'stale')
+        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND repo_memory_bindings.edge_id IN ({placeholders})
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?
@@ -412,17 +449,19 @@ pub(crate) fn memories_for_call_path_hash(
     edge_sequence_hash: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<RepoMemory>> {
-    let mut stmt = conn.prepare(
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_call_paths ON repo_memory_call_paths.memory_id = repo_memories.id
-        WHERE repo_memories.status IN ('active', 'stale')
+        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND repo_memory_call_paths.edge_sequence_hash = ?1
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?2
-        ",
-    )?;
+        "
+    ))?;
     ids_to_memories(
         conn,
         stmt.query_map(params![edge_sequence_hash, i64::from(limit)], |row| row.get("memory_id"))?,
@@ -437,17 +476,23 @@ pub(crate) fn memory_search(
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
+    // Isolation: the FTS MATCH spans every repo, so the join to `repo_memories` filters to the
+    // active repo. `{repo_clause}` is empty pre-A5 (memory still repo-global). This is the
+    // cross-repo memory search leak guard — an identical-titled memory in a sibling repo must
+    // never surface here.
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT DISTINCT repo_memory_fts.memory_id
         FROM repo_memory_fts
         JOIN repo_memories ON repo_memories.id = repo_memory_fts.memory_id
         WHERE repo_memory_fts MATCH ?1
-          AND repo_memories.status IN ('active', 'stale')
+          AND repo_memories.status IN ('active', 'stale'){repo_clause}
         ORDER BY bm25(repo_memory_fts)
         LIMIT ?2
-        ",
-    )?;
+        "
+    ))?;
     ids_to_memories(
         conn,
         stmt.query_map(params![query, i64::from(limit)], |row| row.get("memory_id"))?,
@@ -471,6 +516,10 @@ pub(crate) fn rebind_memory(
     let now = now_ms();
     insert_binding(conn, memory_id, &binding, now)?;
     insert_auto_moniker_binding(conn, memory_id, &binding, now)?;
+    // Re-stamp the freshly re-inserted bindings from the parent memory's repo (the create path does
+    // this too). Without it the rebound rows keep the `__unassigned__` default and fall out of the
+    // binding-scoped reads while the parent memory stays in its real repo — the review finding.
+    stamp_bindings_from_parent_repo(conn, memory_id)?;
     conn.execute(
         "UPDATE repo_memories SET source_text_hash = ?2, updated_at_ms = ?3 WHERE id = ?1",
         params![memory_id, binding.source_text_hash, now],
@@ -506,14 +555,16 @@ pub(crate) fn list_memories(
     // Use a subquery to pick the first binding per memory (stable tie-break).
     // The outer WHERE on m.status restricts to non-obsolete memories, matching
     // the memory_search / memories_for_* convention.
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
     let rows: Vec<MemorySummary> = if let Some(binding_kind) = kind {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "
             SELECT m.id AS memory_id, m.kind, m.title, m.status,
                    b.binding_kind, b.binding_id
             FROM repo_memories AS m
             JOIN repo_memory_bindings AS b ON b.memory_id = m.id
-            WHERE m.status IN ('active', 'stale')
+            WHERE m.status IN ('active', 'stale'){repo_clause}
               AND b.binding_kind = ?1
               AND b.rowid = (
                   SELECT b2.rowid FROM repo_memory_bindings AS b2
@@ -522,17 +573,17 @@ pub(crate) fn list_memories(
                   LIMIT 1
               )
             ORDER BY m.updated_at_ms DESC
-            ",
-        )?;
+            "
+        ))?;
         stmt.query_map([binding_kind], memory_summary_row)?.collect::<Result<_, _>>()?
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "
             SELECT m.id AS memory_id, m.kind, m.title, m.status,
                    b.binding_kind, b.binding_id
             FROM repo_memories AS m
             JOIN repo_memory_bindings AS b ON b.memory_id = m.id
-            WHERE m.status IN ('active', 'stale')
+            WHERE m.status IN ('active', 'stale'){repo_clause}
               AND b.rowid = (
                   SELECT b2.rowid FROM repo_memory_bindings AS b2
                   WHERE b2.memory_id = m.id
@@ -540,8 +591,8 @@ pub(crate) fn list_memories(
                   LIMIT 1
               )
             ORDER BY m.updated_at_ms DESC
-            ",
-        )?;
+            "
+        ))?;
         stmt.query_map([], memory_summary_row)?.collect::<Result<_, _>>()?
     };
     Ok(rows)
@@ -580,15 +631,19 @@ pub struct MemoryDoctorEntry {
 /// `scip_moniker` bindings are excluded (self-heal on the next oracle run, never
 /// rebind-actionable).
 pub(crate) fn doctor_attention_count(conn: &Connection) -> anyhow::Result<u64> {
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
     let count: i64 = conn.query_row(
-        "
+        &format!(
+            "
         SELECT COUNT(*)
         FROM repo_memory_bindings AS b
         JOIN repo_memories AS m ON m.id = b.memory_id
         WHERE m.status = 'active'
           AND b.anchor_status IN ('gone', 'stale')
-          AND b.binding_kind != 'scip_moniker'
-        ",
+          AND b.binding_kind != 'scip_moniker'{repo_clause}
+        "
+        ),
         [],
         |row| row.get(0),
     )?;
@@ -598,7 +653,9 @@ pub(crate) fn doctor_attention_count(conn: &Connection) -> anyhow::Result<u64> {
 pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>> {
     // Query bindings whose anchor_status is non-current, restricted to active memories.
     // Mirrors the column list used by validate_memories / binding_row.
-    let mut stmt = conn.prepare(
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT b.memory_id, b.binding_kind, b.binding_id, b.path,
                b.symbol_kind, b.signature_hash, b.anchor_status,
@@ -610,10 +667,10 @@ pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDocto
           -- `scip_moniker` bindings are excluded: a lagging moniker self-heals on the next
           -- `oracle run` and is never rebind-actionable; a genuinely dead symbol surfaces via
           -- its symbol/logical_symbol binding anyway (#70).
-          AND b.binding_kind != 'scip_moniker'
+          AND b.binding_kind != 'scip_moniker'{repo_clause}
         ORDER BY b.memory_id, b.binding_kind, b.binding_id
-        ",
-    )?;
+        "
+    ))?;
 
     struct RawRow {
         memory_id: String,
@@ -657,6 +714,39 @@ pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDocto
             anchor_status: r.anchor_status,
             candidates,
         });
+    }
+
+    // Placeholder-scoped memories (V042): user-authored memories stranded under the
+    // '__unassigned__' repo on a consolidated DB — the V042 backfill's leave-at-placeholder path,
+    // reachable only by hand-driving `register_repo` before the consolidate importer exists. They
+    // are invisible to every scoped memory read, so the doctor must surface them rather than let
+    // them vanish silently: one entry per memory under the distinct `placeholder_repo` marker
+    // (rebind-by-hand territory — no computable candidates). Skipped when the active repo IS the
+    // placeholder (an un-adopted single-repo DB, where placeholder scope is the normal state).
+    if let Some(active) = &scope
+        && active != crate::index::schema::LEGACY_REPO_ID
+    {
+        let mut stmt = conn.prepare(
+            "
+            SELECT id, title FROM repo_memories
+            WHERE status IN ('active', 'stale') AND repo_id = ?1
+            ORDER BY id
+            ",
+        )?;
+        let rows = stmt.query_map([crate::index::schema::LEGACY_REPO_ID], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (memory_id, title) = row?;
+            entries.push(MemoryDoctorEntry {
+                memory_id,
+                title,
+                binding_kind: "repo".to_string(),
+                binding_id: crate::index::schema::LEGACY_REPO_ID.to_string(),
+                anchor_status: "placeholder_repo".to_string(),
+                candidates: Vec::new(),
+            });
+        }
     }
     Ok(entries)
 }
@@ -733,7 +823,11 @@ pub(crate) fn anchor_health_counts(
     conn: &Connection,
 ) -> anyhow::Result<crate::index::AnchorHealth> {
     let mut health = crate::index::AnchorHealth::default();
-    let mut stmt = conn.prepare(
+    // Scoped to the active repo (V042): these counts drive per-repo doctor warnings, so a sibling
+    // repo's bindings must not inflate them on a consolidated DB.
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT b.anchor_status, COUNT(*) AS cnt
         FROM repo_memory_bindings AS b
@@ -742,10 +836,10 @@ pub(crate) fn anchor_health_counts(
           -- Auxiliary `scip_moniker` anchors are excluded exactly as in `doctor_report`: these
           -- counts drive the 'run memory doctor' warnings, so counting rows doctor then hides
           -- would yield an unresolvable warning (#70 review).
-          AND b.binding_kind != 'scip_moniker'
+          AND b.binding_kind != 'scip_moniker'{repo_clause}
         GROUP BY b.anchor_status
-        ",
-    )?;
+        "
+    ))?;
     let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
     for row in rows {
         let (status, count) = row?;
@@ -769,15 +863,25 @@ pub(crate) fn validate_memories(
     // root when known (correct under a multi-worktree shared DB), else the persisted source_root.
     let fs_root = effective_fs_root(conn, active_root);
     let fs_root = fs_root.as_deref();
-    let mut stmt = conn.prepare(
+    // Validate ONLY the active repo's bindings (V042): this sweep both counts AND rewrites
+    // anchor_status, so an unscoped pass would validate a sibling repo's bindings against THIS
+    // repo's index/filesystem — flipping a sibling's healthy anchors to gone (its paths don't
+    // exist here) or, worse, blessing a sibling's binding as current when its path collides with
+    // one of ours. The downstream UPDATE/DELETE key on rows this SELECT returned, so scoping the
+    // read scopes the mutation.
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause =
+        crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memory_bindings");
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line,
                logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, github_owner,
                github_repo, github_number, symbol_kind, signature_hash, moniker_tool,
                moniker_tool_version, relocation_reason, anchor_status, created_at_ms
         FROM repo_memory_bindings
-        ",
-    )?;
+        WHERE 1=1{repo_clause}
+        "
+    ))?;
     let rows = stmt.query_map([], binding_row)?;
     let tx = conn.unchecked_transaction()?;
     let mut report = RepoMemoryValidationReport {

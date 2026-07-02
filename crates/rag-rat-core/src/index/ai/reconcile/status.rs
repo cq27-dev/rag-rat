@@ -166,8 +166,15 @@ pub(crate) fn embedding_reconcile_plan(
 pub(crate) fn last_reconcile_status(
     conn: &Connection,
 ) -> anyhow::Result<Option<LastReconcileStatus>> {
+    // Scoped to the active repo (V042): `reconcile_attempts` is a global append-only log, so the
+    // "latest attempt" pick must filter `repo_id` — else a sibling repo's newer attempt on a
+    // consolidated DB would be reported as this repo's status. `{repo_clause}` empty pre-A5.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "reconcile_attempts")?;
+    let repo_clause =
+        crate::index::schema::periphery_repo_scope_clause(&scope, "reconcile_attempts");
     conn.query_row(
-        "
+        &format!(
+            "
         SELECT started_at_ms,
                finished_at_ms,
                batch_size,
@@ -179,9 +186,11 @@ pub(crate) fn last_reconcile_status(
                status,
                message
         FROM reconcile_attempts
+        WHERE 1=1{repo_clause}
         ORDER BY started_at_ms DESC, id DESC
         LIMIT 1
-        ",
+        "
+        ),
         [],
         |row| {
             let elapsed_ms = u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0);

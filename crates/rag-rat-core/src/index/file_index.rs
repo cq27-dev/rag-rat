@@ -293,6 +293,24 @@ impl IndexDatabase {
     ) -> anyhow::Result<()> {
         let conn = self.storage.connection();
         let normalizer_kind = clones::NormalizerKind::Baseline.as_db_str();
+        // Resolve the periphery scope ONCE (not per token). Post-A5 `clone_token_df`'s PK is
+        // `(repo_id, normalizer_kind, token_hash)`, so the upsert must stamp `repo_id` AND target
+        // it in the ON CONFLICT — the repo id is embedded as a per-call literal so the
+        // bound params (`?1` kind, `?2` token) stay unchanged. Pre-A5 (no `repo_id` column)
+        // uses the original SQL.
+        let clone_df_bump_sql =
+            match crate::index::schema::periphery_repo_scope(conn, "clone_token_df")? {
+                Some(repo_id) => format!(
+                    "INSERT INTO clone_token_df(repo_id, normalizer_kind, token_hash, df)
+                 VALUES ('{}', ?1, ?2, 1)
+                 ON CONFLICT(repo_id, normalizer_kind, token_hash) DO UPDATE SET df = df + 1",
+                    repo_id.replace('\'', "''")
+                ),
+                None => "INSERT INTO clone_token_df(normalizer_kind, token_hash, df)
+                 VALUES (?1, ?2, 1)
+                 ON CONFLICT(normalizer_kind, token_hash) DO UPDATE SET df = df + 1"
+                    .to_string(),
+            };
         for (local_index, fp) in fingerprints {
             let symbol_id = symbol_db_ids[*local_index];
             // The token bag rides the fingerprint row as ONE serialized BLOB (#231), replacing the
@@ -321,12 +339,8 @@ impl IndexDatabase {
             // rebuild.rs). R7: iterate the IN-MEMORY `fp.token_bag` here — no decode round-trip.
             if bump_df.0 {
                 for &(token_hash, _freq) in &fp.token_bag {
-                    conn.prepare_cached(
-                        "INSERT INTO clone_token_df(normalizer_kind, token_hash, df)
-                         VALUES (?1, ?2, 1)
-                         ON CONFLICT(normalizer_kind, token_hash) DO UPDATE SET df = df + 1",
-                    )?
-                    .execute(params![normalizer_kind, token_hash])?;
+                    conn.prepare_cached(&clone_df_bump_sql)?
+                        .execute(params![normalizer_kind, token_hash])?;
                 }
             }
         }

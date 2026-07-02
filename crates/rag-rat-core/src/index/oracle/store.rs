@@ -76,23 +76,44 @@ pub(crate) fn resolution_before_counts(
 /// "symbols enriched" signal (#70). Scoped to `tool_version` (not just `tool`) so the count
 /// describes the SAME run as the report's `edge_oracle`-derived metrics: a later same-tool run with
 /// a different `tool_version` must not bleed its monikers into this report. Also scoped to the
-/// ACTIVE repo (A3): `logical_symbol_monikers` carries no `repo_id`, so a consolidated DB's count
-/// must join `logical_symbols` and filter `repo_id = active_repo_id` — otherwise a sibling repo's
-/// monikers inflate this report's enriched-symbol count.
+/// ACTIVE repo: `logical_symbol_monikers` gained its own `repo_id` column in V042 (A5), so the
+/// count filters it directly via the periphery scope clause — otherwise a sibling repo's monikers
+/// inflate this report's enriched-symbol count.
 pub(crate) fn count_symbols_with_moniker(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
 ) -> anyhow::Result<u64> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let repo_clause = oracle_repo_scope_clause(conn, "logical_symbol_monikers")?;
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM logical_symbol_monikers
-         WHERE tool = ?1 AND tool_version = ?2
-           AND logical_symbol_id IN (SELECT id FROM logical_symbols WHERE repo_id = ?3)",
-        params![tool.as_db_str(), tool_version, repo_id],
+        &format!(
+            "SELECT COUNT(*) FROM logical_symbol_monikers
+             WHERE tool = ?1 AND tool_version = ?2{repo_clause}"
+        ),
+        params![tool.as_db_str(), tool_version],
         |row| row.get(0),
     )?;
     Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// The ` AND <qualifier>.repo_id = '…'` predicate for the oracle periphery tables (`oracle_runs` /
+/// `edge_oracle` / `logical_symbol_monikers`, all scoped in the A5 migration), or `""` on the
+/// pre-A5 schema. Probing `oracle_runs` is authoritative for the set (all three gain `repo_id` in
+/// the same migration). See `schema::periphery_repo_scope`.
+pub(super) fn oracle_repo_scope_clause(
+    conn: &Connection,
+    qualifier: &str,
+) -> anyhow::Result<String> {
+    let scope = crate::index::schema::periphery_repo_scope(conn, "oracle_runs")?;
+    Ok(crate::index::schema::periphery_repo_scope_clause(&scope, qualifier))
+}
+
+/// The active `repo_id` to STAMP on an oracle-periphery write (`oracle_runs` / `edge_oracle` /
+/// `logical_symbol_monikers`), or `None` on the pre-A5 schema. Embedded as a per-call literal in
+/// the writers so their bound params (and the ON CONFLICT target column list) are the only things
+/// that change with scoping.
+fn oracle_repo_scope(conn: &Connection) -> anyhow::Result<Option<String>> {
+    Ok(crate::index::schema::periphery_repo_scope(conn, "oracle_runs")?)
 }
 
 /// An edge candidate to feed the oracle join: the callee identifier byte range (the SCIP key, #67)
@@ -300,27 +321,21 @@ pub(crate) fn logical_symbol_id_for_member(
 /// inside the run's transaction, so the moniker set is **authoritative** for the latest run: a
 /// symbol the current `.scip` no longer defines must not keep a stale moniker.
 ///
-/// SCOPE (load-bearing, A3): the DELETE is restricted to monikers whose logical symbol belongs to
-/// the ACTIVE repo (`logical_symbols.repo_id = active_repo_id`) — `logical_symbols` ids are now
-/// repo-distinct, so `logical_symbol_monikers` (which has no `repo_id` column of its own) can hold
-/// rows for several repos in a consolidated DB. A global `DELETE ... WHERE tool = ?` would erase a
-/// SIBLING repo's live moniker anchors on every oracle run, making its `scip_moniker` memory
-/// relocation go gone/unverified. Dangling rows (whose content-derived logical id died in a
-/// rebuild, so they join NO repo's `logical_symbols`) are still swept — they belong to no repo and
-/// never resolve through the live-join reads, so sweeping them can never touch a sibling's valid
-/// rows.
+/// SCOPE (load-bearing): the DELETE is restricted to the ACTIVE repo's monikers via
+/// `logical_symbol_monikers.repo_id` — its own column since V042 (A5), stamped on write to the
+/// repo that owns the moniker. A global `DELETE ... WHERE tool = ?` would erase a SIBLING repo's
+/// live moniker anchors on every oracle run, making its `scip_moniker` memory relocation go
+/// gone/unverified. This repo's dangling rows (whose content-derived logical id died in a rebuild
+/// but whose `repo_id` still marks them ours) are swept alongside; a sibling's dangling rows are
+/// left for that repo's own run to clear (they resolve through no live join, so they never leak).
 pub(crate) fn clear_logical_symbol_monikers_for_tool(
     conn: &Connection,
     tool: OracleTool,
 ) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    conn.execute(
-        "DELETE FROM logical_symbol_monikers
-         WHERE tool = ?1
-           AND (logical_symbol_id IN (SELECT id FROM logical_symbols WHERE repo_id = ?2)
-                OR logical_symbol_id NOT IN (SELECT id FROM logical_symbols))",
-        params![tool.as_db_str(), repo_id],
-    )?;
+    let repo_clause = oracle_repo_scope_clause(conn, "logical_symbol_monikers")?;
+    conn.execute(&format!("DELETE FROM logical_symbol_monikers WHERE tool = ?1{repo_clause}"), [
+        tool.as_db_str(),
+    ])?;
     Ok(())
 }
 
@@ -334,16 +349,29 @@ pub(crate) fn write_logical_symbol_moniker(
     logical_symbol_id: i64,
     moniker: &str,
 ) -> anyhow::Result<()> {
+    // Post-A5 the PK is `(repo_id, logical_symbol_id, tool)`, so stamp `repo_id` AND widen the ON
+    // CONFLICT target. The repo id is a per-call literal prefix so the bound params (`?1`..`?5`)
+    // are unchanged; pre-A5 uses the original 5-column shape.
+    let (repo_col, repo_val, conflict_prefix) = match oracle_repo_scope(conn)? {
+        Some(repo_id) => (
+            "repo_id, ".to_string(),
+            format!("'{}', ", repo_id.replace('\'', "''")),
+            "repo_id, ".to_string(),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    };
     conn.execute(
-        "
-        INSERT INTO logical_symbol_monikers(logical_symbol_id, tool, tool_version, moniker, \
-         computed_at)
-        VALUES (?1, ?2, ?3, ?4, ?5)
-        ON CONFLICT(logical_symbol_id, tool) DO UPDATE SET
+        &format!(
+            "
+        INSERT INTO logical_symbol_monikers({repo_col}logical_symbol_id, tool, tool_version, \
+             moniker, computed_at)
+        VALUES ({repo_val}?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT({conflict_prefix}logical_symbol_id, tool) DO UPDATE SET
             tool_version = excluded.tool_version,
             moniker = excluded.moniker,
             computed_at = excluded.computed_at
-        ",
+        "
+        ),
         params![logical_symbol_id, tool.as_db_str(), tool_version, moniker, now_ms()],
     )?;
     Ok(())
@@ -374,11 +402,18 @@ pub(crate) fn clear_edge_oracle_for_tool(
     // `name_strings` join for the `edge_kind` text match. The callsite-file `files.sha256` is NOT
     // gated here: the authoritative clear must drop the prior verdict for a content-matching edge
     // even when the file drifted (the run rewrites it), exactly as the old rowid clear did.
+    //
+    // SCOPE (load-bearing, A5): the DELETE also filters `edge_oracle.repo_id` (its own column since
+    // V042). Without it, a SIBLING repo's verdict whose `source_path` + content key collide with
+    // one of this repo's live edges (an identical shared file, the same-path poison tripwire)
+    // would be cross-cleared by this repo's run — the same content join
+    // `edge_oracle_scope_join` guards on the read side. `{repo_clause}` empty pre-A5.
+    let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
     conn.execute(
         &format!(
             "
         DELETE FROM edge_oracle
-        WHERE tool = ?1 AND tool_version = ?2
+        WHERE tool = ?1 AND tool_version = ?2{repo_clause}
           AND EXISTS (
             SELECT 1
             FROM edges_data
@@ -429,17 +464,29 @@ pub(crate) fn write_edge_oracle(
     tool_version: &str,
     row: &EdgeOracleRow<'_>,
 ) -> anyhow::Result<()> {
+    // Post-A5 the content-key PK gains a leading `repo_id`, so stamp it AND widen the ON CONFLICT
+    // target. The repo id is a per-call literal prefix so the bound params (`?1`..`?13`) are
+    // unchanged; pre-A5 uses the original shape.
+    let (repo_col, repo_val, conflict_prefix) = match oracle_repo_scope(conn)? {
+        Some(repo_id) => (
+            "repo_id, ".to_string(),
+            format!("'{}', ", repo_id.replace('\'', "''")),
+            "repo_id, ".to_string(),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    };
     conn.execute(
-        "
+        &format!(
+            "
         INSERT INTO edge_oracle(
-            source_path, source_start_byte, source_end_byte,
+            {repo_col}source_path, source_start_byte, source_end_byte,
             callee_start_byte, callee_end_byte, edge_kind,
             file_sha, tool, tool_version,
             resolved_symbol_id, scip_symbol, kind, computed_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        VALUES ({repo_val}?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ON CONFLICT(
-            tool, tool_version, source_path,
+            {conflict_prefix}tool, tool_version, source_path,
             source_start_byte, source_end_byte,
             callee_start_byte, callee_end_byte, edge_kind
         ) DO UPDATE SET
@@ -448,7 +495,8 @@ pub(crate) fn write_edge_oracle(
             scip_symbol = excluded.scip_symbol,
             kind = excluded.kind,
             computed_at = excluded.computed_at
-        ",
+        "
+        ),
         params![
             row.source_path,
             row.source_start_byte,
@@ -512,13 +560,22 @@ pub(crate) fn record_oracle_run_at(
     // against the index's last-change clock; stamping completion time made a run that
     // overlapped a watcher reindex look fresher than the edits it skipped, wedging the gate at
     // NotStale (#145).
+    // Post-A5 `oracle_runs` carries `repo_id` (the read key is (repo_id, tool, tool_version,
+    // commit_sha, worktree_id)); stamp it as a per-call literal prefix so the bound params are
+    // unchanged. Pre-A5 uses the original 7-column shape.
+    let (repo_col, repo_val) = match oracle_repo_scope(conn)? {
+        Some(repo_id) => ("repo_id, ".to_string(), format!("'{}', ", repo_id.replace('\'', "''"))),
+        None => (String::new(), String::new()),
+    };
     conn.execute(
-        "
+        &format!(
+            "
         INSERT INTO oracle_runs(
-            tool, tool_version, commit_sha, worktree_id, started_at, status, stats_json
+            {repo_col}tool, tool_version, commit_sha, worktree_id, started_at, status, stats_json
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        ",
+        VALUES ({repo_val}?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "
+        ),
         params![
             tool.as_db_str(),
             tool_version,
@@ -548,14 +605,17 @@ pub(crate) fn latest_run_tool_version(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<Option<String>> {
+    let repo_clause = oracle_repo_scope_clause(conn, "oracle_runs")?;
     let version = conn
         .query_row(
-            "
+            &format!(
+                "
             SELECT tool_version FROM oracle_runs
-            WHERE tool = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+            WHERE tool = ?1 AND commit_sha = ?2 AND worktree_id = ?3{repo_clause}
             ORDER BY id DESC
             LIMIT 1
-            ",
+            "
+            ),
             params![tool.as_db_str(), commit_sha, worktree_id],
             |row| row.get::<_, String>(0),
         )
@@ -576,14 +636,17 @@ pub(crate) fn latest_run_started_at(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<Option<i64>> {
+    let repo_clause = oracle_repo_scope_clause(conn, "oracle_runs")?;
     let started_at = conn
         .query_row(
-            "
+            &format!(
+                "
             SELECT started_at FROM oracle_runs
-            WHERE tool = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+            WHERE tool = ?1 AND commit_sha = ?2 AND worktree_id = ?3{repo_clause}
             ORDER BY id DESC
             LIMIT 1
-            ",
+            "
+            ),
             params![tool.as_db_str(), commit_sha, worktree_id],
             |row| row.get::<_, i64>(0),
         )
@@ -599,9 +662,13 @@ pub(crate) fn any_run_in_scope(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<bool> {
+    let repo_clause = oracle_repo_scope_clause(conn, "oracle_runs")?;
     let exists = conn
         .query_row(
-            "SELECT 1 FROM oracle_runs WHERE commit_sha = ?1 AND worktree_id = ?2 LIMIT 1",
+            &format!(
+                "SELECT 1 FROM oracle_runs WHERE commit_sha = ?1 AND worktree_id = \
+                 ?2{repo_clause} LIMIT 1"
+            ),
             params![commit_sha, worktree_id],
             |_| Ok(()),
         )
@@ -644,8 +711,18 @@ pub(crate) fn any_run_in_scope(
 /// need its `name_strings`-joined text columns (`edge_kind`, `confidence`, `to_name`); the
 /// surfacing reads are bound by an `edge_id IN (...)` list or the staleness/anchor indexes, so the
 /// view's joins are not on an unbounded hot scan.
-pub(crate) fn edge_oracle_scope_join() -> String {
-    format!(
+///
+/// SCOPE (load-bearing, A5): the join to `files` is by the edge's CONTENT key (`source_path`,
+/// `file_sha`) — so in a consolidated DB a SIBLING repo's `edge_oracle` verdict whose `source_path`
+/// and `file_sha` collide with one of THIS repo's files (an identical vendored/shared file, the
+/// same-path poison tripwire) would join onto the active repo's `files` and surface/count as ours.
+/// The `edge_oracle.repo_id` predicate (its own column since V042) pins the verdict to the active
+/// repo directly, so every read consumer that routes through this helper inherits the isolation.
+/// `{repo_clause}` is empty pre-A5. Appended last so a caller's trailing ` AND <extra>` still
+/// composes.
+pub(crate) fn edge_oracle_scope_join(conn: &Connection) -> anyhow::Result<String> {
+    let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
+    Ok(format!(
         "
     FROM edge_oracle
     JOIN files ON files.path = edge_oracle.source_path
@@ -657,9 +734,9 @@ pub(crate) fn edge_oracle_scope_join() -> String {
               AND edges.callee_end_byte = edge_oracle.callee_end_byte
               AND edges.edge_kind = edge_oracle.edge_kind
     WHERE edge_oracle.tool = ?1 AND edge_oracle.tool_version = ?2
-      AND {scope}",
+      AND {scope}{repo_clause}",
         scope = active_checkout_file_predicate("?3", "?4"),
-    )
+    ))
 }
 
 /// Count `edge_oracle` rows for `(tool, tool_version)` **within the active checkout**, optionally
@@ -674,7 +751,7 @@ pub(crate) fn count_edge_oracle_scoped(
     worktree_id: &str,
     kind: Option<OracleResolutionKind>,
 ) -> anyhow::Result<u64> {
-    let scope_join = edge_oracle_scope_join();
+    let scope_join = edge_oracle_scope_join(conn)?;
     // COUNT(DISTINCT edge_oracle.rowid), not COUNT(*): the scope join joins each `edge_oracle` row
     // to its LIVE edge by the content key. That key is measured 1:1 with a live edge (0
     // collisions / 1.03M rows — the call-site source span makes it unique), so today this
@@ -807,6 +884,7 @@ pub(crate) fn current_oracle_verdicts_for_edges(
     if edge_ids.is_empty() {
         return Ok(out);
     }
+    let scope_join = edge_oracle_scope_join(conn)?;
     // Bind the variable-length id list after the fixed ?1..?4 scope slots. Chunk to stay under
     // SQLite's bound-variable limit on large traversals.
     for chunk in edge_ids.chunks(900) {
@@ -827,7 +905,6 @@ pub(crate) fn current_oracle_verdicts_for_edges(
              FROM name_strings WHERE name_strings.id = (SELECT qualified_name_id FROM symbols \
              WHERE symbols.id = edge_oracle.resolved_symbol_id)), \
              edge_oracle.scip_symbol{scope_join}{current} AND edges.id IN ({placeholders})",
-            scope_join = edge_oracle_scope_join(),
             current = edge_oracle_current_predicate(),
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -886,7 +963,7 @@ pub(crate) fn current_oracle_verdicts_all(
     // resolves to), which is the id the importance ranker's heuristic traversal carries.
     let sql = format!(
         "SELECT edges.id, edge_oracle.kind, edge_oracle.resolved_symbol_id{scope_join}{current}",
-        scope_join = edge_oracle_scope_join(),
+        scope_join = edge_oracle_scope_join(conn)?,
         current = edge_oracle_current_predicate(),
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -957,7 +1034,7 @@ pub(crate) fn current_oracle_comparisons(
          symbols.id = edges.to_symbol_id)), edges.to_name, edge_oracle.resolved_symbol_id, \
          edge_oracle.scip_symbol, files.path, COALESCE(NULLIF(edges.source_start_line, 0), 1) \
          {scope_join}{current} ORDER BY files.path, edges.source_start_line",
-        scope_join = edge_oracle_scope_join(),
+        scope_join = edge_oracle_scope_join(conn)?,
         current = edge_oracle_current_predicate(),
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1029,11 +1106,16 @@ pub(crate) fn prune_oracle_runs_outside_scope(
     }
     let commit_list = sql_quoted_list(live_commits);
     let worktree_list = sql_quoted_list(live_worktrees);
+    // Per-repo (A5): scope the prune to the ACTIVE repo's runs — `live_commits`/`live_worktrees`
+    // are the active repo's live set, so without this a gc of repo A would delete every sibling
+    // repo's runs (their commits are not in A's live set). `{repo_clause}` empty pre-A5. This
+    // is the "oracle prune parity across repos" contract.
+    let repo_clause = oracle_repo_scope_clause(conn, "oracle_runs")?;
     let deleted = conn.execute(
         &format!(
             "DELETE FROM oracle_runs
              WHERE commit_sha NOT IN ({commit_list})
-               AND worktree_id NOT IN ({worktree_list})"
+               AND worktree_id NOT IN ({worktree_list}){repo_clause}"
         ),
         [],
     )?;
@@ -1059,8 +1141,14 @@ pub(crate) fn prune_oracle_runs_outside_scope(
 /// is deliberately decoupled from sweep timing (the next `oracle run`'s authoritative clear also
 /// removes content-matching stale rows; this catches the rows that have no live edge at all).
 pub(crate) fn prune_edge_oracle_without_live_edge(conn: &Connection) -> anyhow::Result<u64> {
+    // Per-repo (A5): only sweep the ACTIVE repo's dangling verdicts (`{repo_clause}` on
+    // `edge_oracle`, empty pre-A5). The inner live-edge match stays GLOBAL-across-worktrees within
+    // the repo (no `active_checkout_file_predicate`), so a sibling worktree's still-live verdict is
+    // never swept — the #248 R6 posture, now bounded to one repo.
+    let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
     let deleted = conn.execute(
-        "
+        &format!(
+            "
         DELETE FROM edge_oracle
         WHERE NOT EXISTS (
             SELECT 1
@@ -1073,8 +1161,9 @@ pub(crate) fn prune_edge_oracle_without_live_edge(conn: &Connection) -> anyhow::
               AND edges_data.callee_start_byte = edge_oracle.callee_start_byte
               AND edges_data.callee_end_byte = edge_oracle.callee_end_byte
               AND ek.value = edge_oracle.edge_kind
-        )
-        ",
+        ){repo_clause}
+        "
+        ),
         [],
     )?;
     Ok(u64::try_from(deleted).unwrap_or(0))

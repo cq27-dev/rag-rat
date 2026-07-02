@@ -153,18 +153,42 @@ impl IndexDatabase {
     /// for recall either way.) df feeds candidate GENERATION (the `sub_block_tokens` ordering), not
     /// just ranking. Each symbol's decoded bag has no duplicate `token_hash` (the codec invariant),
     /// so counting one increment per (symbol, token) pair equals `COUNT(DISTINCT symbol_id)`.
-    fn refresh_clone_token_df(&self) -> anyhow::Result<()> {
-        // Phase 1 (read): decode every fingerprint's bag and accumulate df in memory, off the
-        // connection borrow. NULL `token_bag` rows (un-reindexed after the V032 migration) and any
-        // stale/corrupt blob (decode → None) contribute nothing, exactly as a missing postings row
-        // would have.
+    pub(crate) fn refresh_clone_token_df(&self) -> anyhow::Result<()> {
+        // Resolve the active-repo scope ONCE: it gates BOTH the fingerprint READ below and the df
+        // wipe/reinsert (Phase 2). `symbol_fingerprints` is deliberately `repo_id`-free (keyed by
+        // `symbol_id`, FK CASCADE — see the CLONE_FINGERPRINT_DDL note), so the read is scoped
+        // TRANSITIVELY by joining `symbols` → `main.files` and filtering `files.repo_id`, exactly
+        // like the clone candidate reads. Without it, a consolidated DB's SIBLING repo's
+        // fingerprints pool their token frequencies into THIS repo's df — inflating
+        // document frequencies and reordering `sub_block_tokens`, which changes SourcererCC
+        // candidate selection (the review finding). `probe = "clone_token_df"` is
+        // authoritative for the periphery set.
+        let df_scope = {
+            let conn = self.storage.connection();
+            crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?
+        };
+
+        // Phase 1 (read): decode every (active-repo) fingerprint's bag and accumulate df in memory,
+        // off the connection borrow. NULL `token_bag` rows (un-reindexed after the V032 migration)
+        // and any stale/corrupt blob (decode → None) contribute nothing, exactly as a missing
+        // postings row would have.
         // Outer key: normalizer_kind (cloned once per kind, not per (symbol, token) pair).
         // Inner key: token_hash → df count.
         let mut df: BTreeMap<String, BTreeMap<i64, i64>> = BTreeMap::new();
         {
             let conn = self.storage.connection();
-            let mut stmt =
-                conn.prepare("SELECT normalizer_kind, token_bag FROM symbol_fingerprints")?;
+            let read_sql = match &df_scope {
+                Some(repo_id) => format!(
+                    "SELECT symbol_fingerprints.normalizer_kind, symbol_fingerprints.token_bag
+                     FROM symbol_fingerprints
+                     JOIN symbols ON symbols.id = symbol_fingerprints.symbol_id
+                     JOIN main.files ON main.files.id = symbols.file_id
+                     WHERE main.files.repo_id = '{}'",
+                    repo_id.replace('\'', "''")
+                ),
+                None => "SELECT normalizer_kind, token_bag FROM symbol_fingerprints".to_string(),
+            };
+            let mut stmt = conn.prepare(&read_sql)?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let normalizer_kind: String = row.get(0)?;
@@ -181,16 +205,36 @@ impl IndexDatabase {
             }
         }
 
-        // Phase 2 (write): replace the table contents with the recomputed df.
+        // Phase 2 (write): replace the ACTIVE REPO's df with the recomputed df. Post-A5
+        // `clone_token_df` carries `repo_id` in its PK (df must not pool across repos), so both the
+        // wipe and the reinsert scope to the active repo — the repo id is embedded as a per-call
+        // literal so the bound params stay unchanged; pre-A5 uses the original global SQL.
         let conn = self.storage.connection();
-        conn.execute_batch("DELETE FROM clone_token_df;")?;
+        let df_delete_sql = match &df_scope {
+            Some(repo_id) => format!(
+                "DELETE FROM clone_token_df WHERE repo_id = '{}';",
+                repo_id.replace('\'', "''")
+            ),
+            None => "DELETE FROM clone_token_df;".to_string(),
+        };
+        let df_insert_sql = match &df_scope {
+            Some(repo_id) => format!(
+                "INSERT INTO clone_token_df(repo_id, normalizer_kind, token_hash, df)
+                 VALUES ('{}', ?1, ?2, ?3)",
+                repo_id.replace('\'', "''")
+            ),
+            None => "INSERT INTO clone_token_df(normalizer_kind, token_hash, df) VALUES (?1, ?2, \
+                     ?3)"
+            .to_string(),
+        };
+        conn.execute_batch(&df_delete_sql)?;
         for (normalizer_kind, inner) in df {
             for (token_hash, count) in inner {
-                conn.prepare_cached(
-                    "INSERT INTO clone_token_df(normalizer_kind, token_hash, df) VALUES (?1, ?2, \
-                     ?3)",
-                )?
-                .execute(params![normalizer_kind, token_hash, count])?;
+                conn.prepare_cached(&df_insert_sql)?.execute(params![
+                    normalizer_kind,
+                    token_hash,
+                    count
+                ])?;
             }
         }
         // The recomputed df may reorder `sub_block_tokens`, so the persisted clone-graph postings

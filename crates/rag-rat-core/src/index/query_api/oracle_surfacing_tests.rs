@@ -707,6 +707,9 @@ fn compiler_upgrade_survives_heuristic_limit() {
 /// `(commit, worktree)` is dropped by `prune_to_live` when that context is not live.
 #[test]
 fn gc_prunes_oracle_runs_for_dead_contexts() {
+    // Asserts whole-DB `oracle_runs` counts; opt out of the poison harness whose sibling seeds a
+    // run under its own repo_id.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
     let config = rust_config(root.clone());

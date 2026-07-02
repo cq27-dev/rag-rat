@@ -15,6 +15,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub(crate) use validate::*;
 
+/// The active `repo_id` scope for the memory tables, or `None` on the pre-A5 schema (the memory
+/// tables are still repo-global until the periphery-scoping migration lands). Every memory
+/// read/write gates its `repo_id` predicate on this: `Some(repo_id)` scopes to the active repo,
+/// `None` runs the original unscoped SQL. See `schema::periphery_repo_scope` for the deferral.
+pub(crate) fn memory_repo_scope(conn: &Connection) -> anyhow::Result<Option<String>> {
+    Ok(crate::index::schema::periphery_repo_scope(conn, "repo_memories")?)
+}
+
+/// The ` AND repo_memories.repo_id = '…'` predicate for a memory read, or `""` when unscoped.
+pub(crate) fn memory_repo_scope_clause(scope: &Option<String>) -> String {
+    crate::index::schema::periphery_repo_scope_clause(scope, "repo_memories")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoMemory {
     pub memory_id: String,

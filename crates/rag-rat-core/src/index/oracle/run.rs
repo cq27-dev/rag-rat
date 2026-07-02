@@ -699,7 +699,7 @@ fn count_low_confidence_with_oracle(
     let count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(*){} AND edges.confidence IN ('NameOnly', 'Ambiguous')",
-            store::edge_oracle_scope_join()
+            store::edge_oracle_scope_join(conn)?
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
         |row| row.get(0),
@@ -724,7 +724,7 @@ fn count_low_confidence_upgrades(
         &format!(
             "SELECT COUNT(*){} AND edge_oracle.kind = 'upgrade' AND edges.confidence IN \
              ('NameOnly', 'Ambiguous')",
-            store::edge_oracle_scope_join()
+            store::edge_oracle_scope_join(conn)?
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
         |row| row.get(0),
@@ -750,7 +750,7 @@ fn count_upgradeable_low_confidence(
         &format!(
             "SELECT COUNT(*){} AND edge_oracle.kind IN ('upgrade', 'resolved-external') AND \
              edges.confidence IN ('NameOnly', 'Ambiguous')",
-            store::edge_oracle_scope_join()
+            store::edge_oracle_scope_join(conn)?
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
         |row| row.get(0),

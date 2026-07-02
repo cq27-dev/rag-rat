@@ -16,32 +16,36 @@
 //! read/count/delete that returns the UNION across repos (a missing `repo_id` filter on a
 //! whole-table scan). (2) SAME-PATH rows seed under a REAL primary-repo path (resolved at seed time
 //! by [`primary_collision_path`]) — they catch the class the distinct-path rows CANNOT: an
-//! aggregate that reads a scoped table grouped by a NON-repo key (path / source_path) and then
-//! JOINS the result onto the active repo's rows BY PATH instead of flowing repo attribution through
-//! the join. The canonical example is the V041 `github_ref_counts` CTE in
-//! `query::repo_brief::file_rows` (`SELECT source_path, COUNT(*) FROM github_refs GROUP BY
+//! aggregate that reads a scoped table grouped by a NON-repo key (path / source_path / (path,
+//! start_byte)) and then JOINS the result onto the active repo's rows BY THAT KEY instead of
+//! flowing repo attribution through the join. The canonical example is the V041 `github_ref_counts`
+//! CTE in `query::repo_brief::file_rows` (`SELECT source_path, COUNT(*) FROM github_refs GROUP BY
 //! source_path` then `LEFT JOIN … ON github_ref_counts.path = files.path`): a sibling's
 //! `github_refs` row at `src/lib.rs` inflates the active repo's file `src/lib.rs` unless the CTE
 //! filters `repo_id`. A distinct-path sibling ref at `zz_poison_path.rs` never joins onto a primary
-//! file, so ONLY a same-path ref exposes that leak. Same-path rows go in for `github_refs` (the
-//! join-by-path papertrail), `files`, `git_file_changes`, and `parser_failures`; each is pinned in
+//! file, so ONLY a same-path ref exposes that leak. Same-path rows go in for `github_refs`,
+//! `files`, `git_file_changes`, `parser_failures` (V041), and — for the V042 periphery whose
+//! readers key by path — `repo_memory_bindings` (path-bound memories joined onto files by path) and
+//! `edge_oracle` (source_path + source_start_byte joined onto files); each is pinned in
 //! [`sibling_tripwires`] by a path-INDEPENDENT sentinel column so the intact check holds regardless
 //! of which fixture path was chosen.
 //!
-//! SCHEMA-VERSION SCOPE (load-bearing): this worktree is **V041** (`LATEST_SCHEMA_VERSION = 41`),
+//! SCHEMA-VERSION SCOPE (load-bearing): this worktree is **V042** (`LATEST_SCHEMA_VERSION = 42`),
 //! which scopes the V040 core tables — `repos`, `repo_roots`, `repo_meta`, `files`, `packages`,
-//! `logical_symbols`, `docs`, `parser_failures`, `git_commits`, `git_file_changes` (plus tables
-//! scoped TRANSITIVELY through them: `chunks`/`symbols`/`edges_data` via `files.id`;
-//! `logical_symbol_members`/`logical_symbol_monikers` via `logical_symbols.id`) — AND the seven
-//! V041 GitHub papertrail tables (`github_refs`, `github_issues`, `github_comments`,
-//! `github_pull_requests`, `github_reviews`, `github_review_comments`, `github_ref_sync`) plus the
-//! `github_fts` mirror, each of which gained a `repo_id` column in V041. [`seed_sibling`] seeds a
-//! tripwire row into every one of those. The repo-memory, oracle (`oracle_runs`/`edge_oracle`),
-//! clone, `dream_findings`, and `reconcile_attempts` tables are STILL GLOBAL at V041 — they gain
-//! `repo_id` only in A5 (V042), which is NOT in this worktree — so seeding a
-//! `repo_id='poison-sibling'` row into them is impossible and a read of them is *legitimately*
-//! cross-repo here. Seeding them would manufacture FALSE tripwires. When A5 lands, extend
-//! [`seed_sibling`] to those tables at the same time their scoping does.
+//! `logical_symbols`, `docs`, `parser_failures`, `git_commits`, `git_file_changes` (plus
+//! `chunks`/`symbols`/`edges_data` TRANSITIVELY via `files.id` and `logical_symbol_members` via
+//! `logical_symbols.id`) — the seven V041 GitHub papertrail tables (`github_refs`, `github_issues`,
+//! `github_comments`, `github_pull_requests`, `github_reviews`, `github_review_comments`,
+//! `github_ref_sync`) plus the `github_fts` mirror — AND the V042 periphery tables that each gained
+//! their OWN `repo_id`: `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`,
+//! `logical_symbol_monikers` (now direct, no longer only transitive), `oracle_runs`, `edge_oracle`,
+//! `clone_graph_generations`, `clone_token_df`, `clone_refinements`, `dream_findings`, and
+//! `reconcile_attempts` (with `repo_memory_tags` scoped transitively through `repo_memories`).
+//! [`seed_sibling`] seeds a tripwire row into every one of those. Nothing repo-scoped is left
+//! unseeded at V042; a table without a `repo_id` dimension (content-addressed pools like
+//! `name_strings` / `embedding_cache`, the FTS-derived `chunk_fts`, `clone_edges`/postings scoped
+//! by their globally-unique `build_generation`) is deliberately absent — seeding it would
+//! manufacture a FALSE tripwire against a legitimately cross-repo store.
 //!
 //! WHY THE SIBLING IS NOT REGISTERED IN `repos` (load-bearing at V040): the eight direct-scoped
 //! DATA tables (`files`, `packages`, `logical_symbols`, `docs`, `parser_failures`, `git_commits`,
@@ -112,9 +116,24 @@ const POISON_SAMEPATH_MSG: &str = "zz_poison_samepath_msg";
 /// `git_file_changes.additions` sentinel pinning the same-path `git_file_changes` row (a value no
 /// real fixture change produces).
 const POISON_SAMEPATH_ADDITIONS: i64 = 7_700_077;
+/// `repo_memory_bindings.binding_id` sentinel pinning the same-path memory binding (a SECOND
+/// binding off the poison memory whose `path` column is a REAL primary path — the distinct-path
+/// binding leaves `path` NULL, so it never reaches the `path IS NOT NULL` path-join readers).
+const POISON_SAMEPATH_BIND: &str = "zz_poison_samepath_bind";
+/// `edge_oracle.scip_symbol` sentinel pinning the same-path oracle edge (its `source_path` +
+/// `file_sha` collide with a real primary file so the `edge_oracle`→`files` path+sha join trips).
+const POISON_SAMEPATH_SCIP: &str = "zz_poison_samepath_scip";
 /// Fallback collision path when the fixture indexed no files — nothing to collide with, but the row
 /// still guards against an unscoped DELETE.
 const POISON_SAMEPATH_FALLBACK: &str = "zz_poison_no_primary_file.rs";
+
+/// The poison sibling's repo-memory id — the anchor the memory bindings / tags / FTS mirror hang
+/// off (they scope through `memory_id` → `repo_memories.repo_id`, or carry `repo_id` directly).
+const POISON_MEMORY_ID: &str = "zz_poison_mem";
+
+/// The poison sibling's clone generation / token-hash sentinel — a distinctive integer far outside
+/// any fixture's `MAX(generation)+1` allocation so a seeded clone row never collides.
+const POISON_GENERATION: i64 = 9_900_000_042;
 
 thread_local! {
     /// Whether [`seed_if_enabled`] seeds on this thread. Default ON. Thread-local (not a global
@@ -276,14 +295,17 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
     )?;
     // logical_symbol_monikers has NO repo_id and NO FK; it is scoped only by the join to
     // logical_symbols. This row is the tripwire for the oracle moniker clear/count (round-6 P2 #3).
+    // Since V042 `logical_symbol_monikers` carries its OWN `repo_id` (the count/clear/write now
+    // filter it directly rather than joining `logical_symbols`), stamp it the sibling id.
     conn.execute(
         "INSERT INTO logical_symbol_monikers(logical_symbol_id, tool, tool_version, moniker, \
-         computed_at)
-         VALUES (?1, 'scip-rust', ?2, ?3, 0)",
+         computed_at, repo_id)
+         VALUES (?1, 'scip-rust', ?2, ?3, 0, ?4)",
         params![
             POISON_LOGICAL_ID,
             format!("{POISON_PREFIX}ver"),
-            format!("{POISON_PREFIX}moniker")
+            format!("{POISON_PREFIX}moniker"),
+            POISON_REPO_ID
         ],
     )?;
 
@@ -435,12 +457,106 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
         format!("{POISON_PREFIX}revcomment"),
     )?;
 
-    // --- SAME-PATH tripwires: sibling rows whose PATH deliberately collides with a real primary
-    // path (`collision_path`). A join-by-path aggregate that reads a scoped table without a
-    // `repo_id` predicate attributes these to the active repo. The DISTINCT-PATH rows above cannot
-    // catch that class — their `zz_poison_` paths never match a primary path. Each row is under
-    // `POISON_REPO_ID`, so `clear_sibling`'s existing `WHERE repo_id = POISON_REPO_ID` deletes
-    // them; the intact check pins each by its own sentinel column (not by path). ---
+    // --- A5 periphery (V042): repo memories (+ bindings / tags / FTS mirror), oracle runs, edge
+    // oracle, clone generations / token-df / refinements, dream findings, and reconcile attempts
+    // each gained a `repo_id` column in V042, so a sibling row is now valid and any unscoped
+    // periphery read/count/delete trips a tripwire. `repo_memory_tags` has NO `repo_id` of its own
+    // (it scopes transitively via `memory_id` → `repo_memories.repo_id`), so it hangs off the
+    // poison memory. ---
+    conn.execute(
+        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms, \
+         updated_at_ms, source, memory_version, repo_id)
+         VALUES (?1, 'Invariant', ?2, ?3, 'high', 'active', 0, 0, 'agent', 'v1', ?4)",
+        params![
+            POISON_MEMORY_ID,
+            format!("{POISON_PREFIX}title"),
+            format!("{POISON_PREFIX}body"),
+            POISON_REPO_ID
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, anchor_status, \
+         created_at_ms, repo_id)
+         VALUES (?1, 'path', ?2, 'current', 0, ?3)",
+        params![POISON_MEMORY_ID, format!("{POISON_PREFIX}bind"), POISON_REPO_ID],
+    )?;
+    conn.execute("INSERT INTO repo_memory_tags(memory_id, tag) VALUES (?1, ?2)", params![
+        POISON_MEMORY_ID,
+        format!("{POISON_PREFIX}tag")
+    ])?;
+    conn.execute(
+        "INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)
+         VALUES (?1, ?2, ?3, ?4, 'Invariant', ?5)",
+        params![
+            POISON_REPO_ID,
+            POISON_MEMORY_ID,
+            format!("{POISON_PREFIX}title"),
+            format!("{POISON_PREFIX}body"),
+            format!("{POISON_PREFIX}tag")
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO oracle_runs(tool, tool_version, commit_sha, worktree_id, started_at, status, \
+         stats_json, repo_id)
+         VALUES ('scip-rust', ?1, ?2, '', 0, 'complete', '{}', ?3)",
+        params![format!("{POISON_PREFIX}ver"), POISON_COMMIT, POISON_REPO_ID],
+    )?;
+    conn.execute(
+        "INSERT INTO edge_oracle(repo_id, source_path, source_start_byte, source_end_byte, \
+         callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+         scip_symbol, kind, computed_at)
+         VALUES (?1, ?2, 0, 0, 0, 0, 'calls_name', ?3, 'scip-rust', ?4, ?5, 'resolved', 0)",
+        params![
+            POISON_REPO_ID,
+            format!("{POISON_PREFIX}edge.rs"),
+            format!("{POISON_PREFIX}sha"),
+            format!("{POISON_PREFIX}ver"),
+            format!("{POISON_PREFIX}scip")
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO clone_graph_generations(generation, status, theta_floor, normalizer_kind, \
+         normalizer_version, source_revision, started_at_ms, repo_id)
+         VALUES (?1, 'Complete', 0.7, 'baseline', 1, ?2, 0, ?3)",
+        params![POISON_GENERATION, format!("{POISON_PREFIX}rev"), POISON_REPO_ID],
+    )?;
+    conn.execute(
+        "INSERT INTO clone_token_df(repo_id, normalizer_kind, token_hash, df)
+         VALUES (?1, 'baseline', ?2, 1)",
+        params![POISON_REPO_ID, POISON_GENERATION],
+    )?;
+    conn.execute(
+        "INSERT INTO clone_refinements(repo_id, class_key, language, refine_mode, template, \
+         variation_points_json, proposed_signature_json, confidence, anti_unify_coverage, \
+         lcs_ratio, refactorability, norm_version, alignment_version, created_at_ms, lcs_sampled)
+         VALUES (?1, ?2, 'rust', 'exact', ?3, '[]', '{}', 'high', 0.0, 0.0, 0.0, 1, 1, 0, 0)",
+        params![POISON_REPO_ID, format!("{POISON_PREFIX}class"), format!("{POISON_PREFIX}tmpl")],
+    )?;
+    conn.execute(
+        "INSERT INTO dream_findings(id, kind, subject, claim_hash, evidence, base_rank, \
+         first_seen_at_ms, last_seen_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0.0, 0, 0, ?6)",
+        params![
+            format!("{POISON_PREFIX}dream"),
+            format!("{POISON_PREFIX}kind"),
+            format!("{POISON_PREFIX}subj"),
+            format!("{POISON_PREFIX}claim"),
+            format!("{POISON_PREFIX}ev"),
+            POISON_REPO_ID
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO reconcile_attempts(started_at_ms, status, repo_id) VALUES (0, ?1, ?2)",
+        params![format!("{POISON_PREFIX}status"), POISON_REPO_ID],
+    )?;
+
+    // --- SAME-PATH tripwires: sibling rows whose PATH (or path+sha / path+byte) deliberately
+    // collides with a real primary row (`collision_path`). A join-by-<key> aggregate that reads a
+    // scoped table without a `repo_id` predicate attributes these to the active repo. The
+    // DISTINCT-PATH rows above cannot catch that class — their `zz_poison_` paths never match a
+    // primary path. Each row is under `POISON_REPO_ID`, so `clear_sibling`'s existing
+    // `WHERE repo_id = POISON_REPO_ID` deletes them; the intact check pins each by its own sentinel
+    // column (not by path). ---
     // files: caught by any unscoped `main.files` read that groups/joins by path (the scope view
     // would exclude the sibling, so only a view-bypassing path read leaks). No children hung off
     // it.
@@ -478,6 +594,44 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
             collision_path,
             POISON_SAMEPATH_REFTEXT,
             POISON_REPO_ID
+        ],
+    )?;
+    // repo_memory_bindings at the shared `path` (V042): a SECOND path-binding off the poison memory
+    // whose `path` column is a REAL primary path — caught by the memory path-join readers
+    // (`repo_brief::memory_counts_by_path`, `orientation` memory titles, `memory::memories_for_*`)
+    // if they forget the `repo_id` predicate. The distinct-path binding leaves `path` NULL, so it
+    // never reaches those `path IS NOT NULL` readers. Distinct `binding_id` for the PK.
+    conn.execute(
+        "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+         anchor_status, created_at_ms, repo_id)
+         VALUES (?1, 'path', ?2, ?3, 'current', 0, ?4)",
+        params![POISON_MEMORY_ID, POISON_SAMEPATH_BIND, collision_path, POISON_REPO_ID],
+    )?;
+    // edge_oracle at the shared (source_path, file_sha) (V042): the `edge_oracle`→`files` metric
+    // join keys on `files.path = source_path AND files.sha256 = file_sha`, so it is scoped only
+    // transitively through the `files` view — a sibling row whose path AND sha match a real primary
+    // file (an identical vendored/shared file across repos) leaks unless the read filters
+    // `edge_oracle.repo_id`. `collision_sha` is the primary file's sha at `collision_path` (or the
+    // fallback when no primary file exists — then nothing collides).
+    let collision_sha: String = conn.query_row(
+        "SELECT COALESCE(
+             (SELECT sha256 FROM main.files WHERE path = ?1 AND repo_id != ?2 ORDER BY sha256 \
+         LIMIT 1),
+             ?3)",
+        params![collision_path, POISON_REPO_ID, POISON_SAMEPATH_SHA],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO edge_oracle(repo_id, source_path, source_start_byte, source_end_byte, \
+         callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+         scip_symbol, kind, computed_at)
+         VALUES (?1, ?2, 0, 0, 0, 0, 'calls_name', ?3, 'scip-rust', ?4, ?5, 'resolved', 0)",
+        params![
+            POISON_REPO_ID,
+            collision_path,
+            collision_sha,
+            format!("{POISON_PREFIX}ver"),
+            POISON_SAMEPATH_SCIP
         ],
     )?;
 
@@ -527,7 +681,18 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
          DELETE FROM github_reviews WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM github_review_comments WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM github_ref_sync WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM github_fts WHERE repo_id = '{POISON_REPO_ID}';"
+         DELETE FROM github_fts WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM reconcile_attempts WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM dream_findings WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM clone_refinements WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM clone_token_df WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM clone_graph_generations WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM edge_oracle WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM oracle_runs WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM repo_memory_fts WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM repo_memory_tags WHERE memory_id = '{POISON_MEMORY_ID}';
+         DELETE FROM repo_memory_bindings WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM repo_memories WHERE repo_id = '{POISON_REPO_ID}';"
     ))?;
     Ok(())
 }
@@ -570,7 +735,8 @@ fn sibling_tripwires() -> Vec<(&'static str, String)> {
         (
             "logical_symbol_monikers",
             format!(
-                "logical_symbol_id = {POISON_LOGICAL_ID} AND moniker = '{POISON_PREFIX}moniker'"
+                "logical_symbol_id = {POISON_LOGICAL_ID} AND repo_id = '{POISON_REPO_ID}' AND \
+                 moniker = '{POISON_PREFIX}moniker'"
             ),
         ),
         // github papertrail (V041): each base table + the fts mirror pinned by the sentinel
@@ -637,8 +803,8 @@ fn sibling_tripwires() -> Vec<(&'static str, String)> {
                 POISON_GH_ITEM_ID + 5
             ),
         ),
-        // SAME-PATH tripwires: pinned by a path-INDEPENDENT sentinel column (the collision path is
-        // fixture-dependent), so the intact check holds whichever primary path was chosen.
+        // SAME-PATH tripwires (V041): pinned by a path-INDEPENDENT sentinel column (the collision
+        // path is fixture-dependent), so the intact check holds whichever primary path was chosen.
         (
             "main.files",
             format!("repo_id = '{POISON_REPO_ID}' AND sha256 = '{POISON_SAMEPATH_SHA}'"),
@@ -654,6 +820,46 @@ fn sibling_tripwires() -> Vec<(&'static str, String)> {
         (
             "github_refs",
             format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_SAMEPATH_GH_NUMBER}"),
+        ),
+        // A5 periphery (V042): each directly-scoped table pinned by the sibling repo_id (plus its
+        // sentinel key where a table's row is otherwise ambiguous). `repo_memory_tags` scopes
+        // transitively through the poison memory.
+        ("repo_memories", format!("repo_id = '{POISON_REPO_ID}' AND id = '{POISON_MEMORY_ID}'")),
+        // Pinned to the distinct-path binding's `binding_id` so the same-path binding tripwire
+        // (a SECOND binding under the same memory) doesn't inflate this count.
+        (
+            "repo_memory_bindings",
+            format!("repo_id = '{POISON_REPO_ID}' AND binding_id = '{POISON_PREFIX}bind'"),
+        ),
+        ("repo_memory_tags", format!("memory_id = '{POISON_MEMORY_ID}'")),
+        (
+            "repo_memory_fts",
+            format!("repo_id = '{POISON_REPO_ID}' AND memory_id = '{POISON_MEMORY_ID}'"),
+        ),
+        ("oracle_runs", format!("repo_id = '{POISON_REPO_ID}'")),
+        // Pinned to the distinct-path edge's `scip_symbol` so the same-path edge tripwire doesn't
+        // inflate this count.
+        (
+            "edge_oracle",
+            format!("repo_id = '{POISON_REPO_ID}' AND scip_symbol = '{POISON_PREFIX}scip'"),
+        ),
+        (
+            "clone_graph_generations",
+            format!("repo_id = '{POISON_REPO_ID}' AND generation = {POISON_GENERATION}"),
+        ),
+        ("clone_token_df", format!("repo_id = '{POISON_REPO_ID}'")),
+        ("clone_refinements", format!("repo_id = '{POISON_REPO_ID}'")),
+        ("dream_findings", format!("repo_id = '{POISON_REPO_ID}'")),
+        ("reconcile_attempts", format!("repo_id = '{POISON_REPO_ID}'")),
+        // SAME-PATH tripwires (V042): the memory binding and oracle edge whose path (and, for the
+        // oracle, path+sha) collide with a real primary row, pinned by their own sentinel keys.
+        (
+            "repo_memory_bindings",
+            format!("repo_id = '{POISON_REPO_ID}' AND binding_id = '{POISON_SAMEPATH_BIND}'"),
+        ),
+        (
+            "edge_oracle",
+            format!("repo_id = '{POISON_REPO_ID}' AND scip_symbol = '{POISON_SAMEPATH_SCIP}'"),
         ),
     ]
 }

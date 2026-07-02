@@ -133,13 +133,22 @@ pub(crate) fn refine_lookup(
     // The full content payload (4b): the rendered template + the serialized variation_points /
     // proposed_signature + the REAL anti_unify_coverage round-trip alongside the scoring outputs,
     // so a warm hit returns everything without recomputing the alignment.
+    // Per-repo (A5): `clone_refinements.class_key` is content-derived, so it collides across repos;
+    // scope the read to the active repo. `{repo_clause}` is empty pre-A5. Read-only-safe (both the
+    // column probe and the active-repo resolve are reads), so it stays callable on a read-only
+    // conn.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "clone_refinements")?;
+    let repo_clause =
+        crate::index::schema::periphery_repo_scope_clause(&scope, "clone_refinements");
     #[allow(clippy::type_complexity)]
     let hit: Option<(f64, String, f64, i64, String, String, String, f64)> = conn
         .query_row(
-            "SELECT lcs_ratio, confidence, refactorability, lcs_sampled,
+            &format!(
+                "SELECT lcs_ratio, confidence, refactorability, lcs_sampled,
                     template, variation_points_json, proposed_signature_json, anti_unify_coverage
              FROM clone_refinements
-             WHERE class_key = ?1 AND norm_version = ?2 AND alignment_version = ?3",
+             WHERE class_key = ?1 AND norm_version = ?2 AND alignment_version = ?3{repo_clause}"
+            ),
             rusqlite::params![refinement_key, NORM_VERSION, ALIGNMENT_VERSION],
             |row| {
                 Ok((
@@ -283,15 +292,25 @@ pub(crate) fn refine_compute_and_store_budgeted(
     let variation_points_json = serde_json::to_string(&template.variation_points)?;
     let proposed_signature_json = serde_json::to_string(&signature)?;
 
-    // Persist the full row. INSERT OR REPLACE because `class_key` is the table PRIMARY KEY — a
-    // re-run at a NEW version pin replaces the stale row in place rather than accumulating.
+    // Persist the full row. INSERT OR REPLACE keys on the PRIMARY KEY — pre-A5 that is `class_key`;
+    // post-A5 it is `(repo_id, class_key)`, so stamp the active repo (a content class_key collides
+    // across repos). The repo id is a per-call literal prefix so the bound params (`?1`..`?14`)
+    // stay unchanged.
+    let (repo_col, repo_val) =
+        match crate::index::schema::periphery_repo_scope(conn, "clone_refinements")? {
+            Some(repo_id) =>
+                ("repo_id, ".to_string(), format!("'{}', ", repo_id.replace('\'', "''"))),
+            None => (String::new(), String::new()),
+        };
     conn.execute(
-        "INSERT OR REPLACE INTO clone_refinements(
-             class_key, language, refine_mode, template,
+        &format!(
+            "INSERT OR REPLACE INTO clone_refinements(
+             {repo_col}class_key, language, refine_mode, template,
              variation_points_json, proposed_signature_json, confidence,
              anti_unify_coverage, lcs_ratio, refactorability,
              norm_version, alignment_version, created_at_ms, lcs_sampled
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         ) VALUES ({repo_val}?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+        ),
         rusqlite::params![
             refinement_key,
             language,

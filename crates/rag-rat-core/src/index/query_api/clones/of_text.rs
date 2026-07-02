@@ -596,8 +596,14 @@ fn load_test_symbol_ids(conn: &Connection) -> anyhow::Result<HashSet<i64>> {
 /// sub-block ordering. A token absent from the index is maximally selective (`DF_FALLBACK`),
 /// matching `load_scoped_baseline_bags`.
 fn load_clone_token_df(conn: &Connection) -> anyhow::Result<HashMap<i64, i64>> {
-    let mut stmt = conn
-        .prepare("SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = 'baseline'")?;
+    // Per-repo df (A5): scope to the active repo; `{df_repo_clause}` is empty pre-A5.
+    let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
+    let df_repo_clause =
+        crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = \
+         'baseline'{df_repo_clause}"
+    ))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
     let mut map = HashMap::new();
     for row in rows {

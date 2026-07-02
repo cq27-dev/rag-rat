@@ -130,8 +130,16 @@ pub(crate) fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec
     // `token_bag` BLOB, so df can no longer be a per-token SQL JOIN. Each decoded token's df is
     // looked up here in Rust and COALESCEd to the fallback sentinel — a missing-df token must NOT
     // be dropped (design rev-4 §2). Only the baseline normalizer feeds candidate recall.
-    let mut df_stmt = conn
-        .prepare("SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = 'baseline'")?;
+    // Post-A5 df is per-repo (its PK carries `repo_id`), so scope the read to the active repo —
+    // `{df_repo_clause}` is empty pre-A5. The writer (`refresh_clone_token_df` / the incremental
+    // bump) stamps the same repo, so the two agree.
+    let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
+    let df_repo_clause =
+        crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
+    let mut df_stmt = conn.prepare(&format!(
+        "SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = \
+         'baseline'{df_repo_clause}"
+    ))?;
     let df_by_token: std::collections::HashMap<i64, i64> = df_stmt
         .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
         .collect::<Result<_, _>>()?;

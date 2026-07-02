@@ -63,7 +63,30 @@ fn claim_hash(kind: &str, subject: &str, evidence: &str) -> String {
     hex16(&h.finalize())
 }
 
-fn finding_id(kind: &str, subject: &str, ch: &str) -> String {
+/// Derive a finding id with the owning repo FOLDED into the hash (the `logical_symbols.stable_id`
+/// precedent, A3). The id column stays a GLOBAL `TEXT PRIMARY KEY` while the lifecycle lookups are
+/// repo-scoped — without the fold, two repos producing the same `(kind, subject, claim_hash)`
+/// derive the SAME id, and the second repo's scoped lookup (which no longer sees the sibling's row)
+/// takes the INSERT path straight into a PK violation. Folding keeps ids globally unique and
+/// coordination-free with no PK shape change.
+pub(crate) fn repo_folded_finding_id(repo_id: &str, kind: &str, subject: &str, ch: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(repo_id.as_bytes());
+    h.update([0x1f]);
+    h.update(kind.as_bytes());
+    h.update([0x1f]);
+    h.update(subject.as_bytes());
+    h.update([0x1f]);
+    h.update(ch.as_bytes());
+    hex16(&h.finalize())
+}
+
+/// The runtime id derivation: repo-folded on the post-A5 schema (`scope` is `Some`), the original
+/// repo-blind hash pre-A5 (no `repo_id` column — single-repo by construction, ids stay compatible).
+fn finding_id(scope: &Option<String>, kind: &str, subject: &str, ch: &str) -> String {
+    if let Some(repo_id) = scope {
+        return repo_folded_finding_id(repo_id, kind, subject, ch);
+    }
     let mut h = Sha256::new();
     h.update(kind.as_bytes());
     h.update([0x1f]);
@@ -71,6 +94,36 @@ fn finding_id(kind: &str, subject: &str, ch: &str) -> String {
     h.update([0x1f]);
     h.update(ch.as_bytes());
     hex16(&h.finalize())
+}
+
+/// Re-derive every persisted finding id under its row's CURRENT `repo_id` (and remap the in-table
+/// `superseded_by` references — the only place a finding id is persisted outside the `id` column
+/// itself). Called from the V042 migration (after the periphery backfill) and from `register_repo`
+/// adoption (after the periphery re-point), mirroring `realign_logical_symbol_ids`: whenever a
+/// row's `repo_id` changes, the id it SHOULD have changes with it. Idempotent (an already-derived
+/// id re-derives to itself) and cheap (the worklist is small). Callers guard on the `repo_id`
+/// column existing.
+pub(crate) fn rederive_finding_ids(conn: &Connection) -> rusqlite::Result<()> {
+    let rows: Vec<(String, String, String, String, String)> = conn
+        .prepare("SELECT id, kind, subject, claim_hash, repo_id FROM dream_findings")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut remap = Vec::new();
+    for (old_id, kind, subject, ch, repo_id) in rows {
+        let new_id = repo_folded_finding_id(&repo_id, &kind, &subject, &ch);
+        if new_id != old_id {
+            remap.push((old_id, new_id));
+        }
+    }
+    for (old_id, new_id) in &remap {
+        conn.execute("UPDATE dream_findings SET id = ?2 WHERE id = ?1", [old_id, new_id])?;
+    }
+    for (old_id, new_id) in &remap {
+        conn.execute("UPDATE dream_findings SET superseded_by = ?2 WHERE superseded_by = ?1", [
+            old_id, new_id,
+        ])?;
+    }
+    Ok(())
 }
 
 fn hex16(bytes: &[u8]) -> String {
@@ -89,17 +142,26 @@ fn hex16(bytes: &[u8]) -> String {
 /// are checkout-scoped; the caller in-degree is not yet scoped (follow-up: reuse the scoped
 /// `important_symbols` PageRank instead of this raw in-degree proxy).
 fn coverage_gap(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<DreamFinding>> {
-    let mut stmt = conn.prepare(
+    // The COVERAGE exclusion subqueries read `repo_memory_bindings` and must be scoped to the
+    // ACTIVE repo (V042): a SIBLING repo's binding — a colliding `symbol_id` rowid, or a path
+    // binding at a path this repo also has (the same-path case) — would otherwise mark this repo's
+    // load-bearing symbol as covered and SUPPRESS its coverage-gap finding (a false negative).
+    // `{binding_clause}`/`{b_clause}` empty pre-A5.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let binding_clause =
+        crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memory_bindings");
+    let b_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "b");
+    let mut stmt = conn.prepare(&format!(
         "SELECT s.name, f.path, COUNT(DISTINCT e.from_symbol_id) AS d FROM edges_data e JOIN \
          symbols s ON s.id = e.to_symbol_id JOIN files f ON f.id = s.file_id WHERE e.to_symbol_id \
          IS NOT NULL AND e.from_symbol_id IS NOT NULL AND f.has_test_code = 0 AND e.to_symbol_id \
-         NOT IN (SELECT symbol_id FROM repo_memory_bindings WHERE symbol_id IS NOT NULL) AND \
-         e.to_symbol_id NOT IN (SELECT lsm.symbol_id FROM logical_symbol_members lsm JOIN \
-         repo_memory_bindings b ON b.logical_symbol_id = lsm.logical_symbol_id WHERE \
-         b.logical_symbol_id IS NOT NULL) AND f.path NOT IN (SELECT path FROM \
-         repo_memory_bindings WHERE path IS NOT NULL) GROUP BY e.to_symbol_id ORDER BY d DESC \
-         LIMIT ?1",
-    )?;
+         NOT IN (SELECT symbol_id FROM repo_memory_bindings WHERE symbol_id IS NOT \
+         NULL{binding_clause}) AND e.to_symbol_id NOT IN (SELECT lsm.symbol_id FROM \
+         logical_symbol_members lsm JOIN repo_memory_bindings b ON b.logical_symbol_id = \
+         lsm.logical_symbol_id WHERE b.logical_symbol_id IS NOT NULL{b_clause}) AND f.path NOT IN \
+         (SELECT path FROM repo_memory_bindings WHERE path IS NOT NULL{binding_clause}) GROUP BY \
+         e.to_symbol_id ORDER BY d DESC LIMIT ?1"
+    ))?;
     let rows: Vec<(String, String, i64)> = stmt
         .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -130,8 +192,13 @@ fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
     let mut out = Vec::new();
     // 'stale'-status memories are still LIVE (just flagged) and are the ones most likely to hold a
     // moved/deleted path — scan them too, matching the memory layer's status IN ('active','stale').
-    let mut stmt =
-        conn.prepare("SELECT id, body FROM repo_memories WHERE status IN ('active', 'stale')")?;
+    // Scoped to the ACTIVE repo (V042): a sibling repo's memory referencing a path that does not
+    // resolve in THIS repo's index must not surface as this repo's stale_reference finding.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memories");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, body FROM repo_memories WHERE status IN ('active', 'stale'){repo_clause}"
+    ))?;
     let mems: Vec<(String, String)> =
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     for (id, body) in mems {
@@ -160,10 +227,30 @@ fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
     Ok(out)
 }
 
+/// The active `repo_id` to scope the `dream_findings` lifecycle by (V042), or `None` on the pre-A5
+/// schema (the column is absent, so the reads/writes run unscoped — the original repo-global SQL).
+/// Probes `dream_findings` — see `schema::periphery_repo_scope`.
+fn dream_repo_scope(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    crate::index::schema::periphery_repo_scope(conn, "dream_findings")
+}
+
+/// The ` AND dream_findings.repo_id = '…'` predicate for a scoped `dream_findings` read/write, or
+/// `""` when unscoped.
+fn dream_repo_scope_clause(scope: &Option<String>) -> String {
+    crate::index::schema::periphery_repo_scope_clause(scope, "dream_findings")
+}
+
 /// Sync findings into `dream_findings` with the identity-keyed lifecycle (refresh / supersede /
 /// resolve), ATOMICALLY: all writes run in one transaction so a mid-run failure can't leave a torn
 /// worklist (the per-finding upserts + the resolve pass commit together or not at all). Returns
 /// (opened, refreshed, superseded, resolved).
+///
+/// SCOPE (A5): every lookup / supersede / resolve / list here filters `dream_findings.repo_id`, and
+/// the INSERT stamps it, so a run in one repo of a consolidated DB never reads, supersedes, or
+/// resolves a sibling repo's worklist rows. The id is derived by [`repo_folded_finding_id`] — the
+/// repo is IN the hash, so two repos minting the same `(kind, subject, claim_hash)` never collide
+/// on the global `id` PK (the scoped lookup cannot see a sibling's row, so a repo-blind id would
+/// turn that case into a PK violation on insert rather than the pre-scoping silent UPDATE).
 fn sync(
     conn: &Connection,
     findings: &[DreamFinding],
@@ -182,26 +269,41 @@ fn sync_in_tx(
 ) -> rusqlite::Result<(usize, usize, usize, usize)> {
     let (mut opened, mut refreshed, mut superseded, mut resolved) = (0, 0, 0, 0);
     let mut seen: HashSet<(String, String)> = HashSet::new();
+    // Resolve the active-repo scope once for the whole sync (all statements below share it): the
+    // read predicate `{repo_clause}` and the INSERT's `{repo_col}`/`{repo_val}` stamp prefix.
+    let scope = dream_repo_scope(conn)?;
+    let repo_clause = dream_repo_scope_clause(&scope);
+    let (repo_col, repo_val) = match &scope {
+        Some(repo_id) => ("repo_id, ".to_string(), format!("'{}', ", repo_id.replace('\'', "''"))),
+        None => (String::new(), String::new()),
+    };
     for f in findings {
         let ch = claim_hash(&f.kind, &f.subject, &f.evidence);
         seen.insert((f.kind.clone(), f.subject.clone()));
         // Look up by the EXACT claim (incl. its current status) — NOT status-blind, or an evidence
         // flip-back (A→B→A) or a resolved-then-reappears would match a terminal row and silently
-        // refresh it, stranding the actually-current finding.
+        // refresh it, stranding the actually-current finding. Scoped to the active repo so a
+        // sibling's identically-keyed row can't hijack this repo's re-resolution.
         let existing: Option<(String, String)> = conn
             .query_row(
-                "SELECT id, status FROM dream_findings WHERE kind = ?1 AND subject = ?2 AND \
-                 claim_hash = ?3",
+                &format!(
+                    "SELECT id, status FROM dream_findings WHERE kind = ?1 AND subject = ?2 AND \
+                     claim_hash = ?3{repo_clause}"
+                ),
                 rusqlite::params![f.kind, f.subject, ch],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok();
         // supersede any OTHER current row for this (kind, subject) — used by both the revive and
-        // the brand-new branches (the world changed, so a prior verdict no longer applies).
+        // the brand-new branches (the world changed, so a prior verdict no longer applies). Scoped
+        // so it never supersedes a sibling repo's current finding sharing this (kind, subject).
         let supersede_others = |id: &str| {
             conn.execute(
-                "UPDATE dream_findings SET status = 'superseded', superseded_by = ?1 WHERE kind = \
-                 ?2 AND subject = ?3 AND id != ?1 AND status IN ('open','accepted','dismissed')",
+                &format!(
+                    "UPDATE dream_findings SET status = 'superseded', superseded_by = ?1 WHERE \
+                     kind = ?2 AND subject = ?3 AND id != ?1 AND status IN \
+                     ('open','accepted','dismissed'){repo_clause}"
+                ),
                 rusqlite::params![id, f.kind, f.subject],
             )
         };
@@ -228,11 +330,13 @@ fn sync_in_tx(
             },
             // brand-new claim for this (kind, subject): open fresh + supersede prior current rows
             None => {
-                let id = finding_id(&f.kind, &f.subject, &ch);
+                let id = finding_id(&scope, &f.kind, &f.subject, &ch);
                 conn.execute(
-                    "INSERT INTO dream_findings(id, kind, subject, claim_hash, evidence, \
-                     base_rank, status, first_seen_at_ms, last_seen_at_ms) \
-                     VALUES(?1,?2,?3,?4,?5,?6,'open',?7,?7)",
+                    &format!(
+                        "INSERT INTO dream_findings({repo_col}id, kind, subject, claim_hash, \
+                         evidence, base_rank, status, first_seen_at_ms, last_seen_at_ms) \
+                         VALUES({repo_val}?1,?2,?3,?4,?5,?6,'open',?7,?7)"
+                    ),
                     rusqlite::params![id, f.kind, f.subject, ch, f.evidence, f.rank, now_ms],
                 )?;
                 opened += 1;
@@ -240,12 +344,14 @@ fn sync_in_tx(
             },
         }
     }
-    // resolve: any current finding whose (kind, subject) was not reported this run -> drift gone
+    // resolve: any current finding whose (kind, subject) was not reported this run -> drift gone.
+    // Scoped so this repo's run only resolves ITS OWN worklist, never a sibling repo's open
+    // findings.
     let current: Vec<(String, String, String)> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT id, kind, subject FROM dream_findings WHERE status IN \
-             ('open','accepted','dismissed')",
-        )?
+             ('open','accepted','dismissed'){repo_clause}"
+        ))?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, kind, subject) in current {
@@ -266,12 +372,14 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<Drea
 
     // emit the OPEN worklist from the store (post-sync); each finding's exposed rank is its
     // base_rank DECAYED by age since first_seen (effective_rank) — a stale unreviewed finding
-    // sinks below fresh ones (the documented anti-rot, now real, not just base_rank DESC).
+    // sinks below fresh ones (the documented anti-rot, now real, not just base_rank DESC). Scoped
+    // to the active repo so the emitted worklist never mixes in a sibling repo's open findings.
+    let repo_clause = dream_repo_scope_clause(&dream_repo_scope(conn)?);
     let mut open: Vec<DreamFinding> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT kind, subject, evidence, base_rank, first_seen_at_ms FROM dream_findings \
-             WHERE status = 'open'",
-        )?
+             WHERE status = 'open'{repo_clause}"
+        ))?
         .query_map([], |r| {
             let base: f64 = r.get(3)?;
             let first_seen: i64 = r.get(4)?;
@@ -302,6 +410,103 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         crate::index::schema::apply(&c).unwrap();
         c
+    }
+
+    /// Point the connection's periphery scope at `repo_id` — mirrors the scope-context write the
+    /// production open installs (and `multi_repo_scope::a5_set_active_repo`).
+    fn set_repo(c: &Connection, repo_id: &str) {
+        c.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
+            [repo_id],
+        )
+        .unwrap();
+    }
+
+    /// A5 finding: `finding_id` folds the owning repo. Two repos minting the SAME
+    /// `(kind, subject, claim_hash)` derive DISTINCT ids — a repo-blind id would make the second
+    /// repo's sync explode on the global `id` PK, because its repo-scoped lookup cannot see the
+    /// sibling's row and takes the INSERT path.
+    #[test]
+    fn two_repos_minting_the_same_finding_do_not_collide_on_the_global_id() {
+        let c = mem_db();
+        let finding = || {
+            vec![DreamFinding {
+                kind: "coverage_gap".into(),
+                subject: "x::F".into(),
+                evidence: "7 callers".into(),
+                rank: 0.5,
+            }]
+        };
+        set_repo(&c, "repo-a");
+        sync(&c, &finding(), 1000).unwrap();
+        set_repo(&c, "repo-b");
+        // Pre-fix this is a PK violation, not an UPDATE: the scoped lookup misses repo-a's row and
+        // the insert derives the same repo-blind id.
+        sync(&c, &finding(), 2000).unwrap();
+
+        let rows: Vec<(String, String)> = c
+            .prepare(
+                "SELECT id, repo_id FROM dream_findings WHERE status = 'open' ORDER BY repo_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "each repo holds its own open finding: {rows:?}");
+        assert_eq!(rows[0].1, "repo-a");
+        assert_eq!(rows[1].1, "repo-b");
+        assert_ne!(rows[0].0, rows[1].0, "the two findings carry DISTINCT repo-folded ids");
+    }
+
+    /// `rederive_finding_ids` re-points every id (and the in-table `superseded_by` references) to
+    /// the repo-folded derivation, and is idempotent — the V042 migration and adoption both call
+    /// it after re-stamping `repo_id`.
+    #[test]
+    fn rederive_finding_ids_repoints_ids_and_superseded_by() {
+        let c = mem_db();
+        // Two rows under `repo-x` carrying LEGACY (repo-blind) ids, chained by superseded_by.
+        c.execute_batch(
+            "INSERT INTO dream_findings(id, kind, subject, claim_hash, evidence, base_rank, \
+             status, superseded_by, first_seen_at_ms, last_seen_at_ms, repo_id)
+             VALUES ('oldid1', 'coverage_gap', 'x::F', 'c1', 'ev1', 0.5, 'superseded', 'oldid2', \
+             0, 0, 'repo-x'),
+                    ('oldid2', 'coverage_gap', 'x::F', 'c2', 'ev2', 0.6, 'open', NULL, 0, 0, \
+             'repo-x');",
+        )
+        .unwrap();
+        rederive_finding_ids(&c).unwrap();
+
+        let new1 = repo_folded_finding_id("repo-x", "coverage_gap", "x::F", "c1");
+        let new2 = repo_folded_finding_id("repo-x", "coverage_gap", "x::F", "c2");
+        let ids: Vec<(String, Option<String>)> = c
+            .prepare("SELECT id, superseded_by FROM dream_findings ORDER BY claim_hash")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids[0].0, new1, "row 1's id re-derived under its repo");
+        assert_eq!(ids[1].0, new2, "row 2's id re-derived under its repo");
+        assert_eq!(
+            ids[0].1.as_deref(),
+            Some(new2.as_str()),
+            "the superseded_by reference is remapped to the re-derived id"
+        );
+        // Idempotent: a second pass moves nothing.
+        rederive_finding_ids(&c).unwrap();
+        let again: Vec<String> = c
+            .prepare("SELECT id FROM dream_findings ORDER BY claim_hash")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(again, vec![new1, new2], "re-derivation is idempotent");
     }
 
     #[test]

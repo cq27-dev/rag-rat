@@ -50,9 +50,22 @@ pub(crate) fn reconcile_with_options_progress(
     let max_embedding_chars = options.max_embedding_chars.max(MIN_EMBEDDING_CHARS);
     let started = now_ms();
     set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_STARTED_META, &started.to_string())?;
+    // Stamp the active repo (V042): `reconcile_attempts` carries `repo_id`, so the attempt is
+    // attributed to the repo whose reconcile this is — else the row defaults to the placeholder and
+    // the per-repo status read never sees it. Per-call literal prefix so the bound params are
+    // unchanged; pre-A5 uses the original 4-column shape. The finalize UPDATE keys the row by its
+    // autoincrement `id`, so it needs no repo predicate.
+    let (repo_col, repo_val) =
+        match crate::index::schema::periphery_repo_scope(conn, "reconcile_attempts")? {
+            Some(repo_id) =>
+                ("repo_id, ".to_string(), format!("'{}', ", repo_id.replace('\'', "''"))),
+            None => (String::new(), String::new()),
+        };
     conn.execute(
-        "INSERT INTO reconcile_attempts(started_at_ms, limit_count, status, batch_size) VALUES \
-         (?1, ?2, 'Running', ?3)",
+        &format!(
+            "INSERT INTO reconcile_attempts({repo_col}started_at_ms, limit_count, status, \
+             batch_size) VALUES ({repo_val}?1, ?2, 'Running', ?3)"
+        ),
         params![
             started,
             options.limit.map(i64::from),

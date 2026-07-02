@@ -835,6 +835,30 @@ pub(crate) fn insert_binding(
     }
     Ok(())
 }
+/// Stamp every `repo_memory_bindings` row of `memory_id` with the PARENT memory's `repo_id` (spec
+/// §4.5: a binding inherits its memory's repo). Sourced from `repo_memories.repo_id`, NOT the
+/// active repo — a memory bound under a repo other than the currently-active one (a future
+/// cross-repo shape) keeps its own attribution. Called after every binding (re-)insert
+/// (`create_memory` after its memory is stamped, `rebind_memory` which deletes + re-inserts), so a
+/// re-inserted binding never strands at the `__unassigned__` default — which would drop it out of
+/// the binding-scoped sweeps (`validate_memories`, `doctor_report`, `anchor_health_counts`) while
+/// the parent memory sat in the active repo. No-op pre-A5 (no `repo_id` column).
+/// `repo_memory_call_paths` / `repo_memory_call_path_edges` are transitive (scoped via the
+/// `repo_memories` FK), so they carry no `repo_id` to stamp.
+pub(crate) fn stamp_bindings_from_parent_repo(
+    conn: &Connection,
+    memory_id: &str,
+) -> anyhow::Result<()> {
+    if crate::index::schema::periphery_repo_scope(conn, "repo_memory_bindings")?.is_some() {
+        conn.execute(
+            "UPDATE repo_memory_bindings
+             SET repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
+             WHERE memory_id = ?1",
+            [memory_id],
+        )?;
+    }
+    Ok(())
+}
 pub(crate) struct RelocateMatch {
     pub(crate) binding_id: String,
     pub(crate) symbol_id: i64,

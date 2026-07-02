@@ -3,15 +3,21 @@ mod migrations;
 mod registry;
 pub(crate) use baseline::*;
 pub(crate) use migrations::*;
+// `multiple_real_repos` lost its production callers when V042's real `repo_id` predicates
+// superseded the gc / clone-precompute seam guards (A5); it survives only as a
+// registry-internal check (`resolve_config_repo_id`) and a `multi_repo_scope` test assertion,
+// so the re-export is test-only now.
+#[cfg(test)]
+pub(crate) use registry::multiple_real_repos;
 pub(crate) use registry::{
-    CONNECTION_CONTEXT_REPO_KEY, active_repo_id, multiple_real_repos, resolve_config_repo_id,
-    sole_repo_id,
+    CONNECTION_CONTEXT_REPO_KEY, active_repo_id, periphery_repo_scope, periphery_repo_scope_clause,
+    resolve_config_repo_id, sole_repo_id,
 };
 pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 41;
+pub const LATEST_SCHEMA_VERSION: u32 = 42;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -268,6 +274,16 @@ const MIGRATION_041_DESCRIPTION: &str =
      issues, comments, pull_requests, reviews, review_comments, ref_sync) and rebuild github_fts \
      with a repo_id UNINDEXED column, so lexical and papertrail queries in a consolidated \
      database never surface a sibling repo's refs or issues (memory-sync phase A4)";
+const MIGRATION_042_ID: &str = "042_repo_id_periphery_scoping";
+const MIGRATION_042_CHECKSUM: &str = "sha256:rag-rat-repo-id-periphery-scoping-v42";
+const MIGRATION_042_DESCRIPTION: &str =
+    "Repo-scope the clone / oracle / reconcile / memory periphery: add repo_id to \
+     clone_graph_generations, oracle_runs, reconcile_attempts, repo_memories, \
+     repo_memory_bindings (additive) and rebuild clone_token_df, clone_refinements, edge_oracle, \
+     logical_symbol_monikers, dream_findings with repo_id in their PK / UNIQUE plus \
+     repo_memory_fts with a repo_id UNINDEXED column, so clone stats, oracle runs, and memory \
+     search in a consolidated database never pool or surface a sibling repo's rows (memory-sync \
+     phase A5)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -613,6 +629,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_041_CHECKSUM,
         description: MIGRATION_041_DESCRIPTION,
         apply: apply_github_repo_id_scoping,
+    },
+    Migration {
+        id: MIGRATION_042_ID,
+        checksum: MIGRATION_042_CHECKSUM,
+        description: MIGRATION_042_DESCRIPTION,
+        apply: apply_repo_id_periphery_scoping,
     },
 ];
 

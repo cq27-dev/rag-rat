@@ -1248,11 +1248,14 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
     let db = IndexDatabase::rebuild(&config).unwrap();
     // Null out the symbol_id so the exact-id check misses, and corrupt binding_id to an
     // impossible qualified_name so the qualified_name lookup also misses — leaving only
-    // the bare-name+hash path, which must return None (>=2 candidates).
+    // the bare-name+hash path, which must return None (>=2 candidates). Scoped to the test's
+    // own SYMBOL binding: the poison sibling seeds two PATH bindings under one memory, and an
+    // unscoped rewrite would collapse their binding_ids into a PK collision.
     db.storage
         .connection()
         .execute(
-            "UPDATE repo_memory_bindings SET symbol_id = NULL, binding_id = 'src/gone.rs::target'",
+            "UPDATE repo_memory_bindings SET symbol_id = NULL, binding_id = 'src/gone.rs::target' \
+             WHERE binding_kind = 'symbol'",
             [],
         )
         .unwrap();
@@ -1849,6 +1852,40 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+/// A memory stranded under the `'__unassigned__'` placeholder on an ADOPTED DB — the V042
+/// consolidated-DB backfill's leave-at-placeholder path — is user-authored data invisible to
+/// every scoped memory read. The doctor must surface it as a `placeholder_repo` entry instead of
+/// letting it vanish silently. (Needs a REAL git fixture: on a placeholder-active DB the
+/// placeholder scope is the normal state and the doctor deliberately stays quiet about it.)
+#[test]
+fn memory_doctor_surfaces_placeholder_scoped_memories() {
+    let (_root, config) = super::poison_test_config("doctor_placeholder");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // Strand a memory under the placeholder, exactly as the V042 backfill leaves one on a
+    // consolidated DB.
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO repo_memories(
+                 id, kind, title, body, confidence, status, created_at_ms, updated_at_ms, source,
+                 memory_version, repo_id)
+             VALUES ('mem_placeholder', 'Invariant', 'stranded memory', 'body', 'high', 'active', \
+             0, 0, 'manual', 'v1', ?1)",
+            [crate::index::schema::LEGACY_REPO_ID],
+        )
+        .unwrap();
+
+    let entries = db.memory_doctor().unwrap();
+    let entry = entries
+        .iter()
+        .find(|e| e.memory_id == "mem_placeholder")
+        .expect("the placeholder-scoped memory must be surfaced by the doctor");
+    assert_eq!(entry.anchor_status, "placeholder_repo");
+    assert_eq!(entry.title, "stranded memory");
+    assert_eq!(entry.binding_kind, "repo");
+    assert!(entry.candidates.is_empty(), "no computable rebind candidates for a repo strand");
 }
 
 #[test]

@@ -518,8 +518,21 @@ pub(crate) fn validate_len(field: &str, value: &str, max: usize) -> anyhow::Resu
     }
     Ok(())
 }
-pub(crate) fn memory_id(now: i64, input_hash: &str) -> String {
-    let suffix = input_hash.chars().take(12).collect::<String>();
+/// Derive a memory id. On the post-A5 schema (`scope` is `Some`) the owning repo is FOLDED into the
+/// hash suffix: two repos creating IDENTICAL content in the same millisecond would otherwise derive
+/// the same `mem_<ms>_<hash-prefix>` id — the repo-scoped dedupe (correctly) sees no duplicate, and
+/// the insert explodes on the global PK. Phase B and beyond: memory ids must remain globally unique
+/// and coordination-free (they replicate across devices/DBs with no allocator) — folding the repo
+/// INTO the hash strengthens that property, never weakens it. Pre-A5 (`None`) keeps the original
+/// repo-blind suffix so a single-repo DB's ids are unchanged.
+pub(crate) fn memory_id(now: i64, input_hash: &str, scope: &Option<String>) -> String {
+    let suffix = match scope {
+        Some(repo_id) => hex_sha256(format!("{repo_id}\u{1f}{input_hash}").as_bytes())
+            .chars()
+            .take(12)
+            .collect::<String>(),
+        None => input_hash.chars().take(12).collect::<String>(),
+    };
     format!("mem_{now:x}_{suffix}")
 }
 pub(crate) fn memory_input_hash(kind: &str, title: &str, body: &str, tags: &[String]) -> String {

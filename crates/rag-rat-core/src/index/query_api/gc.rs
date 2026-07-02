@@ -117,16 +117,13 @@ impl IndexDatabase {
         // prune a dead checkout's run rows with the SAME live sets, so a run and the
         // edges it produced are dropped together.
         oracle::prune_edge_oracle_without_live_edge(conn)?;
-        // V042 SEAM: `oracle_runs` has NO `repo_id` yet, so `prune_oracle_runs_outside_scope`
-        // deletes GLOBALLY against THIS repo's live sets. On a consolidated multi-repo DB that
-        // would wipe a sibling repo's run rows (its commits/worktrees are legitimately
-        // absent from this repo's live sets). Skip the global prune when more than one real
-        // repo is registered; the per-repo prune lands once `oracle_runs` gains `repo_id`
-        // in V042 (successor branch). A single-repo DB (every DB pre-A7) is unaffected —
-        // the guard is dormant.
-        if !schema::multiple_real_repos(conn)? {
-            oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
-        }
+        // Per-repo (A5): `prune_oracle_runs_outside_scope` now filters `oracle_runs.repo_id` (its
+        // own column since V042), so it deletes only THIS repo's run rows that fall outside THIS
+        // repo's live sets — a sibling repo's runs are legitimately absent from this repo's live
+        // set but are no longer touched. That real `repo_id` predicate SUPERSEDES the old V042-seam
+        // `multiple_real_repos` guard, so the prune runs unconditionally again (exactly as it did
+        // on a single-repo DB before scoping).
+        oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
         // #357: `embedding_cache` is content-keyed too (survives reindex, like the oracle above),
         // so it needs the SAME global sweep — drop vectors no live chunk references in ANY
         // context (a sibling worktree / branch may still use one, so this must not be

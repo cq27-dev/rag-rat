@@ -46,14 +46,21 @@ pub(crate) fn moniker_for_logical_symbol(
     conn: &Connection,
     logical_symbol_id: i64,
 ) -> anyhow::Result<Option<MonikerRow>> {
+    // Per-repo (A5): `logical_symbol_id` is content-derived and collides across repos, so scope to
+    // the active repo. `{repo_clause}` empty pre-A5.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "logical_symbol_monikers")?;
+    let repo_clause =
+        crate::index::schema::periphery_repo_scope_clause(&scope, "logical_symbol_monikers");
     conn.query_row(
-        "
+        &format!(
+            "
         SELECT moniker, tool, tool_version
         FROM logical_symbol_monikers
-        WHERE logical_symbol_id = ?1
+        WHERE logical_symbol_id = ?1{repo_clause}
         ORDER BY tool
         LIMIT 1
-        ",
+        "
+        ),
         [logical_symbol_id],
         |row| Ok(MonikerRow { moniker: row.get(0)?, tool: row.get(1)?, tool_version: row.get(2)? }),
     )
@@ -69,12 +76,17 @@ pub(crate) fn moniker_for_logical_symbol_tool(
     logical_symbol_id: i64,
     tool: &str,
 ) -> anyhow::Result<Option<MonikerRow>> {
+    let scope = crate::index::schema::periphery_repo_scope(conn, "logical_symbol_monikers")?;
+    let repo_clause =
+        crate::index::schema::periphery_repo_scope_clause(&scope, "logical_symbol_monikers");
     conn.query_row(
-        "
+        &format!(
+            "
         SELECT moniker, tool, tool_version
         FROM logical_symbol_monikers
-        WHERE logical_symbol_id = ?1 AND tool = ?2
-        ",
+        WHERE logical_symbol_id = ?1 AND tool = ?2{repo_clause}
+        "
+        ),
         params![logical_symbol_id, tool],
         |row| Ok(MonikerRow { moniker: row.get(0)?, tool: row.get(1)?, tool_version: row.get(2)? }),
     )
@@ -108,15 +120,31 @@ pub(crate) fn resolve_moniker(
     moniker: &str,
     tool: &str,
 ) -> anyhow::Result<MonikerResolution> {
-    let mut stmt = conn.prepare(
+    // Per-repo (A5): BOTH sides are scoped. `logical_symbol_monikers` carries its own `repo_id`
+    // since V042, so a SIBLING repo carrying the same SCIP moniker string must not capture this
+    // memory's re-resolution during validation (relocate it onto — or mark it ambiguous/gone by —
+    // the sibling's row). The `logical_symbols` liveness join is scoped too (its `repo_id`
+    // predicate rides the LEFT JOIN's `ON` so a dangling row still reads as not-live rather
+    // than being dropped) — belt-and-suspenders since `logical_symbol_id` already folds
+    // `repo_id` into its content hash. The `tool_has_rows` probe (the Gone-vs-NoData
+    // discriminator) is scoped identically so a sibling's rows can't make this repo's tool look
+    // populated. `{repo_clause}` empty pre-A5.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "logical_symbol_monikers")?;
+    let moniker_clause =
+        crate::index::schema::periphery_repo_scope_clause(&scope, "logical_symbol_monikers");
+    let symbol_clause =
+        crate::index::schema::periphery_repo_scope_clause(&scope, "logical_symbols");
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT logical_symbol_monikers.logical_symbol_id, logical_symbol_monikers.tool_version,
                logical_symbols.id IS NOT NULL AS live
         FROM logical_symbol_monikers
-        LEFT JOIN logical_symbols ON logical_symbols.id = logical_symbol_monikers.logical_symbol_id
-        WHERE logical_symbol_monikers.moniker = ?1 AND logical_symbol_monikers.tool = ?2
-        ",
-    )?;
+        LEFT JOIN logical_symbols ON logical_symbols.id = \
+         logical_symbol_monikers.logical_symbol_id{symbol_clause}
+        WHERE logical_symbol_monikers.moniker = ?1 AND logical_symbol_monikers.tool = \
+         ?2{moniker_clause}
+        "
+    ))?;
     let rows = stmt
         .query_map(params![moniker, tool], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
@@ -129,7 +157,10 @@ pub(crate) fn resolve_moniker(
     match (rows.is_empty(), first, second) {
         (true, ..) => {
             let tool_has_rows: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM logical_symbol_monikers WHERE tool = ?1)",
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM logical_symbol_monikers WHERE tool = \
+                     ?1{moniker_clause})"
+                ),
                 [tool],
                 |row| row.get(0),
             )?;

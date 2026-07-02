@@ -693,29 +693,35 @@ fn newest_commit_time(conn: &Connection) -> anyhow::Result<i64> {
 fn memory_counts(conn: &Connection, path: Option<&str>) -> anyhow::Result<RepoBriefMemoryCounts> {
     let mut counts = RepoBriefMemoryCounts::default();
 
+    // Scoped to the active repo (V042): these counts drive the per-repo brief, so a sibling repo's
+    // memories (including a same-path binding that collides with one of ours) must not inflate them
+    // on a consolidated DB. `{repo_clause}` empty pre-A5 — see `schema::periphery_repo_scope`.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memories");
     if let Some(path) = path {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "
             SELECT repo_memories.status, COUNT(DISTINCT repo_memories.id)
             FROM repo_memories
             JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-            WHERE repo_memory_bindings.path = ?1
+            WHERE repo_memory_bindings.path = ?1{repo_clause}
             GROUP BY repo_memories.status
-            ",
-        )?;
+            "
+        ))?;
         let rows =
             stmt.query_map([path], |row| Ok((row.get::<_, String>(0)?, row_u64(row, 1)?)))?;
         for row in rows {
             add_memory_count(&mut counts, row?);
         }
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "
             SELECT status, COUNT(*)
             FROM repo_memories
+            WHERE 1=1{repo_clause}
             GROUP BY status
-            ",
-        )?;
+            "
+        ))?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row_u64(row, 1)?)))?;
         for row in rows {
             add_memory_count(&mut counts, row?);
@@ -779,17 +785,22 @@ fn memory_counts_by_path(
     conn: &Connection,
     _paths: &[String],
 ) -> anyhow::Result<BTreeMap<String, RepoBriefMemoryCounts>> {
-    let mut stmt = conn.prepare(
+    // Scoped to the active repo (V042): the join is by `repo_memory_bindings.path`, so a sibling
+    // repo's path-bound memory whose path collides with one of ours (the same-path poison tripwire)
+    // would attribute its counts to our file without this predicate. `{repo_clause}` empty pre-A5.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memories");
+    let mut stmt = conn.prepare(&format!(
         "
         SELECT repo_memory_bindings.path,
                repo_memories.status,
                COUNT(DISTINCT repo_memories.id)
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-        WHERE repo_memory_bindings.path IS NOT NULL
+        WHERE repo_memory_bindings.path IS NOT NULL{repo_clause}
         GROUP BY repo_memory_bindings.path, repo_memories.status
-        ",
-    )?;
+        "
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row_u64(row, 2)?))
     })?;

@@ -53,8 +53,11 @@ pub(crate) fn status(
 /// `(status, commit_sha)` of the most recent run for a tool/version **in the active checkout**, if
 /// any. SCOPE (load-bearing): filtered to `(commit_sha, worktree_id)` so a sibling worktree's run
 /// sharing the same `(tool, tool_version, commit_sha)` can't surface as THIS checkout's last run.
-/// The verdict counts in `status` are already worktree-scoped; this keeps the run meta consistent
-/// with them rather than describing a different checkout's pass.
+/// ALSO filtered to the ACTIVE REPO (V042): the verdict counts beside this in `status` route
+/// through the repo-scoped `edge_oracle_scope_join`, so without the same predicate here a SIBLING
+/// repo's newer run at the same `(tool, tool_version, commit_sha, worktree_id)` — the fork case —
+/// would headline this repo's `oracle status` while the counts describe a different repo's pass.
+/// `{repo_clause}` empty pre-A5.
 fn last_run_meta(
     conn: &Connection,
     tool: OracleTool,
@@ -62,15 +65,18 @@ fn last_run_meta(
     commit_sha: &str,
     worktree_id: &str,
 ) -> anyhow::Result<Option<(String, String)>> {
+    let repo_clause = super::store::oracle_repo_scope_clause(conn, "oracle_runs")?;
     let row = conn
         .query_row(
-            "
+            &format!(
+                "
             SELECT status, commit_sha FROM oracle_runs
             WHERE tool = ?1 AND tool_version = ?2
-              AND commit_sha = ?3 AND worktree_id = ?4
+              AND commit_sha = ?3 AND worktree_id = ?4{repo_clause}
             ORDER BY id DESC
             LIMIT 1
-            ",
+            "
+            ),
             rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )

@@ -206,20 +206,26 @@ fn recently_changed_source_files(conn: &Connection, limit: usize) -> anyhow::Res
 /// Dir-bound memories already appear as annotations on the tree nodes (or as
 /// `root_memory_title`), so we exclude them here to avoid duplication.
 fn active_non_dir_memory_titles(conn: &Connection, limit: usize) -> anyhow::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    // Scoped to the active repo (V042): a sibling repo's active memory must not appear in this
+    // repo's orientation. Scoping the outer `m` on `repo_memories.repo_id` is sufficient — the
+    // inner `dir`-exclusion subquery only removes ids, and a sibling id can never equal an
+    // active memory's. `{repo_clause}` empty pre-A5.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    let mut stmt = conn.prepare(&format!(
         "-- Active memories not bound to a directory, newest-updated first.
          -- Invariant: excludes binding_kind='dir' rows so tree-shown titles are not repeated.
          SELECT m.title
          FROM repo_memories AS m
-         WHERE m.status = 'active'
+         WHERE m.status = 'active'{repo_clause}
            AND m.id NOT IN (
                SELECT b.memory_id
                FROM repo_memory_bindings AS b
                WHERE b.binding_kind = 'dir'
            )
          ORDER BY m.updated_at_ms DESC
-         LIMIT ?1",
-    )?;
+         LIMIT ?1"
+    ))?;
     let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
@@ -234,18 +240,24 @@ fn active_non_dir_memory_titles(conn: &Connection, limit: usize) -> anyhow::Resu
 /// [`active_non_dir_memory_titles`] (active + excludes `binding_kind='dir'`) so the
 /// `(+N more)` overflow note reflects the true total, not the truncated title list.
 fn active_non_dir_memory_count(conn: &Connection) -> anyhow::Result<u32> {
+    // Scoped to the active repo (V042), matching `active_non_dir_memory_titles` so the `(+N more)`
+    // total counts only this repo's memories. `{repo_clause}` empty pre-A5.
+    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
     let count: i64 = conn.query_row(
-        "-- Total active memories not bound to a directory (mirrors the titles query).
+        &format!(
+            "-- Total active memories not bound to a directory (mirrors the titles query).
          -- Invariant: excludes binding_kind='dir' rows so the count matches what the
          -- titles list draws from; only the LIMIT/ORDER differ.
          SELECT COUNT(*)
          FROM repo_memories AS m
-         WHERE m.status = 'active'
+         WHERE m.status = 'active'{repo_clause}
            AND m.id NOT IN (
                SELECT b.memory_id
                FROM repo_memory_bindings AS b
                WHERE b.binding_kind = 'dir'
-           )",
+           )"
+        ),
         [],
         |row| row.get(0),
     )?;

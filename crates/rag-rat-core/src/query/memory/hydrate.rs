@@ -6,8 +6,14 @@ pub(crate) fn duplicate_memory_id(
     body: &str,
     binding: &ResolvedBinding,
 ) -> anyhow::Result<Option<String>> {
+    // Dedupe NEVER crosses repos (spec §4.4): a duplicate is a same-repo title+body+binding match.
+    // The `{repo_clause}` is empty on the pre-A5 schema (memory still repo-global), so this stays
+    // the original global dedupe until the periphery-scoping migration lands.
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
     conn.query_row(
-        "
+        &format!(
+            "
         SELECT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
@@ -15,9 +21,10 @@ pub(crate) fn duplicate_memory_id(
           AND lower(repo_memories.body) = lower(?2)
           AND repo_memory_bindings.binding_kind = ?3
           AND repo_memory_bindings.binding_id = ?4
-          AND repo_memories.status != 'obsolete'
+          AND repo_memories.status != 'obsolete'{repo_clause}
         LIMIT 1
-        ",
+        "
+        ),
         params![title.trim(), body.trim(), binding.binding_kind, binding.binding_id],
         |row| row.get("memory_id"),
     )
@@ -42,15 +49,31 @@ pub(crate) fn replace_tags(
 pub(crate) fn upsert_memory_fts(conn: &Connection, memory_id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM repo_memory_fts WHERE memory_id = ?1", [memory_id])?;
     let tags = tags_for_memory(conn, memory_id)?.join(" ");
-    conn.execute(
-        "
-        INSERT INTO repo_memory_fts(memory_id, title, body, kind, tags)
-        SELECT id, title, body, kind, ?2
-        FROM repo_memories
-        WHERE id = ?1
-        ",
-        params![memory_id, tags],
-    )?;
+    // Post-A5 the FTS carries a `repo_id UNINDEXED` mirror of the parent memory's, so
+    // `memory_search` can filter it after the MATCH. Stamp it from `repo_memories.repo_id`
+    // (already set by the time this runs). On the pre-A5 schema the column does not exist, so
+    // write the original row shape.
+    if memory_repo_scope(conn)?.is_some() {
+        conn.execute(
+            "
+            INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)
+            SELECT repo_id, id, title, body, kind, ?2
+            FROM repo_memories
+            WHERE id = ?1
+            ",
+            params![memory_id, tags],
+        )?;
+    } else {
+        conn.execute(
+            "
+            INSERT INTO repo_memory_fts(memory_id, title, body, kind, tags)
+            SELECT id, title, body, kind, ?2
+            FROM repo_memories
+            WHERE id = ?1
+            ",
+            params![memory_id, tags],
+        )?;
+    }
     Ok(())
 }
 pub(crate) fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemory> {

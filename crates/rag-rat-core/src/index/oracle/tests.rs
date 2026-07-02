@@ -1931,6 +1931,111 @@ fn clear_edge_oracle_for_tool_scopes_by_checkout_content() {
     );
 }
 
+/// A5 finding: `edge_oracle` reads (via the shared `edge_oracle_scope_join`) and the authoritative
+/// clear (`clear_edge_oracle_for_tool`) are scoped by `edge_oracle.repo_id`. A SIBLING repo's
+/// verdict whose CONTENT key (path + spans + sha) collides with one of THIS repo's live edges must
+/// neither inflate the scoped count nor be cross-cleared by this repo's run — the content join
+/// alone (files/edges are shared) would otherwise surface and delete it.
+#[test]
+fn edge_oracle_reads_and_clears_are_scoped_to_the_active_repo() {
+    let h = Harness::new();
+    let active_file = h.add_file("a.rs", "fn caller() { target(); }\n");
+    let active_sha = h.file_sha("a.rs");
+    let active_edge = h.add_edge(active_file, "target", 14, 20, "NameOnly", None);
+    h.write_verdict(active_edge, &active_sha, None, "s", OracleResolutionKind::Upgrade);
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1
+    );
+
+    // Copy the active verdict under a SIBLING repo_id: SAME content key, so it joins the SAME live
+    // edge — an UNSCOPED read would double-count it and an unscoped clear would delete it.
+    let copied = h
+        .conn
+        .execute(
+            "INSERT INTO edge_oracle(repo_id, source_path, source_start_byte, source_end_byte, \
+             callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+             resolved_symbol_id, scip_symbol, kind, computed_at)
+             SELECT 'oracle-sibling', source_path, source_start_byte, source_end_byte, \
+             callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+             resolved_symbol_id, scip_symbol, kind, computed_at
+             FROM edge_oracle WHERE repo_id != 'oracle-sibling'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(copied, 1, "one content-colliding sibling verdict seeded");
+
+    // The scoped count still sees ONLY the active repo's verdict.
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "a sibling repo's content-colliding verdict must not inflate the active repo's count",
+    );
+
+    // The scoped clear removes ONLY the active repo's verdict; the sibling survives.
+    store::clear_edge_oracle_for_tool(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let remaining: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(remaining, 1, "the sibling repo's verdict survives the active repo's clear");
+    let sibling: i64 = h
+        .conn
+        .query_row("SELECT COUNT(*) FROM edge_oracle WHERE repo_id = 'oracle-sibling'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(sibling, 1, "the surviving row is the sibling's");
+}
+
+/// A5 finding: `oracle status` pairs its run HEADER (`last_run_meta`) and its verdict COUNTS to the
+/// SAME repo. The counts route through the repo-scoped `edge_oracle_scope_join`; without the same
+/// `oracle_runs.repo_id` predicate on the header read, a SIBLING repo's NEWER run at the identical
+/// `(tool, tool_version, commit_sha, worktree_id)` — the fork case — would headline this repo's
+/// status while the counts describe this repo's pass.
+#[test]
+fn oracle_status_header_and_counts_describe_the_active_repo_not_a_sibling() {
+    let h = Harness::new();
+    // One active-repo verdict + its run row (stamped with the active repo by the writer).
+    let f = h.add_file("a.rs", "fn caller() { target(); }\n");
+    let sha = h.file_sha("a.rs");
+    let edge = h.add_edge(f, "target", 14, 20, "NameOnly", None);
+    h.write_verdict(edge, &sha, None, "s", OracleResolutionKind::Upgrade);
+    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, "complete", "{}").unwrap();
+
+    // A sibling repo's NEWER run (higher id — wins an unscoped ORDER BY id DESC) at the SAME
+    // (tool, version, commit, worktree), plus a content-colliding sibling verdict.
+    h.conn
+        .execute(
+            "INSERT INTO oracle_runs(repo_id, tool, tool_version, commit_sha, worktree_id, \
+             started_at, status, stats_json)
+             VALUES ('oracle-sibling', ?1, ?2, ?3, ?4, 999, 'failed', '{}')",
+            params![TOOL.as_db_str(), VERSION, COMMIT, WORKTREE],
+        )
+        .unwrap();
+    h.conn
+        .execute(
+            "INSERT INTO edge_oracle(repo_id, source_path, source_start_byte, source_end_byte, \
+             callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+             resolved_symbol_id, scip_symbol, kind, computed_at)
+             SELECT 'oracle-sibling', source_path, source_start_byte, source_end_byte, \
+             callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+             resolved_symbol_id, scip_symbol, kind, computed_at
+             FROM edge_oracle WHERE repo_id != 'oracle-sibling'",
+            [],
+        )
+        .unwrap();
+
+    let status = super::status::status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(
+        status.last_run_status.as_deref(),
+        Some("complete"),
+        "the status header must be the ACTIVE repo's run, not the sibling's newer 'failed' run",
+    );
+    assert_eq!(
+        status.total_verdicts, 1,
+        "the counts stay scoped to the active repo — header and counts describe the SAME repo",
+    );
+}
+
 /// #248 THE killer test: an `edge_oracle` verdict SURVIVES reindex for an UNCHANGED file. A reindex
 /// rewrites `edges_data` (DELETE + reinsert with NEW rowids); before the content-key fix the
 /// `ON DELETE CASCADE` FK wiped every verdict and the opt-in oracle never repopulated. Now the
