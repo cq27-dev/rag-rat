@@ -50,6 +50,14 @@ impl IndexDatabase {
         let mut db = Self::open(&config.database)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
+        // The incremental/maintenance/watch path opens config-blind (`Self::open`), so seed the
+        // active embedding model from config here too — else a pre-fix index (active unset) would
+        // keep reconciling via the hash fallback on watcher/maintenance passes until some other
+        // `open_config` command heals it (#394 review).
+        ai::seed_active_embedding_model(
+            db.storage.connection(),
+            config.llm.embedding.backend.model_id(),
+        )?;
         if db.indexed_file_count()? == 0 {
             return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
