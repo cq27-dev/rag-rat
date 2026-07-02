@@ -521,6 +521,7 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
     )
     .unwrap();
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
@@ -1293,6 +1294,7 @@ where
     )
     .unwrap();
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![

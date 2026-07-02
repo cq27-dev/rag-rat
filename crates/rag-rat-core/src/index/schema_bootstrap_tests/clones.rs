@@ -214,11 +214,8 @@ fn migration_036_adds_content_addressed_embedding_cache() {
 fn migration_037_adds_content_anchored_clone_subblock_postings() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     crate::index::schema::apply(&conn).expect("apply");
-    assert_eq!(
-        crate::index::schema::LATEST_SCHEMA_VERSION,
-        37,
-        "LATEST_SCHEMA_VERSION is 37 after V037"
-    );
+    // NB: V037 is no longer the schema tip (V038 added the repos registry), so this test no longer
+    // pins LATEST_SCHEMA_VERSION to an absolute number — that pin lives on the current-tip test.
 
     // The full ladder creates the postings table + the generation completeness column.
     assert!(
@@ -1068,6 +1065,7 @@ fn multi_language_clone_integration_finds_within_language_no_cross() {
     .unwrap();
 
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![
@@ -1278,6 +1276,7 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
     .unwrap();
 
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

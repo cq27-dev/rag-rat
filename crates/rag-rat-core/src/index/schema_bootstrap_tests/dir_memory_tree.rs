@@ -301,6 +301,7 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
         fs::write(root.join("src/pkg/inner/deep").join(name), "pub fn f() {}\n").unwrap();
     }
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
@@ -528,6 +529,7 @@ fn dir_tree_truncates_at_max_nodes() {
         fs::write(dir.join("lib.rs"), "pub fn f() {}\n").unwrap();
     }
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
@@ -672,6 +674,7 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
         fs::write(root.join("top/mid/y").join(name), "pub fn fy() {}\n").unwrap();
     }
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

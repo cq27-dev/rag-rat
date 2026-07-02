@@ -863,6 +863,7 @@ fn mixed_config() -> (PathBuf, Config) {
     fs::write(root.join("docs/search.md"), "# Title\nalpha token\n").unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn alpha_symbol() {}\n").unwrap();
     (root.clone(), Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![
@@ -897,6 +898,7 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
     fs::create_dir_all(root.join("docs")).unwrap();
     fs::write(root.join("docs/search.md"), text).unwrap();
     (root.clone(), Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
@@ -918,6 +920,7 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
 
 fn rust_config(root: PathBuf) -> Config {
     Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

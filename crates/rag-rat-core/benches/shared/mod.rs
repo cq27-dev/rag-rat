@@ -53,6 +53,7 @@ pub fn temp_db_path() -> PathBuf {
 /// A Config indexing `subdir` of the corpus into a fresh temp DB.
 pub fn bench_config(subdir: &str) -> Config {
     Config {
+        repo_id_override: None,
         root: corpus_dir(),
         database: temp_db_path(),
         targets: vec![ResolvedTarget {

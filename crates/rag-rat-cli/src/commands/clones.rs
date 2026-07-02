@@ -276,6 +276,7 @@ mod tests {
         std::fs::write(root.join("src/b.rs"), &clone_body).unwrap();
 
         let config = Config {
+            repo_id_override: None,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {

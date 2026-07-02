@@ -154,6 +154,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
     run_git(&root, &["commit", "-m", "init"]);
 
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

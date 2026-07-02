@@ -23,6 +23,10 @@ pub struct Config {
     pub version_check: VersionCheckConfig,
     pub oracle: OracleConfig,
     pub search: SearchConfig,
+    /// Optional `[index] repo_id` override for the consolidated global store — pins the repo's
+    /// identity instead of deriving it from the root-commit hash. `None` = derive. Consumed by
+    /// `crate::repo_identity::resolve_repo_identity`; it does NOT influence the database path.
+    pub repo_id_override: Option<String>,
 }
 
 /// Search-ranking knobs (`[search]`). Default OFF so the shipped fuse is byte-identical to today;
@@ -742,7 +746,22 @@ impl Config {
             config_dir.join(&log.dir)
         };
 
-        Ok(Self { root, database, targets, llm, watch, version_check, oracle, search, log })
+        // Parse-only: the override is threaded into repo identity resolution by a later workstream
+        // and deliberately does NOT affect the database path resolved above.
+        let repo_id_override =
+            raw.index.repo_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
+        Ok(Self {
+            root,
+            database,
+            targets,
+            llm,
+            watch,
+            version_check,
+            oracle,
+            search,
+            log,
+            repo_id_override,
+        })
     }
 }
 
@@ -1027,6 +1046,11 @@ impl From<RawSearch> for SearchConfig {
 struct RawIndex {
     root: Option<String>,
     database: Option<String>,
+    /// `[index] repo_id` — pins the repo's identity for the consolidated global store instead of
+    /// deriving it from the root-commit hash. Set it for a fork that must NOT share memories with
+    /// its upstream, or a repo with no commits yet. Parsed here; consumed by
+    /// `resolve_repo_identity` in a later workstream (no effect on path resolution).
+    repo_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1422,6 +1446,51 @@ mod tests {
             main.canonicalize().unwrap(),
             "a linked worktree's config root anchors to the main worktree",
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repo_id_override_is_parsed_and_does_not_change_the_database_path() {
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-repoid-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            tmp.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\nrepo_id = \"  pinned-id  \"\n[target_bindings]\nrust = \
+             [\"src\"]\n",
+        )
+        .unwrap();
+
+        let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            config.repo_id_override.as_deref(),
+            Some("pinned-id"),
+            "the [index] repo_id override is parsed and trimmed",
+        );
+        // Parse-only: the override must NOT influence path resolution — the database stays at the
+        // per-repo default beside `root`.
+        assert_eq!(config.database, config.root.join(".rag-rat/index.sqlite"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repo_id_override_absent_is_none() {
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp =
+            std::env::temp_dir().join(format!("ragrat-repoid-none-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            tmp.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+
+        let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
+        assert_eq!(config.repo_id_override, None, "no [index] repo_id → None");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

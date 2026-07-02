@@ -293,6 +293,7 @@ fn parser_failures_report_paths() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("broken.rs"), "pub fn broken(").unwrap();
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod data_dir;
 pub mod dream;
 pub mod embedding_models;
 #[cfg(feature = "eval")]
@@ -10,6 +11,7 @@ pub mod locks;
 pub mod logging;
 pub mod output;
 pub mod query;
+pub mod repo_identity;
 pub mod search;
 pub mod serde_big_id;
 pub mod storage;

@@ -1,11 +1,13 @@
 mod baseline;
 mod migrations;
+mod registry;
 pub(crate) use baseline::*;
 pub(crate) use migrations::*;
+pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 37;
+pub const LATEST_SCHEMA_VERSION: u32 = 38;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -237,6 +239,12 @@ const MIGRATION_037_DESCRIPTION: &str =
      generation-staged like clone_edges) + clone_graph_generations.postings_written so the \
      write-time clone check does a bounded indexed lookup instead of rebuilding the RAM index and \
      scales past the 40k guard (#296)";
+const MIGRATION_038_ID: &str = "038_repos_registry";
+const MIGRATION_038_CHECKSUM: &str = "sha256:rag-rat-repos-registry-v38";
+const MIGRATION_038_DESCRIPTION: &str =
+    "Add repos registry + repo_roots + repo_meta (per-machine repo identity registry and per-repo \
+     key/value store) with the __unassigned__ adoption placeholder — the substrate for the global \
+     consolidated database and repo_id scoping (memory-sync phase A)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -558,6 +566,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_037_CHECKSUM,
         description: MIGRATION_037_DESCRIPTION,
         apply: apply_clone_subblock_postings_tables,
+    },
+    Migration {
+        id: MIGRATION_038_ID,
+        checksum: MIGRATION_038_CHECKSUM,
+        description: MIGRATION_038_DESCRIPTION,
+        apply: apply_repos_registry,
     },
 ];
 

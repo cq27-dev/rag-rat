@@ -800,6 +800,7 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
     run_git(&root, &["commit", "-m", "Refresh beta docs"]);
 
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![

@@ -838,6 +838,7 @@ mod tests {
     /// `&Config` for the under-a-target gate, #332).
     fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
         Config {
+            repo_id_override: None,
             root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -860,6 +861,7 @@ mod tests {
     #[test]
     fn event_touches_worktree_matches_checkout_targets_and_registry() {
         let config = Config {
+            repo_id_override: None,
             root: PathBuf::from("/main"),
             database: PathBuf::from("/main/.rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -957,6 +959,7 @@ mod tests {
         // `config.root` is the `crate` SUBDIR of the repo.
         let config_root = repo.join("crate").canonicalize().unwrap();
         let config = Config {
+            repo_id_override: None,
             root: config_root,
             database: repo.join("crate/.rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1001,6 +1004,7 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
 
         let config = Config {
+            repo_id_override: None,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1063,6 +1067,7 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "").unwrap();
 
         let config = Config {
+            repo_id_override: None,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1136,6 +1141,7 @@ mod tests {
         let sub = wt.join("crates"); // config.root is the subdirectory.
         let target_dirs = vec![PathBuf::from(".")];
         let config = Config {
+            repo_id_override: None,
             root: sub.clone(),
             database: sub.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1281,6 +1287,7 @@ mod tests {
 
         let sub = main.join("crate").canonicalize().unwrap(); // config.root is the subdir.
         let config = Config {
+            repo_id_override: None,
             root: sub.clone(),
             database: sub.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1543,6 +1550,7 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         let root = root.canonicalize().unwrap();
         let config = Config {
+            repo_id_override: None,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {

@@ -676,6 +676,7 @@ mod tests {
         )
         .unwrap();
         let config = crate::Config {
+            repo_id_override: None,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![crate::config::ResolvedTarget {
@@ -786,6 +787,7 @@ mod tests {
         .unwrap();
         let db_path = root.join(".rag-rat/index.sqlite");
         let config = crate::Config {
+            repo_id_override: None,
             root: root.clone(),
             database: db_path.clone(),
             targets: vec![crate::config::ResolvedTarget {
@@ -850,6 +852,7 @@ mod tests {
         )
         .unwrap();
         let config = crate::Config {
+            repo_id_override: None,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![crate::config::ResolvedTarget {
@@ -945,6 +948,7 @@ mod tests {
             kind: crate::config::TargetKind::Source,
         };
         let config = crate::Config {
+            repo_id_override: None,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![

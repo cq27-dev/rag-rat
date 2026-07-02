@@ -1172,6 +1172,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_035_ID => Some(35),
             MIGRATION_036_ID => Some(36),
             MIGRATION_037_ID => Some(37),
+            MIGRATION_038_ID => Some(38),
             _ => None,
         })
         .max()
@@ -1218,6 +1219,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_035_ID
             | MIGRATION_036_ID
             | MIGRATION_037_ID
+            | MIGRATION_038_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1261,6 +1263,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_035_ID => migration.checksum != MIGRATION_035_CHECKSUM,
         MIGRATION_036_ID => migration.checksum != MIGRATION_036_CHECKSUM,
         MIGRATION_037_ID => migration.checksum != MIGRATION_037_CHECKSUM,
+        MIGRATION_038_ID => migration.checksum != MIGRATION_038_CHECKSUM,
         _ => false,
     }
 }
@@ -1558,6 +1561,54 @@ pub(crate) fn apply_clone_subblock_postings_tables(conn: &Connection) -> rusqlit
     )?;
     Ok(())
 }
+
+/// V038 (memory-sync phase A1): the per-machine `repos` registry + per-repo `repo_meta` k/v store —
+/// the substrate the global-DB consolidation scopes every other table against. All greenfield,
+/// STRICT per repo convention.
+///
+/// The seed placeholder row (`repo_id = '__unassigned__'`, which MUST equal
+/// [`super::LEGACY_REPO_ID`]) marks a legacy single-repo DB awaiting adoption: the first
+/// post-migration open calls [`super::register_repo`], which rewrites the placeholder to the real
+/// content-derived `repo_id` in one step. A consolidated DB holding more than one repo never
+/// carries the placeholder — `register_repo` refuses to adopt when a different real id already
+/// owns the DB.
+///
+/// `repo_roots`/`repo_meta` carry an `ON DELETE CASCADE` FK to `repos` (NOT to a reindex-volatile
+/// parent), so the volatile-FK trip-wire does not flag them and they need no allowlist entry.
+///
+/// Idempotent: `CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE` the placeholder, so a fresh DB
+/// (the full `apply` ladder) and a forward-migrated V037 index converge on the identical shape,
+/// and a re-run is a no-op.
+pub(crate) fn apply_repos_registry(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(REPOS_REGISTRY_DDL)
+}
+
+/// V038 DDL. The placeholder literal `'__unassigned__'` MUST equal [`super::LEGACY_REPO_ID`] —
+/// `super::register_repo` reads that constant when it adopts the row (a matching bootstrap test
+/// pins the two together).
+pub(crate) const REPOS_REGISTRY_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS repos(
+        repo_id          TEXT PRIMARY KEY,
+        display_name     TEXT NOT NULL,
+        registered_at_ms INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS repo_roots(
+        repo_id          TEXT NOT NULL REFERENCES repos(repo_id) ON DELETE CASCADE,
+        root             TEXT NOT NULL,
+        registered_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(repo_id, root)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS repo_meta(
+        repo_id TEXT NOT NULL REFERENCES repos(repo_id) ON DELETE CASCADE,
+        key     TEXT NOT NULL,
+        value   TEXT,
+        PRIMARY KEY(repo_id, key)
+    ) STRICT;
+    -- Adoption placeholder (MUST equal schema::LEGACY_REPO_ID). A legacy single-repo DB carries
+    -- exactly this one row until register_repo() rewrites it to the real content-derived repo_id.
+    INSERT OR IGNORE INTO repos(repo_id, display_name, registered_at_ms)
+        VALUES ('__unassigned__', '', 0);
+";
 
 /// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see
 /// `parser::detect_is_test`) so clone detection can keep tests out of the corpus. Idempotent via

@@ -8,6 +8,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
     fs::create_dir_all(&docs).unwrap();
 
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

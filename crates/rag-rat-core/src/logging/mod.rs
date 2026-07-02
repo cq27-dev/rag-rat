@@ -129,6 +129,7 @@ mod tests {
 
     fn test_config(dir: &std::path::Path, enabled: bool) -> Config {
         Config {
+            repo_id_override: None,
             root: dir.to_path_buf(),
             database: dir.join(".rag-rat/index.sqlite"),
             targets: Vec::new(),

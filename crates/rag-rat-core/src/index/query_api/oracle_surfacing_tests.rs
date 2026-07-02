@@ -29,6 +29,7 @@ fn temp_root() -> PathBuf {
 
 fn rust_config(root: PathBuf) -> Config {
     Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
@@ -1139,6 +1140,7 @@ fn deleted_and_generated_paths_counted_in_skipped() {
     fs::write(root.join("gen/out.rs"), "pub fn generated_fn() {}\n").unwrap();
     // A config with a Generated target for `gen/` so `out.rs` indexes generated.
     let config = Config {
+        repo_id_override: None,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![

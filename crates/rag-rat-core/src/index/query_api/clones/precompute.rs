@@ -816,6 +816,7 @@ mod tests {
         )
         .unwrap();
         crate::Config {
+            repo_id_override: None,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![crate::config::ResolvedTarget {
