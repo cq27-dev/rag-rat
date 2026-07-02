@@ -1658,10 +1658,12 @@ const V039_RECONCILE_META_KEYS: &[&str] =
     &["embedding_active_model_version", "vector_int8_reencode_cursor"];
 
 /// V039 (memory-sync phase A2): relocate the per-repo singleton meta keys out of the global
-/// `index_meta` / `reconcile_meta` into `repo_meta`, under the `LEGACY_REPO_ID` placeholder (the
-/// only repo a phase-A DB holds). [`super::register_repo`] re-points these rows to the real repo_id
-/// at adoption. The read/write call sites move to the `repo_meta` accessors in the same change, so
-/// a moved key is never read from the table it was deleted from.
+/// `index_meta` / `reconcile_meta` into `repo_meta`, under the SOLE `repos` row that owns this DB
+/// (see [`sole_repo_id`]) — the real repo_id when the DB was already adopted, else the
+/// [`super::LEGACY_REPO_ID`] placeholder V038 seeds. Targeting the sole row (not a hardcoded
+/// placeholder) is what keeps the `repo_meta → repos` FK satisfied on an ADOPTED DB, where the
+/// placeholder row is gone. The read/write call sites move to the `repo_meta` accessors in the same
+/// change, so a moved key is never read from the table it was deleted from.
 ///
 /// Idempotent (`INSERT OR IGNORE` deduped by the `(repo_id, key)` PK + `DELETE` of the source
 /// rows): a fresh DB has empty meta tables → the copy/delete are no-ops, and a forward-migrated
@@ -1675,23 +1677,56 @@ pub(crate) fn apply_move_per_repo_meta(conn: &Connection) -> rusqlite::Result<()
 }
 
 /// Copy the listed keys from `source_table` (a `(key, value)` k/v table) into `repo_meta` under the
-/// placeholder repo_id, then delete them from the source. `source_table` and `keys` are internal
-/// string literals (never user input), so interpolating them into the SQL is safe.
+/// repo that owns this DB ([`sole_repo_id`]), then delete them from the source. Resolving the
+/// target HERE — inside the shared helper — means every future key-move caller inherits the correct
+/// target (real-after-adoption / placeholder-before), instead of each re-deriving a placeholder
+/// that a prior adoption may have deleted. `source_table` and `keys` are internal string literals
+/// (never user input), so interpolating them into the SQL is safe.
 fn relocate_meta_keys(
     conn: &Connection,
     source_table: &str,
     keys: &[&str],
 ) -> rusqlite::Result<()> {
+    let target_repo_id = sole_repo_id(conn)?;
     let in_list = keys.iter().map(|key| format!("'{key}'")).collect::<Vec<_>>().join(", ");
     conn.execute(
         &format!(
             "INSERT OR IGNORE INTO repo_meta(repo_id, key, value)
              SELECT ?1, key, value FROM {source_table} WHERE key IN ({in_list})"
         ),
-        [super::LEGACY_REPO_ID],
+        [target_repo_id.as_str()],
     )?;
     conn.execute(&format!("DELETE FROM {source_table} WHERE key IN ({in_list})"), [])?;
     Ok(())
+}
+
+/// The single `repos` row that owns this DB at migration time — the real repo_id if it was already
+/// adopted via [`super::register_repo`], else the [`super::LEGACY_REPO_ID`] placeholder V038 seeds.
+///
+/// The relocation MUST target this id, not a hardcoded placeholder: on an adopted DB the
+/// placeholder row is deleted, so an `INSERT` into `repo_meta` under it trips the `repo_meta →
+/// repos` FK — with `foreign_keys = ON` (production) that aborts the whole `migrate_forward`; with
+/// it off it orphans rows the per-repo accessors ([`super::single_repo_id`]) can never resolve.
+/// V038 always leaves exactly one `repos` row and `register_repo` keeps it at one, so 0 or >1 is a
+/// broken invariant — surfaced as an attributable migration error rather than a silent FK abort or
+/// a wrong-scope pick. (Distinct from [`super::single_repo_id`], the runtime stand-in: that one
+/// `debug_assert`s the one-row invariant and `LIMIT 1`s in release; a migration needs the hard
+/// error on `!= 1`.)
+fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
+    let mut stmt = conn.prepare("SELECT repo_id FROM repos")?;
+    let mut ids =
+        stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if ids.len() == 1 {
+        return Ok(ids.pop().expect("length checked to be exactly 1"));
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+        Some(format!(
+            "V039 per-repo meta relocation expects exactly one repos row (the sole repo owning \
+             this DB), found {}",
+            ids.len()
+        )),
+    ))
 }
 
 /// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see

@@ -65,30 +65,38 @@ pub fn register_repo(
         )));
     }
 
-    // No real repo yet: adopt the placeholder. Insert the real `repos` row FIRST, then re-point the
-    // placeholder's children, then drop the placeholder. Since V039 (phase A2) `repo_meta` carries
-    // rows under the placeholder, and its FK to `repos` is enforced (`foreign_keys = ON`), the
-    // placeholder PK cannot be rewritten in place while children reference it. Insert-first /
-    // delete-last keeps every FK satisfied at each statement boundary without needing an enclosing
-    // transaction or deferred checks. `repo_roots` never holds placeholder rows (it is only ever
-    // written under a real id, by `record_repo_root` below), so only `repo_meta` needs re-pointing;
-    // A3 extends this to the direct-scoped tables it adds.
-    let placeholder_present = conn
+    // No real repo yet: adopt the placeholder in ONE transaction. Insert the real `repos` row
+    // FIRST, re-point the placeholder's children, then drop the placeholder. Since V039 (phase
+    // A2) `repo_meta` carries rows under the placeholder, and its FK to `repos` is enforced
+    // (`foreign_keys = ON`), the placeholder PK cannot be rewritten in place while children
+    // reference it; the insert-first / delete-last order keeps every FK satisfied at each statement
+    // boundary. The enclosing `unchecked_transaction` makes the whole adoption ATOMIC: a crash or
+    // mid-sequence error rolls it ALL back, so the DB never lands in the torn state where BOTH the
+    // real row and the placeholder survive — a state the "already registered" fast path above would
+    // never repair and `single_repo_id`'s one-row expectation would break on.
+    // `unchecked_transaction` is the right tool on a shared `&Connection` (rusqlite): it needs
+    // no `&mut`, commits on `.commit()`, and rolls back on drop. `repo_roots` never holds
+    // placeholder rows (it is only ever written under a real id, by `record_repo_root` below),
+    // so only `repo_meta` needs re-pointing; A3 extends this to the direct-scoped tables it
+    // adds. The fresh path (no placeholder) runs in the same transaction for uniformity.
+    let tx = conn.unchecked_transaction()?;
+    let placeholder_present = tx
         .query_row("SELECT 1 FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID], |_| Ok(()))
         .optional()?
         .is_some();
-    conn.execute(
+    tx.execute(
         "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?2, ?3)",
         params![identity.repo_id, identity.display_name, now_ms],
     )?;
     if placeholder_present {
-        conn.execute("UPDATE repo_meta SET repo_id = ?1 WHERE repo_id = ?2", params![
+        tx.execute("UPDATE repo_meta SET repo_id = ?1 WHERE repo_id = ?2", params![
             identity.repo_id,
             LEGACY_REPO_ID
         ])?;
-        conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID])?;
+        tx.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID])?;
     }
-    record_repo_root(conn, &identity.repo_id, &root, now_ms)?;
+    record_repo_root(&tx, &identity.repo_id, &root, now_ms)?;
+    tx.commit()?;
     Ok(identity.repo_id.clone())
 }
 

@@ -573,3 +573,130 @@ fn repo_meta_accessors_round_trip_and_scope_by_repo() {
     );
     delete_repo_meta(&conn, LEGACY_REPO_ID, "k").unwrap(); // no-op when already absent
 }
+
+/// FINDING 1 regression: an ALREADY-ADOPTED V038 DB (placeholder deleted, one REAL `repos` row)
+/// must forward-migrate through V039 without tripping the `repo_meta → repos` FK. V039 relocates
+/// the per-repo meta under the SOLE `repos` row — the real id here — not a hardcoded
+/// `__unassigned__` placeholder (gone after adoption). With `foreign_keys = ON` (production, via
+/// `IndexConnection`), the old hardcoded-placeholder insert ABORTS `migrate_forward` (`INSERT OR
+/// IGNORE` does NOT suppress an immediate FK violation); with it off it orphans rows
+/// `single_repo_id` can never resolve. Asserting the keys land under the real id — and the
+/// migration completes — covers both.
+#[test]
+fn migration_039_relocates_under_the_real_id_on_an_adopted_v038_db() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    // Match production: the FK is enforced, so a relocation targeting the vanished placeholder
+    // aborts (rather than silently orphaning the rows under a dangling id).
+    conn.execute_batch("PRAGMA foreign_keys = ON;").expect("enable FK enforcement");
+    schema::apply(&conn).expect("apply");
+
+    // The pre-relocation legacy shape: the per-repo keys still sit in the GLOBAL k/v tables.
+    upsert_meta(&conn, "index_meta", "source_root", "/src/repo");
+    upsert_meta(&conn, "index_meta", "indexed_at_ms", "5000");
+    upsert_meta(&conn, "reconcile_meta", "embedding_active_model_version", "hash-v1");
+
+    // Adopt: the placeholder row is deleted, leaving exactly one REAL repos row.
+    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1).unwrap();
+    assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "adopted: placeholder gone");
+
+    // Rewind the ledger to V038 and forward-migrate: V039 re-runs against the adopted DB.
+    truncate_schema_to(&conn, 38);
+    assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
+    schema::migrate_forward(&conn)
+        .expect("V039 forward-migrates an adopted DB without an FK abort");
+
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema reaches LATEST after the forward migrate",
+    );
+    // The keys land under the REAL id (never the vanished placeholder); `single_repo_id` resolves
+    // it.
+    assert_eq!(schema::single_repo_id(&conn).unwrap(), "repo-abc");
+    for (key, value) in [
+        ("source_root", "/src/repo"),
+        ("indexed_at_ms", "5000"),
+        ("embedding_active_model_version", "hash-v1"),
+    ] {
+        assert_eq!(
+            crate::index::meta::repo_meta(&conn, "repo-abc", key).unwrap().as_deref(),
+            Some(value),
+            "{key} relocated under the real repo id",
+        );
+    }
+    let placeholder_meta: i64 = conn
+        .query_row("SELECT COUNT(*) FROM repo_meta WHERE repo_id = ?1", [LEGACY_REPO_ID], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(placeholder_meta, 0, "nothing relocated under the vanished placeholder");
+}
+
+/// FINDING 2 (atomicity): `register_repo`'s adoption — insert the real row, re-point `repo_meta`,
+/// drop the placeholder, record the root — runs in ONE transaction, so a failure mid-sequence rolls
+/// the WHOLE thing back. Without it, a crash after the insert but before the delete would leave
+/// BOTH the real row and the placeholder: the "already registered" fast path would then never
+/// repair it, and `single_repo_id`'s one-row expectation would break. Forced here with a temporary
+/// `BEFORE DELETE ON repos` trigger that RAISEs on the placeholder delete — adoption must return
+/// Err with the DB FULLY unchanged (placeholder present, its `repo_meta` rows intact, no real row,
+/// no roots); after dropping the trigger, adoption succeeds cleanly, proving the failed attempt
+/// left nothing behind.
+#[test]
+fn register_repo_adoption_is_atomic_on_a_mid_sequence_failure() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    conn.execute_batch("PRAGMA foreign_keys = ON;").expect("enable FK enforcement");
+    schema::apply(&conn).expect("apply");
+    // As V039 leaves a not-yet-adopted DB: per-repo meta under the placeholder.
+    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
+    crate::index::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
+
+    // Fail the adoption at its LAST mutation (the placeholder delete), mid-transaction.
+    conn.execute_batch(
+        "CREATE TRIGGER fail_placeholder_delete BEFORE DELETE ON repos
+         WHEN OLD.repo_id = '__unassigned__'
+         BEGIN SELECT RAISE(ABORT, 'injected adoption failure'); END;",
+    )
+    .expect("install failure trigger");
+
+    let err = register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 1)
+        .expect_err("adoption must fail while the trigger blocks the placeholder delete");
+    assert!(
+        err.to_string().contains("injected adoption failure"),
+        "surfaces the trigger RAISE: {err}",
+    );
+
+    // The transaction rolled back: the DB is the exact pre-adoption state.
+    assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 1, "placeholder survives the rollback");
+    assert_eq!(repo_row_count(&conn, "repo-abc"), 0, "the half-inserted real row rolled back");
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0)).unwrap();
+    assert_eq!(total, 1, "exactly the placeholder row remains");
+    assert_eq!(
+        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "source_root").unwrap().as_deref(),
+        Some("/src/repo"),
+        "repo_meta stays under the placeholder (the re-point rolled back)",
+    );
+    assert_eq!(
+        crate::index::meta::repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms").unwrap().as_deref(),
+        Some("9"),
+    );
+    let real_meta: i64 = conn
+        .query_row("SELECT COUNT(*) FROM repo_meta WHERE repo_id = 'repo-abc'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(real_meta, 0, "no repo_meta rows re-pointed to the real id");
+    let roots: i64 = conn.query_row("SELECT COUNT(*) FROM repo_roots", [], |r| r.get(0)).unwrap();
+    assert_eq!(roots, 0, "no root recorded (record_repo_root never committed)");
+
+    // Remove the fault and adopt again: a clean success, proving nothing was left half-done.
+    conn.execute_batch("DROP TRIGGER fail_placeholder_delete;").expect("drop trigger");
+    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/repo"), 2)
+        .expect("adoption succeeds once the fault is removed");
+    assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "placeholder adopted away");
+    assert_eq!(repo_row_count(&conn, "repo-abc"), 1, "the real repo owns the DB");
+    assert_eq!(schema::single_repo_id(&conn).unwrap(), "repo-abc");
+    assert_eq!(
+        crate::index::meta::repo_meta(&conn, "repo-abc", "source_root").unwrap().as_deref(),
+        Some("/src/repo"),
+        "meta carried over to the real id on the successful adoption",
+    );
+    assert_eq!(root_count(&conn, "repo-abc"), 1, "its root is recorded");
+}
