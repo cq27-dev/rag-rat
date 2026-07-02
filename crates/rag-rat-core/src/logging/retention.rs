@@ -14,11 +14,10 @@ const RECENT_SECS: u64 = 300;
 /// recently; otherwise it is PROTECTED (a live process may hold the fd — unlinking it would strand
 /// the writer on a deleted inode). Protected files are still COUNTED against `max_files`.
 ///
-/// Candidates are pruned by (a) age > `retention_days` — every platform; (b) size >
-/// `max_file_bytes` and (c) total-count > `max_files` — only where process liveness is verifiable
-/// (unix). On a platform without a liveness probe the size/count rules could evict a live-but-idle
-/// log, so they are skipped there and only the age rule (which reaps files untouched for whole
-/// days) runs.
+/// Candidates are pruned by (a) age > `retention_days`, (b) size > `max_file_bytes`, and (c) total
+/// count > `max_files` — but ONLY where process liveness is verifiable (unix). On a platform
+/// without a liveness probe none of the rules run (a live-but-idle log is indistinguishable from a
+/// dead one), so per-process files simply accumulate there until a proper probe lands.
 pub(super) fn sweep_retention(
     dir: &Path,
     retention_days: u64,
@@ -49,23 +48,27 @@ pub(super) fn sweep_retention(
         Err(_) => return,
     }
 
-    // Age rule — safe on every platform (a file untouched for whole days can't be an active log).
-    if retention_days > 0
-        && let Some(cutoff) = SystemTime::now()
-            .checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)))
-    {
-        candidates.retain(|(path, mtime, _)| {
-            if *mtime < cutoff {
-                let _ = std::fs::remove_file(path);
-                false
-            } else {
-                true
-            }
-        });
-    }
-
-    // Size + count could evict a live-but-idle log where liveness can't be checked — unix only.
+    // ALL pruning is gated on a verifiable process-liveness probe. Without one (non-unix) a
+    // live-but-idle log can't be told from a dead one — and Rust opens files share-delete on
+    // Windows, so even deleting an open log succeeds (delete-pending) and strands the writer.
+    // So on a platform without the probe we prune NOTHING and let per-process files accumulate
+    // (logging is off by default); a Windows liveness probe is the follow-up. On unix the pid
+    // check makes every rule safe: (a) age > retention_days; (b) size > max_file_bytes; (c)
+    // total count > max_files.
     if cfg!(unix) {
+        if retention_days > 0
+            && let Some(cutoff) = SystemTime::now()
+                .checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)))
+        {
+            candidates.retain(|(path, mtime, _)| {
+                if *mtime < cutoff {
+                    let _ = std::fs::remove_file(path);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         if max_file_bytes > 0 {
             candidates.retain(|(path, _, len)| {
                 if *len > max_file_bytes {
@@ -121,8 +124,8 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(not(unix))]
 fn process_is_alive(_pid: u32) -> bool {
-    // No cheap portable liveness probe; size/count pruning is skipped on this platform (see
-    // `sweep_retention`), so a live log is protected by the recent-mtime window + age-only pruning.
+    // No cheap portable liveness probe. `sweep_retention` skips ALL pruning on this platform, so a
+    // live log is never deleted; this return value is unused there. A Windows probe is a follow-up.
     false
 }
 
@@ -153,6 +156,9 @@ mod tests {
         assert_eq!(rag_rat_log_pid("random-1-2.log"), None); // wrong role prefix
     }
 
+    // All pruning (age/size/count) is unix-only — it needs the pid-liveness probe (see
+    // `sweep_retention` / `process_is_alive`).
+    #[cfg(unix)]
     #[test]
     fn prunes_by_age() {
         let dir = tempfile::tempdir().unwrap();
