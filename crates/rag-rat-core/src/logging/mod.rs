@@ -10,7 +10,6 @@
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -48,30 +47,33 @@ impl Role {
     }
 }
 
-/// Held by the caller (`main`) for the process lifetime; `Drop` flushes the non-blocking writer, so
-/// short-lived hook/CLI processes don't lose their tail on exit.
+/// Returned by [`init_logging`] and held by the caller (`main`). Writes are BLOCKING (synchronous
+/// to the file), so there is no buffered tail to flush — nothing is lost on a normal exit, a
+/// short-lived hook/CLI process, or the MCP hot-upgrade `exec()` (which never runs destructors).
+/// This handle is just a marker today; keeping it lets the writer strategy change without touching
+/// call sites.
 pub struct LogHandle {
-    _guard: Option<WorkerGuard>,
+    _private: (),
 }
 
 /// A global `tracing` subscriber may be installed only once per process.
 static INIT: OnceLock<()> = OnceLock::new();
 
-/// Install the process-global debug-log subscriber. No-op (returns a guard-less handle) when
-/// logging is disabled, already initialized, or init fails — logging never affects correctness.
+/// Install the process-global debug-log subscriber. No-op (returns an inert handle) when logging is
+/// disabled, already initialized, or init fails — logging never affects correctness.
 pub fn init_logging(config: &Config, role: Role) -> LogHandle {
     let env = std::env::var("RAG_RAT_LOG").ok().filter(|s| !s.trim().is_empty());
     if !config.log.enabled && env.is_none() {
-        return LogHandle { _guard: None };
+        return LogHandle { _private: () };
     }
     if INIT.set(()).is_err() {
-        return LogHandle { _guard: None };
+        return LogHandle { _private: () };
     }
     match try_init(config, &role, env) {
         Ok(handle) => handle,
         Err(err) => {
             eprintln!("rag-rat: debug logging disabled (init failed: {err})");
-            LogHandle { _guard: None }
+            LogHandle { _private: () }
         },
     }
 }
@@ -94,13 +96,15 @@ fn try_init(config: &Config, role: &Role, env: Option<String>) -> anyhow::Result
     let start_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let file_name = format!("{}-{}-{}.log", role.file_stem(), pid, start_ms);
 
-    // One file per process (no date suffix), non-blocking so the hot MCP path never blocks on IO;
-    // the guard in `LogHandle` flushes on drop for short-lived processes too.
+    // One file per process (no date suffix). BLOCKING writes (the appender is its own `MakeWriter`,
+    // no `non_blocking` worker): every record is synchronously on disk, so nothing is buffered to
+    // lose on a normal exit, a short-lived process, or the MCP hot-upgrade `exec()` (which never
+    // runs destructors). Debug logging is off by default, so the per-event write cost is only
+    // paid when a user has deliberately turned it on to diagnose.
     let appender = tracing_appender::rolling::never(&log.dir, &file_name);
-    let (writer, guard) = tracing_appender::non_blocking(appender);
 
     let registry = tracing_subscriber::registry().with(filter);
-    let fmt_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer);
+    let fmt_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer(appender);
     match log.format {
         LogFormat::Json => registry.with(fmt_layer.json()).try_init()?,
         LogFormat::Text => registry.with(fmt_layer).try_init()?,
@@ -115,7 +119,7 @@ fn try_init(config: &Config, role: &Role, env: Option<String>) -> anyhow::Result
         version = env!("CARGO_PKG_VERSION"),
         "rag-rat logging started"
     );
-    Ok(LogHandle { _guard: Some(guard) })
+    Ok(LogHandle { _private: () })
 }
 
 #[cfg(test)]
@@ -164,7 +168,7 @@ mod tests {
         {
             let _handle = init_logging(&config, Role::Hook);
             tracing::info!(target: "rag_rat_core::probe", "hello");
-        } // guard drop flushes the non-blocking writer
+        } // blocking writer: both records are already on disk
         let files: Vec<_> =
             std::fs::read_dir(&config.log.dir).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(files.len(), 1, "exactly one per-process file");

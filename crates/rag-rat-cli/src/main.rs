@@ -78,8 +78,8 @@ fn main() -> anyhow::Result<()> {
     let config = load_config_or_hint(&cli.config)?;
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
 
-    // Debug logging (off unless `[log] enabled` or `RAG_RAT_LOG`). Held for the whole command,
-    // including the long-lived `run_stdio` under `Cmd::Mcp`, so the guard flushes on process exit.
+    // Debug logging (off unless `[log] enabled` or `RAG_RAT_LOG`). Writes are blocking (synchronous
+    // to the file), so nothing is lost on exit or on the `Cmd::Mcp` hot-upgrade `exec()`.
     // `Cmd::Init` / `Cmd::ClaudeHook` returned above (no config, and claude-hook fires
     // per-tool-call — logging it would flood the per-process dir and evict the mcp/maintenance
     // signal).
