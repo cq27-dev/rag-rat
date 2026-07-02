@@ -888,6 +888,7 @@ fn mixed_config() -> (PathBuf, Config) {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        log: Default::default(),
     })
 }
 
@@ -911,6 +912,7 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        log: Default::default(),
     })
 }
 
@@ -931,6 +933,7 @@ fn rust_config(root: PathBuf) -> Config {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        log: Default::default(),
     }
 }
 

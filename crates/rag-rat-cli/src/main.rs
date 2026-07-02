@@ -78,6 +78,13 @@ fn main() -> anyhow::Result<()> {
     let config = load_config_or_hint(&cli.config)?;
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
 
+    // Debug logging (off unless `[log] enabled` or `RAG_RAT_LOG`). Held for the whole command,
+    // including the long-lived `run_stdio` under `Cmd::Mcp`, so the guard flushes on process exit.
+    // `Cmd::Init` / `Cmd::ClaudeHook` returned above (no config, and claude-hook fires
+    // per-tool-call — logging it would flood the per-process dir and evict the mcp/maintenance
+    // signal).
+    let _log = rag_rat_core::logging::init_logging(&config, log_role(&cli.command));
+
     match cli.command {
         Cmd::Init(_) | Cmd::ClaudeHook => unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
@@ -338,6 +345,30 @@ pub(crate) fn load_config_or_hint(path: &str) -> anyhow::Result<Config> {
         );
     }
     Ok(Config::load(path)?)
+}
+
+/// Map the invoked subcommand to a debug-log [`Role`](rag_rat_core::logging::Role) (drives the log
+/// file name + startup event). The git hooks invoke `rag-rat maintenance --trigger post-*`, so a
+/// maintenance pass with a git-origin trigger is the `hook` role — the reconcile/embedding path we
+/// most want to trace. A manual `maintenance` and every other command are `cli:<name>`.
+fn log_role(cmd: &Cmd) -> rag_rat_core::logging::Role {
+    use rag_rat_core::logging::Role;
+    match cmd {
+        Cmd::Mcp => Role::Mcp,
+        Cmd::Maintenance(args) if is_git_hook_trigger(args.trigger.as_deref()) => Role::Hook,
+        Cmd::Maintenance(_) => Role::Cli("maintenance".to_string()),
+        Cmd::Reconcile(_) => Role::Cli("reconcile".to_string()),
+        Cmd::Index(_) => Role::Cli("index".to_string()),
+        Cmd::Doctor => Role::Cli("doctor".to_string()),
+        Cmd::Gc => Role::Cli("gc".to_string()),
+        _ => Role::Cli("cmd".to_string()),
+    }
+}
+
+/// The git-hook `--trigger` values that mark a maintenance pass as hook-originated (vs a manual
+/// run).
+fn is_git_hook_trigger(trigger: Option<&str>) -> bool {
+    matches!(trigger, Some("post-commit" | "post-checkout" | "post-merge" | "post-rewrite"))
 }
 
 /// Open the index for a read command, mapping a not-yet-built index to a friendly hint instead

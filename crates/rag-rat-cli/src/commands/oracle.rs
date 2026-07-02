@@ -479,6 +479,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         (root, config)
     }
@@ -524,6 +525,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         let config = config_with(vec!["**/*.rs".to_string()], Vec::new());
         let profile = |dirs: &[&str]| {
