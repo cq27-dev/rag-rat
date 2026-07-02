@@ -76,6 +76,19 @@ impl FileLock {
     }
 }
 
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Release the flock EXPLICITLY, not by relying on the fd-close that follows. flock
+        // ownership belongs to the open-file-description, so a child forked while this lock is held
+        // (any `std::process::Command` on another thread — CLOEXEC closes fds only at exec, and the
+        // fork→exec window keeps the OFD alive) inherits a reference that keeps the close from
+        // releasing the lock until the child execs (#409). `unlock()` (flock `LOCK_UN`) drops the
+        // lock now, regardless of surviving OFD references in pre-exec children. Best-effort: the
+        // fd still closes right after, so ignore the error.
+        let _ = self._file.unlock();
+    }
+}
+
 /// Per-DB write-serialization lock path: next to the index database (under the git common dir for a
 /// shared DB, or `<root>/.rag-rat/` for a single worktree — both excluded from the watch tree).
 pub fn write_lock_path(database: &Path) -> PathBuf {
@@ -307,6 +320,59 @@ mod tests {
         drop(first);
         let reacquired = FileLock::try_acquire(&path).unwrap();
         assert!(reacquired.is_some(), "should acquire after the holder drops");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #409: flock ownership belongs to the open-file-description, not the fd. A child forked
+    /// while the lock is held (any sibling test shelling out to `git` in another libtest thread)
+    /// inherits the OFD, so releasing the lock by fd-close alone leaves it held until the child
+    /// execs (CLOEXEC closes fds only at exec — the fork→exec window keeps the OFD alive). The
+    /// explicit `File::unlock()` in `Drop for FileLock` releases immediately regardless of
+    /// surviving OFD references. Here the child never execs — it just sleeps — so ONLY the explicit
+    /// unlock can free the lock; close alone would keep it held for the child's whole lifetime.
+    #[cfg(unix)]
+    #[test]
+    fn drop_releases_flock_immediately_despite_a_fork_inherited_fd() {
+        let dir = temp_dir();
+        let path = dir.join("fork.lock");
+
+        let held = FileLock::try_acquire(&path).unwrap().expect("first acquire should succeed");
+
+        // Existing behavior still holds: while genuinely held in-process (no fork in play yet), a
+        // second try_acquire is blocked — so a later `Some` is a real release, not always-Some.
+        assert!(
+            FileLock::try_acquire(&path).unwrap().is_none(),
+            "a second acquire must fail while the lock is genuinely held"
+        );
+
+        // Fork a child that inherits the locked OFD and keeps it alive (no exec) for ~300ms.
+        // SAFETY: post-fork in a possibly-multithreaded test binary the child may run only
+        // async-signal-safe libc calls and must not allocate or run Rust runtime teardown; it does
+        // neither — just `usleep` then `_exit` (no unwind, no atexit).
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::usleep(300_000);
+                libc::_exit(0);
+            }
+        }
+
+        // Parent: drop our handle. With the explicit unlock this frees the flock now; relying on
+        // fd-close alone would leave it held while the child holds the inherited OFD open.
+        drop(held);
+
+        let reacquired = FileLock::try_acquire(&path).unwrap();
+
+        // Reap the child before asserting so a failure path still doesn't leak a zombie.
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        assert!(
+            reacquired.is_some(),
+            "drop must release the flock immediately despite the fork-inherited fd (#409)"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
