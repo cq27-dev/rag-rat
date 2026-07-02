@@ -746,10 +746,15 @@ impl Config {
             config_dir.join(&log.dir)
         };
 
-        // Parse-only: the override is threaded into repo identity resolution by a later workstream
-        // and deliberately does NOT affect the database path resolved above.
-        let repo_id_override =
+        // The branch-local override (trim + drop empty), then ANCHORED to the MAIN worktree's
+        // config. Repo IDENTITY is per-repo, not per-branch: every worktree of a repo must resolve
+        // the SAME override regardless of which checkout launched — consistent with the
+        // root/database/targets anchoring above. A linked branch whose `rag-rat.toml` omits or pins
+        // a DIFFERENT `[index] repo_id` would otherwise split identity by launch point. Parse-only:
+        // the override never affects the database path resolved above.
+        let local_repo_id_override =
             raw.index.repo_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
+        let repo_id_override = main_repo_id_override(&root, &local_root, local_repo_id_override);
         Ok(Self {
             root,
             database,
@@ -880,6 +885,59 @@ fn main_base_targets(root: &Path, local_root: &Path) -> Option<Vec<ResolvedTarge
     // Main's targets are root-relative; validate (and store) them against the anchored `root`,
     // which is the equivalent path under the main worktree the base index is discovered from.
     resolve_targets(root, raw.target_bindings, raw.target).ok()
+}
+
+/// The `[index] repo_id` override anchored to the MAIN worktree's `rag-rat.toml`, mirroring
+/// [`main_base_targets`]: repo identity is per-repo, so every worktree must resolve the same override
+/// no matter which checkout launched. `local_override` (already trimmed + non-empty-or-`None`) is
+/// returned unchanged when this config is NOT anchored away from its own checkout (`root ==
+/// local_root`: the main checkout or a non-git dir), or when main's `rag-rat.toml` is unreadable /
+/// unparsable (best-effort fallback, exactly as `main_base_targets` does for targets).
+///
+/// When anchored to main, MAIN's value is authoritative — INCLUDING when main OMITS the override
+/// (→ `None`, derive from the root commit): honoring the branch's pin there would make identity
+/// launch-point-dependent, the exact split this guards. A branch that pins a DIFFERENT non-empty id
+/// than main is warned (identity is per-repo; main wins), matching how the base-target anchoring
+/// silently prefers main. This re-reads main's config rather than sharing `main_base_targets`'
+/// read, because the two have different fallback semantics (targets fall back on VALIDATION
+/// failure; the override has nothing to validate) — a second read of one small TOML at load time.
+fn main_repo_id_override(
+    root: &Path,
+    local_root: &Path,
+    local_override: Option<String>,
+) -> Option<String> {
+    if root == local_root {
+        return local_override; // not anchored away — the local config IS the base config
+    }
+    // Anchored to a different (main) root. Read MAIN's config; its `[index] repo_id` is the
+    // per-repo identity. If main's config can't be located/read/parsed, fall back to the local
+    // override (best effort, as `main_base_targets` does).
+    let Some(main_config_path) = main_worktree_root(root).map(|main| main.join("rag-rat.toml"))
+    else {
+        return local_override;
+    };
+    let Ok(text) = fs::read_to_string(&main_config_path) else {
+        return local_override;
+    };
+    let Ok(raw) = toml::from_str::<RawConfig>(&text) else {
+        return local_override;
+    };
+    let main_override =
+        raw.index.repo_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
+    // A linked branch pinning a different non-empty id than main is a divergence: identity is
+    // per-repo, so main's value wins. Warn (eprintln, this file's only user-facing channel) so the
+    // mismatch is visible rather than silently dropped.
+    if let Some(local) = local_override.as_deref()
+        && local != main_override.as_deref().unwrap_or_default()
+    {
+        eprintln!(
+            "rag-rat: [index] repo_id in the linked worktree config ({local}) differs from the \
+             main worktree config ({}); using the main worktree's value so every worktree of this \
+             repo shares one identity",
+            main_override.as_deref().unwrap_or("<derived from root commit>")
+        );
+    }
+    main_override
 }
 
 /// The main worktree root, derived from the git common dir (`<main>/.git`). Returns `None` outside
@@ -1615,6 +1673,110 @@ mod tests {
         assert!(
             dirs.contains(&PathBuf::from("extra")),
             "base keeps main's `extra` even though the branch dropped it: {dirs:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_load_anchors_repo_id_override_to_main_when_the_branch_diverges() {
+        // FINDING 4: repo IDENTITY is per-repo, so the `[index] repo_id` override is read from the
+        // MAIN worktree's config, NOT the launching (branch-local) one. A linked worktree that pins
+        // a DIFFERENT id must still resolve MAIN's — otherwise identity splits by which checkout
+        // launched. This mirrors the root/database/targets anchoring above.
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp =
+            std::env::temp_dir().join(format!("ragrat-repoid-anchor-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        // Main pins a canonical repo_id.
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\nrepo_id = \"canonical-id\"\n[target_bindings]\nrust = \
+             [\"src\"]\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+
+        // The branch pins a DIVERGENT id, committed on the branch and checked out in the worktree.
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+        std::fs::write(
+            linked.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\nrepo_id = \"branch-divergent-id\"\n[target_bindings]\nrust = \
+             [\"src\"]\n",
+        )
+        .unwrap();
+        git(&linked, &["add", "-A"]);
+        git(&linked, &["commit", "-qm", "branch pins a different repo_id"]);
+
+        let from_main = Config::load(main.join("rag-rat.toml")).unwrap();
+        let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            from_main.repo_id_override.as_deref(),
+            Some("canonical-id"),
+            "the main checkout resolves its own override",
+        );
+        assert_eq!(
+            from_linked.repo_id_override.as_deref(),
+            Some("canonical-id"),
+            "a linked worktree resolves MAIN's repo_id override, not its own branch-local pin",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_load_anchors_repo_id_override_to_main_when_main_omits_it() {
+        // The strong form of FINDING 4: MAIN omits `[index] repo_id` (identity derives from the
+        // root commit), but the branch pins one. The anchored value is MAIN's absence →
+        // None, so identity stays derived and launch-point-independent; the branch pin is
+        // NOT honored for the shared identity (honoring it would make identity depend on
+        // which worktree launched).
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir()
+            .join(format!("ragrat-repoid-mainomit-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        // Main OMITS repo_id.
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+        std::fs::write(
+            linked.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\nrepo_id = \"branch-only-id\"\n[target_bindings]\nrust = \
+             [\"src\"]\n",
+        )
+        .unwrap();
+        git(&linked, &["add", "-A"]);
+        git(&linked, &["commit", "-qm", "branch pins a repo_id main lacks"]);
+
+        let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            from_linked.repo_id_override, None,
+            "main omits the override, so the anchored identity derives — the branch pin is ignored",
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

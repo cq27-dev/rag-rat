@@ -170,6 +170,56 @@ fn reapplying_schema_after_adoption_does_not_resurrect_the_placeholder() {
     assert_eq!(repo_row_count(&conn, "repo-abc"), 1, "the adopted repo survives the re-apply");
 }
 
+/// Defense in depth (FINDING 3): even though the resolver refuses a pinned placeholder, a
+/// hand-built `RepoIdentity` carrying the reserved marker must be REFUSED by `register_repo` —
+/// otherwise adoption degenerates: `real_repo_ids` filters the marker, the adoption UPDATE rewrites
+/// the placeholder PK to itself, roots pool under the marker, and registration reports success
+/// while the DB stays unadopted. The exact degenerate sequence: pin the marker → register → assert
+/// error, DB unchanged; then a real registration still adopts cleanly.
+#[test]
+fn register_repo_refuses_the_reserved_placeholder_and_stays_adoptable() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+
+    let err =
+        register_repo(&conn, &identity(LEGACY_REPO_ID, "myrepo"), Path::new("/src/myrepo"), 1)
+            .expect_err("registering the reserved placeholder must be refused");
+    assert!(err.to_string().contains(LEGACY_REPO_ID), "refusal names the reserved value: {err}");
+
+    // DB unchanged: exactly the placeholder row, no real repo, no root recorded under the marker.
+    assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 1, "placeholder untouched");
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0)).unwrap();
+    assert_eq!(total, 1, "no extra repos row minted");
+    let roots: i64 = conn.query_row("SELECT COUNT(*) FROM repo_roots", [], |r| r.get(0)).unwrap();
+    assert_eq!(roots, 0, "no root recorded under the marker");
+
+    // A subsequent REAL registration adopts cleanly (the failed attempt left nothing behind).
+    register_repo(&conn, &identity("repo-abc", "myrepo"), Path::new("/src/myrepo"), 2)
+        .expect("a real repo still adopts after the refused placeholder attempt");
+    assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 0, "placeholder adopted away");
+    assert_eq!(repo_row_count(&conn, "repo-abc"), 1, "the real repo owns the DB");
+    assert_eq!(root_count(&conn, "repo-abc"), 1, "its root is recorded");
+}
+
+/// An empty or whitespace-only repo_id cannot scope rows, so `register_repo` refuses it (defense in
+/// depth alongside the reserved-marker guard) rather than adopting the placeholder under a blank
+/// id.
+#[test]
+fn register_repo_refuses_an_empty_or_whitespace_repo_id() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+
+    for blank in ["", "   "] {
+        let err = register_repo(&conn, &identity(blank, "myrepo"), Path::new("/src/myrepo"), 1)
+            .expect_err("an empty/whitespace repo_id must be refused");
+        assert!(err.to_string().contains("empty"), "refusal explains the empty id: {err}");
+    }
+    // Untouched: still just the placeholder, nothing minted by the refusals.
+    assert_eq!(repo_row_count(&conn, LEGACY_REPO_ID), 1, "placeholder untouched by refusals");
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0)).unwrap();
+    assert_eq!(total, 1, "no rows minted by the refused blank registrations");
+}
+
 /// Re-registering the same repo+root is a no-op (no duplicate rows).
 #[test]
 fn register_repo_is_idempotent() {

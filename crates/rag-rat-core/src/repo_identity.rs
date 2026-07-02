@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+use crate::index::schema::LEGACY_REPO_ID;
+
 /// A repo's identity for the registry: the scoping key + a human label.
 #[derive(Debug, Clone)]
 pub struct RepoIdentity {
@@ -38,11 +40,30 @@ pub fn resolve_repo_identity(
         root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
     if let Some(id) = override_id.map(str::trim).filter(|id| !id.is_empty()) {
+        // The placeholder marker is reserved for a pre-adoption single-repo DB; pinning it would
+        // degenerate registry adoption (see `register_repo`). Refuse with a remedy-naming error
+        // rather than mint an identity that can never be adopted.
+        if id == LEGACY_REPO_ID {
+            anyhow::bail!(reserved_repo_id_error());
+        }
         return Ok(RepoIdentity { repo_id: id.to_string(), display_name });
     }
 
     let repo_id = smallest_root_commit(root)?;
     Ok(RepoIdentity { repo_id, display_name })
+}
+
+/// The remedy-naming error for pinning the reserved placeholder id: it marks a pre-adoption
+/// single-repo DB, so adopting under it would rewrite the placeholder PK to itself and leave the DB
+/// unadopted while reporting success (see [`register_repo`]).
+///
+/// [`register_repo`]: crate::index::schema::register_repo
+fn reserved_repo_id_error() -> String {
+    format!(
+        "`{LEGACY_REPO_ID}` is a reserved repo_id (the pre-adoption placeholder marker) and \
+         cannot be pinned via `[index] repo_id` in rag-rat.toml. Choose a different stable \
+         string, or omit the override to derive the id from the root commit."
+    )
 }
 
 /// The lexicographically smallest hash among the parentless commits reachable from HEAD. Mirrors
@@ -205,6 +226,30 @@ mod tests {
         // An empty/whitespace override falls through to the derived id.
         let blank = resolve_repo_identity(&root, Some("   ")).unwrap();
         assert_eq!(blank.repo_id, derived);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The pre-adoption placeholder marker ([`LEGACY_REPO_ID`]) is a RESERVED repo_id: pinning it
+    /// via `[index] repo_id` would degenerate registry adoption (the adoption UPDATE rewrites the
+    /// placeholder PK to itself, leaving the DB unadopted while reporting success). The resolver
+    /// refuses it — before and after trimming — with an error naming the reserved value.
+    #[test]
+    fn override_equal_to_the_reserved_placeholder_is_refused() {
+        let root = temp_root();
+        init_repo(&root);
+        git(&root, &["commit", "--allow-empty", "-q", "-m", "genesis"]);
+
+        let err = resolve_repo_identity(&root, Some(LEGACY_REPO_ID))
+            .expect_err("the reserved placeholder id must not be pinnable");
+        let msg = err.to_string();
+        assert!(msg.contains(LEGACY_REPO_ID), "error names the reserved value: {msg}");
+        assert!(msg.contains("reserved"), "error explains it is reserved: {msg}");
+
+        // Whitespace padding must not sneak the marker past the trim.
+        let padded = format!("  {LEGACY_REPO_ID}  ");
+        let err_padded = resolve_repo_identity(&root, Some(&padded))
+            .expect_err("the trimmed reserved id is still refused");
+        assert!(err_padded.to_string().contains("reserved"), "{err_padded}");
         std::fs::remove_dir_all(&root).ok();
     }
 

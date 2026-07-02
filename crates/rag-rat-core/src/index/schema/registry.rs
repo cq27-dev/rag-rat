@@ -32,6 +32,21 @@ pub fn register_repo(
     root: &Path,
     now_ms: i64,
 ) -> rusqlite::Result<String> {
+    // Defense in depth: the resolver already refuses a pinned placeholder and never derives it, but
+    // a caller can hand-build a `RepoIdentity`. Registering the placeholder (or an empty/whitespace
+    // id) would degenerate adoption — `real_repo_ids` filters the marker, so the adoption UPDATE
+    // would rewrite the placeholder PK to itself, roots would pool under the marker, and this would
+    // return success while the DB stayed unadopted (a later real registration then trips the child
+    // FK or orphans roots under the marker).
+    let trimmed_id = identity.repo_id.trim();
+    if trimmed_id.is_empty() || trimmed_id == LEGACY_REPO_ID {
+        return Err(registry_refusal(format!(
+            "refusing to register the reserved or empty repo_id {:?}: `{LEGACY_REPO_ID}` is the \
+             pre-adoption placeholder and an empty id cannot scope rows",
+            identity.repo_id
+        )));
+    }
+
     let root = root.to_string_lossy();
     let real_ids = real_repo_ids(conn)?;
 
@@ -44,13 +59,10 @@ pub fn register_repo(
     // A different real repo already owns this DB — refuse rather than adopt (single-repo invariant
     // for phase A; multi-repo registration lands with the default-path flip).
     if let Some(other) = real_ids.first() {
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            Some(format!(
-                "cannot register repo {}: this index is already registered to a different repo {}",
-                identity.repo_id, other
-            )),
-        ));
+        return Err(registry_refusal(format!(
+            "cannot register repo {}: this index is already registered to a different repo {}",
+            identity.repo_id, other
+        )));
     }
 
     // No real repo yet: adopt the placeholder in place, or insert fresh if it is somehow absent.
@@ -72,6 +84,17 @@ pub fn register_repo(
     }
     record_repo_root(conn, &identity.repo_id, &root, now_ms)?;
     Ok(identity.repo_id.clone())
+}
+
+/// A `SQLITE_CONSTRAINT` failure carrying `msg` — the registry's refusal shape. These are
+/// single-repo-invariant violations (a reserved/empty id, or a different repo already owning the
+/// DB), not real SQL constraint trips; the shape keeps them on `rusqlite::Result` without a bespoke
+/// error type for the phase-A registry.
+fn registry_refusal(msg: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+        Some(msg),
+    )
 }
 
 /// Every registered `repo_id` that is a real (adopted) id — i.e. excluding the [`LEGACY_REPO_ID`]
