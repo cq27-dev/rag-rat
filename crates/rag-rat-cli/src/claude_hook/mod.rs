@@ -24,9 +24,11 @@ use rag_rat_core::query::orientation::Orientation;
 use rag_rat_core::storage::IndexConnection;
 use serde::Deserialize;
 
-/// Skip the write-time clone check above this many fingerprinted functions: the check builds an
-/// in-RAM inverted index over all of them (O(functions)) until the persisted-postings follow-up
-/// (#287) lands, so on a very large repo it no-ops rather than add a perceptible delay to a write.
+/// Skip the write-time clone check above this many fingerprinted functions — but ONLY in the RAM
+/// FALLBACK mode, which builds an in-RAM inverted index over all of them (O(functions)) and so
+/// would add a perceptible delay to a write on a very large repo. When the persisted-postings fast
+/// path is eligible (#296), the check is a bounded indexed lookup independent of corpus size, so
+/// this guard does not apply — see [`clone_check_skipped_for_size`].
 const MAX_CLONE_CHECK_FUNCTIONS: u64 = 40_000;
 
 /// Minimum similarity for a NEAR clone to be surfaced by the WRITE-TIME hook (#292). Higher than
@@ -390,6 +392,14 @@ fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The write-time clone-check size guard, factored out for testing. Skip the check ONLY when the
+/// RAM fallback would run (`!indexed`) over more than [`MAX_CLONE_CHECK_FUNCTIONS`] functions. In
+/// indexed mode the postings fast path is a bounded indexed lookup independent of corpus size, so
+/// it never skips on size (#296 phase 4).
+fn clone_check_skipped_for_size(indexed: bool, function_count: u64) -> bool {
+    !indexed && function_count > MAX_CLONE_CHECK_FUNCTIONS
+}
+
 /// Write-time clone check (#287): fingerprint the just-written functions and warn if they duplicate
 /// existing indexed code. Best-effort + READ-ONLY — every "not ready" path (no config, DB absent,
 /// index owes a heal/migrate, index too large, no parseable functions) is a SILENT no-op, so it
@@ -402,8 +412,12 @@ fn clone_check(input: &HookInput) -> anyhow::Result<()> {
     // `try_open_config_read_only` returns None when the index still owes a heal/migrate (NOT
     // ready), so this is the no-op-when-not-ready guard — the same gate the MCP read tools use.
     let Some(db) = IndexDatabase::try_open_config_read_only(&config)? else { return Ok(()) };
-    if db.clone_check_function_count().unwrap_or(u64::MAX) > MAX_CLONE_CHECK_FUNCTIONS {
-        return Ok(()); // too large for the in-RAM check — no-op until the persisted postings land
+    // The size guard bounds ONLY the RAM fallback. When a live postings generation is eligible the
+    // check is a bounded indexed lookup (#296 phase 4), so run it regardless of corpus size; only
+    // the fallback no-ops above the cap.
+    let indexed = db.clone_check_indexed_generation().unwrap_or(None).is_some();
+    if clone_check_skipped_for_size(indexed, db.clone_check_function_count().unwrap_or(u64::MAX)) {
+        return Ok(());
     }
     let inputs = extract_clone_inputs(input, &config.root);
     if inputs.is_empty() {

@@ -614,3 +614,18 @@ fn format_clone_warning_caps_the_ref_list() {
     );
     assert!(!out.contains("src/m11.rs::f11"), "doesn't list every ref: {out}");
 }
+
+// ─── #296 phase 4: the 40k size guard is fallback-only ──────────────────────
+
+#[test]
+fn clone_check_size_guard_is_fallback_only() {
+    // RAM fallback (no eligible postings generation): skip strictly ABOVE the cap, run at/below it.
+    assert!(super::clone_check_skipped_for_size(false, super::MAX_CLONE_CHECK_FUNCTIONS + 1));
+    assert!(!super::clone_check_skipped_for_size(false, super::MAX_CLONE_CHECK_FUNCTIONS));
+    assert!(!super::clone_check_skipped_for_size(false, 0));
+
+    // Indexed (postings fast path eligible): the bounded lookup is corpus-size-independent, so it
+    // NEVER skips on size — not even far past the cap.
+    assert!(!super::clone_check_skipped_for_size(true, super::MAX_CLONE_CHECK_FUNCTIONS + 1));
+    assert!(!super::clone_check_skipped_for_size(true, u64::MAX));
+}

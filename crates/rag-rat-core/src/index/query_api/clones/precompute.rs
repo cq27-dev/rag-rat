@@ -185,7 +185,7 @@ impl IndexDatabase {
     /// - `normalizer_version == NORM_VERSION`,
     /// - `postings_written` (a postings-complete, postings-aware generation — review R2), AND
     /// - `source_revision == content_revision()` EXACTLY (not merely present).
-    pub(crate) fn clone_check_indexed_generation(&self) -> anyhow::Result<Option<i64>> {
+    pub fn clone_check_indexed_generation(&self) -> anyhow::Result<Option<i64>> {
         // BASE-SCOPE ONLY. The clone graph (edges + postings) is built in the BASE scope —
         // maintenance restores it before the clone-graph pass, and `content_revision()` is GLOBAL
         // over `main.files` so it CANNOT encode which scope produced the postings. Under a
