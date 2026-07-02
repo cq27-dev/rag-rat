@@ -68,6 +68,7 @@ model = "jinaai/jina-embeddings-v2-base-code"
 [llm.embedding.remote]
 cookbook = "@rag-rat/cookbook modal"
 backend = "infinity"
+model = "jinaai/jina-embeddings-v2-base-code"
 gpu = "L4"
 query_endpoint = "http://localhost:7997"
 batch_size = 8
@@ -86,6 +87,7 @@ model = "jinaai/jina-embeddings-v2-base-code"
 [llm.embedding.remote]
 endpoint = "http://localhost:7997"
 backend = "infinity"
+model = "jinaai/jina-embeddings-v2-base-code"
 TOML
 fi
 
@@ -95,16 +97,18 @@ case "$db" in
   "$source_root"/*) echo "refusing: db '$db' resolves into the source checkout" >&2; exit 1 ;;
 esac
 
-# Activate the configured embedding model + persist its remote config. A fresh `index` only builds
-# the SOURCE index; it does not install/activate the embedding model, so without this the git-hook
-# `maintenance` reconcile would fall back to the not-ready default and never take the light/embed
-# path this harness is meant to reproduce.
-rag-rat --config rag-rat.toml models install "jinaai/jina-embeddings-v2-base-code"
-
 rag-rat index --config rag-rat.toml
+# Activate the configured embedding model + persist its remote config AFTER the index exists:
+# `models install` opens the index (and errors if it isn't built yet). A fresh `index` only builds
+# the SOURCE index, so without this the git-hook `maintenance` reconcile falls back to the not-ready
+# default and never takes the light/embed path this harness is meant to reproduce.
+rag-rat --config rag-rat.toml models install "jinaai/jina-embeddings-v2-base-code"
 rag-rat hooks install
 
-# Drive git actions to fire the hooks (the light/incremental maintenance path).
+# Drive git actions to fire the hooks (the light/incremental maintenance path). Give the throwaway
+# clone its own identity so `git commit` works in a clean container / CI user with no global config.
+git config user.email "repro@rag-rat.local"
+git config user.name "rag-rat repro"
 git checkout -q -b repro-branch
 git commit -q --allow-empty -m "repro: fire post-commit hook"
 git checkout -q -
