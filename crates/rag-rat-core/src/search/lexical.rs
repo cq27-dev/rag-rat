@@ -206,12 +206,19 @@ fn search_with_query_embedding(
     options: SearchOptions,
 ) -> anyhow::Result<Vec<SearchHit>> {
     let terms = query_terms(query);
-    // REPO SCOPING (A3): every candidate row flows through the `files` scope VIEW (both the bm25
+    // REPO SCOPING (A4): every candidate row flows through the `files` scope VIEW (both the bm25
     // and the vector pass JOIN `files`), which filters `repo_id` FIRST — so in a consolidated
     // DB a sibling repo's chunks are dropped by the INNER JOIN before ranking. `active_repo_id`
-    // is resolved ONCE here and threaded into the git boost queries (which read the
-    // direct-scoped `git_file_changes` by path, bypassing the view).
+    // is resolved ONCE here and threaded into the git/github boost queries (which read the
+    // direct-scoped `git_file_changes` / `github_refs` by path, bypassing the view).
     let repo_id = crate::index::schema::active_repo_id(conn)?;
+    // RECALL BOUND: `chunk_fts` / `chunk_embeddings` MATCH globally, then the repo (+ commit +
+    // worktree) filter is applied by the scope-view JOIN. Because SQLite applies `LIMIT` AFTER the
+    // join filter, the candidate window is a PER-REPO window — the active repo is never starved by
+    // a sibling repo's matches. `candidate_limit` (8× the caller's limit, well past the plan's
+    // 4× floor) caps how many post-filter candidates enter ranking; a query whose active-repo
+    // matches exceed 8×limit keeps only the BM25/vector-top `candidate_limit` of them, the same
+    // bound as a single-repo DB.
     let candidate_limit = i64::from(limit.max(10)).saturating_mul(8);
     let vector_available = query_embedding.is_some();
     let mut ranked = BTreeMap::<i64, RankedHit>::new();
@@ -688,10 +695,9 @@ fn historical_boost(
     options: SearchOptions,
     repo_id: &str,
 ) -> anyhow::Result<HistoricalBoost> {
-    // `git_file_changes` is direct-scoped (V040) and queried by PATH here (bypassing the scope
-    // view), so the `repo_id` predicate keeps a sibling repo's history from boosting a same-named
-    // path in a consolidated DB. (`github_refs` stays global until the papertrail tables gain
-    // `repo_id` in the A4 scoping phase.)
+    // `git_file_changes` / `github_refs` are direct-scoped (V040/V041) and queried by PATH here
+    // (bypassing the scope view), so the `repo_id` predicate keeps a sibling repo's history from
+    // boosting a same-named path in a consolidated DB.
     let git = if options.include_git {
         conn.query_row(
             "SELECT COUNT(*) FROM git_file_changes WHERE path = ?1 AND repo_id = ?2 LIMIT 1",
@@ -703,8 +709,8 @@ fn historical_boost(
     };
     let github = if options.include_papertrail {
         conn.query_row(
-            "SELECT COUNT(*) FROM github_refs WHERE source_path = ?1 LIMIT 1",
-            [path],
+            "SELECT COUNT(*) FROM github_refs WHERE source_path = ?1 AND repo_id = ?2 LIMIT 1",
+            params![path, repo_id],
             |row| row.get::<_, i64>(0),
         )?
     } else {

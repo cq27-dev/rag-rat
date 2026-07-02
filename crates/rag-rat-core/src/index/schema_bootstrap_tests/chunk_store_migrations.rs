@@ -724,12 +724,19 @@ fn files_has_test_code_flag_survives_the_heal_path() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
+    // Scope the assertion read to the ACTIVE repo: the poison-sibling harness seeds a same-path
+    // `main.files` row at this fixture's path, so an unscoped `WHERE path = ...` `query_row` is
+    // ambiguous (and after heal re-inserts the primary row at a higher rowid, would return the
+    // sibling's flag). This is a single-repo test, but the fix is to scope the query, not disable
+    // the harness.
+    let repo_id = crate::index::schema::active_repo_id(db.storage.connection()).unwrap();
     let flag = || -> i64 {
         db.storage
             .connection()
             .query_row(
-                "SELECT has_test_code FROM main.files WHERE path = 'src/markers.rs'",
-                [],
+                "SELECT has_test_code FROM main.files WHERE path = 'src/markers.rs' AND repo_id = \
+                 ?1",
+                [&repo_id],
                 |row| row.get(0),
             )
             .unwrap()

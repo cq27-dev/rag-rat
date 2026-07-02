@@ -42,19 +42,23 @@ fn dirty_git_files_are_indexed_as_worktree_overlay() {
 
     fs::write(docs.join("search.md"), "# Title\noverlay token\n").unwrap();
     let db = IndexDatabase::index_changed(&config).unwrap();
-    let scopes = db
-        .storage
-        .connection()
+    // Scope the raw file-scope enumeration to the ACTIVE repo: the poison-sibling harness seeds a
+    // same-path (committed-shaped) `main.files` row at this fixture's path, which would otherwise
+    // appear as an extra `(true, false)`. Reading through the scope view is wrong here (the test
+    // needs both the raw committed row AND the overlay row), so scope by `repo_id` instead.
+    let conn = db.storage.connection();
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let scopes = conn
         .prepare(
             "
                 SELECT commit_sha != '', worktree_id != ''
                 FROM main.files
-                WHERE path = 'docs/search.md'
+                WHERE path = 'docs/search.md' AND repo_id = ?1
                 ORDER BY commit_sha != '' DESC, worktree_id != '' DESC
                 ",
         )
         .unwrap()
-        .query_map([], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)))
+        .query_map([&repo_id], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();

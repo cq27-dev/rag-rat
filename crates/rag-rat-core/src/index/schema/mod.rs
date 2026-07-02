@@ -11,7 +11,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 40;
+pub const LATEST_SCHEMA_VERSION: u32 = 41;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -261,6 +261,13 @@ const MIGRATION_040_DESCRIPTION: &str =
      parser_failures, git_commits + git_file_changes) with rebuilt UNIQUE / PK keys and the \
      re-pointed commit_fts external content, plus the two active-embedding-model provenance meta \
      keys moved to repo_meta (memory-sync phase A3)";
+const MIGRATION_041_ID: &str = "041_github_repo_id_scoping";
+const MIGRATION_041_CHECKSUM: &str = "sha256:rag-rat-github-repo-id-scoping-v41";
+const MIGRATION_041_DESCRIPTION: &str =
+    "Repo-scope the GitHub papertrail cache: add repo_id to the seven github_* tables (refs, \
+     issues, comments, pull_requests, reviews, review_comments, ref_sync) and rebuild github_fts \
+     with a repo_id UNINDEXED column, so lexical and papertrail queries in a consolidated \
+     database never surface a sibling repo's refs or issues (memory-sync phase A4)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -600,6 +607,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_040_CHECKSUM,
         description: MIGRATION_040_DESCRIPTION,
         apply: apply_repo_id_core_scoping,
+    },
+    Migration {
+        id: MIGRATION_041_ID,
+        checksum: MIGRATION_041_CHECKSUM,
+        description: MIGRATION_041_DESCRIPTION,
+        apply: apply_github_repo_id_scoping,
     },
 ];
 

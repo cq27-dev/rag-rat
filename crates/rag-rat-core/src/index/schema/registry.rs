@@ -8,16 +8,35 @@ use crate::repo_identity::{LOCAL_ONLY_ID_PREFIX, RepoIdentity, RepoIdentityClass
 /// `commit_sha` / `worktree_id`). [`active_repo_id`] reads it; `install_scope_view` writes it.
 pub(crate) const CONNECTION_CONTEXT_REPO_KEY: &str = "repo_id";
 
-/// The direct-scoped tables that gained a `repo_id TEXT NOT NULL` column in V040 (phase A3) and
-/// therefore need their [`LEGACY_REPO_ID`] placeholder rows re-pointed at the real id when
-/// [`register_repo`] adopts a legacy DB. `git_file_changes` is intentionally ABSENT: its
-/// `(repo_id, commit_hash)` FK to `git_commits(repo_id, hash)` is `ON UPDATE CASCADE`, so rewriting
-/// `git_commits.repo_id` re-points its rows automatically — an explicit UPDATE would instead trip
-/// the FK (the child would reference the real id before the parent moved). `repo_meta` is handled
-/// separately (its FK is to `repos`, and it moved in V039). The A1 adoption contract requires every
-/// direct-scoped table backfill in the same call as the `repos`-row rewrite.
-const V040_DIRECT_SCOPED_TABLES: &[&str] =
-    &["files", "packages", "logical_symbols", "docs", "parser_failures", "git_commits"];
+/// The direct-scoped tables whose [`LEGACY_REPO_ID`] placeholder rows [`register_repo`] re-points
+/// at the real id when it adopts a legacy DB. V040 (phase A3) added the core tables; V041 (phase
+/// A4) added the seven GitHub papertrail tables plus the derived `github_fts` mirror (own-content
+/// FTS5, so its `repo_id UNINDEXED` value updates in place — re-pointing here keeps papertrail
+/// scoped to the real id without waiting for the next sync's `rebuild_fts`). `git_file_changes` is
+/// intentionally ABSENT: its `(repo_id, commit_hash)` FK to `git_commits(repo_id, hash)` is `ON
+/// UPDATE CASCADE`, so rewriting `git_commits.repo_id` re-points its rows automatically — an
+/// explicit UPDATE would instead trip the FK (the child would reference the real id before the
+/// parent moved). `repo_meta` is handled separately (its FK is to `repos`, and it moved in V039).
+/// The A1 adoption contract requires every direct-scoped table backfill in the same call as the
+/// `repos`-row rewrite.
+const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
+    // V040 (phase A3) core tables.
+    "files",
+    "packages",
+    "logical_symbols",
+    "docs",
+    "parser_failures",
+    "git_commits",
+    // V041 (phase A4) GitHub papertrail tables + the derived FTS mirror.
+    "github_refs",
+    "github_issues",
+    "github_comments",
+    "github_pull_requests",
+    "github_reviews",
+    "github_review_comments",
+    "github_ref_sync",
+    "github_fts",
+];
 
 /// The placeholder `repo_id` a freshly-migrated single-repo DB carries until it is adopted (see the
 /// V038 DDL) — and the backfill value every direct-scoped table gets when later migrations add
@@ -171,13 +190,24 @@ pub fn register_repo(
             source_id,
             SHALLOW_BOUNDARY_META_KEY,
         ])?;
-        // Re-point every direct-scoped table's source rows onto the real id (A3 extends the A1/A2
-        // adoption contract from `repos`/`repo_meta` to the V040 tables). Runs INSIDE the same
-        // transaction, keeping the insert-first ordering: on a fresh open the tables are empty and
-        // these are no-ops; on a forward-migrated DB (or a shallow-clone upgrade) they carry the
-        // rows onto the real id atomically with the `repos` rewrite. `git_commits` is updated here;
-        // `git_file_changes` follows via its `ON UPDATE CASCADE` FK.
-        for table in V040_DIRECT_SCOPED_TABLES {
+        // Re-point every direct-scoped table's source rows onto the real id (A3/A4 extend the
+        // A1/A2 adoption contract from `repos`/`repo_meta` to the V040 core tables and the V041
+        // GitHub papertrail tables). Runs INSIDE the same adoption transaction, keeping the
+        // insert-first ordering: on a fresh open the tables are empty and these are no-ops; on a
+        // forward-migrated DB that indexed under the placeholder (or a shallow-clone upgrade) they
+        // carry the rows onto the real id atomically with the `repos` rewrite. `git_commits` is
+        // updated here; `git_file_changes` follows via its `ON UPDATE CASCADE` FK.
+        for table in DIRECT_SCOPED_ADOPTION_TABLES {
+            // Guard on table presence: a real consolidated DB is fully migrated (every
+            // direct-scoped table exists), but the schema-bootstrap tests exercise
+            // adoption against ISOLATION fixtures that seed only the subset a given
+            // migration touches (V040 core tables OR V041 github tables). Skipping an
+            // absent table keeps adoption correct on the full schema while staying
+            // robust to those partial fixtures — a table that does not exist has no
+            // source rows to re-point.
+            if !adoption_table_present(&tx, table)? {
+                continue;
+            }
             tx.execute(&format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"), params![
                 identity.repo_id,
                 source_id
@@ -223,6 +253,20 @@ pub fn register_repo(
         );
     }
     Ok(identity.repo_id.clone())
+}
+
+/// Whether `table` exists in the schema (a plain or FTS5-virtual table both register in
+/// `sqlite_master` as `type = 'table'`) — the adoption loop's guard so a partial isolation
+/// fixture's absent direct-scoped table is skipped rather than tripping a `no such table` failure.
+fn adoption_table_present(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// A `SQLITE_CONSTRAINT` failure carrying `msg` — the registry's refusal shape. These are

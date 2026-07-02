@@ -376,6 +376,11 @@ fn migrate_adds_edge_name_columns_before_indexing_them() {
 
 #[test]
 fn migrate_preserves_github_papertrail_cache() {
+    // Whole-table `row_count` cache-total checks are single-repo by nature: they assert the
+    // papertrail cache survived a schema migration. The poison sibling's V041-scoped github rows
+    // would inflate the unscoped totals (production github reads ARE scoped — the multi_repo_scope
+    // leak matrix proves it), so opt this cache-total test out of the harness.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -419,6 +424,11 @@ fn migrate_preserves_github_papertrail_cache() {
 
 #[test]
 fn full_rebuild_preserves_github_papertrail_cache() {
+    // Whole-table `row_count` cache-total checks are single-repo by nature: they assert the
+    // papertrail cache survived a full rebuild. The poison sibling's V041-scoped github rows would
+    // inflate the unscoped totals (production github reads ARE scoped — the multi_repo_scope leak
+    // matrix proves it), so opt this cache-total test out of the harness.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
     let db = IndexDatabase::rebuild(&config).unwrap();

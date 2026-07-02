@@ -155,14 +155,15 @@ pub(crate) fn sync_progress(
     }
 }
 pub(crate) fn github_ref_synced(conn: &Connection, reference: &GitHubRef) -> anyhow::Result<bool> {
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let status = conn
         .query_row(
             "
             SELECT status
             FROM github_ref_sync
-            WHERE owner = ?1 AND repo = ?2 AND number = ?3
+            WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND repo_id = ?4
             ",
-            params![reference.owner, reference.repo, reference.number],
+            params![reference.owner, reference.repo, reference.number, repo_id],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -173,10 +174,10 @@ pub(crate) fn github_ref_synced(conn: &Connection, reference: &GitHubRef) -> any
         "
         SELECT EXISTS(
             SELECT 1 FROM github_issues
-            WHERE owner = ?1 AND repo = ?2 AND number = ?3
+            WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND repo_id = ?4
         )
         ",
-        params![reference.owner, reference.repo, reference.number],
+        params![reference.owner, reference.repo, reference.number, repo_id],
         |row| row.get::<_, bool>(0),
     )?;
     Ok(cached_issue)
@@ -187,16 +188,26 @@ pub(crate) fn mark_ref_sync(
     status: &str,
     error: Option<&str>,
 ) -> anyhow::Result<()> {
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     conn.execute(
         "
-        INSERT INTO github_ref_sync(owner, repo, number, status, synced_at_ms, last_error)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        INSERT INTO github_ref_sync(owner, repo, number, status, synced_at_ms, last_error, repo_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ON CONFLICT(owner, repo, number) DO UPDATE SET
             status = excluded.status,
             synced_at_ms = excluded.synced_at_ms,
-            last_error = excluded.last_error
+            last_error = excluded.last_error,
+            repo_id = excluded.repo_id
         ",
-        params![reference.owner, reference.repo, reference.number, status, now_ms(), error],
+        params![
+            reference.owner,
+            reference.repo,
+            reference.number,
+            status,
+            now_ms(),
+            error,
+            repo_id
+        ],
     )?;
     Ok(())
 }

@@ -653,3 +653,201 @@ fn orientation_pins_the_fork_repo_over_a_shared_root_sibling() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+// --- Cross-repo FTS / papertrail leak matrix (spec §9, memory-sync phase A4) ---
+//
+// Repo A is really indexed (its chunk_fts / commit_fts / git_file_changes are populated by the
+// rebuild); repo B's search rows are SEEDED directly under REPO_B with UNIQUELY-named content. The
+// contract: every search / git-history / papertrail query run on repo A's scoped connection returns
+// ONLY repo A's rows and NEVER surfaces repo B's — even though both live in the one database.
+
+/// Repo B's unique tokens (seeded under REPO_B); a query for any of these from repo A's connection
+/// must come back empty.
+const B_LEXICAL_TOKEN: &str = "zebrafishunique";
+const B_COMMIT_TOKEN: &str = "narwhalcommitunique";
+const B_ISSUE_TOKEN: &str = "unicornissueunique";
+/// Repo A's unique GitHub token (seeded under the real repo id) — the positive control on the same
+/// papertrail surface.
+const A_ISSUE_TOKEN: &str = "phoenixissueunique";
+
+/// Seed a GitHub ref + issue + FTS row for `repo_id`, all carrying `token`.
+fn seed_github_issue(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    token: &str,
+    source_path: &str,
+) {
+    conn.execute(
+        "INSERT INTO github_refs(owner, repo, number, ref_kind, source_kind, source_path, \
+         source_commit, source_text, discovered_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, 'closing', 'file', ?4, NULL, ?5, 0, ?6)",
+        rusqlite::params![owner, repo, number, source_path, format!("{token} ref"), repo_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, \
+         is_pull_request, synced_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, 'http://x', 'open', ?4, ?5, 0, 0, ?6)",
+        rusqlite::params![
+            owner,
+            repo,
+            number,
+            format!("{token} title"),
+            format!("{token} body"),
+            repo_id
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
+         classification, repo_id)
+         VALUES (?1, ?2, ?3, 'issue', ?4, 'http://x', ?5, ?6, 'other', ?7)",
+        rusqlite::params![
+            owner,
+            repo,
+            number,
+            number.to_string(),
+            format!("{token} title"),
+            format!("{token} body"),
+            repo_id
+        ],
+    )
+    .unwrap();
+}
+
+/// Seed repo B's search-surface rows (a chunk in chunk_fts, a commit in commit_fts, a
+/// git_file_changes row, a github ref/issue/fts) under REPO_B, plus repo A's own github issue under
+/// the real id (the positive control). Requires a `two_repo_fixture` (repo A indexed, repo B's file
+/// rows already seeded).
+fn seed_search_leak_data(fx: &TwoRepoFixture) {
+    let conn = fx.db.storage.connection();
+
+    // Repo B: a chunk whose text carries a unique token, wired into chunk_text + the contentless
+    // chunk_fts, hung off repo B's live b_only.rs file row.
+    let file_id: i64 = conn
+        .query_row(
+            "SELECT id FROM main.files WHERE repo_id = ?1 AND path = 'src/b_only.rs'",
+            [REPO_B],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let text = format!("fn b_fn() {{ /* {B_LEXICAL_TOKEN} */ }}");
+    let chunk_id: i64 = conn
+        .query_row(
+            "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, \
+             start_line, end_line, text_hash)
+             VALUES (?1, 'symbol', 'b_fn', 0, 10, 1, 5, 'bhash') RETURNING id",
+            [file_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    crate::index::chunk_text_store::seed_chunk_text(conn, chunk_id, &text).unwrap();
+    conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", rusqlite::params![
+        chunk_id, text
+    ])
+    .unwrap();
+
+    // Repo B: a commit + file change under REPO_B, then re-point the external-content commit_fts
+    // over EVERY repo's commits so repo B's commit IS in the FTS (the leak surface the join
+    // must filter).
+    conn.execute(
+        "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s, committed_at_s, \
+         subject, body, changed_file_count, repo_id)
+         VALUES ('bbbbb1111', 'b', 'b@e', 10, 10, ?1, '', 1, ?2)",
+        rusqlite::params![format!("{B_COMMIT_TOKEN} subject"), REPO_B],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind, \
+         repo_id)
+         VALUES ('bbbbb1111', 'src/b_only.rs', 1, 0, 'modified', ?1)",
+        [REPO_B],
+    )
+    .unwrap();
+    crate::index::schema::rebuild_commit_fts(conn).unwrap();
+
+    // Repo B's papertrail (must never leak) + repo A's own papertrail (the positive control).
+    seed_github_issue(conn, REPO_B, "octob", "rb", 77, B_ISSUE_TOKEN, "src/b_only.rs");
+    seed_github_issue(conn, &fx.repo_a_id, "octoa", "ra", 11, A_ISSUE_TOKEN, "src/a_only.rs");
+}
+
+/// Lexical + hybrid candidate selection is repo-scoped: repo B's uniquely-tokened chunk is
+/// unreachable from repo A's connection (both the bm25 and the vector candidate pass JOIN the
+/// repo-scoped `files` view, so a sibling repo's chunk is dropped before ranking), while repo A's
+/// own chunk is still found.
+#[test]
+fn lexical_and_hybrid_search_never_surface_the_other_repo() {
+    let fx = two_repo_fixture();
+    seed_search_leak_data(&fx);
+    let conn = fx.db.storage.connection();
+
+    // Raw lexical (bm25 candidates through the scope view): repo B's token does not leak.
+    let leaked =
+        crate::search::lexical::search_lexical_only(conn, B_LEXICAL_TOKEN, 10, false).unwrap();
+    assert!(leaked.is_empty(), "repo B chunk leaked into repo A lexical search: {leaked:?}");
+    // Full hybrid entry (bm25 + vector fuse; no model ⇒ lexical-only, still through the view).
+    let leaked_hybrid = fx.db.search(B_LEXICAL_TOKEN, 10, false).unwrap();
+    assert!(leaked_hybrid.is_empty(), "repo B chunk leaked into repo A hybrid search");
+    // Positive control: repo A's own indexed symbol IS reachable.
+    let own = crate::search::lexical::search_lexical_only(conn, "a_only", 10, false).unwrap();
+    assert!(
+        own.iter().any(|hit| hit.path == "src/a_only.rs"),
+        "repo A must still see its own chunk: {own:?}"
+    );
+
+    let _ = fs::remove_dir_all(fx.root_a);
+}
+
+/// Git-history queries are repo-scoped: repo B's commit (commit_fts MATCH) and its path history are
+/// unreachable from repo A, and `status` counts only repo A's commits — repo A still sees its own.
+#[test]
+fn git_history_queries_never_surface_the_other_repo() {
+    let fx = two_repo_fixture();
+    seed_search_leak_data(&fx);
+    let conn = fx.db.storage.connection();
+
+    // commit_search joins commit_fts → git_commits and filters git_commits.repo_id.
+    let leaked = crate::index::git_history::commit_search(conn, B_COMMIT_TOKEN, 10).unwrap();
+    assert!(leaked.is_empty(), "repo B commit leaked into repo A commit_search: {leaked:?}");
+    let own = crate::index::git_history::commit_search(conn, "init", 10).unwrap();
+    assert!(!own.is_empty(), "repo A must still see its own commit");
+
+    // history_for_path filters git_file_changes.repo_id.
+    let leaked_hist =
+        crate::index::git_history::history_for_path(conn, "src/b_only.rs", 10).unwrap();
+    assert!(leaked_hist.is_empty(), "repo B path history leaked: {leaked_hist:?}");
+    let own_hist = crate::index::git_history::history_for_path(conn, "src/a_only.rs", 10).unwrap();
+    assert!(!own_hist.is_empty(), "repo A must still see its own path history");
+
+    // status counts are per-repo: repo A has exactly its one indexed commit, not repo B's.
+    let status = crate::index::git_history::status(conn, &fx.root_a).unwrap();
+    assert_eq!(status.commit_count, 1, "status counts only repo A's git_commits, not repo B's");
+
+    let _ = fs::remove_dir_all(fx.root_a);
+}
+
+/// Papertrail queries are repo-scoped: repo B's issue (github_fts MATCH) and its path-anchored ref
+/// are unreachable from repo A, while repo A's own issue on the SAME surface is found.
+#[test]
+fn papertrail_queries_never_surface_the_other_repo() {
+    let fx = two_repo_fixture();
+    seed_search_leak_data(&fx);
+    let conn = fx.db.storage.connection();
+
+    // github_issue_search → search_fts, which filters github_fts.repo_id.
+    let leaked = fx.db.github_issue_search(B_ISSUE_TOKEN, 10).unwrap();
+    assert!(leaked.is_empty(), "repo B issue leaked into repo A github search: {leaked:?}");
+    let own = fx.db.github_issue_search(A_ISSUE_TOKEN, 10).unwrap();
+    assert!(!own.is_empty(), "repo A must still see its own issue");
+
+    // refs_for_path filters github_refs.repo_id.
+    let leaked_refs = crate::index::github::refs_for_path(conn, "src/b_only.rs", 10).unwrap();
+    assert!(leaked_refs.is_empty(), "repo B github ref leaked: {leaked_refs:?}");
+    let own_refs = crate::index::github::refs_for_path(conn, "src/a_only.rs", 10).unwrap();
+    assert!(!own_refs.is_empty(), "repo A must still see its own github ref");
+
+    let _ = fs::remove_dir_all(fx.root_a);
+}

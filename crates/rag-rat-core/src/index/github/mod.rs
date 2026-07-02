@@ -312,6 +312,9 @@ pub(crate) struct FtsRow<'a> {
     url: &'a str,
     title: &'a str,
     body: &'a str,
+    /// The active repo that owns this papertrail row (V041). Stamped into `github_fts.repo_id`
+    /// (UNINDEXED) so a MATCH in a consolidated DB filters to one repo.
+    repo_id: &'a str,
 }
 
 #[derive(Debug, Clone)]

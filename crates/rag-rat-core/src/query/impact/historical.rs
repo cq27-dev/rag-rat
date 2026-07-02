@@ -115,12 +115,14 @@ pub(crate) fn github_refs_for_paths(
     if budget == 0 {
         return Ok(());
     }
+    // `github_refs` is direct-scoped (V041): only surface the ACTIVE repo's refs for this path.
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut added = 0usize;
     let mut stmt = conn.prepare(
         "
         SELECT owner, repo, number, ref_kind, source_kind, source_text
         FROM github_refs
-        WHERE source_path = ?1
+        WHERE source_path = ?1 AND repo_id = ?3
         ORDER BY id DESC
         LIMIT ?2
         ",
@@ -131,8 +133,9 @@ pub(crate) fn github_refs_for_paths(
         }
         let before = surface.len();
         let file = file_for_path(conn, path)?;
-        let rows =
-            stmt.query_map(params![path, i64::try_from(budget).unwrap_or(i64::MAX)], |row| {
+        let rows = stmt.query_map(
+            params![path, i64::try_from(budget).unwrap_or(i64::MAX), repo_id],
+            |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -141,7 +144,8 @@ pub(crate) fn github_refs_for_paths(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                 ))
-            })?;
+            },
+        )?;
         for row in rows {
             let (owner, repo, number, ref_kind, source_kind, source_text) = row?;
             surface.push(
@@ -168,19 +172,22 @@ pub(crate) fn github_rationale_for_query(
     if fts_query.is_empty() {
         return Ok(());
     }
+    // `github_fts` is one index over every repo's papertrail; the `repo_id` filter is MANDATORY
+    // (V041) so a MATCH here never surfaces a sibling repo's issue in a consolidated DB.
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT url, title, classification
         FROM github_fts
-        WHERE github_fts MATCH ?1
+        WHERE github_fts MATCH ?1 AND repo_id = ?3
         ORDER BY rank
         LIMIT ?2
         ",
     )?;
-    let rows = stmt
-        .query_map(params![fts_query, i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        })?;
+    let rows = stmt.query_map(
+        params![fts_query, i64::try_from(limit).unwrap_or(i64::MAX), repo_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+    )?;
     for row in rows {
         let (url, title, classification) = row?;
         surface.push(

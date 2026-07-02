@@ -11,16 +11,37 @@
 //! assertion trips; a production DELETE that forgets it silently wipes the sibling, which
 //! [`assert_sibling_intact`] catches.
 //!
-//! SCHEMA-VERSION SCOPE (load-bearing): this worktree is **V040** (`LATEST_SCHEMA_VERSION = 40`),
-//! where exactly TEN tables carry a `repo_id` column — `repos`, `repo_roots`, `repo_meta`, `files`,
-//! `packages`, `logical_symbols`, `docs`, `parser_failures`, `git_commits`, `git_file_changes` —
-//! plus tables scoped TRANSITIVELY through them (`chunks`/`symbols`/`edges_data` via `files.id`;
-//! `logical_symbol_members`/`logical_symbol_monikers` via `logical_symbols.id`). The github, repo
-//! memory, oracle (`oracle_runs`/`edge_oracle`), clone, `dream_findings`, and `reconcile_attempts`
-//! tables are GLOBAL at V040 — they gain `repo_id` only in A4 (V041) / A5 (V042), which are NOT in
-//! this worktree — so seeding a `repo_id='poison-sibling'` row into them is impossible and a read
-//! of them is *legitimately* cross-repo here. Seeding them would manufacture FALSE tripwires. When
-//! A4/A5 land, extend [`seed_sibling`] to those tables at the same time their scoping does.
+//! TWO TRIPWIRE CLASSES (load-bearing). (1) DISTINCT-PATH rows seed under `zz_poison_`-prefixed
+//! paths/keys that can never collide with a primary-repo path — they catch an unscoped
+//! read/count/delete that returns the UNION across repos (a missing `repo_id` filter on a
+//! whole-table scan). (2) SAME-PATH rows seed under a REAL primary-repo path (resolved at seed time
+//! by [`primary_collision_path`]) — they catch the class the distinct-path rows CANNOT: an
+//! aggregate that reads a scoped table grouped by a NON-repo key (path / source_path) and then
+//! JOINS the result onto the active repo's rows BY PATH instead of flowing repo attribution through
+//! the join. The canonical example is the V041 `github_ref_counts` CTE in
+//! `query::repo_brief::file_rows` (`SELECT source_path, COUNT(*) FROM github_refs GROUP BY
+//! source_path` then `LEFT JOIN … ON github_ref_counts.path = files.path`): a sibling's
+//! `github_refs` row at `src/lib.rs` inflates the active repo's file `src/lib.rs` unless the CTE
+//! filters `repo_id`. A distinct-path sibling ref at `zz_poison_path.rs` never joins onto a primary
+//! file, so ONLY a same-path ref exposes that leak. Same-path rows go in for `github_refs` (the
+//! join-by-path papertrail), `files`, `git_file_changes`, and `parser_failures`; each is pinned in
+//! [`sibling_tripwires`] by a path-INDEPENDENT sentinel column so the intact check holds regardless
+//! of which fixture path was chosen.
+//!
+//! SCHEMA-VERSION SCOPE (load-bearing): this worktree is **V041** (`LATEST_SCHEMA_VERSION = 41`),
+//! which scopes the V040 core tables — `repos`, `repo_roots`, `repo_meta`, `files`, `packages`,
+//! `logical_symbols`, `docs`, `parser_failures`, `git_commits`, `git_file_changes` (plus tables
+//! scoped TRANSITIVELY through them: `chunks`/`symbols`/`edges_data` via `files.id`;
+//! `logical_symbol_members`/`logical_symbol_monikers` via `logical_symbols.id`) — AND the seven
+//! V041 GitHub papertrail tables (`github_refs`, `github_issues`, `github_comments`,
+//! `github_pull_requests`, `github_reviews`, `github_review_comments`, `github_ref_sync`) plus the
+//! `github_fts` mirror, each of which gained a `repo_id` column in V041. [`seed_sibling`] seeds a
+//! tripwire row into every one of those. The repo-memory, oracle (`oracle_runs`/`edge_oracle`),
+//! clone, `dream_findings`, and `reconcile_attempts` tables are STILL GLOBAL at V041 — they gain
+//! `repo_id` only in A5 (V042), which is NOT in this worktree — so seeding a
+//! `repo_id='poison-sibling'` row into them is impossible and a read of them is *legitimately*
+//! cross-repo here. Seeding them would manufacture FALSE tripwires. When A5 lands, extend
+//! [`seed_sibling`] to those tables at the same time their scoping does.
 //!
 //! WHY THE SIBLING IS NOT REGISTERED IN `repos` (load-bearing at V040): the eight direct-scoped
 //! DATA tables (`files`, `packages`, `logical_symbols`, `docs`, `parser_failures`, `git_commits`,
@@ -60,6 +81,40 @@ const POISON_LOGICAL_ID: i64 = 9_900_000_777;
 
 /// The poison sibling's git commit hash (a distinctive 40-hex-shaped sentinel).
 const POISON_COMMIT: &str = "zzpoison00000000000000000000000000000000";
+
+/// The poison sibling's GitHub issue/PR/ref number — a distinctive sentinel far outside any
+/// fixture's range, so a seeded papertrail row is unmistakable and never collides on the
+/// `UNIQUE(owner, repo, number)` / `PRIMARY KEY(owner, repo, number)` keys.
+const POISON_GH_NUMBER: i64 = 9_900_077;
+
+/// Base for the EXPLICIT GitHub item ids on the five body-bearing poison rows (+1 issue, +2
+/// comment, +3 pull, +4 review, +5 review comment). `github::rebuild_fts` derives
+/// `github_fts.item_id` from each base row's `id`, so the harness pins the ids rather than letting
+/// AUTOINCREMENT choose — the seeded mirror rows and a post-resync re-derived mirror then agree on
+/// every tripwire-pinned column (see `github_fts_tripwires_survive_a_papertrail_resync`).
+const POISON_GH_ITEM_ID: i64 = 9_900_077_000;
+
+/// SAME-PATH tripwire sentinels. The DISTINCT-PATH rows above seed under `zz_poison_`-prefixed
+/// paths that never collide with a primary-repo path, so a leak that JOINS a scoped table onto the
+/// active repo's rows BY PATH (rather than flowing repo attribution through the join) cannot trip —
+/// the sibling's path never matches a primary path. These SAME-PATH rows instead seed under a REAL
+/// primary-repo path (resolved at seed time by [`primary_collision_path`]), so an unscoped
+/// join-by-path aggregate attributes the sibling's rows to the active repo and an existing read
+/// assertion trips. Each carries its own path-INDEPENDENT sentinel column value (distinct from the
+/// distinct-path rows) so the intact check pins it regardless of which primary path was chosen.
+const POISON_SAMEPATH_GH_NUMBER: i64 = 9_900_078;
+/// `github_refs.source_text` sentinel on the same-path ref (so it reads distinctly in a dump).
+const POISON_SAMEPATH_REFTEXT: &str = "zz_poison_samepath_reftext";
+/// `files.sha256` sentinel pinning the same-path `files` row.
+const POISON_SAMEPATH_SHA: &str = "zz_poison_samepath_sha";
+/// `parser_failures.message` sentinel pinning the same-path `parser_failures` row.
+const POISON_SAMEPATH_MSG: &str = "zz_poison_samepath_msg";
+/// `git_file_changes.additions` sentinel pinning the same-path `git_file_changes` row (a value no
+/// real fixture change produces).
+const POISON_SAMEPATH_ADDITIONS: i64 = 7_700_077;
+/// Fallback collision path when the fixture indexed no files — nothing to collide with, but the row
+/// still guards against an unscoped DELETE.
+const POISON_SAMEPATH_FALLBACK: &str = "zz_poison_no_primary_file.rs";
 
 thread_local! {
     /// Whether [`seed_if_enabled`] seeds on this thread. Default ON. Thread-local (not a global
@@ -107,6 +162,10 @@ pub(crate) fn seed_if_enabled(conn: &Connection) -> anyhow::Result<()> {
 /// Deliberately touches NO registry table (`repos`/`repo_roots`/`repo_meta`) — see the module docs.
 pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
     clear_sibling(conn)?;
+
+    // Resolve the primary-repo path the SAME-PATH tripwires collide onto BEFORE seeding any sibling
+    // rows (so the poison rows never win the `ORDER BY path` pick).
+    let collision_path = primary_collision_path(conn)?;
 
     // --- git history (git_file_changes FKs git_commits(repo_id, hash); git_commits has NO FK to
     // repos, so this needs no registry row) ---
@@ -228,7 +287,218 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
         ],
     )?;
 
+    // --- github papertrail (V041): the seven base tables + the standalone `github_fts` mirror each
+    // gained a `repo_id` column, so a sibling row is now valid (these caches carry NO FK to
+    // `repos`) and any unscoped papertrail read/count/delete trips a tripwire. The five
+    // body-bearing rows carry EXPLICIT item ids (`POISON_GH_ITEM_ID` + kind offset) because a
+    // papertrail resync (`github::rebuild_fts`) re-derives the whole mirror from these rows —
+    // pinned ids keep the re-derived mirror identical to the seeded one. ---
+    let gh_owner = format!("{POISON_PREFIX}owner");
+    let gh_repo = format!("{POISON_PREFIX}repo");
+    conn.execute(
+        "INSERT INTO github_refs(owner, repo, number, ref_kind, source_kind, source_path, \
+         source_text, discovered_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, 'closing', 'file', ?4, ?5, 0, ?6)",
+        params![
+            gh_owner,
+            gh_repo,
+            POISON_GH_NUMBER,
+            format!("{POISON_PREFIX}path.rs"),
+            format!("{POISON_PREFIX}reftext"),
+            POISON_REPO_ID
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO github_issues(id, owner, repo, number, html_url, state, title, body, \
+         synced_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, ?4, 'http://x', 'open', ?5, ?6, 0, ?7)",
+        params![
+            POISON_GH_ITEM_ID + 1,
+            gh_owner,
+            gh_repo,
+            POISON_GH_NUMBER,
+            format!("{POISON_PREFIX}title"),
+            format!("{POISON_PREFIX}body"),
+            POISON_REPO_ID
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO github_comments(id, owner, repo, number, html_url, body, synced_at_ms, \
+         repo_id)
+         VALUES (?1, ?2, ?3, ?4, 'http://x', ?5, 0, ?6)",
+        params![
+            POISON_GH_ITEM_ID + 2,
+            gh_owner,
+            gh_repo,
+            POISON_GH_NUMBER,
+            format!("{POISON_PREFIX}comment"),
+            POISON_REPO_ID
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO github_pull_requests(id, owner, repo, number, html_url, state, title, body, \
+         synced_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, ?4, 'http://x', 'open', ?5, ?6, 0, ?7)",
+        params![
+            POISON_GH_ITEM_ID + 3,
+            gh_owner,
+            gh_repo,
+            POISON_GH_NUMBER,
+            format!("{POISON_PREFIX}prtitle"),
+            format!("{POISON_PREFIX}prbody"),
+            POISON_REPO_ID
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO github_reviews(id, owner, repo, number, state, body, synced_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, ?4, 'commented', ?5, 0, ?6)",
+        params![
+            POISON_GH_ITEM_ID + 4,
+            gh_owner,
+            gh_repo,
+            POISON_GH_NUMBER,
+            format!("{POISON_PREFIX}review"),
+            POISON_REPO_ID
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO github_review_comments(id, owner, repo, number, html_url, body, \
+         synced_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, ?4, 'http://x', ?5, 0, ?6)",
+        params![
+            POISON_GH_ITEM_ID + 5,
+            gh_owner,
+            gh_repo,
+            POISON_GH_NUMBER,
+            format!("{POISON_PREFIX}revcomment"),
+            POISON_REPO_ID
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO github_ref_sync(owner, repo, number, status, synced_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, 'ok', 0, ?4)",
+        params![gh_owner, gh_repo, POISON_GH_NUMBER, POISON_REPO_ID],
+    )?;
+    // github_fts mirror rows, seeded EXACTLY as `github::rebuild_fts` derives them from the five
+    // base rows above (one row per item kind; same item_id / url / title / body slot mapping —
+    // reviews derive url = COALESCE(html_url, '') = '' and review comments derive title =
+    // COALESCE(path, '') = '' from the unseeded nullable columns). A resync DELETEs the whole
+    // mirror and re-derives it, so seeding anything else would strand the intact check on a
+    // vanished row set; `github_fts_tripwires_survive_a_papertrail_resync` pins this equivalence.
+    // `classification` is recomputed by `insert_fts` (`classify_text`) at re-derivation and is
+    // deliberately NOT pinned by the tripwires.
+    let insert_poison_fts = |kind: &str, item_id: i64, url: &str, title: &str, body: String| {
+        conn.execute(
+            "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
+             classification, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'other', ?9)",
+            params![
+                gh_owner,
+                gh_repo,
+                POISON_GH_NUMBER,
+                kind,
+                item_id.to_string(),
+                url,
+                title,
+                body,
+                POISON_REPO_ID
+            ],
+        )
+    };
+    insert_poison_fts(
+        "issue",
+        POISON_GH_ITEM_ID + 1,
+        "http://x",
+        &format!("{POISON_PREFIX}title"),
+        format!("{POISON_PREFIX}body"),
+    )?;
+    insert_poison_fts(
+        "comment",
+        POISON_GH_ITEM_ID + 2,
+        "http://x",
+        "",
+        format!("{POISON_PREFIX}comment"),
+    )?;
+    insert_poison_fts(
+        "pull",
+        POISON_GH_ITEM_ID + 3,
+        "http://x",
+        &format!("{POISON_PREFIX}prtitle"),
+        format!("{POISON_PREFIX}prbody"),
+    )?;
+    insert_poison_fts("review", POISON_GH_ITEM_ID + 4, "", "", format!("{POISON_PREFIX}review"))?;
+    insert_poison_fts(
+        "review_comment",
+        POISON_GH_ITEM_ID + 5,
+        "http://x",
+        "",
+        format!("{POISON_PREFIX}revcomment"),
+    )?;
+
+    // --- SAME-PATH tripwires: sibling rows whose PATH deliberately collides with a real primary
+    // path (`collision_path`). A join-by-path aggregate that reads a scoped table without a
+    // `repo_id` predicate attributes these to the active repo. The DISTINCT-PATH rows above cannot
+    // catch that class — their `zz_poison_` paths never match a primary path. Each row is under
+    // `POISON_REPO_ID`, so `clear_sibling`'s existing `WHERE repo_id = POISON_REPO_ID` deletes
+    // them; the intact check pins each by its own sentinel column (not by path). ---
+    // files: caught by any unscoped `main.files` read that groups/joins by path (the scope view
+    // would exclude the sibling, so only a view-bypassing path read leaks). No children hung off
+    // it.
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id, repo_id)
+         VALUES (?1, 'rust', 'source', ?2, 0, 0, ?3, '', ?4)",
+        params![collision_path, POISON_SAMEPATH_SHA, POISON_COMMIT, POISON_REPO_ID],
+    )?;
+    // git_file_changes at the shared path (off the sibling commit): caught by an unscoped churn /
+    // co-change / history aggregate that joins `git_file_changes.path` onto the scoped `files`.
+    conn.execute(
+        "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind, \
+         repo_id)
+         VALUES (?1, ?2, ?3, 0, 'modified', ?4)",
+        params![POISON_COMMIT, collision_path, POISON_SAMEPATH_ADDITIONS, POISON_REPO_ID],
+    )?;
+    // parser_failures at the shared path (PK is (repo_id, path), so this is distinct from the
+    // distinct-path failure): caught by an unscoped parser-failure read joined/grouped by path.
+    conn.execute(
+        "INSERT INTO parser_failures(repo_id, path, language, message) VALUES (?1, ?2, 'rust', ?3)",
+        params![POISON_REPO_ID, collision_path, POISON_SAMEPATH_MSG],
+    )?;
+    // github_refs at the shared source_path: THE canonical join-by-path leak (the V041
+    // `github_ref_counts` CTE in `repo_brief::file_rows`). Distinct `number` from the distinct-path
+    // ref, so the `UNIQUE(owner, repo, number, source_kind, ...)` index is satisfied.
+    conn.execute(
+        "INSERT INTO github_refs(owner, repo, number, ref_kind, source_kind, source_path, \
+         source_text, discovered_at_ms, repo_id)
+         VALUES (?1, ?2, ?3, 'closing', 'file', ?4, ?5, 0, ?6)",
+        params![
+            gh_owner,
+            gh_repo,
+            POISON_SAMEPATH_GH_NUMBER,
+            collision_path,
+            POISON_SAMEPATH_REFTEXT,
+            POISON_REPO_ID
+        ],
+    )?;
+
     Ok(())
+}
+
+/// The lexicographically-first REAL (non-sibling) indexed path — the primary-repo path the
+/// SAME-PATH tripwires collide onto. Falls back to [`POISON_SAMEPATH_FALLBACK`] when the fixture
+/// indexed no files (an empty repo): there is then nothing to collide with, but the seeded rows
+/// still guard against an unscoped DELETE. Deterministic (`ORDER BY path`), so a meta-test can
+/// re-resolve the same path. Resolve it BEFORE seeding the sibling's own rows (all under
+/// `POISON_REPO_ID`, so `repo_id != POISON_REPO_ID` also excludes them defensively).
+fn primary_collision_path(conn: &Connection) -> anyhow::Result<String> {
+    let path: String = conn.query_row(
+        "SELECT COALESCE(
+             (SELECT path FROM main.files WHERE repo_id != ?1 ORDER BY path LIMIT 1),
+             ?2)",
+        params![POISON_REPO_ID, POISON_SAMEPATH_FALLBACK],
+        |row| row.get(0),
+    )?;
+    Ok(path)
 }
 
 /// Remove every poison-sibling row, child→parent, so [`seed_sibling`] is idempotent across repeated
@@ -249,7 +519,15 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
          DELETE FROM packages WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM git_file_changes WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM git_commits WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM main.files WHERE repo_id = '{POISON_REPO_ID}';"
+         DELETE FROM main.files WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM github_refs WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM github_issues WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM github_comments WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM github_pull_requests WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM github_reviews WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM github_review_comments WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM github_ref_sync WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM github_fts WHERE repo_id = '{POISON_REPO_ID}';"
     ))?;
     Ok(())
 }
@@ -264,10 +542,20 @@ fn sibling_tripwires() -> Vec<(&'static str, String)> {
         format!("file_id IN (SELECT id FROM main.files WHERE repo_id = '{POISON_REPO_ID}')");
     vec![
         ("git_commits", format!("repo_id = '{POISON_REPO_ID}' AND hash = '{POISON_COMMIT}'")),
-        ("git_file_changes", format!("repo_id = '{POISON_REPO_ID}'")),
+        // Pinned to the distinct-path row's path so the same-path `git_file_changes` tripwire
+        // (a second row under `POISON_REPO_ID`) doesn't inflate this count.
+        (
+            "git_file_changes",
+            format!("repo_id = '{POISON_REPO_ID}' AND path = '{POISON_PREFIX}change.rs'"),
+        ),
         ("main.files", format!("repo_id = '{POISON_REPO_ID}' AND path = '{POISON_PREFIX}file.rs'")),
         ("packages", format!("repo_id = '{POISON_REPO_ID}'")),
-        ("parser_failures", format!("repo_id = '{POISON_REPO_ID}'")),
+        // Pinned to the distinct-path row's path so the same-path `parser_failures` tripwire
+        // doesn't inflate this count.
+        (
+            "parser_failures",
+            format!("repo_id = '{POISON_REPO_ID}' AND path = '{POISON_PREFIX}fail.rs'"),
+        ),
         ("docs", format!("repo_id = '{POISON_REPO_ID}'")),
         ("logical_symbols", format!("id = {POISON_LOGICAL_ID} AND repo_id = '{POISON_REPO_ID}'")),
         ("symbols", file_scope.clone()),
@@ -284,6 +572,88 @@ fn sibling_tripwires() -> Vec<(&'static str, String)> {
             format!(
                 "logical_symbol_id = {POISON_LOGICAL_ID} AND moniker = '{POISON_PREFIX}moniker'"
             ),
+        ),
+        // github papertrail (V041): each base table + the fts mirror pinned by the sentinel
+        // number.
+        ("github_refs", format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}")),
+        ("github_issues", format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}")),
+        (
+            "github_comments",
+            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}"),
+        ),
+        (
+            "github_pull_requests",
+            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}"),
+        ),
+        ("github_reviews", format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}")),
+        (
+            "github_review_comments",
+            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}"),
+        ),
+        (
+            "github_ref_sync",
+            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER}"),
+        ),
+        // github_fts: one derived mirror row per item kind, pinned by item_kind + item_id + body
+        // so a papertrail resync's re-derivation must reconverge onto exactly this set
+        // (`classification` is derivation-owned and deliberately unpinned).
+        (
+            "github_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
+                 'issue' AND item_id = '{}' AND body = '{POISON_PREFIX}body'",
+                POISON_GH_ITEM_ID + 1
+            ),
+        ),
+        (
+            "github_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
+                 'comment' AND item_id = '{}' AND body = '{POISON_PREFIX}comment'",
+                POISON_GH_ITEM_ID + 2
+            ),
+        ),
+        (
+            "github_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
+                 'pull' AND item_id = '{}' AND body = '{POISON_PREFIX}prbody'",
+                POISON_GH_ITEM_ID + 3
+            ),
+        ),
+        (
+            "github_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
+                 'review' AND item_id = '{}' AND body = '{POISON_PREFIX}review'",
+                POISON_GH_ITEM_ID + 4
+            ),
+        ),
+        (
+            "github_fts",
+            format!(
+                "repo_id = '{POISON_REPO_ID}' AND number = {POISON_GH_NUMBER} AND item_kind = \
+                 'review_comment' AND item_id = '{}' AND body = '{POISON_PREFIX}revcomment'",
+                POISON_GH_ITEM_ID + 5
+            ),
+        ),
+        // SAME-PATH tripwires: pinned by a path-INDEPENDENT sentinel column (the collision path is
+        // fixture-dependent), so the intact check holds whichever primary path was chosen.
+        (
+            "main.files",
+            format!("repo_id = '{POISON_REPO_ID}' AND sha256 = '{POISON_SAMEPATH_SHA}'"),
+        ),
+        (
+            "git_file_changes",
+            format!("repo_id = '{POISON_REPO_ID}' AND additions = {POISON_SAMEPATH_ADDITIONS}"),
+        ),
+        (
+            "parser_failures",
+            format!("repo_id = '{POISON_REPO_ID}' AND message = '{POISON_SAMEPATH_MSG}'"),
+        ),
+        (
+            "github_refs",
+            format!("repo_id = '{POISON_REPO_ID}' AND number = {POISON_SAMEPATH_GH_NUMBER}"),
         ),
     ]
 }
@@ -338,6 +708,93 @@ mod tests {
         assert!(sibling_files >= 1, "the poison file must be seeded by the default rebuild");
 
         // And every tripwire is intact right after seeding.
+        assert_sibling_intact(conn);
+    }
+
+    /// SAME-PATH tripwire liveness: the harness must seed a sibling row whose join key COLLIDES
+    /// with a real primary-repo path, and an intentionally path-keyed UNSCOPED aggregate must see
+    /// it — proving the harness can trip a join-by-path leak (the class the distinct-path rows
+    /// cannot). The paired assertion pins the FIX: the SCOPED production `repo_brief` attributes
+    /// ZERO of the sibling's refs to the primary path. If the unscoped side stops seeing the
+    /// sentinel, the same-path harness is asleep and every join-by-path scoping test is toothless.
+    #[test]
+    fn same_path_tripwires_expose_a_join_by_path_leak() {
+        let (_root, config) = poison_test_config("poison_samepath");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let conn = db.storage.connection();
+
+        // The real primary path the harness collided onto — re-resolved the same deterministic way
+        // `primary_collision_path` picks it (src/lib.rs for this fixture).
+        let collision_path: String = conn
+            .query_row(
+                "SELECT path FROM main.files WHERE repo_id != ?1 ORDER BY path LIMIT 1",
+                [POISON_REPO_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !collision_path.starts_with(POISON_PREFIX),
+            "the collision path must be a REAL primary path, got `{collision_path}`"
+        );
+
+        // The UNSCOPED join-by-path shape (the pre-fix `github_ref_counts` CTE) sees the sibling's
+        // colliding ref at the primary path — the tripwire is live.
+        let unscoped_refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM github_refs WHERE source_path = ?1",
+                [&collision_path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            unscoped_refs >= 1,
+            "same-path github_refs tripwire is asleep: an unscoped path aggregate saw no sibling \
+             ref at the primary path `{collision_path}`",
+        );
+
+        // The SCOPED production surface must NOT leak it: the fixture repo has no github_refs of
+        // its own, so its `src/lib.rs` candidate reports zero refs.
+        let brief = db
+            .repo_brief(crate::query::repo_brief::RepoBriefOptions {
+                mode: crate::query::repo_brief::RepoBriefMode::Spine,
+                limit: 50,
+                include_generated: true,
+                include_memories: false,
+            })
+            .unwrap();
+        let primary = brief
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == collision_path)
+            .expect("the primary path must appear in the brief");
+        assert_eq!(
+            primary.metrics.github_ref_count, 0,
+            "repo_brief leaked a sibling repo's github_refs across the shared path \
+             `{collision_path}` — scope the github_ref_counts CTE by repo_id",
+        );
+
+        // The same-path rows are counted by the intact check too.
+        assert_sibling_intact(conn);
+    }
+
+    /// A papertrail resync (the github sync tail) DELETEs the whole `github_fts` mirror and
+    /// re-derives it from the base tables — every poisoned base row becomes a derived mirror row.
+    /// The harness must reconverge: the seeded mirror rows are derivation-faithful copies (same
+    /// item_id / url / title / body slots per kind), so the rebuilt mirror carries the SAME
+    /// tripwire set and `assert_sibling_intact` stays meaningful after a mid-test resync. This
+    /// pins `seed_sibling`'s fts seeding to `rebuild_fts`'s derivation — if a column mapping in
+    /// either drifts, this fails locally instead of surfacing as a phantom sibling
+    /// leak in whichever github test resyncs first.
+    #[test]
+    fn github_fts_tripwires_survive_a_papertrail_resync() {
+        let (_root, config) = poison_test_config("poison_resync");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let conn = db.storage.connection();
+
+        // Intact on the seeded mirror…
+        assert_sibling_intact(conn);
+        // …and byte-equivalently intact on the re-derived mirror.
+        crate::index::github::rebuild_fts(conn).unwrap();
         assert_sibling_intact(conn);
     }
 

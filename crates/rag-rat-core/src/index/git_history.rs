@@ -149,14 +149,14 @@ pub(crate) fn apply_prepared(
 
     // `git_commits` / `git_file_changes` are direct-scoped since V040, so a history reindex of ONE
     // repo must delete and re-insert only THAT repo's rows — a wholesale wipe would drop a sibling
-    // repo's commits in a consolidated DB. (`git_chunk_blame` is transitive via `chunks`/`files`
-    // and regenerated lazily; its per-repo scoping is deferred to the blame/query workstream — a
-    // marked A4/A5 seam. `commit_fts` is external-content over `git_commits` and is resynced
-    // below.)
+    // repo's commits in a consolidated DB. `git_chunk_blame` is transitive via `chunks`/`files`, so
+    // it is cleared through the active repo's chunks (A4): a history reindex invalidates blame for
+    // this whole repo (new commits change attribution), but must not touch a sibling repo's cache.
+    // `commit_fts` is external-content over `git_commits` and is resynced below.
     let repo_id = schema::active_repo_id(conn)?;
     conn.execute("DELETE FROM git_file_changes WHERE repo_id = ?1", params![repo_id])?;
     conn.execute("DELETE FROM git_commits WHERE repo_id = ?1", params![repo_id])?;
-    conn.execute_batch("DELETE FROM git_chunk_blame;")?;
+    delete_repo_chunk_blame(conn, &repo_id)?;
 
     for commit in &prepared.commits {
         conn.execute(
@@ -607,15 +607,34 @@ pub fn source_text_hash(text: &str) -> String {
     hex_sha256(text.as_bytes())
 }
 
+/// Delete the cached chunk-blame rows belonging to `repo_id`'s chunks. `git_chunk_blame` carries no
+/// `repo_id` (it is transitive via `chunks` → `files`), so scope the delete through the join to
+/// `main.files.repo_id` — NOT the `temp.files` scope view, which would additionally narrow to the
+/// active commit/worktree and leave this repo's other-context blame behind. A git-history reindex
+/// invalidates blame for the whole repo, so every chunk of the active repo is cleared.
+fn delete_repo_chunk_blame(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM git_chunk_blame
+         WHERE chunk_id IN (
+             SELECT chunks.id
+             FROM chunks
+             JOIN main.files ON main.files.id = chunks.file_id
+             WHERE main.files.repo_id = ?1
+         )",
+        params![repo_id],
+    )?;
+    Ok(())
+}
+
 fn clear(conn: &Connection) -> anyhow::Result<()> {
     // Clear only the ACTIVE repo's git history (V040 scoping) — a wholesale wipe would drop a
-    // sibling repo's commits in a consolidated DB. `git_chunk_blame` is transitive/regenerated
-    // (A4/A5 seam). `commit_fts` is resynced from the surviving `git_commits` via the #51-safe
-    // `'rebuild'` afterward.
+    // sibling repo's commits in a consolidated DB. `git_chunk_blame` is transitive via
+    // `chunks`/`files`, cleared through the active repo's chunks (A4). `commit_fts` is resynced
+    // from the surviving `git_commits` via the #51-safe `'rebuild'` afterward.
     let repo_id = schema::active_repo_id(conn)?;
     conn.execute("DELETE FROM git_file_changes WHERE repo_id = ?1", params![repo_id])?;
     conn.execute("DELETE FROM git_commits WHERE repo_id = ?1", params![repo_id])?;
-    conn.execute_batch("DELETE FROM git_chunk_blame;")?;
+    delete_repo_chunk_blame(conn, &repo_id)?;
     crate::index::schema::rebuild_commit_fts(conn)?;
     // The reload-gate keys moved to `repo_meta` (V039); clear them for the active repo.
     for key in

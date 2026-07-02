@@ -538,10 +538,11 @@ pub(crate) fn file_rows(
 ) -> anyhow::Result<Vec<FileBriefRow>> {
     let newest_commit = newest_commit_time(conn)?;
     let recent_floor = newest_commit.saturating_sub(90 * 24 * 60 * 60);
-    // The churn CTE reads the direct-scoped `git_file_changes` / `git_commits` (V040); the
-    // `repo_id` predicate keeps a sibling repo's churn for a SHARED path (two repos both having
-    // `src/lib.rs`) out of this repo's brief — the outer LEFT JOIN is by path, so the scoped
-    // `files` view alone cannot exclude it.
+    // The `churn` (V040 `git_file_changes` / `git_commits`) and `github_ref_counts` (V041
+    // `github_refs`) CTEs both aggregate a direct-scoped table by PATH and LEFT JOIN the result
+    // onto `files` by path. Their `repo_id = ?3` predicate keeps a sibling repo's rows for a
+    // SHARED path (two repos both having `src/lib.rs`) out of this repo's brief — the outer join is
+    // by path, so the scoped `files` view alone cannot exclude a sibling's colliding-path row.
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
@@ -587,6 +588,7 @@ pub(crate) fn file_rows(
           SELECT source_path AS path, COUNT(*) AS ref_count
           FROM github_refs
           WHERE source_path IS NOT NULL
+            AND github_refs.repo_id = ?3
           GROUP BY source_path
         )
         SELECT files.path, files.language, files.kind, files.generated,

@@ -1175,6 +1175,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_038_ID => Some(38),
             MIGRATION_039_ID => Some(39),
             MIGRATION_040_ID => Some(40),
+            MIGRATION_041_ID => Some(41),
             _ => None,
         })
         .max()
@@ -1224,6 +1225,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_038_ID
             | MIGRATION_039_ID
             | MIGRATION_040_ID
+            | MIGRATION_041_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1270,6 +1272,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_038_ID => migration.checksum != MIGRATION_038_CHECKSUM,
         MIGRATION_039_ID => migration.checksum != MIGRATION_039_CHECKSUM,
         MIGRATION_040_ID => migration.checksum != MIGRATION_040_CHECKSUM,
+        MIGRATION_041_ID => migration.checksum != MIGRATION_041_CHECKSUM,
         _ => false,
     }
 }
@@ -2116,6 +2119,153 @@ fn rebuild_git_commits_tables_with_repo_id(conn: &Connection) -> rusqlite::Resul
         INSERT INTO commit_fts(commit_fts) VALUES('rebuild');
         ",
     )
+}
+
+/// The seven GitHub papertrail tables V041 (phase A4) gives a direct `repo_id` column. Order is
+/// stable so the adoption re-point loop and this migration agree; `github_fts` is NOT here — it is
+/// the standalone FTS mirror, rebuilt separately by [`rebuild_github_fts_with_repo_id`].
+const V041_GITHUB_SCOPED_TABLES: &[&str] = &[
+    "github_refs",
+    "github_issues",
+    "github_comments",
+    "github_pull_requests",
+    "github_reviews",
+    "github_review_comments",
+    "github_ref_sync",
+];
+
+/// V041 (memory-sync phase A4): repo-scope the GitHub papertrail cache so a lexical/papertrail
+/// query in a consolidated DB never surfaces a sibling repo's refs or issues. The seven
+/// [`V041_GITHUB_SCOPED_TABLES`] were repo-GLOBAL before; each gains a `repo_id` column
+/// ([`REPO_ID_COLUMN_DEF`] — existing rows backfill to the placeholder that `register_repo`
+/// re-points at adoption, the A1/A2/A3 pattern), and the standalone `github_fts` gains a `repo_id
+/// UNINDEXED` column via a REBUILD (its FTS5 columns can't be ALTERed).
+///
+/// SCOPE (deliberate): the base tables gain the column but keep their existing keys
+/// (`github_issues`/`github_pull_requests` `UNIQUE(owner, repo, number)`; `github_ref_sync`'s PK;
+/// the id-keyed caches). Phase A keeps ONE repo per DB (`register_repo` refuses a second real repo
+/// until A7), so those keys stay correct; widening them to include `repo_id` for the eventual
+/// multi-repo DB is an A7 concern. Reads scope by the connection's active `repo_id`; writes stamp
+/// it.
+///
+/// TORN-STATE / RE-APPLY: the whole migration self-wraps in ONE `BEGIN IMMEDIATE ... COMMIT` (the
+/// ladder runs apply fns in AUTOCOMMIT), so the base-table columns, the `github_fts` rebuild, AND
+/// the already-adopted-DB backfill commit together — the `github_fts.repo_id` sentinel flips only
+/// once every step (backfill included) has landed. `add_column_if_missing` and the rebuild's
+/// leading `DROP ... IF EXISTS` keep a re-run after a torn intermediate idempotent. All-or-nothing
+/// sentinel: `github_fts` carrying `repo_id` means the whole migration already committed, so a
+/// fresh-from-target DB or a `create_or_migrate` / `rebuild` re-apply short-circuits before
+/// touching anything (and never resolves `sole_repo_id`, keeping the ladder replay-safe on a
+/// consolidated DB).
+pub(crate) fn apply_github_repo_id_scoping(conn: &Connection) -> rusqlite::Result<()> {
+    if column_exists(conn, "github_fts", "repo_id")? {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> rusqlite::Result<()> {
+        // Each base-table column is independent additive DDL (one atomic ALTER).
+        for table in V041_GITHUB_SCOPED_TABLES {
+            add_column_if_missing(conn, table, "repo_id", REPO_ID_COLUMN_DEF)?;
+        }
+        rebuild_github_fts_with_repo_id(conn)?;
+        // P1 (the V039/V040 class): the static `DEFAULT '__unassigned__'` stamps existing rows the
+        // placeholder, and on an ALREADY-ADOPTED DB `register_repo`'s fast path never re-points —
+        // so scoped papertrail reads would return NOTHING for the real repo until the next github
+        // sync. Resolve the sole `repos` row and re-point the placeholder rows onto it (no-op on an
+        // un-adopted DB, where the rows correctly wait for `register_repo` to adopt them).
+        backfill_github_repo_id_to_sole_repo(conn)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return result;
+    }
+    conn.execute_batch("COMMIT;")
+}
+
+/// Rebuild the standalone (own-content) `github_fts` with an added `repo_id UNINDEXED` column via
+/// the create-new / copy / drop / rename recipe. Its rows are copied stamped the placeholder; the
+/// caller's [`backfill_github_repo_id_to_sole_repo`] then re-points them onto the real id on an
+/// adopted DB.
+///
+/// Runs INSIDE the caller's transaction ([`apply_github_repo_id_scoping`] wraps the whole V041
+/// migration in one `BEGIN IMMEDIATE`), so it opens no txn of its own. The leading `DROP TABLE IF
+/// EXISTS github_fts_new` drops a hard-kill scratch artifact (which bypasses rollback) so the
+/// rebuild re-converges rather than failing on CREATE — the V040 recipe. `github_fts` has no FK, so
+/// no `foreign_keys` toggle is needed.
+fn rebuild_github_fts_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS github_fts_new;
+        CREATE VIRTUAL TABLE github_fts_new USING fts5(
+            owner,
+            repo,
+            number UNINDEXED,
+            item_kind UNINDEXED,
+            item_id UNINDEXED,
+            url UNINDEXED,
+            title,
+            body,
+            classification,
+            repo_id UNINDEXED,
+            tokenize='porter'
+        );
+        INSERT INTO github_fts_new(
+            owner, repo, number, item_kind, item_id, url, title, body, classification, repo_id
+        )
+        SELECT owner, repo, number, item_kind, item_id, url, title, body, classification,
+               '__unassigned__'
+        FROM github_fts;
+        DROP TABLE github_fts;
+        ALTER TABLE github_fts_new RENAME TO github_fts;
+        ",
+    )
+}
+
+/// P1 backfill (the V040 [`backfill_repo_id_to_sole_repo`] pattern, github edition): re-point every
+/// V041 github row from the placeholder onto the sole `repos` id when the DB is ALREADY ADOPTED, so
+/// a scoped papertrail read sees this repo's cached refs/issues immediately after the upgrade
+/// rather than only after the next sync. No-op on an un-adopted DB (`sole_repo_id` == the
+/// placeholder — the rows correctly wait for `register_repo` to adopt them). Runs inside the
+/// caller's V041 txn, so it is atomic with the sentinel-setting FTS rebuild. The sentinel
+/// short-circuit keeps a replay off this path entirely; the explicit `repos`-cardinality gate
+/// below additionally makes the FIRST apply safe on a CONSOLIDATED DB (leave-at-placeholder
+/// instead of `sole_repo_id`'s one-row hard error aborting the upgrade).
+fn backfill_github_repo_id_to_sole_repo(conn: &Connection) -> rusqlite::Result<()> {
+    // Cardinality gate: the backfill re-points onto THE sole owner of a single-repo DB, and only
+    // that shape has one. A CONSOLIDATED DB (multiple `repos` rows) that reaches V041 without the
+    // sentinel must not abort the forward-migration on `sole_repo_id`'s one-row hard error — there
+    // is no single correct owner to pick. Invariant: on `!= 1` repos rows the github rows stay
+    // under the placeholder, which is safe because (a) the papertrail is a refetchable CACHE, not
+    // authored data; (b) every scoped reader filters `repo_id = <active>`, so placeholder rows are
+    // simply invisible — never misattributed; and (c) the github writers RECLAIM stranded rows by
+    // UPSERT: the tables keep natural keys WITHOUT `repo_id` (the phase-A deviation), so a
+    // placeholder row OCCUPIES its key and a bare `INSERT OR IGNORE` could never repopulate it —
+    // instead each writer's `ON CONFLICT ... DO UPDATE` (or `OR REPLACE` on the id-keyed caches)
+    // re-stamps `repo_id` and refreshes the content on the next sync touching the key, and the
+    // sync-tail `rebuild_fts` re-derives the mirror accordingly (the upsert-reclaim invariant in
+    // `github/store.rs`).
+    let repos_rows: i64 = conn.query_row("SELECT COUNT(*) FROM repos", [], |row| row.get(0))?;
+    if repos_rows != 1 {
+        return Ok(());
+    }
+    let target = sole_repo_id(conn)?;
+    if target == super::LEGACY_REPO_ID {
+        return Ok(());
+    }
+    for table in V041_GITHUB_SCOPED_TABLES {
+        conn.execute(&format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"), [
+            target.as_str(),
+            super::LEGACY_REPO_ID,
+        ])?;
+    }
+    // The own-content FTS mirror carries its own `repo_id UNINDEXED` value; re-point it in place
+    // too.
+    conn.execute("UPDATE github_fts SET repo_id = ?1 WHERE repo_id = ?2", [
+        target.as_str(),
+        super::LEGACY_REPO_ID,
+    ])?;
+    Ok(())
 }
 
 /// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see

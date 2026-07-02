@@ -1,5 +1,5 @@
 use super::*;
-use crate::index::{repo_meta, schema, set_repo_meta, table_row_count};
+use crate::index::{repo_meta, schema, scoped_table_row_count, set_repo_meta};
 
 pub(crate) fn sync_from_refs<C: GitHubClient>(
     conn: &Connection,
@@ -76,14 +76,17 @@ pub(crate) fn sync_issue<C: GitHubClient>(
     })
 }
 pub(crate) fn status(conn: &Connection, ctx: &GitHubContext) -> anyhow::Result<GitHubStatus> {
+    // The github_* tables are direct-scoped (V041); report only the ACTIVE repo's counts, not the
+    // union across a consolidated DB.
+    let repo_id = schema::active_repo_id(conn)?;
     Ok(GitHubStatus {
-        refs: table_row_count(conn, "github_refs")?,
-        issues: table_row_count(conn, "github_issues")?,
-        comments: table_row_count(conn, "github_comments")?,
-        pulls: table_row_count(conn, "github_pull_requests")?,
-        reviews: table_row_count(conn, "github_reviews")?,
-        review_comments: table_row_count(conn, "github_review_comments")?,
-        last_sync_ms: repo_meta(conn, &schema::active_repo_id(conn)?, "github_last_sync_ms")?
+        refs: scoped_table_row_count(conn, "github_refs", &repo_id)?,
+        issues: scoped_table_row_count(conn, "github_issues", &repo_id)?,
+        comments: scoped_table_row_count(conn, "github_comments", &repo_id)?,
+        pulls: scoped_table_row_count(conn, "github_pull_requests", &repo_id)?,
+        reviews: scoped_table_row_count(conn, "github_reviews", &repo_id)?,
+        review_comments: scoped_table_row_count(conn, "github_review_comments", &repo_id)?,
+        last_sync_ms: repo_meta(conn, &repo_id, "github_last_sync_ms")?
             .and_then(|value| value.parse().ok()),
         capability: if ctx.gh_available {
             "gh_cli_available".to_string()
@@ -125,16 +128,17 @@ pub(crate) fn refs_for_path(
     path: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<GitHubRef>> {
+    let repo_id = schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT owner, repo, number, ref_kind, source_kind, source_path, source_commit, source_text
         FROM github_refs
-        WHERE source_path = ?1
+        WHERE source_path = ?1 AND repo_id = ?3
         ORDER BY id DESC
         LIMIT ?2
         ",
     )?;
-    let rows = stmt.query_map(params![path, i64::from(limit)], ref_row)?;
+    let rows = stmt.query_map(params![path, i64::from(limit), repo_id], ref_row)?;
     collect_rows(rows)
 }
 pub(crate) fn papertrail_for_chunk(

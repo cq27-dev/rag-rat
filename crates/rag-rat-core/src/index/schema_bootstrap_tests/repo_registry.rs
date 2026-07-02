@@ -869,15 +869,19 @@ fn seed_pre_v040_commit(conn: &rusqlite::Connection, hash: &str, subject: &str) 
     conn.execute_batch("INSERT INTO commit_fts(commit_fts) VALUES('rebuild');").unwrap();
 }
 
-/// Fresh `apply` runs V040 (the schema tip): every direct-scoped core table gains `repo_id`, and
-/// the widened UNIQUE/PK keys make same-path/same-hash rows distinct across repos. Owns the
-/// absolute `LATEST_SCHEMA_VERSION` pin.
+/// Fresh `apply` runs V040: every direct-scoped core table gains `repo_id`, and the widened
+/// UNIQUE/PK keys make same-path/same-hash rows distinct across repos. (The absolute
+/// `LATEST_SCHEMA_VERSION` pin moved to `migration_041_*`, the new tip; this uses only the symbolic
+/// `current_version == LATEST` check.)
 #[test]
-fn migration_040_is_the_latest_tip_and_scopes_core_tables() {
+fn migration_040_scopes_core_tables() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 40, "V040 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 40, "schema at LATEST after apply");
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     for table in [
         "files",
@@ -1773,4 +1777,434 @@ fn open_config_falls_back_to_the_sole_repo_on_a_non_git_root() {
         "the un-adopted single-repo DB scopes to the placeholder"
     );
     let _ = fs::remove_dir_all(root);
+}
+
+// --- V041: repo_id scoping on the GitHub papertrail tables (memory-sync phase A4) ---
+
+/// The pre-V041 shape of the seven GitHub tables + `github_fts` (no `repo_id`) plus the V038
+/// registry, built in ISOLATION so [`schema::apply_github_repo_id_scoping`] is exercised against
+/// its own inputs (the directory's "assert deferred absence / rebuild behavior in isolation" rule).
+fn seed_pre_v041_github_schema(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        "
+        CREATE TABLE github_refs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, repo TEXT NOT NULL,
+            number INTEGER NOT NULL, ref_kind TEXT NOT NULL DEFAULT 'unknown',
+            source_kind TEXT NOT NULL, source_path TEXT, source_commit TEXT,
+            source_text TEXT NOT NULL, discovered_at_ms INTEGER NOT NULL);
+        CREATE TABLE github_issues(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, repo TEXT NOT NULL,
+            number INTEGER NOT NULL, html_url TEXT NOT NULL, state TEXT NOT NULL, title TEXT NOT \
+         NULL,
+            body TEXT NOT NULL, author TEXT, created_at TEXT, updated_at TEXT,
+            is_pull_request INTEGER NOT NULL DEFAULT 0, synced_at_ms INTEGER NOT NULL,
+            UNIQUE(owner, repo, number));
+        CREATE TABLE github_comments(
+            id INTEGER PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL, number INTEGER NOT \
+         NULL,
+            html_url TEXT NOT NULL, body TEXT NOT NULL, author TEXT, created_at TEXT, updated_at \
+         TEXT,
+            synced_at_ms INTEGER NOT NULL);
+        CREATE TABLE github_pull_requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, repo TEXT NOT NULL,
+            number INTEGER NOT NULL, html_url TEXT NOT NULL, state TEXT NOT NULL, title TEXT NOT \
+         NULL,
+            body TEXT NOT NULL, author TEXT, created_at TEXT, updated_at TEXT, merged_at TEXT,
+            synced_at_ms INTEGER NOT NULL, UNIQUE(owner, repo, number));
+        CREATE TABLE github_reviews(
+            id INTEGER PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL, number INTEGER NOT \
+         NULL,
+            html_url TEXT, state TEXT NOT NULL, body TEXT NOT NULL, author TEXT, submitted_at TEXT,
+            synced_at_ms INTEGER NOT NULL);
+        CREATE TABLE github_review_comments(
+            id INTEGER PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL, number INTEGER NOT \
+         NULL,
+            path TEXT, html_url TEXT NOT NULL, body TEXT NOT NULL, author TEXT, created_at TEXT,
+            updated_at TEXT, synced_at_ms INTEGER NOT NULL);
+        CREATE TABLE github_ref_sync(
+            owner TEXT NOT NULL, repo TEXT NOT NULL, number INTEGER NOT NULL, status TEXT NOT NULL,
+            synced_at_ms INTEGER NOT NULL, last_error TEXT, PRIMARY KEY(owner, repo, number));
+        CREATE VIRTUAL TABLE github_fts USING fts5(
+            owner, repo, number UNINDEXED, item_kind UNINDEXED, item_id UNINDEXED, url UNINDEXED,
+            title, body, classification, tokenize='porter');
+        ",
+    )
+    .unwrap();
+    schema::apply_repos_registry(conn).expect("V038 registry seeds the placeholder");
+}
+
+/// Fresh `apply` runs V041 (the schema tip): the seven GitHub tables and `github_fts` gain a direct
+/// `repo_id`. Owns the absolute `LATEST_SCHEMA_VERSION` pin.
+#[test]
+fn migration_041_is_the_latest_tip_and_scopes_github() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 41, "V041 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 41, "schema at LATEST after apply");
+
+    for table in [
+        "github_refs",
+        "github_issues",
+        "github_comments",
+        "github_pull_requests",
+        "github_reviews",
+        "github_review_comments",
+        "github_ref_sync",
+        "github_fts",
+    ] {
+        assert!(
+            conn_table_columns(&conn, table).contains(&"repo_id".to_string()),
+            "{table} gains a direct repo_id column"
+        );
+    }
+}
+
+/// V041's `github_fts` REBUILD is driven against the pre-V041 fixture IN ISOLATION: the base tables
+/// gain `repo_id`, the FTS row survives the rebuild (backfilled to the placeholder) and still
+/// MATCHes, and the migration RE-CONVERGES from a torn intermediate (a leftover `github_fts_new`
+/// scratch table from a crashed prior pass). Then `register_repo` adoption re-points every
+/// placeholder row — the base tables AND the derived FTS mirror.
+#[test]
+fn migration_041_github_rebuild_preserves_rows_and_reconverges_from_torn_state() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    seed_pre_v041_github_schema(&conn);
+    // A synced issue + its FTS row, as a pre-V041 index carries them.
+    conn.execute(
+        "INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, synced_at_ms)
+         VALUES ('o', 'r', 7, 'http://i', 'open', 'zebra title', 'zebra body', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
+         classification)
+         VALUES ('o', 'r', 7, 'issue', '1', 'http://i', 'zebra title', 'zebra body', 'other')",
+        [],
+    )
+    .unwrap();
+
+    // TORN STATE: a prior V041 pass crashed after creating the scratch FTS table. The rebuild must
+    // drop it and re-converge rather than fail on CREATE.
+    conn.execute_batch("CREATE TABLE github_fts_new(bogus INTEGER);").unwrap();
+
+    schema::apply_github_repo_id_scoping(&conn).expect("V041 converges from the torn state");
+
+    assert!(!conn_table_exists(&conn, "github_fts_new"), "scratch table gone");
+    assert!(
+        conn_table_columns(&conn, "github_fts").contains(&"repo_id".to_string()),
+        "github_fts rebuilt with repo_id"
+    );
+    assert!(
+        conn_table_columns(&conn, "github_issues").contains(&"repo_id".to_string()),
+        "github_issues gained repo_id"
+    );
+
+    // The FTS row survived, backfilled to the placeholder, and still MATCHes.
+    let (repo_id, matched): (String, i64) = conn
+        .query_row(
+            "SELECT repo_id, (SELECT COUNT(*) FROM github_fts WHERE github_fts MATCH 'zebra')
+             FROM github_fts WHERE github_fts MATCH 'zebra'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(repo_id, LEGACY_REPO_ID, "existing FTS rows backfill to the placeholder");
+    assert_eq!(matched, 1, "github_fts still MATCHes after the rebuild");
+
+    // Idempotent re-run (the sentinel short-circuits once github_fts carries repo_id).
+    schema::apply_github_repo_id_scoping(&conn).expect("re-apply is a clean no-op");
+}
+
+/// Full-schema adoption of the V041 GitHub papertrail: `register_repo` re-points the placeholder
+/// github rows (a base table AND the `github_fts` mirror) onto the real id. Kept SEPARATE from the
+/// `migration_041_github_rebuild_*` isolation test above because adoption now runs
+/// `realign_logical_symbol_ids`, which needs the full core schema the github-only isolation fixture
+/// omits (it would trip `no such table: logical_symbols`). The full ladder gives adoption every
+/// table it touches.
+#[test]
+fn register_repo_repoints_github_papertrail_rows_to_the_real_id() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    schema::apply(&conn).unwrap();
+    // A synced issue + its FTS mirror seeded under the placeholder, as a pre-adoption index carries
+    // them (both explicitly stamped LEGACY_REPO_ID so adoption's placeholder re-point matches).
+    conn.execute(
+        "INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, \
+         synced_at_ms, repo_id)
+         VALUES ('o', 'r', 7, 'http://i', 'open', 'zebra title', 'zebra body', 0, ?1)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
+         classification, repo_id)
+         VALUES ('o', 'r', 7, 'issue', '1', 'http://i', 'zebra title', 'zebra body', 'other', ?1)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
+
+    register_repo(&conn, &identity("repo-real", "r"), Path::new("/src/r"), 1).unwrap();
+
+    let issue_repo: String =
+        conn.query_row("SELECT repo_id FROM github_issues", [], |r| r.get(0)).unwrap();
+    assert_eq!(issue_repo, "repo-real", "adoption re-points github_issues");
+    let fts_repo: String = conn
+        .query_row("SELECT repo_id FROM github_fts WHERE github_fts MATCH 'zebra'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fts_repo, "repo-real", "adoption re-points the github_fts mirror in place");
+}
+
+/// P1 backfill (the V040 class): applying V041 on an ALREADY-ADOPTED DB (a real `repos` row, the
+/// placeholder gone) must re-point the existing github rows — base tables AND the `github_fts`
+/// mirror — onto the real id via `sole_repo_id`, NOT strand them under the static
+/// `'__unassigned__'` column default where a scoped papertrail read would never see them until the
+/// next sync.
+#[test]
+fn migration_041_backfills_an_adopted_pre_v041_db_under_the_real_repo_id() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    seed_pre_v041_github_schema(&conn);
+    conn.execute(
+        "INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, synced_at_ms)
+         VALUES ('o', 'r', 7, 'http://i', 'open', 't', 'b', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO github_refs(owner, repo, number, source_kind, source_text, discovered_at_ms)
+         VALUES ('o', 'r', 7, 'file', 'reftext', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
+         classification)
+         VALUES ('o', 'r', 7, 'issue', '1', 'http://i', 't', 'b', 'other')",
+        [],
+    )
+    .unwrap();
+    // Adopt as a pre-V041 binary's `register_repo` left it: a real `repos` row, placeholder gone.
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-adopted', 'r', \
+         1)",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
+
+    schema::apply_github_repo_id_scoping(&conn).expect("V041 applies on an adopted DB");
+
+    for table in ["github_refs", "github_issues", "github_fts"] {
+        let (total, under_real): (i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(repo_id = 'repo-adopted'), 0) FROM {table}"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(total > 0, "{table}: the fixture seeded at least one row");
+        assert_eq!(under_real, total, "{table}: every row backfilled under the REAL repo id");
+    }
+    let stranded: i64 = conn
+        .query_row("SELECT COUNT(*) FROM github_issues WHERE repo_id = ?1", [LEGACY_REPO_ID], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(stranded, 0, "nothing remains stranded under the placeholder");
+}
+
+/// V041 on a CONSOLIDATED (multi-repo) V040-level DB: there is no single owner for the backfill to
+/// re-point onto, so the migration must SUCCEED — not abort on `sole_repo_id`'s one-row hard error
+/// — and leave the github rows under the placeholder. That is safe: the papertrail is a
+/// refetchable cache, every scoped reader filters `repo_id = <active>` (placeholder rows are
+/// invisible, never misattributed), and each repo's next github sync re-populates its slice under
+/// the proper stamp.
+#[test]
+fn migration_041_leaves_github_rows_at_the_placeholder_on_a_consolidated_db() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    seed_pre_v041_github_schema(&conn);
+    conn.execute(
+        "INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, synced_at_ms)
+         VALUES ('o', 'r', 7, 'http://i', 'open', 't', 'b', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO github_refs(owner, repo, number, source_kind, source_text, discovered_at_ms)
+         VALUES ('o', 'r', 7, 'file', 'reftext', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO github_fts(owner, repo, number, item_kind, item_id, url, title, body, \
+         classification)
+         VALUES ('o', 'r', 7, 'issue', '1', 'http://i', 't', 'b', 'other')",
+        [],
+    )
+    .unwrap();
+    // The consolidated end-state: TWO real repos, placeholder row gone.
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-a', 'a', 1), \
+         ('repo-b', 'b', 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
+
+    schema::apply_github_repo_id_scoping(&conn)
+        .expect("V041 must not abort the upgrade on a consolidated DB");
+
+    for table in ["github_refs", "github_issues", "github_fts"] {
+        let (total, under_placeholder): (i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(repo_id = '{LEGACY_REPO_ID}'), 0) FROM {table}"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(total > 0, "{table}: the fixture seeded at least one row");
+        assert_eq!(
+            under_placeholder, total,
+            "{table}: every row stays under the placeholder — no arbitrary owner is picked"
+        );
+        // The shape every V041 reader uses: a scoped read filters `repo_id = <active>`, so the
+        // placeholder rows are invisible to BOTH repos.
+        for repo in ["repo-a", "repo-b"] {
+            let visible: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE repo_id = ?1"),
+                    [repo],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(visible, 0, "{table}: placeholder rows must be invisible to {repo}");
+        }
+    }
+}
+
+/// The reclamation half of the consolidated-DB gate: the github tables keep natural keys WITHOUT
+/// `repo_id`, so a placeholder-stranded row OCCUPIES its key — a conflict-ignoring writer could
+/// never repopulate it and the cache would be stranded forever. The writers upsert-reclaim
+/// instead: the next sync that touches a stranded key re-stamps `repo_id`, refreshes the content,
+/// and the sync-tail `rebuild_fts` re-derives the mirror. Rows the sync does NOT touch stay under
+/// the placeholder (they wait for their own repo's sync).
+#[test]
+fn v041_placeholder_github_rows_are_reclaimed_by_the_next_sync() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // The state the consolidated-DB gate leaves: github rows stranded under the placeholder on a
+    // two-real-repo DB.
+    conn.execute_batch(&format!(
+        "INSERT INTO github_refs(owner, repo, number, ref_kind, source_kind, source_path, \
+         source_commit, source_text, discovered_at_ms, repo_id)
+         VALUES ('o', 'r', 7, 'unknown', 'manual', NULL, NULL, 'o/r#7', 1, '{p}');
+         INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, \
+         synced_at_ms, repo_id)
+         VALUES ('o', 'r', 7, 'http://stale', 'open', 'stale title', 'stale body', 1, '{p}');
+         INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, \
+         synced_at_ms, repo_id)
+         VALUES ('o', 'r', 8, 'http://other', 'open', 'other stale', 'other body', 1, '{p}');
+         INSERT INTO github_ref_sync(owner, repo, number, status, synced_at_ms, repo_id)
+         VALUES ('o', 'r', 7, 'synced', 1, '{p}');
+         INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-a', 'a', 1), \
+         ('repo-b', 'b', 2);
+         DELETE FROM repos WHERE repo_id = '{p}';",
+        p = LEGACY_REPO_ID
+    ))
+    .unwrap();
+    // Mirror state before any reclaim: derived from the stranded base rows.
+    crate::index::github::rebuild_fts(&conn).unwrap();
+
+    // Pin the connection's active repo to repo-a (what `set_context` installs on a real open).
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);
+         INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', 'repo-a');",
+    )
+    .unwrap();
+
+    // repo-a's sync touches o/r#7: re-discovers the ref (same natural key as the stranded row),
+    // refetches the issue with fresh content, and marks the sync cursor.
+    let reference = crate::index::github::GitHubRef {
+        owner: "o".to_string(),
+        repo: "r".to_string(),
+        number: 7,
+        ref_kind: "unknown".to_string(),
+        source_kind: "manual".to_string(),
+        source_path: None,
+        source_commit: None,
+        source_text: "o/r#7".to_string(),
+    };
+    crate::index::github::store_ref(&conn, &reference).unwrap();
+    crate::index::github::store_issue(&conn, &crate::index::github::GitHubIssue {
+        owner: "o".to_string(),
+        repo: "r".to_string(),
+        number: 7,
+        html_url: "http://fresh".to_string(),
+        state: "closed".to_string(),
+        title: "fresh title".to_string(),
+        body: "fresh body".to_string(),
+        author: None,
+        created_at: None,
+        updated_at: None,
+        is_pull_request: false,
+    })
+    .unwrap();
+    crate::index::github::mark_ref_sync(&conn, &reference, "synced", None).unwrap();
+    // The sync tail: the whole-table mirror rebuild follows the reclaimed base rows.
+    crate::index::github::rebuild_fts(&conn).unwrap();
+
+    // The touched rows are re-stamped to repo-a with refreshed content…
+    let (issue_repo, issue_title): (String, String) = conn
+        .query_row("SELECT repo_id, title FROM github_issues WHERE number = 7", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(issue_repo, "repo-a", "the stranded issue row is reclaimed by the syncing repo");
+    assert_eq!(issue_title, "fresh title", "reclaim refreshes the content, not just the stamp");
+    for table in ["github_refs", "github_ref_sync"] {
+        let repo: String = conn
+            .query_row(&format!("SELECT repo_id FROM {table} WHERE number = 7"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(repo, "repo-a", "{table}: stranded row reclaimed");
+    }
+    // …the FTS mirror is consistent with the reclaimed base rows…
+    let fts_repo: String = conn
+        .query_row("SELECT repo_id FROM github_fts WHERE number = 7", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fts_repo, "repo-a", "the mirror row follows the reclaimed base row");
+    // …a scoped read now sees the papertrail…
+    let visible: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM github_issues WHERE repo_id = 'repo-a' AND number = 7",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(visible, 1, "the reclaimed row is visible to repo-a's scoped reads");
+    // …and the row the sync did NOT touch stays under the placeholder for its own repo's sync.
+    for table in ["github_issues", "github_fts"] {
+        let repo: String = conn
+            .query_row(&format!("SELECT repo_id FROM {table} WHERE number = 8"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(repo, LEGACY_REPO_ID, "{table}: untouched stranded row stays placeholder");
+    }
+}
+
+/// A V040 index forward-migrates to V041 on `migrate_forward` — reaching LATEST.
+#[test]
+fn migration_041_forward_migrates_a_v040_index() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    truncate_schema_to(&conn, 40);
+    assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 }

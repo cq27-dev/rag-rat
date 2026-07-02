@@ -53,15 +53,17 @@ pub(crate) fn evidence_for_issue(
     number: i64,
     limit: u32,
 ) -> anyhow::Result<Vec<GitHubEvidence>> {
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT owner, repo, number, item_kind, item_id, url, title, body, classification, 0.0
         FROM github_fts
-        WHERE owner = ?1 AND repo = ?2 AND number = ?3
+        WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND repo_id = ?5
         LIMIT ?4
         ",
     )?;
-    let rows = stmt.query_map(params![owner, repo, number, i64::from(limit)], evidence_row)?;
+    let rows =
+        stmt.query_map(params![owner, repo, number, i64::from(limit), repo_id], evidence_row)?;
     let mut evidence = collect_rows(rows)?;
     for item in &mut evidence {
         item.evidence_kind = "literal_github_ref";
@@ -74,18 +76,20 @@ pub(crate) fn evidence_for_commit_refs(
     commit_hash: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<GitHubEvidence>> {
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT owner, repo, number
         FROM github_refs
         WHERE source_kind = 'commit'
           AND source_commit LIKE ?1
+          AND repo_id = ?3
         ORDER BY ref_kind = 'closing' DESC, id DESC
         LIMIT ?2
         ",
     )?;
     let commit_like = format!("{commit_hash}%");
-    let refs = stmt.query_map(params![commit_like, i64::from(limit)], |row| {
+    let refs = stmt.query_map(params![commit_like, i64::from(limit), repo_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
     })?;
     let mut evidence = Vec::new();
@@ -104,7 +108,14 @@ pub(crate) fn search_fts(
     limit: u32,
 ) -> anyhow::Result<Vec<GitHubEvidence>> {
     let fts_query = fts_query(query);
-    let kind_clause = kind.map(|_| "AND item_kind = ?3").unwrap_or("");
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    // The `repo_id` filter is MANDATORY (V041): `github_fts` is one index over every repo's
+    // papertrail in a consolidated DB, so a bare MATCH would surface a sibling repo's issues. Its
+    // parameter index trails the optional `item_kind` bind, so it shifts with the kind clause.
+    let (kind_clause, repo_index) = match kind {
+        Some(_) => ("AND item_kind = ?3", 4),
+        None => ("", 3),
+    };
     let sql = format!(
         "
         SELECT owner, repo, number, item_kind, item_id, url, title, body, classification,
@@ -112,15 +123,16 @@ pub(crate) fn search_fts(
         FROM github_fts
         WHERE github_fts MATCH ?1
         {kind_clause}
+          AND repo_id = ?{repo_index}
         ORDER BY score
         LIMIT ?2
         "
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(kind) = kind {
-        stmt.query_map(params![fts_query, i64::from(limit), kind], evidence_row)?
+        stmt.query_map(params![fts_query, i64::from(limit), kind, repo_id], evidence_row)?
     } else {
-        stmt.query_map(params![fts_query, i64::from(limit)], evidence_row)?
+        stmt.query_map(params![fts_query, i64::from(limit), repo_id], evidence_row)?
     };
     let mut hits = collect_rows(rows)?;
     for (rank, hit) in hits.iter_mut().enumerate() {
@@ -173,10 +185,11 @@ pub(crate) fn ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitHubRef> {
     })
 }
 pub(crate) fn refs(conn: &Connection) -> anyhow::Result<Vec<GitHubRef>> {
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "SELECT owner, repo, number, ref_kind, source_kind, source_path, source_commit, \
-         source_text FROM github_refs",
+         source_text FROM github_refs WHERE repo_id = ?1",
     )?;
-    let rows = stmt.query_map([], ref_row)?;
+    let rows = stmt.query_map([repo_id], ref_row)?;
     collect_rows(rows)
 }
