@@ -3,15 +3,13 @@ mod commands;
 mod fs_atomic;
 mod hooks_support;
 mod render;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
-use std::{env, fs};
 
 use clap::Parser;
 pub(crate) use commands::*;
 pub(crate) use fs_atomic::*;
 pub(crate) use hooks_support::*;
-use rag_rat_core::config::EmbeddingRuntimeConfig;
 use rag_rat_core::index::IndexProgress;
 use rag_rat_core::index::github::GitHubSyncAction;
 use rag_rat_core::search::lexical::SearchHit;
