@@ -338,20 +338,22 @@ fn run_maintenance_pass(
     rag_rat_core::watch::refresh_worktree_overlays(&mut db, config, budget.as_ref());
     // The base reconcile gets whatever budget the overlays left; `None` → exhausted (or no cap left
     // at all), so skip it rather than start a fresh full-budget reconcile.
-    let reconcile_report =
-        match budget.as_ref().and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
-            Some(options) => {
-                let report = db.reconcile_with_options_progress(options, render_reconcile_progress)?;
-                tracing::info!(target: "rag_rat_core::maintenance", phase = "reconcile", ran = true, status = %report.status, "phase complete");
-                Some(report)
-            },
-            None => {
-                // No budget left (overlays/reencode consumed it) or a 0-cap "skip embedding" pass —
-                // this is a common reason the base backlog stays non-empty across hook passes.
-                tracing::info!(target: "rag_rat_core::maintenance", phase = "reconcile", ran = false, skip_reason = "no_budget_remaining", "phase skipped");
-                None
-            },
-        };
+    let reconcile_report = match budget
+        .as_ref()
+        .and_then(rag_rat_core::watch::ReconcileBudget::next_options)
+    {
+        Some(options) => {
+            let report = db.reconcile_with_options_progress(options, render_reconcile_progress)?;
+            tracing::info!(target: "rag_rat_core::maintenance", phase = "reconcile", ran = true, status = %report.status, "phase complete");
+            Some(report)
+        },
+        None => {
+            // No budget left (overlays/reencode consumed it) or a 0-cap "skip embedding" pass —
+            // this is a common reason the base backlog stays non-empty across hook passes.
+            tracing::info!(target: "rag_rat_core::maintenance", phase = "reconcile", ran = false, skip_reason = "no_budget_remaining", "phase skipped");
+            None
+        },
+    };
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
     let gc_report = db.garbage_collect().ok();
@@ -465,6 +467,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -529,6 +532,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            log: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
 
