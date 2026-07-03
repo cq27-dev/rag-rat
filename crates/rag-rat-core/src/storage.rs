@@ -134,11 +134,36 @@ impl IndexConnection {
             "
             PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
             ",
         )?;
-        Ok(())
+        // The delete→WAL transition needs an EXCLUSIVE lock, and SQLite deliberately does NOT run
+        // the busy handler on parts of that upgrade path (it returns SQLITE_BUSY immediately to
+        // break potential deadlocks among racing upgraders) — so busy_timeout alone does NOT save
+        // two truly concurrent FIRST opens of a fresh DB: one fails instantly with "database is
+        // locked" (the `concurrent_create_or_migrate_applies_the_schema_exactly_once` race, and a
+        // real production shape once a shared multi-repo DB gets its first two writers at once).
+        // Bounded manual retry instead: the loser converges as soon as the winner completes,
+        // because an ALREADY-WAL database answers `journal_mode = WAL` as a no-op without the
+        // exclusive lock. Not a flock: this must cover EVERY open path uniformly (config opens,
+        // bare opens, heals), not just the schema-apply bootstrap.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.conn.execute_batch(
+                "
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                ",
+            ) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    let err = anyhow::Error::from(err);
+                    if !is_busy(&err) || std::time::Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                },
+            }
+        }
     }
 
     fn fts5_available(&self) -> bool {

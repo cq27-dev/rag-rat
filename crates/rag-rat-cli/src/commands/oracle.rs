@@ -40,7 +40,8 @@ pub(crate) fn with_oracle_write_lock<T>(
     config: &Config,
     body: impl FnOnce(&IndexDatabase) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
+    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     let db = open_index(config)?;
     body(&db)
 }
@@ -446,7 +447,7 @@ mod tests {
 
     use rag_rat_core::config::{ResolvedTarget, TargetKind};
     use rag_rat_core::language::Language;
-    use rag_rat_core::locks::{FileLock, write_lock_path};
+    use rag_rat_core::locks::{FileLock, write_lock_path, write_lock_repo_id};
     use rag_rat_core::{Config, IndexDatabase};
 
     use crate::cli::{OracleArgs, OracleCommand, OracleRunArgs, OracleToolArg};
@@ -596,8 +597,12 @@ mod tests {
             run.scip = Some(scip_path);
         }
 
-        // Hold the write lock the run must contend for.
-        let lock = FileLock::acquire_blocking(&write_lock_path(&config.database)).unwrap();
+        // Hold the write lock the run must contend for (per-repo, A6).
+        let lock = FileLock::acquire_blocking(&write_lock_path(
+            &config.database,
+            &write_lock_repo_id(&config),
+        ))
+        .unwrap();
 
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
@@ -637,7 +642,9 @@ mod tests {
         super::oracle(&config, &args).unwrap();
 
         // The lock is free now — a non-blocking acquire must succeed.
-        let lock = FileLock::try_acquire(&write_lock_path(&config.database)).unwrap();
+        let lock =
+            FileLock::try_acquire(&write_lock_path(&config.database, &write_lock_repo_id(&config)))
+                .unwrap();
         assert!(lock.is_some(), "oracle run must release the write lock when it returns");
 
         let _ = std::fs::remove_dir_all(&root);

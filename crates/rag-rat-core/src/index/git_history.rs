@@ -137,14 +137,61 @@ pub(crate) fn prepare(root: &Path) -> anyhow::Result<PreparedGitHistory> {
     Ok(PreparedGitHistory { repo: Some(repo), commits, changes })
 }
 
+/// The history reload-gate CURSOR values (`git_history_indexed_head`/`_root`/`_shallow`) a row
+/// apply produces, held back for a deferred write (A6, batch-4 P2). The git rows themselves are
+/// keyed, INERT data — `is_history_current` and `status` treat the CURSORS as the authority, never
+/// bare row presence — so a generation-staged rebuild lands the bulky rows early (Phase 2) and
+/// writes these cursors inside the terminal flip transaction, keeping "what commit is this index
+/// at" consistent with the file generation the pointer publishes. `None` cursors = a non-git root
+/// (the apply cleared the tables; nothing to record).
+pub(crate) struct HistoryCursors {
+    head: String,
+    root_key: String,
+    shallow: bool,
+}
+
+/// Write the reload-gate cursors — the LAST step of a history apply, split out so the full
+/// rebuild can defer it into the terminal flip transaction while incremental/recovery paths write
+/// it immediately after their rows (live-in-place semantics).
+pub(crate) fn record_history_cursors(
+    conn: &Connection,
+    cursors: &HistoryCursors,
+) -> anyhow::Result<()> {
+    let repo_id = schema::active_repo_id(conn)?;
+    set_repo_meta(conn, &repo_id, "git_history_indexed_head", &cursors.head)?;
+    set_repo_meta(conn, &repo_id, "git_history_indexed_root", &cursors.root_key)?;
+    set_repo_meta(
+        conn,
+        &repo_id,
+        "git_history_indexed_shallow",
+        if cursors.shallow { "1" } else { "0" },
+    )?;
+    Ok(())
+}
+
 pub(crate) fn apply_prepared(
     conn: &Connection,
     root: &Path,
     prepared: PreparedGitHistory,
 ) -> anyhow::Result<GitHistoryIndexStatus> {
+    let (status, cursors) = apply_prepared_deferring_cursors(conn, root, prepared)?;
+    if let Some(cursors) = cursors {
+        record_history_cursors(conn, &cursors)?;
+    }
+    Ok(status)
+}
+
+/// [`apply_prepared`] minus the cursor write: lands the `git_commits`/`git_file_changes` rows +
+/// the `commit_fts` resync and RETURNS the cursors for the caller to record later — the
+/// generation-staged rebuild's rows-inert/cursors-last seam (A6, batch-4 P2).
+pub(crate) fn apply_prepared_deferring_cursors(
+    conn: &Connection,
+    root: &Path,
+    prepared: PreparedGitHistory,
+) -> anyhow::Result<(GitHistoryIndexStatus, Option<HistoryCursors>)> {
     let Some(repo) = prepared.repo else {
         clear(conn)?;
-        return status(conn, root);
+        return Ok((status(conn, root)?, None));
     };
 
     // `git_commits` / `git_file_changes` are direct-scoped since V040, so a history reindex of ONE
@@ -206,16 +253,11 @@ pub(crate) fn apply_prepared(
     // every repo searchable.
     crate::index::schema::rebuild_commit_fts(conn)?;
     // Reload-gate key: head + root + shallow flag. `is_history_current` skips the next reload
-    // only when all three still match and git_commits is non-empty.
-    set_repo_meta(conn, &repo_id, "git_history_indexed_head", &repo.head)?;
-    set_repo_meta(conn, &repo_id, "git_history_indexed_root", &root_key(root))?;
-    set_repo_meta(
-        conn,
-        &repo_id,
-        "git_history_indexed_shallow",
-        if repo.shallow { "1" } else { "0" },
-    )?;
-    status(conn, root)
+    // only when all three still match and git_commits is non-empty. Returned for the caller to
+    // record — immediately (`apply_prepared`) or deferred into the rebuild's terminal txn.
+    let cursors =
+        HistoryCursors { head: repo.head.clone(), root_key: root_key(root), shallow: repo.shallow };
+    Ok((status(conn, root)?, Some(cursors)))
 }
 
 pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {

@@ -97,8 +97,9 @@ impl IndexDatabase {
         let has_test_code = chunks.iter().any(|pc| text_has_test_marker(&pc.chunk.text));
         let file_id = self.storage.connection().query_row(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-             indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code, repo_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code, repo_id, \
+             generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              RETURNING id",
             params![
                 path_string(path),
@@ -113,6 +114,8 @@ impl IndexDatabase {
                 &scope.worktree_id,
                 has_test_code,
                 self.active_repo_id,
+                // A6: heal writes land on the connection's live generation.
+                self.active_generation,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -150,15 +153,44 @@ impl IndexDatabase {
         graph: Option<&mut edges::FullRebuildGraph>,
     ) -> anyhow::Result<()> {
         let file = &prepared_file.file;
+        // Parser-failure routing (A6, P2 review): the FULL REBUILD (`graph.is_some()` — the same
+        // mode split the edge accumulator uses) STAGES its upserts/clears into the connection's
+        // temp table, published atomically with the flip by `apply_staged_parser_failures`. The
+        // per-wave commits land BEFORE the flip, so a direct write here would expose (and, on a
+        // tail failure, strand) an UNPUBLISHED generation's failure state to readers still scoped
+        // to the old generation. Incremental passes (`None`) write the LIVE generation in place,
+        // so they keep the direct upsert/clear (their `remove_file_in_scope` already cleared; the
+        // clear branch is the full-rebuild's clean-reparse path, a no-op for them).
+        let staged_rebuild = graph.is_some();
         let prepared = match &prepared_file.prepared {
             Ok(prepared) => prepared,
             Err(err) => {
-                self.insert_parser_failure(&file.relative_path, file.language, &err.to_string())?;
+                if staged_rebuild {
+                    self.stage_parser_failure(
+                        &file.relative_path,
+                        file.language,
+                        Some(&err.to_string()),
+                    )?;
+                } else {
+                    self.insert_parser_failure(
+                        &file.relative_path,
+                        file.language,
+                        &err.to_string(),
+                    )?;
+                }
                 return Ok(());
             },
         };
         if let Some(message) = &prepared.parser_failure {
-            self.insert_parser_failure(&file.relative_path, file.language, message)?;
+            if staged_rebuild {
+                self.stage_parser_failure(&file.relative_path, file.language, Some(message))?;
+            } else {
+                self.insert_parser_failure(&file.relative_path, file.language, message)?;
+            }
+        } else if staged_rebuild {
+            self.stage_parser_failure(&file.relative_path, file.language, None)?;
+        } else {
+            self.clear_parser_failure(&file.relative_path)?;
         }
         let path = path_string(&file.relative_path);
         // Precompute the file-level test-code flag (#77): impact_surface's "tests touching this
@@ -172,8 +204,9 @@ impl IndexDatabase {
             .connection()
             .prepare_cached(
                 "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-                 indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code, repo_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code, \
+                 repo_id, generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  RETURNING id",
             )?
             .query_row(
@@ -190,6 +223,10 @@ impl IndexDatabase {
                     file.worktree_id,
                     has_test_code,
                     self.active_repo_id,
+                    // A6: the WRITE generation of this pass — N+1 for a full rebuild (staged
+                    // alongside the live generation, made live by the flip), the live generation
+                    // for incremental (written in place).
+                    self.active_generation,
                 ],
                 |row| row.get::<_, i64>(0),
             )?;

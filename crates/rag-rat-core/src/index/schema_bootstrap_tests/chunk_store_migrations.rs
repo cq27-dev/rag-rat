@@ -298,9 +298,11 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         );
     }
 
-    // Hold the write lock exactly as the CLI `index` command does, then open under it. Pre-#226
-    // this blocked 30s on the migrate lock and errored; now it migrates immediately.
-    let _lock = crate::locks::WriteLock::acquire_blocking(&db_path).unwrap();
+    // Hold the PER-REPO write lock exactly as the CLI `index` command does, then open under it.
+    // Pre-#226 the open-time migrate took the SAME lock and self-deadlocked; A6 moved the migrate
+    // onto the GLOBAL schema lock, so it is now an INDEPENDENT lock — the held per-repo write lock
+    // never blocks it, and the open migrates immediately.
+    let _lock = crate::locks::WriteLock::acquire_blocking(&db_path, "testrepo0000").unwrap();
     let db =
         IndexDatabase::open(&db_path).expect("open migrates the Older schema under the held lock");
     assert_eq!(
@@ -595,11 +597,14 @@ fn gc_preserves_a_name_strings_entry_referenced_only_by_a_symbol() {
     let conn = db.storage.connection();
     // `files`/`symbols` are per-connection scoped TEMP VIEWS after open/rebuild; write the base
     // tables in `main`. Scope the file to the live commit so gc keeps it.
+    // Insert at the ACTIVE generation (A6) so gc's dead-generation sweep keeps this row (it is the
+    // live generation), the same way a real indexed file lands — the default 0 would be a dead
+    // generation after the rebuild advanced the live pointer, and gc would sweep it.
     conn.execute(
         "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,
-                                commit_sha, worktree_id)
-         VALUES ('only.rs', 'rust', 'source', 'h', 0, 0, ?1, ?2)",
-        params![db.active_commit_sha, db.active_worktree_id],
+                                commit_sha, worktree_id, generation)
+         VALUES ('only.rs', 'rust', 'source', 'h', 0, 0, ?1, ?2, ?3)",
+        params![db.active_commit_sha, db.active_worktree_id, db.active_generation],
     )
     .unwrap();
     let file_id = conn.last_insert_rowid();

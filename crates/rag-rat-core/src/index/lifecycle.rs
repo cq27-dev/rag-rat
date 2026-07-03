@@ -37,11 +37,17 @@ impl IndexDatabase {
         // (read/MCP/init open) still takes the real lock. Compatible/Newer/Dirty/Missing
         // need no lock — `ensure_compatible_or_migrate` returns or refuses without writing.
         if schema::status(storage.connection())?.state == schema::SchemaState::Older {
+            // A6: the GLOBAL schema lock, not a per-repo write lock — a migration rewrites the
+            // shared ladder (every repo's tables), so it serializes across all repos.
+            // Reentrant on the holding thread, so a CLI write command that opens under
+            // its per-repo write lock and migrates here takes a DIFFERENT (schema) lock
+            // without self-deadlocking.
             let _lock =
-                crate::locks::WriteLock::acquire_timeout(path, SCHEMA_MIGRATE_LOCK_TIMEOUT)?
+                crate::locks::WriteLock::acquire_schema_timeout(path, SCHEMA_MIGRATE_LOCK_TIMEOUT)?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "timed out waiting for the index write lock to auto-migrate the schema"
+                            "timed out waiting for the schema-migration lock to auto-migrate the \
+                             schema"
                         )
                     })?;
             schema::ensure_compatible_or_migrate(storage.connection())?;
@@ -62,13 +68,26 @@ impl IndexDatabase {
         if let Some(root) = repo_meta(storage.connection(), &repo_id, "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
+        // Stamp the sole repo's LIVE generation (a heal write on this connection lands on the
+        // live generation, not 0) AND install the repo+generation `files` view (A6, P2 review):
+        // `set_context` is never called on a bare open, so without a view every unqualified
+        // `files` join (lexical search, status counts, the graph heal) resolved to raw
+        // `main.files` — which post-A6 also holds STAGED (pre-flip) and SUPERSEDED (pre-gc)
+        // generations. This is the round-6 bare-open class on the generation axis; the view
+        // closes it for every reader on this connection at once, while deliberately keeping the
+        // bare open's CROSS-SCOPE semantics (all commits/worktrees of the sole repo — #360
+        // pins that `open` counts more than the base-scoped `open_config`).
+        let active_generation = schema::live_files_generation(storage.connection(), &repo_id)?;
+        write_repo_generation_view(storage.connection(), &repo_id, active_generation)?;
         let db = Self {
             storage,
             active_repo_id: repo_id,
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
+            active_generation,
             github: github::GitHubContext::default(),
             config: None,
+            _identity_lock: None,
         };
         if check_graph {
             db.ensure_graph_index_current()?;
@@ -84,10 +103,12 @@ impl IndexDatabase {
             active_repo_id: String::new(),
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
+            active_generation: 0,
             // Real usage: resolve the GitHub repo context from the local `gh` CLI here, at the
             // boundary. rebuild/open (used by tests and the bare index command) leave it offline.
             github: github::GitHubContext::from_gh(),
             config: Some(config.clone()),
+            _identity_lock: None,
         };
         db.storage.set_source_root(config.root.clone());
         // Register/adopt BEFORE anything repo-scoped runs, then install the scope context so the
@@ -133,6 +154,35 @@ impl IndexDatabase {
             Err(err) if err.is_absent() => schema::sole_repo_id(conn)?,
             Err(err) => return Err(err.into()),
         };
+        // FENCE-GAP CLOSE (A6, batch-5 P2): a LOCK-DISCIPLINED writer's held lock must match the
+        // repo id it writes under. The entry lock was keyed by the id DERIVED before open; if the
+        // clone was unshallowed in between, the id just resolved (and upgraded to) is a DIFFERENT
+        // discriminator — the rest of this command would write the portable repo's rows under
+        // only the stale `local:` lock, concurrent with any fresh portable-lock writer. Detect
+        // "I hold SOME per-repo lock for this DB, but not the resolved id's" and acquire the
+        // resolved id's lock for this connection's lifetime. Lockless openers (MCP reads/heals)
+        // hold nothing and stay lockless. This is the out-of-order edge of the canonical lock
+        // order (the resolved portable id sorts before the held `local:` one), so it is BOUNDED —
+        // a timeout is a retryable error, never a hang (see the locks module doc).
+        let db_path = self.storage.database_path().to_path_buf();
+        if crate::locks::thread_holds_any_repo_write_lock(&db_path)
+            && !crate::locks::thread_holds_write_lock(&db_path, &repo_id)
+        {
+            self._identity_lock = Some(
+                crate::locks::WriteLock::acquire_timeout(
+                    &db_path,
+                    &repo_id,
+                    SCHEMA_MIGRATE_LOCK_TIMEOUT,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the repo identity changed to {repo_id} underneath this command (its \
+                         write lock is keyed by the old identity) and the new identity's lock is \
+                         still held elsewhere; re-run the command"
+                    )
+                })?,
+            );
+        }
         self.active_repo_id = repo_id;
         Ok(())
     }
@@ -184,8 +234,10 @@ impl IndexDatabase {
             active_repo_id: repo_id,
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
+            active_generation: 0,
             github: github::GitHubContext::from_gh(),
             config: Some(config.clone()),
+            _identity_lock: None,
         };
         // Install the scope context BEFORE the heal-owed gates: `set_context` mirrors the resolved
         // `repo_id` into `temp.connection_context` (writable even on a read-only main DB), so the
@@ -239,7 +291,9 @@ impl IndexDatabase {
             },
             schema::SchemaState::Compatible => {},
             schema::SchemaState::Missing | schema::SchemaState::Older => {
-                schema::apply(storage.connection())?;
+                // Every schema-APPLY path serializes on the GLOBAL schema lock and RE-CHECKS
+                // under it (the racer may have finished) — see `apply_schema_under_lock`.
+                Self::apply_schema_under_lock(path, storage.connection())?;
             },
         }
         ai::ensure_model_manifest(storage.connection())?;
@@ -263,20 +317,92 @@ impl IndexDatabase {
     /// source-root restore therefore move to `rebuild`, out of this low-level helper.
     pub(super) fn create_or_migrate(path: &Path) -> anyhow::Result<Self> {
         let storage = IndexConnection::open(path)?;
-        schema::apply(storage.connection())?;
+        // Double-checked schema apply (batch-4 P2): two repos' concurrent `index --full` against
+        // one shared Missing/Older DB reach this constructor simultaneously, and an un-serialized
+        // `schema::apply` races itself (`add_column_if_missing`'s check-then-ALTER trips duplicate
+        // -column errors; the dirty-marker dance churns). Skip when already Compatible — `apply`
+        // on a Compatible DB is a proven data no-op (the full-ladder replay tests), so skipping is
+        // both safe and cheaper — else serialize on the GLOBAL schema lock and re-check under it.
+        if schema::status(storage.connection())?.state != schema::SchemaState::Compatible {
+            Self::apply_schema_under_lock(path, storage.connection())?;
+        }
         Ok(Self {
             storage,
             active_repo_id: String::new(),
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
+            active_generation: 0,
             github: github::GitHubContext::default(),
             config: None,
+            _identity_lock: None,
         })
     }
 
+    /// Run `schema::apply` under the GLOBAL schema-migration lock, RE-CHECKING the state once the
+    /// lock is held (double-checked: the concurrent applier we serialized behind may have finished
+    /// the work, in which case this is a no-op). EVERY path that can APPLY schema goes through
+    /// here or `open_and_migrate`'s equivalent (batch-4 P2 rule) — the schema ladder is shared by
+    /// all repos in the DB file, so appliers must serialize across repos, which the per-repo write
+    /// flock deliberately does not do.
+    fn apply_schema_under_lock(path: &Path, conn: &rusqlite::Connection) -> anyhow::Result<()> {
+        let _lock =
+            crate::locks::WriteLock::acquire_schema_timeout(path, SCHEMA_MIGRATE_LOCK_TIMEOUT)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "timed out waiting for the schema-migration lock to apply the schema"
+                    )
+                })?;
+        if schema::status(conn)?.state != schema::SchemaState::Compatible {
+            schema::apply(conn)?;
+        }
+        Ok(())
+    }
+
     pub fn set_context(&mut self, commit_sha: &str, worktree_id: &str) -> anyhow::Result<()> {
+        // A reader / incremental open scopes to the repo's LIVE generation (A6) — the pointer a
+        // full rebuild flips once its staged generation is complete. The rebuild connection
+        // overrides this with its WRITE generation via `set_context_at_generation`.
+        let generation =
+            schema::live_files_generation(self.storage.connection(), &self.active_repo_id)?;
+        self.set_context_at_generation(commit_sha, worktree_id, generation)
+    }
+
+    /// Install the scope VIEW for an arbitrary `(commit, worktree)` at an explicit generation
+    /// WITHOUT touching this connection's `active_*` fields — the rebuild tail's overlay
+    /// re-resolution seam (A6). The terminal flip transaction swaps the view to each carried
+    /// overlay scope (so `resolve_overlay_edges` resolves that overlay's edges against its view
+    /// over the freshly staged base), then back to the base scope; the connection's own identity
+    /// (`active_commit_sha` / `active_worktree_id` / `active_generation`) must stay the base
+    /// rebuild's throughout, so the writer-side stamps and `active_scope_is_linked_overlay`
+    /// gates are unaffected by the temporary view swaps.
+    pub(super) fn install_view_for_scope(
+        &self,
+        commit_sha: &str,
+        worktree_id: &str,
+        generation: i64,
+    ) -> rusqlite::Result<()> {
+        write_scope_view(self.storage.connection(), &ScopeContext {
+            repo_id: self.active_repo_id.clone(),
+            commit_sha: commit_sha.to_string(),
+            worktree_id: worktree_id.to_string(),
+            generation,
+        })
+    }
+
+    /// [`set_context`] pinned to an EXPLICIT `files.generation` — the full rebuild's seam (A6). The
+    /// rebuild installs the scope view (and stamps every direct-scoped write, via
+    /// `self.active_generation`) at the WRITE generation N+1 it is building, so its own
+    /// edge-resolution / logical-symbol reads see only the generation being built; concurrent
+    /// readers stay on the live generation N until the flip.
+    pub(crate) fn set_context_at_generation(
+        &mut self,
+        commit_sha: &str,
+        worktree_id: &str,
+        generation: i64,
+    ) -> anyhow::Result<()> {
         self.active_commit_sha = commit_sha.to_string();
         self.active_worktree_id = worktree_id.to_string();
+        self.active_generation = generation;
         // The repo dimension comes from `self.active_repo_id` (resolved at open), not re-derived
         // from the connection — a consolidated DB's sole-repo fallback would be ambiguous. This is
         // the one caller that scopes to a SPECIFIC repo without reading it back from the context.
@@ -284,6 +410,7 @@ impl IndexDatabase {
             repo_id: self.active_repo_id.clone(),
             commit_sha: commit_sha.to_string(),
             worktree_id: worktree_id.to_string(),
+            generation,
         })?;
         Ok(())
     }
@@ -345,10 +472,15 @@ pub fn install_worktree_scope_view(
     cwd: &Path,
 ) -> anyhow::Result<()> {
     let (commit_sha, worktree_id) = resolve_worktree_scope(config_root, Some(cwd));
+    // A6: this raw-conn READ installer scopes to the repo's LIVE generation from `repo_meta` (an
+    // empty `repo_id` — the sibling-safe "match nothing" case — reads generation 0, still matching
+    // nothing, since no row carries the empty repo).
+    let generation = schema::live_files_generation(conn, repo_id)?;
     write_scope_view(conn, &ScopeContext {
         repo_id: repo_id.to_string(),
         commit_sha,
         worktree_id,
+        generation,
     })?;
     Ok(())
 }
@@ -375,6 +507,10 @@ pub(crate) struct ScopeContext {
     pub repo_id: String,
     pub commit_sha: String,
     pub worktree_id: String,
+    /// The `files.generation` the view filters on (A6): the repo's LIVE generation for a
+    /// reader/incremental open, the WRITE generation N+1 for the connection driving a full
+    /// rebuild.
+    pub generation: i64,
 }
 
 /// Install the scope view on a RAW connection that has no `IndexDatabase` to carry
@@ -392,10 +528,12 @@ pub(crate) fn install_scope_view(
     worktree_id: &str,
 ) -> rusqlite::Result<()> {
     let repo_id = schema::active_repo_id(conn)?;
+    let generation = schema::active_generation(conn)?;
     write_scope_view(conn, &ScopeContext {
         repo_id,
         commit_sha: commit_sha.to_string(),
         worktree_id: worktree_id.to_string(),
+        generation,
     })
 }
 
@@ -415,10 +553,18 @@ fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext) -> rusqlite
     stmt.execute(params![schema::CONNECTION_CONTEXT_REPO_KEY, ctx.repo_id])?;
     stmt.execute(params!["commit_sha", ctx.commit_sha])?;
     stmt.execute(params!["worktree_id", ctx.worktree_id])?;
+    // A6: the file generation the view filters on. Stored as TEXT beside the other context keys;
+    // the INTEGER `generation` column's numeric affinity coerces it back in the comparisons
+    // below.
+    stmt.execute(params![schema::CONNECTION_CONTEXT_GENERATION_KEY, ctx.generation.to_string()])?;
+    drop(stmt);
 
-    // Every branch (and the shadowing sub-select) is repo-scoped: `worktree_id`/`commit_sha` alone
-    // are not globally unique across repos (forks share a commit; the empty base scope is shared),
-    // so the `repo_id` predicate is what keeps a sibling repo's rows out of the view.
+    // Every branch (and the shadowing sub-select) is repo- AND generation-scoped (A3 + A6):
+    // `worktree_id`/`commit_sha` alone are not globally unique across repos (forks share a commit;
+    // the empty base scope is shared), so the `repo_id` predicate keeps a sibling repo's rows out;
+    // the `generation` predicate keeps a superseded full-rebuild generation (dead until gc sweeps
+    // it) out, so a reader sees the COMPLETE old generation until the rebuild flips
+    // `live_files_generation`, then the complete new one — never a half-built mix.
     conn.execute_batch(
         "
             DROP VIEW IF EXISTS temp.files;
@@ -427,6 +573,8 @@ fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext) -> rusqlite
          indexed_revision, commit_sha, worktree_id, has_test_code
             FROM main.files
             WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+              AND generation = (SELECT value FROM temp.connection_context WHERE key = \
+         'files_generation')
               AND worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
          'worktree_id') AND worktree_id != '' AND kind != 'deleted'
             UNION ALL
@@ -434,11 +582,15 @@ fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext) -> rusqlite
          indexed_revision, commit_sha, worktree_id, has_test_code
             FROM main.files
             WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+              AND generation = (SELECT value FROM temp.connection_context WHERE key = \
+         'files_generation')
               AND commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
               AND commit_sha != ''
               AND path NOT IN (
                   SELECT path FROM main.files
                   WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+                    AND generation = (SELECT value FROM temp.connection_context WHERE key = \
+         'files_generation')
                     AND worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
          'worktree_id')
                     AND worktree_id != ''
@@ -446,5 +598,45 @@ fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext) -> rusqlite
         ",
     )?;
 
+    Ok(())
+}
+
+/// Repo + generation-only `files` view for the BARE open (A6, P2 review). A bare
+/// `IndexDatabase::open` (the MCP `call_tool(database, …)` read path, tests, `doctor`)
+/// deliberately serves ALL commits/worktrees of the sole repo — #360 pins that its counts exceed
+/// the base-scoped `open_config` — so it cannot install the commit/worktree-scoped view above.
+/// But leaving `files` unqualified resolved it to raw `main.files`, which post-A6 also holds
+/// STAGED (pre-flip) and SUPERSEDED (pre-gc) generations: the round-6 bare-open class on the
+/// generation axis. This view keeps the cross-scope semantics while pinning `repo_id` and the
+/// LIVE generation. The context rows are written too, so free-conn helpers
+/// (`schema::active_repo_id` / `schema::active_generation`) resolve the same values;
+/// `commit_sha`/`worktree_id` stay empty (no checkout scope).
+fn write_repo_generation_view(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    generation: i64,
+) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+    )?;
+    let mut stmt =
+        conn.prepare("INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES (?1, ?2)")?;
+    stmt.execute(params![schema::CONNECTION_CONTEXT_REPO_KEY, repo_id])?;
+    stmt.execute(params!["commit_sha", ""])?;
+    stmt.execute(params!["worktree_id", ""])?;
+    stmt.execute(params![schema::CONNECTION_CONTEXT_GENERATION_KEY, generation.to_string()])?;
+    drop(stmt);
+    conn.execute_batch(
+        "
+            DROP VIEW IF EXISTS temp.files;
+            CREATE TEMP VIEW temp.files AS
+            SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
+         indexed_revision, commit_sha, worktree_id, has_test_code
+            FROM main.files
+            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+              AND generation = (SELECT value FROM temp.connection_context WHERE key = \
+         'files_generation');
+        ",
+    )?;
     Ok(())
 }

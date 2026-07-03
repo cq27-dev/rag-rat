@@ -373,10 +373,18 @@ impl IndexDatabase {
             let mut tombstoned = 0;
             for path in &delta.tombstones {
                 let exists: bool = self.storage.connection().query_row(
-                    // Direct `main.files` probe → explicit `repo_id` predicate (A3).
+                    // Direct `main.files` probe → explicit `repo_id` (A3) + `generation` (A6)
+                    // predicates: only a tombstone at THIS connection's live generation suppresses
+                    // the write — a superseded generation's copy does not hide the path.
                     "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
-                     commit_sha = '' AND worktree_id = ?3 AND kind = 'deleted')",
-                    params![self.active_repo_id, path_string(path), worktree_id],
+                     commit_sha = '' AND worktree_id = ?3 AND kind = 'deleted' AND generation = \
+                     ?4)",
+                    params![
+                        self.active_repo_id,
+                        path_string(path),
+                        worktree_id,
+                        self.active_generation
+                    ],
                     |row| row.get(0),
                 )?;
                 if !exists {

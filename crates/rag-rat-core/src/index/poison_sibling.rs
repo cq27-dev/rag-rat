@@ -207,10 +207,17 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
     )?;
 
     // --- direct-scoped core tables ---
+    // A6: seed the sibling's files at generation 0 — the sibling's OWN live generation (it has no
+    // `repo_meta[live_files_generation]`, so its live generation reads 0). This is DISTINCT from
+    // the primary repo's post-rebuild live generation (>= 1, since the seed runs at the rebuild
+    // tail after the flip), so a repo-UNSCOPED dead-generation sweep — `WHERE generation !=
+    // <primary live>` missing the `repo_id` predicate — would delete these rows and trip
+    // `assert_sibling_intact`. That is the exact class the generation gc sweep must never regress
+    // (and the reason the sibling carries no `repo_meta` live-generation pointer of its own).
     conn.execute(
         "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
-         commit_sha, worktree_id, repo_id)
-         VALUES (?1, 'rust', 'source', ?2, 0, 0, ?3, '', ?4)",
+         commit_sha, worktree_id, repo_id, generation)
+         VALUES (?1, 'rust', 'source', ?2, 0, 0, ?3, '', ?4, 0)",
         params![
             format!("{POISON_PREFIX}file.rs"),
             format!("{POISON_PREFIX}sha"),
@@ -560,10 +567,11 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
     // files: caught by any unscoped `main.files` read that groups/joins by path (the scope view
     // would exclude the sibling, so only a view-bypassing path read leaks). No children hung off
     // it.
+    // Generation 0 (the sibling's live generation), as for the distinct-path file above.
     conn.execute(
         "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
-         commit_sha, worktree_id, repo_id)
-         VALUES (?1, 'rust', 'source', ?2, 0, 0, ?3, '', ?4)",
+         commit_sha, worktree_id, repo_id, generation)
+         VALUES (?1, 'rust', 'source', ?2, 0, 0, ?3, '', ?4, 0)",
         params![collision_path, POISON_SAMEPATH_SHA, POISON_COMMIT, POISON_REPO_ID],
     )?;
     // git_file_changes at the shared path (off the sibling commit): caught by an unscoped churn /

@@ -4,11 +4,27 @@
 //!
 //! - the **per-worktree election lock** (one watcher per worktree), keyed by the canonicalized
 //!   worktree root and living under the git common dir;
-//! - the **per-DB write-serialization lock** (held by the watcher, the git hooks, and manual
-//!   `index`), so exactly one writer touches the shared index at a time.
+//! - the **per-DB, per-repo write-serialization lock** (held by the watcher, the git hooks, and
+//!   manual `index`), so exactly one writer touches a repo's slice of the shared index at a time.
 //!
 //! Locks release when the file handle drops (the OS also releases on process death), so there is no
 //! stale-pidfile cleanup. Caveat: file locks are unreliable on NFS and WSL2 `drvfs`/`9p` mounts.
+//!
+//! # Canonical lock order (A6, batch-5 P2)
+//!
+//! When a flow must hold MORE THAN ONE per-repo write lock (today: the LocalOnly→Portable identity
+//! upgrade, and a writer whose resolved repo id turns out to differ from the one it locked at
+//! entry), the CANONICAL TOTAL ORDER is LEXICOGRAPHIC on the sanitized discriminator
+//! ([`canonical_lock_order`]) — supersedes the earlier role-based
+//! "incoming-then-outgoing" argument, which broke the moment a second multi-lock path appeared
+//! with the opposite roles. Multi-lock acquirers sort the ids they need and acquire in that order
+//! wherever they start from a clean slate; an acquisition that would VIOLATE the order (the
+//! earlier-sorting lock requested while a later-sorting one is already held — unavoidable when
+//! the entry lock was taken identity-blind before the second id was knowable) MUST be BOUNDED
+//! (`acquire_timeout`, never `acquire_blocking`): the bounded out-of-order edge is what keeps the
+//! pre-held-entry-lock topology deadlock-free — a wait cycle needs two hold-and-wait edges, purely
+//! in-order unbounded edges cannot form a cycle under a total order, and any cycle containing a
+//! bounded edge self-breaks within its timeout (one side surfaces a retryable error).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -89,25 +105,109 @@ impl Drop for FileLock {
     }
 }
 
-/// Per-DB write-serialization lock path: next to the index database (under the git common dir for a
-/// shared DB, or `<root>/.rag-rat/` for a single worktree — both excluded from the watch tree).
-pub fn write_lock_path(database: &Path) -> PathBuf {
-    database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-write.lock")
+/// A short, filesystem-safe discriminator for a repo's per-DB lock files (A6): the first 12 ASCII
+/// alphanumerics of `repo_id`. Stable per repo (a portable id is a hex root-commit hash; a `local:`
+/// id and the root-hash fallback are hex too) and distinct enough that different repos in one
+/// shared global DB never share a lock file — 12 chars ≈ 48 bits, collision-negligible for the
+/// handful of repos on a machine. Empty / all-punctuation ids degrade to a fixed stem rather than a
+/// bare `rag-rat-write-.lock`.
+fn lock_discriminator(repo_id: &str) -> String {
+    let disc: String = repo_id.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
+    if disc.is_empty() { "repo".to_string() } else { disc }
 }
 
-/// Per-DB maintenance coordination lock, held by the running `rag-rat maintenance` command for its
-/// whole pass so the multiple git hooks a single amend/merge/rebase fires coalesce into one pass
-/// instead of each running a full discover (#267). Separate from [`write_lock_path`] so it only
-/// coordinates CLI maintenance invocations — the pass itself still takes the write lock internally,
-/// serializing with the watcher as before.
-pub fn maintenance_lock_path(database: &Path) -> PathBuf {
-    database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-maintenance.lock")
+/// Per-DB, PER-REPO write-serialization lock path: next to the index database, keyed by `repo_id`
+/// (A6). On a shared global DB this keeps two writers to DIFFERENT repos from serializing on one
+/// flock — a full rebuild of repo A must not block a memory write to repo B beyond the busy-timeout
+/// slice (spec §3.3) — while writers to the SAME repo (across its worktrees, which share a repo_id)
+/// still contend. The concurrent access to the SQLite file itself is serialized by WAL, not this
+/// lock. Resolve `repo_id` before opening via [`write_lock_repo_id`].
+pub fn write_lock_path(database: &Path, repo_id: &str) -> PathBuf {
+    database
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("rag-rat-write-{}.lock", lock_discriminator(repo_id)))
+}
+
+/// The GLOBAL schema-migration lock path, beside the DB (A6): ONE per database file, taken only by
+/// the open-time auto-migrate ([`crate::index`] lifecycle). A schema migration rewrites the SHARED
+/// migration ladder — every repo's tables — so it must serialize across ALL repos, unlike the
+/// per-repo [`write_lock_path`]. Keeping it separate means a repo's ordinary write is neither
+/// blocked by nor blocks an unrelated repo except during the brief migration itself.
+pub fn schema_lock_path(database: &Path) -> PathBuf {
+    database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-schema.lock")
+}
+
+/// Per-DB, PER-REPO maintenance coordination lock, held by the running `rag-rat maintenance`
+/// command for its whole pass so the multiple git hooks a single amend/merge/rebase fires coalesce
+/// into one pass instead of each running a full discover (#267). Keyed by `repo_id` (A6) like
+/// [`write_lock_path`], so a maintenance pass on one repo never coalesces (or blocks) an unrelated
+/// repo's. Separate from the write lock so it only coordinates CLI maintenance invocations — the
+/// pass itself still takes the write lock internally.
+pub fn maintenance_lock_path(database: &Path, repo_id: &str) -> PathBuf {
+    database
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("rag-rat-maintenance-{}.lock", lock_discriminator(repo_id)))
 }
 
 /// Marker a coalesced `maintenance` trigger sets to ask the in-flight runner to run one more pass
-/// after the current one, so a change that arrived mid-pass is still covered (#267).
-pub fn maintenance_pending_path(database: &Path) -> PathBuf {
-    database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-maintenance.pending")
+/// after the current one, so a change that arrived mid-pass is still covered (#267). Per-repo (A6),
+/// pairing with the per-repo [`maintenance_lock_path`].
+pub fn maintenance_pending_path(database: &Path, repo_id: &str) -> PathBuf {
+    database
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("rag-rat-maintenance-{}.pending", lock_discriminator(repo_id)))
+}
+
+/// Order two repo ids by the CANONICAL LOCK ORDER (see the module doc): lexicographic on the
+/// sanitized discriminator, i.e. the order of the lock FILE NAMES themselves. Multi-lock
+/// acquirers sort with this before acquiring. Ties (same discriminator — same repo) are the
+/// reentrant case, not an ordering question.
+pub fn canonical_lock_order<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {
+    if lock_discriminator(a) <= lock_discriminator(b) { (a, b) } else { (b, a) }
+}
+
+/// Whether THIS THREAD currently holds the per-repo write lock for `(database, repo_id)` — the
+/// reentrancy registry probe, exposed so identity-resolution code can tell "my held entry lock
+/// already covers the resolved repo" from the batch-5 fence gap (entry lock keyed by a stale
+/// derived id).
+pub fn thread_holds_write_lock(database: &Path, repo_id: &str) -> bool {
+    write_lock_held_on_this_thread(&write_lock_path(database, repo_id))
+}
+
+/// Whether THIS THREAD holds ANY per-repo write lock for `database` (any `rag-rat-write-*.lock`
+/// sibling of the DB file; the global schema lock and maintenance locks do not count). `true` for
+/// a LOCKED writer (CLI/watcher entry), `false` for the deliberately lockless openers (MCP reads,
+/// heals) — the discriminating probe for the batch-5 rule "a writer's held lock must match the
+/// repo id it writes under": only a flow that IS lock-disciplined must extend its coverage when
+/// the resolved id differs; a lockless flow stays lockless.
+pub fn thread_holds_any_repo_write_lock(database: &Path) -> bool {
+    let dir = database.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    HELD_WRITE_LOCKS.with_borrow(|held| {
+        held.iter().any(|(path, &depth)| {
+            depth > 0
+                && path.parent() == Some(dir.as_path())
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("rag-rat-write-"))
+        })
+    })
+}
+
+/// The repo discriminator for a config's per-DB write / maintenance locks (A6). Resolution CANNOT
+/// open the DB (this lock guards the open itself), so it derives the identity straight from git via
+/// [`resolve_repo_identity`](crate::repo_identity::resolve_repo_identity), honoring an `[index]
+/// repo_id` override — worktrees of one repo resolve to the same id and therefore share a lock. A
+/// non-git / unresolvable root (a bare temp dir, a rejected pin) falls back to a stable hash of the
+/// canonicalized root; a per-repo DB there holds exactly one repo, so any stable value serializes
+/// its writers correctly.
+pub fn write_lock_repo_id(config: &Config) -> String {
+    crate::repo_identity::resolve_repo_identity(&config.root, config.repo_id_override.as_deref())
+        .map(|identity| identity.repo_id)
+        .unwrap_or_else(|_| format!("root{}", worktree_hash(&config.root)))
 }
 
 thread_local! {
@@ -159,10 +259,37 @@ pub struct WriteLock {
 }
 
 impl WriteLock {
-    /// Blocks until acquired (returns immediately if this thread already holds it). Use only for
-    /// non-interactive writers; interactive / hook callers use [`WriteLock::acquire_timeout`].
-    pub fn acquire_blocking(database: &Path) -> anyhow::Result<WriteLock> {
-        let lock_path = write_lock_path(database);
+    /// Blocks until the PER-REPO write lock is acquired (returns immediately if this thread already
+    /// holds it). Use only for non-interactive writers; interactive / hook callers use
+    /// [`WriteLock::acquire_timeout`]. `repo_id` keys the lock file (A6) — resolve it via
+    /// [`write_lock_repo_id`].
+    pub fn acquire_blocking(database: &Path, repo_id: &str) -> anyhow::Result<WriteLock> {
+        Self::acquire_path_blocking(write_lock_path(database, repo_id))
+    }
+
+    /// Polls until the PER-REPO write lock is acquired or `timeout` elapses (returns immediately if
+    /// this thread already holds it); `Ok(None)` on timeout. `repo_id` keys the lock file (A6).
+    pub fn acquire_timeout(
+        database: &Path,
+        repo_id: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<WriteLock>> {
+        Self::acquire_path_timeout(write_lock_path(database, repo_id), timeout)
+    }
+
+    /// Polls until the GLOBAL schema-migration lock ([`schema_lock_path`]) is acquired or `timeout`
+    /// elapses; `Ok(None)` on timeout. Taken ONLY by the open-time auto-migrate (A6): a schema
+    /// migration rewrites the shared ladder, so it serializes across ALL repos, unlike the per-repo
+    /// write lock. Reentrant on the holding thread like the per-repo lock (a command already
+    /// holding it that re-opens under it does not self-deadlock).
+    pub fn acquire_schema_timeout(
+        database: &Path,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<WriteLock>> {
+        Self::acquire_path_timeout(schema_lock_path(database), timeout)
+    }
+
+    fn acquire_path_blocking(lock_path: PathBuf) -> anyhow::Result<WriteLock> {
         if write_lock_held_on_this_thread(&lock_path) {
             register_write_lock(&lock_path);
             return Ok(WriteLock { _inner: None, lock_path });
@@ -172,13 +299,10 @@ impl WriteLock {
         Ok(WriteLock { _inner: Some(inner), lock_path })
     }
 
-    /// Polls until acquired or `timeout` elapses (returns immediately if this thread already holds
-    /// it); `Ok(None)` on timeout.
-    pub fn acquire_timeout(
-        database: &Path,
+    fn acquire_path_timeout(
+        lock_path: PathBuf,
         timeout: Duration,
     ) -> anyhow::Result<Option<WriteLock>> {
-        let lock_path = write_lock_path(database);
         if write_lock_held_on_this_thread(&lock_path) {
             register_write_lock(&lock_path);
             return Ok(Some(WriteLock { _inner: None, lock_path }));
@@ -384,33 +508,87 @@ mod tests {
         // thread is a genuine second writer → must still contend on the real OS lock.
         let dir = temp_dir();
         let db = dir.join("index.sqlite");
+        let repo = "repoaaaa0000";
 
-        let outer = WriteLock::acquire_blocking(&db).unwrap();
+        let outer = WriteLock::acquire_blocking(&db, repo).unwrap();
         // Nested acquire on the same thread re-enters immediately (a raw lock would self-deadlock).
-        let inner = WriteLock::acquire_timeout(&db, Duration::from_millis(50)).unwrap();
+        let inner = WriteLock::acquire_timeout(&db, repo, Duration::from_millis(50)).unwrap();
         assert!(inner.is_some(), "nested same-thread acquire must re-enter, not block");
         drop(inner);
 
         // While `outer` is still held, a DIFFERENT thread must not be able to acquire it.
         let db_other = db.clone();
         let got = std::thread::spawn(move || {
-            WriteLock::acquire_timeout(&db_other, Duration::from_millis(100)).unwrap().is_some()
+            WriteLock::acquire_timeout(&db_other, repo, Duration::from_millis(100))
+                .unwrap()
+                .is_some()
         })
         .join()
         .unwrap();
         assert!(!got, "a second thread must contend on the real OS lock while the first holds it");
 
+        // A6: a DIFFERENT repo's write lock is an INDEPENDENT file, so it acquires even while this
+        // repo's lock is held — the whole point of per-repo locks (a rebuild of one repo must not
+        // block a write to another in a shared DB).
+        let db_sibling = db.clone();
+        let sibling_got = std::thread::spawn(move || {
+            WriteLock::acquire_timeout(&db_sibling, "repobbbb1111", Duration::from_millis(100))
+                .unwrap()
+                .is_some()
+        })
+        .join()
+        .unwrap();
+        assert!(sibling_got, "a different repo's write lock must not be blocked by this repo's");
+
         drop(outer);
         // Fully released once the outermost guard drops: a fresh (cross-thread) acquire succeeds.
         let db_after = db.clone();
         let reacquired = std::thread::spawn(move || {
-            WriteLock::acquire_timeout(&db_after, Duration::from_millis(100)).unwrap().is_some()
+            WriteLock::acquire_timeout(&db_after, repo, Duration::from_millis(100))
+                .unwrap()
+                .is_some()
         })
         .join()
         .unwrap();
         assert!(reacquired, "the lock is free after the outermost guard drops");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canonical_lock_order_is_total_and_lexicographic_on_the_discriminator() {
+        // A portable (hex-leading) id sorts before a `local:`-derived one (hex digits < 'l' after
+        // sanitization), whichever way the pair is passed — the total order every multi-lock
+        // acquirer sorts by (see the module doc).
+        assert_eq!(
+            canonical_lock_order("0abc123root", "local:deadbeef"),
+            ("0abc123root", "local:deadbeef")
+        );
+        assert_eq!(
+            canonical_lock_order("local:deadbeef", "0abc123root"),
+            ("0abc123root", "local:deadbeef")
+        );
+        // Equal discriminators (the same repo) are the reentrant case, not an ordering question;
+        // the order is merely stable.
+        assert_eq!(canonical_lock_order("aaaa", "aaaa"), ("aaaa", "aaaa"));
+    }
+
+    #[test]
+    fn lock_paths_are_per_repo_but_the_schema_lock_is_global() {
+        // A6: the write / maintenance locks are keyed by repo_id (different repos → different
+        // files), while the schema-migration lock is one file per DB regardless of repo.
+        let db = Path::new("/repo/.rag-rat/index.sqlite");
+        assert_ne!(write_lock_path(db, "aaaa11112222"), write_lock_path(db, "bbbb33334444"));
+        assert_eq!(write_lock_path(db, "aaaa11112222"), write_lock_path(db, "aaaa11112222"));
+        assert_ne!(
+            maintenance_lock_path(db, "aaaa11112222"),
+            maintenance_lock_path(db, "bbbb33334444")
+        );
+        // The schema lock ignores the repo entirely (one migration serializer per DB file).
+        assert_eq!(schema_lock_path(db), schema_lock_path(db));
+        assert!(schema_lock_path(db).to_string_lossy().ends_with("rag-rat-schema.lock"));
+        // A `local:`-prefixed id sanitizes to alphanumerics (the `:` is dropped), still per-repo.
+        assert_eq!(write_lock_path(db, "local:abcdef01"), write_lock_path(db, "local:abcdef01"));
     }
 
     #[test]

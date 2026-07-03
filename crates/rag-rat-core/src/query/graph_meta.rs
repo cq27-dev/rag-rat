@@ -247,14 +247,23 @@ fn primary_symbol(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<Pri
 }
 
 fn count_callers(conn: &Connection, symbol: &PrimarySymbol) -> anyhow::Result<u64> {
+    // GENERATION-SCOPED via the `files` view (batch 6, count-scoping class): the `to_symbol_id =
+    // ?1` arm keys on a LIVE rowid (dead-generation edges carry re-minted ids, so they never
+    // match — as the clean `count_callees`/`count_edges_for_symbol` siblings rely on), but the
+    // unresolved `(to_symbol_id IS NULL AND to_name_id = …)` arm matches callsites purely by
+    // NAME and so counts dead-generation edges during a dead-generation window, inflating
+    // `caller_count`/`truncated` on GraphEvidence. Joining the scoped view bounds the count to
+    // the live generation's callsites (columns qualified because `files.id` would otherwise
+    // collide with the `-id` edge term).
     let count = conn
         .prepare_cached(
             "
-        SELECT COUNT(DISTINCT COALESCE(from_symbol_id, -id))
+        SELECT COUNT(DISTINCT COALESCE(edges.from_symbol_id, -edges.id))
         FROM edges
-        WHERE edge_kind IN ('calls_name', 'constructs', 'uses_macro')
-          AND (to_symbol_id = ?1 OR (to_symbol_id IS NULL AND to_name_id = (SELECT id FROM \
-             name_strings WHERE value = ?2)))
+        JOIN files source_files ON source_files.id = edges.source_file_id
+        WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_macro')
+          AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
+             (SELECT id FROM name_strings WHERE value = ?2)))
         ",
         )?
         .query_row(params![symbol.id, symbol.name], |row| row.get::<_, i64>(0))?;

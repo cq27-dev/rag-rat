@@ -266,6 +266,13 @@ impl IndexDatabase {
         // consolidated DB; the content-derived `stable_id` collapses cross-scope duplicates
         // into one logical symbol with per-scope members, and downstream reads stay
         // scope-filtered via the `files` view.
+        // Filter `main.files.generation` to the ACTIVE generation (A6): a full rebuild leaves the
+        // superseded generation's file rows in place (swept lazily by gc), so a bare `repo_id`
+        // predicate would fold BOTH the dead and the live generation's symbols into one grouping.
+        // `self.active_generation` is the WRITE generation on the rebuild connection — which the
+        // rebuild flips to LIVE and carries forward every live overlay onto BEFORE this runs, so
+        // filtering it folds the base scope + every carried-forward overlay of the live generation
+        // and nothing dead. On an incremental pass it is the live generation, unchanged behavior.
         let mut stmt = conn.prepare(
             "
             SELECT symbols.id, main.files.path, symbols.language, symbols.name,
@@ -274,12 +281,12 @@ impl IndexDatabase {
             FROM main.symbols AS symbols
             JOIN main.files ON main.files.id = symbols.file_id
             LEFT JOIN main.name_strings qn ON qn.id = symbols.qualified_name_id
-            WHERE main.files.repo_id = ?1
+            WHERE main.files.repo_id = ?1 AND main.files.generation = ?2
             ORDER BY symbols.language, main.files.path, symbols.name, qn.value,
                      symbols.kind, symbols.signature, symbols.start_byte, symbols.end_byte
             ",
         )?;
-        let mut rows = stmt.query(params![self.active_repo_id])?;
+        let mut rows = stmt.query(params![self.active_repo_id, self.active_generation])?;
         let mut current: Option<(LogicalSymbolKey, Vec<LogicalSymbolMemberRow>)> = None;
         while let Some(row) = rows.next()? {
             let member = LogicalSymbolMemberRow {
@@ -416,10 +423,18 @@ impl IndexDatabase {
             // the same set the repopulate below (over the repo-scoped `files`
             // view) re-derives. Within the repo this matches the prior wholesale behavior; only
             // sibling repos are now spared.
+            // The `generation` predicate (A6) makes the sentence above literally true: the wipe
+            // removes exactly the set the repopulate re-derives (the ACTIVE generation's edges).
+            // Without it, a heal would also wipe a superseded generation's edges (merely early gc)
+            // — and, in the rare concurrent case of a version-bump heal racing another
+            // connection's staged rebuild, the STAGED generation's edges, which nothing would
+            // re-resolve.
             self.storage.connection().execute(
                 "DELETE FROM edges_data
-                  WHERE source_file_id IN (SELECT id FROM main.files WHERE repo_id = ?1)",
-                params![self.active_repo_id],
+                  WHERE source_file_id IN (
+                      SELECT id FROM main.files WHERE repo_id = ?1 AND generation = ?2
+                  )",
+                params![self.active_repo_id, self.active_generation],
             )?;
             // Repopulate the per-package import scope BEFORE re-resolving (#61). A bare
             // version-bump re-resolve would re-derive `import_scope_*` on the new edges

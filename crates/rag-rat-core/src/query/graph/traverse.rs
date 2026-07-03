@@ -207,6 +207,7 @@ pub(crate) fn traversal_summary(
                 SUM(CASE WHEN edges.confidence = 'Ambiguous' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN edges.to_symbol_id IS NULL THEN 1 ELSE 0 END)
             FROM edges
+            JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
             LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})
@@ -227,6 +228,7 @@ pub(crate) fn traversal_summary(
                 SUM(CASE WHEN edges.confidence = 'Ambiguous' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN edges.to_symbol_id IS NULL THEN 1 ELSE 0 END)
             FROM edges
+            JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
             LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})
@@ -383,6 +385,7 @@ pub(crate) fn hidden_unresolved_candidate_count(
             "
             SELECT COUNT(*)
             FROM edges
+            JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
             LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})
@@ -403,6 +406,7 @@ pub(crate) fn hidden_unresolved_candidate_count(
             "
             SELECT COUNT(*)
             FROM edges
+            JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
             LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
             WHERE edges.edge_kind IN ({quoted})

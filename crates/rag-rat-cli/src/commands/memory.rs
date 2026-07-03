@@ -14,7 +14,8 @@ use crate::render::print_output;
 pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // `dream` WRITES dream_findings — serialize with the watcher/index like every other write
     // command (index/maintenance/oracle); WriteLock is reentrant so the open-time migrate is safe.
-    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
+    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     let db = open_index(config)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

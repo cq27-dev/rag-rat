@@ -711,12 +711,26 @@ fn insert_stale_overlay_row(db: &IndexDatabase, path: &str, worktree_id: &str) -
     // Stamp the ACTIVE repo id (V040): a stale overlay row is a leftover from a prior index of the
     // SAME repo, so it must carry that repo's id for the full-rebuild staging + scope view to see
     // it.
+    // Stamp the ACTIVE generation (A6): a real stale overlay is a leftover from a PRIOR index of
+    // the LIVE generation, so it lives at that generation and is visible through the scope view
+    // exactly like a genuine leftover — inserting it at the default 0 while the index is on a
+    // later generation would make it invisible to discovery and defeat the heal path the tests
+    // exercise.
     db.storage
         .connection()
         .execute(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
-             commit_sha, worktree_id, repo_id) VALUES (?1, ?2, ?3, ?4, 0, 0, '', ?5, ?6)",
-            rusqlite::params![path, language, kind, sha, worktree_id, db.active_repo_id],
+             commit_sha, worktree_id, repo_id, generation) VALUES (?1, ?2, ?3, ?4, 0, 0, '', ?5, \
+             ?6, ?7)",
+            rusqlite::params![
+                path,
+                language,
+                kind,
+                sha,
+                worktree_id,
+                db.active_repo_id,
+                db.active_generation
+            ],
         )
         .unwrap();
     db.storage.connection().last_insert_rowid()
@@ -828,6 +842,7 @@ mod chunk_store_migrations;
 mod clones;
 mod dir_memory_tree;
 mod dispatch;
+mod generation_rebuild;
 mod git_history_reload;
 mod github_papertrail;
 mod graph_edges;

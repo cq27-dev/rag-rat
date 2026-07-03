@@ -561,11 +561,17 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
+    // A6: scope the edge lookup through the live-generation `files` view (`JOIN files` on
+    // `source_file_id`). The rebuild stages a fresh generation and leaves the prior generation's
+    // `edges_data` rows in place (dead until gc), so a raw `edges` read with `ORDER BY id LIMIT 1`
+    // would keep returning the dead gen's edge — this pins the LIVE edge id, which the rebuild does
+    // reassign.
     let edge_id = |db: &IndexDatabase| -> i64 {
         db.storage
             .connection()
             .query_row(
-                "SELECT id FROM edges WHERE to_name LIKE '%callee%' ORDER BY id LIMIT 1",
+                "SELECT edges.id FROM edges JOIN files ON files.id = edges.source_file_id
+                 WHERE edges.to_name LIKE '%callee%' ORDER BY edges.id LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -1068,10 +1074,21 @@ fn full_rebuild_leaves_no_orphan_symbol_rows_for_a_path() {
     fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
     let config = source_config(root.clone(), Language::Rust);
 
+    // A6: count through the scope VIEW (`files` = the live-generation `temp.files`). A full rebuild
+    // stages a fresh generation and leaves the prior one's symbol rows in RAW `main.symbols` (dead,
+    // reclaimed lazily by gc — which is a no-op on this non-git fixture, so they persist here). But
+    // a reader and a symbol-id-keyed binding only ever see the LIVE generation, which is
+    // exactly one `target` — the #50 invariant restated for generation staging (a stranded
+    // binding relocates against the live generation, never onto a dead orphan).
     let count_targets = |db: &IndexDatabase| -> i64 {
         db.storage
             .connection()
-            .query_row("SELECT COUNT(*) FROM symbols WHERE name = 'target'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM symbols JOIN files ON files.id = symbols.file_id
+                 WHERE symbols.name = 'target'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap()
     };
 
@@ -1481,13 +1498,21 @@ fn memory_chunk_binding_relocates_by_hash() {
     // different text_hash, so the content-exact match remains unique.
     let db = IndexDatabase::rebuild(&config).unwrap();
 
-    // The old chunk_id must no longer exist.
+    // The old chunk_id must no longer refer to a LIVE chunk. A6: the rebuild stages a fresh
+    // generation and leaves the old chunk row in `main.chunks` (dead until gc), so scope through
+    // the live-generation `files` view — the dead chunk's file row is absent from it, so the
+    // join drops the stale rowid exactly as a reader (and `relocate_chunk_by_hash`) sees it.
     let old_exists: i64 = db
         .storage
         .connection()
-        .query_row("SELECT COUNT(*) FROM chunks WHERE id = ?1", [chunk_id], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM chunks JOIN files ON files.id = chunks.file_id
+             WHERE chunks.id = ?1",
+            [chunk_id],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(old_exists, 0, "old chunk_id should be gone after rebuild");
+    assert_eq!(old_exists, 0, "old chunk_id should no longer refer to a live chunk after rebuild");
 
     let report = db.memory_validate().unwrap();
     assert_eq!(

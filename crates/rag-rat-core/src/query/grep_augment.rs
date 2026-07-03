@@ -461,8 +461,14 @@ fn render(
 /// Caller/callee edge counts. Callers resolve by `to_symbol_id` or qualified-name match;
 /// callees are edges leaving any of the symbol's concrete rows.
 fn edge_counts(conn: &Connection, hit: &symbol::SymbolHit) -> anyhow::Result<(i64, i64)> {
+    // GENERATION-SCOPED via the `files` view (batch 6, count-scoping class; `compose` installs the
+    // worktree scope view before calling in). The `to_symbol_id = ?1` arm keys on a LIVE rowid, but
+    // the `OR target_qualified_name = ?2` arm matches callers purely by NAME and so double-counts
+    // dead-generation edges during a dead-generation window, inflating the "{N} callers" line.
     let callers: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM edges WHERE to_symbol_id = ?1 OR target_qualified_name = ?2",
+        "SELECT COUNT(*) FROM edges
+         JOIN files source_files ON source_files.id = edges.source_file_id
+         WHERE edges.to_symbol_id = ?1 OR edges.target_qualified_name = ?2",
         rusqlite::params![hit.symbol_id, hit.qualified_name],
         |row| row.get(0),
     )?;

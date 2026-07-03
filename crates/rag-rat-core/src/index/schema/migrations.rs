@@ -1177,6 +1177,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_040_ID => Some(40),
             MIGRATION_041_ID => Some(41),
             MIGRATION_042_ID => Some(42),
+            MIGRATION_043_ID => Some(43),
             _ => None,
         })
         .max()
@@ -1228,6 +1229,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_040_ID
             | MIGRATION_041_ID
             | MIGRATION_042_ID
+            | MIGRATION_043_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1276,6 +1278,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_040_ID => migration.checksum != MIGRATION_040_CHECKSUM,
         MIGRATION_041_ID => migration.checksum != MIGRATION_041_CHECKSUM,
         MIGRATION_042_ID => migration.checksum != MIGRATION_042_CHECKSUM,
+        MIGRATION_043_ID => migration.checksum != MIGRATION_043_CHECKSUM,
         _ => false,
     }
 }
@@ -1998,6 +2001,85 @@ fn rebuild_files_table_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
         SELECT
             id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
             indexed_revision, commit_sha, worktree_id, has_test_code, '__unassigned__'
+        FROM files;
+        DROP TABLE files;
+        ALTER TABLE files_new RENAME TO files;
+        CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
+        CREATE INDEX IF NOT EXISTS idx_files_commit_path ON files(commit_sha, path);
+        CREATE INDEX IF NOT EXISTS idx_files_worktree_path ON files(worktree_id, path);
+        ",
+    )
+}
+
+/// V043 (phase A6): add `files.generation` and widen the UNIQUE to `(repo_id, path, commit_sha,
+/// worktree_id, generation)`, so a full rebuild can STAGE a fresh generation of every file row
+/// ALONGSIDE the live one (same `(repo_id, path, commit_sha, worktree_id)`, different `generation`)
+/// and flip readers over atomically, instead of clearing-then-reinserting inside one long
+/// write-locked transaction (spec §3.3 — bounded writer holds + reader consistency).
+///
+/// SENTINEL: `files.generation` present ⇒ the whole migration already committed (the rebuild below
+/// is atomic), so a `create_or_migrate`/`rebuild`/`index --full` re-apply short-circuits before the
+/// write lock — the V040/V042 recipe.
+///
+/// NO placeholder→sole-repo backfill (unlike V040–V042): `generation` is REPO-NEUTRAL. Every
+/// pre-V043 row is the current live generation of its repo, and `DEFAULT 0` stamps them all 0 —
+/// which is exactly the live generation a fresh index carries (`repo_meta[live_files_generation]`
+/// absent ⇒ 0). So existing rows stay visible under the live-generation scope view with no per-repo
+/// resolution, on an adopted or an un-adopted DB alike.
+pub(crate) fn apply_files_generation(conn: &Connection) -> rusqlite::Result<()> {
+    // All-or-nothing sentinel: the rebuild commits atomically, so `files.generation` present means
+    // the whole migration already ran. Short-circuit before taking the write lock.
+    if column_exists(conn, "files", "generation")? {
+        return Ok(());
+    }
+    // The rebuild RENAMEs an FK-referenced parent (`chunks`/`symbols`/`edges_data` REFERENCE
+    // files(id)); FK enforcement must be OFF, and a PRAGMA toggle is a no-op inside a transaction,
+    // so set it BEFORE BEGIN (the V040 recipe).
+    conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+    let result = rebuild_files_table_with_generation(conn);
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+        return result;
+    }
+    conn.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?;
+    Ok(())
+}
+
+/// Rebuild `files` adding a trailing `generation INTEGER NOT NULL DEFAULT 0` column and the widened
+/// `UNIQUE(repo_id, path, commit_sha, worktree_id, generation)`. Copies `id` verbatim (FK target of
+/// `chunks`/`symbols`/`edges_data` — the V040 `rebuild_files_table_with_repo_id` precedent) and
+/// stamps every existing row `generation = 0` (the live generation of a not-yet-restaged index).
+/// `files` stays non-STRICT to match its baseline shape. Leading `DROP TABLE IF EXISTS files_new` =
+/// torn-state re-convergence (a hard kill of a prior V043 pass could leave the scratch table
+/// behind).
+fn rebuild_files_table_with_generation(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS files_new;
+        CREATE TABLE files_new(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            modified_at_ms INTEGER NOT NULL,
+            generated INTEGER NOT NULL DEFAULT 0,
+            indexed_at_ms INTEGER NOT NULL,
+            indexed_revision TEXT NOT NULL DEFAULT '',
+            commit_sha TEXT NOT NULL DEFAULT '',
+            worktree_id TEXT NOT NULL DEFAULT '',
+            has_test_code INTEGER NOT NULL DEFAULT 0,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            generation INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(repo_id, path, commit_sha, worktree_id, generation)
+        );
+        INSERT OR IGNORE INTO files_new(
+            id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+            indexed_revision, commit_sha, worktree_id, has_test_code, repo_id, generation
+        )
+        SELECT
+            id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+            indexed_revision, commit_sha, worktree_id, has_test_code, repo_id, 0
         FROM files;
         DROP TABLE files;
         ALTER TABLE files_new RENAME TO files;

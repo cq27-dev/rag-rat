@@ -305,8 +305,17 @@ pub(crate) fn forward_visibility_filter(options: &GraphTraversalOptions) -> &'st
     }
 }
 pub(crate) fn unique_symbol_name(conn: &Connection, name: &str) -> anyhow::Result<bool> {
+    // GENERATION-SCOPED via the `files` view (batch 6, count-scoping class): an unscoped
+    // `COUNT(*) FROM symbols` counts the SAME live name once per generation during a
+    // dead-generation window (post-flip pre-gc, or crashed pre-flip staging) → count == 2 →
+    // "not unique" → the caller's `unique_short_name` gate DISABLES the short-name fallback
+    // branch and suppresses a genuine LIVE hop from the returned rows. Joining the scoped view
+    // counts only the live generation's symbols, matching the row queries in `traverse` /
+    // `traversal_summary`.
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) AS symbol_count FROM symbols WHERE name = ?1",
+        "SELECT COUNT(*) AS symbol_count FROM symbols
+         JOIN files ON files.id = symbols.file_id
+         WHERE symbols.name = ?1",
         [name],
         |row| row.get("symbol_count"),
     )?;

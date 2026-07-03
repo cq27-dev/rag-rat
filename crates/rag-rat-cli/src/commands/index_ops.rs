@@ -18,9 +18,11 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     if args.watch {
         return run_watch(config.clone());
     }
-    // Serialize with the background watcher / other writers (busy_timeout backstops any heal on
-    // the query path).
-    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
+    // Serialize with the background watcher / other writers OF THIS REPO (busy_timeout backstops
+    // any heal on the query path). The write lock is per-repo (A6), so a rebuild here never
+    // blocks an unrelated repo's writer in a shared global DB.
+    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     // `--worktree`: index a linked worktree's branch overlay on top of the existing base index
     // (#219). A distinct mode — the delta vs the base, not a base (re)build — so handle it before
     // the full/discover/changed branches.
@@ -226,8 +228,9 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // "rerun pending" marker and exit immediately; the runner re-checks the marker after its pass
     // and runs once more to cover a change that arrived mid-pass. The pass still takes the write
     // lock internally, so serialization with the watcher is unchanged.
-    let pending = rag_rat_core::locks::maintenance_pending_path(&config.database);
-    let lock_path = rag_rat_core::locks::maintenance_lock_path(&config.database);
+    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
+    let pending = rag_rat_core::locks::maintenance_pending_path(&config.database, &lock_repo);
+    let lock_path = rag_rat_core::locks::maintenance_lock_path(&config.database, &lock_repo);
     let Some(_maint) = rag_rat_core::locks::FileLock::try_acquire(&lock_path)? else {
         let _ = fs::File::create(&pending);
         return print_output(&serde_json::json!({
@@ -269,10 +272,11 @@ fn run_maintenance_pass(
     let _span = tracing::info_span!("maintenance_pass", %trigger, max_seconds).entered();
     tracing::info!(target: "rag_rat_core::maintenance", "maintenance pass started");
 
-    // Serialize with the background watcher (and other writers). The hook backgrounds this command,
-    // so blocking here never holds up the git operation; busy_timeout backstops the query-path
-    // heal.
-    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database)?;
+    // Serialize with the background watcher (and other writers) OF THIS REPO. The hook backgrounds
+    // this command, so blocking here never holds up the git operation; busy_timeout backstops the
+    // query-path heal. Per-repo write lock (A6).
+    let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
+    let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "lock_acquired", elapsed_ms = started.elapsed().as_millis() as u64, "write lock acquired");
 
     let mut db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
@@ -672,7 +676,9 @@ mod tests {
 
     #[test]
     fn maintenance_coalesces_a_concurrent_trigger() {
-        use rag_rat_core::locks::{FileLock, maintenance_lock_path, maintenance_pending_path};
+        use rag_rat_core::locks::{
+            FileLock, maintenance_lock_path, maintenance_pending_path, write_lock_repo_id,
+        };
 
         // #267: a single amend/merge/rebase fires several git hooks, each backgrounding
         // `rag-rat maintenance`. A concurrent trigger must coalesce — skip its pass and set the
@@ -706,7 +712,8 @@ mod tests {
         };
         IndexDatabase::rebuild(&config).unwrap();
 
-        let pending = maintenance_pending_path(&config.database);
+        let lock_repo = write_lock_repo_id(&config);
+        let pending = maintenance_pending_path(&config.database, &lock_repo);
         let args = super::MaintenanceArgs {
             trigger: Some("post-rewrite".to_string()),
             max_seconds: Some(0), // skip the embedding reconcile; we only assert coalescing
@@ -716,8 +723,9 @@ mod tests {
         };
 
         // Hold the coordination lock to simulate an in-flight maintenance pass.
-        let held =
-            FileLock::try_acquire(&maintenance_lock_path(&config.database)).unwrap().unwrap();
+        let held = FileLock::try_acquire(&maintenance_lock_path(&config.database, &lock_repo))
+            .unwrap()
+            .unwrap();
         assert!(!pending.exists());
         // A concurrent trigger coalesces: it does NOT run a pass; it sets the rerun marker.
         super::maintenance(&config, &args).unwrap();

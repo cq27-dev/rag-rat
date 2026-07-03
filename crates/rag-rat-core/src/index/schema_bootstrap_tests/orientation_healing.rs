@@ -49,6 +49,11 @@ fn full_rebuild_survives_stale_overlay_rows() {
     drop(db);
 
     let db = IndexDatabase::rebuild(&config).expect("rebuild must survive stale overlay rows");
+    // A6: the rebuild stages a fresh generation and leaves the prior one (the stale overlay
+    // included) DEAD for lazy reclamation rather than clearing it in-transaction. gc sweeps
+    // that dead generation, after which raw `main.files` holds exactly the new generation's one
+    // row per path.
+    db.garbage_collect().unwrap();
 
     let rows: Vec<(String, String)> = {
         let conn = db.storage.connection();
@@ -96,6 +101,11 @@ fn full_rebuild_clears_foreign_leaked_rows_at_the_active_scope() {
 
     let db = IndexDatabase::rebuild(&config)
         .expect("rebuild must survive and clear foreign leaked rows");
+    // A6: the rebuild no longer clears the foreign row in-transaction — it stages a fresh
+    // generation and the foreign row (an old, now-superseded generation) is DEAD and invisible
+    // to readers (the scope view filters the live generation). gc reclaims that dead generation
+    // from `main.files`.
+    db.garbage_collect().unwrap();
     let leaked: i64 = db
         .storage
         .connection()

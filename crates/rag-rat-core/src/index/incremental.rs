@@ -201,16 +201,81 @@ impl IndexDatabase {
         Ok((db, content_changed))
     }
 
+    /// Standalone full-corpus indexing into the CURRENT context — no generation staging, no
+    /// pointer flip: the connection's `active_generation` is written directly, so this is only
+    /// correct on a scope+generation with no pre-existing file rows (a fresh index). The wave
+    /// loop shares the full rebuild's temp-table staging (`graph.is_some()` routing), so this
+    /// finalize must publish everything the rebuild's terminal transaction would (batch 7 P2:
+    /// staged parser failures were silently dropped here — a standalone pass's newly failing
+    /// files vanished from `parser_failures`, and coverage/repo-brief underreported, until some
+    /// later full rebuild happened to publish the staging). Unlike the rebuild there is no flip
+    /// to defer to: this path operates on the LIVE generation, so its failure state is not
+    /// staged-generation authority — it publishes atomically with this pass's own edges.
     pub fn index_targets(&self, config: &Config) -> anyhow::Result<()> {
-        self.index_targets_with_progress(config, &mut |_| {})?;
+        let (_, graph) = self.index_targets_with_progress(config, &mut |_| {})?;
+        // The standalone twin of the rebuild's Phase-2 + terminal tail, in ONE short transaction
+        // (batch 6 moved base edges + package roots out of the wave loop; batch 7 completed the
+        // twin), mirroring the rebuild's order. Step by step against `rebuild_with_progress`:
+        // - build_chunk_text_store: first-index dict training — `insert_chunks` staged the text
+        //   into `temp.rebuild_chunk_text` when no dict existed; a no-op once a dict exists.
+        // - finalize_base_edges: base package roots + accumulated-edge resolution (batch 6).
+        // - rebuild_logical_symbols: the open-time graph heal re-derives EDGES only, so without
+        //   this fold the standalone pass's symbols stay invisible to symbol_lookup/graph nav (the
+        //   `finalize_overlay_refresh` precedent — every finalize that writes symbols folds).
+        // - apply_staged_parser_failures: THE batch-7 finding — the wave loop stages failures
+        //   (`graph.is_some()` routing), so the finalize must publish them; at this connection's
+        //   own (live) generation, atomic with its edges (no flip exists to defer to).
+        // - refresh_clone_token_df: the waves wrote fingerprints under `BumpDf(false)`, whose
+        //   contract is "df is recomputed authoritatively at finalize" — without this the
+        //   standalone path left df stale/empty.
+        // - sync_fts + the graph/flags marks: chunk_fts was written inline and the edges/flags were
+        //   just derived in full, so record freshness like the rebuild does — otherwise the very
+        //   next open pays a full (safe but wasted) edge re-derive heal and an FTS rebuild.
+        // NOT here, deliberately: the generation carry-forwards, overlay re-resolution, git
+        // history/meta/cursors, source_root, the live-generation pointer, and the model seed are
+        // PUBLISH authority — a standalone pass writes the live generation in place and owns no
+        // flip, no git authority, and no checkout move.
+        self.storage.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> anyhow::Result<()> {
+            self.build_chunk_text_store()?;
+            self.finalize_base_edges(config, graph)?;
+            self.rebuild_logical_symbols()?;
+            self.apply_staged_parser_failures(self.active_generation)?;
+            self.refresh_clone_token_df()?;
+            self.sync_fts()?;
+            self.mark_graph_index_current()?;
+            self.mark_generated_flags_current()
+        })();
+        if result.is_err() {
+            let _ = self.storage.execute_batch("ROLLBACK");
+            return result;
+        }
+        self.storage.execute_batch("COMMIT")?;
         Ok(())
+    }
+
+    /// Write the ACTIVE (base) scope's `packages` rows + the global `local_crate_roots` union, then
+    /// resolve and insert every accumulated base edge against those roots (the full-rebuild fast
+    /// path — [`edges::resolve_and_insert_edges`] computes each file's package from the
+    /// just-written rows at load time, so the rows MUST land first). NO transaction of its own
+    /// — the caller wraps it. `rebuild` runs this INSIDE its terminal publish transaction so
+    /// the generation-less `packages`/`local_crate_roots` writes are invisible to a concurrent
+    /// reader/heal until the pointer flips and roll back with a failed tail (batch 6 P2, #4);
+    /// the standalone `index_targets` runs it in a short transaction of its own.
+    pub(super) fn finalize_base_edges(
+        &self,
+        config: &Config,
+        graph: edges::FullRebuildGraph,
+    ) -> anyhow::Result<()> {
+        self.refresh_packages(&config.root)?;
+        edges::resolve_and_insert_edges(self.storage.connection(), graph)
     }
 
     pub(super) fn index_targets_with_progress<F>(
         &self,
         config: &Config,
         progress: &mut F,
-    ) -> anyhow::Result<usize>
+    ) -> anyhow::Result<(usize, edges::FullRebuildGraph)>
     where
         F: FnMut(IndexProgress),
     {
@@ -232,36 +297,110 @@ impl IndexDatabase {
         let wave_size = index_wave_size();
         let mut graph = edges::FullRebuildGraph::default();
         let mut done = 0usize;
+        // Per-connection staging for the generation-less `parser_failures` mutations this pass
+        // produces (A6, P2 review): the waves below commit BEFORE the flip, so upserting/clearing
+        // the real table here would expose an unpublished generation's failure state. Insert
+        // routes stage into this table; `apply_staged_parser_failures` publishes it — inside the
+        // rebuild's terminal flip transaction, or the standalone `index_targets`' own finalize
+        // transaction (batch 7). `message` NULL = clean parse (clear at publish).
+        self.storage.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS rebuild_parser_failures(
+                 path TEXT PRIMARY KEY,
+                 language TEXT NOT NULL,
+                 message TEXT
+             );
+             DELETE FROM temp.rebuild_parser_failures;",
+        )?;
+        // The first-index chunk-text staging table lives with the wave loop that writes it
+        // (batch 7): BOTH entries — the full rebuild and the standalone `index_targets` — run
+        // waves whose `insert_chunks` stages text here when no dict exists yet, so the creation
+        // belongs to the shared loop, not the rebuild alone (the standalone path used to error
+        // "no such table" on a fresh, dict-less index).
+        self.prepare_rebuild_scratch_tables()?;
         for wave in files.chunks(wave_size) {
             let prepared = prepare_files_with_progress(wave, progress, done, total)?;
-            for prepared_file in &prepared {
-                done += 1;
-                if should_report_file_progress(done, total) {
-                    progress(IndexProgress::IndexingFile {
-                        current: done,
-                        total,
-                        path: prepared_file.file.relative_path.clone(),
-                        language: prepared_file.file.language,
-                        kind: prepared_file.file.kind,
-                    });
+            // A6: commit each wave in its OWN short transaction. A full rebuild stages a fresh file
+            // GENERATION (`self.active_generation`, set to N+1 by the rebuild's `set_context`)
+            // ALONGSIDE the still-live one, so it must NOT hold the shared DB's write lock across
+            // the whole file set — a sibling repo's short write (a memory create) has
+            // to be able to slip in between waves within the busy-timeout slice (spec
+            // §3.3). Readers stay on the live generation until the flip; a wave that
+            // fails rolls back just its own batch, and a torn
+            // rebuild's committed-but-never-flipped generation is swept lazily by gc.
+            //
+            // INTERLEAVED SAME-REPO WRITERS ARE SAFE HERE (A6, P2 review — the proof, not a
+            // hand-wave). The per-repo advisory flock covers the CLI/watcher writers, but NOT
+            // every write path (MCP `memory_create`/`memory_update` and the read-path heals go
+            // through `open_config` locklessly), so a same-repo write CAN land between wave
+            // commits. The proof splits by what the writer touches:
+            // - DISJOINT-TABLE writers — this proof's own scope (regression test
+            //   `a_memory_written_mid_rebuild_survives_the_flip_intact`): MEMORY writes touch only
+            //   `repo_memories`/bindings/tags/fts, none of the rebuild's tables. A binding captured
+            //   against the LIVE generation's symbol/chunk ROWIDS goes stale when the flip + gc
+            //   retire those rows — the ORDINARY reindex lifecycle those bindings already live with
+            //   (rowids re-mint on every incremental pass too): `memory_validate` re-anchors by
+            //   content hash / the generation-stable `logical_symbol_id`. (The pre-A6
+            //   mega-transaction did not make such a write safe — it made it FAIL with SQLITE_BUSY
+            //   after the busy_timeout; landing it and re-anchoring is the designed behavior, not a
+            //   regression.)
+            // - FILES-ADJACENT writers (heals, incremental replacement, gc) are NOT covered by
+            //   disjointness; they get the same GENERATION DISCIPLINE the rebuild uses. Their
+            //   deletes carry the writer's own generation (`remove_file_in_scope` — a
+            //   live-generation heal can never remove a staged row for the same scope key); gc's
+            //   deadness predicate is `generation != live` UNDER THE PER-REPO WRITE FLOCK (batch 5:
+            //   a collector holding the flock knows no rebuild is mid-flight, so an above-live
+            //   staging is abandoned, not in-progress — the flockless-safe `< live` form is the
+            //   fallback; see `gc.rs`, plus the CLI `gc` flock belt). Every rebuild ENTRY acquires
+            //   that flock (`rebuild_with_progress`, batch 6), so the precondition holds by
+            //   construction. And every reader resolves `files` through a repo+generation view
+            //   (`set_context` on config opens, `write_repo_generation_view` on bare opens), so the
+            //   staged generation is invisible until the flip. Writes they DO make land at the live
+            //   generation and die with it at gc after the flip (wasted work, not corruption);
+            //   `target` is allocated strictly above both the row-MAX and the live pointer, so
+            //   staged keys never collide.
+            self.storage.execute_batch("BEGIN IMMEDIATE")?;
+            let wave_result: anyhow::Result<()> = (|| {
+                for prepared_file in &prepared {
+                    done += 1;
+                    if should_report_file_progress(done, total) {
+                        progress(IndexProgress::IndexingFile {
+                            current: done,
+                            total,
+                            path: prepared_file.file.relative_path.clone(),
+                            language: prepared_file.file.language,
+                            kind: prepared_file.file.kind,
+                        });
+                    }
+                    // chunk_fts is written inline from the in-memory chunk text (#77 Phase 2): it's
+                    // contentless now, so there is no content table for a closing 'rebuild' to
+                    // re-read, and the in-memory text is available regardless of whether the
+                    // chunks.text column still exists. `finalize_full_rebuild_fts` then only
+                    // rebuilds commit_fts.
+                    self.insert_prepared_file(prepared_file, Some(&mut graph))?;
                 }
-                // chunk_fts is written inline from the in-memory chunk text (#77 Phase 2): it's
-                // contentless now, so there is no content table for a closing 'rebuild' to re-read,
-                // and the in-memory text is available regardless of whether the chunks.text column
-                // still exists. `finalize_full_rebuild_fts` then only rebuilds commit_fts.
-                self.insert_prepared_file(prepared_file, Some(&mut graph))?;
+                Ok(())
+            })();
+            if let Err(err) = wave_result {
+                let _ = self.storage.execute_batch("ROLLBACK");
+                return Err(err);
             }
+            self.storage.execute_batch("COMMIT")?;
+            // Test seam: a barrier between committed waves lets a concurrent reader observe the
+            // staged (but not-yet-live) generation. Keyed by THIS connection's database path so
+            // parallel same-process tests (libtest / coverage) never trip each other's barrier.
+            // No-op in production.
+            #[cfg(test)]
+            crate::index::rebuild::run_after_wave_commit(self.database_path());
             // `prepared` (this wave's chunk texts / symbols / edge candidates) drops here.
         }
-        // Per-package import scope (#61): write the active scope's `packages` rows + the global
-        // `local_crate_roots` union now — files are inserted, but the resolve below has not run, so
-        // it computes each file's package from these fresh rows at load time. (`set_context`
-        // installs the `files` scope view at open, so the scoped reads in the resolve see
-        // these rows.)
-        self.refresh_packages(&config.root)?;
-        edges::resolve_and_insert_edges(self.storage.connection(), graph)?;
-
-        Ok(total)
+        // Base-edge resolution + package roots NO LONGER run here (batch 6 P2, #4). The full
+        // rebuild carries the accumulated `graph` out to its TERMINAL publish transaction
+        // (`finalize_base_edges`), where `refresh_packages` writes the generation-less
+        // `packages`/`local_crate_roots` and the resolve inserts the base edges — all atomic with
+        // the pointer flip, so a concurrent reader/heal on the old generation never sees the new
+        // package map, and a failed tail rolls the whole lot back. The waves above committed only
+        // the staged-generation file/chunk/symbol rows (inert until the flip).
+        Ok((total, graph))
     }
 
     /// Returns `(file_count, manifest_in_change_set)`. The manifest flag is true when any changed
@@ -365,15 +504,18 @@ impl IndexDatabase {
             // commit share `commit_sha`/`worktree_id`, and without `repo_id` the
             // committed-row probe below would see a SIBLING repo's committed row and
             // delete THIS repo's overlay as if its own base row existed.
+            // Also generation-qualified (A6): the heal operates on THIS connection's live
+            // generation only — a staged or superseded generation's overlay rows are the
+            // rebuild's / gc's business.
             let mut stmt = conn.prepare(
                 "SELECT id, path, sha256 FROM main.files
                  WHERE repo_id = ?1 AND worktree_id = ?2 AND worktree_id != '' AND kind != \
-                 'deleted'",
+                 'deleted' AND generation = ?3",
             )?;
-            let rows = stmt
-                .query_map(params![self.active_repo_id, self.active_worktree_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?;
+            let rows = stmt.query_map(
+                params![self.active_repo_id, self.active_worktree_id, self.active_generation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut healed = 0usize;
@@ -382,9 +524,13 @@ impl IndexDatabase {
                 continue; // genuinely dirty — the overlay is the canonical row
             }
             let committed_exists: bool = self.storage.connection().query_row(
+                // Generation-qualified (A6): only a committed row at THIS connection's live
+                // generation can take over from the overlay — a staged or superseded generation's
+                // committed row must not trigger deleting a live overlay.
                 "SELECT EXISTS(SELECT 1 FROM main.files
-                 WHERE repo_id = ?1 AND path = ?2 AND commit_sha = ?3 AND worktree_id = '')",
-                params![self.active_repo_id, path, self.active_commit_sha],
+                 WHERE repo_id = ?1 AND path = ?2 AND commit_sha = ?3 AND worktree_id = ''
+                   AND generation = ?4)",
+                params![self.active_repo_id, path, self.active_commit_sha, self.active_generation],
                 |row| row.get(0),
             )?;
             if committed_exists {

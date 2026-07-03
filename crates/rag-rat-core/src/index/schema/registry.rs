@@ -8,6 +8,17 @@ use crate::repo_identity::{LOCAL_ONLY_ID_PREFIX, RepoIdentity, RepoIdentityClass
 /// `commit_sha` / `worktree_id`). [`active_repo_id`] reads it; `install_scope_view` writes it.
 pub(crate) const CONNECTION_CONTEXT_REPO_KEY: &str = "repo_id";
 
+/// The `temp.connection_context` key under which the scope view stashes the active file GENERATION
+/// (A6) — the value the `files` view filters on. `write_scope_view` writes it (the LIVE generation
+/// for a reader/incremental open, the WRITE generation for the connection driving a full rebuild);
+/// [`active_generation`] reads it back for the view-less heal paths.
+pub(crate) const CONNECTION_CONTEXT_GENERATION_KEY: &str = "files_generation";
+
+/// The `repo_meta` key holding a repo's LIVE `files.generation` — the pointer a full rebuild flips
+/// once its freshly-staged generation is complete (A6). Absent ⇒ 0 (a fresh index, and every row a
+/// pre-V043 upgrade carries), so an un-restaged index needs no `repo_meta` write to be visible.
+pub(crate) const LIVE_FILES_GENERATION_META_KEY: &str = "live_files_generation";
+
 /// The direct-scoped tables whose [`LEGACY_REPO_ID`] placeholder rows [`register_repo`] re-points
 /// at the real id when it adopts a legacy DB. V040 (phase A3) added the core tables; V041 (phase
 /// A4) added the seven GitHub papertrail tables plus the derived `github_fts` mirror (own-content
@@ -76,6 +87,12 @@ pub const LEGACY_REPO_ID: &str = "__unassigned__";
 /// later LocalOnly→Portable upgrade can PROVE the incoming deepened clone is the same repository —
 /// its HEAD must reach these boundary commits. Absent ⇒ no proof recorded ⇒ the upgrade is refused.
 const SHALLOW_BOUNDARY_META_KEY: &str = "shallow_boundary";
+
+/// How long a LocalOnly→Portable upgrade waits for a writer still holding the OUTGOING `local:`
+/// discriminator's write lock (A6, batch-4 P2) before refusing. Generous — an in-flight
+/// index/maintenance pass finishes its lock holds well within it; a timeout surfaces an explicit
+/// refusal, never a silent re-point under a live writer.
+const UPGRADE_OUTGOING_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Register `identity` in this database's `repos`/`repo_roots` registry, returning the stored
 /// `repo_id`.
@@ -175,6 +192,54 @@ pub fn register_repo(
                 "cannot register repo {}: this index is already registered to a different repo {}",
                 identity.repo_id, real_ids[0]
             ))),
+    };
+
+    // UPGRADE HOLDS BOTH REPO LOCKS (A6, batch-4/5 P2). Writers key their per-repo advisory flock
+    // by the DERIVED repo id, and the derivation flips `local:` → portable the moment the clone
+    // is deepened — so around an upgrade the lock IDENTITY is unstable: a writer that started
+    // PRE-unshallow holds the OUTGOING `local:` lock, a post-unshallow writer holds the INCOMING
+    // portable one, and the re-point below must serialize with BOTH. Acquire the two ids' locks
+    // in the CANONICAL LEXICOGRAPHIC ORDER (`locks::canonical_lock_order`; the locks module doc
+    // owns the ordering rule, which SUPERSEDES the old role-based "incoming-then-outgoing"
+    // argument — that argument broke as soon as a second multi-lock path appeared with the roles
+    // reversed, the batch-5 fence-gap writer). Each acquisition is reentrant-instant when this
+    // thread already holds it (a CLI entry lock for either id) and BOUNDED otherwise — bounded
+    // because entry locks are taken identity-blind, so a pre-held later-sorting lock can force an
+    // out-of-order edge, and bounded out-of-order edges are what keep that topology deadlock-free
+    // (a timeout surfaces a retryable refusal instead of a hang; see the locks module doc).
+    // ROOT-PATH-KEYED LOCKS REJECTED as the alternative: two clones of the SAME repo on one
+    // machine must still serialize on repo_id, which path-keying would break. A pathless
+    // (in-memory) connection skips the locks — no cross-process writer can exist for it.
+    let _upgrade_locks = match (&upgrade_from, conn.path().filter(|p| !p.is_empty())) {
+        (Some(local_id), Some(db_path)) => {
+            let db_path = Path::new(db_path);
+            let (first, second) =
+                crate::locks::canonical_lock_order(local_id.as_str(), &identity.repo_id);
+            let mut guards = Vec::with_capacity(2);
+            for repo in [first, second] {
+                guards.push(
+                    crate::locks::WriteLock::acquire_timeout(
+                        db_path,
+                        repo,
+                        UPGRADE_OUTGOING_LOCK_TIMEOUT,
+                    )
+                    .map_err(|err| {
+                        registry_refusal(format!(
+                            "cannot upgrade {local_id}: failed acquiring the write lock for \
+                             {repo}: {err}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        registry_refusal(format!(
+                            "cannot upgrade {local_id}: timed out waiting for an in-flight writer \
+                             holding the write lock for {repo}"
+                        ))
+                    })?,
+                );
+            }
+            Some(guards)
+        },
+        _ => None,
     };
 
     // No real repo yet (or a `local:`-id upgrade): adopt in ONE transaction. Insert the real
@@ -449,6 +514,48 @@ fn context_repo_id(conn: &Connection) -> Option<String> {
     .optional()
     .ok()
     .flatten()
+}
+
+/// The LIVE `files.generation` for `repo_id` (A6), read from `repo_meta`. Absent or unparseable ⇒
+/// `0`, which is the generation `DEFAULT 0` stamps every pre-V043 row and every never-restaged
+/// index carries — so a fresh / upgraded index is visible under generation 0 with no `repo_meta`
+/// write. The full rebuild advances this pointer atomically once its staged generation is complete.
+pub(crate) fn live_files_generation(conn: &Connection, repo_id: &str) -> rusqlite::Result<i64> {
+    let raw = crate::index::repo_meta(conn, repo_id, LIVE_FILES_GENERATION_META_KEY)?;
+    Ok(raw.and_then(|value| value.trim().parse::<i64>().ok()).unwrap_or(0))
+}
+
+/// The `files.generation` a connection operates on (A6) — the value every generation-scoped read
+/// filters against and every view-less heal path pins its `main.files` candidate pool to.
+///
+/// Prefers the SCOPE CONTEXT (`temp.connection_context['files_generation']`) installed by
+/// `write_scope_view`: a reader/incremental open carries the LIVE generation there, and the
+/// connection driving a full rebuild carries its WRITE generation (N+1) so its own edge-resolution
+/// / logical-symbol reads see the generation it is building, not the one still live. Falls back to
+/// the active repo's LIVE generation from `repo_meta` when NO context row is installed — the bare
+/// `open` heal paths (`ensure_graph_index_current` → `resolve_edges` → `all_symbols`) run without a
+/// scope view, exactly as [`active_repo_id`] falls back to [`sole_repo_id`] there.
+pub(crate) fn active_generation(conn: &Connection) -> rusqlite::Result<i64> {
+    if let Some(generation) = context_generation(conn) {
+        return Ok(generation);
+    }
+    let repo_id = active_repo_id(conn)?;
+    live_files_generation(conn, &repo_id)
+}
+
+/// Read the active generation from the per-connection scope context, tolerating the absence of the
+/// `temp.connection_context` table (a raw connection with no view installed) — the
+/// [`context_repo_id`] pattern, parsing the stored TEXT value to an integer.
+fn context_generation(conn: &Connection) -> Option<i64> {
+    conn.query_row(
+        "SELECT value FROM temp.connection_context WHERE key = ?1",
+        [CONNECTION_CONTEXT_GENERATION_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|value| value.trim().parse::<i64>().ok())
 }
 
 /// The sole repo owning a single-repo database — the identity-less fallback for [`active_repo_id`]

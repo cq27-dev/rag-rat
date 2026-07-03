@@ -511,12 +511,18 @@ pub(crate) fn summary_counts(conn: &Connection) -> anyhow::Result<SummaryCounts>
     // transitively through `source_file_id → main.files.repo_id` (the same join
     // `lexical::graph_boost` and `ensure_graph_index_current`'s scoped delete use), so count it
     // that way rather than via the global `edges` compatibility view (round-5 finding).
+    // The `generation` predicate is EXACTNESS-load-bearing (A6, P2 review): a generation-staged
+    // rebuild's committed waves make the staged generation's edges visible in `edges_data`
+    // pre-flip, and the superseded generation's linger until gc — a repo-only join would report
+    // old+new (roughly double) edges. `active_generation` matches the `files` count above (the
+    // view filters the same value), keeping the two counts one consistent snapshot.
     let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let generation = crate::index::schema::active_generation(conn)?;
     let graph_edges: u64 = conn.query_row(
         "SELECT COUNT(*) FROM edges_data e
            JOIN main.files f ON f.id = e.source_file_id
-          WHERE f.repo_id = ?1",
-        [&repo_id],
+          WHERE f.repo_id = ?1 AND f.generation = ?2",
+        rusqlite::params![repo_id, generation],
         |row| row_u64(row, 0),
     )?;
     let git_commits = scoped_table_row_count(conn, "git_commits", &repo_id)?;

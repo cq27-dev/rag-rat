@@ -320,7 +320,13 @@ pub(crate) fn validate_call_path_binding(
 }
 
 /// Is there still an edge matching this one's loose identity (names/kind/target), ignoring line
-/// numbers? Used to call a call-path edge `relocated` (moved) rather than `gone` (#38).
+/// numbers? Used to call a call-path edge `relocated` (moved) rather than `gone` (#38). The
+/// `JOIN files` is load-bearing (A6): `edges`/`edges_data` are NOT generation-scoped, so without it
+/// a superseded generation's edge rows (dead until gc) would keep matching — a genuinely-deleted
+/// call site would be reported `relocated` forever instead of `gone`. The join drops
+/// dead-generation edges (their `source_file_id` file row is absent from the live scope view) and
+/// scopes to the active repo for free, matching the sibling helpers `edge_by_fingerprint` /
+/// `call_path_edge_by_id`.
 fn call_path_edge_relocatable(
     conn: &Connection,
     from_name: Option<&str>,
@@ -332,6 +338,7 @@ fn call_path_edge_relocatable(
         "
         SELECT COUNT(*)
         FROM edges
+        JOIN files ON files.id = edges.source_file_id
         WHERE edge_kind = ?3
           AND COALESCE(from_name, '') = COALESCE(?1, '')
           AND COALESCE(to_name, '') = COALESCE(?2, '')

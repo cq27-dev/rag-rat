@@ -23,14 +23,17 @@ impl IndexDatabase {
         self.remove_file_in_scope(Path::new(&path), "", worktree_id)?;
         self.storage.connection().execute(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-             indexed_at_ms, indexed_revision, commit_sha, worktree_id, repo_id)
-             VALUES (?1, 'unknown', 'deleted', '', 0, 0, ?2, '', '', ?3, ?4)
-             ON CONFLICT(repo_id, path, commit_sha, worktree_id) DO UPDATE SET
+             indexed_at_ms, indexed_revision, commit_sha, worktree_id, repo_id, generation)
+             VALUES (?1, 'unknown', 'deleted', '', 0, 0, ?2, '', '', ?3, ?4, ?5)
+             ON CONFLICT(repo_id, path, commit_sha, worktree_id, generation) DO UPDATE SET
                 kind = 'deleted',
                 sha256 = '',
                 modified_at_ms = 0,
                 indexed_at_ms = excluded.indexed_at_ms",
-            params![path, now_ms(), worktree_id, self.active_repo_id],
+            // A6: the tombstone lands on the connection's live generation, and the ON CONFLICT
+            // target matches the V043 UNIQUE (repo_id, path, commit_sha, worktree_id,
+            // generation).
+            params![path, now_ms(), worktree_id, self.active_repo_id, self.active_generation],
         )?;
         self.mark_fts_dirty()?;
         Ok(())
@@ -48,6 +51,15 @@ impl IndexDatabase {
         // 'NameOnly' is the EdgeConfidence demotion the resolver applies to a target-less edge.
         let name_only_id = edges::intern_edge_string(self.storage.connection(), "NameOnly")?;
         let repo_id = self.active_repo_id.as_str();
+        // Every delete below carries the WRITER'S generation (A6, P2 review): the V043 UNIQUE
+        // admits one row per (repo, path, commit, worktree) PER GENERATION, so a scope key alone
+        // over-matches — a lockless heal or incremental replacement running mid-rebuild (its
+        // connection at the LIVE generation) would otherwise also delete the STAGED generation's
+        // freshly committed row for the same scope key, punching a hole in the generation about
+        // to be published. The writer's `active_generation` is live for heals/incremental and
+        // the staging target on the rebuild connection, so each writer removes only its own
+        // generation's rows.
+        let generation = self.active_generation;
         self.storage.connection().execute(
             "UPDATE edges_data
              SET to_symbol_id = NULL,
@@ -59,14 +71,16 @@ impl IndexDatabase {
                    AND main.files.commit_sha = ?2
                    AND main.files.worktree_id = ?3
                    AND main.files.repo_id = ?5
+                   AND main.files.generation = ?6
              )",
-            params![path, commit_sha, worktree_id, name_only_id, repo_id],
+            params![path, commit_sha, worktree_id, name_only_id, repo_id, generation],
         )?;
         self.storage.connection().execute(
             "DELETE FROM edges_data
              WHERE source_file_id IN (
                     SELECT id FROM main.files
                     WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4
+                      AND generation = ?5
                 )
                 OR from_symbol_id IN (
                     SELECT symbols.id FROM symbols
@@ -75,8 +89,9 @@ impl IndexDatabase {
                       AND main.files.commit_sha = ?2
                       AND main.files.worktree_id = ?3
                       AND main.files.repo_id = ?4
+                      AND main.files.generation = ?5
                 )",
-            params![path, commit_sha, worktree_id, repo_id],
+            params![path, commit_sha, worktree_id, repo_id, generation],
         )?;
         // `parser_failures` is keyed by `(repo_id, path)` (V040). A LINKED-WORKTREE OVERLAY pass
         // must NOT delete: that would clear a REAL parse failure recorded for the same path
@@ -99,8 +114,9 @@ impl IndexDatabase {
                    AND main.files.commit_sha = ?2
                    AND main.files.worktree_id = ?3
                    AND main.files.repo_id = ?4
+                   AND main.files.generation = ?5
              )",
-            params![path, commit_sha, worktree_id, repo_id],
+            params![path, commit_sha, worktree_id, repo_id, generation],
         )?;
         // Deleting the chunks cascades (ON DELETE CASCADE, foreign_keys=ON) to git_chunk_blame,
         // chunk_embeddings, chunk_summaries, and chunk_text — so the gate skipping the full
@@ -113,21 +129,24 @@ impl IndexDatabase {
              WHERE file_id IN (
                 SELECT id FROM main.files
                 WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4
+                  AND generation = ?5
              )",
-            params![path, commit_sha, worktree_id, repo_id],
+            params![path, commit_sha, worktree_id, repo_id, generation],
         )?;
         self.storage.connection().execute(
             "DELETE FROM symbols
              WHERE file_id IN (
                 SELECT id FROM main.files
                 WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4
+                  AND generation = ?5
              )",
-            params![path, commit_sha, worktree_id, repo_id],
+            params![path, commit_sha, worktree_id, repo_id, generation],
         )?;
         self.storage.connection().execute(
             "DELETE FROM main.files
-             WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4",
-            params![path, commit_sha, worktree_id, repo_id],
+             WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4
+               AND generation = ?5",
+            params![path, commit_sha, worktree_id, repo_id, generation],
         )?;
         self.mark_fts_dirty()?;
         Ok(())

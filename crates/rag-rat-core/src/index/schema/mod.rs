@@ -10,14 +10,15 @@ pub(crate) use migrations::*;
 #[cfg(test)]
 pub(crate) use registry::multiple_real_repos;
 pub(crate) use registry::{
-    CONNECTION_CONTEXT_REPO_KEY, active_repo_id, periphery_repo_scope, periphery_repo_scope_clause,
-    resolve_config_repo_id, sole_repo_id,
+    CONNECTION_CONTEXT_GENERATION_KEY, CONNECTION_CONTEXT_REPO_KEY, LIVE_FILES_GENERATION_META_KEY,
+    active_generation, active_repo_id, live_files_generation, periphery_repo_scope,
+    periphery_repo_scope_clause, resolve_config_repo_id, sole_repo_id,
 };
 pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 42;
+pub const LATEST_SCHEMA_VERSION: u32 = 43;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -284,6 +285,13 @@ const MIGRATION_042_DESCRIPTION: &str =
      repo_memory_fts with a repo_id UNINDEXED column, so clone stats, oracle runs, and memory \
      search in a consolidated database never pool or surface a sibling repo's rows (memory-sync \
      phase A5)";
+const MIGRATION_043_ID: &str = "043_files_generation";
+const MIGRATION_043_CHECKSUM: &str = "sha256:rag-rat-files-generation-v43";
+const MIGRATION_043_DESCRIPTION: &str =
+    "Add files.generation and widen the UNIQUE key to (repo_id, path, commit_sha, worktree_id, \
+     generation), so a full rebuild can stage a fresh generation of every file row alongside the \
+     live one and flip readers over atomically instead of clearing-then-reinserting inside one \
+     long write-locked transaction (memory-sync phase A6)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -635,6 +643,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_042_CHECKSUM,
         description: MIGRATION_042_DESCRIPTION,
         apply: apply_repo_id_periphery_scoping,
+    },
+    Migration {
+        id: MIGRATION_043_ID,
+        checksum: MIGRATION_043_CHECKSUM,
+        description: MIGRATION_043_DESCRIPTION,
+        apply: apply_files_generation,
     },
 ];
 

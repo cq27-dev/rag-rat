@@ -108,6 +108,12 @@ pub struct IndexDatabase {
     pub active_repo_id: String,
     pub active_commit_sha: String,
     pub active_worktree_id: String,
+    /// The `files.generation` this connection writes at and scopes to (A6): the repo's LIVE
+    /// generation on a reader / incremental open, the WRITE generation N+1 while a full rebuild
+    /// stages a fresh generation before flipping the live pointer. Resolved by `set_context` /
+    /// `set_context_at_generation`; every direct-scoped file INSERT stamps it. `0` until the first
+    /// context is installed — the generation a fresh index and every pre-V043 row carries.
+    pub active_generation: i64,
     /// Injected GitHub repo context. Resolved from `gh` only in `open_config` (real usage);
     /// `rebuild`/`open` leave it offline, and tests set it explicitly — so the library never
     /// shells out to `gh` during tests (#60).
@@ -118,6 +124,15 @@ pub struct IndexDatabase {
     /// zero-hit heal (`symbol_candidates`, #152) needs it to index a just-added file the watcher
     /// hasn't caught yet. Without it that heal is a graceful no-op.
     config: Option<Config>,
+    /// The RESOLVED repo's per-repo write lock, held for this connection's lifetime when identity
+    /// resolution lands on a repo whose lock differs from the one the surrounding command took at
+    /// entry (A6, batch-5 P2 — the fence gap). Entry locks are keyed by the id DERIVED before
+    /// open; an unshallow between derivation and adoption re-points the repo to a portable id, so
+    /// without this the writer would keep writing the portable repo's rows under only the stale
+    /// `local:` lock while a fresh portable-lock writer runs concurrently. RULE: a writer's held
+    /// lock must match the repo id it writes under. `None` on the lockless open paths (they stay
+    /// lockless by design) and whenever the entry lock already covers the resolved id.
+    _identity_lock: Option<crate::locks::WriteLock>,
 }
 
 #[derive(Debug, Clone)]

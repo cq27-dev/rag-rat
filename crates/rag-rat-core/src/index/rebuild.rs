@@ -1,4 +1,26 @@
+// Re-export the test-only wave barrier (defined at the end of the file so the `#[cfg(test)]`
+// module stays last — clippy::items_after_test_module). `incremental.rs`'s wave loop calls
+// `run_after_wave_commit`; the reader-consistency tests register a database-keyed hook via
+// `set_after_wave_commit` and hold the returned guard.
+#[cfg(test)]
+pub(crate) use wave_barrier::{WaveBarrierGuard, run_after_wave_commit, set_after_wave_commit};
+
 use super::*;
+
+/// Which liveness AXIS staged the rows a [`IndexDatabase::delete_staged_files_cascade`] call is
+/// sweeping (A6). The cascade's id-keyed children behave identically under both, but the
+/// GENERATION-LESS, path-keyed tables must be classified per axis — see the `parser_failures`
+/// block inside the cascade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StagedSweep {
+    /// The staged rows' `(commit_sha, worktree_id)` context is dead (outside every live set): the
+    /// path's last owner in this repo is going away, so path-keyed satellite state goes with it.
+    DeadContext,
+    /// The staged rows belong to a superseded `files.generation` (a completed rebuild's old
+    /// generation, or a torn rebuild's never-flipped staging). The SAME paths live on in the
+    /// current generation, so path-keyed satellite state must survive untouched.
+    DeadGeneration,
+}
 
 impl IndexDatabase {
     pub fn rebuild(config: &Config) -> anyhow::Result<Self> {
@@ -13,6 +35,22 @@ impl IndexDatabase {
             database: config.database.clone(),
             mode: IndexMode::Full,
         });
+        // Every rebuild ENTRY holds the per-repo write flock (batch 6, concurrency HIGH). The
+        // library `rebuild` was a FLOCK-LESS production writer reachable from `rag-rat init`'s
+        // `setup_index` (through `index_discover`'s missing-DB / empty-index fallback to
+        // `rebuild_with_progress`) — which FALSIFIED the precondition gc's `generation != live`
+        // deadness predicate documents ("every production rebuild entry runs under the flock"): a
+        // flock-holding collector (watcher/git-hook maintenance, `rag-rat gc`) racing this staging
+        // would read live=N, classify the mid-flight staged N+1 as dead, and cascade it — the
+        // rebuild's flip then publishes an EMPTY generation and returns Ok. Acquiring here makes
+        // the precondition hold by CONSTRUCTION, not convention. `WriteLock` is reentrant
+        // within a thread, so the CLI/watcher wrappers that already hold it just bump the
+        // depth; a flock-less caller (init) acquires it fresh. `write_lock_repo_id`
+        // resolves from git WITHOUT opening the DB, so it precedes `create_or_migrate`
+        // (which opens it). Blocking (non-interactive writer); a racing collector holds the
+        // flock only for its brief sweep.
+        let lock_repo = crate::locks::write_lock_repo_id(config);
+        let _write_lock = crate::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
         let mut db = Self::create_or_migrate(&config.database)?;
         // Register/adopt the repo BEFORE the scope view is installed and BEFORE any repo-scoped
         // write, so `active_repo_id` is a real (registered) id — every direct-scoped insert stamps
@@ -21,121 +59,349 @@ impl IndexDatabase {
         // the repo or heals the model manifest, so both move here, ordered after
         // registration.
         db.adopt_repo_from_config(config)?;
+        // A6: stage a FRESH file generation instead of clearing-then-reinserting in one long
+        // write-locked transaction. `old_live` is the generation readers currently see; `target` is
+        // higher than any the repo holds, so it never collides with a torn prior rebuild's
+        // committed-but-never-flipped generation (which `old_live + 1` could). The rebuild writes
+        // `target`; the flip publishes it.
+        let old_live = schema::live_files_generation(db.storage.connection(), &db.active_repo_id)?;
+        let target = db.next_files_generation(old_live)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
-        db.set_context(&commit_sha, &worktree_id)?;
+        // Install the scope view + writer stamp at the WRITE generation, so every insert lands on
+        // `target` and the rebuild's own edge-resolution / logical-symbol reads see only it.
+        db.set_context_at_generation(&commit_sha, &worktree_id, target)?;
         ai::ensure_model_manifest(db.storage.connection())?;
         progress(IndexProgress::IndexingGitHistory);
         let mut git_history = Some(spawn_git_history_prepare(&config.root));
-        // RAM-first bulk build: a full rebuild is one big atomic write, so skip per-commit fsyncs
-        // (synchronous=OFF) and give SQLite a large page cache. Restored to NORMAL after the
-        // rebuild. Only `rebuild` uses this; incremental indexing and the watcher stay durable.
-        //
-        // NB: stay in WAL — switching journal_mode needs an EXCLUSIVE database lock, which fails
-        // ("database is locked") whenever another connection is open (e.g. the watcher, or a
-        // concurrent reader). `synchronous` and `cache_size` are per-connection and safe under
-        // concurrency. Also do NOT touch `temp_store` — changing it drops the connection_context
-        // overlay temp table created by `set_context` above.
-        db.storage.execute_batch(
-            "PRAGMA synchronous = OFF;
-             PRAGMA cache_size = -262144;",
-        )?;
+        // RAM-first bulk build: give SQLite a large per-connection page cache. `synchronous` stays
+        // NORMAL — the shared global DB must NEVER run `synchronous = OFF` (spec §3.3, Global
+        // Constraint). A full rebuild is no longer one mega-transaction, so a crash mid-rebuild
+        // leaves a STAGED (never-flipped) generation gc reclaims, not a corrupt file — durability
+        // no longer trades against a giant write. `cache_size`/`soft_heap_limit` are per-connection
+        // and safe under concurrency; do NOT touch `temp_store` (it would drop the
+        // connection_context overlay temp table `set_context_at_generation` created above).
+        db.storage.execute_batch("PRAGMA cache_size = -262144;")?;
         maybe_set_sqlite_soft_heap_limit();
-        // Diagnostic: override wal_autocheckpoint for this rebuild. Setting it to 0 disables the
-        // auto-checkpoint that fires at COMMIT — used to test whether the trailing peak spike is
-        // the final checkpoint of the multi-GB WAL (mega-transaction) vs something else. No-op
-        // unless RAG_RAT_WAL_AUTOCHECKPOINT is set.
+        // Diagnostic: override wal_autocheckpoint for this rebuild. No-op unless
+        // RAG_RAT_WAL_AUTOCHECKPOINT is set.
         if let Ok(raw) = std::env::var("RAG_RAT_WAL_AUTOCHECKPOINT")
             && let Ok(pages) = raw.trim().parse::<i64>()
         {
             db.storage.execute_batch(&format!("PRAGMA wal_autocheckpoint = {pages};"))?;
         }
-        let result = (|| -> anyhow::Result<()> {
-            mem_trace("before clear (start of rebuild txn)");
-            // BEGIN IMMEDIATE acquires the write lock up front. A plain BEGIN starts as a reader
-            // and upgrades on the first mutation; if another writer raced in between, the upgrade
-            // fails with SQLITE_BUSY *immediately* (busy_timeout doesn't apply to the upgrade,
-            // since retrying would break snapshot isolation). IMMEDIATE makes the wait honor
-            // busy_timeout instead — the fix for the intermittent multi-writer "deadlock".
-            db.storage.execute_batch("BEGIN IMMEDIATE")?;
-            db.clear_full_rebuild_tables()?;
-            mem_trace("after clear_full_rebuild_tables (purge)");
-            db.set_repo_meta("source_root", &config.root.display().to_string())?;
+        let result = (|| -> anyhow::Result<usize> {
+            mem_trace("before rebuild (staging a fresh generation)");
+            // NO clear of the live rows anywhere below: the old generation stays intact and
+            // complete for concurrent readers until the flip; the fresh generation lands alongside
+            // it and gc sweeps the dead one afterward (A6). The wave-staging scratch temp tables
+            // are created by `index_targets_with_progress` itself (batch 7 — the standalone
+            // `index_targets` entry shares the same wave loop and needs them too).
+            // Only the IN-MEMORY source root is set here (this connection reads file bytes from
+            // the new checkout for the whole staging run); the PERSISTED
+            // `repo_meta[source_root]` is an AUTHORITY key other readers resolve fs-fallback
+            // paths against (memory validation, heals), so it joins the cursors-last set and is
+            // written inside the terminal flip transaction (batch-5 P2): a rebuild from a NEW
+            // checkout root that fails pre-publish must leave old-generation readers resolving
+            // against the OLD root. Audit of the other early meta writes found no further
+            // authority keys: the FTS freshness trio is global infrastructure over main.* (not
+            // generation authority), and everything else already rides the flip.
             db.storage.set_source_root(config.root.clone());
-            // Per-package import scope (#61): the `packages` rows + the global `local_crate_roots`
-            // union are written by `refresh_packages`, called inside `index_targets_with_progress`
-            // AFTER files are inserted but BEFORE the in-memory resolve pass (which computes each
-            // file's package from those rows at load time) — the files do not exist yet here.
-            db.write_git_meta(&config.root)?;
-            let indexed = db.index_targets_with_progress(config, &mut progress)?;
-            mem_trace("after index_targets (edges resolved+inserted)");
-            db.apply_prepared_git_history(
+
+            // Phase 1: the file/chunk/symbol bulk, written at the WRITE generation in CHUNKED
+            // transactions (one per wave) so the rebuild never holds the shared DB's write lock
+            // across the whole file set. Base EDGES accumulate in the returned `graph` and are
+            // resolved LATER, inside the terminal transaction (batch 6 #4) — NOT here — so the
+            // generation-less `packages`/`local_crate_roots` they resolve against never precede the
+            // flip. `refresh_packages` moved out with them.
+            let (indexed, graph) = db.index_targets_with_progress(config, &mut progress)?;
+            mem_trace("after index_targets (staged generation written; base edges pending)");
+
+            // Phase 2: the ONLY pre-flip derived write left is the compressed chunk_text store. It
+            // is keyed by STAGED chunk ids (a live-generation reader never joins them — inert) and
+            // gc sweeps it with the dead generation, so committing it before the flip misleads no
+            // reader. Everything a reader treats as AUTHORITY moved into the terminal flip
+            // transaction below (batch 6): base edges + package roots (#4), the git-history ROWS +
+            // `commit_fts` (#1), and the clone-token df (#2). The pre-A6 mega-transaction's
+            // atomicity for those domains is restored WITHOUT re-inflating Phase 1's chunked waves.
+            db.storage.execute_batch("BEGIN IMMEDIATE")?;
+            // Derive the compressed chunk_text store (#77 Phase 2) from the staged chunk text.
+            db.build_chunk_text_store()?;
+            db.storage.execute_batch("COMMIT")?;
+            mem_trace("after phase 2 (chunk_text store)");
+
+            // Phase 3: the TERMINAL transaction. The pointer flip is the LAST fallible step of a
+            // rebuild — everything a reader treats as AUTHORITY or that must be CONSISTENT with the
+            // published generation completes INSIDE this one transaction, with
+            // `live_files_generation` written last. A failure anywhere here rolls the WHOLE tail
+            // back — the pointer never moves, readers stay on the complete old generation, and a
+            // retry stages a fresh target. Its writes are uncommitted until the flip, so a
+            // concurrent reader/heal never observes any of the GENERATION-LESS ones (base package
+            // roots, re-keyed overlay packages, git-history rows, clone df) in front of the
+            // still-live OLD generation. TXN-SIZE TRADEOFF (batch 6): the terminal txn now also
+            // carries base-edge resolution (O(edges), formerly its own Phase-1 tail txn) and the
+            // git-history rows + external-content `commit_fts` rebuild (O(commits) on a
+            // deep-history repo). Both are the price of atomicity and stay proportional
+            // to symbol/edge/history counts, NOT the file bytes — the whole-file
+            // indexing bulk stays in Phase 1's waves.
+            db.storage.execute_batch("BEGIN IMMEDIATE")?;
+            // Carry every live row OUTSIDE the base scope (linked-worktree overlays, other-commit
+            // leftovers) forward onto `target` — the rebuild only re-emits the base scope, so
+            // they must ride along to stay visible after the flip.
+            db.carry_forward_live_overlays(target, old_live)?;
+            let carried_overlays = db.carried_overlay_worktrees(target)?;
+            // Carry each carried overlay's PACKAGE ROOTS onto the new base scope (batch 6 #3): the
+            // overlay FILE rows carried above are matched into the scope view by `worktree_id`
+            // alone, but `load_package_roots_into_scope` reads `packages` by `(commit_sha,
+            // worktree_id)`, so an overlay keyed to the OLD base HEAD finds NO package map under
+            // the re-resolution view (installed at the NEW base commit) and resolves
+            // its imports fall-open. Re-key their `commit_sha` to the rebuilt HEAD
+            // BEFORE the re-resolution.
+            db.carry_forward_overlay_packages(&carried_overlays)?;
+            // Base package roots + base-edge resolution, folded into the flip (batch 6 #4):
+            // `finalize_base_edges` writes the generation-less `packages`/`local_crate_roots` and
+            // resolves every accumulated base edge against them. Runs INSIDE the terminal txn so
+            // those authority writes are invisible to a concurrent reader/heal until the pointer
+            // moves and roll back with a failed tail; the resolve reads the package rows back from
+            // this same uncommitted transaction.
+            db.finalize_base_edges(config, graph)?;
+            // Re-resolve each carried overlay's OWN edges against the freshly staged base (P2
+            // review): the base re-emit re-minted every base `symbols.id`, so a carried overlay
+            // edge's `to_symbol_id` still points at the OLD generation's symbol row — dead the
+            // moment gc sweeps it. `resolve_overlay_edges` writes only the overlay's own rows
+            // (targets span the overlay view), exactly as `finalize_overlay_refresh` uses it; the
+            // view is swapped per overlay and restored to the base scope after.
+            for worktree_id in &carried_overlays {
+                db.install_view_for_scope(&db.active_commit_sha, worktree_id, target)?;
+                db.resolve_overlay_edges(worktree_id)?;
+            }
+            if !carried_overlays.is_empty() {
+                db.install_view_for_scope(&db.active_commit_sha, &db.active_worktree_id, target)?;
+            }
+            // Logical symbols fold the generation being published (base scope + carried
+            // overlays), scoped to `self.active_generation == target` — the carried overlays are
+            // already at `target` within this transaction, so the fold sees them (the A6 handoff
+            // note, now satisfied PRE-flip inside the same atomic write).
+            progress(IndexProgress::RebuildingLogicalSymbols);
+            db.rebuild_logical_symbols()?;
+            // Publish the STAGED `parser_failures` state (upserts for paths that failed this
+            // pass, clears for clean re-parses, an orphan sweep for paths removed from the tree)
+            // atomically with the flip: the waves staged these mutations in a temp table instead
+            // of writing the generation-less table mid-pass, so readers see the OLD failure state
+            // until the pointer moves and a tail failure rolls the whole reconciliation back with
+            // it. Generation-dead gc deliberately never touches this table.
+            db.apply_staged_parser_failures(target)?;
+            // Recompute clone-token df over the FINAL published set (batch 6 #2): it reads
+            // `symbol_fingerprints` at `active_generation == target`, which AFTER the overlay
+            // carry-forward above is exactly the generation about to go live (base + carried
+            // overlays). Recomputing in Phase 2 (before carry-forward) either omitted carried
+            // overlay fingerprints from the df on success, or on a tail failure left the OLD
+            // generation's clone queries reading a df computed from the never-published target —
+            // and the df drives sub-block-postings selection + persisted-postings
+            // invalidation, so it is consumed as authority w.r.t. the published set,
+            // not merely a drift-tolerated hint.
+            db.refresh_clone_token_df()?;
+            // Git-history ROWS + external-content `commit_fts` fold into the flip too (batch 6 #1):
+            // `git_commits`/`git_file_changes` are read DIRECTLY by
+            // `query::orientation::recent_commit_subjects`, lexical churn, and commit search — not
+            // only through the deferred `git_history_indexed_*` cursors — so landing them in Phase
+            // 2 let a rebuild that observed changed/cleared history then failed
+            // pre-flip strand the NEW history rows in front of the still-live OLD file
+            // generation. The reload-gate CURSORS still write cursors-last below; the
+            // ROWS + `commit_fts` now ride the same atomic transaction as the file
+            // generation, so orientation/search can never mix new history with the old
+            // files.
+            let history_cursors = db.apply_prepared_git_history_deferring_cursors(
                 &config.root,
                 git_history
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("git history preparation was already used"))?,
             )?;
-            mem_trace("after git_history");
-            progress(IndexProgress::RebuildingLogicalSymbols);
-            db.rebuild_logical_symbols()?;
-            mem_trace("after rebuild_logical_symbols");
-            // Edges were resolved and inserted in one in-memory pass inside
-            // index_targets_with_progress (full rebuild), so there is no separate resolve_edges
-            // phase.
+            progress(IndexProgress::RebuildingFts);
+            // chunk_fts was written inline during chunk insert; only the external-content
+            // commit_fts needs the bulk 'rebuild' here (#77 Phase 2), now atomic with
+            // the git rows it indexes.
+            db.finalize_full_rebuild_fts()?;
             progress(IndexProgress::ResolvingGraph);
             db.mark_graph_index_current()?;
-            // Full rebuild writes correct `files.generated` via `file_is_generated`, so stamp the
-            // flags version current and skip a redundant re-derive on next open (#202).
+            // Full rebuild writes correct `files.generated`, so stamp the flags version current and
+            // skip a redundant re-derive on next open (#202).
             db.mark_generated_flags_current()?;
-            mem_trace("after mark_graph_index_current");
-            // Derive the compressed chunk_text store (#77 Phase 2) from chunks.text inside the same
-            // transaction, so the dict row + the blobs that use it are committed atomically.
-            db.build_chunk_text_store()?;
-            mem_trace("after build_chunk_text_store");
-            progress(IndexProgress::RebuildingFts);
-            // chunk_fts was written inline during chunk insert; only commit_fts
-            // needs the bulk 'rebuild' here (#77 Phase 2).
-            db.finalize_full_rebuild_fts()?;
-            mem_trace("after finalize_full_rebuild_fts");
-            // Recompute clone token document-frequency authoritatively from the token-bag BLOBs
-            // just written (#231). The per-symbol incremental bump in store_symbol_fingerprints
-            // drifts over edits; a full rebuild owns the whole checkout, so derive df exactly here.
-            // df is a selectivity hint only (candidate read COALESCEs it), never a correctness
-            // input — but keeping it exact maximizes the rare-first sub-block prune.
-            db.refresh_clone_token_df()?;
-            mem_trace("after refresh_clone_token_df");
+            // The git AUTHORITY writes ride the flip (batch-4 P2): `git_commit`/`git_dirty` meta
+            // and the history reload-gate cursors say "this index reflects commit H" — true only
+            // once the generation built at H is published. Deferring them here means a tail
+            // failure leaves status()/`is_history_current` honestly reporting the OLD state (a
+            // reload stays owed), and the retry publishes files + git authority together.
+            db.set_repo_meta("source_root", &config.root.display().to_string())?;
+            db.write_git_meta(&config.root)?;
+            if let Some(cursors) = &history_cursors {
+                db.record_git_history_cursors(cursors)?;
+            }
+            // Publish: `live_files_generation` LAST, so a concurrent reader sees either the whole
+            // old generation or the whole new one, never a mix. The active-model seed rides the
+            // flip (#394): it is advanced only when the fresh generation actually goes live.
+            db.set_repo_meta(schema::LIVE_FILES_GENERATION_META_KEY, &target.to_string())?;
             db.set_repo_meta("indexed_at_ms", &now_ms().to_string())?;
-            // Adopt the configured embedding model as this index's active model INSIDE the rebuild
-            // transaction, so reconcile targets it (and read-only opens serve immediately) rather
-            // than the hash fallback (#394) — and a failed rebuild rolls the seed back with the
-            // rest, leaving the pre-rebuild active model intact rather than pointing at
-            // a missing model (#394 review).
             ai::seed_active_embedding_model(
                 db.storage.connection(),
                 config.llm.embedding.backend.model_id(),
             )?;
             db.storage.execute_batch("COMMIT")?;
-            mem_trace("after COMMIT");
+            mem_trace("after terminal flip (overlay edges + logical symbols + pointer)");
             progress(IndexProgress::Finished { files: indexed });
-            Ok(())
+            Ok(indexed)
         })();
         if result.is_err() {
             if let Some(handle) = git_history.take() {
                 let _ = join_git_history_prepare(handle);
             }
+            // Roll back whichever phase transaction was left open by the failing `?` (Phase 1's
+            // per-wave commits already landed a staged generation that never flips — dead,
+            // gc-swept).
             let _ = db.storage.execute_batch("ROLLBACK");
         }
-        // Restore durable fsync behavior for any later writes on this connection (reconcile, etc.).
         // cache_size is left bumped — harmless for the short remaining lifetime of the connection.
-        let _ = db.storage.execute_batch("PRAGMA synchronous = NORMAL;");
         result?;
-        // Poison-sibling test harness (compiled out of production): after the rebuild commits,
-        // register a second `poison-sibling` repo with tripwire rows in every repo-scoped table, so
-        // any unscoped read/count/delete downstream trips an EXISTING test. Default-ON per test
-        // thread; a test needing a virgin single-repo DB opts out via
-        // `poison_sibling::disable_poison_sibling`. See the module docs.
+        // Poison-sibling test harness (compiled out of production): after the rebuild flips,
+        // register a second `poison-sibling` repo with tripwire rows in every repo-scoped
+        // table, so any unscoped read/count/delete downstream trips an EXISTING test.
+        // Default-ON per test thread; a test needing a virgin single-repo DB opts out via
+        // `poison_sibling::disable_poison_sibling`.
         #[cfg(test)]
         crate::index::poison_sibling::seed_if_enabled(db.storage.connection())?;
         Ok(db)
+    }
+
+    /// The generation a full rebuild stages into (A6): STRICTLY ABOVE both every generation the
+    /// ACTIVE repo's rows currently carry AND the live pointer itself. The row-MAX keeps it above
+    /// a torn prior rebuild's committed-but-never-flipped staging (which `live + 1` could collide
+    /// with); folding `old_live` in keeps it above the pointer even when the live generation has
+    /// ZERO rows left (every file incrementally removed) — without that, `MAX(rows) + 1` could
+    /// allocate BELOW live, and gc's LOCKLESS-SAFE `generation < live` fallback predicate would
+    /// classify the fresh staging as superseded and cascade it mid-rebuild. (Under gc's primary
+    /// `generation != live` form the per-repo write flock is the protection — every rebuild entry
+    /// holds it, batch 6 — but the allocator stays above live so the lockless fallback is safe too,
+    /// and so the `< live`/`!= live` forms agree on an in-flight staging.) Per-repo — the `files`
+    /// view scopes `(repo_id, generation)`, so generations need only be unique WITHIN a repo.
+    fn next_files_generation(&self, old_live: i64) -> anyhow::Result<i64> {
+        let max_row_generation = self.storage.connection().query_row(
+            "SELECT COALESCE(MAX(generation), 0) FROM main.files WHERE repo_id = ?1",
+            params![self.active_repo_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(max_row_generation.max(old_live) + 1)
+    }
+
+    /// The DISTINCT linked-worktree ids among the rows just carried forward onto `target` — the
+    /// overlay scopes whose edges the terminal transaction must re-resolve against the freshly
+    /// staged base (their old `to_symbol_id` targets die with the superseded generation). Excludes
+    /// the empty (committed) scope and the base checkout's own worktree id; other-commit leftovers
+    /// carry no worktree id, so they never appear here (their edges are self-contained per scope
+    /// and die with their context at gc).
+    fn carried_overlay_worktrees(&self, target: i64) -> anyhow::Result<Vec<String>> {
+        let conn = self.storage.connection();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT worktree_id FROM main.files
+             WHERE repo_id = ?1 AND generation = ?2
+               AND worktree_id != '' AND worktree_id != ?3
+             ORDER BY worktree_id",
+        )?;
+        let rows = stmt
+            .query_map(params![self.active_repo_id, target, self.active_worktree_id], |row| {
+                row.get::<_, String>(0)
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Carry every LIVE row OUTSIDE the base rebuild scope — linked-worktree overlays and
+    /// other-commit leftovers — forward from the previous live generation `old_live` onto the
+    /// freshly-staged `target`, so they stay visible after the flip. A full rebuild only re-emits
+    /// the BASE scope (`commit_sha` = the rebuilt HEAD, or `worktree_id` = the base checkout),
+    /// so those non-base rows would otherwise vanish under the new live generation; the base
+    /// scope it DID re-emit stays at `old_live` → dead → swept by gc. A no-op on a non-git repo
+    /// (base commit + base worktree both empty ⇒ every row IS in the base scope) and when there
+    /// are no overlays. Runs INSIDE the terminal flip transaction so a reader sees overlays at
+    /// exactly one generation.
+    fn carry_forward_live_overlays(&self, target: i64, old_live: i64) -> anyhow::Result<()> {
+        self.storage.connection().execute(
+            "UPDATE main.files SET generation = ?1
+             WHERE repo_id = ?2 AND generation = ?3
+               AND commit_sha != ?4 AND worktree_id != ?5",
+            params![
+                target,
+                self.active_repo_id,
+                old_live,
+                self.active_commit_sha,
+                self.active_worktree_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Re-key each carried linked-worktree overlay's generation-less `packages` rows onto the
+    /// rebuilt base commit so its terminal-txn edge re-resolution finds them (batch 6 #3). An
+    /// overlay's FILE rows are matched into the scope view by `worktree_id` ALONE
+    /// (commit-agnostic), but `load_package_roots_into_scope` (resolve.rs) reads `packages` by
+    /// BOTH `(commit_sha, worktree_id)`, and the re-resolution installs the view at
+    /// `active_commit_sha` (the NEW base HEAD). An overlay indexed at the OLD base HEAD keyed
+    /// its package rows to that old commit, so without this the read finds no overlay package
+    /// map and resolves the branch's imports against the wrong / fall-open roots — until a
+    /// separate overlay refresh runs. Re-keying `commit_sha` to the rebuilt HEAD aligns them
+    /// with BOTH the re-resolution context AND a post-flip overlay query's `(base_sha,
+    /// worktree_id)` scope.
+    ///
+    /// SUPERSEDED OLD ROWS ARE DELETED, NOT RE-KEYED (batch 7 P2): an overlay that already
+    /// REFRESHED after the base HEAD moved wrote fresh rows at the NEW `(commit_sha,
+    /// worktree_id)` while its old-commit rows lingered (`refresh_packages` deletes only its own
+    /// scope). A blind re-key of those old rows collides with the fresh ones under
+    /// `UNIQUE(repo_id, manifest_dir, commit_sha, worktree_id)` and ABORTS the whole rebuild —
+    /// and the fresh refresh is also more current than any re-key could make the stale row. So:
+    /// (1) DELETE old-commit rows whose `manifest_dir` already has a row at the new key (the
+    /// fresh refresh wins); (2) DELETE all-but-the-newest duplicates among the REMAINING
+    /// old-commit rows — rows at TWO different stale commits (two refreshes, two HEAD moves ago)
+    /// would otherwise both re-key to the same new key and collide with each other; highest
+    /// `id` wins (`refresh_packages` reinserts per pass, so rowid order is recency); (3) re-key
+    /// the survivors. `commit_sha != ?1` throughout keeps a same-HEAD rebuild (the overlay
+    /// already at this commit) a pure no-op — no self-UPDATE, no collision, nothing deleted.
+    /// Scoped to exactly the `worktree_ids` `carried_overlay_worktrees` re-resolves (non-empty,
+    /// != the base checkout), so other-commit leftovers (`worktree_id = ''`) are untouched. Runs
+    /// INSIDE the terminal flip transaction, so the re-key is invisible until the pointer moves.
+    fn carry_forward_overlay_packages(&self, worktree_ids: &[String]) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        let mut delete_shadowed = conn.prepare(
+            "DELETE FROM packages
+             WHERE repo_id = ?2 AND worktree_id = ?3 AND commit_sha != ?1
+               AND manifest_dir IN (
+                   SELECT manifest_dir FROM packages
+                   WHERE repo_id = ?2 AND worktree_id = ?3 AND commit_sha = ?1
+               )",
+        )?;
+        let mut delete_stale_duplicates = conn.prepare(
+            "DELETE FROM packages
+             WHERE repo_id = ?2 AND worktree_id = ?3 AND commit_sha != ?1
+               AND id NOT IN (
+                   SELECT MAX(id) FROM packages
+                   WHERE repo_id = ?2 AND worktree_id = ?3 AND commit_sha != ?1
+                   GROUP BY manifest_dir
+               )",
+        )?;
+        let mut rekey = conn.prepare(
+            "UPDATE packages SET commit_sha = ?1
+             WHERE repo_id = ?2 AND worktree_id = ?3 AND commit_sha != ?1",
+        )?;
+        for worktree_id in worktree_ids {
+            delete_shadowed.execute(params![
+                self.active_commit_sha,
+                self.active_repo_id,
+                worktree_id
+            ])?;
+            delete_stale_duplicates.execute(params![
+                self.active_commit_sha,
+                self.active_repo_id,
+                worktree_id
+            ])?;
+            rekey.execute(params![self.active_commit_sha, self.active_repo_id, worktree_id])?;
+        }
+        Ok(())
     }
 
     /// Recompute `clone_token_df` exactly from the `symbol_fingerprints.token_bag` BLOBs (#231).
@@ -177,14 +443,23 @@ impl IndexDatabase {
         let mut df: BTreeMap<String, BTreeMap<i64, i64>> = BTreeMap::new();
         {
             let conn = self.storage.connection();
+            // A6: the join also filters the ACTIVE generation. During a full rebuild this runs
+            // AFTER the fresh generation's fingerprints are staged but BEFORE gc sweeps the
+            // superseded one, so a repo-only join would fold BOTH generations' bags and
+            // systematically double every df — not drift, a 2x skew of the "exact" recompute this
+            // function exists to produce. `active_generation` is the WRITE generation on the
+            // rebuild connection (exactly the fingerprints just written) and the live generation
+            // elsewhere. The pre-V042 `None` branch has no files join to filter (that schema also
+            // predates V043).
             let read_sql = match &df_scope {
                 Some(repo_id) => format!(
                     "SELECT symbol_fingerprints.normalizer_kind, symbol_fingerprints.token_bag
                      FROM symbol_fingerprints
                      JOIN symbols ON symbols.id = symbol_fingerprints.symbol_id
                      JOIN main.files ON main.files.id = symbols.file_id
-                     WHERE main.files.repo_id = '{}'",
-                    repo_id.replace('\'', "''")
+                     WHERE main.files.repo_id = '{}' AND main.files.generation = {}",
+                    repo_id.replace('\'', "''"),
+                    self.active_generation
                 ),
                 None => "SELECT normalizer_kind, token_bag FROM symbol_fingerprints".to_string(),
             };
@@ -246,51 +521,21 @@ impl IndexDatabase {
         Ok(())
     }
 
-    fn clear_full_rebuild_tables(&self) -> anyhow::Result<()> {
-        // Stage the active context's file ids, then cascade-delete them and their derived rows.
-        //
-        // AUTHORITATIVE (load-bearing, #87): a full rebuild owns the WHOLE checkout, so the
-        // commit-scope staging deliberately does NOT mirror the scope VIEW's shadowing rule.
-        // The view excludes a committed row whose path has a worktree-overlay row (overlay
-        // wins for reads) — but exempting it from the CLEAR left it behind to collide with the
-        // rebuild's fresh insert at the same `(path, commit_sha, '')` whenever a stale overlay
-        // lingered (a dirty-then-committed file whose cleanup never ran), failing the whole
-        // rebuild with a UNIQUE constraint error. Stage every row of the active commit AND
-        // every row of the active worktree, shadowed or not. A sibling worktree at the same
-        // commit self-heals on its next discover pass (its missing paths reindex).
-        // Every staged row is constrained to the ACTIVE REPO (A3): the commit/worktree keys are not
-        // globally unique across repos in a consolidated DB (forks share a commit), so without the
-        // `repo_id` predicate a full rebuild of one repo would stage — and cascade-delete — a
-        // sibling repo's rows. The repo id lives in the same `temp.connection_context` the scope
-        // view populates.
-        self.storage.execute_batch(
-            "
-            CREATE TEMP TABLE IF NOT EXISTS staged_file_ids(id INTEGER PRIMARY KEY);
-            DELETE FROM temp.staged_file_ids;
-            INSERT OR IGNORE INTO temp.staged_file_ids(id)
-            SELECT id
-            FROM main.files
-            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
-              AND worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
-             'worktree_id')
-              AND worktree_id != '';
-            INSERT OR IGNORE INTO temp.staged_file_ids(id)
-            SELECT id
-            FROM main.files
-            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
-              AND commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
-              AND commit_sha != '';
-            ",
-        )?;
-        self.delete_staged_files_cascade()?;
-        // Do NOT clear chunk_text_dict: dicts are IMMUTABLE decode keys (#77 Phase 2). Other
-        // worktree contexts' blobs reference existing versions, and deleting a version would orphan
-        // them. The staged cascade above already removed THIS context's chunk_text rows;
-        // insert_chunks recompresses them against the latest existing dict version (or, on
-        // the very first index when no dict exists yet, stages the text so
-        // build_chunk_text_store trains version 1). Per-connection staging table for that
-        // first-index path: insert_chunks writes the in-memory text here (there is no
-        // chunks.text column) and build_chunk_text_store reads + clears it.
+    /// Set up the per-connection scratch temp tables the wave loop needs, WITHOUT clearing any
+    /// live rows (A6). The rebuild stages a FRESH generation alongside the live one — the old
+    /// generation must stay intact for concurrent readers until the flip, and gc sweeps it
+    /// afterward — so the former staged-cascade DELETE of the active scope is GONE (its
+    /// collision-avoidance job is obsolete: the widened `UNIQUE(repo_id, path, commit_sha,
+    /// worktree_id, generation)` lets a stale lingering overlay coexist with the fresh insert
+    /// at a different generation).
+    ///
+    /// Only the first-index chunk-text staging table is (re)created here: `insert_chunks` writes
+    /// the in-memory text into it and `build_chunk_text_store` reads + clears it (there is no
+    /// chunks.text column). `chunk_text_dict` is never cleared — dicts are IMMUTABLE decode
+    /// keys (#77 Phase 2), and other generations'/scopes' blobs reference existing versions.
+    /// Called by `index_targets_with_progress` (batch 7): BOTH entries — the full rebuild and the
+    /// standalone `index_targets` — run the wave loop whose inserts stage into this table.
+    pub(super) fn prepare_rebuild_scratch_tables(&self) -> anyhow::Result<()> {
         self.storage.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS rebuild_chunk_text(
                  chunk_id INTEGER PRIMARY KEY,
@@ -298,15 +543,36 @@ impl IndexDatabase {
              );
              DELETE FROM temp.rebuild_chunk_text;",
         )?;
-        self.storage.execute_batch("DELETE FROM temp.staged_file_ids;")?;
         Ok(())
     }
 
-    /// Cascade-delete every derived row (edges, symbols, chunks, embeddings, FTS, blame, docs,
-    /// parser failures) for the file ids staged in `temp.staged_file_ids`, then the files
-    /// themselves. The caller is responsible for populating and clearing the temp table.
-    /// Shared by full rebuild (active context) and GC (dead, non-live contexts).
-    pub(super) fn delete_staged_files_cascade(&self) -> anyhow::Result<()> {
+    /// Cascade-delete every derived row (edges, symbols, chunks, embeddings, FTS, blame, docs —
+    /// and, for a context-death sweep only, parser failures) for the file ids staged in
+    /// `temp.staged_file_ids`, then the files themselves. The caller is responsible for populating
+    /// and clearing the temp table. GC's two sweeps share it, distinguished by [`StagedSweep`].
+    pub(super) fn delete_staged_files_cascade(&self, sweep: StagedSweep) -> anyhow::Result<()> {
+        // GENERATION-LESS TABLE CLASSIFICATION (A6, P2 review): `parser_failures` is keyed by
+        // `(repo_id, path)` with NO generation — path-keyed indexer state OWNED at (re)parse time
+        // (upsert on failure, clear on clean parse, orphan-path sweep in the rebuild tail). A
+        // DEAD-GENERATION sweep must NOT delete it: the staged dead rows share their paths with the
+        // LIVE generation, so the path-keyed delete would drop a still-failing live path's only
+        // record. Only true CONTEXT death (a dead commit/worktree — the path's last owner in this
+        // repo going away) may clear it. The row-value join matches BOTH key columns so a sibling
+        // repo's failure at the same path is never clobbered. Runs BEFORE the batch below (it joins
+        // the staged `main.files` rows the batch deletes). Everything else in the cascade is keyed
+        // by staged file/symbol/chunk ids (per-generation rows) or, for the `logical_symbols`
+        // orphan cleanup, by membership — correct under both sweep axes.
+        if sweep == StagedSweep::DeadContext {
+            self.storage.connection().execute(
+                "DELETE FROM main.parser_failures
+                 WHERE (repo_id, path) IN (
+                     SELECT files.repo_id, files.path
+                     FROM main.files
+                     JOIN temp.staged_file_ids ON staged_file_ids.id = files.id
+                 )",
+                [],
+            )?;
+        }
         self.storage.execute_batch(
             "
             INSERT OR IGNORE INTO main.name_strings(value) VALUES ('unresolved');
@@ -385,15 +651,6 @@ impl IndexDatabase {
                 FROM main.chunks
                 JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
             );
-            -- `parser_failures` is keyed by `(repo_id, path)` (V040), so match BOTH — a bare-path
-            -- delete would clobber a sibling repo's failure at the same path. Staged files all
-            -- belong to one repo, but the row-value join is correct regardless of that.
-            DELETE FROM main.parser_failures
-            WHERE (repo_id, path) IN (
-                SELECT files.repo_id, files.path
-                FROM main.files
-                JOIN temp.staged_file_ids ON staged_file_ids.id = files.id
-            );
             DELETE FROM main.symbol_fingerprints
             WHERE symbol_id IN (
                 SELECT symbols.id
@@ -413,5 +670,73 @@ impl IndexDatabase {
             ",
         )?;
         Ok(())
+    }
+}
+
+/// Test seam for the generation-staged rebuild: a barrier the full rebuild runs after each
+/// committed file wave, so a concurrent reader can observe the STAGED (committed but not-yet-live)
+/// generation mid-rebuild. Compiled out of production entirely; kept at the end of the file so it
+/// does not read as a `#[cfg(test)]` module with production items after it
+/// (clippy::items_after_test_module).
+///
+/// KEYED BY DATABASE PATH, never a single process-global slot: the coverage job runs plain
+/// `cargo test` under llvm-cov — every test shares ONE process with parallel libtest threads
+/// (unlike nextest's process-per-test), so two barrier tests racing a global slot drop each
+/// other's hook (and its channel sender → `RecvError`), and a leaked hook could fire inside an
+/// UNRELATED test's rebuild. The same class as the #409 flock/fork coverage incident: same-process
+/// global state that is safe under nextest breaks under libtest. Keying by the rebuild's database
+/// path makes concurrent tests inherently isolated (each uses its own temp DB), and registration
+/// returns an RAII [`WaveBarrierGuard`] so the entry is removed even when the test panics.
+#[cfg(test)]
+mod wave_barrier {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    /// `Arc`, not `Box`: [`run_after_wave_commit`] clones the hook out of the registry and RELEASES
+    /// the map lock before calling it — the hook blocks on its test barrier, and holding the map
+    /// lock across that block would serialize (or deadlock) every other test's registration.
+    /// `Sync` is required by the shared `Arc`; hook captures that are `!Sync` (channel endpoints)
+    /// ride in `Mutex`es.
+    pub(crate) type WaveHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+    static AFTER_WAVE_COMMIT: Mutex<BTreeMap<PathBuf, WaveHook>> = Mutex::new(BTreeMap::new());
+
+    /// Unregisters its database's hook on drop — panic-safe cleanup, so a failing barrier test
+    /// can never leak a hook into a stranger's rebuild.
+    pub(crate) struct WaveBarrierGuard {
+        database: PathBuf,
+    }
+
+    impl Drop for WaveBarrierGuard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = AFTER_WAVE_COMMIT.lock() {
+                hooks.remove(&self.database);
+            }
+        }
+    }
+
+    /// Register the after-wave-commit hook for the rebuild whose `config.database` is `database`.
+    /// Hold the returned guard for the duration of the observed rebuild.
+    #[must_use = "dropping the guard unregisters the hook"]
+    pub(crate) fn set_after_wave_commit(database: &Path, hook: WaveHook) -> WaveBarrierGuard {
+        AFTER_WAVE_COMMIT
+            .lock()
+            .expect("wave barrier registry poisoned")
+            .insert(database.to_path_buf(), hook);
+        WaveBarrierGuard { database: database.to_path_buf() }
+    }
+
+    /// Invoked by the full-rebuild wave loop after each wave commits, with the rebuilding
+    /// connection's database path; fires only a hook registered for THAT database.
+    pub(crate) fn run_after_wave_commit(database: &Path) {
+        let hook = AFTER_WAVE_COMMIT
+            .lock()
+            .expect("wave barrier registry poisoned")
+            .get(database)
+            .cloned();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }

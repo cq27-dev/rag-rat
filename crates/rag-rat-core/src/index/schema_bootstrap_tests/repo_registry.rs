@@ -1332,6 +1332,158 @@ fn register_repo_upgrades_a_local_only_id_to_a_portable_id_in_place() {
     let _ = fs::remove_dir_all(&repo);
 }
 
+/// A6 batch-4 P2: the LocalOnly→Portable upgrade must SERIALIZE with a writer still holding the
+/// OUTGOING `local:` discriminator's write lock — the lock identity flips with the derived id at
+/// unshallow time, so without this the upgrade re-points every scoped row out from under an
+/// in-flight pre-unshallow writer. (Deadlock order: the upgrade is the only multi-lock holder and
+/// always acquires incoming-then-outgoing; see the comment in `register_repo`.)
+#[test]
+fn upgrade_blocks_until_the_outgoing_local_lock_holder_finishes() {
+    let repo = real_git_repo("upgrade-lock");
+    let boundary = head_commit_hash(&repo);
+
+    // FILE-backed DB: the outgoing-lock acquisition keys off `conn.path()` (a pathless in-memory
+    // DB skips it — no cross-process writer can exist there).
+    let db_root = unique_temp_root();
+    let _ = fs::remove_dir_all(&db_root);
+    fs::create_dir_all(&db_root).unwrap();
+    let db_path = db_root.join("index.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    seed_pre_v040_core_schema(&conn);
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms) VALUES \
+         ('src/lib.rs', 'rust', 'source', 'a', 0, 0)",
+        [],
+    )
+    .unwrap();
+    schema::apply_repo_id_core_scoping(&conn).expect("V040 applies");
+    let local_id = "local:aaaa1111bbbb";
+    register_repo(&conn, &identity_local(local_id, "shallow", vec![boundary]), repo.as_path(), 1)
+        .unwrap();
+
+    // Writer 1: an in-flight pre-unshallow writer — holds the OUTGOING local-id lock while
+    // writing two rows with a deliberate pause between them.
+    let writer_db = db_path.clone();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let _lock =
+            crate::locks::WriteLock::acquire_blocking(&writer_db, "local:aaaa1111bbbb").unwrap();
+        let conn = rusqlite::Connection::open(&writer_db).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             repo_id) VALUES ('src/w1.rs', 'rust', 'source', 'w1', 0, 0, 'local:aaaa1111bbbb')",
+            [],
+        )
+        .unwrap();
+        held_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             repo_id) VALUES ('src/w2.rs', 'rust', 'source', 'w2', 0, 0, 'local:aaaa1111bbbb')",
+            [],
+        )
+        .unwrap();
+        // The lock releases on drop, AFTER both writes — the upgrade must not run before this.
+    });
+    held_rx.recv().unwrap();
+
+    // Writer 2 triggers the upgrade (the post-unshallow open). It must BLOCK on the outgoing
+    // lock until writer 1 finishes, then re-point EVERYTHING — including writer 1's second row.
+    let started = std::time::Instant::now();
+    register_repo(&conn, &identity("0abc123root", "deepened"), repo.as_path(), 2)
+        .expect("the upgrade proceeds once the outgoing-lock holder finishes");
+    let elapsed = started.elapsed();
+    writer.join().unwrap();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(300),
+        "the upgrade must block until the outgoing local-lock holder completes, got {elapsed:?}"
+    );
+    // No interleaved re-point: row attribution is consistent — every row (the seed + BOTH of the
+    // in-flight writer's rows) ended under the portable id, none stranded under the local id.
+    let under_local: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files WHERE repo_id = ?1", [local_id], |r| r.get(0))
+        .unwrap();
+    let under_portable: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files WHERE repo_id = '0abc123root'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(under_local, 0, "no row left under the outgoing local id");
+    assert_eq!(under_portable, 3, "seed + both in-flight writer rows re-pointed together");
+
+    let _ = fs::remove_dir_all(&db_root);
+    let _ = fs::remove_dir_all(&repo);
+}
+
+/// A6 batch-5 P2 (the fence gap): a writer whose entry lock was keyed by the STALE `local:` id
+/// (derived pre-unshallow) and whose open then resolves + upgrades to the portable id must extend
+/// its lock coverage to the RESOLVED id for the rest of its run — a fresh portable-lock writer
+/// blocks until it completes, instead of running concurrently with a writer holding only the
+/// retired local lock. RULE: a writer's held lock must match the repo id it writes under.
+#[test]
+fn a_writer_whose_identity_upgrades_mid_run_extends_its_lock_to_the_resolved_id() {
+    let repo = real_git_repo("fence-gap");
+    let boundary = head_commit_hash(&repo);
+    let config = source_config(repo.clone(), Language::Rust);
+    let local_id = "local:feedfacecafe";
+    {
+        let db = IndexDatabase::create_or_migrate(&config.database).unwrap();
+        register_repo(
+            db.storage.connection(),
+            &identity_local(local_id, "shallow", vec![boundary]),
+            repo.as_path(),
+            1,
+        )
+        .unwrap();
+    }
+
+    // The gap writer: entry lock keyed by the stale local id (what a pre-unshallow derivation
+    // gave), then the open resolves the portable id, upgrades, and — the fix — stashes the
+    // resolved id's lock on the connection for its lifetime.
+    let _entry_lock =
+        crate::locks::WriteLock::acquire_blocking(&config.database, local_id).unwrap();
+    let db = IndexDatabase::open_config(&config).unwrap();
+    let resolved = db.active_repo_id.clone();
+    assert!(
+        !resolved.starts_with("local:"),
+        "the open resolved + upgraded to the portable id, got {resolved}"
+    );
+
+    // A concurrent portable-lock writer (another thread — same-thread probes would re-enter)
+    // must BLOCK while the gap writer's connection lives...
+    let probe_db = config.database.clone();
+    let probe_id = resolved.clone();
+    let blocked = std::thread::spawn(move || {
+        crate::locks::WriteLock::acquire_timeout(
+            &probe_db,
+            &probe_id,
+            std::time::Duration::from_millis(150),
+        )
+        .unwrap()
+        .is_some()
+    })
+    .join()
+    .unwrap();
+    assert!(!blocked, "a portable-lock writer must block while the gap writer runs");
+
+    // ...and proceed once it completes (dropping the connection releases the stashed lock).
+    drop(db);
+    let probe_db = config.database.clone();
+    let free = std::thread::spawn(move || {
+        crate::locks::WriteLock::acquire_timeout(
+            &probe_db,
+            &resolved,
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap()
+        .is_some()
+    })
+    .join()
+    .unwrap();
+    assert!(free, "the resolved id's lock frees when the gap writer's connection drops");
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
 /// A real git repo (two empty commits) for the upgrade-proof tests — its HEAD is a commit a genuine
 /// deepened clone would reach.
 fn real_git_repo(tag: &str) -> PathBuf {
@@ -2267,8 +2419,14 @@ fn seed_pre_v042_periphery_schema(conn: &rusqlite::Connection) {
 fn migration_042_is_the_latest_tip_and_scopes_periphery() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 42, "V042 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 42, "schema at LATEST after apply");
+    // V042 is no longer the ABSOLUTE tip (V043 adds files.generation on top); the tip pin moves to
+    // the newest migration's test (`schema_at_latest_after_apply_is_v043` in generation_rebuild).
+    // Here just assert `apply` reaches LATEST — V042's periphery scoping is on the way to the tip.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     for table in V042_PERIPHERY_TABLES {
         assert!(
@@ -2566,8 +2724,8 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
     schema::migrate_forward(&conn).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
-        42,
-        "the A-phase ladder reached V042"
+        schema::LATEST_SCHEMA_VERSION,
+        "the A-phase ladder reached LATEST (V042's periphery scoping is on the way to the tip)"
     );
 
     // Every seeded row survived the ladder, still under the placeholder (scoped to the legacy id).

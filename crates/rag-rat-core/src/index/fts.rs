@@ -105,6 +105,31 @@ impl IndexDatabase {
         if !self.fts_dirty()? && fts_source_revision.as_deref() == Some(content_revision.as_str()) {
             return Ok(());
         }
+        // NEVER rebuild while any SEARCHABLE chunk lacks its durable text row (A6, P2 review): a
+        // generation-staged full rebuild commits its waves BEFORE `build_chunk_text_store` runs,
+        // so on a FIRST index (no `chunk_text_dict` yet) the staged chunks carry inline
+        // `chunk_fts` rows whose text exists only in the REBUILDING connection's temp table.
+        // `rebuild_chunk_fts`'s 'delete-all' + re-derive from `chunk_text` would silently drop
+        // those rows from BM25 and the freshness stamp below would mark the loss clean —
+        // permanent missing rows in the published generation. Degrade instead: serve the current
+        // (possibly stale) FTS and leave the dirty/stale state in place, so the refresh re-fires
+        // once the text store is complete (the rebuild's own finalize records freshness for the
+        // fast path). The probe is deliberately "HAS an fts row we cannot re-derive" — not a bare
+        // "lacks text" — so a chunk with NEITHER row (never searchable; the re-derive would
+        // exclude it regardless) can never wedge freshness healing permanently. Runs only on the
+        // dirty/stale path, never steady-state.
+        let irreplaceable_fts_rows: bool = self.storage.connection().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.chunks
+                 WHERE id IN (SELECT rowid FROM chunk_fts)
+                   AND id NOT IN (SELECT chunk_id FROM main.chunk_text)
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if irreplaceable_fts_rows {
+            return Ok(());
+        }
         self.rebuild_fts()?;
         let refreshed_revision = self.meta("fts_source_revision")?;
         if refreshed_revision.as_deref() != Some(content_revision.as_str()) {

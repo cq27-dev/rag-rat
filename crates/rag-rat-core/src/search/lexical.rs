@@ -578,6 +578,12 @@ fn graph_boost(
     // id), so the `EXISTS` drops no live edge in a single-repo DB. It applies AFTER the
     // `from_name_id`/`to_name_id` index seek narrows to ≤64 candidate edges, so the hot-path
     // integer indexes still drive the scan.
+    //
+    // A6 SURVIVOR (deliberately NOT generation-scoped, re-justified in the P2 sweep): this is a
+    // RANKING boost, not an exactness counter — a superseded generation's edges can inflate a
+    // confidence pick until gc, shifting ordering marginally before self-correcting, while the
+    // candidate set itself flows through the generation-scoped view. Re-evaluate only if this
+    // ever feeds a count a caller treats as exact.
     let mut stmt = conn.prepare_cached(
         "
         SELECT ek.value, conf.value, fn.value, tn.value

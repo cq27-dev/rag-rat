@@ -132,6 +132,16 @@ fn main() -> anyhow::Result<()> {
         Cmd::Models(args) => models(&config, &args)?,
         Cmd::Reconcile(args) => reconcile(&config, &args)?,
         Cmd::Gc => {
+            // gc is a WRITER (it cascade-deletes dead generations and dead contexts), so it takes
+            // the per-repo write flock like every other CLI writer. That flock is exactly what
+            // makes gc's `generation != live` deadness predicate safe (batch 5):
+            // holding it proves no rebuild is mid-flight, so an ABOVE-live staging is
+            // abandoned, not in-progress — and every rebuild entry now takes the flock
+            // too (batch 6), so a gc racing a mid-flight rebuild serializes with it
+            // instead of sweeping the staged generation out from under it.
+            let lock_repo = rag_rat_core::locks::write_lock_repo_id(&config);
+            let _lock =
+                rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
             let db = open_index(&config)?;
             print_output(&db.garbage_collect()?)?;
         },

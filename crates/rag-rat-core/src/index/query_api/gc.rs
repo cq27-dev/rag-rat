@@ -4,6 +4,7 @@
 use serde::Serialize;
 
 use super::*;
+use crate::index::rebuild::StagedSweep;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GcReport {
@@ -43,9 +44,11 @@ impl IndexDatabase {
     }
 
     /// Prune file rows (and their derived rows) whose `commit_sha` and `worktree_id` are both
-    /// outside the live sets. Refuses to prune when both live sets are empty, so a missing
-    /// live set never wipes the index. `parser_failures` are keyed by path (shared across
-    /// commits) and are regenerated on the next index, so they are not preserved per-commit.
+    /// outside the live sets, after unconditionally sweeping the repo's DEAD file generations
+    /// (which need no git context — see the sweep comment below). Refuses CONTEXT pruning when
+    /// both live sets are empty, so a missing live set never wipes the index. `parser_failures`
+    /// (path-keyed, generation-less) fall only with a dead CONTEXT — never with a dead
+    /// generation, whose paths live on ([`StagedSweep`]).
     pub fn prune_to_live(
         &self,
         live_commits: &[String],
@@ -54,12 +57,58 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         let files_before = table_row_count(conn, "files")?;
         let chunks_before = table_row_count(conn, "chunks")?;
+        // A6 (P2 review): sweep this repo's DEAD file GENERATIONS FIRST, and UNCONDITIONALLY —
+        // BEFORE the empty-live-sets early return below. Generation liveness needs only
+        // `repo_id` + the repo's live-generation pointer, never a git context, so the "no live
+        // context ⇒ refuse to prune" guard (which protects CONTEXT pruning from a missing live
+        // set) must not gate it: behind the guard, a non-git / plain-directory index would leak a
+        // full generation of files/chunks/symbols/FTS rows on EVERY rebuild, unbounded.
+        //
+        // DEADNESS IS `generation != live` UNDER A LOCK PRECONDITION (batch-5 P2, superseding the
+        // batch-3 `< live` form): non-live generations split into SUPERSEDED (`< live`) and
+        // ABANDONED staging (`> live` — a failed rebuild's committed-but-never-flipped waves; a
+        // persistently failing tail would otherwise leak a full staged copy PER RETRY,
+        // unreclaimable by a below-live sweep). Sweeping ABOVE live is safe exactly when no
+        // rebuild is mid-flight — and the PER-REPO WRITE FLOCK is that proof: every production
+        // rebuild entry runs under it (CLI `index`, the watcher/maintenance passes; verified —
+        // the only flock-less rebuild callers are tests), so a collector HOLDING the flock knows
+        // any above-live rows are abandoned, not in-progress.
+        //
+        // INVARIANT (documented precondition, not asserted): callers of `garbage_collect` /
+        // `prune_to_live` hold this repo's write flock. All production callers do — `Cmd::Gc`
+        // (batch-4 belt), `run_maintenance_pass`, and the watcher's pass all acquire it before
+        // opening. A hypothetical flock-less embedded collector must fall back to the
+        // lockless-safe `< live` form — do NOT weaken this predicate's precondition silently.
+        // (The allocator still guarantees staging sits strictly above live:
+        // `next_files_generation` = max(row-MAX, live) + 1.) `StagedSweep::DeadGeneration` keeps
+        // the cascade off the generation-less `parser_failures` (the same paths live on in the
+        // current generation). Scoped to the active repo, so a sibling's generations are
+        // untouched.
+        conn.execute_batch(
+            "
+            CREATE TEMP TABLE IF NOT EXISTS staged_file_ids(id INTEGER PRIMARY KEY);
+            DELETE FROM temp.staged_file_ids;
+            ",
+        )?;
+        let live_generation =
+            crate::index::schema::live_files_generation(conn, &self.active_repo_id)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO temp.staged_file_ids(id)
+             SELECT id FROM main.files WHERE repo_id = ?1 AND generation != ?2",
+            params![self.active_repo_id, live_generation],
+        )?;
+        self.delete_staged_files_cascade(StagedSweep::DeadGeneration)?;
+        conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
         if live_commits.is_empty() && live_worktrees.is_empty() {
+            let files_remaining = table_row_count(conn, "files")?;
+            let chunks_remaining = table_row_count(conn, "chunks")?;
             return Ok(GcReport {
-                files_pruned: 0,
-                chunks_pruned: 0,
-                files_remaining: files_before,
-                chunks_remaining: chunks_before,
+                files_pruned: files_before.saturating_sub(files_remaining),
+                chunks_pruned: chunks_before.saturating_sub(chunks_remaining),
+                files_remaining,
+                chunks_remaining,
+                // Context pruning was skipped (no live context could be determined); the
+                // generation sweep above needs no context and ran regardless.
                 skipped: true,
             });
         }
@@ -69,7 +118,6 @@ impl IndexDatabase {
             DELETE FROM temp.gc_live_commits;
             CREATE TEMP TABLE IF NOT EXISTS gc_live_worktrees(id TEXT PRIMARY KEY);
             DELETE FROM temp.gc_live_worktrees;
-            CREATE TEMP TABLE IF NOT EXISTS staged_file_ids(id INTEGER PRIMARY KEY);
             DELETE FROM temp.staged_file_ids;
             ",
         )?;
@@ -103,7 +151,10 @@ impl IndexDatabase {
             ",
             [self.active_repo_id.as_str()],
         )?;
-        self.delete_staged_files_cascade()?;
+        // Context-death cascade: this staging holds only rows whose (commit, worktree) fell out of
+        // every live set, so path-keyed satellite state (`parser_failures`) goes with them. The
+        // dead-GENERATION sweep already ran above, unconditionally.
+        self.delete_staged_files_cascade(StagedSweep::DeadContext)?;
         conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
         // Since #248 `edge_oracle` is content-keyed with NO `edges_data` FK (it survives reindex,
         // the moniker model), so the file/edge prune above no longer cascades verdicts
