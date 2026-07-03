@@ -373,9 +373,10 @@ impl IndexDatabase {
             let mut tombstoned = 0;
             for path in &delta.tombstones {
                 let exists: bool = self.storage.connection().query_row(
-                    "SELECT EXISTS(SELECT 1 FROM main.files WHERE path = ?1 AND commit_sha = '' \
-                     AND worktree_id = ?2 AND kind = 'deleted')",
-                    params![path_string(path), worktree_id],
+                    // Direct `main.files` probe → explicit `repo_id` predicate (A3).
+                    "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
+                     commit_sha = '' AND worktree_id = ?3 AND kind = 'deleted')",
+                    params![self.active_repo_id, path_string(path), worktree_id],
                     |row| row.get(0),
                 )?;
                 if !exists {
@@ -496,7 +497,11 @@ impl IndexDatabase {
         self.apply_incremental_file_plan(files, BTreeSet::new(), progress)
     }
 
-    /// Existing file rows in a scope as `path → sha256` — for the idle-safe skip above.
+    /// Existing file rows in a scope as `path → sha256` — for the idle-safe skip above. A direct
+    /// `main.files` probe (bypasses the repo-scoped view), so it carries the `repo_id` predicate
+    /// explicitly (A3): today's sole caller passes a non-empty (path-derived, globally unique)
+    /// `worktree_id`, but this is the documented reusable primitive — a base-scope caller
+    /// (`commit_sha`, `''`) would otherwise skip files on the strength of a fork sibling's sha.
     fn scope_file_shas(
         &self,
         commit_sha: &str,
@@ -504,11 +509,13 @@ impl IndexDatabase {
     ) -> anyhow::Result<HashMap<String, String>> {
         let conn = self.storage.connection();
         let mut stmt = conn.prepare(
-            "SELECT path, sha256 FROM main.files WHERE commit_sha = ?1 AND worktree_id = ?2",
+            "SELECT path, sha256 FROM main.files
+             WHERE repo_id = ?1 AND commit_sha = ?2 AND worktree_id = ?3",
         )?;
-        let rows = stmt.query_map(params![commit_sha, worktree_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = stmt
+            .query_map(params![self.active_repo_id, commit_sha, worktree_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
         rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
 
@@ -521,10 +528,15 @@ impl IndexDatabase {
     ) -> anyhow::Result<usize> {
         let existing: Vec<String> = {
             let conn = self.storage.connection();
+            // Direct `main.files` probe → explicit `repo_id` predicate (A3), same class as the
+            // heal probes in `incremental.rs`.
             let mut stmt = conn.prepare(
-                "SELECT path FROM main.files WHERE worktree_id = ?1 AND worktree_id != ''",
+                "SELECT path FROM main.files
+                 WHERE repo_id = ?1 AND worktree_id = ?2 AND worktree_id != ''",
             )?;
-            let rows = stmt.query_map([worktree_id], |row| row.get::<_, String>(0))?;
+            let rows = stmt.query_map(params![self.active_repo_id, worktree_id], |row| {
+                row.get::<_, String>(0)
+            })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut pruned = 0usize;

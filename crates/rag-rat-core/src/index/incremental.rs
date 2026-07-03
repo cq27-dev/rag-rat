@@ -47,9 +47,31 @@ impl IndexDatabase {
             return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
 
-        let mut db = Self::open(&config.database)?;
+        // Open with the graph check DEFERRED (`check_graph = false`). `Self::open`'s eager check
+        // runs `ensure_graph_index_current` — a repo-scoped edge DELETE+rebuild keyed on
+        // `active_repo_id` — during the open itself, BEFORE this pass adopts the config's repo. On
+        // a consolidated DB `Self::open` scopes to the config-blind SOLE repo (the
+        // lexicographically-first), so the eager check would refresh/wipe the WRONG repo's graph
+        // (or skip the config repo's own stale graph) before adoption switches scope. Adopt
+        // + install the scope context FIRST, then run the graph/generated-flags heal for
+        // the correct repo — the exact sequence `open_config` uses.
+        let mut db = Self::open_with_graph_check(&config.database, false)?;
+        // Register/adopt the config's repo BEFORE `set_context` stamps `active_repo_id` into the
+        // scope view (A3). `Self::open` scoped to the SOLE repo via the config-blind fallback; on a
+        // consolidated DB that would pick the lexicographically-first repo, so this incremental
+        // pass could delete/stamp rows under the WRONG repo. Adopting here — the same step
+        // `open_config` and `rebuild` run — resolves the config's own identity and points
+        // every repo-scoped write below at it. Idempotent on an already-adopted single-repo
+        // DB (the common case).
+        db.adopt_repo_from_config(config)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
+        // Now that the config's repo is adopted and its scope is installed, run the deferred graph
+        // + generated-flags heal against the RIGHT repo (the graph check's edge DELETE is
+        // scoped by `active_repo_id`, so it must not run under the pre-adoption sole-repo
+        // fallback).
+        db.ensure_graph_index_current()?;
+        db.ensure_generated_flags_current()?;
         if db.indexed_file_count()? == 0 {
             return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
@@ -338,13 +360,20 @@ impl IndexDatabase {
         }
         let overlays: Vec<(i64, String, String)> = {
             let conn = self.storage.connection();
+            // Direct `main.files` probes bypass the repo-scoped `files` view, so they carry the
+            // `repo_id` predicate explicitly (A3): in a consolidated DB two forks at the same
+            // commit share `commit_sha`/`worktree_id`, and without `repo_id` the
+            // committed-row probe below would see a SIBLING repo's committed row and
+            // delete THIS repo's overlay as if its own base row existed.
             let mut stmt = conn.prepare(
                 "SELECT id, path, sha256 FROM main.files
-                 WHERE worktree_id = ?1 AND worktree_id != '' AND kind != 'deleted'",
+                 WHERE repo_id = ?1 AND worktree_id = ?2 AND worktree_id != '' AND kind != \
+                 'deleted'",
             )?;
-            let rows = stmt.query_map([&self.active_worktree_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+            let rows = stmt
+                .query_map(params![self.active_repo_id, self.active_worktree_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut healed = 0usize;
@@ -354,8 +383,8 @@ impl IndexDatabase {
             }
             let committed_exists: bool = self.storage.connection().query_row(
                 "SELECT EXISTS(SELECT 1 FROM main.files
-                 WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = '')",
-                params![path, self.active_commit_sha],
+                 WHERE repo_id = ?1 AND path = ?2 AND commit_sha = ?3 AND worktree_id = '')",
+                params![self.active_repo_id, path, self.active_commit_sha],
                 |row| row.get(0),
             )?;
             if committed_exists {

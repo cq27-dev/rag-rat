@@ -263,6 +263,16 @@ pub(crate) fn symbols_for_file(
 /// raw `symbols` duplicated every symbol whenever multiple scopes coexist and collapsed edge
 /// resolution (#89).
 pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol>> {
+    // Scope the edge-resolution CANDIDATE POOL to the active repo (A3). This SELECT joins `files` —
+    // the per-connection scope VIEW when one is installed (rebuild / incremental / overlay), which
+    // already filters `repo_id`. But the bare-open graph refresh (`IndexDatabase::open` →
+    // `ensure_graph_index_current`) runs with NO scope view, so `files` resolves to the unscoped
+    // `main.files` and would pull EVERY repo's symbols into the pool in a consolidated DB — letting
+    // repo A's edges resolve onto repo B's symbols. The `main.files` sub-select pins the pool to
+    // the active repo in both cases: redundant under a scope view (view rows ⊆ active repo),
+    // and the sole repo predicate on the view-less path. `active_repo_id` falls back to
+    // `sole_repo_id` when no context is installed, matching the bare-open scope.
+    let active_repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, qn.value, symbols.kind,
@@ -271,10 +281,11 @@ pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol
         FROM symbols
         JOIN files ON files.id = symbols.file_id
         LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+        WHERE symbols.file_id IN (SELECT id FROM main.files WHERE repo_id = ?1)
         ORDER BY qn.value
         ",
     )?;
-    let rows = stmt.query_map([], symbol_row)?;
+    let rows = stmt.query_map(rusqlite::params![active_repo_id], symbol_row)?;
     collect_rows(rows)
 }
 pub(crate) fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {

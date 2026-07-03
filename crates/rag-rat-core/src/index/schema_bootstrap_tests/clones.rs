@@ -1384,6 +1384,8 @@ fn clones_for_symbol_returns_the_class_by_ref_and_by_path_line() {
     assert!(solo_res.symbol_resolved, "the solo symbol still resolves");
     assert!(solo_res.symbol_fingerprinted, "the solo function is eligible (fingerprinted)");
 
+    // Post-condition: the clone rebuild/precompute must not touch a sibling repo (round-6 harness).
+    crate::index::poison_sibling::assert_sibling_intact(db2.storage.connection());
     let _ = fs::remove_dir_all(root);
 }
 

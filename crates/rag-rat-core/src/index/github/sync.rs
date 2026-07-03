@@ -208,8 +208,13 @@ pub(crate) fn discover_commit_refs(
     default_repo: Option<&str>,
     out: &mut Vec<GitHubRef>,
 ) -> anyhow::Result<()> {
-    let mut stmt = conn.prepare("SELECT hash, subject, body FROM git_commits")?;
-    let rows = stmt.query_map([], |row| {
+    // `git_commits` is direct-scoped (V040), so discovery only mines the ACTIVE repo's commit
+    // messages for issue refs — a consolidated DB must not attribute a sibling repo's `#N` refs to
+    // this repo.
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let mut stmt =
+        conn.prepare("SELECT hash, subject, body FROM git_commits WHERE repo_id = ?1")?;
+    let rows = stmt.query_map([&repo_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
     })?;
     for row in rows {

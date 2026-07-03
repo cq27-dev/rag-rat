@@ -22,14 +22,19 @@ const SENTINEL_PATH: &str = "__rag_rat_reload_sentinel__";
 
 fn insert_sentinel_commit(db: &IndexDatabase) {
     let conn = db.storage.connection();
-    // git_file_changes.commit_hash has a FK to git_commits.hash, so reuse a real commit hash; the
-    // sentinel marker is the path, which the reload wipes along with every other change row.
-    let hash: String =
-        conn.query_row("SELECT hash FROM git_commits LIMIT 1", [], |row| row.get(0)).unwrap();
+    // git_file_changes has a COMPOSITE FK `(repo_id, commit_hash) → git_commits(repo_id, hash)`
+    // (V040), so reuse a real commit's BOTH keys; the sentinel marker is the path, which the reload
+    // wipes along with every other change row.
+    let (hash, repo_id): (String, String) = conn
+        .query_row("SELECT hash, repo_id FROM git_commits LIMIT 1", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
     conn.execute(
-        "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind)
-         VALUES (?1, ?2, 0, 0, 'modified')",
-        rusqlite::params![hash, SENTINEL_PATH],
+        "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind, \
+         repo_id)
+         VALUES (?1, ?2, 0, 0, 'modified', ?3)",
+        rusqlite::params![hash, SENTINEL_PATH, repo_id],
     )
     .unwrap();
 }
@@ -268,11 +273,17 @@ fn calls_edge_target(db: &IndexDatabase, path: &str) -> Option<i64> {
         .unwrap()
 }
 
-/// Global `parser_failures` row count (the table is unscoped — keyed by `path` only).
+/// The ACTIVE repo's `parser_failures` row count. Scoped by `repo_id` (V040 gave `parser_failures`
+/// a `(repo_id, path)` PK), so a consolidated DB's other repos — including the poison-sibling test
+/// tripwire — never inflate the "this repo's parse failures" count the overlay tests assert on.
 fn parser_failure_total(db: &IndexDatabase) -> i64 {
     db.storage
         .connection()
-        .query_row("SELECT COUNT(*) FROM parser_failures", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM parser_failures WHERE repo_id = ?1",
+            [&db.active_repo_id],
+            |row| row.get(0),
+        )
         .unwrap()
 }
 
@@ -296,6 +307,24 @@ fn overlay_row_count(db: &IndexDatabase) -> i64 {
         .connection()
         .query_row("SELECT COUNT(*) FROM main.files WHERE worktree_id != ''", [], |row| row.get(0))
         .unwrap()
+}
+
+/// A real git repo with one committed rust file, plus its source `Config` — the fixture the
+/// poison-sibling harness self-tests against. A REAL git root (not a bare temp dir) so
+/// `adopt_repo_from_config` registers a portable repo id (a non-git root is `Absent` and stays
+/// under the placeholder, which would leave `real_repos == 0` and defeat the opt-out self-check).
+pub(crate) fn poison_test_config(tag: &str) -> (PathBuf, Config) {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), format!("pub fn {tag}_anchor() -> i32 {{ 1 }}\n")).unwrap();
+    run_git(&root, &["init", "-q", "-b", "main"]);
+    run_git(&root, &["config", "user.email", "t@e"]);
+    run_git(&root, &["config", "user.name", "t"]);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "seed"]);
+    let config = source_config(root.clone(), Language::Rust);
+    (root, config)
 }
 
 fn source_config(root: PathBuf, language: Language) -> Config {
@@ -679,12 +708,15 @@ fn insert_stale_overlay_row(db: &IndexDatabase, path: &str, worktree_id: &str) -
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
+    // Stamp the ACTIVE repo id (V040): a stale overlay row is a leftover from a prior index of the
+    // SAME repo, so it must carry that repo's id for the full-rebuild staging + scope view to see
+    // it.
     db.storage
         .connection()
         .execute(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
-             commit_sha, worktree_id) VALUES (?1, ?2, ?3, ?4, 0, 0, '', ?5)",
-            rusqlite::params![path, language, kind, sha, worktree_id],
+             commit_sha, worktree_id, repo_id) VALUES (?1, ?2, ?3, ?4, 0, 0, '', ?5, ?6)",
+            rusqlite::params![path, language, kind, sha, worktree_id, db.active_repo_id],
         )
         .unwrap();
     db.storage.connection().last_insert_rowid()
@@ -799,6 +831,7 @@ mod dispatch;
 mod git_history_reload;
 mod github_papertrail;
 mod graph_edges;
+mod multi_repo_scope;
 mod orientation_healing;
 mod reconcile_embeddings;
 mod repo_memory;

@@ -70,6 +70,12 @@ fn dirty_git_files_are_indexed_as_worktree_overlay() {
 
 #[test]
 fn rebuild_populates_revision_metadata_and_fresh_fts_state() {
+    // `content_revision` is a deliberately-GLOBAL digest over the whole `files` table (round-5 kept
+    // it in `index_meta`, not per-repo), and `fts_source_revision` tracks it. This test asserts the
+    // FRESH digest equals the value stored at rebuild time — but the poison-sibling harness seeds a
+    // file AFTER the rebuild commits, so the fresh digest legitimately includes it while the stored
+    // value does not. A whole-DB-digest assertion; opt out.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let (root, config) = markdown_config("alpha token");
     let db = IndexDatabase::rebuild(&config).unwrap();
     let status = db.status(&config.database).unwrap();
@@ -77,7 +83,7 @@ fn rebuild_populates_revision_metadata_and_fresh_fts_state() {
     assert!(!status.content_revision.is_empty());
     assert_eq!(status.fts_source_revision.as_deref(), Some(status.content_revision.as_str()));
     assert_eq!(
-        db.repo_meta("content_revision").unwrap().as_deref(),
+        db.meta("content_revision").unwrap().as_deref(),
         Some(status.content_revision.as_str())
     );
     assert!(!status.fts_dirty);
@@ -547,6 +553,9 @@ fn discover_deletion_is_worktree_scoped() {
     assert_eq!(active("src/a.rs"), 0, "deleted file still active in own worktree");
     assert_eq!(active("src/b.rs"), 1, "live file dropped from own worktree");
 
+    // Post-condition: a worktree-scoped discover-deletion must not delete a sibling repo's rows
+    // (round-6 harness) — the same "delete only my scope" invariant, widened to the repo axis.
+    crate::index::poison_sibling::assert_sibling_intact(conn);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -611,6 +620,8 @@ fn gc_refuses_to_prune_with_no_live_context() {
     assert_eq!(report.files_pruned, 0);
     assert_eq!(table_row_count(db.storage.connection(), "files").unwrap(), before);
 
+    // Post-condition: the refused prune must leave the poison sibling untouched (round-6 harness).
+    crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
     let _ = fs::remove_dir_all(root);
 }
 

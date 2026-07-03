@@ -25,7 +25,7 @@ pub(crate) fn sync_from_refs_with_progress<C: GitHubClient>(
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
         sync_refs(conn, client, refs.iter(), &mut progress)?
     };
-    let repo_id = schema::single_repo_id(conn)?;
+    let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
     Ok(GitHubSyncReport {
         offline,
@@ -63,7 +63,7 @@ pub(crate) fn sync_issue<C: GitHubClient>(
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
         sync_refs(conn, client, refs.iter().filter(|r| r.number == parsed.number), &mut |_| {})?
     };
-    let repo_id = schema::single_repo_id(conn)?;
+    let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
     Ok(GitHubSyncReport {
         offline,
@@ -83,7 +83,7 @@ pub(crate) fn status(conn: &Connection, ctx: &GitHubContext) -> anyhow::Result<G
         pulls: table_row_count(conn, "github_pull_requests")?,
         reviews: table_row_count(conn, "github_reviews")?,
         review_comments: table_row_count(conn, "github_review_comments")?,
-        last_sync_ms: repo_meta(conn, &schema::single_repo_id(conn)?, "github_last_sync_ms")?
+        last_sync_ms: repo_meta(conn, &schema::active_repo_id(conn)?, "github_last_sync_ms")?
             .and_then(|value| value.parse().ok()),
         capability: if ctx.gh_available {
             "gh_cli_available".to_string()
@@ -191,12 +191,17 @@ pub(crate) fn papertrail_for_commit(
     let mut evidence = evidence_for_commit_refs(conn, commit_hash, limit)?;
     let mut fallback_evidence = Vec::new();
     if evidence.is_empty() {
+        // `git_file_changes` is direct-scoped (V040): the prefix probe must not resolve a sibling
+        // repo's commit in a consolidated DB (forks share hashes).
+        let repo_id = schema::active_repo_id(conn)?;
         let mut stmt = conn.prepare(
-            "SELECT path FROM git_file_changes WHERE commit_hash LIKE ?1 ORDER BY path LIMIT ?2",
+            "SELECT path FROM git_file_changes WHERE commit_hash LIKE ?1 AND repo_id = ?3 ORDER \
+             BY path LIMIT ?2",
         )?;
         let commit_like = format!("{commit_hash}%");
-        let rows =
-            stmt.query_map(params![commit_like, i64::from(limit)], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![commit_like, i64::from(limit), repo_id], |row| {
+            row.get::<_, String>(0)
+        })?;
         for row in rows {
             fallback_evidence.extend(evidence_for_path(conn, &row?, limit)?);
         }

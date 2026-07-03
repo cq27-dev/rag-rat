@@ -32,7 +32,7 @@ pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
 /// still owed (falling back to the read-write open, which heals once).
 pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<bool> {
     // The active-model meta moved to `repo_meta` (V039); check the active repo's row there.
-    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     for model_id in LEGACY_MODEL_IDS {
         let lingering: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM ai_models WHERE model_id = ?1)
@@ -71,7 +71,7 @@ pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<boo
 
 pub(crate) fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
     // The active-model meta moved to `repo_meta` (V039); clear it for the active repo.
-    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     for model_id in LEGACY_MODEL_IDS {
         conn.execute("DELETE FROM chunk_embeddings WHERE model_id = ?1", params![model_id])?;
         conn.execute("DELETE FROM ai_models WHERE model_id = ?1", params![model_id])?;

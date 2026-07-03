@@ -324,6 +324,7 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
         conn.connection(),
         &config.root,
         Path::new(&input.cwd),
+        config.repo_id_override.as_deref(),
     )?;
     let (live, enabled) = watcher_state(&config);
     print!("{}", format_digest(&o, live, enabled));
@@ -719,9 +720,20 @@ fn fallback_compose(config: &Config, cwd: &str, search: &Search) -> Option<Strin
     let conn = IndexConnection::open_read_only(&config.database).ok()?;
     // Scope to the session's worktree overlay before composing — `compose` queries the `files`
     // view, so without this it would read raw (unscoped) rows. config.root is the anchored main
-    // worktree; cwd is the session dir (a linked worktree → its overlay, else base) (#219).
+    // worktree; cwd is the session dir (a linked worktree → its overlay, else base) (#219). Resolve
+    // the repo dimension from this config (identity + override) so the scope binds the config's
+    // repo, not the config-blind sole repo (a sibling in a consolidated DB); an unprovable repo →
+    // empty scope, never a sibling's rows.
+    let repo_id = rag_rat_core::index::resolve_scope_repo_id(
+        conn.connection(),
+        &config.root,
+        config.repo_id_override.as_deref(),
+    )
+    .ok()?
+    .unwrap_or_default();
     rag_rat_core::index::install_worktree_scope_view(
         conn.connection(),
+        &repo_id,
         &config.root,
         Path::new(cwd),
     )

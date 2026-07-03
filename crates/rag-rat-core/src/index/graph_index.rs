@@ -29,14 +29,23 @@ impl LogicalSymbolKey {
         }
     }
 
-    /// Deterministic logical-symbol id derived from the key, so it is **stable across reindex**
-    /// (the table is fully rebuilt each pass; an autoincrement rowid would churn the id every
-    /// time, breaking any cached id or logical-symbol-bound memory). A 63-bit truncation of the
-    /// key's SHA-256 — collisions are astronomically unlikely across a repo's symbols, and a
-    /// collision would surface as a loud primary-key error on rebuild rather than silent merging.
-    pub(super) fn stable_id(&self) -> i64 {
+    /// Deterministic logical-symbol id derived from the key AND its owning `repo_id`, so it is
+    /// **stable across reindex** (the table is fully rebuilt each pass; an autoincrement rowid
+    /// would churn the id every time, breaking any cached id or logical-symbol-bound memory)
+    /// yet **repo-distinct** (A3). Folding `repo_id` in is what prevents two repos with
+    /// byte-identical file content from deriving the SAME content-only id and colliding on the
+    /// `logical_symbols.id` PK in a consolidated DB. Fold — not a composite `(repo_id, id)` PK
+    /// — because `id` is ALSO the scalar `sym_<hex>` wire handle and the FK/PK target of
+    /// `logical_symbol_members`, `logical_symbol_monikers`, and `repo_memory_bindings`, so it
+    /// MUST stay a single globally- unique scalar; a composite PK would demote `id` to
+    /// non-unique and break every one of those. `repo_id` is invariant across reindex, so the
+    /// id is as stable as before. A 63-bit truncation of the SHA-256 — collisions are
+    /// astronomically unlikely across a repo's symbols, and a collision would surface as a loud
+    /// primary-key error on rebuild rather than silent merging.
+    pub(super) fn stable_id(&self, repo_id: &str) -> i64 {
         let canonical = format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            repo_id,
             self.language,
             self.path,
             self.name,
@@ -49,6 +58,139 @@ impl LogicalSymbolKey {
         bytes.copy_from_slice(&digest[..8]);
         (u64::from_be_bytes(bytes) >> 1) as i64
     }
+}
+
+/// Recompute every `logical_symbols` row's content-derived id from its OWN `repo_id` and re-point
+/// that id everywhere it is referenced, so ids stay consistent now that
+/// [`LogicalSymbolKey::stable_id`] folds `repo_id` in (A3). Returns the number of rows remapped.
+///
+/// WHY: on an UPGRADED DB (existing pre-fold `logical_symbols`), or when a `repo_id` changes at
+/// adoption (placeholder → real), the next [`IndexDatabase::rebuild_logical_symbols`] would
+/// re-derive every logical symbol under a NEW id, dangling every `repo_memory_bindings`,
+/// `repo_memory_call_paths`, `logical_symbol_monikers`, and `logical_symbol_members` row that still
+/// points at the OLD id (pre-V040 memories + oracle data). This migrates those references IN PLACE
+/// before the first rebuild, so a bound memory resolves to the same symbol under the new id. Called
+/// from the V040 migration (after the `repo_id` backfill) and from [`register_repo`] adoption
+/// (after the placeholder → real re-point), both idempotent: a row already at `hash(repo_id ‖ key)`
+/// is skipped, so the two calls compose without double-remapping.
+///
+/// The hash inputs are row-resident EXCEPT `signature`, which `logical_symbols` does not store —
+/// recover it from any member's `symbols.signature` (every member of a group shares it, since the
+/// signature is part of the key). A logical symbol with no live member is an orphan the next
+/// rebuild would drop anyway (its binding is already effectively dead), so it is left untouched.
+///
+/// FK NOTE: `logical_symbol_members` carries an `ON DELETE CASCADE` FK to `logical_symbols(id)`, so
+/// the caller MUST run with FK enforcement OFF (the V040 migration) or DEFERRED
+/// (`PRAGMA defer_foreign_keys = ON`, the adoption transaction) — else the parent-id UPDATE trips
+/// the child FK. The remap runs inside the caller's transaction (torn-safe) and uses a NEGATIVE
+/// temp-id pass so a new id that equals another remapped row's OLD id can never collide on the PK
+/// mid-migration.
+pub(crate) fn realign_logical_symbol_ids(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    struct Row {
+        old_id: i64,
+        repo_id: String,
+        language: String,
+        path: String,
+        name: String,
+        qualified_name: Option<String>,
+        kind: String,
+        signature: Option<String>,
+    }
+    let mut stmt = conn.prepare(
+        "SELECT ls.id, ls.repo_id, ls.language, ls.path, ls.logical_name,
+                (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
+                ls.kind,
+                (SELECT s.signature FROM logical_symbol_members m
+                   JOIN symbols s ON s.id = m.symbol_id
+                  WHERE m.logical_symbol_id = ls.id LIMIT 1)
+         FROM logical_symbols ls",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Row {
+                old_id: r.get(0)?,
+                repo_id: r.get(1)?,
+                language: r.get(2)?,
+                path: r.get(3)?,
+                name: r.get(4)?,
+                qualified_name: r.get(5)?,
+                kind: r.get(6)?,
+                signature: r.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut remap: Vec<(i64, i64)> = Vec::new();
+    for row in rows {
+        // A NULL interned `qualified_name` means the row predates the #224 backfill (rebuild would
+        // itself fail on it) or is otherwise unrecoverable — skip rather than hash a wrong key.
+        let Some(qualified_name) = row.qualified_name else {
+            continue;
+        };
+        let key = LogicalSymbolKey {
+            language: row.language,
+            path: row.path,
+            name: row.name,
+            qualified_name,
+            kind: row.kind,
+            signature: row.signature,
+        };
+        let new_id = key.stable_id(&row.repo_id);
+        if new_id != row.old_id {
+            remap.push((row.old_id, new_id));
+        }
+    }
+
+    // Two-phase through negative temp ids: `stable_id` values are all >= 0 (`>> 1`), so a `-(i+1)`
+    // temp can never collide with a real id or with another temp. Phase 1 vacates every OLD id in
+    // the remap set; phase 2 lands the finals — so a new id equal to another remapped row's old
+    // id never trips the PK mid-pass. (A new id equal to an already-aligned row's id is a
+    // 63-bit hash collision — the same astronomically-unlikely case a plain rebuild already
+    // surfaces loudly.)
+    for (i, (old_id, _)) in remap.iter().enumerate() {
+        let temp_id = -(i as i64 + 1);
+        rewrite_logical_symbol_id(conn, *old_id, temp_id)?;
+    }
+    for (i, (_, new_id)) in remap.iter().enumerate() {
+        let temp_id = -(i as i64 + 1);
+        rewrite_logical_symbol_id(conn, temp_id, *new_id)?;
+    }
+    Ok(remap.len())
+}
+
+/// Move a single logical-symbol id from `from` to `to` across the PK row and every column that
+/// references it — the members join table, the per-tool monikers, and the two durable-memory
+/// reference tables (`repo_memory_bindings`, `repo_memory_call_paths`' start/end). See
+/// [`realign_logical_symbol_ids`] for the FK-off/deferred requirement.
+fn rewrite_logical_symbol_id(
+    conn: &rusqlite::Connection,
+    from: i64,
+    to: i64,
+) -> rusqlite::Result<()> {
+    conn.execute("UPDATE logical_symbols SET id = ?1 WHERE id = ?2", params![to, from])?;
+    conn.execute(
+        "UPDATE logical_symbol_members SET logical_symbol_id = ?1 WHERE logical_symbol_id = ?2",
+        params![to, from],
+    )?;
+    conn.execute(
+        "UPDATE logical_symbol_monikers SET logical_symbol_id = ?1 WHERE logical_symbol_id = ?2",
+        params![to, from],
+    )?;
+    conn.execute(
+        "UPDATE repo_memory_bindings SET logical_symbol_id = ?1 WHERE logical_symbol_id = ?2",
+        params![to, from],
+    )?;
+    conn.execute(
+        "UPDATE repo_memory_call_paths SET start_logical_symbol_id = ?1
+          WHERE start_logical_symbol_id = ?2",
+        params![to, from],
+    )?;
+    conn.execute(
+        "UPDATE repo_memory_call_paths SET end_logical_symbol_id = ?1
+          WHERE end_logical_symbol_id = ?2",
+        params![to, from],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -79,17 +221,26 @@ impl IndexDatabase {
     }
 
     pub(super) fn rebuild_logical_symbols(&self) -> anyhow::Result<()> {
-        // The insert below re-derives the COMPLETE logical-symbol table from all current symbols,
-        // so clear it entirely first. A member-join "rebuild set" misses logical_symbols whose
-        // members were cascade-deleted with their symbols (clear_full_rebuild_tables deletes
-        // files → symbols → logical_symbol_members via FK, but logical_symbols has no such FK).
-        // Those orphans would then collide with the deterministic stable id on re-insert.
-        self.storage.connection().execute_batch(
-            "
-            DELETE FROM main.logical_symbol_members;
-            DELETE FROM main.logical_symbols;
-            ",
+        // The insert below re-derives the COMPLETE logical-symbol table for the ACTIVE REPO from
+        // its current symbols, so clear that repo's rows entirely first. A member-join
+        // "rebuild set" misses logical_symbols whose members were cascade-deleted with
+        // their symbols (clear_full_rebuild_tables deletes files → symbols →
+        // logical_symbol_members via FK, but logical_symbols has no such FK). Those orphans
+        // would then collide with the deterministic stable id on re-insert. Scoped to
+        // `active_repo_id` (A3): a wholesale clear would wipe a sibling repo's grouping in
+        // a consolidated DB, and the content-derived stable ids can collide across repos —
+        // so the DELETE and the re-derive SELECT both filter this repo. (The
+        // A6 note "constrained to the active repo slice" is folded in here, since the wholesale
+        // cross-repo rebuild became incorrect the moment `logical_symbols` gained `repo_id`.)
+        let conn = self.storage.connection();
+        conn.execute(
+            "DELETE FROM main.logical_symbol_members
+             WHERE logical_symbol_id IN (SELECT id FROM main.logical_symbols WHERE repo_id = ?1)",
+            params![self.active_repo_id],
         )?;
+        conn.execute("DELETE FROM main.logical_symbols WHERE repo_id = ?1", params![
+            self.active_repo_id
+        ])?;
 
         // STREAM the grouping instead of materializing every symbol. The previous version built a
         // `BTreeMap<LogicalSymbolKey, Vec<row>>` over ALL symbols — at kernel scale ~3.5M rows ×
@@ -103,17 +254,18 @@ impl IndexDatabase {
         // current group's members (kilobytes). Byte-identical: same grouping, same
         // `logical_symbols` insert order (ids are content-derived via `stable_id`, not rowids), and
         // the same member order, verified against the golden index.
-        // Read RAW `main.files` (all scopes), NOT the per-connection `files` scope VIEW.
-        // logical_symbols is a GLOBAL table; building it must not depend on whichever scope happens
-        // to be active. When this runs in a worktree-overlay context (a scope view IS installed),
-        // an unqualified `files` resolves to the scoped temp view, so the wholesale DELETE
-        // + repopulate would WIPE every other scope's grouping (base + sibling worktrees)
-        // and restore only the active scope's — persistently breaking `sym_<hex>`-handle
-        // graph nav for base symbols (the #219 review finding). Reading `main.files`
-        // groups every symbol in every live scope; the content-derived `stable_id`
-        // collapses cross-scope duplicates into one logical symbol with per-scope members,
-        // and downstream reads stay scope-filtered via the `files` view.
-        let conn = self.storage.connection();
+        // Read RAW `main.files` (ALL of the active repo's scopes), NOT the per-connection `files`
+        // scope VIEW. logical_symbols is per-repo but scope-INDEPENDENT within a repo; building it
+        // must not depend on whichever commit/worktree scope happens to be active. When this runs
+        // in a worktree-overlay context (a scope view IS installed), an unqualified `files`
+        // resolves to the scoped temp view, so the DELETE + repopulate would WIPE every
+        // other scope's grouping (base + sibling worktrees) and restore only the active
+        // scope's — persistently breaking `sym_<hex>`-handle graph nav for base symbols
+        // (the #219 review finding). Filtering `main.files.repo_id` (A3) keeps every symbol
+        // in every live scope OF THIS REPO while excluding a sibling repo's rows in a
+        // consolidated DB; the content-derived `stable_id` collapses cross-scope duplicates
+        // into one logical symbol with per-scope members, and downstream reads stay
+        // scope-filtered via the `files` view.
         let mut stmt = conn.prepare(
             "
             SELECT symbols.id, main.files.path, symbols.language, symbols.name,
@@ -122,11 +274,12 @@ impl IndexDatabase {
             FROM main.symbols AS symbols
             JOIN main.files ON main.files.id = symbols.file_id
             LEFT JOIN main.name_strings qn ON qn.id = symbols.qualified_name_id
+            WHERE main.files.repo_id = ?1
             ORDER BY symbols.language, main.files.path, symbols.name, qn.value,
                      symbols.kind, symbols.signature, symbols.start_byte, symbols.end_byte
             ",
         )?;
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params![self.active_repo_id])?;
         let mut current: Option<(LogicalSymbolKey, Vec<LogicalSymbolMemberRow>)> = None;
         while let Some(row) = rows.next()? {
             let member = LogicalSymbolMemberRow {
@@ -154,14 +307,14 @@ impl IndexDatabase {
                 current.as_mut().expect("same_group implies Some").1.push(member);
             } else {
                 if let Some((key, members)) = current.take() {
-                    Self::insert_logical_group(conn, &key, &members)?;
+                    Self::insert_logical_group(conn, &self.active_repo_id, &key, &members)?;
                 }
                 let key = LogicalSymbolKey::from(&member);
                 current = Some((key, vec![member]));
             }
         }
         if let Some((key, members)) = current.take() {
-            Self::insert_logical_group(conn, &key, &members)?;
+            Self::insert_logical_group(conn, &self.active_repo_id, &key, &members)?;
         }
         Ok(())
     }
@@ -255,7 +408,19 @@ impl IndexDatabase {
         };
         self.storage.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| -> anyhow::Result<()> {
-            self.storage.connection().execute("DELETE FROM edges_data", [])?;
+            // Scope the wipe to the ACTIVE REPO's edges (A3): `graph_index_version` is per-repo, so
+            // a stale/missing version for repo A must not wipe repo B's edges in a
+            // consolidated DB. An edge belongs to its `source_file_id`'s repo;
+            // `source_file_id` is always set (its FK is `ON DELETE CASCADE`, every edge
+            // is inserted with a file id), so this removes exactly this repo's edges —
+            // the same set the repopulate below (over the repo-scoped `files`
+            // view) re-derives. Within the repo this matches the prior wholesale behavior; only
+            // sibling repos are now spared.
+            self.storage.connection().execute(
+                "DELETE FROM edges_data
+                  WHERE source_file_id IN (SELECT id FROM main.files WHERE repo_id = ?1)",
+                params![self.active_repo_id],
+            )?;
             // Repopulate the per-package import scope BEFORE re-resolving (#61). A bare
             // version-bump re-resolve would re-derive `import_scope_*` on the new edges
             // but read an empty `packages` table (V022 only ADDED the column; it did not

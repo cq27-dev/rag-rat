@@ -1,4 +1,13 @@
 //! Full-text search (FTS5) index lifecycle: rebuild/sync the FTS mirror and track its freshness.
+//!
+//! FTS FRESHNESS KEYS ARE GLOBAL, NOT PER-REPO (V040 reclassification). `chunk_fts` is ONE FTS5
+//! index over the whole `chunks` table (never repo-scoped), and its freshness digest
+//! (`content_revision()`) is computed over the GLOBAL `main.files`. So `fts_dirty`,
+//! `fts_source_revision`, and `fts_synced_at_ms` track global infrastructure and MUST live in the
+//! global `index_meta` (`self.meta` / `self.set_meta`), not per-repo `repo_meta`. V039 relocated
+//! them to `repo_meta` under the one-DB-per-repo assumption; per-repo copies made a consolidated DB
+//! pay a full FTS rebuild forever after a sibling synced (stale-dirty loop). Do NOT route these
+//! back through `self.repo_meta` / `self.set_repo_meta`.
 
 use super::*;
 
@@ -11,7 +20,7 @@ impl IndexDatabase {
         schema::rebuild_commit_fts(self.storage.connection())?;
         self.record_content_revision()?;
         self.record_fts_current()?;
-        self.set_repo_meta("fts_dirty", "false")?;
+        self.set_meta("fts_dirty", "false")?;
         Ok(())
     }
 
@@ -22,7 +31,7 @@ impl IndexDatabase {
         schema::rebuild_commit_fts(self.storage.connection())?;
         self.record_content_revision()?;
         self.record_fts_current()?;
-        self.set_repo_meta("fts_dirty", "false")?;
+        self.set_meta("fts_dirty", "false")?;
         Ok(())
     }
 
@@ -75,29 +84,29 @@ impl IndexDatabase {
     pub fn sync_fts(&self) -> anyhow::Result<()> {
         self.record_content_revision()?;
         self.record_fts_current()?;
-        self.set_repo_meta("fts_dirty", "false")?;
+        self.set_meta("fts_dirty", "false")?;
         Ok(())
     }
 
     fn record_fts_current(&self) -> anyhow::Result<()> {
-        self.set_repo_meta("fts_synced_at_ms", &now_ms().to_string())?;
+        self.set_meta("fts_synced_at_ms", &now_ms().to_string())?;
         let revision = self.content_revision()?;
-        self.set_repo_meta("fts_source_revision", &revision)?;
+        self.set_meta("fts_source_revision", &revision)?;
         Ok(())
     }
 
     pub(super) fn mark_fts_dirty(&self) -> anyhow::Result<()> {
-        self.set_repo_meta("fts_dirty", "true")
+        self.set_meta("fts_dirty", "true")
     }
 
     pub(super) fn ensure_fts_fresh(&self) -> anyhow::Result<()> {
         let content_revision = self.content_revision()?;
-        let fts_source_revision = self.repo_meta("fts_source_revision")?;
+        let fts_source_revision = self.meta("fts_source_revision")?;
         if !self.fts_dirty()? && fts_source_revision.as_deref() == Some(content_revision.as_str()) {
             return Ok(());
         }
         self.rebuild_fts()?;
-        let refreshed_revision = self.repo_meta("fts_source_revision")?;
+        let refreshed_revision = self.meta("fts_source_revision")?;
         if refreshed_revision.as_deref() != Some(content_revision.as_str()) {
             anyhow::bail!(
                 "FTS freshness invariant failed: content_revision={content_revision}, \
@@ -109,6 +118,6 @@ impl IndexDatabase {
     }
 
     pub(super) fn fts_dirty(&self) -> anyhow::Result<bool> {
-        Ok(self.repo_meta("fts_dirty")?.as_deref() == Some("true"))
+        Ok(self.meta("fts_dirty")?.as_deref() == Some("true"))
     }
 }

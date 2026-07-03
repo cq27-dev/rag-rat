@@ -851,6 +851,9 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
     assert!(path.contains("b.rs"), "binding path should be b.rs after relocation: {path}");
     assert_ne!(binding.anchor_status, "gone");
 
+    // Post-condition: memory validation/relocation (which rewrites bindings) must not rebind onto,
+    // or delete, a SIBLING repo's rows (round-6 harness; guards the P2 #2 relocation scoping).
+    crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
     let _ = fs::remove_dir_all(root);
 }
 

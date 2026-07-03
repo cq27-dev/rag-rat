@@ -69,15 +69,24 @@ pub(crate) fn validate_logical_symbol_binding(
         }
         return validate_bound_chunk(conn, binding);
     }
+    // Scope the qualified-name relocation to the ACTIVE repo. `logical_symbols` is direct-scoped by
+    // `repo_id` (V040) and its ids are repo-distinct, so a consolidated DB can hold the SAME
+    // qualified name under a sibling repo. Without the predicate, validating repo A's memory (whose
+    // remembered symbol was deleted/renamed) could rebind it to repo B's logical id/path and report
+    // `relocated` instead of `gone`/`stale`. The `files`-view queries elsewhere in this module are
+    // repo-scoped for free through the scope view; `logical_symbols` is a direct table, so it needs
+    // the explicit filter.
+    let active_repo_id = crate::index::schema::active_repo_id(conn)?;
     let relocated = conn
         .query_row(
             "
             SELECT id, path
             FROM logical_symbols
             WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
+              AND repo_id = ?2
             LIMIT 1
             ",
-            [&binding.binding_id],
+            params![&binding.binding_id, active_repo_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
@@ -415,7 +424,7 @@ pub(crate) fn validate_path_binding(
 /// active checkout root and only falls back to this (#98 review).
 fn persisted_source_root(conn: &Connection) -> Option<PathBuf> {
     // `source_root` moved to `repo_meta` (V039); resolve the active repo (the lone one in phase A).
-    let repo_id = crate::index::schema::single_repo_id(conn).ok()?;
+    let repo_id = crate::index::schema::active_repo_id(conn).ok()?;
     crate::index::repo_meta(conn, &repo_id, "source_root").ok().flatten().map(PathBuf::from)
 }
 

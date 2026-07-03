@@ -2,13 +2,34 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::repo_identity::RepoIdentity;
+use crate::repo_identity::{LOCAL_ONLY_ID_PREFIX, RepoIdentity, RepoIdentityClass};
+
+/// The `temp.connection_context` key under which the scope view stashes the active repo id (beside
+/// `commit_sha` / `worktree_id`). [`active_repo_id`] reads it; `install_scope_view` writes it.
+pub(crate) const CONNECTION_CONTEXT_REPO_KEY: &str = "repo_id";
+
+/// The direct-scoped tables that gained a `repo_id TEXT NOT NULL` column in V040 (phase A3) and
+/// therefore need their [`LEGACY_REPO_ID`] placeholder rows re-pointed at the real id when
+/// [`register_repo`] adopts a legacy DB. `git_file_changes` is intentionally ABSENT: its
+/// `(repo_id, commit_hash)` FK to `git_commits(repo_id, hash)` is `ON UPDATE CASCADE`, so rewriting
+/// `git_commits.repo_id` re-points its rows automatically — an explicit UPDATE would instead trip
+/// the FK (the child would reference the real id before the parent moved). `repo_meta` is handled
+/// separately (its FK is to `repos`, and it moved in V039). The A1 adoption contract requires every
+/// direct-scoped table backfill in the same call as the `repos`-row rewrite.
+const V040_DIRECT_SCOPED_TABLES: &[&str] =
+    &["files", "packages", "logical_symbols", "docs", "parser_failures", "git_commits"];
 
 /// The placeholder `repo_id` a freshly-migrated single-repo DB carries until it is adopted (see the
 /// V038 DDL) — and the backfill value every direct-scoped table gets when later migrations add
 /// `repo_id` columns (phase A3). A consolidated DB holding more than one repo NEVER carries this id
 /// (enforced by [`register_repo`]).
 pub const LEGACY_REPO_ID: &str = "__unassigned__";
+
+/// The `repo_meta` key a [`LocalOnly`](crate::repo_identity::RepoIdentityClass::LocalOnly)
+/// registration records its SORTED shallow-boundary commit hashes under (newline-joined), so a
+/// later LocalOnly→Portable upgrade can PROVE the incoming deepened clone is the same repository —
+/// its HEAD must reach these boundary commits. Absent ⇒ no proof recorded ⇒ the upgrade is refused.
+const SHALLOW_BOUNDARY_META_KEY: &str = "shallow_boundary";
 
 /// Register `identity` in this database's `repos`/`repo_roots` registry, returning the stored
 /// `repo_id`.
@@ -20,9 +41,17 @@ pub const LEGACY_REPO_ID: &str = "__unassigned__";
 ///   `root` is recorded in `repo_roots`.
 /// - **Already this repo** → a no-op except that a not-yet-seen `root` is appended to `repo_roots`
 ///   (worktrees of one repo share a `repo_id`, so several roots on one machine are expected).
-/// - **A different real repo_id already owns the DB** → refuses (returns an error) rather than
-///   corrupting a single-repo DB. Multi-repo registration is deliberately out of scope until the
-///   default-path flip (phase A7); until then one DB == one repo.
+/// - **A `local:` incumbent + an incoming `Portable` id** → *upgrade in place*: the DB was first
+///   indexed under a machine-local shallow-clone id, and the caller has since deepened it (`git
+///   fetch --unshallow`, our own remedy) or pinned a stable id, so the incoming identity is now
+///   portable. Every scoped row, `repo_meta`, `repo_roots`, and logical-symbol id is re-pointed
+///   from the local id to the portable one (the same adoption machinery), rather than stranding the
+///   existing index behind a refusal.
+/// - **Any other different real repo_id already owns the DB** → refuses (returns an error) rather
+///   than corrupting a single-repo DB: two genuinely-different portable repos, or a `LocalOnly`
+///   incoming against a real incumbent (a deepened clone must never DOWNGRADE a portable id back to
+///   machine-local). Multi-repo registration is deliberately out of scope until the default-path
+///   flip (phase A7); until then one DB == one repo.
 ///
 /// `now_ms` is the injected clock (see the repo's time-injection convention), stamped as the
 /// registration time on adoption / first insert.
@@ -47,38 +76,73 @@ pub fn register_repo(
         )));
     }
 
-    let root = root.to_string_lossy();
+    let root_str = root.to_string_lossy();
     let real_ids = real_repo_ids(conn)?;
 
-    // Already registered under this id → idempotent; just make sure the root is recorded.
+    // Already registered under this id → idempotent; just make sure the root is recorded (and, for
+    // a LocalOnly re-registration of the same clone, that its shallow boundary is on record so
+    // a later upgrade can prove against it — self-healing for an index first registered before
+    // this gate).
     if real_ids.iter().any(|id| id == &identity.repo_id) {
-        record_repo_root(conn, &identity.repo_id, &root, now_ms)?;
+        record_repo_root(conn, &identity.repo_id, &root_str, now_ms)?;
+        persist_shallow_boundary(conn, identity)?;
         return Ok(identity.repo_id.clone());
     }
 
-    // A different real repo already owns this DB — refuse rather than adopt (single-repo invariant
-    // for phase A; multi-repo registration lands with the default-path flip).
-    if let Some(other) = real_ids.first() {
-        return Err(registry_refusal(format!(
-            "cannot register repo {}: this index is already registered to a different repo {}",
-            identity.repo_id, other
-        )));
-    }
+    // A different real repo already owns this DB. The single-repo invariant refuses a second repo —
+    // with ONE exception: a shallow-clone UPGRADE. The DB was first indexed under a machine-local
+    // `local:` id (a cut shallow clone), and the caller has since deepened it (`git fetch
+    // --unshallow`, our own remedy) or pinned a stable id, so the incoming identity is now
+    // `Portable`. Re-point the DB from the local id onto the portable one in place (below) instead
+    // of stranding the existing index behind a refusal. Every OTHER mismatch still refuses:
+    // Portable↔different-Portable (two genuinely different repos), and a `LocalOnly` incoming
+    // against any existing real repo (a deepened clone must never DOWNGRADE a portable id back to
+    // machine-local). Guarded on exactly one real repo — a consolidated DB (post-A7) is never
+    // upgraded through this path.
+    let upgrade_from = match real_ids.as_slice() {
+        [] => None,
+        [incumbent]
+            if incumbent.starts_with(LOCAL_ONLY_ID_PREFIX)
+                && identity.class == RepoIdentityClass::Portable =>
+        {
+            // The `local:` prefix + Portable incoming is NECESSARY but not SUFFICIENT: a DB first
+            // indexed from a cut shallow clone, later opened from an UNRELATED full repo at the
+            // same database path (or with a mistaken pin), would otherwise silently
+            // re-point every scoped row, repo_meta, root, and logical id onto that
+            // unrelated id — data loss across two repos. Require PROOF the incoming
+            // clone is a DEEPENED version of THIS incumbent: the incumbent's recorded
+            // shallow-boundary commits must be reachable from the incoming clone's HEAD
+            // (a `git fetch --unshallow` keeps those commits in history; a different
+            // repo reaches none of them). No recorded boundary (a pre-gate registration) counts as
+            // NO PROOF. Verified BEFORE the adoption transaction so a refusal touches nothing.
+            let boundary = read_shallow_boundary(conn, incumbent)?;
+            let proven = !boundary.is_empty()
+                && crate::repo_identity::boundary_reachable_from_head(root, &boundary)
+                    .unwrap_or(false);
+            if !proven {
+                return Err(registry_refusal(unproven_upgrade_error(incumbent, &identity.repo_id)));
+            }
+            Some(incumbent.clone())
+        },
+        _ =>
+            return Err(registry_refusal(format!(
+                "cannot register repo {}: this index is already registered to a different repo {}",
+                identity.repo_id, real_ids[0]
+            ))),
+    };
 
-    // No real repo yet: adopt the placeholder in ONE transaction. Insert the real `repos` row
-    // FIRST, re-point the placeholder's children, then drop the placeholder. Since V039 (phase
-    // A2) `repo_meta` carries rows under the placeholder, and its FK to `repos` is enforced
-    // (`foreign_keys = ON`), the placeholder PK cannot be rewritten in place while children
-    // reference it; the insert-first / delete-last order keeps every FK satisfied at each statement
-    // boundary. The enclosing `unchecked_transaction` makes the whole adoption ATOMIC: a crash or
-    // mid-sequence error rolls it ALL back, so the DB never lands in the torn state where BOTH the
-    // real row and the placeholder survive — a state the "already registered" fast path above would
-    // never repair and `single_repo_id`'s one-row expectation would break on.
-    // `unchecked_transaction` is the right tool on a shared `&Connection` (rusqlite): it needs
-    // no `&mut`, commits on `.commit()`, and rolls back on drop. `repo_roots` never holds
-    // placeholder rows (it is only ever written under a real id, by `record_repo_root` below),
-    // so only `repo_meta` needs re-pointing; A3 extends this to the direct-scoped tables it
-    // adds. The fresh path (no placeholder) runs in the same transaction for uniformity.
+    // No real repo yet (or a `local:`-id upgrade): adopt in ONE transaction. Insert the real
+    // `repos` row FIRST, re-point the source id's children, then drop the source row. Since
+    // V039 (phase A2) `repo_meta` carries rows under the placeholder, and its FK to `repos` is
+    // enforced (`foreign_keys = ON`), the source PK cannot be rewritten in place while children
+    // reference it; the insert-first / delete-last order keeps every FK satisfied at each
+    // statement boundary. The enclosing `unchecked_transaction` makes the whole adoption
+    // ATOMIC: a crash or mid-sequence error rolls it ALL back, so the DB never lands in the
+    // torn state where BOTH the real row and the source survive — a state the "already
+    // registered" fast path above would never repair and `single_repo_id`'s one-row expectation
+    // would break on. `unchecked_transaction` is the right tool on a shared `&Connection`
+    // (rusqlite): it needs no `&mut`, commits on `.commit()`, and rolls back on drop. The fresh
+    // path (no placeholder, no upgrade) runs in the same transaction for uniformity.
     let tx = conn.unchecked_transaction()?;
     let placeholder_present = tx
         .query_row("SELECT 1 FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID], |_| Ok(()))
@@ -88,15 +152,76 @@ pub fn register_repo(
         "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?2, ?3)",
         params![identity.repo_id, identity.display_name, now_ms],
     )?;
-    if placeholder_present {
-        tx.execute("UPDATE repo_meta SET repo_id = ?1 WHERE repo_id = ?2", params![
+    // The id whose rows this registration re-points ONTO the new id: the machine-local incumbent on
+    // a shallow-clone upgrade, else the `__unassigned__` placeholder on a fresh adoption. Both
+    // cases re-point the same scoped tables + realign the same logical ids and then drop the
+    // old `repos` row; only the upgrade path actually has `repo_roots` rows to move (the
+    // placeholder never does, so that UPDATE is a harmless no-op there).
+    let repoint_from =
+        upgrade_from.as_deref().or_else(|| placeholder_present.then_some(LEGACY_REPO_ID));
+    if let Some(source_id) = repoint_from {
+        // Move every source-id `repo_meta` row onto the new id EXCEPT the shallow-boundary record:
+        // it describes the OLD `local:` clone's cut history and is meaningless under the portable
+        // id (which has a full history and never upgrades). Leaving it under `source_id`
+        // lets the `DELETE FROM repos WHERE repo_id = source_id` below cascade it away, so
+        // the portable id never inherits a stale boundary. Harmless no-op on the
+        // placeholder path (no such row).
+        tx.execute("UPDATE repo_meta SET repo_id = ?1 WHERE repo_id = ?2 AND key != ?3", params![
             identity.repo_id,
-            LEGACY_REPO_ID
+            source_id,
+            SHALLOW_BOUNDARY_META_KEY,
         ])?;
-        tx.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID])?;
+        // Re-point every direct-scoped table's source rows onto the real id (A3 extends the A1/A2
+        // adoption contract from `repos`/`repo_meta` to the V040 tables). Runs INSIDE the same
+        // transaction, keeping the insert-first ordering: on a fresh open the tables are empty and
+        // these are no-ops; on a forward-migrated DB (or a shallow-clone upgrade) they carry the
+        // rows onto the real id atomically with the `repos` rewrite. `git_commits` is updated here;
+        // `git_file_changes` follows via its `ON UPDATE CASCADE` FK.
+        for table in V040_DIRECT_SCOPED_TABLES {
+            tx.execute(&format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"), params![
+                identity.repo_id,
+                source_id
+            ])?;
+        }
+        // Move the source id's recorded roots onto the new id BEFORE the source `repos` row is
+        // deleted (its FK is `ON DELETE CASCADE`, so the roots would otherwise be dropped). A
+        // shallow-clone upgrade carries the local id's roots; the placeholder never has any.
+        tx.execute("UPDATE repo_roots SET repo_id = ?1 WHERE repo_id = ?2", params![
+            identity.repo_id,
+            source_id
+        ])?;
+        // `logical_symbols.id` is content-derived and now folds `repo_id` (A3), so re-pointing its
+        // `repo_id` above changed the id every row SHOULD have — the next `rebuild_logical_symbols`
+        // will re-derive `hash(real_repo_id ‖ key)` and dangle every pre-re-point memory/oracle
+        // handle still pointing at the source-derived id. Realign the ids (and every reference) in
+        // place NOW, before that rebuild. `logical_symbol_members` has an `ON DELETE CASCADE` FK to
+        // `logical_symbols(id)`, and adoption runs with `foreign_keys = ON`, so defer FK checks to
+        // COMMIT for this transaction (auto-resets on commit/rollback) — otherwise the parent-id
+        // UPDATE trips the child FK mid-statement. Idempotent with the V040 migration's own
+        // realign.
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+        crate::index::graph_index::realign_logical_symbol_ids(&tx)?;
+        tx.execute("DELETE FROM repos WHERE repo_id = ?1", [source_id])?;
     }
-    record_repo_root(&tx, &identity.repo_id, &root, now_ms)?;
+    record_repo_root(&tx, &identity.repo_id, &root_str, now_ms)?;
+    // Record a fresh LocalOnly adoption's shallow boundary INSIDE the transaction (atomic with the
+    // `repos` row it references), so a future deepened clone can prove the upgrade against it. A
+    // no-op for a Portable identity (empty boundary) and for the upgrade path itself (Portable
+    // incoming).
+    persist_shallow_boundary(&tx, identity)?;
     tx.commit()?;
+    // State what happened on a shallow-clone upgrade (a `local:` id re-pointed to a portable one)
+    // so the transition is legible in the log — it re-writes every scoped row and every logical
+    // id.
+    if let Some(local_id) = upgrade_from {
+        tracing::warn!(
+            old_repo_id = %local_id,
+            new_repo_id = %identity.repo_id,
+            "shallow-clone identity upgraded: the index was registered under a machine-local id \
+             (`local:`) and is now re-pointed to a portable id. All scoped rows, repo_meta, \
+             repo_roots, and logical-symbol ids were migrated in place."
+        );
+    }
     Ok(identity.repo_id.clone())
 }
 
@@ -111,20 +236,199 @@ fn registry_refusal(msg: String) -> rusqlite::Error {
     )
 }
 
-/// The single repo owning this database — the connection-level active-repo stand-in the per-repo
-/// [`repo_meta`](crate::index::repo_meta) accessors resolve until phase A3 threads a real
-/// `ScopeContext`. Phase A keeps ONE repo per DB ([`register_repo`] refuses a second), so `repos`
-/// holds exactly one row: the adopted real id after [`register_repo`], or the [`LEGACY_REPO_ID`]
-/// placeholder on a not-yet-adopted DB (a bare `schema::apply` in a test, or any open before A3
-/// wires registration into `open_config`). A3 replaces every caller with the active repo id from
-/// its scope context.
-pub(crate) fn single_repo_id(conn: &Connection) -> rusqlite::Result<String> {
-    debug_assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM repos", [], |row| row.get::<_, i64>(0))?,
-        1,
-        "phase A holds exactly one repos row per DB until the default-path flip (A3/A7)"
-    );
-    conn.query_row("SELECT repo_id FROM repos LIMIT 1", [], |row| row.get(0))
+/// Persist a [`LocalOnly`](RepoIdentityClass::LocalOnly) identity's sorted shallow-boundary hashes
+/// under its repo id, so a later LocalOnly→Portable upgrade can verify the incoming clone deepens
+/// THIS clone. Idempotent (upsert). A no-op for a Portable identity (empty boundary — nothing to
+/// prove against). Takes a bare `&Connection` so it composes with both the free connection (the
+/// idempotent re-registration path) and the adoption transaction.
+fn persist_shallow_boundary(conn: &Connection, identity: &RepoIdentity) -> rusqlite::Result<()> {
+    if identity.class != RepoIdentityClass::LocalOnly || identity.shallow_boundary.is_empty() {
+        return Ok(());
+    }
+    crate::index::set_repo_meta(
+        conn,
+        &identity.repo_id,
+        SHALLOW_BOUNDARY_META_KEY,
+        &identity.shallow_boundary.join("\n"),
+    )
+}
+
+/// A LocalOnly incumbent's recorded shallow-boundary commit hashes (newline-joined in `repo_meta`),
+/// as a vec. Empty when none was recorded — a pre-gate registration, which the upgrade path treats
+/// as no proof available.
+fn read_shallow_boundary(conn: &Connection, repo_id: &str) -> rusqlite::Result<Vec<String>> {
+    let raw = crate::index::repo_meta(conn, repo_id, SHALLOW_BOUNDARY_META_KEY)?;
+    Ok(raw
+        .map(|value| value.lines().map(str::to_string).filter(|h| !h.is_empty()).collect())
+        .unwrap_or_default())
+}
+
+/// The refusal message for a LocalOnly→Portable upgrade that could not be PROVEN: the incoming
+/// portable clone does not reach the machine-local incumbent's recorded shallow boundary (or none
+/// was recorded), so re-pointing the index onto it risks migrating one repo's data onto an
+/// unrelated id. Names the pin escape hatch to force it when the two genuinely ARE the same repo.
+fn unproven_upgrade_error(incumbent: &str, incoming: &str) -> String {
+    format!(
+        "cannot upgrade the machine-local repo id {incumbent} to {incoming}: could not prove the \
+         incoming repository is a deepened clone of this index (its history does not reach the \
+         recorded shallow boundary, or no boundary was recorded). Refusing rather than re-point \
+         this index onto a possibly-different repo. If they ARE the same repository, pin `[index] \
+         repo_id = \"{incoming}\"` in rag-rat.toml to force it."
+    )
+}
+
+/// The active repo id for `conn` — the value every repo-scoped read/write scopes against.
+///
+/// Prefers the SCOPE CONTEXT installed by `install_scope_view`
+/// (`temp.connection_context['repo_id']`): a consolidated multi-repo DB is only ever reached
+/// through a config-bearing open that registers the repo and installs the context first, so the
+/// context branch is authoritative there and never resolves the wrong repo. Falls back to
+/// [`sole_repo_id`] when NO context row is installed — the identity-less paths (bare `open`,
+/// `create_or_migrate`, a raw test connection, the model-manifest heal before a context is set): a
+/// phase-A DB opened without a config holds exactly one repo, so the fallback is unambiguous there.
+/// This replaced the old `single_repo_id` stand-in at every free-conn call site (A3).
+///
+/// An INSTALLED-BUT-EMPTY context (`""`) is AUTHORITATIVE and returned as-is — it is NOT a missing
+/// context. The raw read callers (CLI/MCP grep hooks, `query::orientation`) deliberately install
+/// `""` when `resolve_scope_repo_id` cannot prove the config repo, meaning "match nothing" rather
+/// than "pick a repo". The scoped `files` view then matches no rows; a direct-scoped reader
+/// (git history, parser failures, `repo_meta`) scoping on this `""` likewise reads nothing — a repo
+/// with the empty id does not exist. Falling through to `sole_repo_id` on an empty context would
+/// let those readers serve a SIBLING repo while the file view is empty (round-5 finding). So only
+/// the ABSENCE of the context row falls back.
+pub(crate) fn active_repo_id(conn: &Connection) -> rusqlite::Result<String> {
+    if let Some(repo_id) = context_repo_id(conn) {
+        return Ok(repo_id);
+    }
+    sole_repo_id(conn)
+}
+
+/// Read the active repo id from the per-connection scope context, tolerating the common absence of
+/// the `temp.connection_context` table (a raw connection with no view installed) — `.ok()` swallows
+/// the "no such table" error into `None`, exactly like `edges::resolve`'s `scope_context_value`.
+fn context_repo_id(conn: &Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM temp.connection_context WHERE key = ?1",
+        [CONNECTION_CONTEXT_REPO_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// The sole repo owning a single-repo database — the identity-less fallback for [`active_repo_id`]
+/// and the config-less open paths (bare `open`, `create_or_migrate`, read-only opens). Prefers an
+/// adopted real repo, falling back to the [`LEGACY_REPO_ID`] placeholder on a not-yet-adopted DB
+/// (`ORDER BY (repo_id = placeholder)` sorts real ids first). Phase A keeps ONE repo per DB on
+/// these paths ([`register_repo`] refuses a second real repo until A7), so the result is
+/// unambiguous; multi-repo access always flows through the scope context, never here. Demoted from
+/// the former universal `single_repo_id` resolver — no hard one-row assertion, so a stray call on a
+/// consolidated DB degrades to a deterministic pick rather than a panic.
+pub(crate) fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
+    conn.query_row(
+        "SELECT repo_id FROM repos ORDER BY (repo_id = ?1), repo_id LIMIT 1",
+        [LEGACY_REPO_ID],
+        |row| row.get(0),
+    )
+}
+
+/// Whether this DB holds MORE THAN ONE real (adopted) repo — the interim guard for global-scope
+/// destructive sweeps over tables that do not yet carry `repo_id` (`oracle_runs`,
+/// `clone_graph_generations`; both gain the column in V042). When true, a per-repo caller must SKIP
+/// the global cleanup rather than wipe a sibling repo's rows. Today `register_repo` keeps this at
+/// one real repo until the A7 default-path flip, so the guard is dormant but present for the V042
+/// seam.
+pub(crate) fn multiple_real_repos(conn: &Connection) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM repos WHERE repo_id != ?1",
+        [LEGACY_REPO_ID],
+        |row| row.get(0),
+    )?;
+    Ok(count > 1)
+}
+
+/// Resolve the `repo_id` a config maps to on a connection WITHOUT registering anything — the
+/// READ-path counterpart to [`register_repo`]. Used by the read-only open
+/// (`try_open_config_read_only`) and the raw-connection scope-view installers (the Claude Code /
+/// MCP hooks, `query::orientation`), which must scope to the CONFIG's repo, not the config-blind
+/// sole repo: in a consolidated DB (post-A7) the [`sole_repo_id`] pick could bind a SIBLING repo.
+///
+/// Returns `None` when the repo cannot be proven to be registered — a fresh/unregistered DB, a
+/// `Rejected` config, or a consolidated DB whose config root is not recorded. The read-only open
+/// then bails to the read-write open (which registers/heals); a raw scope-view caller binds an
+/// empty scope rather than a sibling's rows.
+///
+/// Resolution routes, in order:
+///  1. by IDENTITY — [`resolve_repo_identity`](crate::repo_identity::resolve_repo_identity) derives
+///     the id (honoring an `[index] repo_id` override); if it is a REGISTERED real repo, use it. A
+///     derivable-but-UNREGISTERED id (a new/changed pin, or a now-portable shallow clone) returns
+///     `None` — a changed identity must adopt/surface on the read-write path, never silently keep
+///     serving the old scope.
+///  2. by ROOT (ABSENT configs only) — when there is NO derivable identity (non-git / unborn HEAD),
+///     the recorded `repo_roots` mapping for this root path (registration always records the root,
+///     so this binds the registered repo for a non-git root, e.g. a directly-seeded test repo).
+///  3. the SOLE repo (ABSENT configs only) — on a single-repo DB the sole repo is unambiguous,
+///     preserving the pre-A3 read-path behavior for un-adopted temp/test DBs; on a consolidated DB
+///     it is not, so `None`.
+///
+/// A `Rejected` identity (a reserved/`local:` pin, a root-less/corrupt history) short-circuits to
+/// `None`: it must NOT silently resolve — the read-write open surfaces the actionable error
+/// instead.
+pub(crate) fn resolve_config_repo_id(
+    conn: &Connection,
+    root: &Path,
+    repo_id_override: Option<&str>,
+) -> rusqlite::Result<Option<String>> {
+    match crate::repo_identity::resolve_repo_identity(root, repo_id_override) {
+        // Route 1: a derivable id that is registered scopes correctly even in a consolidated DB.
+        Ok(identity) if repo_id_is_registered(conn, &identity.repo_id)? =>
+            Ok(Some(identity.repo_id)),
+        // A RESOLVED but UNREGISTERED identity — a new/changed `[index] repo_id` pin, or a shallow
+        // clone that now derives a portable id — must NOT silently bind the OLD scope. Return None
+        // so the read-only open declines to the read-write open, which registers/upgrades
+        // the identity and surfaces any mismatch. The recorded-root / sole fallbacks are
+        // ONLY for an ABSENT config (no derivable id at all), never for a config that
+        // resolved to a different, real id: falling through to route 2 here would keep
+        // serving the previously-registered repo under the new identity (round-5 finding).
+        Ok(_) => Ok(None),
+        Err(err) if err.is_absent() => resolve_by_root_or_sole(conn, root),
+        // A Rejected config must surface through the read-write open, never resolve silently here.
+        Err(_) => Ok(None),
+    }
+}
+
+/// Whether `repo_id` is a REGISTERED real repo (present in `repos`, and not the placeholder
+/// marker).
+fn repo_id_is_registered(conn: &Connection, repo_id: &str) -> rusqlite::Result<bool> {
+    if repo_id == LEGACY_REPO_ID {
+        return Ok(false);
+    }
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM repos WHERE repo_id = ?1)", [repo_id], |row| {
+        row.get(0)
+    })
+}
+
+/// Routes 2 + 3 of [`resolve_config_repo_id`]: the recorded `repo_roots` mapping for `root`, else
+/// the sole repo of a single-repo DB (unambiguous), else `None` on a consolidated DB (cannot prove
+/// which repo this root maps to — bind nothing rather than a sibling).
+fn resolve_by_root_or_sole(conn: &Connection, root: &Path) -> rusqlite::Result<Option<String>> {
+    let root = root.to_string_lossy();
+    // A recorded root maps unambiguously to its repo (a physical path belongs to exactly one repo).
+    if let Some(repo_id) = conn
+        .query_row(
+            "SELECT repo_id FROM repo_roots WHERE root = ?1 LIMIT 1",
+            [root.as_ref()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(repo_id));
+    }
+    if multiple_real_repos(conn)? {
+        return Ok(None);
+    }
+    Ok(Some(sole_repo_id(conn)?))
 }
 
 /// Every registered `repo_id` that is a real (adopted) id — i.e. excluding the [`LEGACY_REPO_ID`]

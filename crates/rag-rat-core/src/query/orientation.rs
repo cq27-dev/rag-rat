@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use crate::index::AnchorHealth;
 use crate::query::tree::DirTree;
@@ -52,6 +52,7 @@ pub fn orientation(
     conn: &Connection,
     config_root: &std::path::Path,
     cwd: &std::path::Path,
+    repo_id_override: Option<&str>,
 ) -> anyhow::Result<Orientation> {
     // Step 1: install the WORKTREE-AWARE scoping view. `config_root` (the main worktree, where the
     // shared base index lives) anchors the base commit; `cwd` is the session's working dir — when
@@ -59,7 +60,18 @@ pub fn orientation(
     // otherwise the base scope (#219). Using the worktree's own HEAD as the base (the old
     // `resolve_git_context(cwd)`) was wrong: the index has no committed scope at a linked
     // worktree's HEAD, so orientation saw only the bare overlay delta.
-    crate::index::install_worktree_scope_view(conn, config_root, cwd)?;
+    //
+    // Resolve the REPO dimension explicitly from `config_root` (the raw conn has no scope context
+    // to fall back on, and the config-blind sole repo would be a sibling in a consolidated DB).
+    // Thread the config's `[index] repo_id` override: a fork that PINS an id while sharing a root
+    // commit with its upstream would otherwise mis-resolve — `resolve_config_repo_id`'s identity
+    // route derives the shared root-commit id from `None`, and if the upstream is also registered
+    // it binds the SIBLING's scope, ignoring the pin (round-5 finding). With the override, the
+    // pinned id resolves first. An unprovable repo → empty scope (matches nothing), never a
+    // sibling.
+    let repo_id = crate::index::resolve_scope_repo_id(conn, config_root, repo_id_override)?
+        .unwrap_or_default();
+    crate::index::install_worktree_scope_view(conn, &repo_id, config_root, cwd)?;
 
     // Step 2: directory tree (reads scoped `files` view).
     let tree = crate::query::tree::dir_tree(conn, &Default::default())?;
@@ -136,17 +148,21 @@ fn spine_load_bearing(conn: &Connection, limit: usize) -> anyhow::Result<Vec<(St
 /// READ: subjects of the most recent indexed commits, newest first.
 ///
 /// Invariant: reads `git_commits` — no writes.  Returns an empty Vec when no commits are
-/// indexed (git_commits is empty).
+/// indexed (git_commits is empty for the active repo).
 fn recent_commit_subjects(conn: &Connection, limit: usize) -> anyhow::Result<Vec<String>> {
+    // `git_commits` is direct-scoped (V040): orientation describes the ACTIVE repo, so a sibling
+    // repo's commit subjects must not surface in a consolidated DB.
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
-        "-- Most recent indexed commit subjects, newest first.
-         -- Invariant: git_commits rows are global (not scoped); subjects only.
+        "-- Most recent indexed commit subjects for the active repo, newest first.
+         -- Invariant: git_commits is direct-scoped by repo_id (V040); subjects only.
          SELECT subject
          FROM git_commits
+         WHERE repo_id = ?2
          ORDER BY authored_at_s DESC, committed_at_s DESC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(params![limit as i64, repo_id], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -160,18 +176,22 @@ fn recent_commit_subjects(conn: &Connection, limit: usize) -> anyhow::Result<Vec
 /// Returns an empty Vec when git history is not indexed.
 /// Only returns paths of files that are currently indexed (inner join to scoped `files`).
 fn recently_changed_source_files(conn: &Connection, limit: usize) -> anyhow::Result<Vec<String>> {
+    // The `files` view join bounds output to this repo's indexed paths, but the join key is the
+    // PATH — a sibling repo's git rows for a shared path (`src/lib.rs` in two repos) would still
+    // match, so the direct-scoped tables (V040) carry the explicit `repo_id` predicate too.
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "-- Most recently changed source paths that are currently indexed in the active scope.
-         -- Invariant: files resolves to the scoped TEMP VIEW; git_file_changes is global.
+         -- Invariant: files resolves to the scoped TEMP VIEW; git rows filter repo_id (V040).
          SELECT DISTINCT gfc.path
          FROM git_file_changes AS gfc
-         JOIN git_commits AS gc ON gc.hash = gfc.commit_hash
+         JOIN git_commits AS gc ON gc.hash = gfc.commit_hash AND gc.repo_id = gfc.repo_id
          JOIN files ON files.path = gfc.path
-         WHERE files.generated = 0
+         WHERE files.generated = 0 AND gfc.repo_id = ?2
          ORDER BY gc.authored_at_s DESC, gfc.path ASC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(params![limit as i64, repo_id], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);

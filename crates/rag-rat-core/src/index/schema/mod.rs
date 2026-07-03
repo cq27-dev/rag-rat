@@ -3,12 +3,15 @@ mod migrations;
 mod registry;
 pub(crate) use baseline::*;
 pub(crate) use migrations::*;
-pub(crate) use registry::single_repo_id;
+pub(crate) use registry::{
+    CONNECTION_CONTEXT_REPO_KEY, active_repo_id, multiple_real_repos, resolve_config_repo_id,
+    sole_repo_id,
+};
 pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 39;
+pub const LATEST_SCHEMA_VERSION: u32 = 40;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -251,6 +254,13 @@ const MIGRATION_039_CHECKSUM: &str = "sha256:rag-rat-per-repo-meta-v39";
 const MIGRATION_039_DESCRIPTION: &str = "Relocate the per-repo singleton meta keys from the \
                                          global index_meta / reconcile_meta into repo_meta under \
                                          the __unassigned__ placeholder (memory-sync phase A2)";
+const MIGRATION_040_ID: &str = "040_repo_id_core_scoping";
+const MIGRATION_040_CHECKSUM: &str = "sha256:rag-rat-repo-id-core-scoping-v40";
+const MIGRATION_040_DESCRIPTION: &str =
+    "Add repo_id scoping to the core tables (files, packages, logical_symbols, docs, \
+     parser_failures, git_commits + git_file_changes) with rebuilt UNIQUE / PK keys and the \
+     re-pointed commit_fts external content, plus the two active-embedding-model provenance meta \
+     keys moved to repo_meta (memory-sync phase A3)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -584,6 +594,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_039_CHECKSUM,
         description: MIGRATION_039_DESCRIPTION,
         apply: apply_move_per_repo_meta,
+    },
+    Migration {
+        id: MIGRATION_040_ID,
+        checksum: MIGRATION_040_CHECKSUM,
+        description: MIGRATION_040_DESCRIPTION,
+        apply: apply_repo_id_core_scoping,
     },
 ];
 

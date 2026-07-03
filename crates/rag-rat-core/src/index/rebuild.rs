@@ -14,8 +14,16 @@ impl IndexDatabase {
             mode: IndexMode::Full,
         });
         let mut db = Self::create_or_migrate(&config.database)?;
+        // Register/adopt the repo BEFORE the scope view is installed and BEFORE any repo-scoped
+        // write, so `active_repo_id` is a real (registered) id — every direct-scoped insert stamps
+        // it, and `repo_meta` writes below satisfy the `repo_meta → repos` FK (an
+        // empty/unregistered id would violate it). `create_or_migrate` no longer resolves
+        // the repo or heals the model manifest, so both move here, ordered after
+        // registration.
+        db.adopt_repo_from_config(config)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
+        ai::ensure_model_manifest(db.storage.connection())?;
         progress(IndexProgress::IndexingGitHistory);
         let mut git_history = Some(spawn_git_history_prepare(&config.root));
         // RAM-first bulk build: a full rebuild is one big atomic write, so skip per-commit fsyncs
@@ -120,6 +128,13 @@ impl IndexDatabase {
         // cache_size is left bumped — harmless for the short remaining lifetime of the connection.
         let _ = db.storage.execute_batch("PRAGMA synchronous = NORMAL;");
         result?;
+        // Poison-sibling test harness (compiled out of production): after the rebuild commits,
+        // register a second `poison-sibling` repo with tripwire rows in every repo-scoped table, so
+        // any unscoped read/count/delete downstream trips an EXISTING test. Default-ON per test
+        // thread; a test needing a virgin single-repo DB opts out via
+        // `poison_sibling::disable_poison_sibling`. See the module docs.
+        #[cfg(test)]
+        crate::index::poison_sibling::seed_if_enabled(db.storage.connection())?;
         Ok(db)
     }
 
@@ -199,6 +214,11 @@ impl IndexDatabase {
         // rebuild with a UNIQUE constraint error. Stage every row of the active commit AND
         // every row of the active worktree, shadowed or not. A sibling worktree at the same
         // commit self-heals on its next discover pass (its missing paths reindex).
+        // Every staged row is constrained to the ACTIVE REPO (A3): the commit/worktree keys are not
+        // globally unique across repos in a consolidated DB (forks share a commit), so without the
+        // `repo_id` predicate a full rebuild of one repo would stage — and cascade-delete — a
+        // sibling repo's rows. The repo id lives in the same `temp.connection_context` the scope
+        // view populates.
         self.storage.execute_batch(
             "
             CREATE TEMP TABLE IF NOT EXISTS staged_file_ids(id INTEGER PRIMARY KEY);
@@ -206,13 +226,15 @@ impl IndexDatabase {
             INSERT OR IGNORE INTO temp.staged_file_ids(id)
             SELECT id
             FROM main.files
-            WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
+            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+              AND worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
              'worktree_id')
               AND worktree_id != '';
             INSERT OR IGNORE INTO temp.staged_file_ids(id)
             SELECT id
             FROM main.files
-            WHERE commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
+            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+              AND commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
               AND commit_sha != '';
             ",
         )?;
@@ -319,9 +341,12 @@ impl IndexDatabase {
                 FROM main.chunks
                 JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
             );
+            -- `parser_failures` is keyed by `(repo_id, path)` (V040), so match BOTH — a bare-path
+            -- delete would clobber a sibling repo's failure at the same path. Staged files all
+            -- belong to one repo, but the row-value join is correct regardless of that.
             DELETE FROM main.parser_failures
-            WHERE path IN (
-                SELECT path
+            WHERE (repo_id, path) IN (
+                SELECT files.repo_id, files.path
                 FROM main.files
                 JOIN temp.staged_file_ids ON staged_file_ids.id = files.id
             );

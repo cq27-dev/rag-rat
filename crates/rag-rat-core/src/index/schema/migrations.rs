@@ -1174,6 +1174,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_037_ID => Some(37),
             MIGRATION_038_ID => Some(38),
             MIGRATION_039_ID => Some(39),
+            MIGRATION_040_ID => Some(40),
             _ => None,
         })
         .max()
@@ -1222,6 +1223,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_037_ID
             | MIGRATION_038_ID
             | MIGRATION_039_ID
+            | MIGRATION_040_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1267,6 +1269,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_037_ID => migration.checksum != MIGRATION_037_CHECKSUM,
         MIGRATION_038_ID => migration.checksum != MIGRATION_038_CHECKSUM,
         MIGRATION_039_ID => migration.checksum != MIGRATION_039_CHECKSUM,
+        MIGRATION_040_ID => migration.checksum != MIGRATION_040_CHECKSUM,
         _ => false,
     }
 }
@@ -1687,8 +1690,43 @@ fn relocate_meta_keys(
     source_table: &str,
     keys: &[&str],
 ) -> rusqlite::Result<()> {
-    let target_repo_id = sole_repo_id(conn)?;
+    // V040 RECLASSIFICATION: some keys V039 lists here are GLOBAL infrastructure, not per-repo, and
+    // V040 moves them back to `index_meta` (see [`RECLASSIFIED_GLOBAL_INDEX_META_KEYS`] +
+    // [`move_repo_meta_keys_to_global`]). V039 is frozen (merged), so it still names them — filter
+    // them out HERE so this shared helper never re-relocates a now-global key OUT of `index_meta`.
+    // Two failures this prevents on a ladder replay (`schema::apply` / `index --full`, which
+    // re-runs V039): (1) it would undo the reclassification every full rebuild; (2) with the
+    // key present in `index_meta` the movable-keys gate below would fire, resolve
+    // `sole_repo_id`, and HARD-ERROR on a consolidated >1-repo DB — regressing the round-4
+    // replay property. Every genuinely-per-repo key is unaffected, so V039's relocation is
+    // byte-identical for them.
+    let keys: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|key| !RECLASSIFIED_GLOBAL_INDEX_META_KEYS.contains(key))
+        .collect();
+    if keys.is_empty() {
+        return Ok(());
+    }
     let in_list = keys.iter().map(|key| format!("'{key}'")).collect::<Vec<_>>().join(", ");
+    // IDEMPOTENCE GATE, resolved BEFORE `sole_repo_id`: on a re-apply the source keys are already
+    // gone (schema::apply re-runs the WHOLE ladder — a `create_or_migrate` / `rag-rat index --full`
+    // full rebuild), so there is nothing to move. Return without resolving the sole repo. This is
+    // load-bearing on a CONSOLIDATED (>1 real repo) DB, where `sole_repo_id`'s exactly-one-row
+    // expectation would otherwise HARD-ERROR the ladder replay even though the move is a proven
+    // no-op — breaking `index --full` for every repo in the DB. Only a genuinely-unmigrated
+    // (single-repo / legacy) DB, whose source rows still exist, reaches the resolution. A torn run
+    // (crash between the copy and the delete) still re-converges: the source rows survived the
+    // missing delete, so the gate finds them present and finishes the move.
+    let has_movable_keys: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {source_table} WHERE key IN ({in_list}))"),
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_movable_keys {
+        return Ok(());
+    }
+    let target_repo_id = sole_repo_id(conn)?;
     conn.execute(
         &format!(
             "INSERT OR IGNORE INTO repo_meta(repo_id, key, value)
@@ -1706,12 +1744,12 @@ fn relocate_meta_keys(
 /// The relocation MUST target this id, not a hardcoded placeholder: on an adopted DB the
 /// placeholder row is deleted, so an `INSERT` into `repo_meta` under it trips the `repo_meta →
 /// repos` FK — with `foreign_keys = ON` (production) that aborts the whole `migrate_forward`; with
-/// it off it orphans rows the per-repo accessors ([`super::single_repo_id`]) can never resolve.
+/// it off it orphans rows the per-repo accessors ([`super::sole_repo_id`]) can never resolve.
 /// V038 always leaves exactly one `repos` row and `register_repo` keeps it at one, so 0 or >1 is a
 /// broken invariant — surfaced as an attributable migration error rather than a silent FK abort or
-/// a wrong-scope pick. (Distinct from [`super::single_repo_id`], the runtime stand-in: that one
-/// `debug_assert`s the one-row invariant and `LIMIT 1`s in release; a migration needs the hard
-/// error on `!= 1`.)
+/// a wrong-scope pick. (Distinct from the runtime [`super::sole_repo_id`], which `ORDER BY`s the
+/// placeholder last and `LIMIT 1`s without a hard error; a migration wants the hard error on `!= 1`
+/// so a broken invariant is loud.)
 fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
     let mut stmt = conn.prepare("SELECT repo_id FROM repos")?;
     let mut ids =
@@ -1722,11 +1760,362 @@ fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
     Err(rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
         Some(format!(
-            "V039 per-repo meta relocation expects exactly one repos row (the sole repo owning \
-             this DB), found {}",
+            "per-repo meta relocation expects exactly one repos row (the sole repo owning this \
+             DB), found {}",
             ids.len()
         )),
     ))
+}
+
+/// The `repo_id` column added to every direct-scoped core table in V040. `NOT NULL DEFAULT` the
+/// [`super::LEGACY_REPO_ID`] placeholder: existing rows backfill to the placeholder, which
+/// `register_repo` rewrites to the real id at adoption (the A1/A2 pattern), and any writer that
+/// forgets to stamp still produces a scannable single-repo value rather than NULL.
+const REPO_ID_COLUMN_DEF: &str = "TEXT NOT NULL DEFAULT '__unassigned__'";
+
+/// The `index_meta` keys V040 relocates into `repo_meta` — the active-embedding-model provenance
+/// pair that stayed behind in A2's V039 sweep (they postdated the plan's inventory). Reuniting them
+/// with `active_embedding_model` / `embedding_active_model_version` (already in `repo_meta`) so the
+/// whole model-provenance family is per-repo. Idempotent: on a re-apply the source keys are already
+/// gone, so the copy inserts nothing.
+const V040_INDEX_META_KEYS: &[&str] =
+    &["active_embedding_model_provisional", "active_embedding_remote_config"];
+
+/// The keys V039 relocated to `repo_meta` that V040 RECLASSIFIES as GLOBAL infrastructure and moves
+/// BACK to `index_meta` (see [`move_repo_meta_keys_to_global`]). V039 (frozen) misfiled these under
+/// the one-DB-per-repo assumption, but they are not per-repo state:
+///  * `content_revision` — digest over the WHOLE `main.files` (no `repo_id` filter);
+///  * `fts_dirty` / `fts_source_revision` / `fts_synced_at_ms` — freshness of the ONE global
+///    `chunk_fts` FTS5 index (never repo-scoped);
+///  * `vector_int8_reencode_cursor` — resume marker for a walk over the WHOLE `chunk_embeddings`
+///    table, beside an already-global done-gate.
+///
+/// Per-repo copies caused stale-dirty loops (a consolidated DB paying a full FTS rebuild forever
+/// after a sibling synced) and cross-repo resume confusion. The runtime accessors write these to
+/// the global `index_meta` (`self.meta` / `ai::set_meta`); this migration relocates any
+/// pre-existing per-repo copy.
+const V040_REPO_META_KEYS_TO_GLOBAL: &[&str] = &[
+    "content_revision",
+    "fts_dirty",
+    "fts_source_revision",
+    "fts_synced_at_ms",
+    "vector_int8_reencode_cursor",
+];
+
+/// The subset of [`V040_REPO_META_KEYS_TO_GLOBAL`] that also appears in [`V039_INDEX_META_KEYS`],
+/// so [`relocate_meta_keys`] must EXCLUDE them from V039's `index_meta → repo_meta` sweep (the
+/// runtime now stores them globally in `index_meta`). The reencode cursor is reclassified too but
+/// lives in `V039_RECONCILE_META_KEYS` (a different source table) AND, once global, sits in
+/// `index_meta` where neither V039 sweep names it — so it needs no exclusion here; V040's move-back
+/// handles a stale per-repo copy.
+const RECLASSIFIED_GLOBAL_INDEX_META_KEYS: &[&str] =
+    &["content_revision", "fts_dirty", "fts_source_revision", "fts_synced_at_ms"];
+
+/// Move the listed keys OUT of the per-repo `repo_meta` and back into the GLOBAL `index_meta` — the
+/// inverse of [`relocate_meta_keys`], correcting V039's over-relocation of global-infrastructure
+/// state (see [`V040_REPO_META_KEYS_TO_GLOBAL`]).
+///
+/// IDEMPOTENT + MULTI-REPO-REPLAY-SAFE (the round-4 pattern): resolves NO `sole_repo_id`, so it
+/// never hard-errors on a consolidated DB. `INSERT OR IGNORE` into the `key`-PK'd `index_meta`
+/// keeps ONE global value — every repo computes the same content digest so their copies agree;
+/// where a per-repo copy could differ (`fts_dirty`) the first row wins and the `DELETE` still
+/// clears every copy, and the next FTS freshness check self-corrects the surviving global value.
+/// The `value IS NOT NULL` guard skips a `repo_meta` NULL (its `value` is nullable;
+/// `index_meta.value` is `NOT NULL`). On a re-apply the `repo_meta` rows are already gone, so both
+/// statements are no-ops — the whole helper is safe to run on every `schema::apply`.
+fn move_repo_meta_keys_to_global(conn: &Connection, keys: &[&str]) -> rusqlite::Result<()> {
+    let in_list = keys.iter().map(|key| format!("'{key}'")).collect::<Vec<_>>().join(", ");
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO index_meta(key, value)
+             SELECT key, value FROM repo_meta WHERE key IN ({in_list}) AND value IS NOT NULL"
+        ),
+        [],
+    )?;
+    conn.execute(&format!("DELETE FROM repo_meta WHERE key IN ({in_list})"), [])?;
+    Ok(())
+}
+
+/// V040 (memory-sync phase A3): add `repo_id` scoping to the core tables that have no FK path to
+/// `files` (they scope DIRECTLY; the `files`-reachable tables scope transitively through the
+/// `files.repo_id` the scope view filters on). Per the disposition table:
+///  * `files` — direct `repo_id`; UNIQUE becomes `(repo_id, path, commit_sha, worktree_id)`.
+///  * `packages` — direct; UNIQUE becomes `(repo_id, manifest_dir, commit_sha, worktree_id)`.
+///  * `logical_symbols`, `docs` — direct `repo_id` (add column; no key change).
+///  * `parser_failures` — direct; PK becomes `(repo_id, path)` (was a bare autoincrement id, so
+///    `remove_file_in_scope`'s path-only delete clobbered a sibling repo — inventory #12).
+///  * `git_commits` — direct; PK becomes `(repo_id, hash)`; `commit_fts` external content follows
+///    and `git_file_changes` gains `repo_id` + a composite `(repo_id, commit_hash)` FK.
+///
+/// Also reunites the two straggler active-model meta keys with their family in `repo_meta`.
+///
+/// The key/PK changes force table REBUILDS (SQLite can't alter a UNIQUE/PK in place). Modeled on
+/// the V031 STRICT-rebuild recipe: `foreign_keys = OFF` OUTSIDE `BEGIN IMMEDIATE`,
+/// RENAME→CREATE→copy→ DROP preserving rowids/ids, ROLLBACK on error, then `COMMIT; foreign_keys =
+/// ON`. Every rebuild is wrapped in ONE transaction so a failure leaves the schema untouched;
+/// `files.repo_id` existing is the all-or-nothing sentinel (atomic ⇒ present iff the whole V040
+/// committed), so a re-apply (fresh DB already transformed, or `create_or_migrate`/`rebuild` on an
+/// applied DB) short-circuits.
+///
+/// #51 GUARD: `commit_fts` is external-content over `git_commits`; after the git_commits rebuild its
+/// stored rowids are stale, so it is resynced with the desync-safe `'rebuild'` command, NEVER a
+/// `DELETE FROM commit_fts` (which corrupts a desynced external-content index).
+pub(crate) fn apply_repo_id_core_scoping(conn: &Connection) -> rusqlite::Result<()> {
+    // Reclassify the global-infrastructure keys V039 over-relocated to `repo_meta` back to the
+    // GLOBAL `index_meta`. Runs BEFORE the `files.repo_id` short-circuit so it also corrects a DB a
+    // PRIOR commit of THIS (unreleased) branch already migrated to V040 with those keys in
+    // `repo_meta` — that DB's `files.repo_id` exists, so the short-circuit would otherwise skip it.
+    // Idempotent + multi-repo-safe (resolves no `sole_repo_id`), so running it on every apply is a
+    // no-op once the keys are global.
+    move_repo_meta_keys_to_global(conn, V040_REPO_META_KEYS_TO_GLOBAL)?;
+
+    // All-or-nothing sentinel: the rebuilds below run under one atomic transaction, so `files`
+    // carrying `repo_id` means the whole migration already committed — a fresh-from-target DB or a
+    // `create_or_migrate`/`rebuild` re-apply. Short-circuit before taking the write lock.
+    if column_exists(conn, "files", "repo_id")? {
+        return Ok(());
+    }
+
+    // The table rebuilds need FK enforcement OFF (they RENAME/DROP FK-referenced parents); a PRAGMA
+    // toggle is a no-op inside a transaction, so set it BEFORE BEGIN (V031 recipe).
+    conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+    let result = (|| -> rusqlite::Result<()> {
+        rebuild_files_table_with_repo_id(conn)?;
+        rebuild_packages_table_with_repo_id(conn)?;
+        // `logical_symbols` / `docs` are FK-less on their scoping key (no UNIQUE/PK change), so a
+        // plain additive column suffices — no rebuild.
+        add_column_if_missing(conn, "logical_symbols", "repo_id", REPO_ID_COLUMN_DEF)?;
+        add_column_if_missing(conn, "docs", "repo_id", REPO_ID_COLUMN_DEF)?;
+        rebuild_parser_failures_table_with_repo_id(conn)?;
+        rebuild_git_commits_tables_with_repo_id(conn)?;
+        // Re-point the placeholder-backfilled rows onto the sole repo that owns this DB. On an
+        // already-adopted DB this is what keeps the rebuilt rows visible; on a not-yet-adopted DB
+        // it is a no-op (see the helper). Runs inside the txn, atomic with the rebuilds.
+        backfill_repo_id_to_sole_repo(conn)?;
+        // Now that every `logical_symbols` row carries its final `repo_id`, migrate its
+        // content-derived id to the new `repo_id`-folded derivation and re-point every reference
+        // (memories, monikers, members), so pre-V040 memory/oracle handles survive the first
+        // `rebuild_logical_symbols` after upgrade instead of dangling. FK enforcement is OFF for
+        // the whole V040 transaction (set before BEGIN), which is exactly what the
+        // parent-id remap needs. On a not-yet-adopted DB the rows carry the placeholder
+        // here; `register_repo` runs the same realign again after adopting the real id
+        // (idempotent — already-aligned rows are skipped).
+        crate::index::graph_index::realign_logical_symbol_ids(conn)?;
+        // Reunite the two active-model provenance stragglers with their family in `repo_meta`
+        // (relocated under the sole repo via `relocate_meta_keys`' own `sole_repo_id` resolution;
+        // `register_repo` keeps them there). Runs inside the txn so it is atomic with the rebuilds.
+        relocate_meta_keys(conn, "index_meta", V040_INDEX_META_KEYS)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+        return result;
+    }
+    conn.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?;
+    Ok(())
+}
+
+/// Re-point every V040 direct-scoped table's placeholder-backfilled rows onto the sole repo that
+/// owns this DB — the same established resolution [`relocate_meta_keys`] uses for the meta move
+/// (and the V039 fix e2a2bc5 established).
+///
+/// The rebuilds / `add_column`s above stamp every existing row with the STATIC `__unassigned__`
+/// column DEFAULT (a DEFAULT cannot be a runtime-resolved value). That is correct on a NOT-yet-
+/// adopted DB — the sole repo IS the placeholder, so the rows already carry the right id and
+/// [`super::register_repo`] re-points them at adoption. But on an ALREADY-ADOPTED DB (V038/V039 ran
+/// `register_repo`, so `repos` holds the real id and NO placeholder), `register_repo` takes the
+/// "already registered" fast path that never re-points — so the rebuilt rows would orphan under
+/// `__unassigned__` and the active real-repo scope view would see an EMPTY index after upgrade.
+/// Resolve the sole `repos` row (real when adopted, else the placeholder) via [`sole_repo_id`] and
+/// UPDATE the placeholder rows onto it; skip the no-op churn when the DB is not yet adopted.
+///
+/// FK enforcement is OFF for the whole V040 transaction, so `git_commits`' `ON UPDATE CASCADE` does
+/// NOT fire here — `git_file_changes` is re-pointed EXPLICITLY (unlike the runtime `register_repo`
+/// path, which runs with FK ON and relies on that cascade, so it lists only `git_commits`).
+fn backfill_repo_id_to_sole_repo(conn: &Connection) -> rusqlite::Result<()> {
+    let target = sole_repo_id(conn)?;
+    // Not adopted yet: rows already carry the placeholder; `register_repo` re-points at adoption.
+    if target == super::LEGACY_REPO_ID {
+        return Ok(());
+    }
+    for table in [
+        "files",
+        "packages",
+        "logical_symbols",
+        "docs",
+        "parser_failures",
+        "git_commits",
+        "git_file_changes",
+    ] {
+        conn.execute(&format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"), [
+            target.as_str(),
+            super::LEGACY_REPO_ID,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Rebuild `files` with a leading `repo_id` column and the widened UNIQUE key. `files` is the
+/// scoping ROOT and is FK-referenced by `chunks` / `symbols` / `edges_data` (all `REFERENCES
+/// files(id)`), so the `id` values MUST be preserved — the rebuild copies them verbatim (the V008
+/// `rebuild_files_table_for_commit_scopes` precedent). The full current column set (through V024's
+/// `has_test_code`) is reproduced; `files` stays non-STRICT to match its baseline shape.
+fn rebuild_files_table_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        -- Re-convergence: migrations run in AUTOCOMMIT, so a crash that killed a prior V040 pass
+        -- mid-rebuild could leave the scratch table behind (the enclosing BEGIN/ROLLBACK normally
+        -- prevents this, but a hard process kill bypasses a clean rollback). Drop it so the \
+         rebuild
+        -- restarts from a clean slate rather than failing on CREATE.
+        DROP TABLE IF EXISTS files_new;
+        CREATE TABLE files_new(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            modified_at_ms INTEGER NOT NULL,
+            generated INTEGER NOT NULL DEFAULT 0,
+            indexed_at_ms INTEGER NOT NULL,
+            indexed_revision TEXT NOT NULL DEFAULT '',
+            commit_sha TEXT NOT NULL DEFAULT '',
+            worktree_id TEXT NOT NULL DEFAULT '',
+            has_test_code INTEGER NOT NULL DEFAULT 0,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            UNIQUE(repo_id, path, commit_sha, worktree_id)
+        );
+        INSERT OR IGNORE INTO files_new(
+            id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+            indexed_revision, commit_sha, worktree_id, has_test_code, repo_id
+        )
+        SELECT
+            id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+            indexed_revision, commit_sha, worktree_id, has_test_code, '__unassigned__'
+        FROM files;
+        DROP TABLE files;
+        ALTER TABLE files_new RENAME TO files;
+        CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
+        CREATE INDEX IF NOT EXISTS idx_files_commit_path ON files(commit_sha, path);
+        CREATE INDEX IF NOT EXISTS idx_files_worktree_path ON files(worktree_id, path);
+        ",
+    )
+}
+
+/// Rebuild `packages` (STRICT) with a leading `repo_id` column and the widened UNIQUE key.
+/// `packages` has no FK children (the file→package map is computed at load time, never persisted —
+/// #106), so no id preservation is required, but the rows are copied to keep an already-populated
+/// index intact through the migration.
+fn rebuild_packages_table_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS packages_new;
+        CREATE TABLE packages_new(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            manifest_dir TEXT NOT NULL,
+            commit_sha TEXT NOT NULL DEFAULT '',
+            worktree_id TEXT NOT NULL DEFAULT '',
+            local_roots_json TEXT NOT NULL DEFAULT '[]',
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            UNIQUE(repo_id, manifest_dir, commit_sha, worktree_id)
+        ) STRICT;
+        INSERT OR IGNORE INTO packages_new(
+            id, manifest_dir, commit_sha, worktree_id, local_roots_json, repo_id
+        )
+        SELECT id, manifest_dir, commit_sha, worktree_id, local_roots_json, '__unassigned__'
+        FROM packages;
+        DROP TABLE packages;
+        ALTER TABLE packages_new RENAME TO packages;
+        CREATE INDEX IF NOT EXISTS idx_packages_scope ON packages(commit_sha, worktree_id);
+        ",
+    )
+}
+
+/// Rebuild `parser_failures` with PK `(repo_id, path)` (was a bare autoincrement `id`). The old
+/// shape allowed multiple rows per path and `remove_file_in_scope` deleted by bare path —
+/// clobbering a sibling repo's failure once repos share a DB (inventory #12). The new PK collapses
+/// to one row per `(repo_id, path)`; `INSERT OR IGNORE` dedupes any legacy multi-row-per-path data.
+/// Nothing FK-references `parser_failures`, so dropping the `id` column is safe. Rebuilt STRICT.
+fn rebuild_parser_failures_table_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS parser_failures_new;
+        CREATE TABLE parser_failures_new(
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            message TEXT NOT NULL,
+            PRIMARY KEY(repo_id, path)
+        ) STRICT;
+        INSERT OR IGNORE INTO parser_failures_new(repo_id, path, language, message)
+        SELECT '__unassigned__', path, language, message FROM parser_failures;
+        DROP TABLE parser_failures;
+        ALTER TABLE parser_failures_new RENAME TO parser_failures;
+        ",
+    )
+}
+
+/// Rebuild `git_commits` with PK `(repo_id, hash)` and `git_file_changes` with `repo_id` + a
+/// composite `(repo_id, commit_hash)` FK to it (`ON DELETE CASCADE ON UPDATE CASCADE` — the UPDATE
+/// cascade is what lets `register_repo` adoption re-point `git_commits.repo_id` and carry the
+/// changes along). `git_commits` rowids are PRESERVED (copied explicitly) so the `commit_fts`
+/// external-content rowid mapping stays valid; it is then resynced with the desync-safe `'rebuild'`
+/// (#51 — never `DELETE FROM commit_fts`). These two tables were repo-GLOBAL before; scoping them
+/// stops a `git history` reindex of one repo from wiping another's commits.
+fn rebuild_git_commits_tables_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS git_commits_new;
+        DROP TABLE IF EXISTS git_file_changes_new;
+        CREATE TABLE git_commits_new(
+            hash TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            author_email TEXT NOT NULL,
+            authored_at_s INTEGER NOT NULL,
+            committed_at_s INTEGER NOT NULL,
+            subject TEXT NOT NULL,
+            body TEXT NOT NULL,
+            changed_file_count INTEGER NOT NULL DEFAULT 0,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            PRIMARY KEY(repo_id, hash)
+        ) STRICT;
+        INSERT OR IGNORE INTO git_commits_new(
+            rowid, hash, author_name, author_email, authored_at_s, committed_at_s,
+            subject, body, changed_file_count, repo_id
+        )
+        SELECT
+            rowid, hash, author_name, author_email, authored_at_s, committed_at_s,
+            subject, body, changed_file_count, '__unassigned__'
+        FROM git_commits;
+        DROP TABLE git_commits;
+        ALTER TABLE git_commits_new RENAME TO git_commits;
+
+        CREATE TABLE git_file_changes_new(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_hash TEXT NOT NULL,
+            path TEXT NOT NULL,
+            additions INTEGER,
+            deletions INTEGER,
+            change_kind TEXT NOT NULL DEFAULT 'modified',
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            FOREIGN KEY(repo_id, commit_hash)
+                REFERENCES git_commits(repo_id, hash) ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        INSERT OR IGNORE INTO git_file_changes_new(
+            id, commit_hash, path, additions, deletions, change_kind, repo_id
+        )
+        SELECT id, commit_hash, path, additions, deletions, change_kind, '__unassigned__'
+        FROM git_file_changes;
+        DROP TABLE git_file_changes;
+        ALTER TABLE git_file_changes_new RENAME TO git_file_changes;
+        CREATE INDEX IF NOT EXISTS idx_git_file_changes_path ON git_file_changes(path);
+        CREATE INDEX IF NOT EXISTS idx_git_file_changes_commit ON git_file_changes(commit_hash);
+
+        -- Resync the external-content FTS after the content-table rebuild (#51: 'rebuild', never a
+        -- DELETE, on a possibly-desynced external-content index).
+        INSERT INTO commit_fts(commit_fts) VALUES('rebuild');
+        ",
+    )
 }
 
 /// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see
@@ -2001,7 +2390,49 @@ pub(crate) fn apply_commit_addressable_worktrees(conn: &Connection) -> rusqlite:
     Ok(())
 }
 
+/// Whether `files` already carries a UNIQUE index whose columns include `commit_sha` — i.e. it is
+/// already commit-addressable (the V008 `UNIQUE(path, commit_sha, worktree_id)` or the V040
+/// `UNIQUE(repo_id, path, commit_sha, worktree_id)` that supersedes it). Used to make the V008
+/// files rebuild idempotent + non-clobbering on `apply`'s full re-run.
+fn files_has_commit_scoped_unique(conn: &Connection) -> rusqlite::Result<bool> {
+    let unique_indexes: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA index_list(files)")?;
+        let rows = stmt.query_map([], |row| {
+            // index_list columns: (seq, name, unique, origin, partial).
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+        })?;
+        rows.filter_map(|row| match row {
+            Ok((name, true)) => Some(Ok(name)),
+            Ok((_, false)) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<rusqlite::Result<_>>()?
+    };
+    for index in unique_indexes {
+        let mut stmt = conn.prepare(&format!("PRAGMA index_info({index})"))?;
+        // index_info columns: (seqno, cid, name).
+        let mut cols = stmt.query_map([], |row| row.get::<_, Option<String>>(2))?;
+        if cols.any(|col| matches!(col, Ok(Some(name)) if name == "commit_sha")) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn rebuild_files_table_for_commit_scopes(conn: &Connection) -> rusqlite::Result<()> {
+    // IDEMPOTENCE / NON-CLOBBER (load-bearing since V040): this V008 rebuild recreates `files` with
+    // the columns it knew at V008 — it has NO `repo_id` column. `apply` re-runs EVERY migration
+    // (the `create_or_migrate`/`rebuild` path), so on an already-V040 DB an unconditional rebuild
+    // here would DROP the `repo_id` column (and its real values) BEFORE V040 re-adds it as the
+    // placeholder — and a case-1 `register_repo` (already adopted) would not re-backfill it,
+    // leaving every file row stranded under `__unassigned__`. The rebuild's ONLY job beyond the
+    // additive columns (already added by `apply_commit_addressable_worktrees`) is the
+    // commit-scoped UNIQUE; once `files` already carries a UNIQUE that includes `commit_sha`
+    // (this V008 one, or the V040 `(repo_id, path, commit_sha, worktree_id)` that supersedes
+    // it), the rebuild is redundant.
+    if files_has_commit_scoped_unique(conn)? {
+        return Ok(());
+    }
     conn.execute_batch(
         "
         PRAGMA foreign_keys = OFF;

@@ -406,9 +406,18 @@ impl IndexDatabase {
             params![now_ms(), edges_written as i64, generation],
         )?;
         self.set_repo_meta("clone_graph_live_generation", &generation.to_string())?;
-        conn.execute("DELETE FROM clone_graph_generations WHERE generation != ?1", params![
-            generation
-        ])?;
+        // V042 SEAM: `clone_graph_generations` has NO `repo_id` yet, so this GC is global — it
+        // would delete a SIBLING repo's Complete/Building generation on a consolidated DB,
+        // even though that repo's `repo_meta` still points its live pointer at it (losing
+        // its persisted clone fast path). The live pointer is already per-repo
+        // (`live_generation_row`); the generation TABLE becomes per-repo in V042. Until
+        // then, skip the destructive cleanup when more than one real repo is registered; a
+        // single-repo DB (every DB pre-A7) prunes as before.
+        if !crate::index::schema::multiple_real_repos(conn)? {
+            conn.execute("DELETE FROM clone_graph_generations WHERE generation != ?1", params![
+                generation
+            ])?;
+        }
         Ok(())
     }
 }
@@ -691,7 +700,7 @@ fn flush_batch(
 
 /// The live (Complete) generation row, if one is published.
 fn live_generation_row(conn: &Connection) -> anyhow::Result<Option<GenerationRow>> {
-    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let Some(live) = crate::index::repo_meta(conn, &repo_id, "clone_graph_live_generation")? else {
         return Ok(None);
     };
@@ -707,30 +716,45 @@ fn open_building_generation(
     conn: &Connection,
     source_revision: &str,
 ) -> anyhow::Result<GenerationRow> {
-    let existing: Option<GenerationRow> = conn
-        .query_row(
-            "SELECT generation, source_revision, normalizer_version, cursor_symbol_id, \
-             edges_written, postings_written
-               FROM clone_graph_generations WHERE status = 'Building'
-              ORDER BY generation DESC LIMIT 1",
-            [],
-            map_generation_row,
-        )
-        .ok();
-    if let Some(row) = existing {
-        if row.source_revision == source_revision
-            && row.normalizer_version == NORM_VERSION
-            // Resume only a POSTINGS-AWARE partial. A pre-feature Building generation
-            // (`postings_written = 0`) has no postings for its already-walked symbols; resuming it
-            // would Complete a generation with a permanent postings gap. Discard it instead so the
-            // fresh generation below writes postings from symbol 0 (review R2).
-            && row.postings_written
-        {
-            return Ok(row);
+    // V042 SEAM: `clone_graph_generations` has no `repo_id` until V042, so the global `Building`
+    // row below can belong to ANY repo. On a consolidated multi-repo DB we must NOT touch it —
+    // neither RESUME nor DISCARD:
+    //  * RESUMING would adopt a SIBLING's in-progress generation. `source_revision` here is
+    //    `content_revision()`, GLOBAL over `main.files` (V040 reclassification), so a sibling's
+    //    Building row at the same DB content matches this repo's revision exactly;
+    //    `complete_generation` would then publish the sibling's generation under THIS repo's
+    //    `clone_graph_live_generation`.
+    //  * DISCARDING would delete the sibling's partial (a global `DELETE`).
+    // So gate the WHOLE resume/discard block on a single-repo DB. On a consolidated DB, fall
+    // straight through to a fresh `MAX(generation)+1` allocation (globally unique), leaving
+    // every sibling row intact. A single-repo DB (every DB pre-A7) keeps the resume/discard
+    // fast path unchanged.
+    if !crate::index::schema::multiple_real_repos(conn)? {
+        let existing: Option<GenerationRow> = conn
+            .query_row(
+                "SELECT generation, source_revision, normalizer_version, cursor_symbol_id, \
+                 edges_written, postings_written
+                   FROM clone_graph_generations WHERE status = 'Building'
+                  ORDER BY generation DESC LIMIT 1",
+                [],
+                map_generation_row,
+            )
+            .ok();
+        if let Some(row) = existing {
+            if row.source_revision == source_revision
+                && row.normalizer_version == NORM_VERSION
+                // Resume only a POSTINGS-AWARE partial. A pre-feature Building generation
+                // (`postings_written = 0`) has no postings for its already-walked symbols; resuming
+                // it would Complete a generation with a permanent postings gap. Discard it instead
+                // so the fresh generation below writes postings from symbol 0 (review R2).
+                && row.postings_written
+            {
+                return Ok(row);
+            }
+            // Stale partial (a reindex landed) OR a pre-feature postings-less partial: discard it
+            // (CASCADE drops its edges + postings) and start over.
+            conn.execute("DELETE FROM clone_graph_generations WHERE status = 'Building'", [])?;
         }
-        // Stale partial (a reindex landed) OR a pre-feature postings-less partial: discard it
-        // (CASCADE drops its edges + postings) and start over.
-        conn.execute("DELETE FROM clone_graph_generations WHERE status = 'Building'", [])?;
     }
     let generation: i64 = conn.query_row(
         "SELECT COALESCE(MAX(generation), 0) + 1 FROM clone_graph_generations",
@@ -1135,5 +1159,143 @@ mod tests {
         assert_eq!(db2.precompute_clone_graph(None).unwrap().status, "Complete");
         assert!(!db2.pending_clone_graph().unwrap(), "current again after the rebuild");
         assert!(db2.clone_check_indexed_generation().unwrap().is_some(), "eligible again");
+    }
+
+    // --- #413 finding #6: the global clone-generation cleanups are guarded on a multi-repo DB
+    // (`clone_graph_generations` has no `repo_id` until the V042 seam). ---
+
+    /// Register two REAL repos so `schema::multiple_real_repos` reports the consolidated shape. The
+    /// fixture DB is non-git (unadopted), so its registry holds only the placeholder; inserting the
+    /// rows directly is the white-box multi-repo construction (`register_repo` refuses a second
+    /// real repo until A7).
+    fn make_multi_repo(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-x', 'x', 0);
+             INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-y', 'y', 0);",
+        )
+        .unwrap();
+    }
+
+    /// Insert a `clone_graph_generations` row in `status` toward `source_revision`.
+    fn seed_generation(conn: &rusqlite::Connection, generation: i64, status: &str, revision: &str) {
+        conn.execute(
+            "INSERT INTO clone_graph_generations
+                (generation, status, theta_floor, normalizer_kind, normalizer_version,
+                 source_revision, cursor_symbol_id, edges_written, postings_written, started_at_ms)
+             VALUES (?1, ?2, 0.0, 'baseline', ?3, ?4, 0, 0, 1, 0)",
+            params![generation, status, NORM_VERSION, revision],
+        )
+        .unwrap();
+    }
+
+    fn generation_count(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM clone_graph_generations", [], |r| r.get(0)).unwrap()
+    }
+
+    /// `complete_generation` GCs every other generation; on a multi-repo DB that global delete
+    /// would wipe a sibling repo's live generation, so the guard must skip it.
+    #[test]
+    fn complete_generation_spares_sibling_generations_on_a_multi_repo_db() {
+        let db = build_clone_fixture("mr-complete");
+        {
+            let conn = db.storage.connection();
+            make_multi_repo(conn);
+            seed_generation(conn, 1, "Building", "rev-a"); // this repo's, to complete
+            seed_generation(conn, 2, "Complete", "rev-sibling"); // a sibling's live generation
+        }
+        db.complete_generation(1, 0).unwrap();
+
+        let conn = db.storage.connection();
+        assert_eq!(generation_count(conn), 2, "the multi-repo guard spared the sibling generation");
+        let g1_status: String = conn
+            .query_row("SELECT status FROM clone_graph_generations WHERE generation = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(g1_status, "Complete", "this repo's generation still completes + publishes");
+    }
+
+    /// The complement: a single-repo DB (no sibling to protect) GCs the other generations as
+    /// before.
+    #[test]
+    fn complete_generation_prunes_other_generations_on_a_single_repo_db() {
+        let db = build_clone_fixture("sr-complete");
+        {
+            let conn = db.storage.connection();
+            seed_generation(conn, 1, "Building", "rev-a");
+            seed_generation(conn, 2, "Complete", "rev-old");
+        }
+        db.complete_generation(1, 0).unwrap();
+
+        let conn = db.storage.connection();
+        assert_eq!(generation_count(conn), 1, "single-repo GC drops every other generation");
+    }
+
+    /// `open_building_generation` discards a stale (different-revision) Building row before
+    /// starting fresh; on a multi-repo DB that discard is global, so the guard must skip it and
+    /// leave the sibling's in-progress row intact while still allocating a fresh generation.
+    #[test]
+    fn open_building_generation_spares_a_sibling_building_row_on_a_multi_repo_db() {
+        let db = build_clone_fixture("mr-open");
+        let conn = db.storage.connection();
+        make_multi_repo(conn);
+        seed_generation(conn, 7, "Building", "sibling-rev"); // a sibling's in-progress build
+
+        let opened = open_building_generation(conn, "my-new-rev").unwrap();
+        assert_ne!(opened.generation, 7, "a fresh generation is allocated, not the sibling's");
+        let sibling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM clone_graph_generations WHERE generation = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling, 1, "the sibling repo's Building row is not globally discarded");
+    }
+
+    /// #413 round-5: the multi-repo guard must not just skip the DISCARD — it must also skip the
+    /// RESUME. `source_revision` is `content_revision()`, GLOBAL over `main.files`, so a sibling's
+    /// Building row at the SAME revision (+ postings-aware) would otherwise be RESUMED and then
+    /// published under this repo's live pointer. On a multi-repo DB `open_building_generation` must
+    /// allocate a FRESH generation and leave the sibling's Building row untouched, even on a match.
+    #[test]
+    fn open_building_generation_does_not_resume_a_sibling_building_row_on_a_multi_repo_db() {
+        let db = build_clone_fixture("mr-resume");
+        let conn = db.storage.connection();
+        make_multi_repo(conn);
+        // A sibling's in-progress build at the SAME revision this repo is about to open (a
+        // matching, postings-aware row — `seed_generation` writes `postings_written = 1`).
+        // The pre-fix code would RESUME generation 9 and hand it to this repo.
+        seed_generation(conn, 9, "Building", "shared-rev");
+
+        let opened = open_building_generation(conn, "shared-rev").unwrap();
+        assert_ne!(
+            opened.generation, 9,
+            "a matching sibling Building row is NOT resumed on a multi-repo DB — fresh generation",
+        );
+        let sibling_status: String = conn
+            .query_row("SELECT status FROM clone_graph_generations WHERE generation = 9", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(sibling_status, "Building", "the sibling's Building row is left intact");
+    }
+
+    /// The complement: a single-repo DB discards its own stale Building row as before.
+    #[test]
+    fn open_building_generation_discards_the_stale_building_row_on_a_single_repo_db() {
+        let db = build_clone_fixture("sr-open");
+        let conn = db.storage.connection();
+        seed_generation(conn, 7, "Building", "stale-rev");
+
+        open_building_generation(conn, "new-rev").unwrap();
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM clone_graph_generations WHERE generation = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "single-repo discards the stale Building row as before");
     }
 }

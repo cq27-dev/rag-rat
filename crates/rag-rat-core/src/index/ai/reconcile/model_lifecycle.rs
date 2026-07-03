@@ -107,25 +107,29 @@ pub(crate) fn activate_model_with_version(
     version: &str,
     provisional: bool,
 ) -> anyhow::Result<()> {
-    // Model id + freshness version are per-repo (V039 → repo_meta); the provenance flag is NOT in
-    // the phase-A2 move list, so it stays in the global `index_meta` (A3/A5 scope it later). Split
-    // across tables but still stamped together in this single writer's one call.
+    // The whole active-model provenance family is per-repo now: model id + freshness version moved
+    // to `repo_meta` in V039, and V040 reunited the provisional flag (+ remote config) there — one
+    // writer, one table.
     set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
     set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, version)?;
-    set_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META, if provisional { "1" } else { "0" })?;
+    set_repo_meta(
+        conn,
+        ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META,
+        if provisional { "1" } else { "0" },
+    )?;
     Ok(())
 }
 
 /// Whether the active embedding model is PROVISIONAL — set automatically (seed / cache recovery)
 /// and not yet confirmed by an explicit install or a committed reconcile. Absent ⇒ non-provisional.
 pub(crate) fn active_embedding_model_is_provisional(conn: &Connection) -> anyhow::Result<bool> {
-    Ok(meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META)?.as_deref() == Some("1"))
+    Ok(repo_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META)?.as_deref() == Some("1"))
 }
 
 /// Clear the provisional flag — the active model is now the CONFIRMED choice (an explicit install,
 /// or a reconcile that committed embeddings under it). Idempotent.
 pub(crate) fn clear_active_embedding_model_provisional(conn: &Connection) -> anyhow::Result<()> {
-    set_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META, "0")
+    set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META, "0")
 }
 
 /// Clear the active embedding model entirely — the inverse of [`activate_model_with_version`].
@@ -138,7 +142,7 @@ pub(crate) fn clear_active_embedding_model_provisional(conn: &Connection) -> any
 pub(crate) fn clear_active_embedding_model(conn: &Connection) -> anyhow::Result<()> {
     delete_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META)?;
     delete_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?;
-    delete_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META)?;
+    delete_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META)?;
     clear_active_remote_config(conn)
 }
 
@@ -450,7 +454,7 @@ mod seed_active_embedding_model_tests {
         // A prior open seeded jina PROVISIONALLY, and a remote-config meta was left behind. The
         // user then edits the config to `model = "none"`.
         seed_active_embedding_model(&conn, Some(JINA)).unwrap();
-        set_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{\"stale\":true}").unwrap();
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{\"stale\":true}").unwrap();
         assert!(active_embedding_model_is_provisional(&conn).unwrap());
 
         assert!(

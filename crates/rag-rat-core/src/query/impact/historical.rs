@@ -1,9 +1,11 @@
 use super::*;
 
 pub(crate) fn parser_failure_count(conn: &Connection) -> anyhow::Result<u64> {
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM parser_failures", [], |row| row.get(0))?;
-    Ok(u64::try_from(count).unwrap_or(0))
+    // `parser_failures` is direct-scoped (V040): count only the ACTIVE repo's failures, matching
+    // the scoped `IndexDatabase::parser_failure_count` twin — a sibling repo's parse failures must
+    // not depress this repo's graph-coverage confidence in a consolidated DB.
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    crate::index::scoped_table_row_count(conn, "parser_failures", &repo_id)
 }
 
 pub(crate) fn historical_evidence(
@@ -43,6 +45,10 @@ pub(crate) fn git_commits_for_paths(
     if budget == 0 {
         return Ok(());
     }
+    // `git_commits` / `git_file_changes` are direct-scoped (V040); join AND filter on `repo_id` so
+    // a consolidated DB never attributes a sibling repo's history to this path (a fork shares
+    // hashes).
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut added = 0usize;
     let mut stmt = conn.prepare(
         "
@@ -50,8 +56,9 @@ pub(crate) fn git_commits_for_paths(
                git_commits.hash, git_commits.subject, git_commits.authored_at_s
         FROM git_file_changes
         JOIN git_commits ON git_commits.hash = git_file_changes.commit_hash
+                        AND git_commits.repo_id = git_file_changes.repo_id
         LEFT JOIN files ON files.path = git_file_changes.path
-        WHERE git_file_changes.path = ?1
+        WHERE git_file_changes.path = ?1 AND git_file_changes.repo_id = ?3
         ORDER BY git_commits.authored_at_s DESC, git_commits.hash
         LIMIT ?2
         ",
@@ -62,8 +69,9 @@ pub(crate) fn git_commits_for_paths(
         }
         let before = surface.len();
         let file = file_for_path(conn, path)?;
-        let rows =
-            stmt.query_map(params![path, i64::try_from(budget).unwrap_or(i64::MAX)], |row| {
+        let rows = stmt.query_map(
+            params![path, i64::try_from(budget).unwrap_or(i64::MAX), repo_id],
+            |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
@@ -72,7 +80,8 @@ pub(crate) fn git_commits_for_paths(
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
                 ))
-            })?;
+            },
+        )?;
         for row in rows {
             let (row_path, language, kind, hash, subject, authored_at_s) = row?;
             let file_symbol = FileSymbol {

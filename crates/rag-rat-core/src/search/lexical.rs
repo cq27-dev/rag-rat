@@ -206,6 +206,12 @@ fn search_with_query_embedding(
     options: SearchOptions,
 ) -> anyhow::Result<Vec<SearchHit>> {
     let terms = query_terms(query);
+    // REPO SCOPING (A3): every candidate row flows through the `files` scope VIEW (both the bm25
+    // and the vector pass JOIN `files`), which filters `repo_id` FIRST — so in a consolidated
+    // DB a sibling repo's chunks are dropped by the INNER JOIN before ranking. `active_repo_id`
+    // is resolved ONCE here and threaded into the git boost queries (which read the
+    // direct-scoped `git_file_changes` by path, bypassing the view).
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let candidate_limit = i64::from(limit.max(10)).saturating_mul(8);
     let vector_available = query_embedding.is_some();
     let mut ranked = BTreeMap::<i64, RankedHit>::new();
@@ -243,7 +249,7 @@ fn search_with_query_embedding(
     let (graded_git, demotions) = if options.graded_history {
         let paths = ranked.values().map(|hit| hit.hit.path.clone()).collect::<Vec<_>>();
         let chunk_ids = ranked.keys().copied().collect::<Vec<_>>();
-        (graded_git_scores(conn, &paths)?, demotion_flags(conn, &chunk_ids)?)
+        (graded_git_scores(conn, &paths, &repo_id)?, demotion_flags(conn, &chunk_ids)?)
     } else {
         (std::collections::HashMap::new(), std::collections::HashMap::new())
     };
@@ -251,7 +257,7 @@ fn search_with_query_embedding(
     let mut hits = ranked
         .into_values()
         .map(|mut hit| {
-            let boosts = boosts(conn, &hit.hit, &terms, options)?;
+            let boosts = boosts(conn, &hit.hit, &terms, options, &repo_id)?;
             hit.components.symbol = SYMBOL_WEIGHT * boosts.symbol;
             hit.components.graph = GRAPH_WEIGHT * boosts.graph;
             // The git component is the one real lever: under the flag, replace the binary
@@ -510,11 +516,12 @@ fn boosts(
     hit: &SearchHit,
     terms: &[String],
     options: SearchOptions,
+    repo_id: &str,
 ) -> anyhow::Result<BoostComponents> {
-    let historical = historical_boost(conn, &hit.path, options)?;
+    let historical = historical_boost(conn, &hit.path, options, repo_id)?;
     Ok(BoostComponents {
         symbol: symbol_path_boost(hit, terms),
-        graph: graph_boost(conn, hit, terms)?,
+        graph: graph_boost(conn, hit, terms, repo_id)?,
         git: historical.git,
         github: historical.github,
     })
@@ -535,7 +542,12 @@ fn symbol_path_boost(hit: &SearchHit, terms: &[String]) -> f64 {
     boost.min(1.0)
 }
 
-fn graph_boost(conn: &Connection, hit: &SearchHit, terms: &[String]) -> anyhow::Result<f64> {
+fn graph_boost(
+    conn: &Connection,
+    hit: &SearchHit,
+    terms: &[String],
+    repo_id: &str,
+) -> anyhow::Result<f64> {
     let Some(symbol) = hit.symbol_path.as_deref() else {
         return Ok(0.0);
     };
@@ -551,6 +563,14 @@ fn graph_boost(conn: &Connection, hit: &SearchHit, terms: &[String]) -> anyhow::
     // prepare_cached: this runs once per search CANDIDATE (~limit*8); caching collapses ~80
     // cold statement compilations of this multi-join query to one per connection (#79 cold-query
     // prepare cost).
+    // REPO SCOPING (A3): the name-id predicate matches by symbol NAME, which is not repo-unique — a
+    // sibling repo's identically-named symbol would otherwise inject its edges into this hit's
+    // graph score. Constrain each edge to the active repo through its `source_file_id →
+    // files.repo_id` (the same repo predicate the candidate/git reads carry). `source_file_id`
+    // is always set (its FK is `ON DELETE CASCADE`, and every edge is inserted with its file
+    // id), so the `EXISTS` drops no live edge in a single-repo DB. It applies AFTER the
+    // `from_name_id`/`to_name_id` index seek narrows to ≤64 candidate edges, so the hot-path
+    // integer indexes still drive the scan.
     let mut stmt = conn.prepare_cached(
         "
         SELECT ek.value, conf.value, fn.value, tn.value
@@ -559,8 +579,10 @@ fn graph_boost(conn: &Connection, hit: &SearchHit, terms: &[String]) -> anyhow::
         JOIN name_strings conf ON conf.id = d.confidence_id
         LEFT JOIN name_strings fn ON fn.id = d.from_name_id
         JOIN name_strings tn ON tn.id = d.to_name_id
-        WHERE d.from_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2))
-           OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2))
+        WHERE (d.from_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2))
+            OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN (?1, ?2)))
+          AND EXISTS (SELECT 1 FROM main.files f
+                       WHERE f.id = d.source_file_id AND f.repo_id = ?3)
         ORDER BY
             CASE conf.value
                 WHEN 'Exact' THEN 0
@@ -572,7 +594,7 @@ fn graph_boost(conn: &Connection, hit: &SearchHit, terms: &[String]) -> anyhow::
         LIMIT 64
         ",
     )?;
-    let rows = stmt.query_map(params![symbol, qualified], |row| {
+    let rows = stmt.query_map(params![symbol, qualified, repo_id], |row| {
         Ok(GraphEdgeEvidence {
             edge_kind: row.get(0)?,
             confidence: row.get(1)?,
@@ -664,11 +686,16 @@ fn historical_boost(
     conn: &Connection,
     path: &str,
     options: SearchOptions,
+    repo_id: &str,
 ) -> anyhow::Result<HistoricalBoost> {
+    // `git_file_changes` is direct-scoped (V040) and queried by PATH here (bypassing the scope
+    // view), so the `repo_id` predicate keeps a sibling repo's history from boosting a same-named
+    // path in a consolidated DB. (`github_refs` stays global until the papertrail tables gain
+    // `repo_id` in the A4 scoping phase.)
     let git = if options.include_git {
         conn.query_row(
-            "SELECT COUNT(*) FROM git_file_changes WHERE path = ?1 LIMIT 1",
-            [path],
+            "SELECT COUNT(*) FROM git_file_changes WHERE path = ?1 AND repo_id = ?2 LIMIT 1",
+            params![path, repo_id],
             |row| row.get::<_, i64>(0),
         )?
     } else {
@@ -707,18 +734,25 @@ fn git_score(recent_touch_count: i64, commit_touch_count: i64) -> f64 {
 fn graded_git_scores(
     conn: &Connection,
     paths: &[String],
+    repo_id: &str,
 ) -> anyhow::Result<std::collections::HashMap<String, f64>> {
     let mut scores = std::collections::HashMap::new();
     if paths.is_empty() {
         return Ok(scores);
     }
-    let newest_commit: i64 =
-        conn.query_row("SELECT COALESCE(MAX(authored_at_s), 0) FROM git_commits", [], |row| {
-            row.get(0)
-        })?;
+    // `git_commits` / `git_file_changes` are direct-scoped (V040); the newest-commit floor and the
+    // churn aggregate both filter `repo_id` so a consolidated DB grades against THIS repo's history
+    // only (a fork shares hashes and paths).
+    let newest_commit: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(authored_at_s), 0) FROM git_commits WHERE repo_id = ?1",
+        params![repo_id],
+        |row| row.get(0),
+    )?;
     // Resolve the 90-day recency floor ONCE per query (not per path).
     let recent_floor = newest_commit.saturating_sub(RECENT_WINDOW_SECS);
     let placeholders = std::iter::repeat_n("?", paths.len()).collect::<Vec<_>>().join(", ");
+    // ?1 = recent_floor, ?2..?(paths.len()+1) = paths, ?(paths.len()+2) = repo_id.
+    let repo_index = paths.len() + 2;
     let sql = format!(
         "
         SELECT git_file_changes.path,
@@ -727,16 +761,19 @@ fn graded_git_scores(
          recent_touch_count
         FROM git_file_changes
         JOIN git_commits ON git_commits.hash = git_file_changes.commit_hash
+                        AND git_commits.repo_id = git_file_changes.repo_id
         WHERE git_file_changes.path IN ({placeholders})
+          AND git_file_changes.repo_id = ?{repo_index}
         GROUP BY git_file_changes.path
         "
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut params = Vec::<&dyn rusqlite::ToSql>::with_capacity(paths.len() + 1);
+    let mut params = Vec::<&dyn rusqlite::ToSql>::with_capacity(paths.len() + 2);
     params.push(&recent_floor);
     for path in paths {
         params.push(path);
     }
+    params.push(&repo_id);
     let rows = stmt.query_map(params.as_slice(), |row| {
         let path: String = row.get(0)?;
         let commit_touch_count: i64 = row.get(1)?;
@@ -897,8 +934,10 @@ mod tests {
                 "EXPLAIN QUERY PLAN
                  SELECT ek.value FROM edges_data d
                  JOIN name_strings ek ON ek.id = d.edge_kind_id
-                 WHERE d.from_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b'))
-                    OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b'))",
+                 WHERE (d.from_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b'))
+                     OR d.to_name_id IN (SELECT id FROM name_strings WHERE value IN ('a', 'b')))
+                   AND EXISTS (SELECT 1 FROM main.files f
+                                WHERE f.id = d.source_file_id AND f.repo_id = 'r')",
             )
             .unwrap()
             .query_map([], |row| row.get::<_, String>(3))
@@ -913,6 +952,11 @@ mod tests {
         assert!(
             !plan.contains("SCAN d "),
             "graph_boost must not full-scan edges_data, got plan:\n{plan}"
+        );
+        // The repo predicate must be a PK lookup on files (per candidate edge), never a files scan.
+        assert!(
+            !plan.contains("SCAN f"),
+            "graph_boost repo scope must PK-search files, not scan it, got plan:\n{plan}"
         );
     }
 

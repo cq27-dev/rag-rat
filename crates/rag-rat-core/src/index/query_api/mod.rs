@@ -50,7 +50,10 @@ impl IndexDatabase {
         }
 
         let content_revision = self.content_revision()?;
-        let fts_source_revision = self.repo_meta("fts_source_revision")?;
+        // GLOBAL keys (V040 reclassification): `chunk_fts` is one global FTS5 index and
+        // `content_revision()` digests the whole `main.files`, so their freshness lives in
+        // `index_meta` (`self.meta`), never per-repo `repo_meta`.
+        let fts_source_revision = self.meta("fts_source_revision")?;
         let fts_dirty = self.fts_dirty()?;
 
         Ok(IndexStatus {
@@ -64,7 +67,7 @@ impl IndexDatabase {
                 .and_then(|value| value.parse::<i64>().ok()),
             content_revision: content_revision.clone(),
             fts_synced_at_ms: self
-                .repo_meta("fts_synced_at_ms")?
+                .meta("fts_synced_at_ms")?
                 .and_then(|value| value.parse::<i64>().ok()),
             fts_dirty,
             fts_fresh: !fts_dirty

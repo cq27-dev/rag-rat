@@ -24,7 +24,7 @@ fn orientation_composes_through_read_only_connection() {
 
     // Open the SAME on-disk DB read-only, exactly as session_start does.
     let conn = IndexConnection::open_read_only(&db_path).unwrap();
-    let o = crate::query::orientation::orientation(conn.connection(), &root, &root)
+    let o = crate::query::orientation::orientation(conn.connection(), &root, &root, None)
         .expect("orientation must compose through a read-only main-DB connection");
 
     // The scope view (TEMP table/view) was created and queried — non-empty tree + 6 files.
@@ -87,9 +87,9 @@ fn full_rebuild_clears_foreign_leaked_rows_at_the_active_scope() {
         .connection()
         .execute(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
-             commit_sha, worktree_id) VALUES ('src/foreign_leak.rs', 'rust', 'source', 'leak', 0, \
-             0, ?1, '')",
-            rusqlite::params![commit],
+             commit_sha, worktree_id, repo_id) VALUES ('src/foreign_leak.rs', 'rust', 'source', \
+             'leak', 0, 0, ?1, '', ?2)",
+            rusqlite::params![commit, db.active_repo_id],
         )
         .unwrap();
     drop(db);

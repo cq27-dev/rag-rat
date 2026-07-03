@@ -281,16 +281,20 @@ fn co_touch_pairs(
     rows: &[FileBriefRow],
 ) -> anyhow::Result<BTreeMap<PathPair, u64>> {
     let path_index = path_index(rows);
+    // `git_file_changes` is direct-scoped (V040); the `files` view join is by PATH, so the
+    // explicit `repo_id` predicate is what keeps a sibling repo's co-touch history for a shared
+    // path out of this repo's clusters in a consolidated DB.
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT git_file_changes.commit_hash, git_file_changes.path
         FROM git_file_changes
         JOIN files ON files.path = git_file_changes.path
-        WHERE (?1 OR files.generated = 0)
+        WHERE (?1 OR files.generated = 0) AND git_file_changes.repo_id = ?2
         ORDER BY git_file_changes.commit_hash, git_file_changes.path
         ",
     )?;
-    let mut query_rows = stmt.query([include_generated])?;
+    let mut query_rows = stmt.query((include_generated, &repo_id))?;
     let mut pairs = BTreeMap::<PathPair, u64>::new();
     let mut current_commit = String::new();
     let mut paths = Vec::new();

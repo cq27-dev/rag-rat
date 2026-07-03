@@ -97,8 +97,8 @@ impl IndexDatabase {
         let has_test_code = chunks.iter().any(|pc| text_has_test_marker(&pc.chunk.text));
         let file_id = self.storage.connection().query_row(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-             indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              RETURNING id",
             params![
                 path_string(path),
@@ -112,6 +112,7 @@ impl IndexDatabase {
                 &scope.commit_sha,
                 &scope.worktree_id,
                 has_test_code,
+                self.active_repo_id,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -171,8 +172,8 @@ impl IndexDatabase {
             .connection()
             .prepare_cached(
                 "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-                 indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code, repo_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  RETURNING id",
             )?
             .query_row(
@@ -188,6 +189,7 @@ impl IndexDatabase {
                     file.commit_sha,
                     file.worktree_id,
                     has_test_code,
+                    self.active_repo_id,
                 ],
                 |row| row.get::<_, i64>(0),
             )?;
@@ -485,19 +487,23 @@ impl IndexDatabase {
     /// call would dominate.
     pub(super) fn insert_logical_group(
         conn: &rusqlite::Connection,
+        repo_id: &str,
         key: &LogicalSymbolKey,
         members: &[LogicalSymbolMemberRow],
     ) -> anyhow::Result<()> {
         let group_reason = if members.len() > 1 { "cfg_variant" } else { "single" };
-        let logical_symbol_id = key.stable_id();
+        // Repo-distinct id (A3): `stable_id` folds `repo_id` into the content hash so two repos
+        // with identical content don't collide on the `logical_symbols.id` PK in a
+        // consolidated DB.
+        let logical_symbol_id = key.stable_id(repo_id);
         // Intern the qualified name into the shared `name_strings` pool (#224) — the
         // qualified_name TEXT column was dropped in V028.
         let qualified_name_id = crate::index::edges::intern_edge_string(conn, &key.qualified_name)?;
         conn.prepare_cached(
             "
             INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id, kind, \
-             variant_count, group_reason)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             variant_count, group_reason, repo_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ",
         )?
         .execute(params![
@@ -509,6 +515,7 @@ impl IndexDatabase {
             key.kind,
             i64::try_from(members.len()).unwrap_or(i64::MAX),
             group_reason,
+            repo_id,
         ])?;
         for member in members {
             let signature_hash =

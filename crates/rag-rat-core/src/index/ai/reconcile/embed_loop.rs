@@ -1501,7 +1501,7 @@ mod freshness_version_tests {
         .unwrap();
         set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
         set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, spec.version).unwrap();
-        set_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
 
         let report =
             reconcile_with_options_progress(&conn, ReconcileOptions::default(), |_| {}).unwrap();

@@ -4,7 +4,7 @@ use std::fmt;
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::Serialize;
 
-use crate::index::table_row_count;
+use crate::index::scoped_table_row_count;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoBriefMode {
@@ -504,9 +504,23 @@ pub(crate) fn summary_counts(conn: &Connection) -> anyhow::Result<SummaryCounts>
         conn.query_row("SELECT COUNT(*), COALESCE(SUM(generated), 0) FROM files", [], |row| {
             Ok((row_u64(row, 0)?, row_u64(row, 1)?))
         })?;
-    let graph_edges = table_row_count(conn, "edges")?;
-    let git_commits = table_row_count(conn, "git_commits")?;
-    let git_file_changes = table_row_count(conn, "git_file_changes")?;
+    // `graph_edges` / `git_commits` / `git_file_changes` are all scoped to the ACTIVE repo: the
+    // brief describes ONE repo, so its counts must not report the union across a consolidated
+    // DB. `files` above flows through the repo-scoped view; `git_commits` / `git_file_changes`
+    // are direct-scoped (V040). `edges` has no `repo_id` of its own — it is attributed
+    // transitively through `source_file_id → main.files.repo_id` (the same join
+    // `lexical::graph_boost` and `ensure_graph_index_current`'s scoped delete use), so count it
+    // that way rather than via the global `edges` compatibility view (round-5 finding).
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let graph_edges: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM edges_data e
+           JOIN main.files f ON f.id = e.source_file_id
+          WHERE f.repo_id = ?1",
+        [&repo_id],
+        |row| row_u64(row, 0),
+    )?;
+    let git_commits = scoped_table_row_count(conn, "git_commits", &repo_id)?;
+    let git_file_changes = scoped_table_row_count(conn, "git_file_changes", &repo_id)?;
     let memories = memory_counts(conn, None)?;
     Ok(SummaryCounts {
         total_files,
@@ -524,6 +538,11 @@ pub(crate) fn file_rows(
 ) -> anyhow::Result<Vec<FileBriefRow>> {
     let newest_commit = newest_commit_time(conn)?;
     let recent_floor = newest_commit.saturating_sub(90 * 24 * 60 * 60);
+    // The churn CTE reads the direct-scoped `git_file_changes` / `git_commits` (V040); the
+    // `repo_id` predicate keeps a sibling repo's churn for a SHARED path (two repos both having
+    // `src/lib.rs`) out of this repo's brief — the outer LEFT JOIN is by path, so the scoped
+    // `files` view alone cannot exclude it.
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         WITH file_size AS (
@@ -560,6 +579,8 @@ pub(crate) fn file_rows(
                  COALESCE(SUM(git_file_changes.deletions), 0) AS deletions
           FROM git_file_changes
           JOIN git_commits ON git_commits.hash = git_file_changes.commit_hash
+                          AND git_commits.repo_id = git_file_changes.repo_id
+          WHERE git_file_changes.repo_id = ?3
           GROUP BY git_file_changes.path
         ),
         github_ref_counts AS (
@@ -590,7 +611,7 @@ pub(crate) fn file_rows(
         ",
     )?;
 
-    let rows = stmt.query_map((recent_floor, include_generated), |row| {
+    let rows = stmt.query_map((recent_floor, include_generated, repo_id), |row| {
         Ok(FileBriefRow {
             path: row.get(0)?,
             language: row.get(1)?,
@@ -653,8 +674,15 @@ fn enrich_rows<T: Clone + Default>(
 }
 
 fn newest_commit_time(conn: &Connection) -> anyhow::Result<i64> {
+    // Direct-scoped (V040): the recency floor tracks the ACTIVE repo's newest commit, not a more
+    // recently indexed sibling's.
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     Ok(conn
-        .query_row("SELECT MAX(authored_at_s) FROM git_commits", [], |row| row.get(0))
+        .query_row(
+            "SELECT MAX(authored_at_s) FROM git_commits WHERE repo_id = ?1",
+            [&repo_id],
+            |row| row.get(0),
+        )
         .optional()?
         .flatten()
         .unwrap_or(0))

@@ -270,7 +270,9 @@ fn heal_index_limit_does_not_warn_when_only_fresh_files_are_skipped() {
 fn search_recovers_when_fts_revision_is_stale() {
     let (root, config) = markdown_config("alpha token");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    db.set_repo_meta("fts_source_revision", "stale").unwrap();
+    // `fts_source_revision` is a GLOBAL freshness key (V040 reclassification) — stored in
+    // `index_meta`, so stale it there, not in per-repo `repo_meta`.
+    db.set_meta("fts_source_revision", "stale").unwrap();
 
     let stale = db.status(&config.database).unwrap();
     assert!(!stale.fts_dirty);

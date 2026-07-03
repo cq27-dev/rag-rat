@@ -6,10 +6,18 @@ use super::*;
 /// so no fresh f32 rows ever appear after the conversion.
 const VECTOR_INT8_REENCODE_DONE_META: &str = "vector_int8_reencode_done";
 
-/// Reconcile-meta key persisting the keyset cursor (the last converted `(chunk_id, model_id)`)
+/// GLOBAL `index_meta` key persisting the keyset cursor (the last converted `(chunk_id, model_id)`)
 /// across maintenance passes, so a deadline-stopped conversion RESUMES from where it left off
 /// instead of rescanning from the table head. Serialized as `"<chunk_id>\n<model_id>"`. Only
 /// meaningful while the done-gate ([`VECTOR_INT8_REENCODE_DONE_META`]) is unset.
+///
+/// GLOBAL, not per-repo (V040 reclassification): the re-encode walks the WHOLE `chunk_embeddings`
+/// table (the SELECT/UPDATE below carry no `repo_id` filter) — a format-only conversion that is
+/// repo-independent — and its done-gate is already global. V039 relocated the cursor to
+/// `repo_meta`, which split a single global walk into per-repo resume markers: a sibling repo's
+/// open would find no cursor and rescan from the head. Keep it in `index_meta` (`meta` / `set_meta`
+/// / `delete_meta`), alongside the done-gate. (V040's `move_repo_meta_keys_to_global` migrates a
+/// stale per-repo copy.)
 const VECTOR_INT8_REENCODE_CURSOR_META: &str = "vector_int8_reencode_cursor";
 
 /// Rows converted per transaction. Bounded so a huge index (millions of embeddings) never builds
@@ -118,7 +126,7 @@ fn reencode_legacy_f32_blobs_batched(
 /// back to the sentinel — re-walking from the head is correct (already-int8 rows are skipped),
 /// never wrong.
 fn load_cursor(conn: &Connection) -> anyhow::Result<(i64, String)> {
-    let Some(raw) = repo_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)? else {
+    let Some(raw) = meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)? else {
         return Ok((i64::MIN, String::new()));
     };
     let Some((chunk_id, model_id)) = raw.split_once('\n') else {
@@ -132,7 +140,7 @@ fn load_cursor(conn: &Connection) -> anyhow::Result<(i64, String)> {
 
 /// Persist the keyset cursor as `"<chunk_id>\n<model_id>"` (model ids never contain a newline).
 fn save_cursor(conn: &Connection, cursor: &(i64, String)) -> anyhow::Result<()> {
-    set_repo_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META, &format!("{}\n{}", cursor.0, cursor.1))
+    set_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META, &format!("{}\n{}", cursor.0, cursor.1))
 }
 
 /// Read up to `limit` legacy f32 rows past `cursor`, in `(chunk_id, model_id)` order (the UNIQUE
@@ -266,7 +274,7 @@ fn reencode_and_mark_if_complete(
 
 /// Drop the persisted keyset cursor once the conversion is complete (it is no longer meaningful).
 fn clear_cursor(conn: &Connection) -> anyhow::Result<()> {
-    delete_repo_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)?;
+    delete_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)?;
     Ok(())
 }
 
@@ -277,8 +285,10 @@ mod tests {
     /// `chunk_embeddings` with the columns the re-encode touches, matching the PROD shape from
     /// `schema/baseline.rs`: a surrogate `id INTEGER PRIMARY KEY AUTOINCREMENT` plus a
     /// `UNIQUE(chunk_id, model_id)` secondary index — so the keyset `ORDER BY chunk_id, model_id`
-    /// exercises that UNIQUE index (not a clustered PK), as in production. `index_meta` is the
-    /// done-gate store; `reconcile_meta` is the keyset-cursor store.
+    /// exercises that UNIQUE index (not a clustered PK), as in production. `index_meta` stores BOTH
+    /// the done-gate AND the keyset cursor: the cursor is GLOBAL (the re-encode walks the whole
+    /// `chunk_embeddings` table repo-independently), so no `repos`/`repo_meta` scaffolding is
+    /// needed.
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -290,17 +300,7 @@ mod tests {
                  vector_blob BLOB NOT NULL,
                  UNIQUE(chunk_id, model_id)
              );
-             CREATE TABLE index_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE reconcile_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             -- The reencode cursor moved to `repo_meta` (V039), read/written through
-             -- `single_repo_id` → the `repos` registry; seed the placeholder so the cursor path
-             -- resolves the same lone repo production does.
-             CREATE TABLE repos(repo_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, \
-             registered_at_ms INTEGER NOT NULL);
-             INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('__unassigned__', \
-             '', 0);
-             CREATE TABLE repo_meta(repo_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY \
-             KEY(repo_id, key));",
+             CREATE TABLE index_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .unwrap();
         conn
@@ -493,7 +493,7 @@ mod tests {
     }
 
     fn stored_cursor(conn: &Connection) -> Option<String> {
-        repo_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META).unwrap()
+        meta(conn, VECTOR_INT8_REENCODE_CURSOR_META).unwrap()
     }
 
     #[test]
@@ -538,7 +538,7 @@ mod tests {
             )
             .unwrap();
         }
-        set_repo_meta(&conn, VECTOR_INT8_REENCODE_CURSOR_META, "1\nmodel-a").unwrap();
+        set_meta(&conn, VECTOR_INT8_REENCODE_CURSOR_META, "1\nmodel-a").unwrap();
         assert_eq!(count_remaining_f32(&conn), 4, "4 f32 rows remain past the cursor");
 
         // A follow-up call with NO deadline resumes from the persisted cursor and finishes the

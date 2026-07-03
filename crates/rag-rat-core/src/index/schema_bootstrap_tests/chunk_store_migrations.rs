@@ -117,6 +117,11 @@ fn rebuild_fts_repopulates_contentless_chunk_fts_from_the_store() {
 
 #[test]
 fn full_rebuild_populates_the_chunk_text_store() {
+    // `chunk_text` is a GLOBAL compression store keyed by `chunk_id` (no repo dimension); this test
+    // asserts it mirrors the WHOLE `chunks` table 1:1. The poison-sibling harness seeds a raw
+    // tripwire chunk with no `chunk_text` row, breaking that whole-DB 1:1 by design — a single-repo
+    // invariant, not a leak. Opt out.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     // #77 Phase 2: a full rebuild compresses every chunk into chunk_text against the shared dict,
     // and every stored blob round-trips to its chunks.text.
     let root = unique_temp_root();
@@ -160,6 +165,9 @@ fn full_rebuild_populates_the_chunk_text_store() {
 
 #[test]
 fn incremental_heal_maintains_the_chunk_text_store() {
+    // Whole-DB `chunk_text`↔`chunks` 1:1 invariant (global store) — the poison-sibling tripwire
+    // chunk has no `chunk_text` mirror by design. Single-repo invariant; opt out.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     // #77 Phase 2 (2b-2a): the incremental/heal path writes chunk_text inline with the existing
     // dict, so a healed file's compressed blobs match its NEW text (the old rows cascade out with
     // the chunks). Without this, chunk_text would go stale on every incremental update.
@@ -205,6 +213,10 @@ fn incremental_heal_maintains_the_chunk_text_store() {
 
 #[test]
 fn rebuild_with_files_but_no_chunks_still_trains_a_dict_so_incrementals_dont_orphan() {
+    // Asserts the WHOLE DB has zero chunks (a whitespace-only markdown produces none). The
+    // poison-sibling tripwire seeds one chunk under a sibling repo, so this unscoped whole-DB count
+    // is a single-repo assertion; opt out.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
     // #77 Phase 2 regression (adversarial finding). A full rebuild that indexes a file producing
     // ZERO chunks — a whitespace-only markdown file (markdown_chunks has no whole-file fallback) —
     // must still establish dict version 1. Pre-fix, build_store early-returned on an empty corpus,
@@ -878,7 +890,7 @@ fn orientation_composes_read_only() {
 
     // orientation installs its own scope view — pass the raw connection.
     let conn = db.storage.connection();
-    let o1 = crate::query::orientation::orientation(conn, &root, &root).unwrap();
+    let o1 = crate::query::orientation::orientation(conn, &root, &root, None).unwrap();
 
     // tree: root memory must be set; nodes must be non-empty.
     assert_eq!(
@@ -927,7 +939,7 @@ fn orientation_composes_read_only() {
     let _ = o1.parser_failures;
 
     // Idempotency: run orientation a second time — must succeed with same key results.
-    let o2 = crate::query::orientation::orientation(conn, &root, &root).unwrap();
+    let o2 = crate::query::orientation::orientation(conn, &root, &root, None).unwrap();
     assert_eq!(
         o2.tree.root_memory_title.as_deref(),
         Some("root purpose"),

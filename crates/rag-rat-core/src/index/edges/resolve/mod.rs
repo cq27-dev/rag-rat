@@ -129,10 +129,15 @@ fn load_package_roots_into_scope(
     conn: &Connection,
     scope: &mut imports::ImportScope,
 ) -> anyhow::Result<()> {
-    // The active checkout's (commit_sha, worktree_id), so the `packages` read is scoped exactly
-    // like the `files` view (which reads the same context table). A raw test connection without
-    // the context falls back to empty strings — the same scope `add_package`/`refresh_packages`
-    // write under for non-git fixtures, so the test path stays consistent.
+    // The active checkout's (repo_id, commit_sha, worktree_id), so the `packages` read is scoped
+    // exactly like the `files` view (which reads the same context table). The `repo_id` predicate
+    // (A3) is what keeps a sibling repo's package roots out of THIS repo's import scope in a
+    // consolidated DB where two repos share the empty non-git scope. A raw test connection without
+    // the context falls back to the sole repo (placeholder on an un-adopted DB, matching the
+    // placeholder-defaulted `packages` rows) and to empty commit/worktree — the same scope
+    // `add_package`/`refresh_packages` write under for non-git fixtures, so the test path stays
+    // consistent.
+    let active_repo_id = crate::index::schema::active_repo_id(conn)?;
     let active_commit_sha = scope_context_value(conn, "commit_sha");
     let active_worktree_id = scope_context_value(conn, "worktree_id");
 
@@ -142,16 +147,17 @@ fn load_package_roots_into_scope(
     // reinsert and is meaningless across scopes).
     let packages: Vec<(String, HashSet<String>)> = {
         let mut stmt = match conn.prepare(
-            "SELECT manifest_dir, local_roots_json FROM packages WHERE commit_sha = ?1 AND \
-             worktree_id = ?2",
+            "SELECT manifest_dir, local_roots_json FROM packages WHERE repo_id = ?1 AND \
+             commit_sha = ?2 AND worktree_id = ?3",
         ) {
             Ok(stmt) => stmt,
             // No `packages` table (pre-V022 / non-Cargo): nothing to load, fall open.
             Err(_) => return Ok(()),
         };
-        let rows = stmt.query_map(params![active_commit_sha, active_worktree_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = stmt
+            .query_map(params![active_repo_id, active_commit_sha, active_worktree_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
         let mut packages: Vec<(String, HashSet<String>)> = rows
             .map(|row| {
                 let (manifest_dir, roots_json) = row?;

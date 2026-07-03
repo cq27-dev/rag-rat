@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::index::{delete_repo_meta, repo_meta, schema, set_repo_meta, table_row_count};
+use crate::index::{delete_repo_meta, repo_meta, schema, scoped_table_row_count, set_repo_meta};
 use crate::search::lexical::SearchHit;
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,20 +147,22 @@ pub(crate) fn apply_prepared(
         return status(conn, root);
     };
 
-    conn.execute_batch(
-        "
-        DELETE FROM commit_fts;
-        DELETE FROM git_chunk_blame;
-        DELETE FROM git_file_changes;
-        DELETE FROM git_commits;
-        ",
-    )?;
+    // `git_commits` / `git_file_changes` are direct-scoped since V040, so a history reindex of ONE
+    // repo must delete and re-insert only THAT repo's rows — a wholesale wipe would drop a sibling
+    // repo's commits in a consolidated DB. (`git_chunk_blame` is transitive via `chunks`/`files`
+    // and regenerated lazily; its per-repo scoping is deferred to the blame/query workstream — a
+    // marked A4/A5 seam. `commit_fts` is external-content over `git_commits` and is resynced
+    // below.)
+    let repo_id = schema::active_repo_id(conn)?;
+    conn.execute("DELETE FROM git_file_changes WHERE repo_id = ?1", params![repo_id])?;
+    conn.execute("DELETE FROM git_commits WHERE repo_id = ?1", params![repo_id])?;
+    conn.execute_batch("DELETE FROM git_chunk_blame;")?;
 
     for commit in &prepared.commits {
         conn.execute(
             "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s, \
-             committed_at_s, subject, body, changed_file_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+             committed_at_s, subject, body, changed_file_count, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
             params![
                 commit.hash,
                 commit.author_name,
@@ -169,6 +171,7 @@ pub(crate) fn apply_prepared(
                 commit.committed_at_s,
                 commit.subject,
                 commit.body,
+                repo_id,
             ],
         )?;
     }
@@ -177,32 +180,33 @@ pub(crate) fn apply_prepared(
     for change in prepared.changes {
         *changed_counts.entry(change.commit_hash.clone()).or_default() += 1;
         conn.execute(
-            "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind, \
+             repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 change.commit_hash,
                 change.path,
                 change.additions,
                 change.deletions,
                 change.change_kind,
+                repo_id,
             ],
         )?;
     }
     for (hash, count) in changed_counts {
-        conn.execute("UPDATE git_commits SET changed_file_count = ?2 WHERE hash = ?1", params![
-            hash, count
-        ])?;
+        conn.execute(
+            "UPDATE git_commits SET changed_file_count = ?2 WHERE hash = ?1 AND repo_id = ?3",
+            params![hash, count, repo_id],
+        )?;
     }
 
-    conn.execute_batch(
-        "
-        INSERT INTO commit_fts(rowid, subject, body)
-        SELECT rowid, subject, body FROM git_commits;
-        ",
-    )?;
+    // Resync the external-content FTS from `git_commits` with the desync-safe `'rebuild'` (#51),
+    // never a `DELETE FROM commit_fts` + manual repopulate — the reinserted commit rows took new
+    // rowids, so the stored mapping is stale. `'rebuild'` re-indexes all repos' commits, keeping
+    // every repo searchable.
+    crate::index::schema::rebuild_commit_fts(conn)?;
     // Reload-gate key: head + root + shallow flag. `is_history_current` skips the next reload
     // only when all three still match and git_commits is non-empty.
-    let repo_id = schema::single_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "git_history_indexed_head", &repo.head)?;
     set_repo_meta(conn, &repo_id, "git_history_indexed_root", &root_key(root))?;
     set_repo_meta(
@@ -221,9 +225,12 @@ pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexSt
 
 pub fn status(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {
     let repo = git_repo(root);
-    let commit_count = table_row_count(conn, "git_commits")?;
-    let file_change_count = table_row_count(conn, "git_file_changes")?;
-    let repo_id = schema::single_repo_id(conn)?;
+    // `git_commits` / `git_file_changes` are direct-scoped since V040, so status must count only
+    // THIS repo's rows — a whole-table `table_row_count` would report the union across a
+    // consolidated DB.
+    let repo_id = schema::active_repo_id(conn)?;
+    let commit_count = scoped_table_row_count(conn, "git_commits", &repo_id)?;
+    let file_change_count = scoped_table_row_count(conn, "git_file_changes", &repo_id)?;
     Ok(GitHistoryIndexStatus {
         available: repo.is_some(),
         head: repo.map(|repo| repo.head),
@@ -253,28 +260,32 @@ pub fn replay_commit_cases(
     limit: u32,
     max_files: u32,
 ) -> anyhow::Result<Vec<ReplayCase>> {
+    // Direct-scoped (V040): the eval cases come only from the ACTIVE repo's history.
+    let repo_id = schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT hash, subject, body
         FROM git_commits
         WHERE changed_file_count BETWEEN 1 AND ?2
           AND subject NOT LIKE 'Merge %'
+          AND repo_id = ?3
         ORDER BY authored_at_s DESC
         LIMIT ?1
         ",
     )?;
     let commits: Vec<(String, String, String)> = stmt
-        .query_map(params![i64::from(limit), i64::from(max_files)], |row| {
+        .query_map(params![i64::from(limit), i64::from(max_files), repo_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut paths_stmt =
-        conn.prepare("SELECT path FROM git_file_changes WHERE commit_hash = ?1 ORDER BY path")?;
+    let mut paths_stmt = conn.prepare(
+        "SELECT path FROM git_file_changes WHERE commit_hash = ?1 AND repo_id = ?2 ORDER BY path",
+    )?;
     let mut cases = Vec::with_capacity(commits.len());
     for (hash, subject, body) in commits {
         let changed_paths: Vec<String> = paths_stmt
-            .query_map(params![hash], |row| row.get::<_, String>(0))?
+            .query_map(params![hash, repo_id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?;
         if changed_paths.is_empty() {
             continue;
@@ -336,6 +347,10 @@ pub fn commit_search(
     limit: u32,
 ) -> anyhow::Result<Vec<CommitSearchHit>> {
     let fts_query = fts_query(query);
+    // `commit_fts` is external-content over the direct-scoped `git_commits` (V040); the MATCH runs
+    // over every repo's commits, so the join predicate `git_commits.repo_id = ?` is what keeps a
+    // sibling repo's commits out of THIS repo's results in a consolidated DB.
+    let repo_id = schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT git_commits.hash, git_commits.author_name, git_commits.author_email,
@@ -344,12 +359,12 @@ pub fn commit_search(
                bm25(commit_fts) AS score
         FROM commit_fts
         JOIN git_commits ON git_commits.rowid = commit_fts.rowid
-        WHERE commit_fts MATCH ?1
+        WHERE commit_fts MATCH ?1 AND git_commits.repo_id = ?3
         ORDER BY score, git_commits.authored_at_s DESC
         LIMIT ?2
         ",
     )?;
-    let rows = stmt.query_map(params![fts_query, i64::from(limit)], |row| {
+    let rows = stmt.query_map(params![fts_query, i64::from(limit), repo_id], |row| {
         Ok(CommitSearchHit {
             hash: row.get(0)?,
             author_name: row.get(1)?,
@@ -379,6 +394,9 @@ pub fn history_for_path(
     path: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<PathHistoryItem>> {
+    // `git_file_changes` / `git_commits` are direct-scoped (V040): join AND filter on `repo_id` so
+    // a fork sharing a commit hash can't surface a sibling repo's change rows for this path.
+    let repo_id = schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
         SELECT git_commits.hash, git_file_changes.path, git_file_changes.additions,
@@ -386,12 +404,13 @@ pub fn history_for_path(
                git_commits.author_name, git_commits.authored_at_s, git_commits.subject
         FROM git_file_changes
         JOIN git_commits ON git_commits.hash = git_file_changes.commit_hash
-        WHERE git_file_changes.path = ?1
+                        AND git_commits.repo_id = git_file_changes.repo_id
+        WHERE git_file_changes.path = ?1 AND git_file_changes.repo_id = ?3
         ORDER BY git_commits.authored_at_s DESC, git_commits.hash
         LIMIT ?2
         ",
     )?;
-    let rows = stmt.query_map(params![path, i64::from(limit)], path_history_row)?;
+    let rows = stmt.query_map(params![path, i64::from(limit), repo_id], path_history_row)?;
     collect_rows(rows)
 }
 
@@ -589,16 +608,16 @@ pub fn source_text_hash(text: &str) -> String {
 }
 
 fn clear(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute_batch(
-        "
-        DELETE FROM commit_fts;
-        DELETE FROM git_chunk_blame;
-        DELETE FROM git_file_changes;
-        DELETE FROM git_commits;
-        ",
-    )?;
+    // Clear only the ACTIVE repo's git history (V040 scoping) — a wholesale wipe would drop a
+    // sibling repo's commits in a consolidated DB. `git_chunk_blame` is transitive/regenerated
+    // (A4/A5 seam). `commit_fts` is resynced from the surviving `git_commits` via the #51-safe
+    // `'rebuild'` afterward.
+    let repo_id = schema::active_repo_id(conn)?;
+    conn.execute("DELETE FROM git_file_changes WHERE repo_id = ?1", params![repo_id])?;
+    conn.execute("DELETE FROM git_commits WHERE repo_id = ?1", params![repo_id])?;
+    conn.execute_batch("DELETE FROM git_chunk_blame;")?;
+    crate::index::schema::rebuild_commit_fts(conn)?;
     // The reload-gate keys moved to `repo_meta` (V039); clear them for the active repo.
-    let repo_id = schema::single_repo_id(conn)?;
     for key in
         ["git_history_indexed_head", "git_history_indexed_root", "git_history_indexed_shallow"]
     {
@@ -921,7 +940,7 @@ pub(crate) fn is_history_current(conn: &Connection, root: &Path) -> bool {
         return false;
     }
     let probe = || -> anyhow::Result<bool> {
-        let repo_id = schema::single_repo_id(conn)?;
+        let repo_id = schema::active_repo_id(conn)?;
         let head_matches = repo_meta(conn, &repo_id, "git_history_indexed_head")?.as_deref()
             == Some(repo.head.as_str());
         let root_matches = repo_meta(conn, &repo_id, "git_history_indexed_root")?.as_deref()
@@ -930,8 +949,9 @@ pub(crate) fn is_history_current(conn: &Connection, root: &Path) -> bool {
         // not shallow even if HEAD is unchanged.
         let prior_was_full =
             repo_meta(conn, &repo_id, "git_history_indexed_shallow")?.as_deref() == Some("0");
-        // Guard against a torn/empty prior reload writing the meta without rows.
-        let has_rows = table_row_count(conn, "git_commits")? > 0;
+        // Guard against a torn/empty prior reload writing the meta without rows — counted per-repo
+        // (V040), so a sibling repo's commits can't mask THIS repo's empty history.
+        let has_rows = scoped_table_row_count(conn, "git_commits", &repo_id)? > 0;
         Ok(head_matches && root_matches && prior_was_full && has_rows)
     };
     probe().unwrap_or(false)

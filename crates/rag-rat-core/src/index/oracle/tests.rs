@@ -4883,8 +4883,21 @@ fn resolution_report_assembles_before_after_from_index() {
     write(conf, OracleResolutionKind::Confirm, Some(conf_sym));
     write(contra, OracleResolutionKind::Contradict, Some(contra_sym));
 
-    // Two logical symbols enriched with a moniker for this tool.
+    // Two logical symbols enriched with a moniker for this tool. The `logical_symbols` rows must
+    // exist for the enriched-symbol tally: `count_symbols_with_moniker` joins them and filters by
+    // the active `repo_id` (A3, round-6 P2 #3), so a moniker with no live logical symbol is not an
+    // "enriched symbol" — mirroring production, where oracle only writes a moniker for a resolved
+    // logical symbol. The default `repo_id` (`__unassigned__`) matches this raw-conn harness's
+    // sole/active repo.
     for id in [1_i64, 2] {
+        h.conn
+            .execute(
+                "INSERT INTO logical_symbols(id, language, path, logical_name, kind, \
+                 variant_count, group_reason) VALUES (?1, 'rust', 'a.rs', ?2, 'function', 1, \
+                 'test')",
+                params![id, format!("sym{id}")],
+            )
+            .unwrap();
         h.conn
             .execute(
                 "INSERT INTO logical_symbol_monikers(logical_symbol_id, tool, tool_version, \

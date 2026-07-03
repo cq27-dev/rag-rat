@@ -65,8 +65,18 @@ fn git_history_reload_is_not_skipped_on_a_shallow_clone() {
         shallow.to_str().unwrap(),
     ]);
     let config = rag_rat_config(&shallow);
+    // A depth-cut shallow clone cannot derive a PORTABLE identity (its root is unreachable), but it
+    // no longer fails: `resolve_repo_identity` derives a deterministic `local:`-prefixed LocalOnly
+    // id from the shallow boundary and proceeds. So rebuild/open/incremental adopt it WITHOUT a
+    // pin — exactly the path CI's shallow fixtures exercise — and this test keeps its subject
+    // (the history reload gate) while also covering LocalOnly adoption end-to-end.
 
     let db = IndexDatabase::rebuild(&config).unwrap();
+    assert!(
+        db.active_repo_id.starts_with("local:"),
+        "a cut shallow clone adopts under a LocalOnly id, got {}",
+        db.active_repo_id
+    );
     insert_sentinel_commit(&db);
     drop(db);
 
@@ -86,14 +96,15 @@ fn idle_discover_sweep_does_not_rewrite_indexed_at_ms() {
     let config = git_history_test_config(&root);
 
     let db = IndexDatabase::rebuild(&config).unwrap();
-    // Stamp a non-numeric sentinel so any spurious timestamp write is unmistakable.
+    // Stamp a non-numeric sentinel so any spurious timestamp write is unmistakable. Under the
+    // ACTIVE repo id (a real git fixture is adopted, so the `__unassigned__` placeholder repos row
+    // is gone and `repo_meta` under it would trip the FK).
     db.storage
         .connection()
         .execute(
-            "INSERT INTO repo_meta(repo_id, key, value) VALUES('__unassigned__', 'indexed_at_ms', \
-             'SENTINEL')
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES(?1, 'indexed_at_ms', 'SENTINEL')
              ON CONFLICT(repo_id, key) DO UPDATE SET value = 'SENTINEL'",
-            [],
+            [&db.active_repo_id],
         )
         .unwrap();
     drop(db);

@@ -33,22 +33,23 @@ impl IndexDatabase {
         // change (same global union) is still detected as a change → forces a re-resolve.
         let previous_package_map: std::collections::BTreeMap<String, String> = {
             let mut stmt = conn.prepare(
-                "SELECT manifest_dir, local_roots_json FROM packages WHERE commit_sha = ?1 AND \
-                 worktree_id = ?2",
+                "SELECT manifest_dir, local_roots_json FROM packages WHERE repo_id = ?1 AND \
+                 commit_sha = ?2 AND worktree_id = ?3",
             )?;
-            let rows = stmt
-                .query_map(params![self.active_commit_sha, self.active_worktree_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
+            let rows = stmt.query_map(
+                params![self.active_repo_id, self.active_commit_sha, self.active_worktree_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
             rows.collect::<Result<_, _>>()?
         };
         // Replace this scope's package rows. The id is reassigned each rebuild, which is fine — the
         // file→package mapping is computed at LOAD time from `manifest_dir`, not from a persisted
-        // id.
-        conn.execute("DELETE FROM packages WHERE commit_sha = ?1 AND worktree_id = ?2", params![
-            self.active_commit_sha,
-            self.active_worktree_id
-        ])?;
+        // id. Scoped by `repo_id` (A3) so a sibling repo's packages in a consolidated DB are
+        // untouched.
+        conn.execute(
+            "DELETE FROM packages WHERE repo_id = ?1 AND commit_sha = ?2 AND worktree_id = ?3",
+            params![self.active_repo_id, self.active_commit_sha, self.active_worktree_id],
+        )?;
         // The freshly-written map, compared against `previous_package_map` below.
         let mut current_package_map: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
@@ -58,12 +59,13 @@ impl IndexDatabase {
             )?;
             conn.execute(
                 "INSERT OR REPLACE INTO packages(manifest_dir, commit_sha, worktree_id, \
-                 local_roots_json) VALUES (?1, ?2, ?3, ?4)",
+                 local_roots_json, repo_id) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     package.manifest_dir,
                     self.active_commit_sha,
                     self.active_worktree_id,
-                    roots_json
+                    roots_json,
+                    self.active_repo_id
                 ],
             )?;
             current_package_map.insert(package.manifest_dir.clone(), roots_json);

@@ -398,33 +398,34 @@ pub(crate) fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String
         .optional()?)
 }
 
-/// Delete an `index_meta` key (a no-op when absent) — the `index_meta` counterpart of
-/// [`delete_repo_meta`].
+/// Delete a GLOBAL meta key from `index_meta` (a no-op when absent) — the `index_meta` counterpart
+/// of [`delete_repo_meta`]. Used by the int8 reencode clear path, whose cursor is global (it walks
+/// the whole `chunk_embeddings` table beside an already-global done-gate).
 pub(crate) fn delete_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM index_meta WHERE key = ?1", params![key])?;
+    conn.execute("DELETE FROM index_meta WHERE key = ?1", [key])?;
     Ok(())
 }
 
 /// Read a per-repo meta value (`repo_meta`) for the repo owning `conn` — the repo-scoped twin of
-/// [`meta`], resolving the active repo via `single_repo_id` (phase A3 replaces that with a real
-/// scope context). Used for the per-repo keys V039 relocated out of `index_meta` /
-/// `reconcile_meta`: the active embedding model and its freshness version, and the int8 reencode
-/// cursor.
+/// [`meta`], resolving the active repo via `schema::active_repo_id` (the scope-context id, falling
+/// back to the sole repo). Used for the per-repo keys relocated out of `index_meta` /
+/// `reconcile_meta`: the active embedding model, its freshness version, its provisional/remote-
+/// config provenance (V040), and the int8 reencode cursor.
 pub(crate) fn repo_meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
-    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     Ok(crate::index::repo_meta(conn, &repo_id, key)?)
 }
 
 /// Upsert a per-repo meta value — the repo-scoped twin of [`set_meta`].
 pub(crate) fn set_repo_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     crate::index::set_repo_meta(conn, &repo_id, key, value)?;
     Ok(())
 }
 
-/// Delete a per-repo meta key (a no-op when absent) — the repo-scoped twin of [`delete_meta`].
+/// Delete a per-repo meta key from `repo_meta` (a no-op when absent).
 pub(crate) fn delete_repo_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::single_repo_id(conn)?;
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     crate::index::delete_repo_meta(conn, &repo_id, key)?;
     Ok(())
 }
@@ -442,7 +443,8 @@ pub(crate) fn set_active_remote_config(
 ) -> anyhow::Result<()> {
     let json = serde_json::to_string(remote)
         .map_err(|e| anyhow::anyhow!("failed to serialize remote embedding config: {e}"))?;
-    set_meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, &json)
+    // Per-repo since V040 (rejoined the active-model provenance family in `repo_meta`).
+    set_repo_meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, &json)
 }
 
 /// Read the persisted active remote-embedding config (the inverse of [`set_active_remote_config`]).
@@ -453,7 +455,7 @@ pub(crate) fn set_active_remote_config(
 pub(crate) fn active_remote_config(
     conn: &Connection,
 ) -> anyhow::Result<Option<RemoteEmbeddingConfig>> {
-    let Some(json) = meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META)? else {
+    let Some(json) = repo_meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META)? else {
         return Ok(None);
     };
     let remote: RemoteEmbeddingConfig = serde_json::from_str(&json).map_err(|e| {
@@ -469,7 +471,7 @@ pub(crate) fn active_remote_config(
 /// `active_embedder` stops reconstructing an `OpenAiEmbedder` from a stale prior remote install of
 /// the same model (a no-op when the meta is already absent).
 pub(crate) fn clear_active_remote_config(conn: &Connection) -> anyhow::Result<()> {
-    delete_meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META)
+    delete_repo_meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META)
 }
 
 pub(crate) fn set_reconcile_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
@@ -570,7 +572,7 @@ mod tests {
         assert_eq!(active_remote_config(&conn).unwrap(), Some(remote));
 
         // SECRET-FREE: the serialized JSON carries the auth_env NAME but no token value.
-        let json = meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META).unwrap().unwrap();
+        let json = repo_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META).unwrap().unwrap();
         assert!(json.contains("OLLAMA_TOKEN"), "stores the env-var name: {json}");
         // Belt-and-suspenders: no bearer/token-shaped material leaks into the meta.
         assert!(!json.to_lowercase().contains("bearer"), "no bearer token in meta: {json}");
@@ -581,7 +583,7 @@ mod tests {
     fn active_remote_config_errors_on_malformed_meta() {
         // A corrupted meta must surface loudly, not silently degrade to "no remote config".
         let conn = schema_conn();
-        set_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
+        set_repo_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
         let err = active_remote_config(&conn).expect_err("malformed meta must error");
         assert!(err.to_string().contains("malformed"), "{err}");
     }

@@ -75,17 +75,21 @@ pub(crate) fn resolution_before_counts(
 /// The number of logical symbols enriched with a SCIP moniker for `(tool, tool_version)` — the
 /// "symbols enriched" signal (#70). Scoped to `tool_version` (not just `tool`) so the count
 /// describes the SAME run as the report's `edge_oracle`-derived metrics: a later same-tool run with
-/// a different `tool_version` must not bleed its monikers into this report.
-/// `logical_symbol_monikers` is keyed `(logical_symbol_id, tool)` (repo-global, not
-/// checkout-scoped).
+/// a different `tool_version` must not bleed its monikers into this report. Also scoped to the
+/// ACTIVE repo (A3): `logical_symbol_monikers` carries no `repo_id`, so a consolidated DB's count
+/// must join `logical_symbols` and filter `repo_id = active_repo_id` — otherwise a sibling repo's
+/// monikers inflate this report's enriched-symbol count.
 pub(crate) fn count_symbols_with_moniker(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
 ) -> anyhow::Result<u64> {
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM logical_symbol_monikers WHERE tool = ?1 AND tool_version = ?2",
-        params![tool.as_db_str(), tool_version],
+        "SELECT COUNT(*) FROM logical_symbol_monikers
+         WHERE tool = ?1 AND tool_version = ?2
+           AND logical_symbol_id IN (SELECT id FROM logical_symbols WHERE repo_id = ?3)",
+        params![tool.as_db_str(), tool_version, repo_id],
         |row| row.get(0),
     )?;
     Ok(u64::try_from(count).unwrap_or(0))
@@ -292,18 +296,31 @@ pub(crate) fn logical_symbol_id_for_member(
     .map_err(Into::into)
 }
 
-/// Delete every `logical_symbol_monikers` row for `tool`. Called at the start of a run, inside the
-/// run's transaction, so the moniker set is **authoritative** for the latest run: a symbol the
-/// current `.scip` no longer defines must not keep a stale moniker, and dangling rows (whose
-/// content-derived logical id died in a rebuild) are swept on every run. The clear is global for
-/// the tool — `logical_symbols` itself is rebuilt unscoped from all symbols, so monikers follow
-/// the same (single-checkout-in-practice) lifecycle rather than inventing a per-checkout scope the
-/// parent table doesn't have.
+/// Delete this repo's `logical_symbol_monikers` rows for `tool`. Called at the start of a run,
+/// inside the run's transaction, so the moniker set is **authoritative** for the latest run: a
+/// symbol the current `.scip` no longer defines must not keep a stale moniker.
+///
+/// SCOPE (load-bearing, A3): the DELETE is restricted to monikers whose logical symbol belongs to
+/// the ACTIVE repo (`logical_symbols.repo_id = active_repo_id`) — `logical_symbols` ids are now
+/// repo-distinct, so `logical_symbol_monikers` (which has no `repo_id` column of its own) can hold
+/// rows for several repos in a consolidated DB. A global `DELETE ... WHERE tool = ?` would erase a
+/// SIBLING repo's live moniker anchors on every oracle run, making its `scip_moniker` memory
+/// relocation go gone/unverified. Dangling rows (whose content-derived logical id died in a
+/// rebuild, so they join NO repo's `logical_symbols`) are still swept — they belong to no repo and
+/// never resolve through the live-join reads, so sweeping them can never touch a sibling's valid
+/// rows.
 pub(crate) fn clear_logical_symbol_monikers_for_tool(
     conn: &Connection,
     tool: OracleTool,
 ) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM logical_symbol_monikers WHERE tool = ?1", [tool.as_db_str()])?;
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    conn.execute(
+        "DELETE FROM logical_symbol_monikers
+         WHERE tool = ?1
+           AND (logical_symbol_id IN (SELECT id FROM logical_symbols WHERE repo_id = ?2)
+                OR logical_symbol_id NOT IN (SELECT id FROM logical_symbols))",
+        params![tool.as_db_str(), repo_id],
+    )?;
     Ok(())
 }
 

@@ -88,15 +88,20 @@ impl IndexDatabase {
             }
         }
         // A file survives if its commit is live OR its worktree overlay is live. Empty-string
-        // keys never appear in the live sets, so unkeyed rows are pruned.
+        // keys never appear in the live sets, so unkeyed rows are pruned. Scoped to the ACTIVE REPO
+        // (A3): the live sets are THIS repo's live contexts, so without the `repo_id` predicate
+        // every OTHER repo's files (whose commits/worktrees are legitimately absent from
+        // this repo's live sets) would be staged and cascade-deleted — gc of one repo would
+        // wipe every sibling. The repo_id filter is what makes `garbage_collect` per-repo.
         conn.execute(
             "
             INSERT OR IGNORE INTO temp.staged_file_ids(id)
             SELECT id FROM main.files
-            WHERE commit_sha NOT IN (SELECT sha FROM temp.gc_live_commits)
+            WHERE repo_id = ?1
+              AND commit_sha NOT IN (SELECT sha FROM temp.gc_live_commits)
               AND worktree_id NOT IN (SELECT id FROM temp.gc_live_worktrees)
             ",
-            [],
+            [self.active_repo_id.as_str()],
         )?;
         self.delete_staged_files_cascade()?;
         conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
@@ -112,7 +117,16 @@ impl IndexDatabase {
         // prune a dead checkout's run rows with the SAME live sets, so a run and the
         // edges it produced are dropped together.
         oracle::prune_edge_oracle_without_live_edge(conn)?;
-        oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
+        // V042 SEAM: `oracle_runs` has NO `repo_id` yet, so `prune_oracle_runs_outside_scope`
+        // deletes GLOBALLY against THIS repo's live sets. On a consolidated multi-repo DB that
+        // would wipe a sibling repo's run rows (its commits/worktrees are legitimately
+        // absent from this repo's live sets). Skip the global prune when more than one real
+        // repo is registered; the per-repo prune lands once `oracle_runs` gains `repo_id`
+        // in V042 (successor branch). A single-repo DB (every DB pre-A7) is unaffected —
+        // the guard is dormant.
+        if !schema::multiple_real_repos(conn)? {
+            oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
+        }
         // #357: `embedding_cache` is content-keyed too (survives reindex, like the oracle above),
         // so it needs the SAME global sweep — drop vectors no live chunk references in ANY
         // context (a sibling worktree / branch may still use one, so this must not be
@@ -132,6 +146,18 @@ impl IndexDatabase {
         // pool entry a live symbol points at and null its qname out — the exact footgun
         // this comment warns about (regression test:
         // gc_preserves_a_name_strings_entry_referenced_only_by_a_symbol).
+        //
+        // SHARED-POOL INVARIANT (A3): `name_strings` stays GLOBAL — it is NOT repo-sliced. Liveness
+        // is the UNION over ALL repos: the referencing subqueries below read `edges_data` /
+        // `symbols` / `logical_symbols` across every repo, so a value one repo still
+        // references is kept even while gc runs for a different repo. Scoping this sweep to
+        // the active repo would delete interned strings out from under a sibling repo's
+        // live rows. The same union-liveness rule governs the other content-addressed
+        // shared tables gc touches — `embedding_cache`
+        // (`prune_embedding_cache_unreferenced`, keyed by content hash, swept over live chunks in
+        // ANY scope) — and `chunk_text_dict`, whose immutable decode dictionaries are never swept
+        // at all (a version any repo's blob references must survive), so it needs no
+        // per-repo logic.
         conn.execute(
             "
             DELETE FROM main.name_strings

@@ -156,6 +156,7 @@ mod listener {
                 };
                 let database = config.database.clone();
                 let config_root = config.root.clone();
+                let repo_id_override = config.repo_id_override.clone();
                 // Scope to the session's worktree overlay (#219). Absent cwd (older client) → the
                 // config root, which resolves to the base scope. This also fixes the listener's
                 // prior lack of ANY scope install: compose queries the `files` view, so without
@@ -166,8 +167,19 @@ mod listener {
                 // rusqlite is sync; one short read off the runtime threads.
                 let composed = tokio::task::spawn_blocking(move || {
                     let conn = IndexConnection::open_read_only(&database)?;
+                    // Resolve the repo dimension from this config (identity + override) so the
+                    // scope binds the config's repo, not the config-blind sole
+                    // repo (a sibling in a consolidated DB); an unprovable repo
+                    // → empty scope, never a sibling's rows.
+                    let repo_id = rag_rat_core::index::resolve_scope_repo_id(
+                        conn.connection(),
+                        &config_root,
+                        repo_id_override.as_deref(),
+                    )?
+                    .unwrap_or_default();
                     rag_rat_core::index::install_worktree_scope_view(
                         conn.connection(),
+                        &repo_id,
                         &config_root,
                         &cwd,
                     )?;

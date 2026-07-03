@@ -39,12 +39,13 @@ pub use discovery::DiscoveryStatus;
 pub(crate) use discovery::*;
 pub use git_context::resolve_git_context;
 pub(crate) use git_context::*;
-// Only tests reach `install_scope_view` directly now (non-test code goes through
-// `install_worktree_scope_view`, which calls it within `lifecycle`); gate the re-export so the
-// non-test build doesn't warn it unused.
+// Only tests reach `install_scope_view` directly now: non-test code resolves the repo id
+// explicitly (`resolve_scope_repo_id`) and passes it into `install_worktree_scope_view`, which
+// writes the scope itself rather than routing through the config-blind `active_repo_id`
+// fallback. Gate the re-export so the non-test build doesn't warn it unused.
 #[cfg(test)]
 pub(crate) use lifecycle::install_scope_view;
-pub use lifecycle::install_worktree_scope_view;
+pub use lifecycle::{install_worktree_scope_view, resolve_scope_repo_id};
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub(crate) use meta::{delete_repo_meta, repo_meta, set_repo_meta};
 pub use parser_failures::ParserFailure;
@@ -99,6 +100,12 @@ use crate::storage::{IndexConnection, StorageStatus};
 #[derive(Debug)]
 pub struct IndexDatabase {
     storage: IndexConnection,
+    /// The repo this connection is scoped to — resolved once at open (`register_repo` on a
+    /// config-bearing open, the sole registered repo on a bare/read-only open) and stamped onto
+    /// every direct-scoped write. Mirrored into `temp.connection_context` by `install_scope_view`
+    /// so free-conn helpers resolve the same id via `schema::active_repo_id`. Empty only between
+    /// construction and the first repo resolution.
+    pub active_repo_id: String,
     pub active_commit_sha: String,
     pub active_worktree_id: String,
     /// Injected GitHub repo context. Resolved from `gh` only in `open_config` (real usage);
@@ -324,6 +331,12 @@ impl FileScope {
 
 #[cfg(test)]
 mod schema_bootstrap_tests;
+
+// The poison-sibling test harness. `pub(crate)` (not private) so the `rebuild` seam and the
+// mutating tests across submodules can reach `seed_if_enabled` / `disable_poison_sibling` /
+// `assert_sibling_intact`. See the module docs for what it enforces and how to opt out.
+#[cfg(test)]
+pub(crate) mod poison_sibling;
 
 #[cfg(test)]
 mod generated_path_tests {

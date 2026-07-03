@@ -23,14 +23,14 @@ impl IndexDatabase {
         self.remove_file_in_scope(Path::new(&path), "", worktree_id)?;
         self.storage.connection().execute(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-             indexed_at_ms, indexed_revision, commit_sha, worktree_id)
-             VALUES (?1, 'unknown', 'deleted', '', 0, 0, ?2, '', '', ?3)
-             ON CONFLICT(path, commit_sha, worktree_id) DO UPDATE SET
+             indexed_at_ms, indexed_revision, commit_sha, worktree_id, repo_id)
+             VALUES (?1, 'unknown', 'deleted', '', 0, 0, ?2, '', '', ?3, ?4)
+             ON CONFLICT(repo_id, path, commit_sha, worktree_id) DO UPDATE SET
                 kind = 'deleted',
                 sha256 = '',
                 modified_at_ms = 0,
                 indexed_at_ms = excluded.indexed_at_ms",
-            params![path, now_ms(), worktree_id],
+            params![path, now_ms(), worktree_id, self.active_repo_id],
         )?;
         self.mark_fts_dirty()?;
         Ok(())
@@ -47,6 +47,7 @@ impl IndexDatabase {
         // symbols, so they must not pay the view triggers' per-row dictionary probes.
         // 'NameOnly' is the EdgeConfidence demotion the resolver applies to a target-less edge.
         let name_only_id = edges::intern_edge_string(self.storage.connection(), "NameOnly")?;
+        let repo_id = self.active_repo_id.as_str();
         self.storage.connection().execute(
             "UPDATE edges_data
              SET to_symbol_id = NULL,
@@ -57,14 +58,15 @@ impl IndexDatabase {
                  WHERE main.files.path = ?1
                    AND main.files.commit_sha = ?2
                    AND main.files.worktree_id = ?3
+                   AND main.files.repo_id = ?5
              )",
-            params![path, commit_sha, worktree_id, name_only_id],
+            params![path, commit_sha, worktree_id, name_only_id, repo_id],
         )?;
         self.storage.connection().execute(
             "DELETE FROM edges_data
              WHERE source_file_id IN (
                     SELECT id FROM main.files
-                    WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+                    WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4
                 )
                 OR from_symbol_id IN (
                     SELECT symbols.id FROM symbols
@@ -72,17 +74,21 @@ impl IndexDatabase {
                     WHERE main.files.path = ?1
                       AND main.files.commit_sha = ?2
                       AND main.files.worktree_id = ?3
+                      AND main.files.repo_id = ?4
                 )",
-            params![path, commit_sha, worktree_id],
+            params![path, commit_sha, worktree_id, repo_id],
         )?;
-        // `parser_failures` is keyed by `path` only (no scope). A LINKED-WORKTREE OVERLAY pass must
-        // NOT delete by bare path: that would clear a REAL parse failure recorded for the same path
+        // `parser_failures` is keyed by `(repo_id, path)` (V040). A LINKED-WORKTREE OVERLAY pass
+        // must NOT delete: that would clear a REAL parse failure recorded for the same path
         // by the base (or a sibling) scope. The overlay never WRITES this table either (see
-        // `insert_parser_failure`), so it has nothing of its own to remove (#219 review).
+        // `insert_parser_failure`), so it has nothing of its own to remove (#219 review). Scoped by
+        // `repo_id` (A3) so a sibling REPO's failure at the same path is never clobbered (the
+        // inventory-#12 cross-repo clobber the PK change fixes).
         if !self.active_scope_is_linked_overlay() {
-            self.storage
-                .connection()
-                .execute("DELETE FROM parser_failures WHERE path = ?1", [&path])?;
+            self.storage.connection().execute(
+                "DELETE FROM parser_failures WHERE repo_id = ?1 AND path = ?2",
+                params![repo_id, &path],
+            )?;
         }
         self.storage.connection().execute(
             "DELETE FROM chunk_fts
@@ -92,8 +98,9 @@ impl IndexDatabase {
                  WHERE main.files.path = ?1
                    AND main.files.commit_sha = ?2
                    AND main.files.worktree_id = ?3
+                   AND main.files.repo_id = ?4
              )",
-            params![path, commit_sha, worktree_id],
+            params![path, commit_sha, worktree_id, repo_id],
         )?;
         // Deleting the chunks cascades (ON DELETE CASCADE, foreign_keys=ON) to git_chunk_blame,
         // chunk_embeddings, chunk_summaries, and chunk_text — so the gate skipping the full
@@ -105,21 +112,22 @@ impl IndexDatabase {
             "DELETE FROM chunks
              WHERE file_id IN (
                 SELECT id FROM main.files
-                WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+                WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4
              )",
-            params![path, commit_sha, worktree_id],
+            params![path, commit_sha, worktree_id, repo_id],
         )?;
         self.storage.connection().execute(
             "DELETE FROM symbols
              WHERE file_id IN (
                 SELECT id FROM main.files
-                WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+                WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4
              )",
-            params![path, commit_sha, worktree_id],
+            params![path, commit_sha, worktree_id, repo_id],
         )?;
         self.storage.connection().execute(
-            "DELETE FROM main.files WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3",
-            params![path, commit_sha, worktree_id],
+            "DELETE FROM main.files
+             WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4",
+            params![path, commit_sha, worktree_id, repo_id],
         )?;
         self.mark_fts_dirty()?;
         Ok(())

@@ -522,6 +522,8 @@ fn worktree_overlay_gc_prunes_a_removed_worktrees_overlay() {
     db.garbage_collect().unwrap();
     assert_eq!(overlay_row_count(&db), 0, "GC prunes a removed worktree's overlay");
 
+    // Post-condition: a repo-scoped GC must not touch a SIBLING repo's rows (round-6 harness).
+    crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
 }
@@ -775,9 +777,10 @@ fn worktree_overlay_fts_freshness_revision_is_scope_invariant() {
     // And it matches the stored `fts_source_revision` `sync_fts` wrote during the overlay refresh,
     // so a base read sees FTS as fresh (no rebuild) rather than perpetually stale.
     assert_eq!(
-        db.repo_meta("fts_source_revision").unwrap().as_deref(),
+        db.meta("fts_source_revision").unwrap().as_deref(),
         Some(base_revision.as_str()),
-        "fts_source_revision recorded during the overlay pass matches the global digest",
+        "fts_source_revision (GLOBAL, in index_meta) recorded during the overlay pass matches the \
+         global digest",
     );
     assert!(!db.fts_dirty().unwrap(), "the overlay refresh left FTS clean, not dirty");
 
@@ -1157,14 +1160,16 @@ fn orientation_in_a_linked_worktree_reflects_the_overlay_on_base() {
 
     let conn = IndexConnection::open_read_only(&db_path).unwrap();
     // Worktree cwd: overlay ON base = base.rs + keep.rs + the overlay's added.rs = 3.
-    let o_wt = crate::query::orientation::orientation(conn.connection(), &main, &linked).unwrap();
+    let o_wt =
+        crate::query::orientation::orientation(conn.connection(), &main, &linked, None).unwrap();
     assert_eq!(
         o_wt.total_files, 3,
         "worktree orientation must show base files + the overlay's added file"
     );
 
     // Main cwd: base scope only = 2.
-    let o_main = crate::query::orientation::orientation(conn.connection(), &main, &main).unwrap();
+    let o_main =
+        crate::query::orientation::orientation(conn.connection(), &main, &main, None).unwrap();
     assert_eq!(o_main.total_files, 2, "main orientation shows the base scope");
 
     let _ = fs::remove_dir_all(&main);
