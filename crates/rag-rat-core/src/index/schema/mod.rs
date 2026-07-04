@@ -312,7 +312,7 @@ const MIGRATION_046_CHECKSUM: &str = "sha256:rag-rat-memory-verification-reality
 const MIGRATION_046_DESCRIPTION: &str =
     "Add the dream verification sibling tables memory_reality (one derived verdict/check row per \
      memory, keyed (repo_id, memory_id)) and memory_summaries (one per (repo_id, memory_id, \
-     body_hash) so a body edit self-invalidates), both STRICT and repo_id-scoped. They hold \
+     content_hash) so a body edit self-invalidates), both STRICT and repo_id-scoped. They hold \
      derived, regenerable data so dream verifies memories without ever mutating a repo_memories \
      row (dream v2 pass 0)";
 

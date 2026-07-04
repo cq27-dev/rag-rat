@@ -58,9 +58,10 @@ pub enum VerificationReason {
     AnchorBroken,
     /// No `memory_reality` row yet — never verified.
     NeverChecked,
-    /// The memory body changed since it was last checked (`body_hash` mismatch).
-    BodyChanged,
-    /// A bound file changed since the last check (`checked_inputs_hash` mismatch).
+    /// The note content (title or body) changed since it was last checked (`content_hash`
+    /// mismatch).
+    ContentChanged,
+    /// The evidence pack changed since the last check (`checked_inputs_hash` mismatch).
     InputsChanged,
     /// The stored verdict was produced by an older verdict `PROMPT_VERSION` — the prompt or
     /// evidence-pack format changed, so the old verdict is not comparable and must be re-checked.
@@ -68,13 +69,14 @@ pub enum VerificationReason {
 }
 
 impl VerificationReason {
-    /// Priority rank: broken anchors first, then never-checked, then body churn, then input/prompt
-    /// churn (a stale-prompt row's verdict is at least self-consistent, so it ranks last).
+    /// Priority rank: broken anchors first, then never-checked, then content churn, then
+    /// input/prompt churn (a stale-prompt row's verdict is at least self-consistent, so it ranks
+    /// last).
     fn rank(self) -> f64 {
         match self {
             Self::AnchorBroken => 1.0,
             Self::NeverChecked => 0.75,
-            Self::BodyChanged => 0.5,
+            Self::ContentChanged => 0.5,
             Self::InputsChanged => 0.25,
             Self::PromptChanged => 0.2,
         }
@@ -137,8 +139,9 @@ pub struct FileExcerpt {
 }
 
 /// Active memories that need (re)verification, ranked (broken anchors first) and capped at
-/// `budget`. A memory is enqueued when it has no `memory_reality` row, its body changed
-/// (`body_hash`), or a bound file changed (`checked_inputs_hash`); a stale/gone anchor (the doctor
+/// `budget`. A memory is enqueued when it has no `memory_reality` row, its note content changed
+/// (`content_hash`, covering title+body), or its evidence changed (`checked_inputs_hash`); a
+/// stale/gone anchor (the doctor
 /// predicate) raises the RANK of such a memory to the top but does NOT by itself enqueue one whose
 /// stored verdict still matches — everything else is CHURN-SKIPPED, which is what makes running
 /// this a few times a day cheap. Repo-scoped: only the active repo's memories are considered.
@@ -167,7 +170,8 @@ pub fn verification_queue(
 
     let mut queue = Vec::new();
     for (memory_id, title, body) in mems {
-        let reason = queue_reason(conn, &memory_id, &body, &broken, &scope, &reality_clause)?;
+        let reason =
+            queue_reason(conn, &memory_id, &title, &body, &broken, &scope, &reality_clause)?;
         if let Some(reason) = reason {
             queue.push(VerificationQueueEntry {
                 rank: reason.rank(),
@@ -190,18 +194,19 @@ pub fn verification_queue(
 }
 
 /// Decide why (if at all) `memory_id` needs verification — the churn-skip gate. The stored
-/// `memory_reality` comparators are consulted FIRST: a row whose `body_hash` AND
-/// `checked_inputs_hash` still match the current body + bound-file inputs skips (`None`) REGARDLESS
-/// of anchor status — the stored verdict stands, and a broken anchor is surfaced by `memory doctor`
-/// and the unverifiable/divergence findings, not by re-checking an unchanged note (else a
-/// broken-anchor memory would re-enqueue every run at the top rank and starve NeverChecked; a
-/// genuinely changed bound-file set changes `checked_inputs_hash` and re-enqueues via InputsChanged
+/// `memory_reality` comparators are consulted FIRST: a row whose `content_hash` AND
+/// `checked_inputs_hash` still match the current note (title+body) + evidence skips (`None`)
+/// REGARDLESS of anchor status — the stored verdict stands, and a broken anchor is surfaced by
+/// `memory doctor` and the unverifiable/divergence findings, not by re-checking an unchanged note
+/// (else a broken-anchor memory would re-enqueue every run at the top rank and starve NeverChecked;
+/// a genuinely changed evidence set changes `checked_inputs_hash` and re-enqueues via InputsChanged
 /// anyway). A memory that DOES need a first/re-check takes the top `AnchorBroken` rank when its
-/// anchor is broken, otherwise the specific churn reason (NeverChecked / BodyChanged /
-/// InputsChanged).
+/// anchor is broken, otherwise the specific churn reason (NeverChecked / ContentChanged /
+/// InputsChanged / PromptChanged).
 fn queue_reason(
     conn: &Connection,
     memory_id: &str,
+    title: &str,
     body: &str,
     broken: &HashSet<String>,
     scope: &Option<String>,
@@ -210,14 +215,14 @@ fn queue_reason(
     let stored: Option<(String, Option<String>, Option<String>)> = conn
         .query_row(
             &format!(
-                "SELECT body_hash, checked_inputs_hash, prompt_version FROM memory_reality WHERE \
-                 memory_id = ?1{reality_clause}"
+                "SELECT content_hash, checked_inputs_hash, prompt_version FROM memory_reality \
+                 WHERE memory_id = ?1{reality_clause}"
             ),
             [memory_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((stored_body_hash, stored_inputs_hash, stored_prompt_version)) = stored else {
+    let Some((stored_content_hash, stored_inputs_hash, stored_prompt_version)) = stored else {
         // Never checked → needs a first check; a broken anchor takes the top rank.
         return Ok(Some(if broken.contains(memory_id) {
             VerificationReason::AnchorBroken
@@ -225,7 +230,9 @@ fn queue_reason(
             VerificationReason::NeverChecked
         }));
     };
-    let body_changed = stored_body_hash != crate::index::hex_sha256(body.as_bytes());
+    // The note the prompt audits is TITLE + body, so the content hash covers both — a title-only
+    // edit re-queues just like a body edit.
+    let content_changed = stored_content_hash != note_content_hash(title, body);
     let current_inputs = checked_inputs_hash(conn, memory_id, scope)?;
     let inputs_changed = stored_inputs_hash.as_deref() != Some(current_inputs.as_str());
     // A row from an older verdict prompt/pack version is not comparable to a fresh check — re-queue
@@ -233,7 +240,7 @@ fn queue_reason(
     // off a stale-prompt verdict forever. (An uncitable memory's terminal row is stamped with the
     // current version too, so it also re-evaluates on a bump.)
     let prompt_changed = stored_prompt_version.as_deref() != Some(super::verdict::PROMPT_VERSION);
-    if !body_changed && !inputs_changed && !prompt_changed {
+    if !content_changed && !inputs_changed && !prompt_changed {
         // Verified AND unchanged — churn-skip regardless of anchor status (the stored verdict
         // stands; anchor breakage is surfaced elsewhere).
         return Ok(None);
@@ -241,13 +248,28 @@ fn queue_reason(
     // A change since the last check → re-check. A broken anchor still takes the top rank.
     Ok(Some(if broken.contains(memory_id) {
         VerificationReason::AnchorBroken
-    } else if body_changed {
-        VerificationReason::BodyChanged
+    } else if content_changed {
+        VerificationReason::ContentChanged
     } else if inputs_changed {
         VerificationReason::InputsChanged
     } else {
         VerificationReason::PromptChanged
     }))
+}
+
+/// The dream freshness key for a memory's NOTE content — the single `content_hash` stamped into
+/// `memory_reality` / `memory_summaries`. Hashes the TRIMMED title AND body, newline-delimited (the
+/// house `memory_input_hash` style — deliberately NOT a bare `title ‖ body` concat, which would let
+/// `"ab"+"c"` and `"a"+"bc"` collide), because BOTH the verdict prompt and the compaction prompt
+/// audit the whole note (TITLE + body). So a title-only edit re-verifies / re-summarizes and drops
+/// the stale verdict / summary / marker exactly as a body edit does. (Kept dream-local rather than
+/// reusing `memory_input_hash`, which also folds kind + tags — dimensions the prompts don't audit —
+/// and reads the frozen-at-creation stored `input_hash`.)
+///
+/// `pub(crate)` so the surfacing hydrator recomputes it identically to the queue / verdict-pass
+/// stamp.
+pub(crate) fn note_content_hash(title: &str, body: &str) -> String {
+    crate::index::hex_sha256(format!("{}\n{}", title.trim(), body.trim()).as_bytes())
 }
 
 /// sha256 fingerprint of a memory's ENTIRE deterministic evidence pack — the churn comparator that
@@ -451,10 +473,17 @@ fn resolve_identifier(
     file_paths: &[String],
 ) -> rusqlite::Result<String> {
     let symbol_name = ident.rsplit("::").next().unwrap_or(ident);
-    if BARE_NAME_RE.is_match(symbol_name)
-        && let Some(loc) = resolve_symbol(conn, symbol_name)?
-    {
-        return Ok(format!("symbol {loc}"));
+    if BARE_NAME_RE.is_match(symbol_name) {
+        let locs = resolve_symbol(conn, symbol_name)?;
+        match locs.as_slice() {
+            [] => {},
+            [one] => return Ok(format!("symbol {one}")),
+            // AMBIGUOUS: more than one live definition shares this bare name. Present ALL of them
+            // (sorted) rather than the first — the model must not audit against, and the churn key
+            // must not be pinned to, an UNRELATED same-named symbol (so deleting/renaming the one
+            // the note actually described re-verifies even when a namesake survives).
+            many => return Ok(format!("symbols ({}): {}", many.len(), many.join(", "))),
+        }
     }
     if let Some(path) = resolve_file_segment(ident, file_paths) {
         return Ok(format!("file {path}"));
@@ -477,16 +506,20 @@ fn any_identifier_resolves(
     Ok(false)
 }
 
-/// The first (path-ordered) live symbol whose `name` matches, as `path::name`, through the `files`
-/// view (repo-scoped). `None` when the name is unknown anywhere in the tree.
-fn resolve_symbol(conn: &Connection, name: &str) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT f.path, s.name FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.name = ?1 \
-         ORDER BY f.path, s.name LIMIT 1",
-        [name],
-        |r| Ok(format!("{}::{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-    )
-    .optional()
+/// EVERY live symbol whose `name` matches, as `path::name`, path-sorted, through the `files` view
+/// (repo-scoped). Empty when the name is unknown anywhere in the tree. Returns all matches (not
+/// `LIMIT 1`) so a common bare name is surfaced as ambiguous rather than silently pinned to its
+/// first definition — see [`resolve_identifier`]. `DISTINCT` collapses a symbol indexed twice at
+/// the same path (e.g. across chunks) but keeps genuinely distinct same-named definitions.
+fn resolve_symbol(conn: &Connection, name: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT f.path, s.name FROM symbols s JOIN files f ON f.id = s.file_id WHERE \
+         s.name = ?1 ORDER BY f.path, s.name",
+    )?;
+    stmt.query_map([name], |r| {
+        Ok(format!("{}::{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?
+    .collect()
 }
 
 /// The first (sorted) indexed path that equals `ident` or ends in `/ident` — suffix-aware exactly
@@ -540,6 +573,13 @@ pub(super) fn bound_file_paths(
 /// binding hashes AND shows excerpts over its child files identically — without it, a directory
 /// binding's `files.path` never matches, leaving the empty inputs sentinel (stale churn-skip) and
 /// dropping every bound-source excerpt from the verdict prompt.
+///
+/// Sorted by `(path, file_id)` — NOT the reindex-volatile `files.id` rowid order the expansion
+/// queries return. The excerpt builder consumes the `MAX_EXCERPT_LINES` budget in THIS order, so an
+/// unsorted (rowid) order would let a full/incremental reindex that leaves the same `(path, sha)`
+/// set — and thus the same churn-skipped `checked_inputs_hash` — change WHICH files land in the
+/// evidence pack. Path order makes the pack deterministic and consistent with the path-independent
+/// hash.
 fn resolve_bound_files(
     conn: &Connection,
     memory_id: &str,
@@ -580,7 +620,10 @@ fn resolve_bound_files(
             }
         }
     }
-    Ok(by_id.into_iter().map(|(id, (path, sha))| (path, id, sha)).collect())
+    let mut out: Vec<(String, i64, String)> =
+        by_id.into_iter().map(|(id, (path, sha))| (path, id, sha)).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    Ok(out)
 }
 
 /// Current-text excerpt windows around identifier hits in the memory's bound files, from the
@@ -721,8 +764,8 @@ mod tests {
         file_id
     }
 
-    fn body_hash(body: &str) -> String {
-        crate::index::hex_sha256(body.as_bytes())
+    fn content_hash(title: &str, body: &str) -> String {
+        note_content_hash(title, body)
     }
 
     #[test]
@@ -750,10 +793,10 @@ mod tests {
         .unwrap();
         let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
         c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_inputs_hash, \
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
              prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
             rusqlite::params![
-                body_hash("a plain note"),
+                content_hash("t", "a plain note"),
                 inputs,
                 crate::dream::verdict::PROMPT_VERSION
             ],
@@ -1016,9 +1059,9 @@ mod tests {
         seed_memory(&c, "m1", "t", "a plain note", "r");
         let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
         c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_inputs_hash, \
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
              prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,'an-old-prompt-version',1000)",
-            rusqlite::params![body_hash("a plain note"), inputs],
+            rusqlite::params![content_hash("t", "a plain note"), inputs],
         )
         .unwrap();
         let q = verification_queue(&c, 2000, 10).unwrap();
@@ -1030,7 +1073,7 @@ mod tests {
     fn queue_skips_a_broken_anchor_with_matching_hashes_so_it_never_starves_never_checked() {
         let c = mem_db();
         set_repo(&c, "r");
-        // m1: a GONE binding (broken anchor) BUT a stored reality row whose body_hash + inputs
+        // m1: a GONE binding (broken anchor) BUT a stored reality row whose content_hash + inputs
         // still match — the verdict stands, so it must churn-skip REGARDLESS of the broken anchor.
         // The pre-fix bug re-enqueued a broken anchor every run at the top AnchorBroken rank,
         // starving the never-checked memories below it. Anchor breakage is surfaced by `memory
@@ -1044,10 +1087,10 @@ mod tests {
         .unwrap();
         let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
         c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_inputs_hash, \
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
              prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
             rusqlite::params![
-                body_hash("a plain note"),
+                content_hash("t", "a plain note"),
                 inputs,
                 crate::dream::verdict::PROMPT_VERSION
             ],
@@ -1085,10 +1128,10 @@ mod tests {
         .unwrap();
         let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
         c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_inputs_hash, \
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
              prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
             rusqlite::params![
-                body_hash("note about src/lib.rs"),
+                content_hash("t", "note about src/lib.rs"),
                 inputs,
                 crate::dream::verdict::PROMPT_VERSION
             ],
@@ -1099,11 +1142,11 @@ mod tests {
             "baseline: verified + unchanged"
         );
 
-        // Body edit → body_hash mismatch re-enqueues.
+        // Body edit → content_hash mismatch re-enqueues.
         c.execute("UPDATE repo_memories SET body = 'a rewritten note' WHERE id='m1'", []).unwrap();
         let q = verification_queue(&c, 1, 10).unwrap();
         assert_eq!(q.iter().map(|e| e.reason).collect::<Vec<_>>(), vec![
-            VerificationReason::BodyChanged
+            VerificationReason::ContentChanged
         ]);
 
         // Restore the body, change the bound file's sha → checked_inputs_hash mismatch re-enqueues.
@@ -1115,6 +1158,95 @@ mod tests {
         assert_eq!(q.iter().map(|e| e.reason).collect::<Vec<_>>(), vec![
             VerificationReason::InputsChanged
         ]);
+    }
+
+    #[test]
+    fn queue_re_enqueues_on_title_only_edit() {
+        // Regression (PR #428 Codex P2): the verdict prompt audits TITLE + body, so the
+        // content_hash covers the title — a title-only edit must re-queue even when the
+        // body is unchanged.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "original title", "a stable body", "r");
+        let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
+            rusqlite::params![
+                content_hash("original title", "a stable body"),
+                inputs,
+                crate::dream::verdict::PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+        assert!(
+            verification_queue(&c, 1, 10).unwrap().is_empty(),
+            "baseline: verified + unchanged"
+        );
+
+        c.execute("UPDATE repo_memories SET title = 'a corrected title' WHERE id='m1'", [])
+            .unwrap();
+        let q = verification_queue(&c, 1, 10).unwrap();
+        assert_eq!(q.iter().map(|e| e.reason).collect::<Vec<_>>(), vec![
+            VerificationReason::ContentChanged
+        ]);
+    }
+
+    #[test]
+    fn resolve_bound_files_is_path_sorted_not_rowid_order() {
+        // Regression (PR #428 Codex P2): the excerpt-budget cap consumes files in THIS order, so it
+        // must be path-sorted (deterministic across reindex), not the volatile `files.id` rowid
+        // order the expansion query returns.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a dir note", "r");
+        // Insert under src/ in NON-alphabetical order so rowid order != path order.
+        for p in ["src/zeta.rs", "src/alpha.rs", "src/mid.rs"] {
+            seed_file(&c, p, "fn f() {}\n", "r");
+        }
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','dir','src','src','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let paths: Vec<String> = resolve_bound_files(&c, "m1", &Some("r".to_string()))
+            .unwrap()
+            .into_iter()
+            .map(|(p, _, _)| p)
+            .collect();
+        assert_eq!(paths, vec!["src/alpha.rs", "src/mid.rs", "src/zeta.rs"], "path-sorted");
+    }
+
+    #[test]
+    fn resolve_symbol_returns_all_same_named_matches_as_ambiguous() {
+        // Regression (PR #428 Codex P2): a common bare name must surface as AMBIGUOUS (all
+        // matches), not silently pinned to the first path-ordered definition — else the
+        // model audits against, and the churn key pins to, an unrelated namesake.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a note about `shared_name`", "r");
+        let mk = |path: &str| {
+            let fid = seed_file(&c, path, "fn f() {}\n", "r");
+            c.execute(
+                "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+                 (?1,'rust','shared_name','function',0,0)",
+                rusqlite::params![fid],
+            )
+            .unwrap();
+        };
+        mk("src/b.rs");
+        mk("src/a.rs");
+        let locs = resolve_symbol(&c, "shared_name").unwrap();
+        assert_eq!(
+            locs,
+            vec!["src/a.rs::shared_name", "src/b.rs::shared_name"],
+            "all, path-sorted"
+        );
+        let files = indexed_file_paths(&c).unwrap();
+        let res = resolve_identifier(&c, "shared_name", &files).unwrap();
+        assert!(res.starts_with("symbols (2):"), "renders ambiguous: {res}");
     }
 
     #[test]

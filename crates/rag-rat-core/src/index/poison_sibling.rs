@@ -583,12 +583,12 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
     // own `repo_id`, so a sibling row is now valid and any unscoped verification-queue / evidence /
     // summary read/count/delete trips a tripwire. Both hang off the poison memory id. ---
     conn.execute(
-        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_at_ms)
+        "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_at_ms)
          VALUES (?1, ?2, ?3, 0)",
         params![POISON_MEMORY_ID, POISON_REPO_ID, format!("{POISON_PREFIX}bodyhash")],
     )?;
     conn.execute(
-        "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, generated_at_ms)
+        "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, generated_at_ms)
          VALUES (?1, ?2, ?3, ?4, 0)",
         params![
             POISON_MEMORY_ID,

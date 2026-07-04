@@ -181,55 +181,59 @@ pub(crate) fn ids_to_memories(
     }
     Ok(memories)
 }
-/// The dream summary + verdict marker for a memory's CURRENT body — the `[memory] surface =
-/// "summary"` hydration (dream v2 passes 1 & 2). Returns `(summary, verdict_marker)`:
-///   - `summary` is the `memory_summaries.summary` keyed on the memory's current `body_hash`
-///     (repo-scoped); a body edit changes the key, so a stale summary self-invalidates and this
-///     misses (title-only fallback) until the compaction pass regenerates it.
+/// The dream summary + verdict marker for a memory's CURRENT note (title+body) — the `[memory]
+/// surface = "summary"` hydration (dream v2 passes 1 & 2). Returns `(summary, verdict_marker)`:
+///   - `summary` is the `memory_summaries.summary` keyed on the memory's current `content_hash`
+///     (repo-scoped); a title OR body edit changes the key, so a stale summary self-invalidates and
+///     this misses (title-only fallback) until the compaction pass regenerates it.
 ///   - `verdict_marker` is a plain-text marker derived from the memory's `memory_reality` verdict
-///     for the CURRENT body (`[verdict: diverged]` / `[verdict: current @<short-commit>]`), keyed
-///     on `body_hash` exactly like the summary: a body edit changes the key, so a stale verdict
-///     self-invalidates and this misses until the next verdict pass re-checks. `None` when there is
-///     no matching verdict row or the row's verdict is still NULL (a pass-0-only check).
+///     for the CURRENT note (`[verdict: diverged]` / `[verdict: current @<short-commit>]`), keyed
+///     on `content_hash` exactly like the summary: a title or body edit changes the key, so a stale
+///     verdict self-invalidates and this misses until the next verdict pass re-checks. `None` when
+///     there is no matching verdict row or the row's verdict is still NULL (a pass-0-only check).
 ///
 /// Reads only the derived sibling tables — never a `repo_memories` column.
 pub(crate) fn current_summary_and_verdict(
     conn: &Connection,
     memory_id: &str,
+    title: &str,
     body: &str,
 ) -> rusqlite::Result<(Option<String>, Option<String>)> {
     use crate::index::schema;
-    let body_hash = crate::index::hex_sha256(body.as_bytes());
+    // The dream freshness key is over the WHOLE note (title+body) — recompute it exactly as the
+    // queue / verdict pass / compaction pass stamp it.
+    let content_hash = crate::dream::note_content_hash(title, body);
     // Scope both sibling reads by the active repo (both carry `repo_id`, V045). One probe suffices
     // — they scope to the same active repo id.
     let scope = schema::periphery_repo_scope(conn, "memory_summaries")?;
     let summary_clause = schema::periphery_repo_scope_clause(&scope, "memory_summaries");
     // Gate the summary on the SAME identity the compaction queue treats as "covered": current
-    // body_hash AND current `COMPACT_PROMPT_VERSION`. Without the version predicate a summary
+    // content_hash AND current `COMPACT_PROMPT_VERSION`. Without the version predicate a summary
     // produced by an obsolete compact prompt/guards keeps surfacing while the memory waits
     // behind the compaction budget (or a model failure) for a fresh one.
     let summary: Option<String> = conn
         .query_row(
             &format!(
-                "SELECT summary FROM memory_summaries WHERE memory_id = ?1 AND body_hash = ?2 AND \
-                 prompt_version = ?3{summary_clause}"
+                "SELECT summary FROM memory_summaries WHERE memory_id = ?1 AND content_hash = ?2 \
+                 AND prompt_version = ?3{summary_clause}"
             ),
-            params![memory_id, body_hash, crate::dream::COMPACT_PROMPT_VERSION],
+            params![memory_id, content_hash, crate::dream::COMPACT_PROMPT_VERSION],
             |r| r.get(0),
         )
         .optional()?;
     let reality_clause = schema::periphery_repo_scope_clause(&scope, "memory_reality");
     // Gate the verdict marker on the current verdict `PROMPT_VERSION` too (the SQL predicate), so a
     // verdict from an obsolete prompt is not shown while the queue waits to re-check it. The
-    // remaining stale checks — body_hash (the WHERE) and the evidence-pack hash (below) — mirror
+    // remaining stale checks — content_hash (the WHERE) and the evidence-pack hash (below) — mirror
     // the queue and divergence finder exactly.
     let reality: Option<(Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
             &format!(
                 "SELECT verdict, checked_against_commit, checked_inputs_hash FROM memory_reality \
-                 WHERE memory_id = ?1 AND body_hash = ?2 AND prompt_version = ?3{reality_clause}"
+                 WHERE memory_id = ?1 AND content_hash = ?2 AND prompt_version = \
+                 ?3{reality_clause}"
             ),
-            params![memory_id, body_hash, crate::dream::VERDICT_PROMPT_VERSION],
+            params![memory_id, content_hash, crate::dream::VERDICT_PROMPT_VERSION],
             |r| {
                 Ok((
                     r.get::<_, Option<String>>(0)?,

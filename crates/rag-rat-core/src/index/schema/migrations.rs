@@ -2627,16 +2627,17 @@ pub(crate) fn apply_github_child_key_widening(conn: &Connection) -> rusqlite::Re
 // proposes). So the derived state lives in SIBLING tables, not new columns on `repo_memories`:
 //
 //  * `memory_reality` — one row per memory (keyed `(repo_id, memory_id)`), the verification
-//    bookmark + verdict. `body_hash` and `checked_inputs_hash` are the churn-skip comparators the
-//    verification queue reads: a memory is re-queued when its current body_hash differs from the
-//    stored one (a body edit) OR its recomputed bound-file input hash differs (source churn under
-//    the note). `checked_inputs_hash` is a DELIBERATE addition to the plan's schema — a cheap sha
-//    comparison over the sorted shas of the memory's bound files beats a commit-ancestry walk. The
-//    verdict columns (`verdict`/`direction`/`model_id`/`prompt_version`/`evidence_json`) are NULL
-//    in pass 0 (deterministic) and filled by the phase-B model verdict pass.
-//  * `memory_summaries` — one row per `(repo_id, memory_id, body_hash)`, so a body edit changes the
-//    key and self-invalidates the stale summary (a LEFT JOIN on the current body_hash misses, the
-//    compaction pass in phase C regenerates).
+//    bookmark + verdict. `content_hash` and `checked_inputs_hash` are the churn-skip comparators
+//    the verification queue reads: a memory is re-queued when its current content_hash differs from
+//    the stored one (a TITLE or body edit — both prompts audit the whole note, so the hash covers
+//    both) OR its recomputed evidence hash differs (source/identifier churn under the note).
+//    `checked_inputs_hash` is a DELIBERATE addition to the plan's schema — a cheap sha comparison
+//    over the memory's evidence pack beats a commit-ancestry walk. The verdict columns
+//    (`verdict`/`direction`/`model_id`/`prompt_version`/`evidence_json`) are NULL in pass 0
+//    (deterministic) and filled by the phase-B model verdict pass.
+//  * `memory_summaries` — one row per `(repo_id, memory_id, content_hash)`, so a title or body edit
+//    changes the key and self-invalidates the stale summary (a LEFT JOIN on the current
+//    content_hash misses, the compaction pass in phase C regenerates).
 //
 // Both are STRICT and carry `repo_id` (repo-unique memory ids post-A5, mirroring how
 // `repo_memory_bindings` scopes by `repo_id`); they hold regenerable data, so no FK to
@@ -2683,7 +2684,9 @@ pub(crate) fn apply_memory_verification_tables(conn: &Connection) -> rusqlite::R
         CREATE TABLE memory_reality(
             memory_id              TEXT    NOT NULL,
             repo_id                TEXT    NOT NULL DEFAULT '__unassigned__',
-            body_hash              TEXT    NOT NULL,
+            -- sha256 over the memory's NOTE content (trimmed title + body) — the churn-skip
+            -- comparator that self-invalidates a stored verdict on any title OR body edit.
+            content_hash           TEXT    NOT NULL,
             verdict                TEXT,
             direction              TEXT,
             -- Informational, for human review: the commit the note was checked against.
@@ -2700,14 +2703,15 @@ pub(crate) fn apply_memory_verification_tables(conn: &Connection) -> rusqlite::R
         CREATE TABLE memory_summaries(
             memory_id       TEXT    NOT NULL,
             repo_id         TEXT    NOT NULL DEFAULT '__unassigned__',
-            -- Keyed WITH body_hash so a body edit changes the key and self-invalidates the \
-         summary.
-            body_hash       TEXT    NOT NULL,
+            -- Keyed WITH content_hash (trimmed title + body) so a title OR body edit changes the \
+         key
+            -- and self-invalidates the stale summary.
+            content_hash    TEXT    NOT NULL,
             summary         TEXT    NOT NULL,
             model_id        TEXT,
             prompt_version  TEXT,
             generated_at_ms INTEGER NOT NULL,
-            PRIMARY KEY (repo_id, memory_id, body_hash)
+            PRIMARY KEY (repo_id, memory_id, content_hash)
         ) STRICT;
         ",
     );

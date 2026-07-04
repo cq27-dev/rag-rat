@@ -48,7 +48,6 @@ use rusqlite::Connection;
 use serde::Serialize;
 pub(crate) use verdict::PROMPT_VERSION as VERDICT_PROMPT_VERSION;
 pub use verdict::VerdictPass;
-pub(crate) use verify::checked_inputs_hash;
 // Dream v2 pass-0 substrate: the churn-skip verification queue + the deterministic,
 // citation-checkable evidence pack. Public so the phase-B model verdict pass (and later the
 // CLI flags) consume a stable interface; the pass-0 `memory_unverifiable` decider stays
@@ -57,6 +56,7 @@ pub use verify::{
     EvidencePack, FileExcerpt, IdentifierResolution, VerificationQueueEntry, VerificationReason,
     evidence_pack, verification_queue,
 };
+pub(crate) use verify::{checked_inputs_hash, note_content_hash};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DreamFinding {

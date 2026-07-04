@@ -744,8 +744,9 @@ fn migration_046_creates_the_verification_tables_on_fresh_apply() {
     );
     assert_eq!(
         pk_cols("memory_summaries"),
-        vec!["repo_id".to_string(), "memory_id".to_string(), "body_hash".to_string()],
-        "memory_summaries is keyed (repo_id, memory_id, body_hash) so a body edit self-invalidates"
+        vec!["repo_id".to_string(), "memory_id".to_string(), "content_hash".to_string()],
+        "memory_summaries is keyed (repo_id, memory_id, content_hash) so a body edit \
+         self-invalidates"
     );
 
     // Re-apply is a no-op (the memory_reality existence sentinel short-circuits).
@@ -756,8 +757,8 @@ fn migration_046_creates_the_verification_tables_on_fresh_apply() {
 /// V046 in ISOLATION against a bare connection: the sibling tables are ABSENT before the migration
 /// runs (the deferred-absence assertion anchored to the migration DDL, NOT the full ladder — the
 /// documented breakage class), it re-converges from a torn `memory_summaries` scratch table,
-/// replays as a no-op, and its keys hold (a duplicate reality row violates the PK; a new body_hash
-/// is a new summary row).
+/// replays as a no-op, and its keys hold (a duplicate reality row violates the PK; a new
+/// content_hash is a new summary row).
 #[test]
 fn migration_046_deferred_absence_and_reconverges_from_torn_state() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -781,31 +782,32 @@ fn migration_046_deferred_absence_and_reconverges_from_torn_state() {
 
     // memory_reality PK (repo_id, memory_id): one row per memory; a duplicate is rejected.
     conn.execute(
-        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_at_ms) VALUES \
+        "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_at_ms) VALUES \
          ('m','r','h',0)",
         [],
     )
     .unwrap();
     assert!(
         conn.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_at_ms) VALUES \
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_at_ms) VALUES \
              ('m','r','h2',1)",
             [],
         )
         .is_err(),
         "PK(repo_id, memory_id) rejects a second reality row for the same memory"
     );
-    // memory_summaries admits a second body_hash for the same memory (the self-invalidation shape).
+    // memory_summaries admits a second content_hash for the same memory (the self-invalidation
+    // shape).
     conn.execute(
-        "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, generated_at_ms) \
+        "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, generated_at_ms) \
          VALUES ('m','r','h','s',0)",
         [],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, generated_at_ms) \
+        "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, generated_at_ms) \
          VALUES ('m','r','h2','s2',0)",
         [],
     )
-    .expect("a new body_hash is a distinct summary row");
+    .expect("a new content_hash is a distinct summary row");
 }

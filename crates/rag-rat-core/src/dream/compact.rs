@@ -5,13 +5,13 @@
 //! deliberately spartan: one model turn per memory, NO tools, NO code context, NO evidence pack —
 //! the note body is the whole input (the offline eval measured that code context DEGRADES
 //! compaction fidelity). Accepted summaries land in `memory_summaries` (PK `(repo_id, memory_id,
-//! body_hash)`, so a body edit self-invalidates and re-queues); a rejected one stores NOTHING, and
-//! the absence of a summary row IS the title-only fallback at surfacing.
+//! content_hash)`, so a title/body edit self-invalidates and re-queues); a rejected one stores
+//! NOTHING, and the absence of a summary row IS the title-only fallback at surfacing.
 //!
 //! Two surfaces the rest of dream consumes:
 //!   - [`run_compact_pass`] — the budgeted runner: queue (active memories with no summary for their
-//!     CURRENT body) → prompt → summary → deterministic acceptance guards (retry once) → on accept,
-//!     UPSERT `memory_summaries` and prune the superseded (older body_hash) rows.
+//!     CURRENT note) → prompt → summary → deterministic acceptance guards (retry once) → on accept,
+//!     UPSERT `memory_summaries` and prune the superseded (older content_hash) rows.
 //!   - the [`guards`] module — the ONLY runtime checks (a deliberate design decision: no
 //!     shape-regex ref linting). Sentence/word bounds, no paragraph breaks, non-empty, and
 //!     tracker-ref resolvability by SET-MEMBERSHIP against the indexed papertrail.
@@ -39,7 +39,7 @@ pub struct CompactPass<'a> {
 }
 
 /// One memory that needs (re)compaction — an active memory with no `memory_summaries` row for its
-/// CURRENT body. Ordered by `memory_id`, capped by the pass budget.
+/// CURRENT note (title+body). Ordered by `memory_id`, capped by the pass budget.
 struct CompactionEntry {
     memory_id: String,
     title: String,
@@ -74,6 +74,7 @@ pub(super) fn run_compact_pass(
         record_summary(conn, RecordSummary {
             memory_id: &entry.memory_id,
             repo_id,
+            title: &entry.title,
             body: &entry.body,
             summary: &summary,
             model_id: pass.model.model_id(),
@@ -84,8 +85,8 @@ pub(super) fn run_compact_pass(
 }
 
 /// Active memories that still need a summary — no `memory_summaries` row keyed on their CURRENT
-/// `body_hash`. A body edit changes the key and re-enqueues (the summary self-invalidates); an
-/// unchanged, already-summarized memory churn-skips, so re-running a few times a day is cheap.
+/// `content_hash`. A title or body edit changes the key and re-enqueues (the summary
+/// self-invalidates); an unchanged, already-summarized memory churn-skips, so re-running is cheap.
 /// Repo-scoped, ordered by `memory_id`, capped at `budget`.
 fn compaction_queue(conn: &Connection, budget: usize) -> rusqlite::Result<Vec<CompactionEntry>> {
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
@@ -101,19 +102,20 @@ fn compaction_queue(conn: &Connection, budget: usize) -> rusqlite::Result<Vec<Co
 
     let mut queue = Vec::new();
     for (memory_id, title, body) in mems {
-        // The current body hash keys the summary; a stored summary under a DIFFERENT hash is stale
-        // (a body edit) and does NOT count as covered — so the memory re-queues. The
-        // `prompt_version` predicate does the same for a `COMPACT_PROMPT_VERSION` bump: a summary
-        // produced by an older prompt/guards no longer counts as covered, so a prompt change
-        // regenerates every summary instead of surfacing stale ones indefinitely.
-        let body_hash = crate::index::hex_sha256(body.as_bytes());
+        // The current content hash keys the summary; a stored summary under a DIFFERENT hash is
+        // stale (a TITLE or body edit — the compaction prompt frames both) and does NOT count as
+        // covered, so the memory re-queues. The `prompt_version` predicate does the same for a
+        // `COMPACT_PROMPT_VERSION` bump: a summary produced by an older prompt/guards no longer
+        // counts as covered, so a prompt change regenerates every summary instead of surfacing
+        // stale ones indefinitely.
+        let content_hash = super::verify::note_content_hash(&title, &body);
         let covered = conn
             .query_row(
                 &format!(
-                    "SELECT 1 FROM memory_summaries WHERE memory_id = ?1 AND body_hash = ?2 AND \
-                     prompt_version = ?3{summary_clause}"
+                    "SELECT 1 FROM memory_summaries WHERE memory_id = ?1 AND content_hash = ?2 \
+                     AND prompt_version = ?3{summary_clause}"
                 ),
-                rusqlite::params![memory_id, body_hash, COMPACT_PROMPT_VERSION],
+                rusqlite::params![memory_id, content_hash, COMPACT_PROMPT_VERSION],
                 |_| Ok(()),
             )
             .optional()?
@@ -201,37 +203,38 @@ fn render_compact_prompt(title: &str, body: &str) -> String {
 struct RecordSummary<'a> {
     memory_id: &'a str,
     repo_id: &'a str,
+    title: &'a str,
     body: &'a str,
     summary: &'a str,
     model_id: &'a str,
     now_ms: i64,
 }
 
-/// UPSERT the accepted summary into `memory_summaries` (PK `(repo_id, memory_id, body_hash)`) AND
-/// prune every superseded row (same memory, a DIFFERENT body_hash) in ONE transaction. That prune
-/// is the invariant: in steady state `memory_summaries` holds exactly ONE row per memory — the
-/// summary of its current body. Without it a churny memory would accrete a stale summary per past
-/// body_hash, and the surfacing LEFT JOIN (keyed on the current body_hash) would still be correct
-/// but the table would grow unboundedly. NEVER writes a `repo_memories` column.
+/// UPSERT the accepted summary into `memory_summaries` (PK `(repo_id, memory_id, content_hash)`)
+/// AND prune every superseded row (same memory, a DIFFERENT content_hash) in ONE transaction. That
+/// prune is the invariant: in steady state `memory_summaries` holds exactly ONE row per memory —
+/// the summary of its current note. Without it a churny memory would accrete a stale summary per
+/// past content_hash, and the surfacing LEFT JOIN (keyed on the current content_hash) would still
+/// be correct but the table would grow unboundedly. NEVER writes a `repo_memories` column.
 fn record_summary(conn: &Connection, r: RecordSummary<'_>) -> rusqlite::Result<()> {
-    let body_hash = crate::index::hex_sha256(r.body.as_bytes());
+    let content_hash = super::verify::note_content_hash(r.title, r.body);
     let tx = conn.unchecked_transaction()?;
-    // Prune superseded summaries (older body_hash) FIRST, so the memory is left with only its
-    // current-body summary after the UPSERT.
+    // Prune superseded summaries (older content_hash) FIRST, so the memory is left with only its
+    // current-note summary after the UPSERT.
     tx.execute(
-        "DELETE FROM memory_summaries WHERE repo_id = ?1 AND memory_id = ?2 AND body_hash != ?3",
-        rusqlite::params![r.repo_id, r.memory_id, body_hash],
+        "DELETE FROM memory_summaries WHERE repo_id = ?1 AND memory_id = ?2 AND content_hash != ?3",
+        rusqlite::params![r.repo_id, r.memory_id, content_hash],
     )?;
     tx.execute(
-        "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, model_id, \
+        "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, model_id, \
          prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(repo_id, \
-         memory_id, body_hash) DO UPDATE SET summary = excluded.summary, model_id = \
+         memory_id, content_hash) DO UPDATE SET summary = excluded.summary, model_id = \
          excluded.model_id, prompt_version = excluded.prompt_version, generated_at_ms = \
          excluded.generated_at_ms",
         rusqlite::params![
             r.memory_id,
             r.repo_id,
-            body_hash,
+            content_hash,
             r.summary,
             r.model_id,
             COMPACT_PROMPT_VERSION,
@@ -502,8 +505,8 @@ mod tests {
 
     fn summary_rows(c: &Connection, memory_id: &str) -> Vec<(String, String)> {
         c.prepare(
-            "SELECT body_hash, summary FROM memory_summaries WHERE memory_id = ?1 ORDER BY \
-             body_hash",
+            "SELECT content_hash, summary FROM memory_summaries WHERE memory_id = ?1 ORDER BY \
+             content_hash",
         )
         .unwrap()
         .query_map([memory_id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -601,7 +604,7 @@ mod tests {
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 7000).unwrap();
         let row: (String, String, String, String, i64) = c
             .query_row(
-                "SELECT summary, model_id, prompt_version, body_hash, generated_at_ms FROM \
+                "SELECT summary, model_id, prompt_version, content_hash, generated_at_ms FROM \
                  memory_summaries WHERE memory_id='m1' AND repo_id='r'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
@@ -610,8 +613,27 @@ mod tests {
         assert_eq!(row.0, GOOD_SUMMARY);
         assert_eq!(row.1, "mock-verdict-model");
         assert_eq!(row.2, COMPACT_PROMPT_VERSION);
-        assert_eq!(row.3, crate::index::hex_sha256(b"a body worth compacting"));
+        assert_eq!(row.3, crate::dream::note_content_hash("note", "a body worth compacting"));
         assert_eq!(row.4, 7000);
+    }
+
+    #[test]
+    fn title_only_edit_recompacts() {
+        // Regression (PR #428 Codex P2): the compaction prompt frames TITLE + body, so the
+        // content_hash covers the title — a title-only edit re-queues for a fresh summary.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "original title", "a stable body", "r");
+        let model = MockVerdictModel::new([GOOD_SUMMARY, GOOD_SUMMARY]);
+        run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
+        assert_eq!(model.calls(), 1, "the un-summarized memory is compacted once");
+        run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 2000).unwrap();
+        assert_eq!(model.calls(), 1, "unchanged → churn-skip");
+
+        c.execute("UPDATE repo_memories SET title='a corrected title' WHERE id='m1'", []).unwrap();
+        run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 3000).unwrap();
+        assert_eq!(model.calls(), 2, "a title-only edit re-compacts");
+        assert_eq!(summary_rows(&c, "m1").len(), 1, "old-note summary pruned, one row remains");
     }
 
     #[test]
@@ -628,8 +650,8 @@ mod tests {
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 2000).unwrap();
         assert_eq!(model.calls(), 1, "an unchanged, already-summarized memory is churn-skipped");
 
-        // A body edit changes body_hash → re-enqueued → the model runs again and the OLD summary
-        // row (under the previous body_hash) is pruned, leaving exactly one row.
+        // A body edit changes content_hash → re-enqueued → the model runs again and the OLD summary
+        // row (under the previous content_hash) is pruned, leaving exactly one row.
         c.execute("UPDATE repo_memories SET body='edited body' WHERE id='m1'", []).unwrap();
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 3000).unwrap();
         assert_eq!(model.calls(), 2, "a body edit re-invokes the model");
@@ -637,8 +659,8 @@ mod tests {
         assert_eq!(rows.len(), 1, "steady state is one summary row per memory (old body pruned)");
         assert_eq!(
             rows[0].0,
-            crate::index::hex_sha256(b"edited body"),
-            "the row is the new body's"
+            crate::dream::note_content_hash("note", "edited body"),
+            "the row is the new note's"
         );
     }
 

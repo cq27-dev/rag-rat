@@ -1474,7 +1474,7 @@ fn verification_queue_never_surfaces_a_sibling_repos_memories() {
     // The sibling repo's memory is ALREADY verified (a matching memory_reality row) — an unscoped
     // reality read would wrongly let repo A's run see it; a scoped read must ignore it.
     conn.execute(
-        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_at_ms) VALUES \
+        "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_at_ms) VALUES \
          ('b_mem', ?1, 'bh', 0)",
         [A5_REPO_B],
     )
@@ -1589,25 +1589,26 @@ fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
 
 /// Dream v2 pass 2 (poison-sibling discipline): the summary + verdict READ-JOIN that the
 /// `surface = "summary"` view uses (`current_summary_and_verdict`) must be repo-scoped. Both repos
-/// carry a `memory_summaries` + `memory_reality` row under the SAME (memory_id, body_hash) — a
+/// carry a `memory_summaries` + `memory_reality` row under the SAME (memory_id, content_hash) — a
 /// read that forgot its `repo_id` predicate would surface the wrong repo's summary/verdict. The
 /// scoped read must return each repo's OWN row.
 #[test]
 fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
     use crate::query::memory::current_summary_and_verdict;
     let conn = a5_scoped_two_repo_conn();
+    let title = "a shared note title";
     let body = "a body shared by both repos' notes";
-    let body_hash = crate::index::hex_sha256(body.as_bytes());
+    let content_hash = crate::dream::note_content_hash(title, body);
 
-    // Same (memory_id, body_hash) under BOTH repos — distinct summary text + verdict per repo.
+    // Same (memory_id, content_hash) under BOTH repos — distinct summary text + verdict per repo.
     for (repo, summary, verdict) in [
         (A5_REPO_A, "repo A compacted summary", "diverged"),
         (A5_REPO_B, "repo B compacted summary", "current"),
     ] {
         conn.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, prompt_version, \
-             generated_at_ms) VALUES ('shared_mem', ?1, ?2, ?3, ?4, 0)",
-            rusqlite::params![repo, body_hash, summary, crate::dream::COMPACT_PROMPT_VERSION],
+            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+             prompt_version, generated_at_ms) VALUES ('shared_mem', ?1, ?2, ?3, ?4, 0)",
+            rusqlite::params![repo, content_hash, summary, crate::dream::COMPACT_PROMPT_VERSION],
         )
         .unwrap();
         // Stamp the current evidence hash (empty value — `shared_mem` has no bindings/identifiers)
@@ -1617,12 +1618,12 @@ fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
             crate::dream::checked_inputs_hash(&conn, "shared_mem", &Some(repo.to_string()))
                 .unwrap();
         conn.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
              checked_inputs_hash, prompt_version, checked_at_ms) VALUES ('shared_mem', ?1, ?2, \
              ?3, ?4, ?5, 0)",
             rusqlite::params![
                 repo,
-                body_hash,
+                content_hash,
                 verdict,
                 inputs,
                 crate::dream::VERDICT_PROMPT_VERSION
@@ -1632,7 +1633,8 @@ fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
     }
 
     a5_set_active_repo(&conn, A5_REPO_A);
-    let (summary_a, verdict_a) = current_summary_and_verdict(&conn, "shared_mem", body).unwrap();
+    let (summary_a, verdict_a) =
+        current_summary_and_verdict(&conn, "shared_mem", title, body).unwrap();
     assert_eq!(
         summary_a.as_deref(),
         Some("repo A compacted summary"),
@@ -1641,7 +1643,8 @@ fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
     assert_eq!(verdict_a.as_deref(), Some("[verdict: diverged]"), "repo A reads its OWN verdict");
 
     a5_set_active_repo(&conn, A5_REPO_B);
-    let (summary_b, verdict_b) = current_summary_and_verdict(&conn, "shared_mem", body).unwrap();
+    let (summary_b, verdict_b) =
+        current_summary_and_verdict(&conn, "shared_mem", title, body).unwrap();
     assert_eq!(
         summary_b.as_deref(),
         Some("repo B compacted summary"),

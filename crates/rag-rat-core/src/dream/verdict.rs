@@ -7,7 +7,7 @@
 //!
 //! Two surfaces the rest of dream consumes:
 //!   - [`run_verdict_pass`] — the budgeted runner: queue → pack → prompt → verdict → on accept,
-//!     UPSERT `memory_reality`. Stamps `body_hash` / `checked_inputs_hash` with the SAME
+//!     UPSERT `memory_reality`. Stamps `content_hash` / `checked_inputs_hash` with the SAME
 //!     comparators the queue reads, so the next run churn-skips an unchanged memory (the model is
 //!     not re-invoked).
 //!   - [`divergence_findings`] — `memory_divergence` findings derived EVERY run from the STORED
@@ -153,6 +153,7 @@ pub(super) fn run_verdict_pass(
             record_uncitable(conn, Uncitable {
                 memory_id: &entry.memory_id,
                 repo_id,
+                title: &entry.title,
                 body: &entry.body,
                 checked_inputs_hash: &inputs_hash,
                 checked_against_commit: checked_against_commit.as_deref(),
@@ -169,6 +170,7 @@ pub(super) fn run_verdict_pass(
         record_verdict(conn, RecordVerdict {
             memory_id: &entry.memory_id,
             repo_id,
+            title: &entry.title,
             body: &entry.body,
             accepted: &accepted,
             checked_inputs_hash: &inputs_hash,
@@ -438,6 +440,7 @@ fn strip_ci<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 struct RecordVerdict<'a> {
     memory_id: &'a str,
     repo_id: &'a str,
+    title: &'a str,
     body: &'a str,
     accepted: &'a AcceptedVerdict,
     checked_inputs_hash: &'a str,
@@ -447,28 +450,28 @@ struct RecordVerdict<'a> {
 }
 
 /// UPSERT the accepted verdict into `memory_reality` (PK `(repo_id, memory_id)`), stamping the
-/// churn-skip comparators (`body_hash`, `checked_inputs_hash`) exactly as the queue reads them so
-/// the next run skips an unchanged memory, plus the verdict, advisory direction, cited evidence,
+/// churn-skip comparators (`content_hash`, `checked_inputs_hash`) exactly as the queue reads them
+/// so the next run skips an unchanged memory, plus the verdict, advisory direction, cited evidence,
 /// model id, prompt version, and check timestamp. NEVER writes a `repo_memories` column.
 fn record_verdict(conn: &Connection, r: RecordVerdict<'_>) -> rusqlite::Result<()> {
-    let body_hash = crate::index::hex_sha256(r.body.as_bytes());
+    let content_hash = verify::note_content_hash(r.title, r.body);
     // Store the cited pack lines as a JSON array so `divergence_findings` can render a compact,
     // stable evidence string from them.
     let evidence_json =
         serde_json::to_string(&r.accepted.evidence).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
-        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, direction, \
+        "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, direction, \
          checked_against_commit, checked_inputs_hash, evidence_json, model_id, prompt_version, \
          checked_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(repo_id, \
-         memory_id) DO UPDATE SET body_hash = excluded.body_hash, verdict = excluded.verdict, \
-         direction = excluded.direction, checked_against_commit = \
+         memory_id) DO UPDATE SET content_hash = excluded.content_hash, verdict = \
+         excluded.verdict, direction = excluded.direction, checked_against_commit = \
          excluded.checked_against_commit, checked_inputs_hash = excluded.checked_inputs_hash, \
          evidence_json = excluded.evidence_json, model_id = excluded.model_id, prompt_version = \
          excluded.prompt_version, checked_at_ms = excluded.checked_at_ms",
         rusqlite::params![
             r.memory_id,
             r.repo_id,
-            body_hash,
+            content_hash,
             r.accepted.verdict.as_db_str(),
             r.accepted.direction.as_db_str(),
             r.checked_against_commit,
@@ -487,6 +490,7 @@ fn record_verdict(conn: &Connection, r: RecordVerdict<'_>) -> rusqlite::Result<(
 struct Uncitable<'a> {
     memory_id: &'a str,
     repo_id: &'a str,
+    title: &'a str,
     body: &'a str,
     checked_inputs_hash: &'a str,
     checked_against_commit: Option<&'a str>,
@@ -495,24 +499,24 @@ struct Uncitable<'a> {
 
 /// Record a TERMINAL, verdict-less `memory_reality` row for an uncitable memory: NULL
 /// `verdict`/`direction`/`model_id`, empty `evidence_json`, but the churn-skip comparators
-/// (`body_hash`, `checked_inputs_hash`) and current `prompt_version` stamped so the memory
+/// (`content_hash`, `checked_inputs_hash`) and current `prompt_version` stamped so the memory
 /// churn-skips instead of re-queuing every run. A NULL verdict is inert for verdict markers and
-/// divergence findings (both filter on a concrete verdict). Re-evaluated when the body, bound-file
-/// inputs, or `PROMPT_VERSION` change — exactly like a real verdict row.
+/// divergence findings (both filter on a concrete verdict). Re-evaluated when the note content,
+/// evidence, or `PROMPT_VERSION` change — exactly like a real verdict row.
 fn record_uncitable(conn: &Connection, r: Uncitable<'_>) -> rusqlite::Result<()> {
-    let body_hash = crate::index::hex_sha256(r.body.as_bytes());
+    let content_hash = verify::note_content_hash(r.title, r.body);
     conn.execute(
-        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, direction, \
+        "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, direction, \
          checked_against_commit, checked_inputs_hash, evidence_json, model_id, prompt_version, \
          checked_at_ms) VALUES (?1,?2,?3,NULL,NULL,?4,?5,'[]',NULL,?6,?7) ON CONFLICT(repo_id, \
-         memory_id) DO UPDATE SET body_hash = excluded.body_hash, verdict = NULL, direction = \
-         NULL, checked_against_commit = excluded.checked_against_commit, checked_inputs_hash = \
+         memory_id) DO UPDATE SET content_hash = excluded.content_hash, verdict = NULL, direction \
+         = NULL, checked_against_commit = excluded.checked_against_commit, checked_inputs_hash = \
          excluded.checked_inputs_hash, evidence_json = '[]', model_id = NULL, prompt_version = \
          excluded.prompt_version, checked_at_ms = excluded.checked_at_ms",
         rusqlite::params![
             r.memory_id,
             r.repo_id,
-            body_hash,
+            content_hash,
             r.checked_against_commit,
             r.checked_inputs_hash,
             PROMPT_VERSION,
@@ -531,22 +535,24 @@ fn indexed_commit(conn: &Connection, scope: &Option<String>) -> rusqlite::Result
     }
 }
 
-/// One `memory_reality` `diverged` row joined to its live memory body — the input to the stale
-/// gates in [`divergence_findings`].
+/// One `memory_reality` `diverged` row joined to its live memory title+body — the input to the
+/// stale gates in [`divergence_findings`].
 struct DivergenceRow {
     memory_id: String,
     direction: Option<String>,
     evidence_json: Option<String>,
-    stored_body_hash: String,
+    stored_content_hash: String,
     stored_inputs_hash: Option<String>,
     stored_prompt_version: Option<String>,
+    title: String,
     body: String,
 }
 
 /// `memory_divergence` findings, derived EVERY run from the STORED `memory_reality` — every
-/// `verdict='diverged'` row whose memory is still active AND whose stored `body_hash`,
-/// `checked_inputs_hash`, and `prompt_version` still match the memory's CURRENT body, evidence, and
-/// the current verdict prompt, repo-scoped. NOT from this run's fresh (budget-capped) checks:
+/// `verdict='diverged'` row whose memory is still active AND whose stored `content_hash`,
+/// `checked_inputs_hash`, and `prompt_version` still match the memory's CURRENT note (title+body),
+/// evidence, and the current verdict prompt, repo-scoped. NOT from this run's fresh (budget-capped)
+/// checks:
 /// because `dream_findings` sync auto-resolves any finding not reported in a run, deriving from
 /// fresh checks would resolve findings for merely-SKIPPED memories. Reading the stored table means
 /// a divergence finding resolves exactly when a RE-CHECK flips the verdict to `current` (row no
@@ -563,8 +569,8 @@ pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<Dre
     let mem_clause = schema::periphery_repo_scope_clause(&scope, "m");
     let reality_clause = schema::periphery_repo_scope_clause(&scope, "mr");
     let mut stmt = conn.prepare(&format!(
-        "SELECT mr.memory_id, mr.direction, mr.evidence_json, mr.body_hash, \
-         mr.checked_inputs_hash, mr.prompt_version, m.body FROM memory_reality mr JOIN \
+        "SELECT mr.memory_id, mr.direction, mr.evidence_json, mr.content_hash, \
+         mr.checked_inputs_hash, mr.prompt_version, m.title, m.body FROM memory_reality mr JOIN \
          repo_memories m ON m.id = mr.memory_id{mem_clause} WHERE mr.verdict = 'diverged' AND \
          m.status = 'active'{reality_clause} ORDER BY mr.memory_id"
     ))?;
@@ -574,24 +580,26 @@ pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<Dre
                 memory_id: r.get(0)?,
                 direction: r.get(1)?,
                 evidence_json: r.get(2)?,
-                stored_body_hash: r.get(3)?,
+                stored_content_hash: r.get(3)?,
                 stored_inputs_hash: r.get(4)?,
                 stored_prompt_version: r.get(5)?,
-                body: r.get(6)?,
+                title: r.get(6)?,
+                body: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    // Stale gates: the verdict was checked against `stored_body_hash` + `stored_inputs_hash` under
-    // `stored_prompt_version`; drop it once the body is edited, the evidence changes, OR the prompt
-    // version is bumped, so an out-of-date `diverged` verdict is not surfaced against code the
-    // author has since changed or via an obsolete prompt. (`checked_inputs_hash` is recomputed
-    // per diverged row — a small set — exactly as the queue's comparator does.)
+    // Stale gates: the verdict was checked against `stored_content_hash` + `stored_inputs_hash`
+    // under `stored_prompt_version`; drop it once the note (title or body) is edited, the
+    // evidence changes, OR the prompt version is bumped, so an out-of-date `diverged` verdict
+    // is not surfaced against code the author has since changed or via an obsolete prompt.
+    // (`checked_inputs_hash` is recomputed per diverged row — a small set — exactly as the
+    // queue's comparator does.)
     let mut out = Vec::new();
     for row in rows {
         if row.stored_prompt_version.as_deref() != Some(PROMPT_VERSION) {
             continue;
         }
-        if row.stored_body_hash != crate::index::hex_sha256(row.body.as_bytes()) {
+        if row.stored_content_hash != verify::note_content_hash(&row.title, &row.body) {
             continue;
         }
         let current_inputs = verify::checked_inputs_hash(conn, &row.memory_id, &scope)?;
@@ -908,7 +916,7 @@ mod tests {
 
         let row: (String, String, String, String, String, i64) = c
             .query_row(
-                "SELECT verdict, direction, model_id, prompt_version, body_hash, checked_at_ms \
+                "SELECT verdict, direction, model_id, prompt_version, content_hash, checked_at_ms \
                  FROM memory_reality WHERE memory_id='m1' AND repo_id='r'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
@@ -918,7 +926,7 @@ mod tests {
         assert_eq!(row.1, "note_ahead");
         assert_eq!(row.2, "mock-verdict-model");
         assert_eq!(row.3, PROMPT_VERSION);
-        assert_eq!(row.4, crate::index::hex_sha256(b"describes `resolvable_thing`"));
+        assert_eq!(row.4, verify::note_content_hash("note", "describes `resolvable_thing`"));
         assert_eq!(row.5, 5000);
     }
 
@@ -941,7 +949,7 @@ mod tests {
             "an unchanged verified memory is churn-skipped (no model call)"
         );
 
-        // A body edit changes body_hash → re-enqueued → the model runs again.
+        // A body edit changes content_hash → re-enqueued → the model runs again.
         c.execute(
             "UPDATE repo_memories SET body='describes `resolvable_thing` (edited)' WHERE id='m1'",
             [],

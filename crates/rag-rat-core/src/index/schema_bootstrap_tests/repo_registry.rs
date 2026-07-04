@@ -3129,7 +3129,7 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
     // A V045 dream-v2 verification sibling — repo_id-scoped from birth. Adoption must re-point it
     // like the rest of the A5 periphery set (it is NOT part of V042; the sibling landed later).
     conn.execute(
-        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, checked_at_ms)
+        "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, checked_at_ms)
          VALUES ('m1', ?1, 'bh', 'current', 0)",
         [LEGACY_REPO_ID],
     )

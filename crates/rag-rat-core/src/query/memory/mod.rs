@@ -241,7 +241,7 @@ impl RepoMemoryEvidence {
     /// [`Self::compact`] plus the dream summary + verdict marker for each memory's CURRENT body
     /// (the `[memory] surface = "summary"` view). Each header is hydrated from the derived
     /// `memory_summaries` / `memory_reality` siblings (repo-scoped, keyed on the current
-    /// body_hash), so a memory with no summary row falls back to the mechanical header
+    /// content_hash), so a memory with no summary row falls back to the mechanical header
     /// (title-only in practice). The full body is never included — `memory show` remains the
     /// expand path.
     pub fn compact_summary_first(
@@ -256,6 +256,7 @@ impl RepoMemoryEvidence {
                     let (summary, verdict) = hydrate::current_summary_and_verdict(
                         conn,
                         &memory.memory_id,
+                        &memory.title,
                         &memory.body,
                     )?;
                     compact.summary = summary;
@@ -321,8 +322,8 @@ pub struct CompactRepoMemory {
     )]
     pub logical_symbol_id: Option<i64>,
     /// The dream-compacted summary of the memory's CURRENT body, populated ONLY under `[memory]
-    /// surface = "summary"` when a `memory_summaries` row exists for the current body_hash (dream
-    /// v2 pass 2). `None` under the default `full` surface, or when no summary has been
+    /// surface = "summary"` when a `memory_summaries` row exists for the current content_hash
+    /// (dream v2 pass 2). `None` under the default `full` surface, or when no summary has been
     /// generated — the title then stands alone (the title-only fallback). The full body is
     /// always one lookup away via `memory show` / `memory_show`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -571,15 +572,15 @@ mod tests {
     }
 
     fn seed_summary(c: &Connection, id: &str, body: &str, summary: &str) {
-        // Stamp the current COMPACT_PROMPT_VERSION — the hydrator gates the summary read on it
-        // (like the compaction queue's coverage check), so a NULL/mismatched version drops
-        // the summary.
+        // Stamp the current content_hash (title `"t"`, matching `memory_with_body`) + the current
+        // COMPACT_PROMPT_VERSION — the hydrator gates the summary read on both (like the compaction
+        // queue's coverage check), so a mismatch drops the summary.
         c.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, prompt_version, \
-             generated_at_ms) VALUES (?1,'r',?2,?3,?4,0)",
+            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+             prompt_version, generated_at_ms) VALUES (?1,'r',?2,?3,?4,0)",
             params![
                 id,
-                crate::index::hex_sha256(body.as_bytes()),
+                crate::dream::note_content_hash("t", body),
                 summary,
                 crate::dream::COMPACT_PROMPT_VERSION
             ],
@@ -588,19 +589,19 @@ mod tests {
     }
 
     fn seed_reality(c: &Connection, id: &str, body: &str, verdict: &str, commit: Option<&str>) {
-        // Key the reality row on the memory's TRUE body_hash, its current evidence hash, AND the
-        // current verdict PROMPT_VERSION — the hydrator gates the marker on all three (like the
-        // queue/divergence finder), so a mismatch on any silently drops it. These test memories
-        // have no bindings/identifiers, so the evidence hash is the stable empty value
-        // `checked_inputs_hash` computes.
+        // Key the reality row on the memory's TRUE content_hash (title `"t"`, matching
+        // `memory_with_body`), its current evidence hash, AND the current verdict PROMPT_VERSION —
+        // the hydrator gates the marker on all three (like the queue/divergence finder), so a
+        // mismatch on any silently drops it. These test memories have no bindings/identifiers, so
+        // the evidence hash is the stable empty value `checked_inputs_hash` computes.
         let inputs = crate::dream::checked_inputs_hash(c, id, &Some("r".to_string())).unwrap();
         c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
              checked_against_commit, checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
              (?1,'r',?2,?3,?4,?5,?6,0)",
             params![
                 id,
-                crate::index::hex_sha256(body.as_bytes()),
+                crate::dream::note_content_hash("t", body),
                 verdict,
                 commit,
                 inputs,
@@ -661,8 +662,9 @@ mod tests {
     #[test]
     fn summary_surface_misses_a_stale_summary_after_a_body_edit() {
         let c = summary_conn();
-        // A summary exists, but for the OLD body — the current body_hash differs, so the LEFT JOIN
-        // misses and the header falls back to title-only (the summary self-invalidated).
+        // A summary exists, but for the OLD body — the current content_hash differs, so the LEFT
+        // JOIN misses and the header falls back to title-only (the summary
+        // self-invalidated).
         seed_summary(
             &c,
             "m1",
@@ -673,14 +675,14 @@ mod tests {
             evidence(vec![memory_with_body("m1", "new body")]).compact_summary_first(&c).unwrap();
         assert_eq!(
             compact.direct[0].summary, None,
-            "a summary keyed on a stale body_hash is not surfaced"
+            "a summary keyed on a stale content_hash is not surfaced"
         );
     }
 
     #[test]
     fn verdict_marker_misses_a_stale_verdict_after_a_body_edit() {
         let c = summary_conn();
-        // A verdict exists, but for the OLD body — the current body_hash differs, so the verdict
+        // A verdict exists, but for the OLD body — the current content_hash differs, so the verdict
         // read misses and the header carries no marker. Symmetric to the stale-summary case: a body
         // edit self-invalidates the verdict just like the summary, so a just-edited memory never
         // renders the PRIOR body's verdict.
@@ -689,28 +691,28 @@ mod tests {
             evidence(vec![memory_with_body("m1", "new body")]).compact_summary_first(&c).unwrap();
         assert_eq!(
             compact.direct[0].verdict, None,
-            "a verdict keyed on a stale body_hash is not surfaced after a body edit"
+            "a verdict keyed on a stale content_hash is not surfaced after a body edit"
         );
     }
 
     #[test]
     fn verdict_marker_misses_a_stale_verdict_after_a_bound_input_change() {
         // Regression (PR #428 Codex P2): the marker is gated on `checked_inputs_hash`, not only
-        // `body_hash`. A stored verdict whose inputs hash no longer matches the memory's current
+        // `content_hash`. A stored verdict whose inputs hash no longer matches the memory's current
         // bound-file inputs (a bound file changed since the check) must drop, like the divergence
         // finder and queue treat an inputs mismatch. Seed a row with a deliberately-mismatched
         // inputs hash — the current inputs hash for this binding-less memory is the
         // empty-set value, which this arbitrary value is not.
         let c = summary_conn();
         let body = "a note whose stored verdict predates a bound-file change";
-        // Stamp the CURRENT prompt version so the only mismatch is the inputs hash — otherwise the
-        // marker would drop for the wrong reason (prompt gate) and not exercise the inputs gate.
+        // Stamp the CURRENT content hash + prompt version so the only mismatch is the inputs hash —
+        // otherwise the marker would drop for the wrong reason and not exercise the inputs gate.
         c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
              checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
              ('m1','r',?1,'diverged','stale-inputs',?2,0)",
             params![
-                crate::index::hex_sha256(body.as_bytes()),
+                crate::dream::note_content_hash("t", body),
                 crate::dream::VERDICT_PROMPT_VERSION
             ],
         )
@@ -731,20 +733,20 @@ mod tests {
         // memory waits behind the budget (or a model failure) for a fresh one.
         let c = summary_conn();
         let body = "b";
-        let body_hash = crate::index::hex_sha256(body.as_bytes());
+        let content_hash = crate::dream::note_content_hash("t", body);
         c.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, prompt_version, \
-             generated_at_ms) VALUES ('m1','r',?1,'A three sentence summary. It holds. \
-             Done.','compact-OLD',0)",
-            params![body_hash],
+            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+             prompt_version, generated_at_ms) VALUES ('m1','r',?1,'A three sentence summary. It \
+             holds. Done.','compact-OLD',0)",
+            params![content_hash],
         )
         .unwrap();
         let inputs = crate::dream::checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
         c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
              checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
              ('m1','r',?1,'diverged',?2,'verify-OLD',0)",
-            params![body_hash, inputs],
+            params![content_hash, inputs],
         )
         .unwrap();
         let compact =
