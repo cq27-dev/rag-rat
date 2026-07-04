@@ -485,8 +485,16 @@ fn resolve_identifier(
             many => return Ok(format!("symbols ({}): {}", many.len(), many.join(", "))),
         }
     }
-    if let Some(path) = resolve_file_segment(ident, file_paths) {
-        return Ok(format!("file {path}"));
+    // A shorthand path (`lib.rs`, `src/lib.rs`) can suffix-match MORE than one indexed file;
+    // present ALL of them for the SAME reason as ambiguous symbols above — else
+    // deleting/changing the file the note meant is masked by an unrelated same-suffix file, and
+    // the churn key stays pinned to the first match. An exact path match is definitive
+    // (returned alone).
+    let files = resolve_file_segment(ident, file_paths);
+    match files.as_slice() {
+        [] => {},
+        [one] => return Ok(format!("file {one}")),
+        many => return Ok(format!("files ({}): {}", many.len(), many.join(", "))),
     }
     Ok(NOT_FOUND.to_string())
 }
@@ -522,14 +530,18 @@ fn resolve_symbol(conn: &Connection, name: &str) -> rusqlite::Result<Vec<String>
     .collect()
 }
 
-/// The first (sorted) indexed path that equals `ident` or ends in `/ident` — suffix-aware exactly
-/// like `stale_reference`'s resolver, so prose shorthand (`src/lib.rs`) still resolves.
-fn resolve_file_segment(ident: &str, file_paths: &[String]) -> Option<String> {
+/// EVERY indexed path that equals `ident` or ends in `/ident` — suffix-aware like
+/// `stale_reference`'s resolver, so prose shorthand (`src/lib.rs`, `lib.rs`) still resolves.
+/// Returns ALL matches (path-sorted; `file_paths` is already sorted) so a shorthand that hits more
+/// than one file is surfaced as ambiguous rather than silently pinned to the first — see
+/// [`resolve_identifier`]. An EXACT path match is definitive (a full real path) and is returned
+/// alone; only the suffix case can be ambiguous.
+fn resolve_file_segment(ident: &str, file_paths: &[String]) -> Vec<String> {
     if let Some(p) = file_paths.iter().find(|p| p.as_str() == ident) {
-        return Some(p.clone());
+        return vec![p.clone()];
     }
     let suffix = format!("/{ident}");
-    file_paths.iter().find(|p| p.ends_with(&suffix)).cloned()
+    file_paths.iter().filter(|p| p.ends_with(&suffix)).cloned().collect()
 }
 
 /// Escape a string for use as a SQLite `LIKE` pattern under `ESCAPE '\'` — the three special chars
@@ -1247,6 +1259,26 @@ mod tests {
         let files = indexed_file_paths(&c).unwrap();
         let res = resolve_identifier(&c, "shared_name", &files).unwrap();
         assert!(res.starts_with("symbols (2):"), "renders ambiguous: {res}");
+    }
+
+    #[test]
+    fn resolve_file_segment_returns_all_same_suffix_matches_as_ambiguous() {
+        // Regression (PR #428 Codex P2): a shorthand path (`lib.rs`) suffix-matching more than one
+        // indexed file must surface as AMBIGUOUS, not pinned to the first — same class as ambiguous
+        // symbols, so deleting the file the note meant re-verifies even when a same-suffix file
+        // survives.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a note about `lib.rs`", "r");
+        seed_file(&c, "crates/b/lib.rs", "fn f() {}\n", "r");
+        seed_file(&c, "crates/a/lib.rs", "fn f() {}\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        let res = resolve_identifier(&c, "lib.rs", &files).unwrap();
+        assert!(res.starts_with("files (2):"), "renders ambiguous: {res}");
+        assert!(
+            res.contains("crates/a/lib.rs") && res.contains("crates/b/lib.rs"),
+            "lists both matches: {res}"
+        );
     }
 
     #[test]
