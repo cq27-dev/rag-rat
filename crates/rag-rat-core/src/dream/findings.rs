@@ -11,6 +11,13 @@ use sha2::{Digest, Sha256};
 
 use super::DreamFinding;
 
+/// The finding kinds a plain `dream` run always computes (no `--verify`) — the resolve pass may
+/// close a stale one even when this run produced zero of them.
+pub(super) const BASE_FINDING_KINDS: &[&str] = &["coverage_gap", "stale_reference"];
+/// The extra kinds the verify pass computes; only resolvable on a `--verify` run (else a plain
+/// `dream` would wrongly resolve findings a prior verify run opened — the kind was not evaluated).
+pub(super) const VERIFY_FINDING_KINDS: &[&str] = &["memory_unverifiable", "memory_divergence"];
+
 fn claim_hash(kind: &str, subject: &str, evidence: &str) -> String {
     let mut h = Sha256::new();
     h.update(kind.as_bytes());
@@ -209,13 +216,21 @@ pub(super) fn dream_repo_scope_clause(scope: &Option<String>) -> String {
 /// repo is IN the hash, so two repos minting the same `(kind, subject, claim_hash)` never collide
 /// on the global `id` PK (the scoped lookup cannot see a sibling's row, so a repo-blind id would
 /// turn that case into a PK violation on insert rather than the pre-scoping silent UPDATE).
+///
+/// RESOLVE IS KIND-SCOPED: the resolve pass only closes findings whose `kind` is in
+/// `resolve_kinds` — the kinds this run actually COMPUTED. A run that omits a kind (e.g. a plain
+/// `dream` without `--verify` skips `memory_unverifiable` / `memory_divergence`) leaves that kind's
+/// open findings untouched instead of resolving them as "no longer seen". Passing the kind (not the
+/// findings) is deliberate: a computed kind that legitimately produced ZERO findings this run must
+/// still resolve its stale rows, so the resolve set can't be derived from `findings` alone.
 pub(super) fn sync(
     conn: &Connection,
     findings: &[DreamFinding],
     now_ms: i64,
+    resolve_kinds: &[&str],
 ) -> rusqlite::Result<(usize, usize, usize, usize)> {
     let tx = conn.unchecked_transaction()?;
-    let counts = sync_in_tx(&tx, findings, now_ms)?;
+    let counts = sync_in_tx(&tx, findings, now_ms, resolve_kinds)?;
     tx.commit()?;
     Ok(counts)
 }
@@ -224,6 +239,7 @@ fn sync_in_tx(
     conn: &Connection,
     findings: &[DreamFinding],
     now_ms: i64,
+    resolve_kinds: &[&str],
 ) -> rusqlite::Result<(usize, usize, usize, usize)> {
     let (mut opened, mut refreshed, mut superseded, mut resolved) = (0, 0, 0, 0);
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -313,7 +329,9 @@ fn sync_in_tx(
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, kind, subject) in current {
-        if !seen.contains(&(kind, subject)) {
+        // Only resolve within the kinds this run computed — a kind not evaluated this run keeps its
+        // open findings (a plain `dream` must not resolve a prior `--verify` run's findings).
+        if resolve_kinds.contains(&kind.as_str()) && !seen.contains(&(kind, subject)) {
             conn.execute("UPDATE dream_findings SET status = 'resolved' WHERE id = ?1", [&id])?;
             resolved += 1;
         }
@@ -342,11 +360,11 @@ mod tests {
             }]
         };
         set_repo(&c, "repo-a");
-        sync(&c, &finding(), 1000).unwrap();
+        sync(&c, &finding(), 1000, BASE_FINDING_KINDS).unwrap();
         set_repo(&c, "repo-b");
         // Pre-fix this is a PK violation, not an UPDATE: the scoped lookup misses repo-a's row and
         // the insert derives the same repo-blind id.
-        sync(&c, &finding(), 2000).unwrap();
+        sync(&c, &finding(), 2000, BASE_FINDING_KINDS).unwrap();
 
         let rows: Vec<(String, String)> = c
             .prepare(
@@ -418,9 +436,9 @@ mod tests {
             evidence: "10 callers".into(),
             rank: 1.0,
         }];
-        let (o, r, s, res) = sync(&c, &f1, 1000).unwrap();
+        let (o, r, s, res) = sync(&c, &f1, 1000, BASE_FINDING_KINDS).unwrap();
         assert_eq!((o, r, s, res), (1, 0, 0, 0), "first run opens");
-        let (o, r, _, _) = sync(&c, &f1, 2000).unwrap();
+        let (o, r, _, _) = sync(&c, &f1, 2000, BASE_FINDING_KINDS).unwrap();
         assert_eq!((o, r), (0, 1), "same finding refreshes, no duplicate");
         // material change -> supersede prior, open fresh
         let f2 = vec![DreamFinding {
@@ -429,14 +447,14 @@ mod tests {
             evidence: "40 callers".into(),
             rank: 1.0,
         }];
-        let (o, _, s, _) = sync(&c, &f2, 3000).unwrap();
+        let (o, _, s, _) = sync(&c, &f2, 3000, BASE_FINDING_KINDS).unwrap();
         assert_eq!((o, s), (1, 1), "changed evidence supersedes + opens fresh");
         let opened: i64 = c
             .query_row("SELECT COUNT(*) FROM dream_findings WHERE status='open'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(opened, 1, "exactly one open finding for the (kind,subject)");
         // run with no findings -> the (kind,subject) resolves
-        let (_, _, _, res) = sync(&c, &[], 4000).unwrap();
+        let (_, _, _, res) = sync(&c, &[], 4000, BASE_FINDING_KINDS).unwrap();
         assert_eq!(res, 1, "absent finding resolves");
     }
 
@@ -466,9 +484,9 @@ mod tests {
             .unwrap()
         };
         // A -> B -> A: the flip-back must leave A current with A's evidence, NOT strand B as open.
-        sync(&c, &cg("10 callers", 0.1), 1000).unwrap();
-        sync(&c, &cg("40 callers", 0.9), 2000).unwrap();
-        sync(&c, &cg("10 callers", 0.1), 3000).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 1000, BASE_FINDING_KINDS).unwrap();
+        sync(&c, &cg("40 callers", 0.9), 2000, BASE_FINDING_KINDS).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 3000, BASE_FINDING_KINDS).unwrap();
         assert_eq!(count(&c, "open"), 1, "exactly one open row after flip-back");
         assert_eq!(
             open_evidence(&c),
@@ -476,9 +494,9 @@ mod tests {
             "current (A) is open, not stale B"
         );
         // resolve, then reappear with the SAME evidence: must revive to open, not stay resolved.
-        sync(&c, &[], 4000).unwrap();
+        sync(&c, &[], 4000, BASE_FINDING_KINDS).unwrap();
         assert!(count(&c, "resolved") >= 1, "absent finding resolves");
-        sync(&c, &cg("10 callers", 0.1), 5000).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 5000, BASE_FINDING_KINDS).unwrap();
         assert_eq!(count(&c, "open"), 1, "reappearing resolved finding is revived to open");
     }
 }

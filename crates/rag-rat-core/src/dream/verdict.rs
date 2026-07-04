@@ -465,32 +465,58 @@ fn indexed_commit(conn: &Connection, scope: &Option<String>) -> rusqlite::Result
 }
 
 /// `memory_divergence` findings, derived EVERY run from the STORED `memory_reality` — every
-/// `verdict='diverged'` row whose memory is still active, repo-scoped. NOT from this run's fresh
-/// (budget-capped) checks: because `dream_findings` sync auto-resolves any finding not reported in
-/// a run, deriving from fresh checks would resolve findings for merely-SKIPPED memories. Reading
-/// the stored table means a divergence finding resolves exactly when a RE-CHECK flips the verdict
-/// to `current` (row no longer `diverged`) or the memory goes inactive — never on a skip. Mirrors
-/// how `verify::unverifiable_findings` runs over the full population for the same reason.
+/// `verdict='diverged'` row whose memory is still active AND whose stored `body_hash` still matches
+/// the memory's CURRENT body, repo-scoped. NOT from this run's fresh (budget-capped) checks:
+/// because `dream_findings` sync auto-resolves any finding not reported in a run, deriving from
+/// fresh checks would resolve findings for merely-SKIPPED memories. Reading the stored table means
+/// a divergence finding resolves exactly when a RE-CHECK flips the verdict to `current` (row no
+/// longer `diverged`), the memory goes inactive, OR its body is edited (the verdict was against the
+/// OLD body and no longer applies — the same stale-body gate the summary/verdict hydrator uses,
+/// `body_hash` computed in Rust because SQLite has no sha256). A churn-SKIPPED but UNEDITED memory
+/// keeps its `body_hash` match, so its finding still surfaces — the resolve-trap protection holds.
+/// Mirrors how `verify::unverifiable_findings` runs over the full population for the same reason.
+/// One `memory_reality` `diverged` row joined to its live memory body — the input to the
+/// stale-body gate in [`divergence_findings`].
+struct DivergenceRow {
+    memory_id: String,
+    direction: Option<String>,
+    evidence_json: Option<String>,
+    stored_body_hash: String,
+    body: String,
+}
+
 pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
     let mem_clause = schema::periphery_repo_scope_clause(&scope, "m");
     let reality_clause = schema::periphery_repo_scope_clause(&scope, "mr");
     let mut stmt = conn.prepare(&format!(
-        "SELECT mr.memory_id, mr.direction, mr.evidence_json FROM memory_reality mr JOIN \
-         repo_memories m ON m.id = mr.memory_id{mem_clause} WHERE mr.verdict = 'diverged' AND \
-         m.status = 'active'{reality_clause} ORDER BY mr.memory_id"
+        "SELECT mr.memory_id, mr.direction, mr.evidence_json, mr.body_hash, m.body FROM \
+         memory_reality mr JOIN repo_memories m ON m.id = mr.memory_id{mem_clause} WHERE \
+         mr.verdict = 'diverged' AND m.status = 'active'{reality_clause} ORDER BY mr.memory_id"
     ))?;
-    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let rows: Vec<DivergenceRow> = stmt
+        .query_map([], |r| {
+            Ok(DivergenceRow {
+                memory_id: r.get(0)?,
+                direction: r.get(1)?,
+                evidence_json: r.get(2)?,
+                stored_body_hash: r.get(3)?,
+                body: r.get(4)?,
+            })
+        })?
         .collect::<rusqlite::Result<_>>()?;
     Ok(rows
         .into_iter()
-        .map(|(memory_id, direction, evidence_json)| {
-            let direction = direction.unwrap_or_else(|| "unknown".to_string());
-            let cited = compact_evidence(evidence_json.as_deref());
+        // Stale-body gate: the verdict was checked against `stored_body_hash`; drop it once the
+        // memory body has been edited (its current hash differs), so an out-of-date `diverged`
+        // verdict is not surfaced against a note the author has since changed.
+        .filter(|row| row.stored_body_hash == crate::index::hex_sha256(row.body.as_bytes()))
+        .map(|row| {
+            let direction = row.direction.unwrap_or_else(|| "unknown".to_string());
+            let cited = compact_evidence(row.evidence_json.as_deref());
             DreamFinding {
                 kind: "memory_divergence".into(),
-                subject: memory_id,
+                subject: row.memory_id,
                 // Evidence is derived from the STORED row, so it is stable across skip-runs
                 // (refresh, not supersede) and only changes when a re-check
                 // rewrites the row.
@@ -853,6 +879,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(open, 0, "no open memory_divergence finding remains");
+    }
+
+    #[test]
+    fn a_plain_dream_run_does_not_resolve_a_prior_verify_runs_divergence_finding() {
+        // Regression (PR #428 Codex P2): the resolve sweep is kind-scoped, so a plain `dream`
+        // (verify off) must NOT resolve the `memory_divergence` finding a prior `--verify` run
+        // opened — it never re-evaluated that kind.
+        use super::super::{DreamOptions, dream_run, dream_run_with_passes};
+
+        let c = seeded_verifiable_repo();
+        let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
+        let verify_opts = DreamOptions { now_ms: 1000, limit: 10, verify: true };
+        let r1 = dream_run_with_passes(
+            &c,
+            verify_opts,
+            Some(VerdictPass { model: &model, budget: 10 }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(divergence_subjects(&r1.findings), vec!["m1".to_string()], "divergence opens");
+
+        // A plain deterministic run (verify OFF): the divergence kind is not computed, so its open
+        // finding is left untouched — not resolved as "no longer seen". The emitted worklist reads
+        // ALL open findings from the store, so the still-open divergence finding is still listed.
+        let plain_opts = DreamOptions { now_ms: 2000, limit: 10, verify: false };
+        let r2 = dream_run(&c, plain_opts).unwrap();
+        assert_eq!(
+            divergence_subjects(&r2.findings),
+            vec!["m1".to_string()],
+            "the divergence finding survives a plain run (not resolved)"
+        );
+        let still_open: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM dream_findings WHERE kind='memory_divergence' AND \
+                 status='open'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_open, 1, "the divergence finding stays open across the plain run");
+    }
+
+    #[test]
+    fn divergence_finding_drops_when_the_body_is_edited_without_a_recheck() {
+        // Regression (PR #428 Codex P2): a stored `diverged` verdict is against the OLD body; once
+        // the body is edited it must not be surfaced against the new note even if the model pass is
+        // absent (disabled / budget-exhausted / skipped) so no re-check happened.
+        use super::super::{DreamOptions, dream_run, dream_run_with_passes};
+
+        let c = seeded_verifiable_repo();
+        let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
+        let verify_opts = DreamOptions { now_ms: 1000, limit: 10, verify: true };
+        dream_run_with_passes(
+            &c,
+            verify_opts,
+            Some(VerdictPass { model: &model, budget: 10 }),
+            None,
+        )
+        .unwrap();
+
+        // Edit the body — no model pass supplied on this verify run, so the stale verdict row is
+        // not re-checked. The stale-body gate must drop it from the derived findings, and
+        // because the kind IS computed (verify on) with the memory absent, the open finding
+        // resolves.
+        c.execute(
+            "UPDATE repo_memories SET body='describes `resolvable_thing` v2' WHERE id='m1'",
+            [],
+        )
+        .unwrap();
+        let r = dream_run(&c, DreamOptions { now_ms: 2000, limit: 10, verify: true }).unwrap();
+        assert!(
+            divergence_subjects(&r.findings).is_empty(),
+            "a diverged verdict against the pre-edit body is not surfaced against the new note"
+        );
+        let open: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM dream_findings WHERE kind='memory_divergence' AND \
+                 status='open'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 0, "the stale divergence finding resolves once the body is edited");
     }
 
     #[test]

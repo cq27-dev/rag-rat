@@ -110,11 +110,18 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<Drea
     // resolved. Deriving divergence from the STORED table (not this run's budget-capped fresh
     // checks) is what keeps a merely churn-SKIPPED memory's finding from being wrongly
     // resolved.
+    // The resolve sweep is scoped to the kinds THIS run computed (see `findings::sync`): base kinds
+    // always; the verify kinds only when `--verify` ran. Without this, a plain `dream` after a
+    // `dream --verify` would resolve the open `memory_unverifiable` / `memory_divergence` findings
+    // it never re-evaluated, silently dropping real worklist items until the next verify run.
+    let mut resolve_kinds: Vec<&str> = findings::BASE_FINDING_KINDS.to_vec();
     if opts.verify {
         findings.extend(verify::unverifiable_findings(conn)?);
         findings.extend(verdict::divergence_findings(conn)?);
+        resolve_kinds.extend_from_slice(findings::VERIFY_FINDING_KINDS);
     }
-    let (opened, refreshed, superseded, resolved) = findings::sync(conn, &findings, opts.now_ms)?;
+    let (opened, refreshed, superseded, resolved) =
+        findings::sync(conn, &findings, opts.now_ms, &resolve_kinds)?;
 
     // emit the OPEN worklist from the store (post-sync); each finding's exposed rank is its
     // base_rank DECAYED by age since first_seen (effective_rank) — a stale unreviewed finding
