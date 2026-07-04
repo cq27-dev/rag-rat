@@ -333,8 +333,9 @@ fn parser_failures_report_paths() {
 fn v044_widens_the_github_natural_keys_to_include_repo_id() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // The ABSOLUTE schema-tip pin moved to the newest migration's test (V045); here just assert
-    // `apply` reaches LATEST symbolically.
+    // The ABSOLUTE schema-tip pin moved to the newest migration's test (V046 —
+    // `migration_046_creates_the_verification_tables_on_fresh_apply`); here just assert
+    // `apply` reaches LATEST symbolically (the hardcoded-LATEST footgun).
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -419,10 +420,13 @@ fn v044_lets_two_repos_cache_the_same_github_item() {
 fn v045_widens_the_github_child_keys_to_include_repo_id() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // The ABSOLUTE schema-tip pin lives with the newest migration (V045): a later migration moves
-    // it to its own test and this becomes a symbolic check.
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 45, "V045 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 45, "schema at LATEST after apply");
+    // The ABSOLUTE schema-tip pin moved to V046's test (dream verification tables) once it became
+    // the newest migration; this is now the symbolic `current_version == LATEST_SCHEMA_VERSION`.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
     for index in [
         "idx_github_comments_repo_unique",
         "idx_github_reviews_repo_unique",

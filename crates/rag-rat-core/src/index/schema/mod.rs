@@ -17,7 +17,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 45;
+pub const LATEST_SCHEMA_VERSION: u32 = 46;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -307,6 +307,14 @@ const MIGRATION_045_DESCRIPTION: &str =
      per owning-parent repo — so two repos sharing an external issue/PR each keep that item's \
      comments and reviews in their scoped papertrail instead of last-syncer-owns restamping \
      (memory-sync phase A7)";
+const MIGRATION_046_ID: &str = "046_memory_verification_reality_summaries";
+const MIGRATION_046_CHECKSUM: &str = "sha256:rag-rat-memory-verification-reality-summaries-v46";
+const MIGRATION_046_DESCRIPTION: &str =
+    "Add the dream verification sibling tables memory_reality (one derived verdict/check row per \
+     memory, keyed (repo_id, memory_id)) and memory_summaries (one per (repo_id, memory_id, \
+     body_hash) so a body edit self-invalidates), both STRICT and repo_id-scoped. They hold \
+     derived, regenerable data so dream verifies memories without ever mutating a repo_memories \
+     row (dream v2 pass 0)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -676,6 +684,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_045_CHECKSUM,
         description: MIGRATION_045_DESCRIPTION,
         apply: apply_github_child_key_widening,
+    },
+    Migration {
+        id: MIGRATION_046_ID,
+        checksum: MIGRATION_046_CHECKSUM,
+        description: MIGRATION_046_DESCRIPTION,
+        apply: apply_memory_verification_tables,
     },
 ];
 

@@ -1334,7 +1334,8 @@ fn dream_run_leaves_a_sibling_repos_findings_untouched() {
     // Run dream on repo A. Its (empty) index reports nothing this run, so the resolve pass resolves
     // repo A's own unreported finding — but repo B's finding must be left OPEN and unemitted.
     a5_set_active_repo(&conn, A5_REPO_A);
-    let report = dream_run(&conn, DreamOptions { limit: 50, now_ms: 1_000 }).unwrap();
+    let report =
+        dream_run(&conn, DreamOptions { limit: 50, now_ms: 1_000, verify: false }).unwrap();
 
     let a_status: String = conn
         .query_row("SELECT status FROM dream_findings WHERE id = 'a-open'", [], |r| r.get(0))
@@ -1425,7 +1426,8 @@ fn dream_candidate_builders_ignore_a_sibling_repos_memories() {
     .unwrap();
 
     a5_set_active_repo(&conn, A5_REPO_A);
-    let report = dream_run(&conn, DreamOptions { limit: 10, now_ms: 1_000 }).unwrap();
+    let report =
+        dream_run(&conn, DreamOptions { limit: 10, now_ms: 1_000, verify: false }).unwrap();
 
     assert!(
         report
@@ -1440,6 +1442,148 @@ fn dream_candidate_builders_ignore_a_sibling_repos_memories() {
         !report.findings.iter().any(|f| f.kind == "stale_reference" && f.subject == "bmem"),
         "a sibling repo's memory must NOT surface as the active repo's stale_reference: {:?}",
         report.findings,
+    );
+}
+
+/// Dream v2 pass 0 (poison-sibling discipline): the verification QUEUE — a new consuming surface —
+/// must never surface a sibling repo's memories, and its `memory_reality` (V046) churn-skip read
+/// must be repo-scoped (per the V042 gating pattern), so a sibling's verified row cannot suppress
+/// this repo's memory.
+#[test]
+fn verification_queue_never_surfaces_a_sibling_repos_memories() {
+    use crate::dream::verification_queue;
+    let conn = a5_scoped_two_repo_conn();
+
+    // An active memory in EACH repo, both anchor-broken (a gone binding) so both are
+    // enqueue-eligible.
+    for (id, repo) in [("a_mem", A5_REPO_A), ("b_mem", A5_REPO_B)] {
+        conn.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
+             (?1,'Invariant','t','prose',?2,'active','agent',1,1,'agent','v1',?3)",
+            rusqlite::params![id, "high", repo],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, anchor_status, \
+             created_at_ms, repo_id) VALUES (?1,'symbol','foo','gone',0,?2)",
+            rusqlite::params![id, repo],
+        )
+        .unwrap();
+    }
+    // The sibling repo's memory is ALREADY verified (a matching memory_reality row) — an unscoped
+    // reality read would wrongly let repo A's run see it; a scoped read must ignore it.
+    conn.execute(
+        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_at_ms) VALUES \
+         ('b_mem', ?1, 'bh', 0)",
+        [A5_REPO_B],
+    )
+    .unwrap();
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let queue = verification_queue(&conn, 1_000, 50).unwrap();
+    let ids: Vec<&str> = queue.iter().map(|e| e.memory_id.as_str()).collect();
+    assert_eq!(ids, vec!["a_mem"], "the queue holds ONLY the active repo's memory: {ids:?}");
+}
+
+/// Dream v2 pass 0 (poison-sibling discipline): the EVIDENCE PACK — a new consuming surface —
+/// resolves identifiers and excerpts through the repo-scoped `files` view, so a sibling repo's
+/// same-path file / same-name symbol never leaks into the active repo's pack, and a
+/// sibling-exclusive symbol resolves to the authoritative NOT FOUND.
+#[test]
+fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
+    use crate::dream::evidence_pack;
+    let conn = a5_scoped_two_repo_conn();
+    let commit = "cafecafecafecafecafecafecafecafecafecafe";
+
+    // Seed a file + one symbol + one chunk under `repo`, at the shared `commit`. Returns nothing;
+    // the shared path/commit prove isolation is by repo_id, not path or commit.
+    let seed = |repo: &str, symbol: &str, chunk_text: &str| {
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id) VALUES \
+             ('src/shared.rs','rust','source',?1,0,0,?2,'',?3)",
+            rusqlite::params![format!("sha-{repo}"), commit, repo],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust',?2,'function',0,0)",
+            rusqlite::params![file_id, symbol],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
+             text_hash) VALUES (?1,'code',0,0,1,1,'th')",
+            [file_id],
+        )
+        .unwrap();
+        let chunk_id = conn.last_insert_rowid();
+        crate::index::chunk_text_store::seed_chunk_text(&conn, chunk_id, chunk_text).unwrap();
+    };
+    // Repo A: shared symbol `target_symbol`, chunk carries a repo-A marker.
+    seed(A5_REPO_A, "target_symbol", "fn target_symbol() { REPO_A_MARKER }");
+    // Repo B (sibling), SAME path + commit: `sibling_only_symbol` exists ONLY here + a repo-B
+    // marker.
+    seed(A5_REPO_B, "sibling_only_symbol", "fn sibling_only_symbol() { REPO_B_MARKER }");
+
+    // Repo A's memory names both symbols and is bound to the shared path.
+    conn.execute(
+        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+         created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
+         ('a_mem','Invariant','t','refs `target_symbol` and \
+         `sibling_only_symbol`','high','active','agent',1,1,'agent','v1',?1)",
+        [A5_REPO_A],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+         anchor_status, created_at_ms, repo_id) VALUES \
+         ('a_mem','path','src/shared.rs','src/shared.rs','current',0,?1)",
+        [A5_REPO_A],
+    )
+    .unwrap();
+    // A sibling memory that the active repo's pack must never surface.
+    conn.execute(
+        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+         created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
+         ('b_mem','Invariant','t','sibling note','high','active','agent',1,1,'agent','v1',?1)",
+        [A5_REPO_B],
+    )
+    .unwrap();
+
+    // Scope to repo A and install its `files` view at the shared commit (the isolation mechanism).
+    a5_set_active_repo(&conn, A5_REPO_A);
+    crate::index::lifecycle::install_scope_view(&conn, commit, "").unwrap();
+
+    let pack = evidence_pack(&conn, "a_mem").unwrap();
+    let resolution = |ident: &str| {
+        pack.identifiers.iter().find(|i| i.identifier == ident).map(|i| i.resolution.as_str())
+    };
+    assert_eq!(
+        resolution("target_symbol"),
+        Some("symbol src/shared.rs::target_symbol"),
+        "the active repo's own symbol resolves"
+    );
+    assert_eq!(
+        resolution("sibling_only_symbol"),
+        Some("NOT FOUND anywhere in the source tree"),
+        "a symbol that exists ONLY in the sibling repo must NOT resolve — the resolution is \
+         repo-scoped through the files view",
+    );
+    let excerpt_text: String = pack.excerpts.iter().map(|e| e.text.as_str()).collect();
+    assert!(excerpt_text.contains("REPO_A_MARKER"), "the excerpt is the active repo's file text");
+    assert!(
+        !excerpt_text.contains("REPO_B_MARKER"),
+        "the same-path sibling file must NOT leak into the active repo's excerpt: {excerpt_text}",
+    );
+
+    // The sibling's own memory is invisible to a pack built under the active repo's scope.
+    let sibling_pack = evidence_pack(&conn, "b_mem").unwrap();
+    assert!(
+        sibling_pack.identifiers.is_empty() && sibling_pack.excerpts.is_empty(),
+        "evidence_pack must return an empty pack for a memory outside the active repo scope",
     );
 }
 

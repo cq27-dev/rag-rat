@@ -701,3 +701,109 @@ fn discover_mode_indexes_new_files_and_removes_deleted_files() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// V046 (dream v2 pass 0): fresh `schema::apply` creates the `memory_reality` / `memory_summaries`
+/// sibling tables, both STRICT + repo_id-scoped with the documented PKs. Carries the ABSOLUTE
+/// schema-tip pin now that V046 is the newest migration; re-applying is idempotent (the
+/// `memory_reality` existence sentinel short-circuits).
+#[test]
+fn migration_046_creates_the_verification_tables_on_fresh_apply() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 46, "V046 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 46, "schema at LATEST after apply");
+
+    let table_sql = |table: &str| -> String {
+        conn.query_row("SELECT sql FROM sqlite_master WHERE name = ?1", [table], |r| r.get(0))
+            .unwrap()
+    };
+    let pk_cols = |table: &str| -> Vec<String> {
+        conn.prepare(&format!(
+            "SELECT name FROM pragma_table_info('{table}') WHERE pk > 0 ORDER BY pk"
+        ))
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    for table in ["memory_reality", "memory_summaries"] {
+        assert!(conn_table_exists(&conn, table), "{table} created on fresh apply");
+        assert!(table_sql(table).contains("STRICT"), "{table} is STRICT");
+        assert!(
+            conn_table_columns(&conn, table).contains(&"repo_id".to_string()),
+            "{table} carries repo_id"
+        );
+    }
+    assert_eq!(
+        pk_cols("memory_reality"),
+        vec!["repo_id".to_string(), "memory_id".to_string()],
+        "memory_reality is keyed (repo_id, memory_id)"
+    );
+    assert_eq!(
+        pk_cols("memory_summaries"),
+        vec!["repo_id".to_string(), "memory_id".to_string(), "body_hash".to_string()],
+        "memory_summaries is keyed (repo_id, memory_id, body_hash) so a body edit self-invalidates"
+    );
+
+    // Re-apply is a no-op (the memory_reality existence sentinel short-circuits).
+    schema::apply(&conn).unwrap();
+    assert!(conn_table_exists(&conn, "memory_reality"), "tables survive a re-apply");
+}
+
+/// V046 in ISOLATION against a bare connection: the sibling tables are ABSENT before the migration
+/// runs (the deferred-absence assertion anchored to the migration DDL, NOT the full ladder — the
+/// documented breakage class), it re-converges from a torn `memory_summaries` scratch table,
+/// replays as a no-op, and its keys hold (a duplicate reality row violates the PK; a new body_hash
+/// is a new summary row).
+#[test]
+fn migration_046_deferred_absence_and_reconverges_from_torn_state() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    // A crashed prior V046 pass could leave a partial `memory_summaries`; the migration's leading
+    // DROP re-converges from it.
+    conn.execute_batch("CREATE TABLE memory_summaries(leftover INTEGER);").unwrap();
+    // Deferred-absence, anchored to the migration DDL in isolation (never against the full ladder,
+    // whose end state always has the table): the sentinel table is absent before V046 runs.
+    assert!(!conn_table_exists(&conn, "memory_reality"), "memory_reality absent before V046 runs");
+
+    schema::apply_memory_verification_tables(&conn).unwrap();
+
+    assert!(conn_table_exists(&conn, "memory_reality"), "V046 creates memory_reality");
+    assert!(conn_table_exists(&conn, "memory_summaries"), "V046 creates memory_summaries");
+    assert!(
+        conn_table_columns(&conn, "memory_summaries").contains(&"repo_id".to_string()),
+        "the torn scratch table was dropped and recreated with the real shape"
+    );
+    // Replay short-circuits on the sentinel.
+    schema::apply_memory_verification_tables(&conn).expect("replay is a no-op");
+
+    // memory_reality PK (repo_id, memory_id): one row per memory; a duplicate is rejected.
+    conn.execute(
+        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_at_ms) VALUES \
+         ('m','r','h',0)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_at_ms) VALUES \
+             ('m','r','h2',1)",
+            [],
+        )
+        .is_err(),
+        "PK(repo_id, memory_id) rejects a second reality row for the same memory"
+    );
+    // memory_summaries admits a second body_hash for the same memory (the self-invalidation shape).
+    conn.execute(
+        "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, generated_at_ms) \
+         VALUES ('m','r','h','s',0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, generated_at_ms) \
+         VALUES ('m','r','h2','s2',0)",
+        [],
+    )
+    .expect("a new body_hash is a distinct summary row");
+}

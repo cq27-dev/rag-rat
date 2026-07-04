@@ -24,6 +24,10 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     let report = db.dream_run(rag_rat_core::dream::DreamOptions {
         now_ms,
         limit: args.limit.unwrap_or(20) as usize,
+        // The deterministic verification pass (dream v2 pass 0) is OFF here so plain `rag-rat
+        // dream` stays byte-identical to the v1 run; the `--verify` flag lands in a later
+        // phase.
+        verify: false,
     })?;
     print_output(&report)
 }

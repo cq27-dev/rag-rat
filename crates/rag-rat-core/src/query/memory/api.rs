@@ -650,6 +650,27 @@ pub(crate) fn doctor_attention_count(conn: &Connection) -> anyhow::Result<u64> {
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
+/// Distinct memory ids whose anchor is `gone`/`stale` — the SAME population `doctor_report` lists
+/// (identical WHERE predicate), exposed as a bare id set so the dream verification queue reuses the
+/// doctor predicate instead of re-inlining the anchor-status join. Repo-scoped; `scip_moniker`
+/// bindings excluded (self-heal on the next oracle run, never rebind-actionable). Returns
+/// `rusqlite::Result` so a `rusqlite::Result` caller (dream) threads it with `?` directly.
+pub(crate) fn memory_ids_with_broken_anchors(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
+    conn.prepare(&format!(
+        "SELECT DISTINCT b.memory_id
+         FROM repo_memory_bindings AS b
+         JOIN repo_memories AS m ON m.id = b.memory_id
+         WHERE m.status = 'active'
+           AND b.anchor_status IN ('gone', 'stale')
+           AND b.binding_kind != 'scip_moniker'{repo_clause}
+         ORDER BY b.memory_id"
+    ))?
+    .query_map([], |row| row.get::<_, String>(0))?
+    .collect()
+}
+
 pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>> {
     // Query bindings whose anchor_status is non-current, restricted to active memories.
     // Mirrors the column list used by validate_memories / binding_row.

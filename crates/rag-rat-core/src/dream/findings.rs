@@ -1,57 +1,15 @@
-//! Dream Mode (#122) — deterministic memory-maintenance worklist.
-//!
-//! Surfaces findings ABOUT memories into `dream_findings`; it NEVER mutates a `repo_memories` row
-//! (dream mode proposes, a human/strong-agent confirms). Two v1 finding kinds, both deterministic
-//! and rate-independent (the spike's commit-replay evals showed change-based signals saturate on an
-//! active repo; these check structure/truth, not churn):
-//!   - `coverage_gap`   — load-bearing symbols (high call-graph in-degree) with no memory binding.
-//!   - `stale_reference`— a memory references a `.rs` path that no longer resolves against the
-//!     index (suffix-aware, so prose shorthand like `src/lib.rs` still resolves).
-//!
-//! Findings are identity-keyed `(kind, subject, claim_hash)`: a re-run with the same evidence
-//! REFRESHES (no duplicate); a materially-changed finding SUPERSEDES the prior one; a finding the
-//! run no longer reports is RESOLVED. Lifecycle verified in the spike prototype before this port.
+//! Dream v1 findings lifecycle: the two deterministic finding builders (`coverage_gap`,
+//! `stale_reference`) and the identity-keyed `dream_findings` sync (refresh / supersede / resolve /
+//! revive) with repo-folded ids. Split out of the former monolithic `dream.rs` so the module index
+//! (`mod.rs`) curates the surface and the v2 verification pass lives in its own sibling (`verify`).
 
 use std::collections::HashSet;
 
 use regex::Regex;
 use rusqlite::Connection;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Serialize)]
-pub struct DreamFinding {
-    pub kind: String,
-    pub subject: String,
-    pub evidence: String,
-    pub rank: f64,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct DreamReport {
-    pub findings: Vec<DreamFinding>, // the open worklist, ranked
-    pub opened: usize,
-    pub refreshed: usize,
-    pub superseded: usize,
-    pub resolved: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DreamOptions {
-    pub now_ms: i64,
-    pub limit: usize, // max coverage_gap findings
-}
-
-/// Half-life for worklist rank decay: an unreviewed finding loses half its rank every 2 weeks, so a
-/// stale item sinks below fresh ones instead of squatting the top forever (anti-rot).
-const RANK_HALF_LIFE_MS: f64 = 14.0 * 86_400_000.0;
-
-/// `base_rank` decayed by age since the finding was first surfaced (`first_seen_at_ms`). This is
-/// the effective ordering rank the worklist exposes — the schema's documented age-decay, made real.
-fn effective_rank(base_rank: f64, first_seen_at_ms: i64, now_ms: i64) -> f64 {
-    let age = (now_ms - first_seen_at_ms).max(0) as f64;
-    base_rank * 0.5_f64.powf(age / RANK_HALF_LIFE_MS)
-}
+use super::DreamFinding;
 
 fn claim_hash(kind: &str, subject: &str, evidence: &str) -> String {
     let mut h = Sha256::new();
@@ -141,7 +99,7 @@ fn hex16(bytes: &[u8]) -> String {
 /// on ELIGIBLE rows. The `files` join resolves to the active-checkout `temp.files` view so callees
 /// are checkout-scoped; the caller in-degree is not yet scoped (follow-up: reuse the scoped
 /// `important_symbols` PageRank instead of this raw in-degree proxy).
-fn coverage_gap(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<DreamFinding>> {
+pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<DreamFinding>> {
     // The COVERAGE exclusion subqueries read `repo_memory_bindings` and must be scoped to the
     // ACTIVE repo (V042): a SIBLING repo's binding — a colliding `symbol_id` rowid, or a path
     // binding at a path this repo also has (the same-path case) — would otherwise mark this repo's
@@ -179,7 +137,7 @@ fn coverage_gap(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<DreamFi
 
 /// `stale_reference`: a memory body references a `.rs` path that no longer resolves against the
 /// index. Suffix-aware so prose shorthand (`src/lib.rs` for `crates/x/src/lib.rs`) is NOT flagged.
-fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
+pub(super) fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
     let all_paths: HashSet<String> = conn
         .prepare("SELECT path FROM files")?
         .query_map([], |r| r.get::<_, String>(0))?
@@ -230,13 +188,13 @@ fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
 /// The active `repo_id` to scope the `dream_findings` lifecycle by (V042), or `None` on the pre-A5
 /// schema (the column is absent, so the reads/writes run unscoped — the original repo-global SQL).
 /// Probes `dream_findings` — see `schema::periphery_repo_scope`.
-fn dream_repo_scope(conn: &Connection) -> rusqlite::Result<Option<String>> {
+pub(super) fn dream_repo_scope(conn: &Connection) -> rusqlite::Result<Option<String>> {
     crate::index::schema::periphery_repo_scope(conn, "dream_findings")
 }
 
 /// The ` AND dream_findings.repo_id = '…'` predicate for a scoped `dream_findings` read/write, or
 /// `""` when unscoped.
-fn dream_repo_scope_clause(scope: &Option<String>) -> String {
+pub(super) fn dream_repo_scope_clause(scope: &Option<String>) -> String {
     crate::index::schema::periphery_repo_scope_clause(scope, "dream_findings")
 }
 
@@ -251,7 +209,7 @@ fn dream_repo_scope_clause(scope: &Option<String>) -> String {
 /// repo is IN the hash, so two repos minting the same `(kind, subject, claim_hash)` never collide
 /// on the global `id` PK (the scoped lookup cannot see a sibling's row, so a repo-blind id would
 /// turn that case into a PK violation on insert rather than the pre-scoping silent UPDATE).
-fn sync(
+pub(super) fn sync(
     conn: &Connection,
     findings: &[DreamFinding],
     now_ms: i64,
@@ -363,68 +321,10 @@ fn sync_in_tx(
     Ok((opened, refreshed, superseded, resolved))
 }
 
-/// Run the deterministic dream-mode pass: compute findings, sync the worklist, return the open
-/// worklist (ranked) + lifecycle counts. Writes ONLY to `dream_findings`; never touches memories.
-pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<DreamReport> {
-    let mut findings = coverage_gap(conn, opts.limit)?;
-    findings.extend(stale_reference(conn)?);
-    let (opened, refreshed, superseded, resolved) = sync(conn, &findings, opts.now_ms)?;
-
-    // emit the OPEN worklist from the store (post-sync); each finding's exposed rank is its
-    // base_rank DECAYED by age since first_seen (effective_rank) — a stale unreviewed finding
-    // sinks below fresh ones (the documented anti-rot, now real, not just base_rank DESC). Scoped
-    // to the active repo so the emitted worklist never mixes in a sibling repo's open findings.
-    let repo_clause = dream_repo_scope_clause(&dream_repo_scope(conn)?);
-    let mut open: Vec<DreamFinding> = conn
-        .prepare(&format!(
-            "SELECT kind, subject, evidence, base_rank, first_seen_at_ms FROM dream_findings \
-             WHERE status = 'open'{repo_clause}"
-        ))?
-        .query_map([], |r| {
-            let base: f64 = r.get(3)?;
-            let first_seen: i64 = r.get(4)?;
-            Ok(DreamFinding {
-                kind: r.get(0)?,
-                subject: r.get(1)?,
-                evidence: r.get(2)?,
-                rank: effective_rank(base, first_seen, opts.now_ms),
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    // deterministic order: effective rank desc, then subject (ties — e.g. fresh stale_reference at
-    // base 0.5 — are stable across runs/reindexes instead of arbitrary SQLite row order).
-    open.sort_by(|a, b| {
-        b.rank
-            .partial_cmp(&a.rank)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.subject.cmp(&b.subject))
-    });
-    Ok(DreamReport { findings: open, opened, refreshed, superseded, resolved })
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{mem_db, set_repo};
     use super::*;
-
-    fn mem_db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::index::schema::apply(&c).unwrap();
-        c
-    }
-
-    /// Point the connection's periphery scope at `repo_id` — mirrors the scope-context write the
-    /// production open installs (and `multi_repo_scope::a5_set_active_repo`).
-    fn set_repo(c: &Connection, repo_id: &str) {
-        c.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        c.execute(
-            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
-            [repo_id],
-        )
-        .unwrap();
-    }
 
     /// A5 finding: `finding_id` folds the owning repo. Two repos minting the SAME
     /// `(kind, subject, claim_hash)` derive DISTINCT ids — a repo-blind id would make the second
@@ -580,62 +480,5 @@ mod tests {
         assert!(count(&c, "resolved") >= 1, "absent finding resolves");
         sync(&c, &cg("10 callers", 0.1), 5000).unwrap();
         assert_eq!(count(&c, "open"), 1, "reappearing resolved finding is revived to open");
-    }
-
-    #[test]
-    fn dream_run_never_mutates_any_memory_column() {
-        let c = mem_db();
-        // seed a memory whose body references a gone path so stale_reference is forced to READ it
-        // and emit a finding keyed on this memory (makes the assertion non-vacuous).
-        c.execute(
-            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-             created_at_ms, updated_at_ms, source, memory_version) VALUES \
-             ('m1','Invariant','t','refs \
-             crates/ghost/src/vanished.rs','high','active','agent',1,1,'agent','v1')",
-            [],
-        )
-        .unwrap();
-        // snapshot every column dream could plausibly mutate (stronger than a row COUNT: an
-        // in-place UPDATE to body/status/etc. would pass a count check but fail this).
-        let snap = |c: &Connection| {
-            c.query_row(
-                "SELECT body, status, confidence, kind, title, created_by, created_at_ms, \
-                 updated_at_ms, source, memory_version FROM repo_memories WHERE id='m1'",
-                [],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, i64>(6)?,
-                        r.get::<_, i64>(7)?,
-                        r.get::<_, String>(8)?,
-                        r.get::<_, String>(9)?,
-                    ))
-                },
-            )
-            .unwrap()
-        };
-        let before = snap(&c);
-        let report = dream_run(&c, DreamOptions { now_ms: 1000, limit: 10 }).unwrap();
-        assert_eq!(before, snap(&c), "dream_run must leave EVERY repo_memories column unchanged");
-        assert!(
-            report.findings.iter().any(|f| f.kind == "stale_reference" && f.subject == "m1"),
-            "non-vacuous: the seeded memory produced a stale_reference finding"
-        );
-    }
-
-    #[test]
-    fn rank_decays_with_age() {
-        let hl = RANK_HALF_LIFE_MS as i64;
-        assert!((effective_rank(1.0, 0, 0) - 1.0).abs() < 1e-9, "no decay at age 0");
-        assert!((effective_rank(1.0, 0, hl) - 0.5).abs() < 0.01, "one half-life halves the rank");
-        assert!(
-            effective_rank(1.0, 0, 2 * hl) < effective_rank(1.0, 0, hl),
-            "older unreviewed findings sink further"
-        );
     }
 }
