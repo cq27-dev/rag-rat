@@ -187,8 +187,10 @@ pub(crate) fn ids_to_memories(
 ///     (repo-scoped); a body edit changes the key, so a stale summary self-invalidates and this
 ///     misses (title-only fallback) until the compaction pass regenerates it.
 ///   - `verdict_marker` is a plain-text marker derived from the memory's `memory_reality` verdict
-///     (`[verdict: diverged]` / `[verdict: current @<short-commit>]`); `None` when there is no
-///     verdict row or the row's verdict is still NULL (a pass-0-only check).
+///     for the CURRENT body (`[verdict: diverged]` / `[verdict: current @<short-commit>]`), keyed
+///     on `body_hash` exactly like the summary: a body edit changes the key, so a stale verdict
+///     self-invalidates and this misses until the next verdict pass re-checks. `None` when there is
+///     no matching verdict row or the row's verdict is still NULL (a pass-0-only check).
 ///
 /// Reads only the derived sibling tables — never a `repo_memories` column.
 pub(crate) fn current_summary_and_verdict(
@@ -216,10 +218,10 @@ pub(crate) fn current_summary_and_verdict(
     let verdict_marker = conn
         .query_row(
             &format!(
-                "SELECT verdict, checked_against_commit FROM memory_reality WHERE memory_id = \
-                 ?1{reality_clause}"
+                "SELECT verdict, checked_against_commit FROM memory_reality WHERE memory_id = ?1 \
+                 AND body_hash = ?2{reality_clause}"
             ),
-            params![memory_id],
+            params![memory_id, body_hash],
             |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .optional()?

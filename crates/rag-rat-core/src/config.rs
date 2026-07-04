@@ -127,7 +127,7 @@ impl Default for DreamModelConfig {
         Self {
             enabled: false,
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen3-4b-instruct-2507".to_string(),
+            model: "qwen3:4b-instruct-2507".to_string(),
             request_timeout_s: 120,
         }
     }
@@ -3609,7 +3609,7 @@ mod tests {
         let default: DreamModelConfig = RawDreamModel::default().into();
         assert!(!default.enabled, "the model verdict pass is OFF by default");
         assert_eq!(default.endpoint, "http://localhost:11434");
-        assert_eq!(default.model, "qwen3-4b-instruct-2507");
+        assert_eq!(default.model, "qwen3:4b-instruct-2507");
         assert_eq!(default.request_timeout_s, 120);
 
         let raw: RawConfig = toml::from_str(
@@ -3638,7 +3638,7 @@ mod tests {
         .unwrap();
         let blank: DreamConfig = blank.dream.into();
         assert_eq!(blank.model.endpoint, "http://localhost:11434", "blank endpoint → default");
-        assert_eq!(blank.model.model, "qwen3-4b-instruct-2507", "blank model → default");
+        assert_eq!(blank.model.model, "qwen3:4b-instruct-2507", "blank model → default");
     }
 
     #[test]

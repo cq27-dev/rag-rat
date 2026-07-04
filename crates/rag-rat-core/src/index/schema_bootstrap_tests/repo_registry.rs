@@ -3126,6 +3126,14 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
         rusqlite::params![crate::index::clones::NORM_VERSION, LEGACY_REPO_ID],
     )
     .unwrap();
+    // A V045 dream-v2 verification sibling — repo_id-scoped from birth. Adoption must re-point it
+    // like the rest of the A5 periphery set (it is NOT part of V042; the sibling landed later).
+    conn.execute(
+        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, checked_at_ms)
+         VALUES ('m1', ?1, 'bh', 'current', 0)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
 
     // Roll the ledger back to the pre-A-phase tip and forward-migrate the WHOLE A-phase ladder.
     truncate_schema_to(&conn, 37);
@@ -3158,6 +3166,7 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
         ("repo_memories", "id = 'm1'"),
         ("oracle_runs", "tool = 'scip'"),
         ("clone_graph_generations", "generation = 1"),
+        ("memory_reality", "memory_id = 'm1'"),
     ] {
         assert_eq!(
             placeholder_count(&format!(
@@ -3195,5 +3204,10 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
         real_repo("SELECT repo_id FROM clone_graph_generations WHERE generation = 1"),
         "repo-real",
         "adoption re-points A5's clone generation"
+    );
+    assert_eq!(
+        real_repo("SELECT repo_id FROM memory_reality WHERE memory_id = 'm1'"),
+        "repo-real",
+        "adoption re-points the V045 memory_reality verification sibling"
     );
 }

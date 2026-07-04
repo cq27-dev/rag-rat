@@ -336,19 +336,54 @@ fn parse_verdict(output: &str) -> Option<ParsedVerdict> {
     Some(ParsedVerdict { verdict: verdict?, direction, evidence })
 }
 
-/// The fabrication guard: EVERY EVIDENCE line must appear in the rendered pack
-/// (whitespace-normalized substring), and there must be at least one — an empty-evidence verdict is
-/// rejected too, so the model can't skip citing. `pack_text` is the exact string rendered into the
-/// prompt.
+/// Minimum normalized (non-whitespace) length for a citation to count — a floor that keeps a bare
+/// boilerplate token (`- source`, `verdict`, `note`) from satisfying the guard by matching a
+/// content-line substring. Set just below the shortest LEGITIMATE citation the corpus produces (a
+/// backticked identifier like `` `thing_two` `` = 11 chars); a higher floor would reject a real
+/// short-identifier citation, so the content-line filter — not this length — is the primary
+/// defense.
+const MIN_CITATION_CHARS: usize = 10;
+
+/// The fabrication guard: EVERY EVIDENCE line must appear in a pack CONTENT line
+/// (whitespace-normalized substring) — an identifier-table entry or a bound-file excerpt line, NOT
+/// a section header or boilerplate (see [`is_pack_content_line`]) — and be at least
+/// [`MIN_CITATION_CHARS`] non-whitespace chars long. There must also be at least one line: an
+/// empty-evidence verdict is rejected too, so the model can't skip citing. `pack_text` is the exact
+/// string rendered into the prompt. Matching only content lines (not the flattened whole pack) is
+/// what stops a citation of pack boilerplate — a header the guard itself emits — from passing.
 fn verdict_is_cited(pack_text: &str, parsed: &ParsedVerdict) -> bool {
     if parsed.evidence.is_empty() {
         return false;
     }
-    let pack_norm = normalize_ws(pack_text);
+    let content: Vec<String> =
+        pack_text.lines().filter(|line| is_pack_content_line(line)).map(normalize_ws).collect();
     parsed.evidence.iter().all(|line| {
         let cite = normalize_ws(line);
-        !cite.is_empty() && pack_norm.contains(&cite)
+        cite.chars().filter(|c| !c.is_whitespace()).count() >= MIN_CITATION_CHARS
+            && content.iter().any(|c| c.contains(&cite))
     })
+}
+
+/// Whether a rendered pack line is CITABLE CONTENT — an identifier-table entry (`` - `ident` -> …
+/// ``) or a bound-file excerpt line (`path:line: text`) — rather than a section header or
+/// boilerplate (`IDENTIFIERS (…):`, `BOUND-FILE EXCERPTS (…):`, `- (no identifiers extracted)`,
+/// `(no bound-file excerpts)`, or a `path:start-end` range header). The citation guard matches only
+/// these, so pack scaffolding can't satisfy a fabricated citation. Mirrors [`render_pack`]'s
+/// emitted shapes.
+fn is_pack_content_line(line: &str) -> bool {
+    let line = line.trim();
+    // Identifier-table entry: `- ` then a backtick span. The `- (no identifiers extracted)`
+    // boilerplate starts with `- (`, not a backtick, so it is excluded.
+    if let Some(rest) = line.strip_prefix("- ") {
+        return rest.starts_with('`');
+    }
+    // Bound-file excerpt line: a `path:<digits>: text` locator (the first `": "` is preceded by an
+    // ASCII digit). The `path:start-end` range headers use a dash and the section
+    // headers/boilerplate carry no such locator, so only real excerpt lines match.
+    match line.find(": ") {
+        Some(idx) => line[..idx].bytes().next_back().is_some_and(|b| b.is_ascii_digit()),
+        None => false,
+    }
 }
 
 /// Collapse every whitespace run (incl. newlines) to a single space and trim — so a citation that
@@ -578,6 +613,47 @@ mod tests {
         let empty =
             parse_verdict("VERDICT: current\nDIRECTION: unknown\nEVIDENCE:\nREASON: none").unwrap();
         assert!(!verdict_is_cited(pack, &empty), "an empty-evidence verdict is rejected too");
+    }
+
+    #[test]
+    fn citation_guard_rejects_header_and_boilerplate_fragments() {
+        // The rendered pack's section headers + boilerplate are NOT citable content: a verdict that
+        // cites one (even a long verbatim fragment lifted from the pack) is rejected, so the pack
+        // scaffolding the guard itself emits can't satisfy a fabricated citation. Only
+        // identifier-table entries and excerpt lines count.
+        let pack = render_pack(&EvidencePack {
+            memory_id: "m1".to_string(),
+            identifiers: vec![verify::IdentifierResolution {
+                identifier: "real_symbol".to_string(),
+                resolution: "symbol src/lib.rs::real_symbol".to_string(),
+            }],
+            excerpts: Vec::new(),
+        });
+        let cited = |frag: &str| ParsedVerdict {
+            verdict: Verdict::Current,
+            direction: Direction::Unknown,
+            evidence: vec![frag.to_string()],
+        };
+        assert!(
+            !verdict_is_cited(
+                &pack,
+                &cited("IDENTIFIERS (resolved against the whole source tree):")
+            ),
+            "the identifier section header is not citable content"
+        );
+        assert!(
+            !verdict_is_cited(&pack, &cited("BOUND-FILE EXCERPTS (current source):")),
+            "the excerpts section header is not citable content"
+        );
+        assert!(
+            !verdict_is_cited(&pack, &cited("source")),
+            "a bare boilerplate token is below the citation-length floor"
+        );
+        // The accept path stays green: a genuine identifier-table entry is still cited.
+        assert!(
+            verdict_is_cited(&pack, &cited("`real_symbol` -> symbol src/lib.rs::real_symbol")),
+            "a real identifier-table entry is still accepted"
+        );
     }
 
     #[test]

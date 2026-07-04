@@ -377,7 +377,7 @@ generative-model dependency. It is **out-of-process, opt-in, and gated by a dete
 [dream.model]
 enabled = false                     # off by default — the model turn is skipped
 endpoint = "http://localhost:11434" # OpenAI-compatible chat server (a local Ollama by default)
-model = "qwen3-4b-instruct-2507"    # server-side model name sent in the request body
+model = "qwen3:4b-instruct-2507"    # server-side model name sent in the request body
 request_timeout_s = 120             # per-request HTTP timeout (a 4B verdict on CPU is slow)
 ```
 

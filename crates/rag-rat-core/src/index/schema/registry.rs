@@ -50,10 +50,12 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
 ];
 
 /// The periphery tables that gain a `repo_id` column in the phase-A5 periphery-scoping migration
-/// (V042, `apply_repo_id_periphery_scoping`) and therefore also need their [`LEGACY_REPO_ID`]
-/// placeholder rows re-pointed at the real id when [`register_repo`] adopts a legacy DB — the A5
-/// continuation of the A1/A3 adoption contract. `repo_memory_fts` is the standalone FTS mirror of
-/// `repo_memories` (its `repo_id` snapshots the parent's at rebuild time), re-pointed alongside.
+/// (V042, `apply_repo_id_periphery_scoping`) — plus the V045 dream-v2 verification siblings
+/// (`memory_reality` / `memory_summaries`), repo_id-scoped from birth — and therefore also need
+/// their [`LEGACY_REPO_ID`] placeholder rows re-pointed at the real id when [`register_repo`]
+/// adopts a legacy DB — the A5 continuation of the A1/A3 adoption contract. `repo_memory_fts` is
+/// the standalone FTS mirror of `repo_memories` (its `repo_id` snapshots the parent's at rebuild
+/// time), re-pointed alongside.
 ///
 /// COLUMN GUARD: several of these tables predate V042 — they exist at earlier schema versions
 /// WITHOUT a `repo_id` column, which V042 adds or rebuilds in. `register_repo` runs on every open,
@@ -74,6 +76,11 @@ const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     "repo_memories",
     "repo_memory_bindings",
     "repo_memory_fts",
+    // V045 dream-v2 verification siblings — repo_id-scoped like `dream_findings`; a LocalOnly→
+    // Portable adoption must re-point their rows too. Guarded by `column_exists` in the re-point
+    // loop, so a pre-V045 partial-schema fixture (table/column absent) is a no-op.
+    "memory_reality",
+    "memory_summaries",
 ];
 
 /// The placeholder `repo_id` a freshly-migrated single-repo DB carries until it is adopted (see the

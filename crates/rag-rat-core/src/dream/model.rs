@@ -17,7 +17,7 @@ pub trait VerdictModel {
     /// the citation guard live in `verdict`, never here.
     fn complete(&self, prompt: &str) -> anyhow::Result<String>;
 
-    /// The model identifier stamped into `memory_reality.model_id` (e.g. `qwen3-4b-instruct-2507`),
+    /// The model identifier stamped into `memory_reality.model_id` (e.g. `qwen3:4b-instruct-2507`),
     /// so a verdict row records which model produced it.
     fn model_id(&self) -> &str;
 }

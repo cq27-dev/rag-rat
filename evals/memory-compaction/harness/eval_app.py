@@ -348,6 +348,10 @@ TITLE: {title}
 {body}"""
 
 # (item_id, expected_verdict, expected_direction_or_None, root)
+# The MODEL-verdict accuracy manifest: the 15 cases the shipped 2-way (current | diverged) prompt is
+# graded on. The two `unverifiable` synthetics are NOT here — they are decided deterministically in
+# pass 0 (verify.rs `unverifiable_findings`) and never reach the model, so they live in
+# PASS0_UNVERIFIABLE below, excluded from the model gate.
 VERIFY_MANIFEST = [
     ("real_16", "current", None, "/repo"), ("real_17", "current", None, "/repo"),
     ("real_20", "current", None, "/repo"), ("real_21", "current", None, "/repo"),
@@ -356,9 +360,16 @@ VERIFY_MANIFEST = [
     ("real_0", "diverged", "note_ahead", "/repo"), ("real_1", "diverged", "note_ahead", "/repo"),
     ("real_3", "diverged", "note_ahead", "/repo"), ("real_9", "diverged", "note_ahead", "/repo"),
     ("real_14", "diverged", "note_ahead", "/repo"),
-    ("syn_0", "unverifiable", None, "/repo"), ("syn_2", "unverifiable", None, "/repo"),
     ("real_22", "diverged", "code_ahead", "/repo-drift"),
     ("real_27", "diverged", "code_ahead", "/repo-drift"),
+]
+
+# Deterministic pass-0 cases: the fictional synthetics whose named modules resolve NOWHERE, decided
+# by verify.rs `unverifiable_findings` with no model. Kept for the historical agentic 3-way arm
+# (`verify_test`, which CAN emit `unverifiable`), but EXCLUDED from the shipped model-verdict gate —
+# the 2-way pack prompt never emits `unverifiable`, so scoring these against it is meaningless.
+PASS0_UNVERIFIABLE = [
+    ("syn_0", "unverifiable", None, "/repo"), ("syn_2", "unverifiable", None, "/repo"),
 ]
 
 
@@ -372,7 +383,9 @@ def verify_test():
     out = []
     for model, ck, _sp in V2_MODELS:
         for root in ["/repo", "/repo-drift"]:
-            rows = [r for r in VERIFY_MANIFEST if r[3] == root]
+            # The historical 3-way research arm covers the pass-0 unverifiable cases too (its prompt
+            # can emit `unverifiable`); the shipped 2-way pack gate below does not.
+            rows = [r for r in VERIFY_MANIFEST + PASS0_UNVERIFIABLE if r[3] == root]
             prompts = [VERIFY_PROMPT.format(
                 binding=bind_of.get(iid, "(no source binding — a conceptual note)"),
                 title=by_id[iid]["title"], body=by_id[iid]["body"])
@@ -391,16 +404,20 @@ def verify_test():
     (RESULTS / "verify-results.json").write_text(json.dumps(out, indent=1))
 
 
+# Mirrors the SHIPPED evidence-pack verdict prompt: dream/verdict.rs `VERDICT_PROMPT_HEAD` +
+# `render_verdict_prompt` tail (PROMPT_VERSION "verify-pack-v1"). It is a 2-way verdict (current |
+# diverged) — `unverifiable` is decided deterministically in pass 0 and NEVER asked of the model, so
+# it is absent here. RE-SYNC this string whenever PROMPT_VERSION bumps in dream/verdict.rs.
 VERIFY_PACK_PROMPT = """You are auditing a repo-intelligence memory NOTE against the repository as it exists RIGHT NOW. You are given a mechanically-generated EVIDENCE PACK from the current checkout: a whole-tree resolution of every identifier the note mentions (an identifier marked "NOT FOUND anywhere in the source tree" truly does not exist in the source — this is exhaustive, not a failed search), and the current text of the note's bound file. The note was written in the past: the code may have moved past it, or the note may describe in-flight work not present in this checkout, or they may agree.
 
 Output EXACTLY this format and nothing else:
-VERDICT: current | diverged | unverifiable
+VERDICT: current | diverged
 DIRECTION: code_ahead | note_ahead | unknown
 EVIDENCE:
-- <one pack line (or its path:line prefix) supporting the verdict>
+- <one line copied verbatim from the EVIDENCE PACK below that supports the verdict>
 REASON: <one sentence>
 
-Meanings: current = the note's load-bearing claims are visible in the pack as described. diverged = the pack clearly contradicts a load-bearing claim (code_ahead: code changed after the note; note_ahead: the note describes work this checkout does not contain yet — e.g. the mechanisms/functions the note says were ADDED are NOT FOUND). unverifiable = the files and identifiers the note names cannot be found at all. DIRECTION is "unknown" unless VERDICT is diverged and you can tell which side is newer.
+Meanings: current = the note's load-bearing claims are visible in the pack as described. diverged = the pack clearly contradicts a load-bearing claim. code_ahead = the code changed after the note was written. note_ahead = the note describes work this checkout does not contain yet — for example, the mechanisms or functions the note says were added are marked NOT FOUND WHILE the note's bound file DOES exist; that is diverged / note_ahead, NOT a reason to give up. DIRECTION is "unknown" unless VERDICT is diverged and you can tell which side is newer. Every EVIDENCE line must be copied verbatim from the EVIDENCE PACK below — never invent one.
 
 NOTE (anchored to {binding}):
 TITLE: {title}

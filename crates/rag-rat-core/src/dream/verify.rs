@@ -114,10 +114,11 @@ pub struct FileExcerpt {
 }
 
 /// Active memories that need (re)verification, ranked (broken anchors first) and capped at
-/// `budget`. A memory is enqueued when a binding anchor is stale/gone (the doctor predicate), it
-/// has no `memory_reality` row, its body changed (`body_hash`), or a bound file changed
-/// (`checked_inputs_hash`) — everything else is CHURN-SKIPPED, which is what makes running this a
-/// few times a day cheap. Repo-scoped: only the active repo's memories are considered.
+/// `budget`. A memory is enqueued when it has no `memory_reality` row, its body changed
+/// (`body_hash`), or a bound file changed (`checked_inputs_hash`); a stale/gone anchor (the doctor
+/// predicate) raises the RANK of such a memory to the top but does NOT by itself enqueue one whose
+/// stored verdict still matches — everything else is CHURN-SKIPPED, which is what makes running
+/// this a few times a day cheap. Repo-scoped: only the active repo's memories are considered.
 ///
 /// `now_ms` is reserved for the caller's verdict stamping (`memory_reality.checked_at_ms`);
 /// pass-0 selection is time-independent, so the queue itself does not read the clock.
@@ -165,8 +166,16 @@ pub fn verification_queue(
     Ok(queue)
 }
 
-/// Decide why (if at all) `memory_id` needs verification — the churn-skip gate. `None` means the
-/// stored `memory_reality` row still matches the current body AND bound-file inputs (skip).
+/// Decide why (if at all) `memory_id` needs verification — the churn-skip gate. The stored
+/// `memory_reality` comparators are consulted FIRST: a row whose `body_hash` AND
+/// `checked_inputs_hash` still match the current body + bound-file inputs skips (`None`) REGARDLESS
+/// of anchor status — the stored verdict stands, and a broken anchor is surfaced by `memory doctor`
+/// and the unverifiable/divergence findings, not by re-checking an unchanged note (else a
+/// broken-anchor memory would re-enqueue every run at the top rank and starve NeverChecked; a
+/// genuinely changed bound-file set changes `checked_inputs_hash` and re-enqueues via InputsChanged
+/// anyway). A memory that DOES need a first/re-check takes the top `AnchorBroken` rank when its
+/// anchor is broken, otherwise the specific churn reason (NeverChecked / BodyChanged /
+/// InputsChanged).
 fn queue_reason(
     conn: &Connection,
     memory_id: &str,
@@ -175,9 +184,6 @@ fn queue_reason(
     scope: &Option<String>,
     reality_clause: &str,
 ) -> rusqlite::Result<Option<VerificationReason>> {
-    if broken.contains(memory_id) {
-        return Ok(Some(VerificationReason::AnchorBroken));
-    }
     let stored: Option<(String, Option<String>)> = conn
         .query_row(
             &format!(
@@ -189,16 +195,29 @@ fn queue_reason(
         )
         .optional()?;
     let Some((stored_body_hash, stored_inputs_hash)) = stored else {
-        return Ok(Some(VerificationReason::NeverChecked));
+        // Never checked → needs a first check; a broken anchor takes the top rank.
+        return Ok(Some(if broken.contains(memory_id) {
+            VerificationReason::AnchorBroken
+        } else {
+            VerificationReason::NeverChecked
+        }));
     };
-    if stored_body_hash != crate::index::hex_sha256(body.as_bytes()) {
-        return Ok(Some(VerificationReason::BodyChanged));
-    }
+    let body_changed = stored_body_hash != crate::index::hex_sha256(body.as_bytes());
     let current_inputs = checked_inputs_hash(conn, memory_id, scope)?;
-    if stored_inputs_hash.as_deref() != Some(current_inputs.as_str()) {
-        return Ok(Some(VerificationReason::InputsChanged));
+    let inputs_changed = stored_inputs_hash.as_deref() != Some(current_inputs.as_str());
+    if !body_changed && !inputs_changed {
+        // Verified AND unchanged — churn-skip regardless of anchor status (the stored verdict
+        // stands; anchor breakage is surfaced elsewhere).
+        return Ok(None);
     }
-    Ok(None)
+    // A change since the last check → re-check. A broken anchor still takes the top rank.
+    Ok(Some(if broken.contains(memory_id) {
+        VerificationReason::AnchorBroken
+    } else if body_changed {
+        VerificationReason::BodyChanged
+    } else {
+        VerificationReason::InputsChanged
+    }))
 }
 
 /// sha256 over the sorted, de-duplicated current sha256s of the memory's bound files (through the
@@ -601,6 +620,46 @@ mod tests {
         .unwrap();
         let q = verification_queue(&c, 2000, 10).unwrap();
         assert!(q.is_empty(), "a verified + unchanged memory is churn-skipped: {q:?}");
+    }
+
+    #[test]
+    fn queue_skips_a_broken_anchor_with_matching_hashes_so_it_never_starves_never_checked() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        // m1: a GONE binding (broken anchor) BUT a stored reality row whose body_hash + inputs
+        // still match — the verdict stands, so it must churn-skip REGARDLESS of the broken anchor.
+        // The pre-fix bug re-enqueued a broken anchor every run at the top AnchorBroken rank,
+        // starving the never-checked memories below it. Anchor breakage is surfaced by `memory
+        // doctor` and the unverifiable/divergence findings, not by re-checking an unchanged note.
+        seed_memory(&c, "m1", "t", "a plain note", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, anchor_status, \
+             created_at_ms, repo_id) VALUES ('m1','symbol','foo','gone',0,'r')",
+            [],
+        )
+        .unwrap();
+        let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_inputs_hash, \
+             checked_at_ms) VALUES ('m1','r',?1,?2,1000)",
+            rusqlite::params![body_hash("a plain note"), inputs],
+        )
+        .unwrap();
+        // Two never-checked memories that must still get slots.
+        seed_memory(&c, "m2", "t", "never checked one", "r");
+        seed_memory(&c, "m3", "t", "never checked two", "r");
+
+        let q = verification_queue(&c, 1000, 10).unwrap();
+        let ids: Vec<&str> = q.iter().map(|e| e.memory_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"m1"),
+            "the unchanged broken-anchor memory is churn-skipped, not re-enqueued: {q:?}"
+        );
+        assert_eq!(ids, vec!["m2", "m3"], "the never-checked memories get slots (not starved)");
+        assert!(
+            q.iter().all(|e| e.reason == VerificationReason::NeverChecked),
+            "only never-checked reasons remain in the queue: {q:?}"
+        );
     }
 
     #[test]

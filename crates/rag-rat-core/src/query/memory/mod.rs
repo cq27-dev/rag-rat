@@ -579,11 +579,13 @@ mod tests {
         .unwrap();
     }
 
-    fn seed_reality(c: &Connection, id: &str, verdict: &str, commit: Option<&str>) {
+    fn seed_reality(c: &Connection, id: &str, body: &str, verdict: &str, commit: Option<&str>) {
+        // Key the reality row on the memory's TRUE body_hash — the hydrator gates the verdict
+        // marker on `body_hash` (like the summary), so a mismatched hash would silently drop it.
         c.execute(
             "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
-             checked_against_commit, checked_at_ms) VALUES (?1,'r','bh',?2,?3,0)",
-            params![id, verdict, commit],
+             checked_against_commit, checked_at_ms) VALUES (?1,'r',?2,?3,?4,0)",
+            params![id, crate::index::hex_sha256(body.as_bytes()), verdict, commit],
         )
         .unwrap();
     }
@@ -607,7 +609,7 @@ mod tests {
             body,
             "A compacted three-sentence summary. It preserves polarity. Done.",
         );
-        seed_reality(&c, "m1", "diverged", None);
+        seed_reality(&c, "m1", body, "diverged", None);
 
         let compact =
             evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
@@ -656,11 +658,27 @@ mod tests {
     }
 
     #[test]
+    fn verdict_marker_misses_a_stale_verdict_after_a_body_edit() {
+        let c = summary_conn();
+        // A verdict exists, but for the OLD body — the current body_hash differs, so the verdict
+        // read misses and the header carries no marker. Symmetric to the stale-summary case: a body
+        // edit self-invalidates the verdict just like the summary, so a just-edited memory never
+        // renders the PRIOR body's verdict.
+        seed_reality(&c, "m1", "old body", "diverged", None);
+        let compact =
+            evidence(vec![memory_with_body("m1", "new body")]).compact_summary_first(&c).unwrap();
+        assert_eq!(
+            compact.direct[0].verdict, None,
+            "a verdict keyed on a stale body_hash is not surfaced after a body edit"
+        );
+    }
+
+    #[test]
     fn verdict_marker_current_carries_the_short_commit() {
         let c = summary_conn();
         let body = "b";
         seed_summary(&c, "m1", body, "One sentence summary here. Two now. Three done.");
-        seed_reality(&c, "m1", "current", Some("abcdef0123456789"));
+        seed_reality(&c, "m1", body, "current", Some("abcdef0123456789"));
         let compact =
             evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
         assert_eq!(

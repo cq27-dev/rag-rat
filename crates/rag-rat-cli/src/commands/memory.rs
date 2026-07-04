@@ -22,6 +22,12 @@ use crate::render::print_output;
 pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // `dream` WRITES dream_findings — serialize with the watcher/index like every other write
     // command (index/maintenance/oracle); WriteLock is reentrant so the open-time migrate is safe.
+    //
+    // ACCEPTED v1 POSTURE: with the model enabled, the verdict/compact passes run their whole
+    // budget (minutes of out-of-process network I/O) while HOLDING this lock, so the watcher and
+    // indexer block for the run's duration. That is acceptable because `dream --verify/--compact`
+    // is an EXPLICIT, human-invoked batch command run at most a few times a day — not a hot path.
+    // A finer-grained lock (release during model I/O) is deferred until that cadence proves wrong.
     let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
     let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     let db = open_index(config)?;
@@ -39,6 +45,16 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // (out-of-process) and borrowed by whichever passes are active; with the model disabled, both
     // are `None` and the run stays 100% deterministic.
     let model_enabled = config.dream.model.enabled;
+    // A model-pass flag with the model disabled would otherwise run silently as a
+    // deterministic-only pass; name the config key so the operator knows why no
+    // verdicts/summaries were written.
+    if (args.verify || args.compact) && !model_enabled {
+        eprintln!(
+            "note: --verify/--compact was requested but [dream.model] enabled = false — running \
+             the deterministic passes only; set [dream.model] enabled = true to run the model \
+             verdict/compaction pass."
+        );
+    }
     let budget = args.max_memories.unwrap_or(20) as usize;
     let model = (model_enabled && (args.verify || args.compact))
         .then(|| rag_rat_core::dream::HttpVerdictModel::from_config(&config.dream.model));
