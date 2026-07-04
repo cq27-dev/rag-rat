@@ -1399,13 +1399,13 @@ impl From<RawSearch> for SearchConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawDream {
     #[serde(default)]
     model: RawDreamModel,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawDreamModel {
     enabled: Option<bool>,
     endpoint: Option<String>,
@@ -1419,7 +1419,7 @@ impl From<RawDream> for DreamConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawMemory {
     surface: Option<String>,
 }

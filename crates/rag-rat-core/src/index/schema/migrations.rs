@@ -1180,6 +1180,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_043_ID => Some(43),
             MIGRATION_044_ID => Some(44),
             MIGRATION_045_ID => Some(45),
+            MIGRATION_046_ID => Some(46),
             _ => None,
         })
         .max()
@@ -1234,6 +1235,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_043_ID
             | MIGRATION_044_ID
             | MIGRATION_045_ID
+            | MIGRATION_046_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1285,6 +1287,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_043_ID => migration.checksum != MIGRATION_043_CHECKSUM,
         MIGRATION_044_ID => migration.checksum != MIGRATION_044_CHECKSUM,
         MIGRATION_045_ID => migration.checksum != MIGRATION_045_CHECKSUM,
+        MIGRATION_046_ID => migration.checksum != MIGRATION_046_CHECKSUM,
         _ => false,
     }
 }
