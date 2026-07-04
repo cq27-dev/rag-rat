@@ -151,7 +151,7 @@ fn obtain_summary(
 }
 
 /// Drop a leading `<think>…</think>` reasoning block a thinking model may prepend (the default
-/// `qwen3:4b-instruct-2507` does not think, but an operator may point `[dream.model]` at one that
+/// `qwen3:4b-instruct` does not think, but an operator may point `[dream.model]` at one that
 /// does), then trim — mirrors the eval harness's `strip_think`. Everything after the LAST
 /// `</think>` is the summary.
 fn strip_think(raw: &str) -> &str {
