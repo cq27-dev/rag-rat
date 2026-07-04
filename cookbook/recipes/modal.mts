@@ -44,10 +44,11 @@ import {
   log,
   raceWithTimeout,
   runRecipe,
+  verifyChat,
   verifyEmbed,
   withBudget,
 } from "../src/contract.js";
-import { selectBackendSpec } from "./backends.mjs";
+import { assertCapabilitySupported, selectBackendSpec } from "./backends.mjs";
 
 /** Provider-side max-lifetime backstop in ms — a leaked box self-destructs after this. */
 const BOX_MAX_LIFETIME_MS = 1_800_000; // 30 minutes
@@ -68,6 +69,10 @@ const TEARDOWN_TIMEOUT_MS = 8_000;
 async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sandbox>> {
   const { input, provisionTimeoutMs } = ctx;
   const spec = selectBackendSpec(input.backend ?? "ollama");
+  // What the box should SERVE (embeddings vs chat). Absent → embed (back-compat). Fail loudly NOW,
+  // before any box is created, if this backend can't serve it (infinity + chat).
+  const capability = input.capability ?? "embed";
+  assertCapabilitySupported(spec, capability);
   const port = spec.port;
   // ONE deadline for the WHOLE sequence (create + pull + verify). EVERY SDK await below — none of
   // which has a native timeout — is raced against the time REMAINING until this deadline via
@@ -161,16 +166,19 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   const endpoint = tunnel.url;
   log("info", `tunnel up: ${endpoint}`);
 
-  // Verify the server actually embeds before we emit `ready`. This catches a box that booted but
+  // Verify the server actually serves before we emit `ready`. This catches a box that booted but
   // isn't serving (the whole point of waiting before the ready event). Budget = the time REMAINING
-  // until the shared deadline (create + pull already consumed some); throws if it's spent.
-  ctx.status("verifying", `probing ${spec.embedPath} for a real vector`);
-  await verifyEmbed(endpoint, {
-    model: input.model,
-    embedPath: spec.embedPath,
-    budgetMs: assertBudgetRemaining(deadline, "embed verification"),
-  });
-  log("info", "embed verification passed; box is serving");
+  // until the shared deadline (create + pull already consumed some); throws if it's spent. The probe
+  // matches the capability: a chat box gets a chat-completions ping, an embed box an embeddings one.
+  const servePath = spec.servePath(capability);
+  ctx.status("verifying", `probing ${servePath} for a real ${capability === "chat" ? "completion" : "vector"}`);
+  const verifyBudgetMs = assertBudgetRemaining(deadline, `${capability} verification`);
+  if (capability === "chat") {
+    await verifyChat(endpoint, { model: input.model, chatPath: servePath, budgetMs: verifyBudgetMs });
+  } else {
+    await verifyEmbed(endpoint, { model: input.model, embedPath: servePath, budgetMs: verifyBudgetMs });
+  }
+  log("info", `${capability} verification passed; box is serving`);
 
   // Open tunnel via encryptedPorts → no per-request token needed. auth_token stays null.
   return { handle: sb, endpoint, auth_token: null };

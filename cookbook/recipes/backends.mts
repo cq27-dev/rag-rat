@@ -6,7 +6,12 @@
  * the embeddings route, and how the model gets loaded — so one provider recipe serves all backends.
  *
  * All three speak the OpenAI-compatible embeddings API, so the embed CALL and {@link verifyEmbed}
- * are backend-independent; only the ROUTE differs (`embedPath`) — see the per-backend note on it.
+ * are backend-independent; only the ROUTE differs (`servePath("embed")`) — see the per-backend note.
+ *
+ * A spec is also CAPABILITY-aware (`embed` vs `chat`): ollama and vLLM serve both — vLLM drops its
+ * `--runner pooling` flag and answers `/v1/chat/completions` for chat — while infinity is embed-only
+ * ({@link assertCapabilitySupported} rejects infinity + chat before a box is created). Chat is the
+ * dream verdict/compaction model; the chat CALL and {@link verifyChat} are likewise backend-independent.
  *
  * Launch facts (verified against upstream docs/live probes, 2026-07):
  *   - ollama    `ollama/ollama:latest`         entrypoint `/bin/ollama`  → `serve` (empty server;
@@ -20,7 +25,7 @@
  *               `/v1/embeddings`; port 8000; GPU-REQUIRED (no official CPU image).
  */
 
-import type { Backend, CookbookInput } from "../src/contract.js";
+import type { Backend, Capability, CookbookInput } from "../src/contract.js";
 
 /** The declarative, provider-independent description of one embedding backend. */
 export interface BackendServerSpec {
@@ -32,11 +37,11 @@ export interface BackendServerSpec {
    */
   readonly port: number;
   /**
-   * The OpenAI embeddings route this server answers on. MUST mirror `RemoteBackend::embed_path` on
-   * the Rust side (ollama/vLLM → `/v1/embeddings`; infinity → `/embeddings`) — the recipe's
-   * verification probe and rag-rat's real embed call have to hit the same URL.
+   * The capabilities this backend can serve — `embed`, `chat`, or both. ollama and vLLM serve both;
+   * infinity is embed-only. {@link assertCapabilitySupported} gates a request against this before a
+   * box is created, so an unsupported (backend, capability) pair fails loudly at provision time.
    */
-  readonly embedPath: string;
+  readonly capabilities: readonly Capability[];
   /**
    * Whether this backend needs a GPU. vLLM's published image is CUDA-only, so a provider MUST attach
    * a GPU for it (the recipe defaults one in when the caller didn't). ollama/infinity are
@@ -58,11 +63,20 @@ export interface BackendServerSpec {
   /**
    * The args to pass AFTER the image's baked entrypoint. A provider hands these to the box verbatim
    * (Modal as a `command` array, RunPod joined into `dockerArgs`). Never include the entrypoint
-   * itself — that's baked into the image.
+   * itself — that's baked into the image. Capability-aware via `input.capability` (default `embed`):
+   * vLLM includes `--runner pooling` (embedding mode) for `embed` and OMITS it for `chat` (the
+   * default generation runner). Absent/null capability → `embed`, so existing callers are unaffected.
    */
   entrypointArgs(input: CookbookInput): readonly string[];
   /** Container env as a plain record; a provider maps it to its own shape. */
   env(input: CookbookInput): Record<string, string>;
+  /**
+   * The OpenAI-compatible route this server answers on for `capability`. MUST mirror the Rust side:
+   * embed → `RemoteBackend::embed_path` (ollama/vLLM `/v1/embeddings`; infinity `/embeddings`); chat
+   * → `/v1/chat/completions` (ollama/vLLM). Throws for a capability the backend cannot serve
+   * (infinity + chat) — the readiness probe and rag-rat's real call have to hit the same URL.
+   */
+  servePath(capability: Capability): string;
 }
 
 /** ollama serves on 11434 and binds loopback by default (OLLAMA_HOST opens it to the tunnel). */
@@ -75,11 +89,14 @@ const VLLM_PORT = 8000;
 const OLLAMA_SPEC: BackendServerSpec = {
   backend: "ollama",
   port: OLLAMA_PORT,
-  embedPath: "/v1/embeddings",
+  // ollama serves both embeddings and chat from the same `serve` process; only the model differs.
+  capabilities: ["embed", "chat"],
   requiresGpu: false,
   modelLoad: "ollama-pull",
   image: () => "ollama/ollama:latest",
+  // `serve` boots an empty server regardless of capability; the model (embed or chat) is pulled after.
   entrypointArgs: () => ["serve"],
+  servePath: (capability) => (capability === "chat" ? "/v1/chat/completions" : "/v1/embeddings"),
   env: (input) => ({
     // ollama binds 127.0.0.1 by default, unreachable through a tunnel/proxy — open all interfaces.
     OLLAMA_HOST: `0.0.0.0:${OLLAMA_PORT}`,
@@ -95,9 +112,10 @@ const OLLAMA_SPEC: BackendServerSpec = {
 const INFINITY_SPEC: BackendServerSpec = {
   backend: "infinity",
   port: INFINITY_PORT,
-  // infinity's OpenAI shape lives at `/embeddings` (it also mounts `/v1/embeddings`, but `/embeddings`
-  // is canonical and is what `RemoteBackend::embed_path` uses).
-  embedPath: "/embeddings",
+  // Embed-only: infinity's `v2` server does embeddings/rerank/classify, NOT chat generation. A chat
+  // request for this backend is rejected (Rust config rejects it too, but the recipe must fail loudly
+  // rather than serve the wrong thing) — see `servePath`.
+  capabilities: ["embed"],
   requiresGpu: false,
   modelLoad: "in-launch",
   // CPU image unless a GPU was explicitly requested (infinity is CPU-capable; the CPU tag is slimmer).
@@ -108,21 +126,41 @@ const INFINITY_SPEC: BackendServerSpec = {
   // rag-rat's client-side fan-out tune still applies.
   entrypointArgs: (input) => ["v2", "--model-id", input.model, "--port", String(INFINITY_PORT)],
   env: () => ({}),
+  // infinity's OpenAI shape lives at `/embeddings` (it also mounts `/v1/embeddings`, but `/embeddings`
+  // is canonical and is what `RemoteBackend::embed_path` uses). Chat is unsupported → throw.
+  servePath: (capability) => {
+    if (capability !== "embed") {
+      throw new Error(
+        `backend "infinity" cannot serve capability "${capability}" — it is embeddings-only ` +
+          `(embeddings/rerank/classify, no chat generation).`,
+      );
+    }
+    return "/embeddings";
+  },
 };
 
 const VLLM_SPEC: BackendServerSpec = {
   backend: "vllm",
   port: VLLM_PORT,
-  embedPath: "/v1/embeddings",
+  // vLLM serves both: `--runner pooling` → embeddings; the default (generation) runner → chat.
+  capabilities: ["embed", "chat"],
   // vLLM's published image (`vllm/vllm-openai`) is CUDA-only — a provider must attach a GPU.
   requiresGpu: true,
   modelLoad: "in-launch",
   image: () => "vllm/vllm-openai:latest",
-  // Entrypoint is `vllm serve`, so the model id is the first positional. `--runner pooling` puts
-  // vLLM in embedding mode (current flag; the old `--task embed` is deprecated as of v0.11). vLLM
-  // binds loopback unless `--host 0.0.0.0` is passed — the classic "up but unreachable" trap.
+  // Entrypoint is `vllm serve`, so the model id is the first positional. vLLM binds loopback unless
+  // `--host 0.0.0.0` is passed — the classic "up but unreachable" trap. The RUNNER is capability-
+  // dependent: `--runner pooling` puts vLLM in embedding mode (current flag; the old `--task embed`
+  // is deprecated as of v0.11); for `chat` we OMIT it so vLLM uses its default GENERATION runner and
+  // serves `/v1/chat/completions`. Passing `--runner pooling` for chat would force embedding mode and
+  // 404 the chat route — the whole reason chat drops the flag.
   entrypointArgs: (input) => {
-    const args = [input.model, "--runner", "pooling", "--host", "0.0.0.0", "--port", String(VLLM_PORT)];
+    const capability = input.capability ?? "embed";
+    const args = [input.model];
+    if (capability === "embed") {
+      args.push("--runner", "pooling");
+    }
+    args.push("--host", "0.0.0.0", "--port", String(VLLM_PORT));
     // Map the concurrency cap to vLLM's max concurrent sequences when set.
     if (input.server_concurrency != null) {
       args.push("--max-num-seqs", String(input.server_concurrency));
@@ -130,6 +168,7 @@ const VLLM_SPEC: BackendServerSpec = {
     return args;
   },
   env: () => ({}),
+  servePath: (capability) => (capability === "chat" ? "/v1/chat/completions" : "/v1/embeddings"),
 };
 
 /** All backend specs, keyed by backend. The one lookup table {@link selectBackendSpec} resolves. */
@@ -142,4 +181,20 @@ const SPECS: Readonly<Record<Backend, BackendServerSpec>> = {
 /** Resolve the {@link BackendServerSpec} for `backend`. Total over the {@link Backend} union. */
 export function selectBackendSpec(backend: Backend): BackendServerSpec {
   return SPECS[backend];
+}
+
+/**
+ * Fail loudly if `spec.backend` cannot serve `capability` (today: infinity + chat). A provider
+ * recipe calls this at the TOP of `provision` — BEFORE it creates any box — so an unsupported pair
+ * aborts into `runRecipe`'s error path with a clear message instead of provisioning a box that would
+ * serve the wrong API (or 404 the probe). rag-rat's Rust config already rejects infinity-for-chat,
+ * but the recipe is the last line of defense and must not silently serve the wrong thing.
+ */
+export function assertCapabilitySupported(spec: BackendServerSpec, capability: Capability): void {
+  if (!spec.capabilities.includes(capability)) {
+    throw new Error(
+      `backend "${spec.backend}" cannot serve capability "${capability}" ` +
+        `(supported: ${spec.capabilities.join(", ")}).`,
+    );
+  }
 }

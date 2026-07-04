@@ -53,9 +53,10 @@ import {
   log,
   pollUntil,
   runRecipe,
+  verifyChat,
   verifyEmbed,
 } from "../src/contract.js";
-import { selectBackendSpec } from "./backends.mjs";
+import { assertCapabilitySupported, selectBackendSpec } from "./backends.mjs";
 
 /**
  * Default provisioning budget (boot + pull + first serving response) when input omits it. A GPU
@@ -102,6 +103,10 @@ interface DeployedPod {
 async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<PodHandle>> {
   const { input, provisionTimeoutMs } = ctx;
   const spec = selectBackendSpec(input.backend ?? "ollama");
+  // What the box should SERVE (embeddings vs chat). Absent → embed (back-compat). Fail loudly NOW,
+  // before any pod is deployed, if this backend can't serve it (infinity + chat).
+  const capability = input.capability ?? "embed";
+  assertCapabilitySupported(spec, capability);
   const port = spec.port;
   // ONE deadline for the WHOLE sequence (deploy + pull + verify). Each step below uses the budget
   // REMAINING until this deadline — never a fresh full budget — so the total stays inside the
@@ -180,15 +185,18 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
     log("info", `model "${input.model}" pulled`);
   }
 
-  // Confirm the server actually embeds before we emit `ready`. Budget = the REMAINING time after the
-  // pull, so deploy+pull+verify together stay inside the single provisioning budget.
-  ctx.status("verifying", `probing ${spec.embedPath} for a real vector`);
-  await verifyEmbed(endpoint, {
-    model: input.model,
-    embedPath: spec.embedPath,
-    budgetMs: assertBudgetRemaining(deadline, "embed verification"),
-  });
-  log("info", "embed verification passed; pod is serving");
+  // Confirm the server actually serves before we emit `ready`. Budget = the REMAINING time after the
+  // pull, so deploy+pull+verify together stay inside the single provisioning budget. The probe matches
+  // the capability: a chat box gets a chat-completions ping, an embed box an embeddings one.
+  const servePath = spec.servePath(capability);
+  ctx.status("verifying", `probing ${servePath} for a real ${capability === "chat" ? "completion" : "vector"}`);
+  const verifyBudgetMs = assertBudgetRemaining(deadline, `${capability} verification`);
+  if (capability === "chat") {
+    await verifyChat(endpoint, { model: input.model, chatPath: servePath, budgetMs: verifyBudgetMs });
+  } else {
+    await verifyEmbed(endpoint, { model: input.model, embedPath: servePath, budgetMs: verifyBudgetMs });
+  }
+  log("info", `${capability} verification passed; pod is serving`);
 
   // RunPod's HTTP proxy is open (no per-request token for proxied ports) → auth_token null.
   return { handle, endpoint, auth_token: null };

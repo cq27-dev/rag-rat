@@ -48,6 +48,24 @@ export function asBackend(value: string): Backend | undefined {
   return (BACKENDS as readonly string[]).includes(value) ? (value as Backend) : undefined;
 }
 
+/**
+ * What a provisioned box SERVES. Orthogonal to {@link Backend}: a backend may serve one or both.
+ *   - `embed` → the OpenAI embeddings API (`/v1/embeddings` or `/embeddings`); {@link verifyEmbed}
+ *     is the readiness probe. This is the historical, default capability.
+ *   - `chat` → the OpenAI chat-completions API (`/v1/chat/completions`); {@link verifyChat} is the
+ *     readiness probe. Used for the dream verdict/compaction model (see the remote-GPU plan).
+ * ollama and vLLM serve both; infinity is embed-only.
+ */
+export type Capability = "embed" | "chat";
+
+/** The capabilities a recipe understands, for input validation. Keep in sync with {@link Capability}. */
+export const CAPABILITIES: readonly Capability[] = ["embed", "chat"] as const;
+
+/** Narrows an arbitrary string to a known {@link Capability}, or `undefined` if unrecognized. */
+export function asCapability(value: string): Capability | undefined {
+  return (CAPABILITIES as readonly string[]).includes(value) ? (value as Capability) : undefined;
+}
+
 /** Provisioning lifecycle phases reported by a `status` event. */
 export type Phase = "provisioning" | "pulling" | "verifying" | "tearing_down";
 
@@ -97,6 +115,15 @@ export interface CookbookInput {
    * hand-run dev invocation). {@link readInput} validates it against {@link BACKENDS}.
    */
   readonly backend?: Backend | null;
+  /**
+   * What the box should SERVE: `"embed"` (OpenAI embeddings) or `"chat"` (OpenAI chat completions —
+   * the dream verdict/compaction model). Omitted/null → `"embed"` (back-compat: existing embedding
+   * callers predate this field and never send it). {@link readInput} validates it against
+   * {@link CAPABILITIES}. The backend spec branches on it — vLLM drops `--runner pooling` for chat,
+   * the route switches to `/v1/chat/completions`, and the readiness probe switches from
+   * {@link verifyEmbed} to {@link verifyChat}. `infinity` cannot serve `"chat"` (embed-only).
+   */
+  readonly capability?: Capability | null;
   /**
    * Ollama context window (`OLLAMA_CONTEXT_LENGTH`) to bake into the ephemeral box for the OLLAMA
    * backend, so chunk vectors match the freshness key that folds `num_ctx` in. Ignored by
@@ -257,6 +284,12 @@ export function readInput(): CookbookInput {
   // config beats a silent wrong-backend provision).
   const backend = optionalBackend(obj["backend"]);
 
+  // capability: optional; absent/null → "embed" (back-compat — existing embedding callers never send
+  // it). A present-but-unknown value is a hard error, mirroring `backend`: silently serving the wrong
+  // capability (embeddings when chat was intended, or vice versa) is exactly the wrong-provision
+  // footgun the strict validation exists to prevent.
+  const capability = optionalCapability(obj["capability"]);
+
   // gpu: optional; if present must be a string (provider spec) or null.
   const gpu = obj["gpu"];
   if (gpu !== undefined && gpu !== null && typeof gpu !== "string") {
@@ -266,6 +299,7 @@ export function readInput(): CookbookInput {
   const result: CookbookInput = {
     model: obj["model"],
     backend,
+    capability,
     ...(provisionTimeout !== undefined ? { provision_timeout_s: provisionTimeout } : {}),
     ...(requestTimeout !== undefined ? { request_timeout_s: requestTimeout } : {}),
     ...(typeof gpu === "string" ? { gpu } : gpu === null ? { gpu: null } : {}),
@@ -291,6 +325,27 @@ function optionalBackend(value: unknown): Backend {
     );
   }
   return backend;
+}
+
+/**
+ * Validate the optional `capability` field: absent/null → `"embed"` (the default — existing
+ * embedding callers predate the field); a known {@link Capability} string passes through; anything
+ * else is a hard error naming the accepted values (a typo beats a silent wrong-capability provision).
+ */
+function optionalCapability(value: unknown): Capability {
+  if (value === undefined || value === null) return "embed";
+  if (typeof value !== "string") {
+    throw new Error(
+      `${COOKBOOK_INPUT_ENV}.capability must be a string or null (got ${describe(value)}).`,
+    );
+  }
+  const capability = asCapability(value);
+  if (capability === undefined) {
+    throw new Error(
+      `${COOKBOOK_INPUT_ENV}.capability "${value}" is not a known capability (one of: ${CAPABILITIES.join(", ")}).`,
+    );
+  }
+  return capability;
 }
 
 /** Validates an optional positive-number field; returns the number, or undefined if absent/null. */
@@ -578,6 +633,90 @@ export function verifyEmbed(endpoint: string, options: VerifyEmbedOptions): Prom
       return {
         ready: false,
         reason: `200 OK but no embedding vector: ${JSON.stringify(body).slice(0, 200)}`,
+      };
+    },
+  });
+}
+
+/** Default delay between chat-readiness probes (ms). */
+const VERIFY_CHAT_POLL_INTERVAL_MS = 3_000;
+/**
+ * Default per-attempt timeout for a chat probe (ms). The first completion on a freshly-booted box
+ * can be slow (weights load into VRAM + first-token latency), so this is generous — but still well
+ * under any sane provisioning budget, so a genuinely stalled attempt aborts and retries.
+ */
+const VERIFY_CHAT_ATTEMPT_TIMEOUT_MS = 30_000;
+
+/** Options for {@link verifyChat}. */
+export interface VerifyChatOptions {
+  /** Chat model name to probe with (the value the server keys on). */
+  readonly model: string;
+  /**
+   * Backend-specific chat-completions route to probe, e.g. `/v1/chat/completions` (ollama/vLLM).
+   * MUST match the route the Rust chat client posts to — the probe and the real chat call have to
+   * hit the same URL, or a box that passes verification still 404s under load.
+   */
+  readonly chatPath: string;
+  /** Wall-clock budget in ms to keep retrying before giving up. Use the provisioning budget. */
+  readonly budgetMs: number;
+  /** Extra headers (e.g. an auth bearer) to send with each probe. Defaults to none. */
+  readonly headers?: Record<string, string>;
+  /** Delay between retries in ms. Defaults to {@link VERIFY_CHAT_POLL_INTERVAL_MS}. */
+  readonly pollIntervalMs?: number;
+  /** Per-attempt fetch timeout in ms. Defaults to {@link VERIFY_CHAT_ATTEMPT_TIMEOUT_MS}. */
+  readonly perAttemptTimeoutMs?: number;
+}
+
+/**
+ * Polls `<endpoint><options.chatPath>` with a tiny OpenAI-compatible chat-completions request until
+ * the server returns a well-formed completion, or the budget runs out — the chat parallel of
+ * {@link verifyEmbed}.
+ *
+ * Every chat recipe must call this BEFORE handing rag-rat the endpoint: a box can be reachable
+ * (tunnel up) while the model is still loading, so "box created" is not "box serving". The probe
+ * posts the SAME shape a chat client uses — a one-turn `messages` array with `max_tokens:1`,
+ * `temperature:0`, `stream:false` — so a server that can't actually generate fails HERE, at
+ * provision time, not later on the hot path. A well-formed `choices[0].message.content` (a string —
+ * a single token under `max_tokens:1`, possibly empty when truncated) is the readiness signal.
+ * Throws if the budget elapses with no completion.
+ */
+export function verifyChat(endpoint: string, options: VerifyChatOptions): Promise<void> {
+  const url = endpointPath(endpoint, options.chatPath);
+  return pollUntil<{ choices?: unknown }>(url, {
+    label: "chat probe",
+    budgetMs: options.budgetMs,
+    // The smallest possible generation: one user turn, a single deterministic token. Enough to prove
+    // the generation pipeline is live without paying for real output.
+    body: {
+      model: options.model,
+      messages: [{ role: "user", content: "ping" }],
+      max_tokens: 1,
+      temperature: 0,
+      stream: false,
+    },
+    pollIntervalMs: options.pollIntervalMs ?? VERIFY_CHAT_POLL_INTERVAL_MS,
+    perAttemptTimeoutMs: options.perAttemptTimeoutMs ?? VERIFY_CHAT_ATTEMPT_TIMEOUT_MS,
+    ...(options.headers !== undefined ? { headers: options.headers } : {}),
+    isReady: (body) => {
+      // OpenAI shape: {choices:[{message:{role,content}, finish_reason}, …]}. A well-formed first
+      // choice whose `message.content` is a STRING = the model generated (the content may be a single
+      // token, or an empty string when truncated at max_tokens:1 — either way the pipeline served).
+      const choices = body.choices;
+      const first = Array.isArray(choices) && choices.length > 0 ? choices[0] : undefined;
+      const message =
+        typeof first === "object" && first !== null
+          ? (first as { message?: unknown }).message
+          : undefined;
+      const content =
+        typeof message === "object" && message !== null
+          ? (message as { content?: unknown }).content
+          : undefined;
+      if (typeof content === "string") {
+        return { ready: true };
+      }
+      return {
+        ready: false,
+        reason: `200 OK but no chat completion: ${JSON.stringify(body).slice(0, 200)}`,
       };
     },
   });
