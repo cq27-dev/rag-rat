@@ -204,7 +204,11 @@ fn queue_reason(
 /// sha256 over the sorted, de-duplicated current sha256s of the memory's bound files (through the
 /// `files` view, so it is repo- and generation-scoped) — the cheap churn comparator that beats a
 /// commit-ancestry walk. An empty bound-file set hashes to a stable sentinel.
-fn checked_inputs_hash(
+///
+/// `pub(super)` so the phase-B verdict pass (`verdict`) recomputes it EXACTLY as the queue's
+/// comparator does when it stamps `memory_reality.checked_inputs_hash` — same function, so the next
+/// run churn-skips instead of re-checking.
+pub(super) fn checked_inputs_hash(
     conn: &Connection,
     memory_id: &str,
     scope: &Option<String>,
@@ -408,7 +412,8 @@ fn indexed_file_paths(conn: &Connection) -> rusqlite::Result<Vec<String>> {
 }
 
 /// Distinct, sorted, non-null binding paths for a memory (repo-scoped) — the memory's bound files.
-fn bound_file_paths(
+/// `pub(super)` so the verdict pass can label a note by its first bound path.
+pub(super) fn bound_file_paths(
     conn: &Connection,
     memory_id: &str,
     scope: &Option<String>,

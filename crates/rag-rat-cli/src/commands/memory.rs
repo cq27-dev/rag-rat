@@ -10,7 +10,12 @@ use crate::render::print_output;
 
 /// Dream-mode worklist (#122): run the deterministic memory-maintenance pass (coverage gaps +
 /// stale references), sync it into `dream_findings`, and render the open worklist. Writes ONLY to
-/// `dream_findings` — never mutates a memory.
+/// `dream_findings` / the derived `memory_reality` sibling — never mutates a `repo_memories` row.
+///
+/// `--verify` turns on the dream v2 verification pass: the deterministic `memory_unverifiable`
+/// findings always, and — when `[dream.model] enabled = true` — the out-of-process model verdict
+/// pass (writing `memory_reality` verdicts + `memory_divergence` findings). Without `--verify` the
+/// run is byte-identical to the v1 deterministic worklist.
 pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // `dream` WRITES dream_findings — serialize with the watcher/index like every other write
     // command (index/maintenance/oracle); WriteLock is reentrant so the open-time migrate is safe.
@@ -21,14 +26,25 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let report = db.dream_run(rag_rat_core::dream::DreamOptions {
+    let opts = rag_rat_core::dream::DreamOptions {
         now_ms,
         limit: args.limit.unwrap_or(20) as usize,
-        // The deterministic verification pass (dream v2 pass 0) is OFF here so plain `rag-rat
-        // dream` stays byte-identical to the v1 run; the `--verify` flag lands in a later
-        // phase.
-        verify: false,
-    })?;
+        verify: args.verify,
+    };
+    // The model verdict pass runs only when the operator both asked for `--verify` AND enabled the
+    // model in config — its first generative-model dependency stays strictly opt-in (#122). The
+    // model client is constructed here (out-of-process) and borrowed for the run; when disabled,
+    // `None` keeps the pass 100% deterministic.
+    let report = if args.verify && config.dream.model.enabled {
+        let model = rag_rat_core::dream::HttpVerdictModel::from_config(&config.dream.model);
+        let pass = rag_rat_core::dream::VerdictPass {
+            model: &model,
+            budget: args.max_memories.unwrap_or(20) as usize,
+        };
+        db.dream_run_with_verdict(opts, Some(pass))?
+    } else {
+        db.dream_run_with_verdict(opts, None)?
+    };
     print_output(&report)
 }
 

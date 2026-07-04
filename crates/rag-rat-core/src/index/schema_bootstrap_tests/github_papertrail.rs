@@ -312,6 +312,7 @@ fn parser_failures_report_paths() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        dream: Default::default(),
         log: Default::default(),
     };
 

@@ -366,3 +366,33 @@ maintenance --max-seconds 30` in the background so branch switches, merges, reba
 refresh the current worktree index and advance changed-first embedding reconciliation without
 blocking normal Git operations. Each maintenance pass also runs a worktree-safe `gc` that prunes
 index rows for commits no longer held by any live worktree (run `rag-rat gc` to prune on demand).
+
+## Dream verdict model (`[dream.model]`)
+
+`[dream.model]` configures the dream verify pass's **model verdict** — rag-rat's only
+generative-model dependency. It is **out-of-process, opt-in, and gated by a deterministic layer**:
+`rag-rat dream` stays 100% deterministic unless you pass `--verify` *and* enable the model here.
+
+```toml
+[dream.model]
+enabled = false                     # off by default — the model turn is skipped
+endpoint = "http://localhost:11434" # OpenAI-compatible chat server (a local Ollama by default)
+model = "qwen3-4b-instruct-2507"    # server-side model name sent in the request body
+request_timeout_s = 120             # per-request HTTP timeout (a 4B verdict on CPU is slow)
+```
+
+The client speaks the standard `/v1/chat/completions` route (temperature 0, no streaming), so any
+compatible server works (Ollama, vLLM, …). Run it with:
+
+```bash
+rag-rat dream --verify --max-memories 20
+```
+
+`--verify` always runs the **deterministic** verification findings (`memory_unverifiable`). When
+`enabled = true`, it additionally runs the model verdict pass: for each memory in a **churn-skip
+queue** (only memories whose body or bound files changed, or that were never checked — capped by
+`--max-memories`), it renders a mechanical evidence pack, asks the model for a `current | diverged`
+verdict (a fabricated citation is rejected, retried once, then discarded), and records the verdict in
+the derived `memory_reality` table. A `diverged` verdict opens a `memory_divergence` finding for the
+review flow. The model **proposes**; it never changes a memory's status. Leaving `enabled = false`
+skips the model turn entirely — no network calls, deterministic findings only.

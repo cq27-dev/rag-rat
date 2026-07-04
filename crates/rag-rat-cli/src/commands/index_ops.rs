@@ -487,6 +487,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            dream: Default::default(),
             log: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
@@ -565,6 +566,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            dream: Default::default(),
             log: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
@@ -641,6 +643,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            dream: Default::default(),
             log: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();
@@ -712,6 +715,7 @@ mod tests {
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
+            dream: Default::default(),
             log: Default::default(),
         };
         IndexDatabase::rebuild(&config).unwrap();

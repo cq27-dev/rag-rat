@@ -23,14 +23,21 @@
 //! dream's "never mutates a `repo_memories` row" invariant even as verification lands.
 
 mod findings;
+mod model;
+mod verdict;
 mod verify;
 
 // Curated crate-facing surface (mod.rs is the index, not the junk drawer): the migration
 // ladder and `register_repo` adoption re-derive persisted finding ids after re-stamping
 // `repo_id`.
 pub(crate) use findings::rederive_finding_ids;
+// The phase-B model verdict pass: the out-of-process verdict-model trait + its HTTP client
+// (the CLI builds one from `[dream.model]`) and the `VerdictPass` handle
+// `dream_run_with_verdict` consumes.
+pub use model::{HttpVerdictModel, VerdictModel};
 use rusqlite::Connection;
 use serde::Serialize;
+pub use verdict::VerdictPass;
 // Dream v2 pass-0 substrate: the churn-skip verification queue + the deterministic,
 // citation-checkable evidence pack. Public so the phase-B model verdict pass (and later the
 // CLI flags) consume a stable interface; the pass-0 `memory_unverifiable` decider stays
@@ -83,19 +90,25 @@ fn effective_rank(base_rank: f64, first_seen_at_ms: i64, now_ms: i64) -> f64 {
 /// worklist (ranked) + lifecycle counts. Writes ONLY to `dream_findings`; never touches memories.
 ///
 /// When [`DreamOptions::verify`] is set, ALSO emits the deterministic `memory_unverifiable`
-/// findings (dream v2 pass 0) through the same identity-keyed sync — off by default, so a plain run
-/// is byte-identical to v1. The model verdict pass (phase B) and compaction (phase C) are NOT here;
-/// this stays 100% deterministic.
+/// findings (dream v2 pass 0) AND the `memory_divergence` findings derived from the STORED
+/// `memory_reality` table (phase B) through the same identity-keyed sync — off by default, so a
+/// plain run is byte-identical to v1. This function does NOT run the model itself (it takes no
+/// model); the model verdict pass runs in [`dream_run_with_verdict`] and writes `memory_reality`
+/// BEFORE this reads it. With no model ever run, the `memory_reality` verdict rows are absent, so
+/// the divergence set is empty — a harmless no-op.
 pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<DreamReport> {
     let mut findings = findings::coverage_gap(conn, opts.limit)?;
     findings.extend(findings::stale_reference(conn)?);
-    // The verification pass emits over ALL active memories (a stable, rate-independent population,
-    // exactly like the other two kinds), so folding it into the identity-keyed sync gives correct
-    // resolve semantics — a memory that becomes verifiable again has its finding resolved. The
-    // budgeted/churn-skipped `verification_queue` is the SEPARATE substrate for phase B's expensive
-    // model verdict, not this cheap deterministic decision.
+    // The verification finding kinds emit over ALL active memories / ALL stored verdict rows
+    // (stable, rate-independent populations, exactly like the other two kinds), so folding them
+    // into the identity-keyed sync gives correct resolve semantics — a memory that becomes
+    // verifiable again, or whose stored verdict flips back to `current`, has its finding
+    // resolved. Deriving divergence from the STORED table (not this run's budget-capped fresh
+    // checks) is what keeps a merely churn-SKIPPED memory's finding from being wrongly
+    // resolved.
     if opts.verify {
         findings.extend(verify::unverifiable_findings(conn)?);
+        findings.extend(verdict::divergence_findings(conn)?);
     }
     let (opened, refreshed, superseded, resolved) = findings::sync(conn, &findings, opts.now_ms)?;
 
@@ -129,6 +142,28 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<Drea
             .then_with(|| a.subject.cmp(&b.subject))
     });
     Ok(DreamReport { findings: open, opened, refreshed, superseded, resolved })
+}
+
+/// [`dream_run`] plus the phase-B model verdict pass. When `verify` is set and a [`VerdictPass`] is
+/// supplied (the CLI builds one only when `[dream.model] enabled = true`), the model verdict pass
+/// runs FIRST — checking the budget-capped churn-skip queue and writing accepted verdicts into
+/// `memory_reality` — and THEN [`dream_run`] computes findings over the now-updated table (so a
+/// fresh `diverged` verdict opens a `memory_divergence` finding in the same run). `None` (model
+/// disabled) is exactly [`dream_run`]: pass 0 only, still 100% deterministic. Never writes a
+/// `repo_memories` column.
+pub fn dream_run_with_verdict(
+    conn: &Connection,
+    opts: DreamOptions,
+    verdict_pass: Option<VerdictPass<'_>>,
+) -> anyhow::Result<DreamReport> {
+    // Run the model verdict pass before the deterministic finding computation: it writes
+    // `memory_reality`, which `dream_run` then reads to derive `memory_divergence` findings.
+    if opts.verify
+        && let Some(pass) = verdict_pass
+    {
+        verdict::run_verdict_pass(conn, pass, opts.now_ms)?;
+    }
+    Ok(dream_run(conn, opts)?)
 }
 
 #[cfg(test)]

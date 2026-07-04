@@ -23,6 +23,7 @@ pub struct Config {
     pub version_check: VersionCheckConfig,
     pub oracle: OracleConfig,
     pub search: SearchConfig,
+    pub dream: DreamConfig,
     /// Optional `[index] repo_id` override for the consolidated global store — pins the repo's
     /// identity instead of deriving it from the root-commit hash. `None` = derive. Consumed by
     /// `crate::repo_identity::resolve_repo_identity`. An EXPLICIT `database` path never depends on
@@ -46,6 +47,46 @@ pub struct SearchConfig {
     /// A/B-swept on the commit-replay eval (`rag-rat eval --replay --rerank`); see
     /// [`crate::search::lexical::SearchOptions::graded_history`].
     pub graded_git_rerank: bool,
+}
+
+/// Dream-mode model verdict pass (`[dream]`). rag-rat's first generative-model dependency (#122),
+/// shaped by its constraints: out-of-process only, an explicit batch command, and a deterministic
+/// layer that gates the model. Default OFF, so `rag-rat dream` stays 100% deterministic unless the
+/// operator opts in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DreamConfig {
+    pub model: DreamModelConfig,
+}
+
+/// `[dream.model]` — the OpenAI-compatible chat endpoint the verdict pass calls (a local Ollama by
+/// default). The client speaks the standard `/v1/chat/completions` route, so any compatible server
+/// works. `enabled = false` by default: turning it on (together with `--verify`) is what enables
+/// the model verdict pass; the deterministic pass-0 findings never depend on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DreamModelConfig {
+    /// Run the model verdict pass at all (default false — opt in explicitly). When false, `rag-rat
+    /// dream --verify` still runs the deterministic pass-0 findings; only the model turn is
+    /// skipped.
+    pub enabled: bool,
+    /// Base URL of the OpenAI-compatible chat server (default a local Ollama). The verdict client
+    /// appends `/v1/chat/completions`.
+    pub endpoint: String,
+    /// The server-side model name sent in the chat request body.
+    pub model: String,
+    /// Per-request HTTP timeout, in seconds. A 4B verdict on CPU can take a while, so the default
+    /// is generous.
+    pub request_timeout_s: u64,
+}
+
+impl Default for DreamModelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "http://localhost:11434".to_string(),
+            model: "qwen3-4b-instruct-2507".to_string(),
+            request_timeout_s: 120,
+        }
+    }
 }
 
 /// Background auto-fresh oracle (`[oracle]`). Opt-in; default OFF. When `auto_run` is enabled, the
@@ -845,6 +886,7 @@ impl Config {
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();
         let search = raw.search.into();
+        let dream = raw.dream.into();
         let mut log = LogConfig::try_from(raw.log)?;
         // Finalize `dir`: empty (unset) → sibling of the db (`<db_parent>/logs`); a set value is
         // resolved relative to the GOVERNING config dir (absolute honored).
@@ -865,6 +907,7 @@ impl Config {
             version_check,
             oracle,
             search,
+            dream,
             log,
             repo_id_override,
             database_key_pinned,
@@ -1194,6 +1237,8 @@ struct RawConfig {
     #[serde(default)]
     search: RawSearch,
     #[serde(default)]
+    dream: RawDream,
+    #[serde(default)]
     target_bindings: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "target")]
     target: Vec<RawTarget>,
@@ -1302,6 +1347,48 @@ impl From<RawSearch> for SearchConfig {
             graded_git_rerank: raw
                 .graded_git_rerank
                 .unwrap_or(SearchConfig::default().graded_git_rerank),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDream {
+    #[serde(default)]
+    model: RawDreamModel,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDreamModel {
+    enabled: Option<bool>,
+    endpoint: Option<String>,
+    model: Option<String>,
+    request_timeout_s: Option<u64>,
+}
+
+impl From<RawDream> for DreamConfig {
+    fn from(raw: RawDream) -> Self {
+        Self { model: raw.model.into() }
+    }
+}
+
+impl From<RawDreamModel> for DreamModelConfig {
+    fn from(raw: RawDreamModel) -> Self {
+        let d = DreamModelConfig::default();
+        // Trim + drop empty so a blank `endpoint = ""` / `model = ""` falls back to the default
+        // instead of producing an unusable URL/model name.
+        Self {
+            enabled: raw.enabled.unwrap_or(d.enabled),
+            endpoint: raw
+                .endpoint
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty())
+                .unwrap_or(d.endpoint),
+            model: raw
+                .model
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .unwrap_or(d.model),
+            request_timeout_s: raw.request_timeout_s.unwrap_or(d.request_timeout_s),
         }
     }
 }
@@ -3448,6 +3535,43 @@ mod tests {
                 .unwrap();
         let search: SearchConfig = raw.search.into();
         assert!(search.graded_git_rerank, "[search] graded_git_rerank = true opts in");
+    }
+
+    #[test]
+    fn dream_model_defaults_off_and_parses_overrides() {
+        let default: DreamModelConfig = RawDreamModel::default().into();
+        assert!(!default.enabled, "the model verdict pass is OFF by default");
+        assert_eq!(default.endpoint, "http://localhost:11434");
+        assert_eq!(default.model, "qwen3-4b-instruct-2507");
+        assert_eq!(default.request_timeout_s, 120);
+
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [dream.model]
+            enabled = true
+            endpoint = "http://ollama.local:11434"
+            model = "qwen3-8b-instruct"
+            request_timeout_s = 60
+            "#,
+        )
+        .unwrap();
+        let dream: DreamConfig = raw.dream.into();
+        assert!(dream.model.enabled, "[dream.model] enabled = true opts in");
+        assert_eq!(dream.model.endpoint, "http://ollama.local:11434");
+        assert_eq!(dream.model.model, "qwen3-8b-instruct");
+        assert_eq!(dream.model.request_timeout_s, 60);
+
+        // A blank endpoint/model falls back to the default rather than producing an unusable value.
+        let blank: RawConfig = toml::from_str(
+            "[index]\nroot = \".\"\n\n[dream.model]\nendpoint = \"\"\nmodel = \"  \"\n",
+        )
+        .unwrap();
+        let blank: DreamConfig = blank.dream.into();
+        assert_eq!(blank.model.endpoint, "http://localhost:11434", "blank endpoint → default");
+        assert_eq!(blank.model.model, "qwen3-4b-instruct-2507", "blank model → default");
     }
 
     #[test]
