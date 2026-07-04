@@ -11,31 +11,26 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use rag_rat_core::Config;
 
-static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
+mod common;
 
 fn unique_temp_root() -> PathBuf {
-    let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("rag-rat-init-yes-{}-{id}", std::process::id()))
+    common::unique_dir("init-yes")
 }
 
 /// Initialize a git repo at `dir` WITH a first commit: an identity-bearing root, so the keyless
 /// config init writes resolves to the (sandboxed) GLOBAL store — an unborn HEAD is identity-less
-/// and stays on the per-root legacy path (covered by the config-level tests).
+/// and stays on the per-root legacy path (covered by the config-level tests). The commit goes
+/// through [`common::git_commit`], so its root-commit hash is deterministically unique and two
+/// fixtures never collide on `repo_id`.
 fn git_init(dir: &std::path::Path) {
-    for args in [
-        &["init", "-q"][..],
-        &["config", "user.email", "t@e.com"],
-        &["config", "user.name", "t"],
-        &["add", "-A"],
-        &["commit", "-qm", "seed"],
-    ] {
-        let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    }
+    common::git(dir, &["init", "-q"]);
+    common::git(dir, &["config", "user.email", "t@e.com"]);
+    common::git(dir, &["config", "user.name", "t"]);
+    common::git(dir, &["add", "-A"]);
+    common::git_commit(dir, &["-qm", "seed"]);
 }
 
 #[test]

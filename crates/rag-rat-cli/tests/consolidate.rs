@@ -11,24 +11,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static TEMP: AtomicU64 = AtomicU64::new(0);
+mod common;
 
-fn unique_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rag-rat-consolidate-{tag}-{}-{}",
-        std::process::id(),
-        TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    dir
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-}
+use common::{git, git_commit, unique_dir};
 
 /// A git fixture repo with one rust file and an EXPLICIT `database` key — the pre-flip `init`
 /// shape — so the initial index builds the LEGACY per-repo `.rag-rat/index.sqlite`.
@@ -46,7 +32,7 @@ fn fixture_repo() -> PathBuf {
     git(&root, &["config", "user.email", "t@e"]);
     git(&root, &["config", "user.name", "t"]);
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "-m", "seed"]);
+    git_commit(&root, &["-q", "-m", "seed"]);
     root
 }
 
@@ -161,7 +147,7 @@ fn consolidate_custom_pin_remedy_moves_then_imports() {
     git(&root, &["config", "user.email", "t@e"]);
     git(&root, &["config", "user.name", "t"]);
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "-m", "seed"]);
+    git_commit(&root, &["-q", "-m", "seed"]);
 
     let custom = root.join("custom/my-index.sqlite");
     let default_legacy = root.join(".rag-rat/index.sqlite");

@@ -11,26 +11,17 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rag_rat_core::language::Language;
 use rag_rat_core::{Config, IndexDatabase};
 
-static TEMP: AtomicU64 = AtomicU64::new(0);
+mod common;
 
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-}
+use common::{git, git_commit, unique_dir};
 
 #[test]
 fn worktree_overlay_ignores_inherited_git_dir_env() {
-    let base = std::env::temp_dir().join(format!(
-        "rag-rat-wtenv-{}-{}",
-        std::process::id(),
-        TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&base);
+    let base = unique_dir("wtenv");
     let main = base.join("main");
     fs::create_dir_all(main.join("src")).unwrap();
     fs::write(main.join("src/keep.rs"), "pub fn keep_fn() {}\n").unwrap();
@@ -47,7 +38,7 @@ fn worktree_overlay_ignores_inherited_git_dir_env() {
     git(&main, &["config", "user.email", "t@e.com"]);
     git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "."]);
-    git(&main, &["commit", "-q", "-m", "C1 has reinf"]);
+    git_commit(&main, &["-q", "-m", "C1 has reinf"]);
 
     // Linked worktree forked at C1 (HAS reinf.rs), nested + gitignored.
     let wt = main.join("wt");
@@ -56,7 +47,7 @@ fn worktree_overlay_ignores_inherited_git_dir_env() {
     // Main REMOVES reinf.rs at C2; the branch keeps it — so reinf.rs lives ONLY in the overlay.
     fs::remove_file(main.join("src/reinf.rs")).unwrap();
     git(&main, &["add", "."]);
-    git(&main, &["commit", "-q", "-m", "C2 removed reinf"]);
+    git_commit(&main, &["-q", "-m", "C2 removed reinf"]);
 
     let config_path = main.join("rag-rat.toml");
     let config = Config::load(&config_path).unwrap();
@@ -103,12 +94,7 @@ fn worktree_overlay_ignores_inherited_git_dir_env() {
 /// config BELONGS: main's `rag-rat.toml`, not the linked checkout's.
 #[test]
 fn default_config_discovery_reaches_the_main_worktree_from_a_linked_checkout() {
-    let base = std::env::temp_dir().join(format!(
-        "rag-rat-wtdisc-{}-{}",
-        std::process::id(),
-        TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&base);
+    let base = unique_dir("wtdisc");
     let main = base.join("main");
     fs::create_dir_all(main.join("src")).unwrap();
     fs::write(main.join("src/lib.rs"), "pub fn discovery_anchor() {}\n").unwrap();
@@ -116,7 +102,7 @@ fn default_config_discovery_reaches_the_main_worktree_from_a_linked_checkout() {
     git(&main, &["config", "user.email", "t@e.com"]);
     git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "."]);
-    git(&main, &["commit", "-q", "-m", "seed"]);
+    git_commit(&main, &["-q", "-m", "seed"]);
     let linked = base.join("wt");
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
 
