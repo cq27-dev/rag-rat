@@ -781,6 +781,33 @@ mod tests {
     }
 
     #[test]
+    fn model_work_pending_reflects_the_queues_and_flags() {
+        // The ephemeral zero-work guard: `verify` peeks the verification queue, `compact` the
+        // compaction queue; neither flag → never pending, so a paid GPU box is never cold-started
+        // for nothing.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let opts = crate::dream::DreamOptions { now_ms: 1, limit: 10, verify: true };
+        assert!(
+            !crate::dream::model_work_pending(&c, opts, 10, true, true).unwrap(),
+            "empty repo → no work"
+        );
+        seed_memory(&c, "m1", "t", "a note", "r");
+        assert!(
+            crate::dream::model_work_pending(&c, opts, 10, true, false).unwrap(),
+            "a never-checked memory is verify-pending"
+        );
+        assert!(
+            crate::dream::model_work_pending(&c, opts, 10, false, true).unwrap(),
+            "an un-summarized memory is compact-pending"
+        );
+        assert!(
+            !crate::dream::model_work_pending(&c, opts, 10, false, false).unwrap(),
+            "neither flag → never pending"
+        );
+    }
+
+    #[test]
     fn queue_enqueues_anchor_gone_and_skips_a_verified_unchanged_memory() {
         let c = mem_db();
         set_repo(&c, "r");

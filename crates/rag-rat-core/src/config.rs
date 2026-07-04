@@ -253,7 +253,7 @@ pub struct LlmConfig {
 ///
 /// Unlike embeddings, `remote` is NOT optional: dream has no in-process backend, so an absent
 /// `[llm.dream.remote]` block still resolves to a serving config — [`RemoteDreamConfig::default`],
-/// a connect to a local Ollama (today's `[dream.model]` default).
+/// a connect to a local Ollama (today's `[llm.dream.remote]` default).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DreamLlmConfig {
     /// Run the model pass at all (default false — opt in explicitly). When false, `rag-rat dream

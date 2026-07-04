@@ -76,6 +76,10 @@ pub struct HttpVerdictModel {
     chat_url: String,
     /// The server-side model name sent in the request body (`[llm.dream.remote] model`).
     model: String,
+    /// Bearer token sent as `Authorization: Bearer <token>` when present — the value of the
+    /// `[llm.dream.remote] auth_env` variable (connect mode) or the ephemeral box's tunnel token
+    /// (`from_provisioned`). `None` for a local server that needs no auth.
+    auth_token: Option<String>,
 }
 
 impl HttpVerdictModel {
@@ -83,8 +87,8 @@ impl HttpVerdictModel {
     /// and the chat route is appended; loopback endpoints bypass the ambient HTTP proxy (a local
     /// Ollama routed through a corporate proxy 403s), matching the embedder client. `endpoint` is
     /// optional on the config, so an absent value falls back to the local-Ollama default (the same
-    /// default `RemoteDreamConfig::default` carries). The ephemeral `from_provisioned` constructor
-    /// that points at a tunnel endpoint lands in a later task.
+    /// default `RemoteDreamConfig::default` carries). A configured `auth_env` names the environment
+    /// variable holding the bearer token, read once here.
     pub fn from_config(cfg: &RemoteDreamConfig) -> Self {
         let endpoint = cfg
             .endpoint
@@ -92,16 +96,53 @@ impl HttpVerdictModel {
             .unwrap_or("http://localhost:11434")
             .trim()
             .trim_end_matches('/');
+        let auth_token = cfg
+            .auth_env
+            .as_deref()
+            .and_then(|var| std::env::var(var).ok())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        Self::build(endpoint, cfg.model.trim(), auth_token, cfg.request_timeout_s)
+    }
+
+    /// Build the verdict client against an EPHEMERAL box just provisioned by the cookbook: the
+    /// tunnel `endpoint` + `auth_token` come from the `ready` handshake (NOT config), the model +
+    /// per-request timeout from `[llm.dream.remote]`. The box's tunnel is a public HTTPS URL (not
+    /// loopback), so the proxy bypass does not apply. Pair with [`provision_verdict_model`], which
+    /// keeps the `ProvisionedBox` alive for the model's lifetime.
+    pub fn from_provisioned(
+        endpoint: &str,
+        auth_token: Option<&str>,
+        model: &str,
+        request_timeout_s: u64,
+    ) -> Self {
+        let auth_token = auth_token.map(str::to_string).filter(|t| !t.is_empty());
+        Self::build(
+            endpoint.trim().trim_end_matches('/'),
+            model.trim(),
+            auth_token,
+            request_timeout_s,
+        )
+    }
+
+    /// Shared constructor for both modes: precompute the chat URL, build the `ureq` agent (loopback
+    /// proxy bypass), and store the bearer token.
+    fn build(
+        endpoint: &str,
+        model: &str,
+        auth_token: Option<String>,
+        request_timeout_s: u64,
+    ) -> Self {
         let chat_url = format!("{endpoint}/v1/chat/completions");
         let mut builder = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(cfg.request_timeout_s)))
+            .timeout_global(Some(Duration::from_secs(request_timeout_s)))
             .http_status_as_error(false)
             .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (dream-verdict)"));
         if endpoint_is_loopback(endpoint) {
             builder = builder.proxy(None);
         }
         let agent: ureq::Agent = builder.build().into();
-        Self { agent, chat_url, model: cfg.model.trim().to_string() }
+        Self { agent, chat_url, model: model.to_string(), auth_token }
     }
 }
 
@@ -123,10 +164,13 @@ impl VerdictModel for HttpVerdictModel {
         let body = serde_json::to_vec(&payload)
             .map_err(|e| anyhow::anyhow!("failed to serialize verdict request: {e}"))?;
 
-        let mut response =
-            self.agent.post(&self.chat_url).content_type("application/json").send(body).map_err(
-                |e| anyhow::anyhow!("verdict request to `{}` failed: {e}", self.chat_url),
-            )?;
+        let mut request = self.agent.post(&self.chat_url).content_type("application/json");
+        if let Some(token) = &self.auth_token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let mut response = request
+            .send(body)
+            .map_err(|e| anyhow::anyhow!("verdict request to `{}` failed: {e}", self.chat_url))?;
         let status = response.status();
         let raw = response
             .body_mut()
@@ -154,6 +198,46 @@ impl VerdictModel for HttpVerdictModel {
             .map(|c| c.message.content)
             .ok_or_else(|| anyhow::anyhow!("chat completion response carried no choices"))
     }
+}
+
+/// Provision an ephemeral cookbook box serving the dream CHAT model and build a verdict client
+/// against it, reusing the embedding path's provisioning driver + leak-safety wholesale (only the
+/// `capability` + backend differ). The returned [`ProvisionedBox`] MUST be kept alive for as long
+/// as the model is used — its `Drop` tears the box down. Ephemeral-only: the caller checks
+/// `remote.is_ephemeral()` (and the zero-work guard) BEFORE calling, so we never cold-start a paid
+/// box for nothing.
+pub fn provision_verdict_model(
+    remote: &RemoteDreamConfig,
+) -> anyhow::Result<(HttpVerdictModel, crate::index::ai::ProvisionedBox)> {
+    use crate::index::ai::{CookbookInput, CookbookProvisioner};
+
+    let cookbook = remote.cookbook.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("provision_verdict_model called on a non-ephemeral `[llm.dream.remote]`")
+    })?;
+    let input = CookbookInput {
+        model: remote.model.trim().to_string(),
+        backend: remote.backend.as_db_str(),
+        capability: "chat",
+        request_timeout_s: remote.request_timeout_s,
+        // Give the recipe a provisioning budget just under the Rust hard ceiling (backend-aware —
+        // vLLM's large image needs longer), so ITS budget expires first (clean provider teardown)
+        // before the Rust SIGKILL backstop fires. Mirrors the embedding `cookbook_input_for`.
+        provision_timeout_s: remote.backend.provision_timeout().as_secs().saturating_sub(20),
+        gpu: remote.gpu.clone(),
+        // Chat serving ignores these — num_ctx is an ollama-embedding knob, and the
+        // verdict/compaction passes call the model sequentially (one turn per memory), so a
+        // single server slot suffices.
+        num_ctx: None,
+        server_concurrency: 1,
+    };
+    let provisioned = CookbookProvisioner::provision(cookbook, &input)?;
+    let model = HttpVerdictModel::from_provisioned(
+        &provisioned.endpoint,
+        provisioned.auth_token.as_deref(),
+        remote.model.trim(),
+        remote.request_timeout_s,
+    );
+    Ok((model, provisioned))
 }
 
 fn response_excerpt(body: &str) -> String {

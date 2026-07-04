@@ -12,7 +12,7 @@ impl IndexDatabase {
     }
 
     /// [`Self::dream_run`] plus the phase-B model verdict pass and the phase-C model compaction
-    /// pass — the CLI supplies each `Some(pass)` only when `[dream.model] enabled = true` and the
+    /// pass — the CLI supplies each `Some(pass)` only when `[llm.dream] enabled = true` and the
     /// matching flag (`--verify` / `--compact`) is set; `None`/`None` is byte-identical to
     /// [`Self::dream_run`].
     pub fn dream_run_with_passes(
@@ -27,5 +27,25 @@ impl IndexDatabase {
             verdict_pass,
             compact_pass,
         )
+    }
+
+    /// Whether the model passes have pending work (the zero-work guard for ephemeral
+    /// `[llm.dream.remote]`): peek the verify/compact churn-skip queues without touching the model,
+    /// so the CLI skips cold-starting a paid GPU box when the queues are already drained. See
+    /// [`crate::dream::model_work_pending`].
+    pub fn dream_model_work_pending(
+        &self,
+        opts: DreamOptions,
+        budget: usize,
+        verify: bool,
+        compact: bool,
+    ) -> anyhow::Result<bool> {
+        Ok(crate::dream::model_work_pending(
+            self.storage.connection(),
+            opts,
+            budget,
+            verify,
+            compact,
+        )?)
     }
 }

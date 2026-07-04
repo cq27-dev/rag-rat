@@ -367,22 +367,44 @@ refresh the current worktree index and advance changed-first embedding reconcili
 blocking normal Git operations. Each maintenance pass also runs a worktree-safe `gc` that prunes
 index rows for commits no longer held by any live worktree (run `rag-rat gc` to prune on demand).
 
-## Dream verdict model (`[dream.model]`)
+## Dream verdict model (`[llm.dream]` / `[llm.dream.remote]`)
 
-`[dream.model]` configures the dream verify pass's **model verdict** — rag-rat's only
+`[llm.dream]` configures the dream verify/compaction passes' **model** — rag-rat's only
 generative-model dependency. It is **out-of-process, opt-in, and gated by a deterministic layer**:
-`rag-rat dream` stays 100% deterministic unless you pass `--verify` *and* enable the model here.
+`rag-rat dream` stays 100% deterministic unless you pass `--verify`/`--compact` *and* set
+`enabled = true`. The serving config lives under `[llm.dream.remote]`, mirroring
+`[llm.embedding.remote]` — a **connect** endpoint (an already-running chat server) or an
+**ephemeral** cookbook-provisioned GPU box.
 
 ```toml
-[dream.model]
-enabled = false                     # off by default — the model turn is skipped
-endpoint = "http://localhost:11434" # OpenAI-compatible chat server (a local Ollama by default)
-model = "qwen3:4b-instruct"    # server-side model name sent in the request body
-request_timeout_s = 300             # per-request HTTP timeout (CPU inference over a large evidence pack is slow)
+[llm.dream]
+enabled = false             # off by default — the model turn is skipped
+
+# CONNECT mode (default when [llm.dream.remote] is omitted): a local Ollama.
+[llm.dream.remote]
+backend  = "ollama"
+endpoint = "http://localhost:11434"     # OpenAI-compatible chat server
+model    = "qwen3:4b-instruct"          # server-side model name
+request_timeout_s = 300
 ```
 
-The client speaks the standard `/v1/chat/completions` route (temperature 0, no streaming), so any
-compatible server works (Ollama, vLLM, …). Run it with:
+For a dense evidence pack, CPU inference is pathologically slow (a large bound file can blow past the
+timeout and never verify). Run the model on an **ephemeral remote GPU** instead — the same cookbook
+mechanism embeddings use — by setting `cookbook` + `gpu` instead of `endpoint`:
+
+```toml
+[llm.dream.remote]
+backend  = "vllm"                       # ollama | vllm  (infinity is embed-only — rejected here)
+cookbook = "@rag-rat/cookbook modal"    # provision an ephemeral box (mutually exclusive with endpoint)
+gpu      = "A10G"                        # provider-specific GPU class (validated at provision time)
+model    = "Qwen/Qwen3-8B"              # HF id for vllm (an ollama name for the ollama backend)
+auth_env = "MODAL_TOKEN"                # optional: env var holding the box's bearer token
+request_timeout_s = 900
+```
+
+The box is provisioned only when there is pending work (a zero-work guard never cold-starts a paid
+GPU for a fully churn-skipped repo) and is torn down when the run ends. The client speaks the
+standard `/v1/chat/completions` route (temperature 0, no streaming). Run it with:
 
 ```bash
 rag-rat dream --verify --max-memories 20
@@ -397,7 +419,7 @@ the derived `memory_reality` table. A `diverged` verdict opens a `memory_diverge
 review flow. The model **proposes**; it never changes a memory's status. Leaving `enabled = false`
 skips the model turn entirely — no network calls, deterministic findings only.
 
-`--compact` (independent of `--verify`, and gated the same way on `[dream.model] enabled = true`)
+`--compact` (independent of `--verify`, and gated the same way on `[llm.dream] enabled = true`)
 runs the **compaction pass**, which rewrites each un-summarized memory into a 3–4 sentence,
 self-contained summary and stores it in the derived `memory_summaries` table:
 

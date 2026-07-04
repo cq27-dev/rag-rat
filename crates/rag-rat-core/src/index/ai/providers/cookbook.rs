@@ -134,11 +134,17 @@ pub struct CookbookInput {
     /// The server-side model name the box should serve (the `[remote] model`): an ollama model
     /// name for the ollama backend, or a HuggingFace model id for infinity/vLLM.
     pub model: String,
-    /// Which embedding backend the recipe should provision — the `RemoteBackend::as_db_str` of the
+    /// Which backend the recipe should provision — the `RemoteBackend::as_db_str` of the
     /// configured backend (`ollama`/`infinity`/`vllm`). Selects the recipe's image, launch
-    /// command, port, embeddings route, and model-load strategy; the embed WIRE CALL is
-    /// identical across all three (OpenAI `/v1/embeddings` shape).
+    /// command, port, serving route, and model-load strategy.
     pub backend: &'static str,
+    /// What the box should SERVE: `"embed"` (`/v1/embeddings`, the readiness probe posts an
+    /// embeddings request) or `"chat"` (`/v1/chat/completions`, generation — the dream verdict /
+    /// compaction model). The backend's launch args + readiness probe branch on this: `vllm` drops
+    /// its `--runner pooling` (embedding) flag for chat, and only chat-capable backends
+    /// (`ollama`/`vllm`) accept `"chat"` — config rejects `infinity` for chat before it reaches
+    /// here.
+    pub capability: &'static str,
     /// Per-REQUEST HTTP timeout the cookbook may forward to its box config — the
     /// `OpenAiEmbedder`'s per-request budget. UNRELATED to provisioning; do NOT use it as the
     /// boot budget.
@@ -518,6 +524,9 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
         // The selected backend routes the recipe's image/launch/port/route; the embed wire call is
         // identical across all three.
         backend: remote.backend.as_db_str(),
+        // Embedding path: serve the `/v1/embeddings` API (readiness probe posts an embeddings
+        // request). The dream path passes `"chat"`.
+        capability: "embed",
         request_timeout_s: remote.request_timeout_s,
         // Give the recipe a provisioning budget just under the Rust hard ceiling (backend-aware:
         // vLLM's large image needs longer), so ITS budget runs out first (clean provider-side
@@ -1213,12 +1222,32 @@ mod tests {
         CookbookInput {
             model: "all-minilm".to_string(),
             backend: "ollama",
+            capability: "embed",
             request_timeout_s: 30,
             provision_timeout_s: 280,
             gpu: None,
             num_ctx: None,
             server_concurrency: 32,
         }
+    }
+
+    #[test]
+    fn embedding_input_is_embed_capability_and_field_serializes() {
+        // The embedding config→input mapping pins `capability = "embed"`; the field must serialize
+        // into the recipe's JSON so a chat box (dream) is distinguishable from an embed box.
+        let remote = RemoteEmbeddingConfig {
+            model: "all-minilm".to_string(),
+            cookbook: Some("@rag-rat/cookbook modal".to_string()),
+            query_endpoint: Some(crate::config::DEFAULT_QUERY_ENDPOINT.to_string()),
+            ..RemoteEmbeddingConfig::default()
+        };
+        assert_eq!(cookbook_input_for(&remote).capability, "embed");
+        let mut chat = input();
+        chat.capability = "chat";
+        assert!(
+            serde_json::to_string(&chat).unwrap().contains("\"capability\":\"chat\""),
+            "capability serializes for the recipe"
+        );
     }
 
     #[test]

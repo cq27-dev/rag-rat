@@ -56,11 +56,36 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
         );
     }
     let budget = args.max_memories.unwrap_or(20) as usize;
-    let model = (model_enabled && (args.verify || args.compact))
-        .then(|| rag_rat_core::dream::HttpVerdictModel::from_config(&config.llm.dream.remote));
-    let verdict_pass = (args.verify && model_enabled)
+    let remote = &config.llm.dream.remote;
+    // Build the model client when a model pass is asked-for AND enabled. For an EPHEMERAL
+    // `[llm.dream.remote]` (cookbook set), provision a GPU box first — but a ZERO-WORK GUARD skips
+    // that entirely when the churn-skip queues are already drained, so an idle `dream --verify`
+    // never cold-starts a paid box. `_provisioned` holds the box for the whole run; its `Drop`
+    // tears it down after the passes finish. Connect mode (or the local-Ollama default) builds
+    // directly.
+    let mut _provisioned = None;
+    let model = if model_enabled && (args.verify || args.compact) {
+        if remote.is_ephemeral() {
+            if db.dream_model_work_pending(opts, budget, args.verify, args.compact)? {
+                let (m, provisioned) = rag_rat_core::dream::provision_verdict_model(remote)?;
+                _provisioned = Some(provisioned);
+                Some(m)
+            } else {
+                eprintln!(
+                    "note: no memories pending verification/compaction — skipping the ephemeral \
+                     `[llm.dream.remote]` GPU box for this run."
+                );
+                None
+            }
+        } else {
+            Some(rag_rat_core::dream::HttpVerdictModel::from_config(remote))
+        }
+    } else {
+        None
+    };
+    let verdict_pass = (args.verify && model.is_some())
         .then(|| rag_rat_core::dream::VerdictPass { model: model.as_ref().unwrap(), budget });
-    let compact_pass = (args.compact && model_enabled)
+    let compact_pass = (args.compact && model.is_some())
         .then(|| rag_rat_core::dream::CompactPass { model: model.as_ref().unwrap(), budget });
     let report = db.dream_run_with_passes(opts, verdict_pass, compact_pass)?;
     print_output(&report)

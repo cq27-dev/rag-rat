@@ -128,6 +128,13 @@ fn compaction_queue(conn: &Connection, budget: usize) -> rusqlite::Result<Vec<Co
     Ok(queue)
 }
 
+/// Whether the compaction queue has ANY pending memory (budget-capped) — the compaction half of the
+/// ephemeral zero-work guard ([`super::model_work_pending`]). Cheap: the same churn-skip query the
+/// pass runs, short-circuited to emptiness so a fully-summarized repo never cold-starts a paid box.
+pub(super) fn compaction_pending(conn: &Connection, budget: usize) -> rusqlite::Result<bool> {
+    Ok(!compaction_queue(conn, budget)?.is_empty())
+}
+
 /// Ask the model once, strip any think block, and run the deterministic acceptance guards. On a
 /// guard failure RETRY ONCE (same prompt); a second failure returns `Ok(None)` — store nothing (the
 /// title-only fallback). A model call error also yields `None` (this memory is skipped, re-queued
@@ -156,7 +163,7 @@ fn obtain_summary(
 }
 
 /// Drop a leading `<think>…</think>` reasoning block a thinking model may prepend (the default
-/// `qwen3:4b-instruct` does not think, but an operator may point `[dream.model]` at one that
+/// `qwen3:4b-instruct` does not think, but an operator may point `[llm.dream.remote]` at one that
 /// does), then trim — mirrors the eval harness's `strip_think`. Everything after the LAST
 /// `</think>` is the summary.
 fn strip_think(raw: &str) -> &str {
