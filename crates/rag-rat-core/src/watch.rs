@@ -827,9 +827,7 @@ mod tests {
     use notify::event::{CreateKind, ModifyKind};
 
     use super::*;
-    use crate::config::{
-        Config, EmbeddingConfig, LlmConfig, ResolvedTarget, TargetKind, WatchConfig,
-    };
+    use crate::config::{Config, LlmConfig, ResolvedTarget, TargetKind, WatchConfig};
     use crate::language::Language;
 
     fn mutation_event(path: PathBuf) -> Event {
@@ -853,12 +851,11 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: LlmConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig::default(),
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
-            dream: Default::default(),
             memory: Default::default(),
             log: Default::default(),
         }
@@ -879,12 +876,11 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: LlmConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig::default(),
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
-            dream: Default::default(),
             memory: Default::default(),
             log: Default::default(),
         };
@@ -980,12 +976,11 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: LlmConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig::default(),
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
-            dream: Default::default(),
             memory: Default::default(),
             log: Default::default(),
         };
@@ -1028,12 +1023,11 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: LlmConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig::default(),
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
-            dream: Default::default(),
             memory: Default::default(),
             log: Default::default(),
         };
@@ -1094,12 +1088,11 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: LlmConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig::default(),
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
-            dream: Default::default(),
             memory: Default::default(),
             log: Default::default(),
         };
@@ -1171,12 +1164,11 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: LlmConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig::default(),
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
-            dream: Default::default(),
             memory: Default::default(),
             log: Default::default(),
         };
@@ -1320,12 +1312,11 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: LlmConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig::default(),
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
-            dream: Default::default(),
             memory: Default::default(),
             log: Default::default(),
         };
@@ -1586,12 +1577,11 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: LlmConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig::default(),
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
             search: Default::default(),
-            dream: Default::default(),
             memory: Default::default(),
             log: Default::default(),
         };

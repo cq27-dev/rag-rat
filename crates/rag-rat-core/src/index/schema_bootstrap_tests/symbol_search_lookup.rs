@@ -538,7 +538,6 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
-        dream: Default::default(),
         memory: Default::default(),
         log: Default::default(),
     };
@@ -1324,7 +1323,6 @@ where
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
-        dream: Default::default(),
         memory: Default::default(),
         log: Default::default(),
     };

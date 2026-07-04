@@ -1103,7 +1103,6 @@ fn multi_language_clone_integration_finds_within_language_no_cross() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
-        dream: Default::default(),
         memory: Default::default(),
         log: Default::default(),
     };
@@ -1299,7 +1298,6 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
-        dream: Default::default(),
         memory: Default::default(),
         log: Default::default(),
     };

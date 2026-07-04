@@ -23,7 +23,6 @@ pub struct Config {
     pub version_check: VersionCheckConfig,
     pub oracle: OracleConfig,
     pub search: SearchConfig,
-    pub dream: DreamConfig,
     pub memory: MemoryConfig,
     /// Optional `[index] repo_id` override for the consolidated global store — pins the repo's
     /// identity instead of deriving it from the root-commit hash. `None` = derive. Consumed by
@@ -48,15 +47,6 @@ pub struct SearchConfig {
     /// A/B-swept on the commit-replay eval (`rag-rat eval --replay --rerank`); see
     /// [`crate::search::lexical::SearchOptions::graded_history`].
     pub graded_git_rerank: bool,
-}
-
-/// Dream-mode model verdict pass (`[dream]`). rag-rat's first generative-model dependency (#122),
-/// shaped by its constraints: out-of-process only, an explicit batch command, and a deterministic
-/// layer that gates the model. Default OFF, so `rag-rat dream` stays 100% deterministic unless the
-/// operator opts in.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DreamConfig {
-    pub model: DreamModelConfig,
 }
 
 /// Repo-memory surfacing (`[memory]`) — how drive-by memory attachments render. Default is `full`
@@ -98,37 +88,6 @@ impl MemorySurface {
             "full" => Some(Self::Full),
             "summary" => Some(Self::Summary),
             _ => None,
-        }
-    }
-}
-
-/// `[dream.model]` — the OpenAI-compatible chat endpoint the verdict pass calls (a local Ollama by
-/// default). The client speaks the standard `/v1/chat/completions` route, so any compatible server
-/// works. `enabled = false` by default: turning it on (together with `--verify`) is what enables
-/// the model verdict pass; the deterministic pass-0 findings never depend on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DreamModelConfig {
-    /// Run the model verdict pass at all (default false — opt in explicitly). When false, `rag-rat
-    /// dream --verify` still runs the deterministic pass-0 findings; only the model turn is
-    /// skipped.
-    pub enabled: bool,
-    /// Base URL of the OpenAI-compatible chat server (default a local Ollama). The verdict client
-    /// appends `/v1/chat/completions`.
-    pub endpoint: String,
-    /// The server-side model name sent in the chat request body.
-    pub model: String,
-    /// Per-request HTTP timeout, in seconds. A 4B verdict on CPU can take a while, so the default
-    /// is generous.
-    pub request_timeout_s: u64,
-}
-
-impl Default for DreamModelConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            endpoint: "http://localhost:11434".to_string(),
-            model: "qwen3:4b-instruct".to_string(),
-            request_timeout_s: 300,
         }
     }
 }
@@ -283,6 +242,26 @@ impl Default for LogConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LlmConfig {
     pub embedding: EmbeddingConfig,
+    pub dream: DreamLlmConfig,
+}
+
+/// Dream-mode model pass (`[llm.dream]`) — rag-rat's first generative-model dependency (#122),
+/// serving its verdict/compaction turns over an OpenAI-compatible chat endpoint. Mirrors
+/// [`EmbeddingConfig`]: an `enabled` gate plus a [`RemoteDreamConfig`] serving block (connect XOR
+/// ephemeral). Default OFF, so `rag-rat dream` stays 100% deterministic unless the operator opts
+/// in.
+///
+/// Unlike embeddings, `remote` is NOT optional: dream has no in-process backend, so an absent
+/// `[llm.dream.remote]` block still resolves to a serving config — [`RemoteDreamConfig::default`],
+/// a connect to a local Ollama (today's `[dream.model]` default).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DreamLlmConfig {
+    /// Run the model pass at all (default false — opt in explicitly). When false, `rag-rat dream
+    /// --verify` still runs the deterministic pass-0 findings; only the model turn is skipped.
+    pub enabled: bool,
+    /// Which chat server serves the dream turns (connect XOR ephemeral). Absent
+    /// `[llm.dream.remote]` → [`RemoteDreamConfig::default`] (a local-Ollama connect).
+    pub remote: RemoteDreamConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -450,6 +429,25 @@ impl RemoteBackend {
             RemoteBackend::Ollama | RemoteBackend::Vllm => "/v1/embeddings",
             RemoteBackend::Infinity => "/embeddings",
         }
+    }
+
+    /// Whether this backend can serve CHAT completions (the dream verdict/compaction turn). Ollama
+    /// (same image, pull a chat model) and vLLM (a generation runner, no `--runner pooling`) both
+    /// can; michaelfeil/infinity is embeddings/rerank/classify only, so a `[llm.dream.remote]`
+    /// block on `infinity` is a config error (`DreamBackendCannotServeChat`). Embeddings request
+    /// the `embed` capability; dream requests `chat`.
+    pub fn supports_chat(self) -> bool {
+        match self {
+            RemoteBackend::Ollama | RemoteBackend::Vllm => true,
+            RemoteBackend::Infinity => false,
+        }
+    }
+
+    /// The HTTP path (appended to the endpoint) of this backend's chat-completions route. Uniform
+    /// across chat-capable backends — ollama and vLLM both expose the OpenAI-standard
+    /// `/v1/chat/completions`; only the SERVING differs (see `supports_chat`), not the route.
+    pub fn chat_path(self) -> &'static str {
+        "/v1/chat/completions"
     }
 
     /// How long the ephemeral cookbook may take to provision + serve a box for this backend before
@@ -636,6 +634,82 @@ impl RemoteEmbeddingConfig {
     }
 
     /// EPHEMERAL mode: provision an on-demand box via `cookbook` for the bulk reconcile.
+    pub fn is_ephemeral(&self) -> bool {
+        self.cookbook.is_some()
+    }
+}
+
+/// Remote-serving config for the dream model pass (`[llm.dream.remote]`). The CHAT-flavored mirror
+/// of [`RemoteEmbeddingConfig`]: it hands the verdict/compaction turn to an OpenAI-compatible chat
+/// server (`POST /v1/chat/completions` on ollama/vLLM) instead of running a model in-process.
+///
+/// Chat is one-turn and budget-capped, so this carries NONE of the embedding block's batching knobs
+/// (`query_endpoint`, `num_ctx`, `batch_size`, `concurrency`, `max_batch_chars`) — only the serving
+/// selector plus a request timeout.
+///
+/// Like embeddings, the mode is INFERRED, not configured — EXACTLY ONE of `endpoint` / `cookbook`
+/// is set:
+/// - `endpoint` present → CONNECT: talk to an already-running chat server at that URL.
+/// - `cookbook` present → EPHEMERAL: the dream command provisions an on-demand box via the cookbook
+///   subprocess, runs the pass against it, then tears it down.
+///
+/// NOT `Serialize`/`Deserialize`: dream config does not round-trip through the index meta (unlike
+/// the embedder, which reconstructs itself from persisted config), matching the old
+/// `DreamModelConfig`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDreamConfig {
+    /// Which OpenAI-compatible server serves this block (`ollama` | `vllm`). `infinity` is
+    /// embed-only and rejected at parse time (`DreamBackendCannotServeChat`). Omitted → `Ollama`.
+    pub backend: RemoteBackend,
+    /// CONNECT: base URL of an already-running chat server (e.g. `"http://localhost:11434"`);
+    /// `/v1/chat/completions` is appended by the verdict client. Mutually exclusive with
+    /// `cookbook`.
+    pub endpoint: Option<String>,
+    /// EPHEMERAL: the cookbook recipe rag-rat spawns to provision an on-demand box — an npm
+    /// package spec (`"@rag-rat/cookbook modal"`, run via `npx -y`) or a recipe file path.
+    /// Mutually exclusive with `endpoint`.
+    pub cookbook: Option<String>,
+    /// The SERVER-side chat model sent in the request body — the server's own identifier, NOT a
+    /// rag-rat registry alias. For `backend = "ollama"` the ollama model name (e.g. `"qwen3:8b"`);
+    /// for vLLM the HuggingFace id the server was launched with (e.g. `"Qwen/Qwen3-4B-Instruct"`).
+    pub model: String,
+    /// EPHEMERAL-only: the GPU the cookbook recipe should provision. PROVIDER-specific and
+    /// validated by the provider at provision time, not here. Set together with a connect
+    /// `endpoint` it is a config error (`DreamRemoteGpuRequiresCookbook`).
+    pub gpu: Option<String>,
+    /// Name of the environment variable holding the bearer token, if the server needs auth. Local
+    /// Ollama needs none, so this is optional; the verdict client reads the var once at
+    /// construction.
+    pub auth_env: Option<String>,
+    /// Per-request HTTP timeout, in seconds. A dense evidence pack against a remote model can take
+    /// a while, so the default is generous.
+    pub request_timeout_s: u64,
+}
+
+impl Default for RemoteDreamConfig {
+    /// A local-Ollama CONNECT — byte-for-byte the pre-migration `[dream.model]` default, so an
+    /// absent `[llm.dream.remote]` block preserves today's behavior.
+    fn default() -> Self {
+        Self {
+            backend: RemoteBackend::Ollama,
+            endpoint: Some("http://localhost:11434".to_string()),
+            cookbook: None,
+            model: "qwen3:4b-instruct".to_string(),
+            gpu: None,
+            auth_env: None,
+            request_timeout_s: 300,
+        }
+    }
+}
+
+impl RemoteDreamConfig {
+    /// CONNECT mode: an already-running server at `endpoint`. Exactly one of connect/ephemeral
+    /// holds (config validation guarantees it), so `is_connect() == !is_ephemeral()`.
+    pub fn is_connect(&self) -> bool {
+        self.endpoint.is_some()
+    }
+
+    /// EPHEMERAL mode: provision an on-demand box via `cookbook` for the dream pass.
     pub fn is_ephemeral(&self) -> bool {
         self.cookbook.is_some()
     }
@@ -926,11 +1000,19 @@ impl Config {
         {
             remote.cookbook = Some(resolved);
         }
+        // Same relative-cookbook resolution for the dream remote — its recipe is handed to
+        // `node`/`npx` too, so a relative path must resolve against the config dir, not the process
+        // CWD. `remote` is not optional for dream (a local-Ollama connect default), so only the
+        // ephemeral case has a cookbook to rewrite.
+        if let Some(cookbook) = llm.dream.remote.cookbook.as_ref()
+            && let Some(resolved) = resolve_relative_cookbook_path(cookbook, &config_dir)
+        {
+            llm.dream.remote.cookbook = Some(resolved);
+        }
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();
         let search = raw.search.into();
-        let dream = raw.dream.into();
         let memory = MemoryConfig::try_from(raw.memory)?;
         let mut log = LogConfig::try_from(raw.log)?;
         // Finalize `dir`: empty (unset) → sibling of the db (`<db_parent>/logs`); a set value is
@@ -952,7 +1034,6 @@ impl Config {
             version_check,
             oracle,
             search,
-            dream,
             memory,
             log,
             repo_id_override,
@@ -1283,8 +1364,6 @@ struct RawConfig {
     #[serde(default)]
     search: RawSearch,
     #[serde(default)]
-    dream: RawDream,
-    #[serde(default)]
     memory: RawMemory,
     #[serde(default)]
     target_bindings: BTreeMap<String, Vec<String>>,
@@ -1400,26 +1479,6 @@ impl From<RawSearch> for SearchConfig {
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq)]
-struct RawDream {
-    #[serde(default)]
-    model: RawDreamModel,
-}
-
-#[derive(Debug, Default, Deserialize, PartialEq)]
-struct RawDreamModel {
-    enabled: Option<bool>,
-    endpoint: Option<String>,
-    model: Option<String>,
-    request_timeout_s: Option<u64>,
-}
-
-impl From<RawDream> for DreamConfig {
-    fn from(raw: RawDream) -> Self {
-        Self { model: raw.model.into() }
-    }
-}
-
-#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawMemory {
     surface: Option<String>,
 }
@@ -1433,28 +1492,6 @@ impl TryFrom<RawMemory> for MemoryConfig {
             None => MemorySurface::default(),
         };
         Ok(Self { surface })
-    }
-}
-
-impl From<RawDreamModel> for DreamModelConfig {
-    fn from(raw: RawDreamModel) -> Self {
-        let d = DreamModelConfig::default();
-        // Trim + drop empty so a blank `endpoint = ""` / `model = ""` falls back to the default
-        // instead of producing an unusable URL/model name.
-        Self {
-            enabled: raw.enabled.unwrap_or(d.enabled),
-            endpoint: raw
-                .endpoint
-                .map(|e| e.trim().to_string())
-                .filter(|e| !e.is_empty())
-                .unwrap_or(d.endpoint),
-            model: raw
-                .model
-                .map(|m| m.trim().to_string())
-                .filter(|m| !m.is_empty())
-                .unwrap_or(d.model),
-            request_timeout_s: raw.request_timeout_s.unwrap_or(d.request_timeout_s),
-        }
     }
 }
 
@@ -1473,13 +1510,123 @@ struct RawIndex {
 struct RawLlm {
     #[serde(default)]
     embedding: RawEmbedding,
+    #[serde(default)]
+    dream: RawDreamLlm,
 }
 
 impl TryFrom<RawLlm> for LlmConfig {
     type Error = ConfigError;
 
     fn try_from(raw: RawLlm) -> Result<Self, Self::Error> {
-        Ok(Self { embedding: EmbeddingConfig::try_from(raw.embedding)? })
+        Ok(Self {
+            embedding: EmbeddingConfig::try_from(raw.embedding)?,
+            dream: DreamLlmConfig::try_from(raw.dream)?,
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+struct RawDreamLlm {
+    enabled: Option<bool>,
+    /// `[llm.dream.remote]` — absent → [`RemoteDreamConfig::default`] (a local-Ollama connect).
+    /// Unlike embeddings there is no in-process fallback, so a missing block still yields a
+    /// serving config rather than `None`.
+    remote: Option<RawRemoteDream>,
+}
+
+impl TryFrom<RawDreamLlm> for DreamLlmConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawDreamLlm) -> Result<Self, Self::Error> {
+        let remote = match raw.remote {
+            Some(remote) => RemoteDreamConfig::try_from(remote)?,
+            None => RemoteDreamConfig::default(),
+        };
+        Ok(Self { enabled: raw.enabled.unwrap_or_default(), remote })
+    }
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+struct RawRemoteDream {
+    backend: Option<String>,
+    endpoint: Option<String>,
+    cookbook: Option<String>,
+    model: Option<String>,
+    gpu: Option<String>,
+    auth_env: Option<String>,
+    request_timeout_s: Option<u64>,
+}
+
+impl TryFrom<RawRemoteDream> for RemoteDreamConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawRemoteDream) -> Result<Self, Self::Error> {
+        let default = RemoteDreamConfig::default();
+        let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        // The SERVER-side chat model name — required, non-empty. For ollama the ollama model name;
+        // for vLLM the HF id the server was launched with.
+        let model = raw.model.unwrap_or_default();
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(ConfigError::DreamRemoteMissingModel);
+        }
+        // Which OpenAI-compatible server serves this block. Omitted → `ollama`.
+        let backend = match trimmed(raw.backend) {
+            None => RemoteBackend::default(),
+            Some(raw_backend) => RemoteBackend::from_db_str(&raw_backend)
+                .ok_or(ConfigError::RemoteBackendUnknown(raw_backend))?,
+        };
+        // Dream requests the CHAT capability; `infinity` is embed-only. Reject it at parse time so
+        // a misrouted backend never reaches the verdict client.
+        if !backend.supports_chat() {
+            return Err(ConfigError::DreamBackendCannotServeChat(backend.as_db_str().to_string()));
+        }
+        // The MODE is INFERRED from which URL field is set (mirrors embeddings): EXACTLY ONE of
+        // `endpoint` (connect) / `cookbook` (ephemeral). Both → ambiguous; neither → no server.
+        let endpoint = trimmed(raw.endpoint);
+        let cookbook = trimmed(raw.cookbook);
+        match (endpoint.is_some(), cookbook.is_some()) {
+            (true, true) | (false, false) => {
+                return Err(ConfigError::DreamRemoteModeAmbiguous);
+            },
+            _ => {},
+        }
+        // SECRET HYGIENE: reject a `user:pass@host` endpoint and direct the user to `auth_env`
+        // instead. Checked against the URL authority only, so an `@` in a path/query is fine.
+        // `cookbook` is a recipe spec, not a URL, so it is not checked.
+        if let Some(url) = endpoint.as_deref()
+            && endpoint_authority_has_userinfo(url)
+        {
+            return Err(ConfigError::DreamRemoteEndpointHasCredentials);
+        }
+        // EPHEMERAL-only: the GPU to provision. A PRESENT-but-empty value is a config error
+        // (clearer than silently dropping a meant-to-be-set key). Set with a connect
+        // `endpoint` it is meaningless → rejected. The VALUE is provider-specific and
+        // validated at provision time.
+        let gpu = match raw.gpu {
+            Some(g) => {
+                let g = g.trim();
+                if g.is_empty() {
+                    return Err(ConfigError::RemoteGpuEmpty);
+                }
+                if endpoint.is_some() {
+                    return Err(ConfigError::DreamRemoteGpuRequiresCookbook);
+                }
+                Some(g.to_string())
+            },
+            None => None,
+        };
+        // Optional — local Ollama needs no auth; trim if present.
+        let auth_env = trimmed(raw.auth_env);
+        Ok(Self {
+            backend,
+            endpoint,
+            cookbook,
+            model: model.to_string(),
+            gpu,
+            auth_env,
+            request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
+        })
     }
 }
 
@@ -1802,6 +1949,33 @@ pub enum ConfigError {
          `jinaai/jina-embeddings-v2-base-code`)"
     )]
     RemoteEmbeddingNonTransformerModel(String),
+    #[error(
+        "[llm.dream.remote] requires a non-empty `model` (the server-side chat model name — an \
+         ollama model like `qwen3:8b`, or the HuggingFace id vLLM was launched with, e.g. \
+         `Qwen/Qwen3-4B-Instruct-2507`)"
+    )]
+    DreamRemoteMissingModel,
+    #[error(
+        "[llm.dream.remote] `backend = \"{0}\"` cannot serve chat completions — dream needs a \
+         chat-capable backend (`ollama` or `vllm`); `infinity` is embed-only. Switch the backend, \
+         or point the dream model at an ollama/vLLM server"
+    )]
+    DreamBackendCannotServeChat(String),
+    #[error(
+        "[llm.dream.remote] requires EXACTLY ONE of `endpoint` (connect to a running chat server) \
+         or `cookbook` (provision an ephemeral box) — set neither both nor zero"
+    )]
+    DreamRemoteModeAmbiguous,
+    #[error(
+        "[llm.dream.remote] `endpoint` must not embed credentials in the URL (no \
+         `user:pass@host`) — put any token in an env var and name it via `auth_env` instead"
+    )]
+    DreamRemoteEndpointHasCredentials,
+    #[error(
+        "[llm.dream.remote] `gpu` applies only to ephemeral `cookbook` provisioning, not a \
+         connect `endpoint` — remove `gpu`, or switch the remote block to a `cookbook` recipe"
+    )]
+    DreamRemoteGpuRequiresCookbook,
     #[error(
         "the `[local_ai]` table was renamed to `[llm]` (#317). Update your rag-rat.toml: rename \
          `[local_ai.embedding]` → `[llm.embedding]` (and any `[local_ai.embedding.remote]` / \
@@ -3605,40 +3779,282 @@ mod tests {
     }
 
     #[test]
-    fn dream_model_defaults_off_and_parses_overrides() {
-        let default: DreamModelConfig = RawDreamModel::default().into();
-        assert!(!default.enabled, "the model verdict pass is OFF by default");
-        assert_eq!(default.endpoint, "http://localhost:11434");
-        assert_eq!(default.model, "qwen3:4b-instruct");
-        assert_eq!(default.request_timeout_s, 300);
-
+    fn dream_absent_defaults_to_off_and_local_ollama_connect() {
+        // No `[llm.dream]` at all → disabled, with a local-Ollama CONNECT serving default
+        // (byte-for-byte the pre-migration `[dream.model]` default).
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
 
-            [dream.model]
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+            "#,
+        )
+        .unwrap();
+        let dream = LlmConfig::try_from(raw.llm).unwrap().dream;
+        assert!(!dream.enabled, "the model pass is OFF by default");
+        assert_eq!(dream.remote, RemoteDreamConfig::default());
+        assert_eq!(dream.remote.backend, RemoteBackend::Ollama);
+        assert_eq!(dream.remote.endpoint.as_deref(), Some("http://localhost:11434"));
+        assert_eq!(dream.remote.model, "qwen3:4b-instruct");
+        assert_eq!(dream.remote.request_timeout_s, 300);
+        assert!(dream.remote.is_connect() && !dream.remote.is_ephemeral());
+    }
+
+    #[test]
+    fn dream_enabled_flag_without_remote_block_keeps_default_serving() {
+        // `[llm.dream] enabled = true` with no `[llm.dream.remote]` still resolves to the default
+        // (a local-Ollama connect) — dream has no in-process backend, so `remote` is never `None`.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.dream]
             enabled = true
+            "#,
+        )
+        .unwrap();
+        let dream = LlmConfig::try_from(raw.llm).unwrap().dream;
+        assert!(dream.enabled, "[llm.dream] enabled = true opts in");
+        assert_eq!(dream.remote, RemoteDreamConfig::default());
+    }
+
+    #[test]
+    fn dream_remote_connect_happy_path_applies_defaults() {
+        // CONNECT is inferred from `endpoint` being set.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.dream]
+            enabled = true
+
+            [llm.dream.remote]
+            backend = "ollama"
             endpoint = "http://ollama.local:11434"
-            model = "qwen3-8b-instruct"
+            model = "qwen3:8b"
+            auth_env = "OLLAMA_TOKEN"
             request_timeout_s = 60
             "#,
         )
         .unwrap();
-        let dream: DreamConfig = raw.dream.into();
-        assert!(dream.model.enabled, "[dream.model] enabled = true opts in");
-        assert_eq!(dream.model.endpoint, "http://ollama.local:11434");
-        assert_eq!(dream.model.model, "qwen3-8b-instruct");
-        assert_eq!(dream.model.request_timeout_s, 60);
+        let dream = LlmConfig::try_from(raw.llm).unwrap().dream;
+        assert!(dream.enabled);
+        assert_eq!(dream.remote, RemoteDreamConfig {
+            backend: RemoteBackend::Ollama,
+            endpoint: Some("http://ollama.local:11434".to_string()),
+            cookbook: None,
+            model: "qwen3:8b".to_string(),
+            gpu: None,
+            auth_env: Some("OLLAMA_TOKEN".to_string()),
+            request_timeout_s: 60,
+        });
+        assert!(dream.remote.is_connect() && !dream.remote.is_ephemeral());
+    }
 
-        // A blank endpoint/model falls back to the default rather than producing an unusable value.
-        let blank: RawConfig = toml::from_str(
-            "[index]\nroot = \".\"\n\n[dream.model]\nendpoint = \"\"\nmodel = \"  \"\n",
+    #[test]
+    fn dream_remote_ephemeral_infers_mode_and_parses_gpu() {
+        // EPHEMERAL is inferred from `cookbook` being set; a vLLM backend serves chat, and `gpu` is
+        // trimmed (not validated here). No `query_endpoint`/batching knobs exist for dream.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.dream]
+            enabled = true
+
+            [llm.dream.remote]
+            backend = "vllm"
+            cookbook = "@rag-rat/cookbook modal"
+            gpu = "  A10G  "
+            model = "Qwen/Qwen3-4B-Instruct-2507"
+            request_timeout_s = 900
+            "#,
         )
         .unwrap();
-        let blank: DreamConfig = blank.dream.into();
-        assert_eq!(blank.model.endpoint, "http://localhost:11434", "blank endpoint → default");
-        assert_eq!(blank.model.model, "qwen3:4b-instruct", "blank model → default");
+        let remote = LlmConfig::try_from(raw.llm).unwrap().dream.remote;
+        assert!(remote.is_ephemeral() && !remote.is_connect());
+        assert_eq!(remote.backend, RemoteBackend::Vllm);
+        assert_eq!(remote.cookbook.as_deref(), Some("@rag-rat/cookbook modal"));
+        assert_eq!(remote.gpu.as_deref(), Some("A10G"), "gpu is trimmed");
+        assert_eq!(remote.model, "Qwen/Qwen3-4B-Instruct-2507");
+        assert_eq!(remote.request_timeout_s, 900);
+    }
+
+    #[test]
+    fn dream_remote_requires_a_non_empty_model() {
+        for model_line in ["", "model = \"  \""] {
+            let raw: RawConfig = toml::from_str(&format!(
+                r#"
+                [index]
+                root = "."
+
+                [llm.dream.remote]
+                endpoint = "http://localhost:11434"
+                {model_line}
+                "#,
+            ))
+            .unwrap();
+            let err = LlmConfig::try_from(raw.llm).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::DreamRemoteMissingModel),
+                "model={model_line:?} → DreamRemoteMissingModel, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn dream_remote_infinity_backend_cannot_serve_chat() {
+        // `infinity` is embed-only; a dream remote on it is rejected at parse time.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.dream.remote]
+            backend = "infinity"
+            endpoint = "http://localhost:7997"
+            model = "some-model"
+            "#,
+        )
+        .unwrap();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::DreamBackendCannotServeChat(b) if b.as_str() == "infinity"),
+            "infinity → DreamBackendCannotServeChat, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn dream_remote_requires_exactly_one_of_endpoint_or_cookbook() {
+        // Neither → no server to reach; both → ambiguous mode. Both reject with the exactly-one
+        // rule.
+        let neither = r#"
+            [index]
+            root = "."
+
+            [llm.dream.remote]
+            model = "qwen3:8b"
+            "#;
+        let both = r#"
+            [index]
+            root = "."
+
+            [llm.dream.remote]
+            model = "qwen3:8b"
+            endpoint = "http://localhost:11434"
+            cookbook = "@rag-rat/cookbook modal"
+            "#;
+        for (label, toml_str) in [("neither", neither), ("both", both)] {
+            let raw: RawConfig = toml::from_str(toml_str).unwrap();
+            let err = LlmConfig::try_from(raw.llm).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::DreamRemoteModeAmbiguous),
+                "{label} endpoint/cookbook → DreamRemoteModeAmbiguous, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn dream_remote_gpu_with_connect_endpoint_is_rejected() {
+        // `gpu` only applies to ephemeral `cookbook` provisioning. Set alongside a connect
+        // `endpoint` it is meaningless → rejected.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.dream.remote]
+            endpoint = "http://localhost:11434"
+            model = "qwen3:8b"
+            gpu = "A10G"
+            "#,
+        )
+        .unwrap();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DreamRemoteGpuRequiresCookbook),
+            "gpu + endpoint → DreamRemoteGpuRequiresCookbook, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn dream_remote_empty_gpu_is_rejected() {
+        for value in ["\"\"", "\"   \""] {
+            let raw: RawConfig = toml::from_str(&format!(
+                r#"
+                [index]
+                root = "."
+
+                [llm.dream.remote]
+                backend = "vllm"
+                cookbook = "@rag-rat/cookbook modal"
+                model = "Qwen/Qwen3-4B-Instruct-2507"
+                gpu = {value}
+                "#,
+            ))
+            .unwrap();
+            let err = LlmConfig::try_from(raw.llm).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RemoteGpuEmpty),
+                "gpu={value} → RemoteGpuEmpty, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn dream_remote_endpoint_with_credentials_is_rejected() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.dream.remote]
+            endpoint = "https://user:token@host:11434"
+            model = "qwen3:8b"
+            "#,
+        )
+        .unwrap();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DreamRemoteEndpointHasCredentials),
+            "endpoint with userinfo → DreamRemoteEndpointHasCredentials, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn dream_remote_unknown_backend_is_rejected() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.dream.remote]
+            backend = "tgi"
+            endpoint = "http://localhost:11434"
+            model = "qwen3:8b"
+            "#,
+        )
+        .unwrap();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RemoteBackendUnknown(b) if b.as_str() == "tgi"),
+            "unknown backend → RemoteBackendUnknown, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn remote_backend_chat_capability_and_path() {
+        assert!(RemoteBackend::Ollama.supports_chat());
+        assert!(RemoteBackend::Vllm.supports_chat());
+        assert!(!RemoteBackend::Infinity.supports_chat(), "infinity is embed-only");
+        // The chat route is uniform across chat-capable backends; only serving differs.
+        assert_eq!(RemoteBackend::Ollama.chat_path(), "/v1/chat/completions");
+        assert_eq!(RemoteBackend::Vllm.chat_path(), "/v1/chat/completions");
     }
 
     #[test]

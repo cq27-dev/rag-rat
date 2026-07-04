@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::DreamModelConfig;
+use crate::config::RemoteDreamConfig;
 
 /// A single-turn verdict model: given a fully-rendered prompt, return the model's raw completion
 /// text. Object-safe so the verdict pass takes a `&dyn VerdictModel` and a test can swap in a mock.
@@ -74,16 +74,24 @@ pub struct HttpVerdictModel {
     agent: ureq::Agent,
     /// `<endpoint>/v1/chat/completions`, precomputed once at construction.
     chat_url: String,
-    /// The server-side model name sent in the request body (`[dream.model] model`).
+    /// The server-side model name sent in the request body (`[llm.dream.remote] model`).
     model: String,
 }
 
 impl HttpVerdictModel {
-    /// Build the verdict client from `[dream.model]`. The endpoint is trimmed and the chat route is
-    /// appended; loopback endpoints bypass the ambient HTTP proxy (a local Ollama routed through a
-    /// corporate proxy 403s), matching the embedder client.
-    pub fn from_config(cfg: &DreamModelConfig) -> Self {
-        let endpoint = cfg.endpoint.trim().trim_end_matches('/');
+    /// Build the verdict client from a CONNECT-mode `[llm.dream.remote]`. The endpoint is trimmed
+    /// and the chat route is appended; loopback endpoints bypass the ambient HTTP proxy (a local
+    /// Ollama routed through a corporate proxy 403s), matching the embedder client. `endpoint` is
+    /// optional on the config, so an absent value falls back to the local-Ollama default (the same
+    /// default `RemoteDreamConfig::default` carries). The ephemeral `from_provisioned` constructor
+    /// that points at a tunnel endpoint lands in a later task.
+    pub fn from_config(cfg: &RemoteDreamConfig) -> Self {
+        let endpoint = cfg
+            .endpoint
+            .as_deref()
+            .unwrap_or("http://localhost:11434")
+            .trim()
+            .trim_end_matches('/');
         let chat_url = format!("{endpoint}/v1/chat/completions");
         let mut builder = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(cfg.request_timeout_s)))

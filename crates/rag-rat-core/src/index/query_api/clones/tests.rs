@@ -210,7 +210,6 @@ fn find_clones_rejects_nan_and_non_finite_min_similarity() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
-        dream: Default::default(),
         memory: Default::default(),
         log: Default::default(),
     };
@@ -795,7 +794,6 @@ fn recall_candidates_identical_blob_vs_postings_grouping() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
-        dream: Default::default(),
         memory: Default::default(),
         log: Default::default(),
     };

@@ -844,7 +844,6 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
-        dream: Default::default(),
         memory: Default::default(),
         log: Default::default(),
     };

@@ -70,7 +70,6 @@ pub fn bench_config(subdir: &str) -> Config {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
-        dream: Default::default(),
         memory: Default::default(),
         log: Default::default(),
     }
