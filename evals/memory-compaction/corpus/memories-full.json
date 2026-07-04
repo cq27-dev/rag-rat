@@ -1,0 +1,911 @@
+[
+ {
+  "memory_id": "mem_19f2992101e_5d94b2cf7a93",
+  "kind": "Decision",
+  "title": "A6 generation-staged full rebuild + per-repo write locks (V043) (memory-sync phase A6)",
+  "body": "A6 of the global-DB consolidation (A1/V038..A5/V042; PR #416 \u2014 five P2 batches, 17 findings, + the coverage barrier incident, all in ONE commit 35891d7 on origin/main e5536e6). A full rebuild STAGES a fresh `files.generation` in CHUNKED per-wave transactions, then publishes via ONE TERMINAL transaction. LATEST 42->43; MIGRATION_043 arms in all three recognizers (`sha256:rag-rat-files-generation-v43`).\n\nV043 = `apply_files_generation`: sentinel `column_exists(files,generation)`; FK-OFF self-wrapped txn; DROP files_new torn re-convergence; `generation INTEGER NOT NULL DEFAULT 0`; UNIQUE -> (repo_id,path,commit_sha,worktree_id,generation); id verbatim. NO sole-repo backfill (repo-neutral; pointer absent=>0). First rebuild publishes generation 1.\n\nRUNTIME. repo_meta[live_files_generation] pointer; registry.rs live_files_generation/active_generation (context else live fallback); active_generation stamped on every file INSERT. set_context_at_generation = rebuild seam. EVERY connection resolves `files` through a generation view: write_scope_view (config opens), write_repo_generation_view (BARE opens \u2014 repo+generation only, preserves #360; the MCP read path).\n\n*** TERMINAL-FLIP + ROWS-INERT/CURSORS-LAST: the flip is the LAST fallible write; bulky KEYED rows may land pre-terminal ONLY when readers treat cursors/meta as authority. AUTHORITY set riding the flip: live_files_generation (last), indexed_at_ms, model seed, graph/flags marks, parser_failures staged apply, git_commit/git_dirty + git_history_indexed_* cursors (rows land Phase 2 via apply_prepared_git_history_deferring_cursors), and \u2014 batch 5 \u2014 repo_meta[source_root] (fs-fallback authority for memory validation/heals; the rebuild sets only the IN-MEMORY root early; a failed rebuild from a NEW checkout leaves old readers on the OLD root; audit found no further early authority keys \u2014 the FTS freshness trio is global infrastructure). Phase-3 order: carry_forward -> per carried overlay view-swap+resolve_overlay_edges -> restore base -> rebuild_logical_symbols -> apply_staged_parser_failures -> marks -> source_root + git meta + cursors -> pointer + seed -> COMMIT. Tests: a_tail_failure_leaves_the_old_generation_live..., ..._git_meta_and_history_cursors_on_the_old_state, ..._source_root_on_the_old_checkout, carried_overlay_edges_re_resolve... ***\n\n*** CANONICAL LOCK ORDER (batch 5, SUPERSEDES the role-based incoming-then-outgoing argument \u2014 it broke when the fence-gap writer appeared with roles reversed): multi-per-repo-lock flows sort ids by `locks::canonical_lock_order` (lexicographic on the sanitized discriminator; locks.rs module doc owns the rule) and acquire in that order from a clean slate; an acquisition violating the order (earlier-sorting lock wanted while a later-sorting one is pre-held \u2014 unavoidable since entry locks are taken identity-blind) MUST be BOUNDED (acquire_timeout, never blocking): in-order unbounded edges cannot cycle under a total order, and any cycle containing a bounded edge self-breaks within the timeout as a retryable refusal. register_repo's upgrade acquires BOTH ids' locks in canonical order (reentrant-instant for a held entry lock), guards through commit. ***\n\n*** FENCE GAP (batch 5): a writer's held lock must match the repo id it writes under. Entry locks key off the PRE-open derived id; an unshallow between derivation and adoption resolves+upgrades to portable \u2014 the writer would keep writing portable rows under only the stale local: lock. Fix: adopt_repo_from_config detects \"thread holds SOME rag-rat-write-* lock for this DB (locks::thread_holds_any_repo_write_lock) but NOT the resolved id's (thread_holds_write_lock)\" and stashes the resolved id's lock in IndexDatabase._identity_lock for the CONNECTION'S LIFETIME (bounded acquire; timeout = retryable \"identity changed; re-run\"). Lockless openers stay lockless. Test: a_writer_whose_identity_upgrades_mid_run_extends_its_lock_to_the_resolved_id (repo_registry.rs). ***\n\n*** LOCK-HELD => NO IN-FLIGHT REBUILD => FULL RECLAMATION (batch 5, supersedes the batch-3 `< live` predicate): gc deadness is `generation != live` UNDER A DOCUMENTED FLOCK PRECONDITION \u2014 every production rebuild entry runs under the per-repo flock (CLI index, watcher/maintenance; verified \u2014 only tests call library rebuild() bare, and the test harness spawn_paused_rebuild now acquires it too), so a collector HOLDING the flock (Cmd::Gc belt, maintenance, watcher \u2014 all verified holders) knows above-live rows are ABANDONED staging from failed rebuilds (which `< live` could never reclaim \u2014 a persistently failing tail leaked a staged copy per retry). A flock-less embedded collector must use the lockless-safe `< live` form; do not silently weaken the precondition. Allocator still guarantees staging above live (max(row-MAX, live)+1). Tests: gc_reclaims_abandoned_staged_generations_from_failed_rebuilds, gc_serializes_on_the_flock_while_a_rebuild_is_mid_flight. ***\n\n*** PARSER_FAILURES = STAGED-UNTIL-PUBLISH: temp.rebuild_parser_failures via graph.is_some(); apply in terminal; orphan sweep judges BASE scope at target and excludes staged upserts (PREPARE failures have no file row). StagedSweep{DeadContext,DeadGeneration} keeps the cascade off it on the generation axis. GENERATION-BOUNDED DELETES: remove_file_in_scope + heal_stale probes carry the writer's generation. FTS RACE: ensure_fts_fresh defers while any chunk HAS an fts row but NO chunk_text row. EVERY-APPLY-PATH SCHEMA LOCK: apply_schema_under_lock (double-checked, global rag-rat-schema.lock) in create_or_migrate + migrate_with_fastembed_cache + open_and_migrate. ***\n\n*** INTERLEAVED WRITERS (proof at the per-wave commit, incremental.rs): (a) disjoint-table (MCP memory) \u2014 safe by disjointness + re-anchor lifecycle; (b) files-adjacent \u2014 generation discipline (bounded deletes, flock-preconditioned deadness, universal views); (c) schema appliers \u2014 global schema lock; (d) identity flux \u2014 canonical-order dual locks + the _identity_lock stash. ***\n\nEXACTNESS vs DRIFT raw main.* reads: EXACT (generation predicate): all_symbols, rebuild_logical_symbols, call_path_edge_relocatable, refresh_clone_token_df, summary_counts graph_edges, ensure_graph_index_current wipe, overlay tombstone probe, heal_stale probes. DRIFT (re-justified in code): lexical graph_boost, delete_repo_chunk_blame.\n\nTEST SEAM: barrier keyed BY DATABASE PATH + RAII WaveBarrierGuard (never process-global \u2014 libtest/coverage; class in the extended #409 flock memory; repro `taskset -c 0,1 cargo test`). spawn_paused_rebuild holds the production flock. Unrelated taskset flake: openai embed ordering, #417.\n\nFALLOUT RULES: fixtures inserting into main.files post-rebuild stamp db.active_generation; \"rebuild clears X\" tests gc after (with flock); non-git counts via the view; tip pins at V043; poison sibling files at generation 0; reader-consistency moves ONLY the generation axis.\n\nGates (final): nextest --workspace 1527 passed; clippy clean; +nightly fmt --check clean; taskset gen-suite (20 tests) 3/3 + lock/upgrade tests clean. HANDOFF A7 importer: do NOT set live_files_generation (absent=>0); register_repo goes multi-repo \u2014 revisit the single-incumbent upgrade guard, keep the canonical-order + outgoing-lock + fence-gap rules. A8: per-repo locks + flock-preconditioned dead-gen gc + the interleaving suite make the concurrent index-A/write-B matrix meaningful.",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783108866078,
+  "updated_at_ms": 1783122755735,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f2992101e_5d94b2cf7a93",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/rebuild.rs",
+    "path": "crates/rag-rat-core/src/index/rebuild.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783108866078
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "V043",
+   "gc",
+   "generation",
+   "locks",
+   "memory-sync",
+   "phase-a",
+   "rebuild",
+   "schema"
+  ]
+ },
+ {
+  "memory_id": "mem_19f2461f3ca_cc6db2285eae",
+  "kind": "BugPattern",
+  "title": "flock released by fd-close alone outlives Drop when a sibling thread forks \u2014 unlock explicitly (#409)",
+  "body": "FileLock (crates/rag-rat-core/src/locks.rs) uses std's native file locks (File::lock/try_lock/unlock, stable \u22651.89 \u2192 flock on Unix). flock ownership belongs to the OPEN-FILE-DESCRIPTION, not the fd. So if you release the lock only by letting the fd close on Drop, and ANY other thread forks a child while the lock is held (any std::process::Command \u2014 the sibling tests shell out to `git`), the child inherits a duplicate reference to the same OFD. CLOEXEC closes fds only at exec, so through the whole fork\u2192exec window the OFD stays alive despite the parent's close, and the flock survives the parent's drop() until the child execs. A try_acquire landing in that window sees WouldBlock.\n\nSYMPTOM (#409): commands::index_ops::tests::maintenance_coalesces_a_concurrent_trigger flaked ONLY in the coverage job (plain `cargo test` under llvm-cov: many libtest threads in ONE process + git-forking sibling tests). Its second maintenance() coalesced after drop(held) because the FileLock's flock was still held via a fork-inherited OFD. nextest is immune (process-per-test \u2192 no in-process sibling forks), which is why only the coverage lane saw it. The same mechanism silently widens SQLITE_BUSY windows for WriteLock whenever a child is spawned mid-hold.\n\nFIX: impl Drop for FileLock calling `let _ = self._file.unlock();` \u2014 flock LOCK_UN releases the lock immediately regardless of surviving OFD references in pre-exec children (fd-close still follows; error ignored, best-effort). WriteLock wraps Option<FileLock> as `_inner`, so this one Drop covers it too; the decrement-first ordering in WriteLock::drop is preserved. Rule: a rag-rat file lock must unlock explicitly on Drop \u2014 never rely on fd-close alone.\n\nDETERMINISTIC TEST PATTERN (locks.rs tests, #[cfg(unix)], drop_releases_flock_immediately_despite_a_fork_inherited_fd): acquire a FileLock; libc::fork() a child that does NOT exec (just libc::usleep(300_000) then libc::_exit(0) \u2014 only async-signal-safe calls post-fork); parent drops the lock and immediately try_acquire the same path \u2192 asserts Some. Reap with libc::waitpid.\n\n*** GENERALIZED CLASS (A6/PR #416 coverage incident, run 28682674819 \u2014 the SECOND instance): SAME-PROCESS-GLOBAL STATE THAT IS SAFE UNDER NEXTEST BREAKS UNDER LIBTEST. The coverage job runs plain `cargo test` under llvm-cov \u2014 every test shares ONE process with parallel libtest threads; nextest (the test job + local habit) is process-per-test and hides the whole class. Instance 2: rebuild.rs's test-only after-wave-commit barrier was a single process-global `Mutex<Option<Box<dyn Fn>>>` slot \u2014 two barrier tests racing it dropped each other's hook AND its mpsc Sender (the other test's `reached_rx.recv()` \u2192 RecvError), and a leaked hook could fire inside an UNRELATED test's rebuild. Repro model: `taskset -c 0,1 cargo test -p rag-rat-core <filter>` (5/5 deterministic pre-fix, 5/5 clean post-fix + clean full-lib rounds).\n\nRULE: test hooks/seams in lib crates must be CONNECTION- or DATABASE-SCOPED, never process-global \u2014 key the registry by the resource the hook observes (the wave barrier: `Mutex<BTreeMap<PathBuf /*database path*/, Arc<dyn Fn + Send + Sync>>>`; production fires `run_after_wave_commit(self.database_path())`), so concurrent tests are inherently isolated (distinct temp DBs = distinct keys) and a leaked entry can't touch a stranger's run. Registration returns an RAII guard whose Drop unregisters (panic-safe \u2014 never manual cleanup a panic skips). Two mechanical notes: (a) use `Arc<dyn Fn + Send + Sync>` not Box so the dispatcher clones the hook out and RELEASES the registry lock before calling it (a hook that blocks on a test barrier must not serialize other tests' registrations); (b) mpsc endpoints are !Sync \u2014 wrap them in `Mutex` inside the hook closure to satisfy the Arc's Sync bound. VERIFY new concurrency-sensitive tests under the failing model, not just nextest: `taskset -c 0,1 cargo test -p rag-rat-core <filter>` a few rounds. (Known pre-existing flake under that model, unrelated: openai embed_batch ordering test, issue #417.) ***",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783021827018,
+  "updated_at_ms": 1783114428945,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f2461f3ca_cc6db2285eae",
+    "binding_kind": "logical_symbol",
+    "binding_id": "crates/rag-rat-core/src/locks.rs::FileLock",
+    "path": "crates/rag-rat-core/src/locks.rs",
+    "start_line": 26,
+    "end_line": 28,
+    "id": "sym_52bbb8c03225aa2c",
+    "chunk_id": 78918,
+    "symbol_kind": "struct",
+    "signature_hash": "6a191dcf8fc3c7d1c13ce42c77a6d16a4a8fb1812dd36cccdbb3bb990e07914f",
+    "anchor_status": "current",
+    "created_at_ms": 1783021827018
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "409",
+   "concurrency",
+   "drop",
+   "flock",
+   "fork",
+   "locks"
+  ]
+ },
+ {
+  "memory_id": "mem_19f283e9644_5fd9ab029557",
+  "kind": "BugPattern",
+  "title": "all_symbols (edge-resolution candidate pool) must be repo-scoped \u2014 bare-open graph refresh has no scope view (PR #413 round-6)",
+  "body": "`edges::helpers::all_symbols` builds the CANDIDATE POOL for edge resolution. It joins `files` \u2014 the per-connection scope VIEW (temp.files) when one is installed (rebuild/incremental/overlay via set_context), which already filters `repo_id`. But the bare-open graph refresh path (`IndexDatabase::open` \u2192 `ensure_graph_index_current` \u2192 `resolve_edges`) installs NO scope view (set_context is not called; commit/worktree are empty), so `files` resolves to the UNSCOPED `main.files`. In a consolidated DB that pulls EVERY repo's symbols into the pool \u2014 repo A's edges resolve onto repo B's symbols, and it CRASHES (\"Invalid column type Null at index 4, name value\") on any sibling symbol with a NULL qualified_name.\n\nFIX: pin the pool to the active repo with `WHERE symbols.file_id IN (SELECT id FROM main.files WHERE repo_id = ?active)` (`active` = `schema::active_repo_id(conn)`, which falls back to `sole_repo_id` when no context is installed \u2014 matching the bare-open scope). This is a NO-OP under a scope view (view rows \u2286 active repo) and the sole scope on the view-less path \u2014 so rebuild/incremental/overlay resolution is unchanged. GENERAL LESSON: a helper that reads `files` unqualified is only repo-scoped WHEN a scope view is installed; the bare `IndexDatabase::open` heal paths (ensure_graph_index_current) run WITHOUT one, so any such helper they reach needs an explicit `main.files.repo_id` predicate. Flushed by the poison-sibling harness.\n\n*** A6 (V043) EXTENSION \u2014 the SAME lesson now has a SECOND axis, GENERATION. A full rebuild STAGES a fresh `files.generation` and leaves the superseded (dead) one in main.chunks/main.symbols/edges_data until gc, so an unqualified reader folds TWO generations. all_symbols gained `AND generation = ?` (bind `schema::active_generation(conn)` \u2014 the WRITE gen under a rebuild's scope view, the LIVE gen on the view-less bare-open heal, exactly mirroring the active_repo_id/sole_repo_id fallback) alongside the repo_id pin: `WHERE symbols.file_id IN (SELECT id FROM main.files WHERE repo_id=? AND generation=?)`. graph_index::rebuild_logical_symbols got the same `main.files.generation=?` filter. ANY raw main.chunks/main.symbols/edges_data reader that bypasses the scope view now needs BOTH the repo_id AND the generation predicate. This class flushed a REAL A6 prod bug: query/memory/validate.rs::call_path_edge_relocatable read raw `edges` (view over edges_data, no generation column of its own) with no files join, so a genuinely-deleted call site was reported `relocated` (a dead-gen edge still matched the loose from/to/kind identity) instead of `gone` until gc \u2014 fixed by `JOIN files ON files.id=edges.source_file_id`. DRIFT-TOLERATED raw readers (refresh_clone_token_df df, lexical::graph_boost ranking) were left to self-correct after gc. Full A6 design: memory mem_19f2992101e (generation-staged rebuild). ***",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783086618180,
+  "updated_at_ms": 1783108914091,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f283e9644_5fd9ab029557",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/edges/helpers.rs",
+    "path": "crates/rag-rat-core/src/index/edges/helpers.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783086618180
+   }
+  ],
+  "call_paths": [],
+  "tags": []
+ },
+ {
+  "memory_id": "mem_19f291adc8d_cf982d0b4ec4",
+  "kind": "Invariant",
+  "title": "GitHub writers must upsert-RECLAIM placeholder-stranded rows \u2014 natural keys exclude repo_id (V041); V042 periphery needs no reclaim (keys lead with repo_id)",
+  "body": "THE TRAP (PR #414 P2): V041 scoped the seven github tables but deliberately kept their natural keys WITHOUT repo_id (phase-A: one repo per DB until A7) \u2014 github_refs UNIQUE(owner, repo, number, source_kind, COALESCE(source_path,''), COALESCE(source_commit,''), source_text); github_issues/github_pull_requests UNIQUE(owner, repo, number); github_ref_sync PK(owner, repo, number); comments/reviews/review_comments keyed by the github item id. The V041 consolidated-DB cardinality gate leaves pre-existing rows stranded under '__unassigned__' \u2014 and a stranded row OCCUPIES its natural key. Any conflict-IGNORING writer (`INSERT OR IGNORE`) or a DO UPDATE that omits repo_id therefore can NEVER repopulate the row: the cache is permanently stranded and invisible to scoped reads (which filter repo_id = active).\n\nTHE INVARIANT (github/store.rs header comment): every github writer RECLAIMS on conflict. store_ref: ON CONFLICT(<full 7-col expression key \u2014 the target must match the expression index EXACTLY, including the trailing source_text; omitting a column is a runtime \"SQL logic error\">) DO UPDATE re-stamps repo_id + refreshes ref_kind/discovered_at_ms, guarded `WHERE github_refs.repo_id != excluded.repo_id` so same-repo re-discovery keeps the old first-discovery/no-rewrite semantics. store_issue/store_pull/mark_ref_sync: `repo_id = excluded.repo_id` in their DO UPDATE SET. store_comment/store_review/store_review_comment: INSERT OR REPLACE on the id PK already reclaims (REPLACE deletes + re-inserts with the new stamp). Last-syncer-owns is the documented phase-A posture for the un-qualified keys. The github_fts mirror needs NO per-row handling: every sync path (sync_refs; sync_issue routes through it) ends in the whole-table rebuild_fts, which re-derives each mirror row's repo_id from its reclaimed base row. Test: v041_placeholder_github_rows_are_reclaimed_by_the_next_sync (repo_registry.rs) \u2014 stranded 2-repo state, one repo syncs one key, asserts re-stamp + content refresh + mirror consistency + scoped visibility + the untouched key staying placeholder.\n\nV042 PERIPHERY AUDIT (why NO reclaim is needed there \u2014 documented at the V042 gate in migrations.rs): every post-V042 key either LEADS with repo_id (clone_token_df PK(repo_id,normalizer_kind,token_hash); clone_refinements PK(repo_id,class_key); edge_oracle PK(repo_id,tool,tool_version,source_path,bytes,edge_kind); logical_symbol_monikers PK(repo_id,logical_symbol_id,tool); dream_findings UNIQUE(repo_id,kind,subject,claim_hash)), is an append-only AUTOINCREMENT log (oracle_runs, reconcile_attempts), keys by the repo-unique generated memory id (repo_memories/bindings/tags/fts), or is a globally-unique counter (clone_graph_generations, MAX(generation)+1 across ALL repos). New writes under a real repo can never conflict with a placeholder row \u2014 stranded rows merely LINGER until a future gc sweep (memories additionally surfaced by doctor as placeholder_repo entries).\n\n*** PR #415 UPDATE (supersedes the old \"dream_findings' content-derived id (no repo fold) is NOT a blocker / A7 deferral\" claim): once the dream LIFECYCLE lookups became repo-scoped (PR #415 batch 1), the repo-blind `finding_id` became a REAL error path \u2014 a reappeared claim in a second repo no longer matches the sibling's row (scoped lookup) and INSERTs the same repo-blind id into the global `id TEXT PRIMARY KEY` \u2192 PK violation. `finding_id` now FOLDS repo_id (`dream::repo_folded_finding_id`, the stable_id precedent); `dream::rederive_finding_ids` re-derives persisted ids (+ remaps the in-table `superseded_by`, the only persisted reference) from the V042 apply fn and from register_repo adoption. `repo_memories.id` (`memory_id`) got the same fold (same-ms identical content across repos collided). GENERAL: scoping a subsystem's LOOKUPS around an unscoped content-derived PK converts silent cross-repo UPDATE absorption into an insert-time collision \u2014 fold the repo into the derivation in the same change that scopes the lookups. ***\n\nGENERAL LESSON for any future \"leave rows at placeholder\" migration escape hatch: check whether the table's writers can actually RECLAIM the key. If the key excludes repo_id, \"the next sync repopulates\" is a lie without upsert-reclaim.",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783101054093,
+  "updated_at_ms": 1783107192653,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f291adc8d_cf982d0b4ec4",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/github/store.rs",
+    "path": "crates/rag-rat-core/src/index/github/store.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783101054093
+   }
+  ],
+  "call_paths": [],
+  "tags": []
+ },
+ {
+  "memory_id": "mem_19f294ba74f_971cbe74d7a7",
+  "kind": "BugPattern",
+  "title": "Poison-sibling tripwires need an ASSERTION on every consuming surface \u2014 seeding is detection only where a test looks",
+  "body": "PR #415 (A5 periphery review). The A5 rebase memory claimed the poison harness \"flushed NO production leak\". WRONG for TWELVE surfaces across two review batches \u2014 seeding was complete, but a seeded sibling row is inert until a test READs/COUNTS/CLEARS/RESOLVES against it via the exact production surface.\n\nTHE GAP: `assert_sibling_intact` only catches a mutation in a test that performs it AND asserts after; a leaky READ (count, join-by-content, \"latest\" ORDER BY, status header, exclusion subquery) has NO built-in tripwire \u2014 you must add a positive scoped-exclusion assertion in a test that drives that surface. THE RULE: for EACH surface consuming a scoped table, add a two-repo/poisoned test asserting isolation. Seeding is necessary, NOT sufficient. Pick seed discriminators an unscoped read would actually surface (reconcile's started_at_ms=0 seed could never win an ORDER BY DESC pick).\n\nBATCH 1 (8): edge_oracle read+clear (edge_oracle_scope_join / clear_edge_oracle_for_tool \u2014 content join, no repo predicate); refresh_clone_token_df (unscoped symbol_fingerprints read); rebind_memory binding stamp (stranded at placeholder \u2192 stamp_bindings_from_parent_repo, from the PARENT's repo not the active one); dream lifecycle (sync_in_tx lookup/supersede/resolve/list); last_reconcile_status (global latest); resolve_moniker (scan+join+tool_has_rows probe); repo_brief memory_counts(_by_path) + orientation active_non_dir_memory_* + tree dir_memory_titles (raw readers bypassing the scoped memory API); memory_by_id (unscoped guard for get/update/mark_obsolete/rebind \u2192 cross-repo mutation by id).\n\nBATCH 2 (4) \u2014 the REPO-BLIND DERIVED-IDENTITY class + 2 missed readers: (1) finding_id was repo-blind while dream lookups became repo-scoped \u2192 two repos minting the same (kind,subject,claim_hash) = PK VIOLATION on the global id (scoped lookup can't see the sibling row that used to absorb the UPDATE). Scoping lookups around an unscoped derived PK CREATES an error path that repo-global code didn't have. Fix: repo_folded_finding_id (stable_id precedent) + rederive_finding_ids(conn) (re-derives ids + remaps in-table superseded_by \u2014 verified the ONLY persisted finding-id reference) called from V042 apply (after backfill) AND register_repo adoption (after periphery re-point, the realign twin). (2) memory_id(now, input_hash) \u2014 same-ms identical content across repos collided; suffix now sha256(repo \u2016 input_hash) when scoped; ids stay globally unique + coordination-free (phase B replication). (3) dream candidate builders: coverage_gap's repo_memory_bindings exclusion subqueries (sibling same-path binding SUPPRESSED this repo's finding \u2014 false negative) + stale_reference's repo_memories scan. (4) oracle status last_run_meta unscoped while its verdict counts were scoped \u2014 sibling's newer run headlined this repo's counts.\n\nDERIVED-IDENTITY DISPOSITION TABLE (the phases-B+ rule: every derived identity is REPO-FOLDED, REPO-SCOPED-KEYED, or DOCUMENTED-GLOBAL \u2014 never implicit):\n- REPO-FOLDED (repo in the hash): logical_symbols.id (stable_id, V040); dream_findings.id (repo_folded_finding_id); repo_memories.id (memory_id suffix).\n- REPO-SCOPED KEY (repo_id in PK/UNIQUE, or keyed by a repo-unique parent): clone_refinements PK(repo_id,class_key); edge_oracle PK(repo_id,tool,ver,path,4 spans,edge_kind); logical_symbol_monikers PK(repo_id,lsid,tool); clone_token_df PK(repo_id,kind,token_hash); git_commits PK(repo_id,hash); parser_failures PK(repo_id,path); files/packages UNIQUE(repo_id,...); dream claim_hash via UNIQUE(repo_id,kind,subject,claim_hash); repo_memory_call_paths.edge_sequence_hash + bindings.binding_id (transitive via repo-unique memory_id); worktree_id (inside files' UNIQUE).\n- GLOBAL BY DESIGN (documented): embedding_cache.input_hash + chunk_text_dict + name_strings (content-addressed shared pools, UNION liveness gc); chunk text/normalized/boundary hashes + symbol_fingerprints.struct_hash (freshness/pairing signals on rows transitively scoped via files \u2014 \"NEVER add scope columns\" note in CLONE_FINGERPRINT_DDL); clone_graph_generations.generation (global MAX+1 allocator; rows repo-stamped, clone_edges/postings transitive via the generation FK); oracle_runs/reconcile_attempts AUTOINCREMENT ids (repo-stamped logs); github (owner,repo,number)+item ids (provider-assigned, phase-A keys exclude repo \u2192 upsert-reclaim invariant, A7 widening owed); content_revision (deliberately whole-DB, V040 reclassification); repo_id itself (the scope root).\nNo identity is bucket-less after batch 2.\n\nWHERE THE ASSERTIONS LANDED: oracle tests edge_oracle_reads_and_clears_are_scoped / oracle_status_header_and_counts_describe_the_active_repo; dream tests two_repos_minting_the_same_finding_do_not_collide + rederive_finding_ids_repoints; multi_repo_scope tests for rebind, moniker, dream lifecycle + candidate builders, reconcile, memory_by_id, brief+orientation+tree, clone_token_df recompute, memory_ids_fold_the_repo. Each verified non-tautological (fix reverted \u2192 test fails).\n\nSUBTLETY: do NOT seed content-addressed tables (symbol_fingerprints) in the GLOBAL poison harness \u2014 many clone fixture tests read them whole-table as sanity counts and break. Seed such siblings per-test via two_repo_fixture instead.",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783104251727,
+  "updated_at_ms": 1783107158812,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f294ba74f_971cbe74d7a7",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/poison_sibling.rs",
+    "path": "crates/rag-rat-core/src/index/poison_sibling.rs",
+    "anchor_status": "gone",
+    "created_at_ms": 1783104251727
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "V042",
+   "harness",
+   "phase-a",
+   "poison-sibling",
+   "repo-id",
+   "testing"
+  ]
+ },
+ {
+  "memory_id": "mem_19f283e2d00_6f3f1a7d64fe",
+  "kind": "Decision",
+  "title": "Poison-sibling harness: distinct-path + SAME-PATH tripwire classes, resync-faithful github_fts, opt-out rules (PR #413/#414)",
+  "body": "WHAT: `crates/rag-rat-core/src/index/poison_sibling.rs` (cfg(test)). The tail of `IndexDatabase::rebuild_with_progress` calls `poison_sibling::seed_if_enabled(conn)` (default-ON per test thread). It seeds a second `poison-sibling` repo's tripwire rows into every repo-scoped table so ANY unscoped read/count/delete in production trips an EXISTING test locally instead of surfacing in review. `assert_sibling_intact(conn)` is a mutating-test post-condition (row-count + exact-sentinel-value check); call it at the end of gc/incremental/oracle/clones/memory-write tests.\n\nTWO TRIPWIRE CLASSES (PR #414 review \u2014 the second one is load-bearing and was MISSING at first):\n(1) DISTINCT-PATH rows seed under `zz_poison_`-prefixed paths/keys that never collide with a primary-repo path \u2014 they catch UNION-across-repos leaks (missing repo_id filter on a whole-table scan/delete).\n(2) SAME-PATH rows seed under a REAL primary-repo path (resolved at seed time by `primary_collision_path` \u2014 lexicographically-first non-sibling `main.files.path`, fallback sentinel when the fixture indexed nothing). WHY PREFIX-ONLY SENTINELS ARE INSUFFICIENT: an aggregate that reads a scoped table grouped by a NON-repo key (path / source_path / (path,sha)) and then JOINS the result onto the active repo's rows BY THAT KEY can never see a `zz_poison_` path \u2014 the join key never matches \u2014 so join-by-non-repo-key leaks are structurally invisible to class (1). Canonical leak it flushed: repo_brief's `github_ref_counts` CTE (GROUP BY source_path, LEFT JOIN onto files by path \u2014 sibling refs on a shared path inflated github_ref_count/ranking; fixed with repo_id predicate INSIDE the CTE, A4). On A5 it flushed `validate_memories` (unscoped `FROM repo_memory_bindings` sweep that also UPDATEs anchor_status \u2014 cross-repo mutation) and `anchor_health_counts` (pooled counts); both now scoped via periphery_repo_scope_clause. SAME-PATH rows: files (sha256 sentinel), git_file_changes (additions=7700077), parser_failures (message sentinel), github_refs (number 9_900_078) at V041; repo_memory_bindings (a SECOND path-kind binding off the poison memory with the `path` COLUMN set \u2014 the distinct-path binding leaves path NULL so it never reaches `path IS NOT NULL` readers; binding_id sentinel) and edge_oracle (source_path + file_sha COLLIDE with the real primary file's sha \u2014 the edge_oracle\u2192files join keys on path+sha; scip_symbol sentinel) at V042. Each same-path row is pinned in `sibling_tripwires` by a path-INDEPENDENT sentinel column; the pre-existing distinct-path predicates for the doubled tables were narrowed (path=\u2026/binding_id=\u2026/scip_symbol=\u2026) so counts stay exactly 1. Meta-test `same_path_tripwires_expose_a_join_by_path_leak` proves liveness: an intentionally unscoped path aggregate sees the sentinel while scoped repo_brief reports 0.\n\nGITHUB_FTS IS DERIVATION-OWNED (PR #414 P2): `github::rebuild_fts` (the sync tail) DELETEs the WHOLE mirror and re-derives one row per base-table item. The harness therefore seeds the five body-bearing base rows with EXPLICIT item ids (POISON_GH_ITEM_ID 9_900_077_000 +1..+5) and seeds FIVE mirror rows exactly as the derivation produces them (per-kind item_id/url/title/body slots; reviews url=COALESCE(html_url,'')='', review_comments title=COALESCE(path,'')=''); `classification` is recomputed by insert_fts (classify_text) and deliberately UNPINNED. Self-test `github_fts_tripwires_survive_a_papertrail_resync` calls the real rebuild_fts and asserts intact \u2014 it PINS the seed\u2194derivation equivalence, so a drift in either fails locally. Do NOT hand-seed a single mirror row again.\n\nFIXTURE-FIX RULE (never weaken the harness): a test whose setup/assertion reads or mutates a scoped table by PATH without a repo predicate is a fixture bug \u2014 scope the query (has_test_code heal test, worktree-overlay scopes enumeration: `main.files WHERE path` gained `AND repo_id=?`; memory_stays_gone corruption UPDATE gained `WHERE binding_kind='symbol'` since the poison memory carries two path bindings whose ids would PK-collide). OPT-OUT (`disable_poison_sibling()`) remains ONLY for genuinely single-repo whole-DB invariants (content_revision digest, chunk_text\u2194chunks totals) \u2014 every opt-out is a claim, not a workaround.\n\nV040 SHAPE (still load-bearing): the sibling is SCOPED DATA rows only \u2014 NO repos/repo_roots/repo_meta row (a registry row would hijack sole_repo_id for the many placeholder fixtures and flip multiple_real_repos). RELATED (same review): the V041/V042 backfills are cardinality-gated \u2014 on !=1 repos rows they leave rows at the placeholder instead of sole_repo_id's hard error aborting the upgrade; memory doctor surfaces placeholder-scoped repo_memories as `placeholder_repo` entries (user-authored data, unlike the refetchable github cache).",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783086591232,
+  "updated_at_ms": 1783099931890,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f283e2d00_6f3f1a7d64fe",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/poison_sibling.rs",
+    "path": "crates/rag-rat-core/src/index/poison_sibling.rs",
+    "anchor_status": "gone",
+    "created_at_ms": 1783086591232
+   }
+  ],
+  "call_paths": [],
+  "tags": []
+ },
+ {
+  "memory_id": "mem_19f28a1f309_88b0c8ffa006",
+  "kind": "Decision",
+  "title": "A4/A5 rebase onto merged A3: V041/V042 backfill P1 fix + poison periphery/github harness extension + item-8 seam-test rework",
+  "body": "Integration of the A4 (V041 github) and A5 (V042 periphery) branches onto the MERGED A3 (main d94da97, which evolved through 6 review rounds after the old A3 head the branches were authored on). End state: A4 = one V041 commit on main; A5 = A4's commit + one V042 commit. Three classes of NON-CONFLICT work the rebase required (beyond mechanical conflict resolution) \u2014 durable because the next agent merging/extending these will hit the same:\n\n1. P1 BACKFILL FIX (V041 AND V042 \u2014 SUPERSEDES the \"stamped placeholder\" / \"placeholder-backfilled\" claims in the A4 mem_19f2517def2 and A5 mem_19f254367c4). Both migrations were authored BEFORE V039/V040 fixed the \"static DEFAULT '__unassigned__' orphans rows on an already-adopted DB\" class, so neither backfilled. FIX: each migration now resolves the migration-local `sole_repo_id(conn)` and re-points placeholder rows onto the real id when adopted (no-op when un-adopted \u2014 rows wait for register_repo), INSIDE the migration's own txn so it is atomic with the column-existence sentinel and only ever runs on the FIRST apply (replay-safe / consolidated-DB safe). V041: `backfill_github_repo_id_to_sole_repo` (apply_github_repo_id_scoping now self-wraps ONE BEGIN IMMEDIATE...COMMIT; rebuild_github_fts_with_repo_id made TXN-LESS to run inside it) over the 7 github base tables + github_fts. V042: `backfill_periphery_repo_id_to_sole_repo` (inside the existing V042 FK-OFF txn, after rebuild_repo_memory_fts) over the 11 A5_PERIPHERY_DIRECT_SCOPED_TABLES. Tests: migration_041_backfills_an_adopted_pre_v041_db_under_the_real_repo_id, migration_042_backfills_an_adopted_pre_v042_db_under_the_real_repo_id.\n\n2. POISON-SIBLING HARNESS EXTENSION (poison_sibling.rs). The harness is a round-6 A3 addition the branches never saw; its module doc explicitly said \"when A4/A5 land, extend seed_sibling\". A4 extends it with the 7 github tables + github_fts (const POISON_GH_NUMBER); A5 extends it with the V042 periphery: repo_memories(+bindings/tags(transitive, no repo_id)/fts), oracle_runs, edge_oracle, logical_symbol_monikers (the pre-existing moniker seed GAINED a repo_id column value), clone_graph_generations/clone_token_df/clone_refinements, dream_findings, reconcile_attempts (consts POISON_MEMORY_ID, POISON_GENERATION); module doc bumped V040->V041->V042 (\"nothing repo-scoped left unseeded\"). Extend seed_sibling + clear_sibling + sibling_tripwires TOGETHER. Running the full suite with the extended harness flushed NO production leak (A4/A5 scoping is correct); every flush was either a whole-DB-count false tripwire (opt out with `disable_poison_sibling()`: the two `*_preserves_github_papertrail_cache`, complete_generation_*/precompute_writes_graph_and_skips_when_current/refine_cache_is_read_through/unrefined_class_outside_top_n/clone_token_df_recomputed/gc_prunes_oracle_runs_for_dead_contexts) or an item-8 seam test (see #3).\n\n3. ITEM-8 SEAM REPLACEMENT + TEST REWORK. V042 gives oracle_runs and clone_graph_generations a real repo_id, so the A3 `schema::multiple_real_repos(conn)` GUARDS (gc oracle-prune, precompute complete_generation, open_building_generation resume/discard) are REPLACED by real repo_id predicates and the guards REMOVED. Consequence: `multiple_real_repos` lost its production callers (only registry-internal resolve_config_repo_id + tests use it), so its schema::mod.rs re-export is now `#[cfg(test)]`-gated. The A3 GUARD-ERA seam TESTS (complete_generation_spares_sibling/prunes_other, open_building_spares/does_not_resume/discards_stale, gc_prunes_a_dead_oracle_run_on_a_single_repo_db, gc_skips_the_global_oracle_prune_on_a_multi_repo_db) tested the guard and BROKE: they seeded a \"sibling\" generation/oracle_run under the PLACEHOLDER (default) while the fixture's active repo was also placeholder (non-git clone fixture) or real (git fixture), so under the per-repo predicate the \"sibling\" was either treated as the active repo's own (resumed/discarded) or a placeholder run wasn't reached by a real-active prune. FIX: `seed_generation` gained an explicit `repo_id` param \u2014 \"this repo's\" rows seed under `&db.active_repo_id`, \"sibling\" rows under a distinct id (\"repo-x\"); the dead oracle_run is stamped `db.active_repo_id` (single-repo, so the scoped prune reaches it) or REPO_B (multi-repo, so it is spared). GENERAL LESSON: any test that constructs a \"sibling repo's\" periphery row MUST stamp it a repo_id distinct from `db.active_repo_id`; the placeholder default no longer suffices once the active repo is real or once the assertion depends on per-repo (not guard) semantics.\n\nBoth branches: cargo nextest run --workspace green (A4 1475, A5 1484), clippy --all-targets -D warnings clean, +nightly fmt clean. Not pushed.",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783093129993,
+  "updated_at_ms": 1783093129993,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f28a1f309_88b0c8ffa006",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783093129993
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "V041",
+   "V042",
+   "backfill",
+   "memory-sync",
+   "migration",
+   "phase-a",
+   "poison-sibling",
+   "rebase",
+   "repo-id"
+  ]
+ },
+ {
+  "memory_id": "mem_19f2517def2_fa15187344b1",
+  "kind": "Decision",
+  "title": "V041 GitHub papertrail + search/git-history repo_id scoping (memory-sync phase A4)",
+  "body": "A4 of the global-DB consolidation (on A1/V038, A2/V039, A3/V040). Repo-scopes the GitHub papertrail cache + closes the A3-marked search/git-history seams. LATEST 40->41; MIGRATION_041 arms added in known_version/known_migration/migration_checksum_mismatch (checksum `sha256:rag-rat-github-repo-id-scoping-v41`). FOOTGUN (cost a debug cycle, same class the A2/A3 memories flag): adding a migration to ADDITIVE_MIGRATIONS is NOT enough \u2014 `apply` runs it but `current_version` (schema::status) caps at the PREVIOUS tip until you also add the id->version arm in known_version, the `| MIGRATION_041_ID` arm in known_migration, and the checksum arm. Symptom: every migration_04x tip/forward test reports left:40 right:41.\n\nV041 = `apply_github_repo_id_scoping` (migrations.rs). SENTINEL = `column_exists(conn,\"github_fts\",\"repo_id\")`. Adds `repo_id TEXT NOT NULL DEFAULT '__unassigned__'` (REPO_ID_COLUMN_DEF) via add_column_if_missing to the 7 base tables [V041_GITHUB_SCOPED_TABLES = github_refs, github_issues, github_comments, github_pull_requests, github_reviews, github_review_comments, github_ref_sync], then REBUILDS github_fts.\n\n*** REBASE-INTEGRATION UPDATE (A4 rebased onto MERGED A3 = main d94da97; branch head now the single V041 commit): apply_github_repo_id_scoping now SELF-WRAPS the whole migration in ONE `BEGIN IMMEDIATE ... COMMIT` (the V040/V042 recipe) and `rebuild_github_fts_with_repo_id` is now TXN-LESS (runs inside the caller's txn). WHY: the P1 backfill below must be ATOMIC with the sentinel-setting FTS rebuild \u2014 else a crash after the FTS commit but before the backfill leaves the sentinel true and a re-run skips it, stranding rows under the placeholder. ***\n\n*** P1 BACKFILL FIX (the V039/V040 class \u2014 was MISSING, added at rebase): the static `DEFAULT '__unassigned__'` stamps existing rows the placeholder, and on an ALREADY-ADOPTED DB register_repo's fast path never re-points \u2014 so scoped papertrail reads return NOTHING for the real repo until the next github sync. NEW `backfill_github_repo_id_to_sole_repo(conn)` runs INSIDE the V041 txn after the FTS rebuild: `sole_repo_id(conn)` (the migration-local resolver, hard-errors on !=1); if == LEGACY_REPO_ID it is a no-op (un-adopted \u2014 rows correctly wait for register_repo); else `UPDATE {table} SET repo_id=real WHERE repo_id=placeholder` over the 7 base tables + `github_fts`. Reached only on the FIRST apply (sentinel short-circuits replay), so `sole_repo_id`'s one-row expectation stays consistent-DB-replay safe. Test: migration_041_backfills_an_adopted_pre_v041_db_under_the_real_repo_id. THE OLD CLAIM \"Rows copied stamped placeholder so papertrail survives until next sync\" IS OBSOLETE \u2014 the backfill lands them under the real id immediately. ***\n\nDELIBERATE SCOPE (the base tables gain the COLUMN only \u2014 no uniqueness-key rebuild): github_issues/github_pull_requests keep UNIQUE(owner,repo,number), github_ref_sync keeps its PK, the id-keyed caches keep their github-id PK. Phase A is ONE repo per DB (register_repo refuses a 2nd real repo until A7). Widening keys to (repo_id,owner,repo,number) is an A7 concern.\n\ngithub_fts REBUILD (`rebuild_github_fts_with_repo_id`): standalone/own-content FTS5 columns can't be ALTERed, so create-new/copy/drop/rename adding `repo_id UNINDEXED` (last column). Copied rows stamped placeholder; the backfill re-points them. Leading `DROP TABLE IF EXISTS github_fts_new` = torn re-convergence.\n\nADOPTION: `V040_DIRECT_SCOPED_TABLES` (registry.rs) RENAMED to `DIRECT_SCOPED_ADOPTION_TABLES` and extended with the 7 github tables + github_fts (own-content FTS5 UPDATE re-points its repo_id in place). NEW: the adoption UPDATE loop is GUARDED by `adoption_table_present(conn,table)` (sqlite_master type='table'; matches FTS5 virtual tables too) \u2014 the schema-bootstrap ISOLATION fixtures seed only a subset, so an unguarded `UPDATE github_refs` would trip `no such table`. git_file_changes stays ABSENT (ON UPDATE CASCADE via git_commits). NB: the github adoption assertion can't live in the github-only ISOLATION test (adoption runs realign_logical_symbol_ids, which needs the full core schema) \u2014 it is covered by the full-schema `register_repo_repoints_github_papertrail_rows_to_the_real_id` test instead.\n\nWRITERS stamp `crate::index::schema::active_repo_id(conn)`: store_ref/store_issue/store_comment/store_pull/store_review/store_review_comment (INSERT +repo_id), mark_ref_sync, FtsRow gained a repo_id field, insert_fts/insert_fts_rows write it, rebuild_fts SELECTs repo_id from each base table. QUERIES filter active_repo_id: evidence.rs search_fts (repo filter MANDATORY; param index TRAILS the optional item_kind bind), evidence_for_issue, evidence_for_commit_refs, refs; api.rs refs_for_path + papertrail_for_commit + status() (scoped_table_row_count per-repo); sync.rs github_ref_synced + discover_commit_refs; impact/historical.rs github_rationale_for_query (github_fts MATCH) + github_refs_for_paths (git_commits_for_paths scoping was A3's, NOT re-applied by A4).\n\nGIT_HISTORY seams (A3-marked) closed: NEW util `scoped_table_row_count(conn,table,repo_id)`; commit_search + history_for_path filter git_commits/git_file_changes.repo_id; git_chunk_blame's wholesale DELETE replaced by `delete_repo_chunk_blame(conn,repo_id)` = delete through chunks JOIN main.files WHERE main.files.repo_id (NOT temp.files scope view). LEXICAL (search/lexical.rs): chunk_fts/chunk_embeddings scope via the files view; historical_boost/graded_git_scores take repo_id; RECALL BOUND documented at candidate_limit (8x = per-repo window).\n\n*** POISON HARNESS EXTENDED (A4 commit): poison_sibling.rs seed_sibling/clear_sibling/sibling_tripwires now cover the 7 github tables + github_fts (const POISON_GH_NUMBER); module doc bumped V040->V041. The two `*_preserves_github_papertrail_cache` schema_migrations tests assert UNSCOPED whole-table `row_count` totals, so they `disable_poison_sibling()` (single-repo by nature). Running the full suite with the extended harness flushed NO production github leak. ***\n\nTESTS: multi_repo_scope.rs leak matrix (seed_search_leak_data / seed_github_issue): lexical_and_hybrid / git_history_queries / papertrail_queries \"never_surface_the_other_repo\". repo_registry.rs owns the V041 tip pin, the github_fts rebuild+torn+adoption isolation test (seed_pre_v041_github_schema), forward-from-V040, and the two new adoption/backfill full-schema tests.",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783033749234,
+  "updated_at_ms": 1783093087294,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f2517def2_fa15187344b1",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783033749234
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "V041",
+   "github",
+   "memory-sync",
+   "migration",
+   "phase-a",
+   "repo-id",
+   "schema",
+   "search"
+  ]
+ },
+ {
+  "memory_id": "mem_19f283e7501_3bfff20fc7af",
+  "kind": "Invariant",
+  "title": "LocalOnly\u2192Portable upgrade REQUIRES shallow-boundary ancestry proof (PR #413 round-6 P2 #4)",
+  "body": "Extends the identity-class decision (mem_19f271576de). A `local:` incumbent + Portable incoming is NECESSARY but NOT SUFFICIENT for the in-place upgrade \u2014 `register_repo` now REQUIRES PROOF the incoming clone is a deepened version of THIS incumbent, else it refuses.\n\nMECHANISM: `RepoIdentity` gained `shallow_boundary: Vec<String>` (sorted boundary hex for a LocalOnly id; EMPTY for Portable/pin \u2014 `resolve_repo_identity`/`derive_repo_id` populate it alongside the id, which is a hash OF exactly those bytes). At LocalOnly registration `register_repo` persists it to `repo_meta` key `shallow_boundary` (`persist_shallow_boundary`, run INSIDE the adoption txn AND on the idempotent re-registration path). At upgrade it reads the incumbent's recorded boundary (`read_shallow_boundary`) and calls `repo_identity::boundary_reachable_from_head(root, &boundary)` (gix: walk the incoming clone's HEAD ancestry, require EVERY boundary commit reachable \u2014 a `git fetch --unshallow` keeps those commits in history, an unrelated repo reaches none). Empty boundary OR unreachable OR gix error \u21d2 REFUSE via `unproven_upgrade_error` (names the `[index] repo_id` pin remedy). Verified BEFORE the adoption txn so a refusal touches nothing.\n\nWHY: a DB first indexed from a cut shallow clone, later opened from an UNRELATED full repo at the same DB path (or a mistaken pin), would otherwise silently re-point every scoped row/repo_meta/root/logical-id onto that unrelated id \u2014 data loss across two repos.\n\nFOOTGUN: the upgrade's repo_meta re-point EXCLUDES the boundary key (`UPDATE repo_meta ... WHERE repo_id=? AND key != 'shallow_boundary'`) so it cascades away with the old `local:` repos row rather than polluting the portable id (which never upgrades). Tests: `register_repo_upgrades_a_local_only_id_to_a_portable_id_in_place` (real git, boundary=HEAD \u2192 proven), `register_repo_refuses_a_portable_upgrade_from_an_unrelated_repo`, `register_repo_refuses_a_local_upgrade_without_a_recorded_boundary`, and `unshallow_upgrades_...` end-to-end. Test helper `identity_local(id, name, boundary)` now takes the boundary vec.",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783086609665,
+  "updated_at_ms": 1783086609665,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f283e7501_3bfff20fc7af",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/repo_identity.rs",
+    "path": "crates/rag-rat-core/src/repo_identity.rs",
+    "anchor_status": "gone",
+    "created_at_ms": 1783086609665
+   }
+  ],
+  "call_paths": [],
+  "tags": []
+ },
+ {
+  "memory_id": "mem_19f27e2470c_15fcd3092b3d",
+  "kind": "BugPattern",
+  "title": "Moving a key back to index_meta requires filtering V039's frozen relocate (else index --full hard-errors on a consolidated DB)",
+  "body": "PR #413 round-5. THE TRAP when reclassifying a V039-relocated key as GLOBAL and moving it back to index_meta (see the 18-key classification memory): V039's apply_move_per_repo_meta is FROZEN (merged) and STILL lists the key in V039_INDEX_META_KEYS. `schema::apply` (create_or_migrate / `rag-rat index --full`) RE-RUNS EVERY migration incl. V039 (only routine opens use migrate_forward = unapplied-only). So once the runtime writes the now-global key to index_meta, V039's relocate_meta_keys sees it there, its round-4 movable-keys gate fires, it resolves the migration-local sole_repo_id, and HARD-ERRORS on a consolidated (>1 real repo) DB \u2014 regressing the round-4 `full_ladder_replay_on_a_two_repo_db_is_idempotent` guard (index --full on a consolidated DB must not error).\n\nTHE FIX (migrations.rs): relocate_meta_keys now FILTERS OUT `RECLASSIFIED_GLOBAL_INDEX_META_KEYS` = [content_revision, fts_dirty, fts_source_revision, fts_synced_at_ms] before building the in_list. Those 4 are the reclassified-global keys that ALSO appear in V039_INDEX_META_KEYS; excluding them means V039's index_meta sweep no longer sees them (gate returns early, no sole_repo_id, no hard-error) while relocating every genuinely-per-repo key byte-identically. The reencode cursor is reclassified too but is NOT in this filter: it lives in V039_RECONCILE_META_KEYS and, once global, sits in index_meta where NEITHER V039 sweep names it \u2014 so it needs no exclusion; V040's move-back handles a stale repo_meta copy. This is NOT \"editing V039\": apply_move_per_repo_meta, the V039 key lists, and the V039 checksum (a hand-authored sentinel, not a SQL hash) are untouched; only the SHARED helper honors V040's reclassification.\n\nTHE MOVE-BACK: `move_repo_meta_keys_to_global(conn, V040_REPO_META_KEYS_TO_GLOBAL[5])` runs at the TOP of apply_repo_id_core_scoping, BEFORE the files.repo_id short-circuit (so it also fixes a DB a prior commit of this branch migrated to V040 with the keys in repo_meta). Idempotent + multi-repo-replay-safe: resolves NO sole_repo_id; INSERT OR IGNORE into the key-PK'd index_meta keeps one global value; DELETE clears every repo_meta copy; on re-apply repo_meta is empty \u2192 no-op. `value IS NOT NULL` guard skips a nullable repo_meta value (index_meta.value is NOT NULL).\n\nTEST: v039_leaves_reclassified_global_keys_in_index_meta pins the filter; full_ladder_replay_on_a_two_repo_db_is_idempotent stays green (proves no hard-error). Test-side: any test that seeded a now-global key in repo_meta / asserted it relocated must switch to index_meta (git_history/reconcile/worktree_overlay/github_papertrail FTS tests, the v039 standalone test swapped fts_dirty\u2192git_commit).",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783080568588,
+  "updated_at_ms": 1783080568588,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f27e2470c_15fcd3092b3d",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783080568588
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "413",
+   "V039",
+   "V040",
+   "memory-sync",
+   "migration",
+   "phase-a",
+   "round-5"
+  ]
+ },
+ {
+  "memory_id": "mem_19f27e1eb74_bc672ed83488",
+  "kind": "Invariant",
+  "title": "Meta-key classification: which V039-relocated keys are GLOBAL vs per-repo (V040 round-5)",
+  "body": "PR #413 round-5 (branch feat/phase-a-3-core-scoping). V039 (A2) relocated 18 singleton meta keys index_meta/reconcile_meta \u2192 repo_meta under the one-DB-per-repo assumption. 5 of them are actually GLOBAL infrastructure; V040 moves them BACK to index_meta. DO NOT re-relocate a global key in a later phase.\n\nTHE 18-KEY TABLE (key | source | class | disposition):\n- source_root | index_meta | PER-REPO | stays repo_meta (this repo's config root; lifecycle open + rebuild/incremental write + query/memory/validate read)\n- content_revision | index_meta | **GLOBAL** | MOVED back \u2014 `IndexDatabase::content_revision()` digests the WHOLE main.files (NO repo filter). Only writer is record_content_revision; Status.content_revision uses the METHOD (fresh), the stored key had ZERO prod readers.\n- git_commit | index_meta | PER-REPO | stays (this repo's HEAD; git_meta write, query_api brief + clones/mod freshness read)\n- git_dirty | index_meta | PER-REPO | stays (this repo's worktree dirty; git_meta/brief)\n- graph_index_version | index_meta | PER-REPO | stays (edges are per-repo via files.repo_id; ensure_graph_index_current's DELETE was already scoped in round-3, so per-repo freshness is correct)\n- active_embedding_model | index_meta | PER-REPO | stays \u2014 DECISION: each repo's rag-rat.toml names its own [llm.embedding] model; reconcile gates per-repo scope on the configured model; seed_active_embedding_model seeds per-repo from config; per-repo chunk_embeddings vectors belong to that repo's model. GLOBAL would make two repos with different embedding configs THRASH (each open reseeds the one active model, forcing the other into perpetual re-embed). (The 2 stragglers active_embedding_model_provisional + active_embedding_remote_config are moved index_meta\u2192repo_meta by V040's existing relocate_meta_keys(V040_INDEX_META_KEYS) \u2014 same per-repo family.)\n- clone_graph_live_generation | index_meta | PER-REPO | stays (pointer to THIS repo's live generation; generations are globally-unique ints, one belongs to one repo; precompute live_generation_row)\n- github_last_sync_ms | index_meta | PER-REPO | stays (github/api)\n- git_history_indexed_head / _root / _shallow | index_meta | PER-REPO | stay (git_history cursors)\n- local_crate_roots | index_meta | PER-REPO | stays (this repo's workspace member roots; packages write, edges/imports read)\n- indexed_at_ms | index_meta | PER-REPO | stays (rebuild/incremental write, brief read)\n- fts_dirty / fts_source_revision / fts_synced_at_ms | index_meta | **GLOBAL** | MOVED back \u2014 chunk_fts is ONE FTS5 index over the whole chunks table (never repo-scoped) and its freshness digest is content_revision() (global). Per-repo copies caused stale-dirty loops (repo A pays a full FTS rebuild forever after repo B synced \u2014 the #219 alternating-rebuild class).\n- embedding_active_model_version | reconcile_meta | PER-REPO | stays (pairs with active_embedding_model; ai/mod ACTIVE_EMBEDDING_MODEL_VERSION_META)\n- vector_int8_reencode_cursor | reconcile_meta | **GLOBAL** | MOVED back \u2014 reencode.rs walks the WHOLE chunk_embeddings table (SELECT/UPDATE carry NO repo_id filter; format-only int8 conversion is repo-independent) beside an already-global done-gate (vector_int8_reencode_done stayed in index_meta). A per-repo cursor split one global walk into per-repo resume markers \u2192 a sibling open rescans from head.\n\nNET: 5 moved back (content_revision, fts_dirty, fts_source_revision, fts_synced_at_ms, vector_int8_reencode_cursor); 13 stay. Runtime accessors for the 5 use the GLOBAL fns: fts.rs/meta.rs/query_api use self.meta/self.set_meta; reencode.rs uses ai::meta/set_meta/delete_meta (new delete_meta added to ai/helpers.rs).",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783080545140,
+  "updated_at_ms": 1783080545140,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f27e1eb74_bc672ed83488",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783080545140
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "413",
+   "V040",
+   "memory-sync",
+   "meta",
+   "phase-a",
+   "repo-id",
+   "round-5"
+  ]
+ },
+ {
+  "memory_id": "mem_19f24ea3aac_ce66224cf610",
+  "kind": "Decision",
+  "title": "V040 repo_id core-table scoping + active_repo_id resolver + scope-view/gc slicing (memory-sync phase A3)",
+  "body": "A3 of the global-DB consolidation (on A1/V038 + A2/V039). Scopes DIRECT core tables by repo_id, makes scope-view + gc repo-aware, replaces single_repo_id with a context resolver. LATEST 39->40; MIGRATION_040 arms in known_version/known_migration/checksum `sha256:rag-rat-repo-id-core-scoping-v40`.\n\nV040 = `apply_repo_id_core_scoping`. DIRECT tables (repo_id NOT NULL DEFAULT '__unassigned__'): files (UNIQUE->(repo_id,path,commit_sha,worktree_id)), packages (UNIQUE->(repo_id,manifest_dir,commit_sha,worktree_id)), logical_symbols+docs (add col), parser_failures (PK->(repo_id,path), STRICT), git_commits (PK->(repo_id,hash), STRICT), git_file_changes (repo_id + composite FK ON DELETE/UPDATE CASCADE). Transitive tables scope via files.repo_id through the view.\n\n*** BACKFILL-TARGET INVARIANT (P1): DEFAULTs are STATIC, so rebuilds stamp existing rows '__unassigned__'; on an ALREADY-ADOPTED DB register_repo's fast path never re-points -> orphan under placeholder -> EMPTY scope view after upgrade. FIX: `backfill_repo_id_to_sole_repo` runs INSIDE the V040 txn after the rebuilds (sole_repo_id, hard error on !=1). git_file_changes updated EXPLICITLY (FK OFF in the txn, so git_commits' ON UPDATE CASCADE does NOT fire). Test: migration_040_backfills_an_adopted_pre_v040_db_under_the_real_repo_id. ***\n\n*** LOGICAL-SYMBOL KEY QUALIFICATION: `LogicalSymbolKey::stable_id(repo_id)` FOLDS repo_id (first canonical field) into the content hash so two repos with identical content derive distinct 63-bit ids. Composite PK REJECTED: `id` is the scalar `sym_<hex>` wire handle + FK/PK target of members/monikers/bindings, must stay a globally-unique scalar. Test: identical_content_in_two_repos_yields_distinct_logical_symbols. ***\n\n*** ROUND-3 (PR #413, branch feat/phase-a-3-core-scoping) \u2014 see the sibling memory \"local-only identity class + logical-symbol id realign\" for the full design; key deltas: ***\n1. ID-MAP REWRITE (the fold's upgrade tail): folding repo_id CHANGES every logical id the next rebuild produces, dangling pre-V040 repo_memory_bindings / repo_memory_call_paths / logical_symbol_monikers / logical_symbol_members. `graph_index.rs::realign_logical_symbol_ids(conn)` recomputes id=hash(row.repo_id \u2016 key) per row (signature recovered via members->symbols; NULL-qname rows skipped) and re-points the PK + all 5 referencing columns via a NEGATIVE temp-id two-phase pass (no mid-migration PK collision). Called from V040 AFTER backfill (FK OFF) AND from register_repo adoption AFTER the placeholder->real re-point (with `PRAGMA defer_foreign_keys=ON` \u2014 logical_symbol_members has an ON DELETE CASCADE FK to logical_symbols(id)). Idempotent; the two calls compose. Common upgrade (pre-V038 DB, unadopted at V040) needs BOTH: V040 aligns under the placeholder id, adoption re-aligns under the real id. Tests: migration_040_realigns_logical_symbol_ids_and_carries_bound_memories, adoption_realigns_logical_symbol_ids_so_pre_v040_memories_survive.\n2. IDENTITY split corrected: a cut shallow clone is NO LONGER `Rejected` \u2014 resolve_repo_identity derives a deterministic `local:`-prefixed LocalOnly id and open_config/rebuild/incremental ADOPT it. `Rejected` now = reserved-'__unassigned__' pin + unreadable/root-less (non-shallow) history only. `Absent` (non-git/unborn HEAD) still falls back to sole_repo_id. Branch on `err.is_absent()`.\n3. ensure_graph_index_current's `DELETE FROM edges_data` is now scoped (`WHERE source_file_id IN (SELECT id FROM main.files WHERE repo_id=?active)`) \u2014 a stale per-repo graph_index_version no longer wipes a sibling's edges. Test: graph_refresh_of_one_repo_leaves_the_other_repos_edges.\n4. lexical::graph_boost gained a repo_id predicate (`AND EXISTS(SELECT 1 FROM main.files f WHERE f.id=d.source_file_id AND f.repo_id=?3)`) \u2014 was the last unscoped edges_data reader; query-plan test still pins name-id index use + no files scan.\n5. INCREMENTAL ADOPTION: index_incremental_with_progress now calls adopt_repo_from_config BEFORE set_context (was Self::open -> set_context, config-blind sole-repo fallback could stamp under the wrong repo on a consolidated DB). Test: incremental_adopts_the_config_repo_over_a_smaller_sibling.\n6. V042 SEAMs (guarded, not scoped): oracle_runs + clone_graph_generations have NO repo_id until V042, and gc's prune_oracle_runs_outside_scope + precompute's complete_generation (`DELETE ... WHERE generation != live`) + open_building_generation (`DELETE ... WHERE status='Building'`) are GLOBAL. Guard each with `schema::multiple_real_repos(conn)` (>1 real repos): SKIP the destructive global sweep on a consolidated DB. Single-repo (every DB pre-A7) unchanged. Tests in gc/precompute + multi_repo_scope.\n*** end ROUND-3 ***\n\nRESOLVER: schema/registry.rs `active_repo_id(conn)` reads temp.connection_context['repo_id'] else `sole_repo_id`. Scope view (`write_scope_view`) filters repo_id in BOTH branches + the shadow sub-select. gc staging is repo-sliced; SHARED content-addressed tables (name_strings, embedding_cache, chunk_text_dict) stay GLOBAL with UNION liveness.\n\nFOOTGUN: V008's files rebuild drops repo_id on every apply() (schema::apply re-runs EVERY migration). Guard with `files_has_commit_scoped_unique(conn)`.\n\nOPEN-FLOW: open_config/rebuild/incremental: open -> adopt_repo_from_config -> set_context -> manifest heal. Registration MUST precede the manifest heal. bare open() uses sole_repo_id; try_open_config_read_only NOW uses resolve_config_repo_id (see ROUND-4).\n\nTESTS: multi_repo_scope.rs two_repo_fixture (indexes A for real, seeds B directly). repo_registry.rs owns the V040 tip pin, backfill, torn-state/FK-CASCADE adoption, the id-realign tests, and the open_config error-class pins (reserved pin surfaces; shallow ADOPTS under LocalOnly; non-git falls back). HANDOFF A4=github(V041); A5=periphery(V042); A6=scope-view generation filter.\n\n*** ROUND-4 (PR #413) READ-PATH SCOPING + MULTI-REPO REPLAY IDEMPOTENCE (findings #1/#2/#3): (a) NEW schema::resolve_config_repo_id(conn, root, override) -> Option<String> (registry.rs) is the READ-path counterpart to register_repo (registers NOTHING): route1 = derive identity, use it IF it is a registered real repo; route2 = the recorded repo_roots mapping for the root (override-independent, catches pinned/local/portable); route3 = sole repo on a single-repo DB, else None on a consolidated one. A Rejected pin -> None (surfaces via the read-write open). try_open_config_read_only now uses it (NOT sole_repo_id) AND builds the db + set_context BEFORE the manifest/embedding-seed gates, so those gates' internal active_repo_id resolves to the CONFIG repo \u2014 previously they ran context-less and hit sole_repo_id -> a SIBLING in a consolidated DB, falsely reporting heal-owed (returned None). (b) install_worktree_scope_view now takes an EXPLICIT repo_id arg; the raw-conn callers (CLI + MCP grep-augment hooks, query::orientation) resolve it via index::resolve_scope_repo_id(conn, config_root, override) and pass it (empty string = sibling-safe empty scope). The old active_repo_id-fallback helper install_scope_view is now #[cfg(test)]-only. (c) FINDING-3: relocate_meta_keys gained an IDEMPOTENCE GATE (SELECT EXISTS ... key IN (...)) BEFORE its migration-local sole_repo_id \u2014 on a re-apply the source keys are already moved, so it returns early WITHOUT resolving sole_repo_id. That is what makes schema::apply (create_or_migrate / index --full) stop HARD-ERRORING at V039 on a consolidated >1-repo DB. V038 (NOT-EXISTS seed guard) and V040 (files.repo_id sentinel short-circuit) were already replay-safe \u2014 proven by full_ladder_replay_on_a_two_repo_db_is_idempotent (replays the WHOLE ladder on a 2-repo DB, asserts no error + no data movement, on a FRESH conn since the fixture conn carries the temp.files view). Read-path tests: read_only_open_binds_the_config_repo_over_a_smaller_sibling, resolve_config_repo_id_binds_a_recorded_root_over_the_sole_pick, resolve_config_repo_id_returns_none_for_a_rejected_pin. ***",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783030758060,
+  "updated_at_ms": 1783076626234,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f24ea3aac_ce66224cf610",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783030758060
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "V040",
+   "gc",
+   "memory-sync",
+   "migration",
+   "phase-a",
+   "repo-id",
+   "schema",
+   "scope-view"
+  ]
+ },
+ {
+  "memory_id": "mem_19f2433a36c_ba277ec23a00",
+  "kind": "Decision",
+  "title": "V038 repos registry + register_repo adoption contract (memory-sync phase A1)",
+  "body": "A1 of the global-DB consolidation. Adds V038 (`repos`/`repo_roots`/`repo_meta`, all STRICT) + `repo_identity.rs` + `data_dir.rs` + a parse-only `[index] repo_id` config override. NO scoping of other tables and NO default-path flip yet (those are A3 / A7).\n\nREGISTRY SHAPE (schema/migrations.rs `apply_repos_registry` / `REPOS_REGISTRY_DDL`). `repos(repo_id PK, display_name, registered_at_ms)`; `repo_roots(repo_id FK->repos ON DELETE CASCADE, root, registered_at_ms, PK(repo_id,root))`; `repo_meta(repo_id FK->repos ON DELETE CASCADE, key, value, PK(repo_id,key))`. Seeds ONE placeholder row repo_id='__unassigned__'; that literal MUST equal schema::LEGACY_REPO_ID. CASCADE FKs point at repos (not a REINDEX_VOLATILE_PARENT), so the volatile-FK trip-wire does NOT flag them.\n\nPLACEHOLDER-SEED INVARIANT (was a real bug). The seed is CONDITIONAL: INSERT OR IGNORE ... SELECT '__unassigned__','',0 WHERE NOT EXISTS (SELECT 1 FROM repos WHERE repo_id != '__unassigned__'). WHY: schema::apply re-runs EVERY additive migration, and IndexDatabase::rebuild reaches it via create_or_migrate on an ALREADY-ADOPTED DB. After adoption removed the placeholder, a plain INSERT OR IGNORE re-mints it beside the real row (test reapplying_schema_after_adoption_does_not_resurrect_the_placeholder). Any NEW state a migration seeds that adoption later removes MUST carry the same \"only when un-adopted\" guard.\n\nregister_repo (schema/registry.rs, pub fn register_repo(conn, &RepoIdentity, root, now_ms) -> rusqlite::Result<String>). Idempotent, called on every open. Cases: (1) repo_id already the real id \u2192 no-op except INSERT OR IGNORE root into repo_roots. (2) NO real id yet (only placeholder) \u2192 ADOPTION (inside ONE txn): INSERT the real repos row, re-point repo_meta children, re-point the V040 direct-scoped tables, realign logical-symbol ids (see A3 EXTENSION), DELETE the placeholder repos row, record root. (3) a DIFFERENT real repo_id already owns the DB \u2192 REFUSE (SQLITE_CONSTRAINT) \u2014 the single-repo invariant for phase A; A7 turns register_repo into multi-repo registration. (ROUND-4: case (3) now has ONE exception \u2014 a `local:` incumbent + a Portable incoming UPGRADES; see the ROUND-4 block below.)\n\nA3 ADOPTION EXTENSION (V040, mem_19f24ea3aac). Inside the SAME adoption txn, after the repo_meta UPDATE and before the placeholder DELETE, register_repo loops `V040_DIRECT_SCOPED_TABLES` = [files, packages, logical_symbols, docs, parser_failures, git_commits] running `UPDATE {table} SET repo_id=real WHERE repo_id=placeholder`. git_file_changes is DELIBERATELY ABSENT (its (repo_id,commit_hash) FK is ON UPDATE CASCADE, carried by the git_commits rewrite). repo_meta handled by the earlier UPDATE.\n\n*** ROUND-3 (PR #413): the adoption loop is followed by `PRAGMA defer_foreign_keys=ON` + `graph_index.rs::realign_logical_symbol_ids(&tx)`. WHY: re-pointing logical_symbols.repo_id changes the id every row SHOULD have (stable_id folds repo_id, A3), so the next rebuild_logical_symbols would dangle every pre-adoption repo_memory_bindings / repo_memory_call_paths / logical_symbol_monikers / logical_symbol_members handle. realign recomputes id=hash(real \u2016 key) and re-points the PK + all 5 referencing columns IN PLACE. It must run with FK checks DEFERRED because logical_symbol_members has an ON DELETE CASCADE FK to logical_symbols(id) and adoption runs foreign_keys=ON \u2014 an immediate parent-id UPDATE would trip the child FK; defer_foreign_keys=ON auto-resets at commit. Idempotent with V040's own realign (the two compose for the pre-V038-upgrade path). Test: adoption_realigns_logical_symbol_ids_so_pre_v040_memories_survive. ***\n\nRESERVED-ID GUARD (defense in depth). register_repo ALSO refuses UP FRONT any identity.repo_id.trim() that is EMPTY/whitespace OR == LEGACY_REPO_ID (a caller can hand-build a RepoIdentity; registering the placeholder degenerates adoption). Tests: register_repo_refuses_the_reserved_placeholder_and_stays_adoptable; register_repo_refuses_an_empty_or_whitespace_repo_id.\n\nrepo_identity.rs (resolve_repo_identity(root, override_id)). Default repo_id = LEXICOGRAPHICALLY SMALLEST root-commit hash reachable from HEAD (a Portable id). A trimmed non-empty override wins (Portable) EXCEPT __unassigned__/LEGACY_REPO_ID, which is REFUSED. display_name = working-tree dir name. *** SHALLOW POSTURE UPDATED (PR #413): a cut shallow clone (no reachable parentless root) NO LONGER errors \u2014 it derives a DETERMINISTIC `local:`-prefixed LocalOnly id from the sorted `.git/shallow` boundary (via repo.shallow_commits()), logs ONE warning, and proceeds. Identity now carries `class: RepoIdentityClass{Portable|LocalOnly}`. RepoIdentityError shrank: `Rejected` = reserved pin + unreadable/root-less (non-shallow) history only; `Absent` = non-git/unborn HEAD (adopt_repo_from_config falls back to sole_repo_id). See the sibling identity-class memory bound to repo_identity.rs. *** Unborn HEAD \u2192 empty_repo_error (Absent). Config gained parse-only pub repo_id_override; adopt_repo_from_config passes it into resolve_repo_identity.\n\ndata_dir.rs \u2014 global_database_path() = data_dir()/rag-rat.sqlite via XDG cascade. Not wired into path resolution yet (A7).\n\nA2 REVIEW-FIX \u2014 ADOPTION IS ATOMIC: register_repo wraps the WHOLE adoption in ONE conn.unchecked_transaction() (INSERT real repos row / UPDATE repo_meta / UPDATE the V040 tables / realign / DELETE placeholder / record_repo_root / commit). WAS A REAL BUG: separate autocommits left a torn state (both real row AND placeholder) the case-(1) fast path never repairs. Test register_repo_adoption_is_atomic_on_a_mid_sequence_failure. V039's relocate_meta_keys resolves a migration-local sole_repo_id (hard error on !=1). NB the LADDER does NOT wrap apply fns in a txn \u2014 a non-idempotent multi-statement migration self-wraps (V040's rebuilds do).\n\n*** ROUND-4 (PR #413): register_repo GAINS the LocalOnly->Portable UPGRADE transition. Case order now: (1) real_ids contains incoming id -> no-op + record root; (2) real_ids == [local:X] AND incoming identity.class==Portable -> UPGRADE; (3) any OTHER different real id -> REFUSE (Portable vs diff-Portable; a LocalOnly incoming vs a real incumbent \u2014 a deepened clone must NOT downgrade a portable id). The adoption txn is generalized: repoint_from = upgrade_from (the local id) .or(placeholder_present ? LEGACY_REPO_ID). It re-points repo_meta + V040_DIRECT_SCOPED_TABLES + repo_roots (NEW: the local id has recorded roots and repo_roots FK is ON DELETE CASCADE, so move them BEFORE deleting the source repos row; the placeholder never has roots so the UPDATE is a no-op there) FROM source_id, then PRAGMA defer_foreign_keys=ON + realign_logical_symbol_ids + DELETE the source repos row. A tracing::warn! on the upgrade path states the local->portable re-point. Guarded on exactly one real repo (a consolidated DB is never upgraded here). Tests (repo_registry.rs): register_repo_upgrades_a_local_only_id_to_a_portable_id_in_place (files+roots re-pointed, bound memory survives the realign, local id gone), register_repo_refuses_a_local_only_incoming_against_a_real_incumbent, register_repo_refuses_a_portable_incoming_against_a_portable_incumbent, and end-to-end unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place. A pinned `local:` id is refused by resolve_repo_identity (see the identity-class memory). ***",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783018791788,
+  "updated_at_ms": 1783076538130,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f2433a36c_ba277ec23a00",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783019562522
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "V038",
+   "memory-sync",
+   "migration",
+   "phase-a",
+   "repo-id",
+   "schema"
+  ]
+ },
+ {
+  "memory_id": "mem_19f271576de_5a2c175154b0",
+  "kind": "Decision",
+  "title": "Repo identity portability class: Portable vs LocalOnly (open-time never hard-rejects a shallow clone)",
+  "body": "PR #413 (branch feat/phase-a-3-core-scoping). `resolve_repo_identity(root, override_id) -> Result<RepoIdentity, RepoIdentityError>` in crates/rag-rat-core/src/repo_identity.rs. `RepoIdentity` gained `class: RepoIdentityClass { Portable | LocalOnly }` (scoping-neutral tag, never an identity input, not persisted).\n\nWHY THIS EXISTS: the CI benchmark/eval/oracle jobs index fixture corpora from SHALLOW checkouts (--depth 1). The prior A3 code REJECTED a cut shallow clone (`RepoIdentityError::Rejected`, \"cannot derive a stable repo_id from the shallow clone\u2026\"), and that error PROPAGATED through open_config/rebuild -> every one of those CI jobs panicked (runs 28630900729/712/713). Blocking indexing on a shallow checkout is wrong: the id IS stable on this machine, it just isn't portable across machines.\n\nTHE RULE \u2014 open-time resolution MUST NOT hard-reject a shallow clone; it downgrades the class instead:\n- Full history reachable (a parentless root commit) -> `Portable`, id = lexicographically-smallest root-commit hash (unchanged).\n- Explicit `[index] repo_id` pin (non-reserved) -> `Portable` (the user chose a stable string).\n- Cut shallow clone (NO reachable parentless root) -> `LocalOnly`, id = `local:<sha256 hex of the sorted .git/shallow boundary commit hashes>`, via `repo.shallow_commits()` (gix keeps that list SORTED, so two opens of the SAME clone hash identical bytes \u2192 deterministic; a DEEPER clone has a different boundary \u2192 a different id, which is exactly why it is not portable). Logs ONE `tracing::warn!` naming the future constraint + both remedies (`git fetch --unshallow`, or pin `[index] repo_id`), then PROCEEDS. register_repo adopts the `local:` id as a normal real repo.\n\n`RepoIdentityError` SHRANK to genuinely-invalid inputs: `Rejected` = a reserved-'__unassigned__' pin OR an unreadable/root-less (NON-shallow) history (walk failure / corrupt graph). `Absent` (unchanged) = not a git repo / unborn HEAD \u2192 adopt_repo_from_config falls back to sole_repo_id (single-repo/unadopted, pre-A3 behavior). Callers branch on `err.is_absent()`; a shallow clone is now an `Ok(LocalOnly)`, never an error.\n\nWHERE THE HARD GATE LIVES INSTEAD: not at open/index time \u2014 in the future family-sync layer, which will refuse to replicate a non-Portable id (a LocalOnly id would split a repo's identity across machines). `class` travels with the identity so sync can enforce that; indexing never does.\n\nTESTS (repo_identity.rs unit + repo_registry.rs integration): shallow_clone_that_cuts_history_gets_a_deterministic_local_only_id (asserts LocalOnly, `local:` prefix, determinism across two opens, pin overrides to Portable); shallow_clone_covering_full_history_resolves_the_real_root (a depth-covering shallow clone is Portable \u2014 `is_shallow()` alone would wrongly downgrade it; the \"no reachable parentless root\" signal is what distinguishes cut-vs-covered); open_config_adopts_a_shallow_clone_under_a_local_only_id; git_history_reload_is_not_skipped_on_a_shallow_clone now runs UNPINNED (exercises the LocalOnly adoption path the CI fixtures hit).\n\nAPPLY: don't reintroduce a shallow-clone rejection at open/index time. If you need \"portable identity required,\" check `class == Portable` at the sync boundary, not in resolve_repo_identity. See the V038 adoption memory (mem_19f2433a36c) and V040 memory (mem_19f24ea3aac) for how the id then flows through registration/scoping.\n\n*** ROUND-4 (PR #413, branch feat/phase-a-3-core-scoping): `LOCAL_ONLY_ID_PREFIX = \"local:\"` is now a SHARED `pub const` in repo_identity.rs (used by local_only_id_from_boundary AND register_repo). resolve_repo_identity now REFUSES a pinned override that starts with `local:` (Rejected class, reserved_local_prefix_error) \u2014 the prefix is reserved for machine-derived shallow ids, and register_repo keys its LocalOnly->Portable UPGRADE off an incumbent id carrying it, so a pinned `local:` id would be ambiguous. A cut shallow clone that is later deepened (`git fetch --unshallow`) resolves Portable again; register_repo then re-points the existing index from the local: id to the portable one IN PLACE (see the V038 adoption memory) instead of the old dead-end refusal. Test: override_with_the_reserved_local_prefix_is_refused. ***",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783067145950,
+  "updated_at_ms": 1783076493515,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f271576de_5a2c175154b0",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/repo_identity.rs",
+    "path": "crates/rag-rat-core/src/repo_identity.rs",
+    "anchor_status": "gone",
+    "created_at_ms": 1783067145950
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "413",
+   "identity",
+   "memory-sync",
+   "phase-a",
+   "repo-id",
+   "shallow-clone"
+  ]
+ },
+ {
+  "memory_id": "mem_19f254367c4_d8b756427aa6",
+  "kind": "Decision",
+  "title": "V042 clone/oracle/reconcile/memory periphery repo_id scoping + integration onto V041 (memory-sync phase A5)",
+  "body": "A5 of the global-DB consolidation (on A1/V038, A2/V039, A3/V040, A4/V041). Scopes the DIRECT periphery tables the A3/A4 sweeps left GLOBAL. LATEST 41->42; MIGRATION_042 arms in known_version/known_migration/migration_checksum_mismatch (checksum `sha256:rag-rat-repo-id-periphery-scoping-v42`) \u2014 the same \"arms not enough / add all three or current_version caps at prior tip\" footgun the A2-A4 memories flag.\n\nV042 = `apply_repo_id_periphery_scoping` (migrations.rs). SENTINEL = `column_exists(conn,\"repo_memories\",\"repo_id\")` (all-or-nothing; the whole migration is ONE self-wrapped `PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;\u2026COMMIT; foreign_keys=ON` because the ladder runs apply fns in AUTOCOMMIT \u2014 the V040 recipe). Each rebuild starts `DROP TABLE IF EXISTS <t>_new` for torn-state re-convergence. THREE shapes:\n- ADDITIVE column (`A5_ADDITIVE_SCOPED_TABLES`, add_column_if_missing REPO_ID_COLUMN_DEF): clone_graph_generations, oracle_runs, reconcile_attempts, repo_memories, repo_memory_bindings.\n- KEY REBUILD (repo_id joins the PK/UNIQUE \u2192 table rebuild): clone_token_df PK(repo_id,normalizer_kind,token_hash); clone_refinements PK(repo_id,class_key); edge_oracle content-key PK prepends repo_id (+3 idx); logical_symbol_monikers PK(repo_id,logical_symbol_id,tool) (+1 idx); dream_findings UNIQUE(repo_id,kind,subject,claim_hash) (+2 idx). STRICT preserved.\n- STANDALONE FTS: repo_memory_fts DROP+CREATE with `repo_id UNINDEXED`, repopulated from repo_memories (so repo_id comes from each memory's freshly-added column; group_concat reads repo_memory_tags).\nclone_edges/clone_subblock_postings are NOT scoped \u2014 the clone GENERATION integer stays GLOBALLY unique (allocated MAX(generation)+1 over ALL repos), so a build_generation belongs to exactly one repo and those children scope transitively; only the generation SWEEPS (complete_generation, Building cleanup, postings invalidation) got a repo_id predicate so a repo's precompute never deletes a sibling's gens. symbol_fingerprints/symbol_token_postings stay symbol_id-keyed (transitive via symbols->files.repo_id) \u2014 the CLONE_FINGERPRINT_DDL \"never add scope columns\" rule is about the COMMIT/WORKTREE axis; repo_id is a different cross-repo axis and only clone_token_df/clone_refinements there take it.\n\nGATING (schema/registry.rs `periphery_repo_scope(conn, probe_table) -> Option<String>` + `periphery_repo_scope_clause(&Option<String>, qualifier)`): every periphery query sweep gates its repo_id predicate on the probe \u2014 Some(active_repo_id) when the column is present (a normal open runs the full ladder incl. V042), None on a raw connection that never ran the ladder (\u2192 original unscoped SQL). Reads interpolate an escaped-literal ` AND t.repo_id='\u2026'` (NOT a bind param \u2014 these carry positional/`IN(...)` lists; the id is registry-validated content, quotes doubled); writers embed the id as a per-call literal prefix so bound params + ON-CONFLICT targets are the only thing that changes when scoped. The rebuilt PKs force write_edge_oracle / write_logical_symbol_moniker / the df bump / clone_refinements INSERT-OR-REPLACE to WIDEN their ON CONFLICT target in the scoped branch. Sweeps touched: query/memory (create stamp; memory_search, memories_for_*, list_memories, doctor_* filter repo_id; duplicate_memory_id +repo_id so dedupe never crosses repos; upsert_memory_fts writes repo_id; moniker_for_logical_symbol* filter); clones (precompute generation sweeps, substrate/of_text df reads, refine/cache read+write, file_index df bump, rebuild refresh_clone_token_df); oracle/store (oracle_runs record/read/prune, edge_oracle write/clear/prune, monikers count/clear/write).\n\nADOPTION: `A5_PERIPHERY_DIRECT_SCOPED_TABLES` (registry.rs, the 5 additive + 5 rebuilt + repo_memory_fts) re-pointed in register_repo's adoption txn, each guarded by `column_exists(tx, table, \"repo_id\")`. This is a STRONGER guard than A4's `adoption_table_present` (table-existence) and it MUST be: several periphery tables (dream_findings, edge_oracle, clone_token_df, logical_symbol_monikers, oracle_runs) predate V042 and exist at earlier schema versions WITHOUT the column, so a partial-schema fixture that stopped before V042 has the table but not the column.\n\nDEFERRED (schema column + adoption done, QUERY scoping not): dream_findings + reconcile_attempts writers use no ON CONFLICT so they don't break on the scoped schema \u2014 they operate on the '__unassigned__' partition, single-repo-correct for phase A; multi-repo dream/reconcile isn't reachable until A7. edge_oracle metric READS (edge_oracle_scope_join, clear_edge_oracle_for_tool) stay transitively scoped via their files join (the WRITE stamps repo_id); only a cross-repo path+sha256 collision could leak.\n\nINTEGRATION (this A5 branch = A4's V041 commit + ONE A5 commit). A5 was authored UNREGISTERED (a sibling owned V041) then registered here: purely additive (consts + LATEST bump + ADDITIVE_MIGRATIONS entry after V041 + the 3 recognizer arms + drop the `#[cfg_attr(not(test), allow(dead_code))]` off the apply fn/6 rebuild helpers/A5_ADDITIVE_SCOPED_TABLES). Rebase conflicts (both stacked on A3/627e8d8): migrations.rs \u2014 A4's V041 fns and A5's V042 block both insert after rebuild_git_commits_tables_with_repo_id and git aligned their trailing braces; resolve by co-locating BOTH (additive) and inserting the missing `}` for rebuild_github_fts_with_repo_id between them. multi_repo_scope.rs \u2014 both APPEND-ONLY (single `@@ -180` hunk each), A5 namespaces its helpers a5_/A5_ so no collision; reconstruct = A4's full file + A5's block (lines 183+). registry.rs/mod.rs auto-merged (A4 renamed V040_DIRECT_SCOPED_TABLES->DIRECT_SCOPED_ADOPTION_TABLES; A5 added its own const/loop after).\n\nTESTS: repo_registry.rs owns the migration-shape coverage (A4's placement convention). migration_042_is_the_latest_tip_and_scopes_periphery owns the absolute LATEST==42 pin (V041's tip test dropped to symbolic \u2014 \"pin moves to the new tip\"). migration_042_periphery_rebuild_preserves_rows_and_reconverges_from_torn_state is the DIRECT-FN ISOLATION test: builds the pre-V042 schema via `seed_pre_v042_periphery_schema` = calling the real pub(crate) DDL fns (apply_baseline + apply_oracle_tables + apply_scip_moniker_anchors + apply_clone_fingerprint_tables + apply_clone_graph_tables + apply_dream_findings + apply_repos_registry) \u2014 DRIFT-PROOF vs hand-copied CREATE TABLEs (per the \"assert deferred-absence against the migration DDL in isolation\" Risk memory). FOOTGUN: that isolation test must NOT call register_repo \u2014 apply_baseline creates `files` WITHOUT repo_id (V040 not run in a periphery-only fixture), so adoption's DIRECT_SCOPED_ADOPTION_TABLES loop (table-presence guard) would `UPDATE files SET repo_id` \u2192 \"no such column\". Adoption is instead covered by full_ladder_v037_to_v042_scopes_both_workstreams_data (full schema): seed A4 (github) + A5 (memory/oracle/clone) rows under the placeholder, truncate_schema_to(37), migrate_forward re-runs the WHOLE A-phase (safe: V038 INSERT OR IGNORE...WHERE NOT EXISTS + V039 copy-before-delete are idempotent, V040/V041/V042 sentinel-short-circuit), assert rows intact under the placeholder, then ONE register_repo re-points BOTH workstreams' rows to the real id. The multi_repo_scope A5 tests were converted from direct-fn to the LADDER (drop the explicit apply_repo_id_periphery_scoping call \u2014 schema::apply now runs V042; the clone_precompute test's DROP-VIEW-then-apply workaround is gone because V042 runs at open BEFORE install_scope_view).\n\nGates: cargo nextest run --workspace 1445 passed; clippy --all-targets -D warnings clean; +nightly fmt clean (the struct_lit_style warnings are pre-existing rustfmt.toml config noise). HANDOFF A6: generation-staged rebuild adds files.generation; the scope view's write_scope_view gains `AND files.generation=<live>`. A7: register_repo becomes multi-repo (drops the single-repo refusal); the deferred dream_findings/reconcile_attempts query scoping + the github uniqueness-key widening land then.",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783036602308,
+  "updated_at_ms": 1783036602308,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f254367c4_d8b756427aa6",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783036602308
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "V042",
+   "clones",
+   "memory",
+   "memory-sync",
+   "migration",
+   "oracle",
+   "phase-a",
+   "repo-id",
+   "schema"
+  ]
+ },
+ {
+  "memory_id": "mem_19f247e7b63_e1c21cdd16ee",
+  "kind": "Decision",
+  "title": "V039 per-repo meta relocation + single_repo_id stand-in (memory-sync phase A2)",
+  "body": "A2 of the global-DB consolidation (stacked on A1/V038). Moves the per-repo SINGLETON meta keys out of global `index_meta`/`reconcile_meta` into `repo_meta` under the `LEGACY_REPO_ID` ('__unassigned__') placeholder, and threads every read/write through a repo-scoped path. No other table scoped (A3+); reconcile_meta TABLE deliberately NOT dropped (later cleanup).\n\nV039 = `apply_move_per_repo_meta` (registered in ADDITIVE_MIGRATIONS; LATEST_SCHEMA_VERSION 38->39; MIGRATION_039 arms in known_version/known_migration/migration_checksum_mismatch; checksum `sha256:rag-rat-per-repo-meta-v39` is a hand-authored sentinel, nothing hashes the SQL). `relocate_meta_keys` does copy-then-delete per source table (INSERT OR IGNORE on the (repo_id,key) PK + DELETE), idempotent + torn-run-safe. MOVED index_meta keys: source_root, content_revision, git_commit, git_dirty, graph_index_version, active_embedding_model, clone_graph_live_generation, github_last_sync_ms, git_history_indexed_{head,root,shallow}, local_crate_roots, indexed_at_ms, fts_{dirty,source_revision,synced_at_ms}. MOVED reconcile_meta keys: embedding_active_model_version, vector_int8_reencode_cursor. STAYED GLOBAL (machine-level or postdate the plan inventory): generated_flags_version, the reencode DONE gate, throughput-tune cache, and the active-model provenance siblings below.\n\nACCESSORS. meta.rs primitives `pub(crate) repo_meta/set_repo_meta/set_repo_meta_if_changed/delete_repo_meta(conn, repo_id, key[, value]) -> rusqlite::Result` (delete_repo_meta added beyond the plan's 3 \u2014 clear paths need it). Re-exported at crate::index scope. IndexDatabase METHOD wrappers (same names, `self.repo_meta(key)`) resolve the repo + call the primitives (self.-style sites: fts, git_meta, graph_index, packages, incremental, rebuild, query_api/mod, clones/mod+precompute:408, record_content_revision). AI-module 2-arg wrappers in ai/helpers.rs mirror the ai::meta/set_meta/delete_meta trio.\n\nsingle_repo_id(conn) (schema/registry.rs, re-exported schema::single_repo_id) = the connection-level ACTIVE-REPO STAND-IN until A3. Returns the SOLE `repos` row (placeholder before adoption \u2014 the A2 common case since register_repo is NOT yet wired into open_config; real id after). debug_assert = exactly ONE repos row (NOT \"non-placeholder\": a legacy un-adopted DB's only row IS the placeholder). A3 REPLACES every single_repo_id(conn) with context.repo_id. Free-conn threading sites A3 must convert: git_history apply_prepared/status/is_history_current/clear; github/api sync_from_refs/sync_issue/status; precompute live_generation_row; edges/imports load_local_roots; query/memory/validate persisted_source_root; ai reconcile (helpers active_embedding_model_id/_version, model_lifecycle activate/clear/seed_owed/is_missing, manifest model_manifest_is_current/remove_legacy_models raw SQL, reencode load/save/clear_cursor); lifecycle open paths (source_root x2, graph_index_version). The IndexDatabase wrappers resolve it internally (A3 edits the wrapper body once).\n\nregister_repo ADOPTION EXTENDED (Step 4): INSERT real repos row FIRST, `UPDATE repo_meta SET repo_id=real WHERE repo_id=placeholder`, then DELETE the placeholder repos row. Insert-first/delete-last keeps the enforced FK (repo_meta -> repos, foreign_keys=ON at storage.rs:136, no ON UPDATE CASCADE) satisfied at each statement boundary without a txn/deferred checks \u2014 an in-place UPDATE of repos.repo_id would violate the FK once repo_meta has placeholder children. repo_roots never has placeholder rows (record_repo_root only writes under a real id). A3 extends re-pointing to its new direct-scoped tables. DEPENDENCY: once A3 wires register_repo into open_config, IndexDatabase::rebuild reaches schema::apply on an already-adopted DB; V038's placeholder seed MUST be the conditional `WHERE NOT EXISTS(real row)` form (A1 PR #408) or it re-mints the placeholder beside the real row and breaks single_repo_id's one-row invariant. (This A2 worktree predates #408; harmless here because register_repo is test-only.)\n\nFOOTGUN (cost real time): a DOUBLE-quoted grep for the key literals MISSES raw SQL, which SINGLE-quotes them. That nearly left THREE PRODUCTION readers on the emptied index_meta: edges/imports.rs::load_local_roots (local_crate_roots), git_history.rs::clear (the git_history_indexed_* DELETE), query/memory/validate.rs::persisted_source_root (source_root). When moving a meta key, grep BOTH quote styles AND `FROM/INTO/UPDATE index_meta|reconcile_meta`. gc.rs reads the CACHED storage.source_root(), not meta \u2014 no change.\n\nMODEL-PROVENANCE FAMILY NOW SPLIT ACROSS TABLES (footgun for A3/A5): active_embedding_model + embedding_active_model_version moved to repo_meta, but the siblings active_embedding_model_provisional + active_embedding_remote_config STAYED in index_meta (not in the plan's move list; postdate #394). activate_model_with_version / clear_active_embedding_model now write both tables in one call; manifest.rs raw SQL was re-pointed to repo_meta with a threaded repo_id. Correct for single-repo; A3/A5 should scope the two stragglers.\n\nDEAD CODE REMOVED (deny-warnings forced it): ai/helpers.rs reconcile_meta (read) + clear_reconcile_meta (only callers were the moved keys); meta.rs IndexDatabase set_meta_if_changed method (callers moved to set_repo_meta_if_changed). set_reconcile_meta STAYS (last_embedding_reconcile_{started,finished}_at_ms writers, which are write-only in prod \u2014 that is why the read/clear twins died).\n\nTESTS: schema_bootstrap_tests/repo_registry.rs owns the V039 + accessor + adoption + single_repo_id tests and now the absolute LATEST_SCHEMA_VERSION==39 tip pin (hardcoded-LATEST footgun). schema::apply-based ai tests just needed direct set_meta/set_reconcile_meta seeds renamed to set_repo_meta; reencode.rs hand-rolls a partial schema so setup_conn had to CREATE repos+repo_meta + seed the placeholder for single_repo_id. Raw-SQL test seeds re-pointed to `repo_meta(repo_id,key,value) VALUES ('__unassigned__', ...)`.",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783023696739,
+  "updated_at_ms": 1783023696739,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f247e7b63_e1c21cdd16ee",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783023696739
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "V039",
+   "memory-sync",
+   "migration",
+   "phase-a",
+   "repo-id",
+   "schema"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23dc4d0c_03815c8a34ea",
+  "kind": "Decision",
+  "title": "Active embedding model is seeded from config on a fresh index \u2014 it does NOT default to embedding-hash (#394)",
+  "body": "BUG (#394) + fix. `active_embedding_model_id(conn)` (index/ai/helpers.rs) falls back to `HASH_MODEL_ID` when the `active_embedding_model` meta is UNSET, and nothing seeded it from config \u2014 so a fresh index silently used `embedding-hash` regardless of `[llm.embedding] model`, and `reconcile` blocked naming `embedding-hash` instead of the configured model. `EmbeddingBackend::default()` is all-MiniLM, NEVER hash.\n\nFIX: `seed_active_embedding_model(conn, configured_model_id)` (index/ai/reconcile/model_lifecycle.rs) activates `config.llm.embedding.backend.model_id()` when a seed is owed. Called from every config-aware open: `rebuild` + `index_incremental_with_progress` (both INSIDE their txn \u2014 see atomicity), `open_config`, and `try_open_config_read_only` (returns None when a seed is owed \u2192 read-only tools fall back to the healing write path).\n\nSEED-OWED = PROVENANCE, NOT A PROXY (load-bearing lesson). Don't infer \"was the active model a user choice?\" from `ai_models.installed` (a recovered cache is installed too) or `current_embedding_count` (explicit install has 0 embeddings pre-reconcile, AND it's an O(index) scan every open). RECORD it: `ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META` (\"active_embedding_model_provisional\") = \"1\" AUTOMATIC / \"0\" or absent EXPLICIT|CONFIRMED. `activate_model_with_version(conn, id, version, provisional)` is the SINGLE writer stamping model+version+provenance together \u2014 `install_model` false (explicit), `recover_cached_fastembed_model` + the seed true (automatic). A reconcile committing embeddings (`embed_loop.rs`, `report.embeddings_written > 0`) calls `clear_active_embedding_model_provisional` \u2192 confirmed. `active_embedding_model_seed_owed`: model selected \u21d2 owed when active unset OR (active != config AND `active_embedding_model_is_provisional`) \u2014 O(1). Absent flag \u21d2 non-provisional \u21d2 respected (pre-#394 indexes + explicit/committed models safe). One signal: explicit install sticks before first reconcile; recovered cache yields to config; config edit before install adopted; committed model never clobbered; no per-open scan.\n\nEMBEDDINGS-OFF SYMMETRY (config `model=\"none\"`, model_id()==None): reconcile/status are config-BLIND (`reconcile_with_options_progress`/`status.rs` read `active_embedding_model_id` from the active meta, NOT config; the CLI reconcile cmd does NOT gate on config=None), so the SEED is the ONLY config\u2192meta bridge \u2014 disabling must flow through it too. `seed_owed(None)` owes a write only to CLEAR a still-active PROVISIONAL model (explicit/confirmed preserved) \u2192 `clear_active_embedding_model` drops model id + freshness version + provenance flag + remote config, so `active_embedding_model_id` returns to the hash fallback and nothing stale lingers. Restores the \"embeddings-off \u21d2 active unset\" invariant; without it a repo first opened with a real embedder then switched to `none` keeps prompting for the disabled model. `delete_meta` is the index_meta counterpart of `clear_reconcile_meta` (`clear_active_remote_config` now builds on it).\n\nTWO GAPS THE SEED SHARED WITH install (fix both when touching activation): (1) the seed clears `active_remote_config` (like `install_model`'s local branch) \u2014 else a reseed away from a remote activation lets `active_embedder` build an `OpenAiEmbedder` against the STALE endpoint \u2192 vectors in the wrong embedding space. (2) ATOMICITY \u2014 BOTH write-path seeds run INSIDE their transaction, never autocommit-before-BEGIN (a failed pass would otherwise strand the active model on a newly configured MISSING model, losing the old fallback): the `rebuild` seed before COMMIT (after set_meta indexed_at_ms); the `index_incremental_with_progress` seed inside its BEGIN IMMEDIATE block, folded into the `mutated` flag so a heal COMMITs while an idle pass with no heal owed stays a no-op read (preserves the #63 no-write invariant).\n\nSeeding does NOT install \u2014 reconcile still BLOCKS until the configured model is installed \u2014 but the block message (`embed_loop.rs` / `status.rs`) names the CONFIGURED model.\n\nTEST FOOTGUN: schema_bootstrap tests use `embedding-hash` as the no-download test embedder and used to rely on active-defaults-to-hash. A fresh index now adopts the CONFIGURED model, so a test that installs/uses hash must SELECT it (`config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap()` before `rebuild`): fixed `reconcile_requires_explicit_model_install_and_ignores_stale_artifacts`, `full_rebuild_preserves_installed_model_manifest`. Provenance unit tests (in-memory conn): respects_an_explicitly_installed_model, config_wins_over_a_provisionally_recovered_model, reseeds_a_provisional_model_when_the_config_changes, a_confirmed_model_is_respected_over_a_config_change, embeddings_off_clears_a_provisional_active_model, embeddings_off_preserves_an_explicit_active_model, embeddings_off_leaves_the_active_model_unset. Integration: reconcile_confirms_a_provisional_model_against_a_config_change; an_incremental_pass_heals_a_missing_active_model_atomically. `activate_model_with_version_writes_all_metas` asserts the provenance meta. PR #395.",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783013068044,
+  "updated_at_ms": 1783019434922,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23dc4d0c_03815c8a34ea",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/ai/reconcile/model_lifecycle.rs",
+    "path": "crates/rag-rat-core/src/index/ai/reconcile/model_lifecycle.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783013068044
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "394",
+   "active-model",
+   "bugfix",
+   "config",
+   "embedding",
+   "reconcile"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23be3a41_0a35130705b6",
+  "kind": "Decision",
+  "title": "files.generated unifies \"generated\" across the query layer; kind=generated files have NO symbols, path-heuristic codegen does (#202)",
+  "body": "Two distinct \"generated\" mechanisms in the indexer, and #202 unified them:\n\n1. **`files.kind = 'generated'`** (target classification, from the rag-rat.toml target's `TargetKind`). A `kind=generated` file is **chunk-only \u2014 it gets NO symbols** (`prep.rs`/`file_index.rs`: symbol extraction is gated `kind != Generated`). So a correctly-classified generated target can never pollute symbol search \u2014 nothing in `symbols` to match.\n\n2. **`files.generated` (INTEGER column)** \u2014 the flag the QUERY layer filters on. Search (`search/lexical.rs`), orientation, tree, clusters, and symbol search all default to `files.generated = 0` with an `include_generated` opt-in. BEFORE #202 it was set purely from `matches!(kind, Generated)`.\n\nTHE BUG (#202): codegen living UNDER a source target \u2014 e.g. ubrn FFI bindings at `packages/.../src/generated/*.ts`, indexed by a plain source binding \u2014 keeps `kind = source`, gets FULL symbol extraction, and had `generated = 0`. So it polluted symbol_lookup AND search, and a `kind != 'generated'` filter could never catch it.\n\nTHE FIX: `crate::index::file_is_generated(kind, path) = matches!(kind, Generated) || is_generated_path(path)` feeds the `generated` column at both insert sites. Those files still get symbols (extraction gated on `kind`, untouched) so the graph keeps them, but default search/lookup hides them. Symbol search filters `GENERATED_EXCLUSION_CLAUSE = \" AND files.generated = 0\"` (query/symbol.rs).\n\nREVIEW-DRIVEN REFINEMENTS (PR #204, three Codex P2s):\n- **`is_generated_path` is SEGMENT-based**, not substring: matches a `generated`/`generated-web` path SEGMENT at any depth INCLUDING repo root (`generated/x.rs`), plus `.d.ts`/`_bg.wasm.d.ts` suffixes. `contains(\"/generated/\")` missed root-level dirs and risked false positives (`pre-generated-data/`).\n- **Existing indexes need a BACKFILL.** Incremental discovery rewrites a file row only on sha/language/kind change, so a flag whose DEFINITION changed never refreshes. Gate: `GENERATED_FLAGS_VERSION` (meta key `generated_flags_version`, mirrors `graph_index_version`). `ensure_generated_flags_current` re-derives over `main.files` (NOT the non-updatable `files` UNION view \u2014 the flag is path-based, scope-independent) on a write-bearing open; read-only opens see the stale version \u2192 return None \u2192 fall back to read-write which heals once. Full rebuild stamps it via `mark_generated_flags_current`. Bump `GENERATED_FLAGS_VERSION` whenever `is_generated_path`'s definition changes again.\n- **Only advertise the opt-in where it's honored.** `symbol_lookup` uses `SymbolArgs` with `SymbolInclude{Memories,Generated}`. `git_history_for_symbol`/`papertrail_for_symbol` resolve via `select_symbol` (always source-only) and never honored `include`, so they take a selector-only `SymbolRefArgs` (no `include`) \u2014 advertising a flag they'd silently ignore is a lie.\n\nHOW TO APPLY:\n- Don't filter symbol search on `files.kind` \u2014 `kind=generated` rows have no symbols; the real pollution is `kind=source` + path-heuristic. Filter on `files.generated`.\n- The MCP opt-in is `symbol_lookup include: [\"generated\"]`. `select_one` drill-down (impact/graph/memory/history/papertrail) always excludes generated; importance/PageRank seeding passes `true` to keep generated nodes. Explicit `symbol_id`/`logical_symbol_id` bypasses the filter (only name/symbol_path SEARCH arms apply it).\n\n(Re-created after a `.rag-rat` index loss; originally mem_19ed636f090.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783011097153,
+  "updated_at_ms": 1783011097153,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23be3a41_0a35130705b6",
+    "binding_kind": "logical_symbol",
+    "binding_id": "crates/rag-rat-core/src/index/mod.rs::file_is_generated",
+    "path": "crates/rag-rat-core/src/index/mod.rs",
+    "start_line": 288,
+    "end_line": 290,
+    "id": "sym_1729da3bd49725c6",
+    "chunk_id": 76483,
+    "symbol_kind": "function",
+    "signature_hash": "7cda26529eb4b5113e0d9b4f1a296cff78da99f38b07c00b49abdbd8459f620f",
+    "anchor_status": "current",
+    "created_at_ms": 1783011097153
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "202",
+   "files-generated",
+   "generated",
+   "indexing",
+   "symbol-search"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23be0a6c_363b055ea2b3",
+  "kind": "BugPattern",
+  "title": "Clone features silently return empty if the index's fingerprints predate the current NORM_VERSION \u2014 needs a new-binary `index --full`",
+  "body": "SYMPTOM: `find_clones` returns 0 classes, `clones_of_text` / the write-time clone-check hook (#287) silently no-op, and the precompute (#286) builds an empty graph \u2014 even though the index exists, is fresh, and has thousands of `symbol_fingerprints` rows.\n\nROOT CAUSE: every clone read path loads bags via `load_scoped_baseline_bags`, which filters `WHERE normalizer_kind='baseline' AND normalizer_version = NORM_VERSION` (currently 3, bumped in #253). An index last (re)fingerprinted by an OLDER binary has its baseline fingerprints at the old nv (1/2), so the nv=3 filter matches ZERO rows \u2192 no candidates \u2192 empty everywhere. The filter is by design (auto-exclude old-nv rows, recompute on reindex \u2014 see index/clones/mod.rs NORM_VERSION doc), but the recompute only happens when a NEW-nv binary REINDEXES a file. A background watcher running an OLD binary keeps refingerprinting at its OWN old nv, so the index never reaches nv=3 until a new-binary reindex.\n\nDIAGNOSE: `SELECT normalizer_version, count(*) FROM symbol_fingerprints WHERE normalizer_kind='baseline' GROUP BY normalizer_version;` \u2014 0 rows at the current NORM_VERSION is the smoking gun. (Hit live: the #287 hook no-op'd on the rag-rat self-index because it was maintained by the old 0.8.0 binary at nv\u22642.)\n\nFIX: `rag-rat index --full` with the NEW binary recomputes the active-context fingerprints at the current nv (stale nv=1/2 rows from OTHER git contexts persist but are correctly excluded). Also RESTART the MCP server/watcher after installing a binary that bumped the schema/nv \u2014 an old running watcher can't read the migrated index, and a new `index --full` leaves it schema-incompatible until restart.\n\nLESSON: any NORM_VERSION / ALIGNMENT_VERSION bump silently disables clone recall on existing indexes until a new-binary reindex \u2014 invisible (no error, just empty results).\n\n(Re-created after a `.rag-rat` index loss; originally mem_19efa7f8f4a.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783011084908,
+  "updated_at_ms": 1783011084908,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23be0a6c_363b055ea2b3",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/clones/mod.rs",
+    "path": "crates/rag-rat-core/src/index/clones/mod.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783011084908
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "286",
+   "287",
+   "clones",
+   "gotcha",
+   "indexing",
+   "norm-version"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23bd6c43_d9018d9f5c93",
+  "kind": "Invariant",
+  "title": "SCIP occurrence ranges are per-document position_encoding (UTF-8/16/32) \u2014 convert in byte space, never assume UTF-8",
+  "body": "The SCIP-oracle reader (`crates/rag-rat-core/src/index/oracle/scip.rs`) must read `Document.position_encoding` PER DOCUMENT and convert column offsets accordingly. SCIP `Occurrence.range` is `[start_line, start_char, end_char]` (single-line) or `[start_line, start_char, end_line, end_char]` (multi-line), and the `*_char` values count code units in the document's declared `position_encoding` \u2014 `UTF8CodeUnitOffsetFromLineStart` (bytes), `UTF16CodeUnitOffsetFromLineStart` (UTF-16 units), `UTF32`/`Unspecified` (one unit per Unicode scalar). It is declared per-`Document`, NOT globally.\n\nTHE TRAP (why this is an Invariant, not a nicety): every encoding agrees on ASCII, so a UTF-8-assuming shortcut passes every ASCII test and then SILENTLY mis-joins the moment an identifier sits after a multibyte character (an accented name, a CJK comment earlier on the line). The wrong byte offset lands on the wrong (or no) occurrence \u2192 a wrong or missing edge upgrade, with no error.\n\nHow it's handled: `LineColumnToByte` precomputes per-line byte starts, then walks one Unicode scalar at a time advancing `code_units_for(scalar, encoding)` until it has consumed `char` units, yielding an absolute BYTE offset. rag-rat edge rows store the callee identifier BYTE range (`callee_start_byte/end_byte`, #67), so the entire join works in byte space \u2014 the encoding only matters at this one conversion. `code_units_for`: UTF-8 \u2192 utf8 len; UTF-16 \u2192 2 for astral (utf8 len 4) else 1; UTF-32/Unspecified \u2192 1. The reader reads the document's CURRENT checkout bytes (via a `read_document_source` closure) to do the conversion; a document whose bytes can't be read is skipped (correct degradation). `local N` symbols are dropped here (`scip::symbol::is_local_symbol`). The correctness test is `oracle::tests::non_ascii_identifier_resolves_under_both_encodings` (the `caf\u00e9.na\u00efve()` case under UTF-8 AND UTF-16) \u2014 keep it.\n\n(Re-created after a `.rag-rat` index loss; originally mem_19ebb898c83.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783011044419,
+  "updated_at_ms": 1783011044419,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23bd6c43_d9018d9f5c93",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/oracle/scip.rs",
+    "path": "crates/rag-rat-core/src/index/oracle/scip.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783011044419
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "encoding",
+   "invariant",
+   "join",
+   "oracle",
+   "position",
+   "scip"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23bd4d7a_5e91d6de53e0",
+  "kind": "Invariant",
+  "title": "files.has_test_code marker set lives in 3 places that MUST match (#77 Phase 1)",
+  "body": "impact_surface's \"tests touching this symbol\" detection uses a precomputed `files.has_test_code` flag instead of scanning `chunks.text` for test markers (#77 Phase 1, PR #223). The marker set \u2014 `#[cfg(test)]` / `describe(` / `it(` / `test(` (the `it(`/`test(` substrings are intentionally broad; they reproduce the original `LIKE '%it(%'`/`'%test(%'` behavior, noise included) \u2014 is encoded in THREE places that must stay byte-identical, or a forward-migrated index and a freshly-indexed one disagree:\n\n1. `index::text_has_test_marker` (crates/rag-rat-core/src/index/util.rs) \u2014 the index-time compute, called in `insert_prepared_file` from the chunk text.\n2. The V024 backfill SQL in `schema::migrations::apply_files_has_test_code` \u2014 `UPDATE files SET has_test_code=1 WHERE id IN (SELECT file_id FROM chunks WHERE text LIKE '%#[cfg(test)]%' OR ...)`.\n3. `test_items`'s filter (crates/rag-rat-core/src/query/impact/items.rs) reads the flag (no longer the markers directly, but its semantics assume the flag means \"contains a marker\").\n\nIf you change the markers, change all three. Also note: the scope VIEW `temp.files` (`lifecycle::install_scope_view`) must list `has_test_code` in BOTH its SELECT branches, or `files.has_test_code` resolves to the view and errors \"no such column\" (this bit during dev \u2014 the view enumerates columns explicitly, it is not `SELECT *`).\n\nRelated: the chunk-mention match in `section_like_items` + `neighbors::textual_fallback` now uses `chunk_fts MATCH` (via `impact::fts_phrase_query`), not `chunks.text LIKE` \u2014 together these mean impact_surface reads no raw `chunks.text`, the prerequisite for #77 Phase 2 (compress `chunks.text` into a `chunk_text(chunk_id, text_zstd)` sister table; sqlite-zstd is viable ON the sister table since it never gets ALTERed, unlike the evolving chunks/files).\n\n(Re-created after a `.rag-rat` index loss; originally mem_19edc79f42a.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783011036538,
+  "updated_at_ms": 1783011036538,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23bd4d7a_5e91d6de53e0",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/util.rs",
+    "path": "crates/rag-rat-core/src/index/util.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783011036538
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "77",
+   "has_test_code",
+   "impact",
+   "invariant",
+   "migration",
+   "schema"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23bd2fe1_b89cb4f95ec7",
+  "kind": "PerformanceNote",
+  "title": "#258: coherence_split GROW uses O(1) edge adjacency not sim-recompute; byte-identical when edges==\u2265\u03b8 set, cargo class divergence is the #271 cap inheritance",
+  "body": "WHERE: crates/rag-rat-core/src/index/clones/refine/split.rs::coherence_split (branch perf/258-coherence-split-edge-adjacency). Fixes #258.\n\nTHE CHANGE: the GROW step's per-(m,g) coherence check went from recomputing `similarity(m,g) >= theta` (an O(token_len) overlap recompute) to an O(1) HashSet edge-adjacency lookup `adjacency.contains((m.min(g), m.max(g)))` over the canonicalized `coherent_edges`. `theta` is dropped from the coherence_split signature (the edge set fully encodes the threshold). `similarity` is still consulted ONCE per edge to rank the descending-sim seed order. Net: a dense (near-)clique component is O(n^2) lookups instead of O(n^2 * token_len) recomputes. All 3 production call sites (clone_symbol_refs, find_clones, clones_for_symbol) + the in-file tests updated.\n\nPARITY (load-bearing \u2014 read before \"fixing\" any apparent divergence):\n- FORWARD (edge => sim>=theta) is UNCONDITIONAL: verified_clone gates `overlap >= ceil(theta*max_len)`, bit-identical to the closure's `overlap/max_len >= theta`; struct_hash edges have overlap==max_len => sim 1.0. So the new GROW NEVER admits a member the old code rejected.\n- REVERSE (sim>=theta => edge) is SourcererCC admissibility, valid EXCEPT where #271's HOT_TOKEN_POSTINGS_CAP=256 drops a theta-pair sharing only hot-capped tokens (not a candidate edge even though sim>=theta). There the OLD GROW recomputes sim and RE-MERGES across that cap-dropped non-edge; the NEW GROW honors the candidate set and does not. So with the cap ON, old GROW over-merges relative to the verified candidate edges; #258 produces tighter, internally-edge-consistent classes.\n\nEMPIRICAL PROOF (cargo bench corpus rust-lang/cargo src/cargo, 2130 clone symbols), main vs #258, SAME index:\n- `clones --recall-symbols` (clean SYMBOL-level gate): BYTE-IDENTICAL, 2130 = 2130, zero diff. No symbol leaves the clone set.\n- `clones --recall-signature` (CLASS-level): DIFFERS \u2014 main 1151 classes / 6008 memberships, #258 1208 classes / 4849 memberships. SAME 2130 member symbols (zero dropped/added); only the partition granularity differs.\n- DECISIVE: raising HOT_TOKEN_POSTINGS_CAP to 5_000_000 (cap never fires => edges == exactly the >=theta set) in BOTH main and #258 and re-diffing recall-signature => BYTE-IDENTICAL (1693 = 1693). This proves (a) the algorithm substitution is exactly output-equivalent when edges == >=theta set, and (b) the cap-on class divergence is 100% the #271 hot-token-cap inheritance, not a #258 bug. main's GROW was silently re-merging across pairs #271 deliberately excluded as non-discriminating noise; #258 is the internally-consistent behavior.\n\nCONSEQUENCE for reviewers: #258 does NOT introduce a new behavior class \u2014 it inherits exactly #271's already-accepted recall approximation, gated by `clones --recall-symbols` (byte-identical here). If you ever need true byte-identical class output vs pre-#271, the lever is the cap, not coherence_split. Do NOT add a sim-recompute or whole-component fallback to coherence_split to \"restore\" the old larger classes \u2014 that re-introduces the cap-excluded noise pairs and defeats both #271 and #258.\n\nTESTS ADDED: coherence_split_edge_adjacency_equals_similarity_recompute_when_edges_are_theta_set (byte-identical parity pin: an inline reference_split_by_similarity_recompute reproduces the OLD per-(m,g) sim>=theta grow; asserted equal on chain/dense-clique/loose-clique/dense-minus-matching fixtures where edges==>=theta set). Kept coherence_split_grows_by_edge_adjacency_not_recomputed_similarity (divergent-direction pin). Widened coherence_split_pathological_dense_minus_matching_returns_fast ceiling 2s->10s (coarse hang-detector under nextest parallelism, not a microbench).\n\n(Re-created after a `.rag-rat` index loss; originally mem_19efb207528.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783011028961,
+  "updated_at_ms": 1783011028961,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23bd2fe1_b89cb4f95ec7",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/clones/refine/split.rs",
+    "path": "crates/rag-rat-core/src/index/clones/refine/split.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783011028961
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "258",
+   "271",
+   "clones",
+   "coherence-split",
+   "edge-adjacency",
+   "parity",
+   "perf",
+   "recall"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23bc9be2_a0afc84c3276",
+  "kind": "Decision",
+  "title": "#259 fix: RANKING-only member_count dampen (1+ln_1p) on un-refined clone classes, post-refine/pre-sort in both find_clones branches",
+  "body": "WHERE: the dampen_unrefined_member_count helper (now in query_api/clones/scoring.rs after the #361 split; was clones.rs) + its TWO call sites inside find_clones (the limited and unlimited branches, each a consolidated post-refine/pre-sort pass). Fixes #259.\n\nTHE BUG (#259 Adversary C, the tail #256 left open): find_clones refines at most UNLIMITED_REFINE_BUDGET=50 classes by provisional ROI, then re-sorts the WHOLE list on the SAME ROI scale. A class still un-refined after the pass \u2014 either past the budget (idx >= 50) OR within budget but refine_class_in_place was a NO-OP (load_refine_members returned Ok(None): overlay scope, drifted source/struct_hash mismatch, parse failure, vanished hydration row) \u2014 keeps its un-refined Plan-2 ROI = cross_module_spread \u00d7 member_count \u00d7 body_token_len_medoid \u00d7 load_bearing_factor \u00d7 cohesion_min_pairwise. That product is LINEAR in member_count and carries NO coverage_roi_gate (coverage exists only post-refine). #256's gate knocks a degenerate REFINED class down \u00d70.10\u20130.70, but an UN-refined giant skips the gate, so a large refine-FAILED component out-ranks a gated refined class purely on member count.\n\nTHE FIX (RANKING-only): dampen_unrefined_member_count(&mut CandidateCloneClass) rewrites ONLY class.roi (the sort key). It divides out the linear member_count factor and multiplies in 1 + member_count.ln_1p() \u2014 the exact sub-linear shape build_class already uses for load_bearing_factor (1.0 + max_importance.ln_1p()). This preserves the other FOUR Plan-2 factors exactly without needing the refine inputs a refine-FAILED class no longer has (no medoid/spread recompute). Self-guards: `if class.refined { return }` (a refined class already went through the coverage gate in apply_refinement \u2014 never double-penalize) and `if mc <= 0.0 { return }`. member_count 2 \u2192 ~2.10 (<5% nudge); 300 \u2192 ~6.71 (~45\u00d7 reduction). Monotone non-decreasing \u2014 deprioritizes the LINEAR dominance, never inverts size, never drops a class.\n\nPLACEMENT (load-bearing): ONE consolidated `for (_, class) in built.iter_mut() { if !class.refined { dampen_unrefined_member_count(class); } }` pass in EACH branch, AFTER the refine loop (so class.refined is final) and immediately BEFORE `cs.sort_by(...)` (so it affects ranking).\n\nWHY GATING, NOT PERF: #259 is allowed to alter the relative ORDER of returned classes; it must NOT alter which pairs are clones or class membership. The dampen touches ONLY class.roi (the sort key) \u2014 never members/membership/which-pairs.\n\nPARITY GREEN BY CONSTRUCTION: find_clones branches into live vs precomputed ONLY at pairs_for_query / precomputed_pairs_if_eligible (returns candidate Vec<(i64,i64)>). Everything downstream \u2014 components_from_pairs, bucket_edges_by_component, coherence_split, build_class, refine_class_in_place, the new dampen + sort \u2014 is SHARED and runs identically regardless of pair source. find_clones_precomputed_matches_live compares MEMBERSHIP (order-insensitive), so a sort-key-only change is invisible to it.\n\nclones_for_symbol and apply_refinement deliberately UNTOUCHED: clones_for_symbol returns a single class never ranked against peers; apply_refinement is the refined-only path (the gate already applies there).\n\nFOOTGUN learned writing the e2e test: the refine cache key (refinement_key) is over the PERSISTED struct_hash + PERSISTED file sha256 (load_source_discriminators reads files.sha256 from the DB, NOT disk), so a drifted source does NOT change the key \u2014 a WARM cache hit serves the cached refinement and never re-reads disk. The drift MUST land before the VERY FIRST find_clones (cold cache) for load_refine_members to run and hit the struct_hash-faithfulness Ok(None). Do the pre-drift sanity on a throwaway index.\n\n(Re-created after a `.rag-rat` index loss; originally mem_19efb1e45fd.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783010991074,
+  "updated_at_ms": 1783010991074,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23bc9be2_a0afc84c3276",
+    "binding_kind": "dir",
+    "binding_id": "crates/rag-rat-core/src/index/query_api/clones",
+    "path": "crates/rag-rat-core/src/index/query_api/clones",
+    "anchor_status": "current",
+    "created_at_ms": 1783010991074
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "259",
+   "clones",
+   "coverage-gate",
+   "dampen",
+   "find_clones",
+   "parity",
+   "ranking",
+   "refine",
+   "roi"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23bc63c1_5c0a69761c22",
+  "kind": "Decision",
+  "title": "query_api/clones is a directory module: mod.rs = curated index + IndexDatabase impl; algorithm split into cohesive siblings (#361)",
+  "body": "`crates/rag-rat-core/src/index/query_api/clones/` was a single 3347-line `clones.rs` with a `clones/` submodule dir (precompute.rs, of_text.rs). #361 (branch refactor/361-clones-split) split the god-module into cohesive siblings \u2014 PURE move/reorganize, no logic change, NO re-export shim. The old `clones.rs` path is GONE.\n\nLAYOUT (mod.rs is a curated INDEX, not the junk drawer):\n- `mod.rs` \u2014 declares the submodules; owns the shared caps/thresholds several stages key off (THETA, MAX_MEMBERS, MEMBER_VALUE_CAP, HYDRATION_CHUNK, and the load-bearing `const _` assert MEMBER_VALUE_CAP < LCS_MEMBER_SAMPLE); curates the pub surface (`pub use types::{...}` \u2014 the 9 DTO types the parent query_api/mod.rs re-exports); and HOSTS the `impl IndexDatabase` query methods (candidate_clone_components, clone_symbol_refs, find_clones, refine_class_in_place [private], clones_for_symbol, load_refine_members [pub(crate)]). Methods stay on the type \u2192 ZERO external call-site changes; the compiler verifies completeness.\n- `types.rs` \u2014 the public DTO/options/eligibility types + `CloneIneligibilityReason::{as_db_str,from_db_str}`.\n- `substrate.rs` \u2014 SymbolBag/TokenPosting + the SourcererCC candidate-gen (candidate_pairs, candidate_pairs_from_bags, pairs_for_query, load_scoped_baseline_bags, add_struct_hash_pairs, sub_block_candidate_pairs, sub_block_tokens, sub_block_len, verified_clone, overlap, components_from_pairs, bucket_edges_by_component; consts METRIC_SAMPLE_CAP, DF_FALLBACK, HOT_TOKEN_POSTINGS_CAP). Shared substrate `precompute` + `of_text` reuse \u2014 they now `use super::substrate::{...}`.\n- `scoring.rs` \u2014 coverage_roi_gate + COVERAGE_* consts, dampen_unrefined_member_count, apply_refinement, build_completeness, class_key_for, canonical_member_order_key, min_pairwise_cohesion.\n- `build.rs` \u2014 build_class + count_stale_member_paths.\n- `refine_load.rs` \u2014 RefineRow, load_refine_rows, load_source_discriminators.\n- `resolve.rs` \u2014 resolve_selector_to_symbol_id, classify_ineligibility_reason.\n- `precompute.rs` / `of_text.rs` \u2014 unchanged except their import block now targets `super::substrate::`.\n- `tests.rs` \u2014 the inline `#[cfg(test)] mod tests` moved out; each test imports from the sibling that owns the symbol.\n\nVISIBILITY (the split footgun): items crossing sibling boundaries were bumped from the old `pub(super)`/private to `pub(crate)` (SymbolBag/TokenPosting fields, candidate-gen free fns, scoring helpers, RefineRow, build_class, resolve fns). Crate-internal only; `mod clones` stays `mod clones;` (private) in query_api/mod.rs \u2014 do NOT make it pub(crate) (would raise the impl methods' reachability above a pub(crate) type and trip private_interfaces under -D warnings, the #215 note). `precompute::precomputed_pairs_if_eligible` stayed `pub(super)` and substrate calls it as `super::precompute::...`.\n\nWHY external callers didn't move: `clones` stays a module and query_api/mod.rs keeps its exact `pub use clones::{...}` / `pub use clones::of_text::{...}` / `pub use clones::precompute::CloneEdgeReport` / `pub(crate) use clones::{MAX_MEMBERS, MEMBER_VALUE_CAP}` \u2014 the curated mod.rs re-export preserves the surface. rag-rat-cli, rag-rat-mcp, index/mod.rs, benches unchanged.\n\nVERIFIED: cargo check -p rag-rat-core --all-targets clean; cargo clippy -p rag-rat-core --all-targets (-D warnings) clean; cargo nextest run -p rag-rat-core = 1078 passed / 0 skipped (clones subset 212); cargo +nightly fmt --check clean.\n\n(Re-created after a `.rag-rat` index loss; originally mem_19f21b3307c.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783010976705,
+  "updated_at_ms": 1783010976705,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23bc63c1_5c0a69761c22",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/query_api/clones/mod.rs",
+    "path": "crates/rag-rat-core/src/index/query_api/clones/mod.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783010976705
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "361",
+   "clones",
+   "mod-rs-index",
+   "module-split",
+   "rust-modern-style"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23bb6585_989c871605ea",
+  "kind": "Decision",
+  "title": "#109 structure-aware reranker signal inventory: which precomputed signals attach cheaply to an RRF candidate + which correlate with the commit-replay gold",
+  "body": "Signal inventory for the model-free structure-aware reranker (#109) that reorders the RRF top-k (search/hybrid.rs::reciprocal_rank_fusion output) before return. Goal: top-3 precision (the eval's mrr_at_10 metric). Eval gold = a commit's CHANGED PATHS + derived changed symbols (commit-message query; eval.rs::replay_eval_query). KEY consequence: signals must correlate with \"is this candidate's PATH/symbol one the commit touched\", which makes the strongest single signal the cheapest one (path/churn), NOT the graph.\n\nCANDIDATE HANDLE: a SearchHit already carries chunk_id, path, and symbol_path (the chunk's qualified name) \u2014 search/lexical.rs::SearchHit. Per-candidate joins on path (free) and symbol resolution (chunks.symbol_path -> active-scope symbol id, the EXISTING enrich_search_hits_with_load_bearing path in index/query_api/importance.rs) are already wired. The `importance: Option<ImportanceEnrichment>` field on SearchHit is ALREADY the scoped-weighted-fan-in enrichment \u2014 a reranker extends this seam.\n\nSIGNAL-BY-SIGNAL (source / precomputed? / per-candidate cost / correlation with gold):\n\n1. GIT RECENCY + CHURN per path \u2014 git_file_changes(path, commit_hash, additions, deletions) JOIN git_commits(authored_at_s/committed_at_s). NOT a per-path column; aggregated at query time exactly like query/repo_brief.rs::file_rows (commit_touch_count, recent_touch_count vs a 90-day floor newest_commit-90d). Per-candidate: one GROUP BY path join (cheap; idx_git_file_changes_path exists). CORRELATION: HIGH, possibly strongest \u2014 a commit-message query asks about active development; files a recent commit touched are exactly high-churn/recently-touched. RISK: same signal as the gold's generative process, so it can OVERFIT the replay eval and may not generalize to real \"where is X\" queries.\n\n2. GLOBAL PageRank (important_symbols, query/pagerank.rs) \u2014 NOT persisted. Computed at query time: load ALL edges + power iteration; measured 0.76s over 38,578 edges live. Too slow for the hot path unless cached. A prior attempt to CACHE per-symbol PageRank was rejected because PageRank is GLOBAL but the score differs PER SCOPE (worktree overlay) so the cache had to be scope-keyed. CORRELATION: WEAK-TO-NEGATIVE \u2014 global importance favors god-modules/hubs (Config, IndexDatabase, Language), NOT what an arbitrary commit touches. VERDICT: do NOT put raw global PageRank in v1.\n\n3. SCOPED WEIGHTED FAN-IN (\"local structural load\", query/load_bearing.rs) \u2014 the cheap LOCAL alternative: sum of edge_weight x confidence over the symbol's IN-edges in active scope. One bounded query per candidate symbol; ALREADY attached to SearchHit.importance. CORRELATION: WEAK (depended-upon-ness != commit-touched-ness). Use as TIE-BREAKER only.\n\n4. SYMBOL KIND / is_test \u2014 symbols.kind + symbols.is_test (V035) + files.has_test_code (V024, precomputed). Per-candidate: free. CORRELATION: MODERATE as a DEMOTION signal \u2014 test chunks are rarely the gold for a feature commit; down-weighting is cheap and plausibly lifts top-3.\n\n5. PATH / STRUCTURAL FEATURES \u2014 files.path, files.generated (precomputed), language. Query<->path token overlap is FREE and directly correlated with the gold (the gold IS a set of paths). generated=1 demotion free. CORRELATION: HIGH for path-token overlap (near-direct proxy for the path gold) + generated demotion.\n\n6. CALL-GRAPH PROXIMITY to query's likely target (find_callers/trace_callees) \u2014 a graph hop (BFS), expensive, needs a NAMED target which a commit-message query lacks. CORRELATION: LOW (a commit's files are a diff, not a call neighborhood). Skip v1.\n\nBEST BANG-FOR-BUCK (cheap AND correlated with the path/symbol gold): (a) git recency+churn per path (cheap aggregate join, highest correlation, with the overfit caveat); (b) path-token/structural match incl. generated+is_test demotion (free, near-direct proxy for the path gold); (c) scoped-weighted-fan-in as a TIE-BREAKER only (already attached, ~0 added cost). Global PageRank and call-graph proximity are the WORST bang-for-buck here: expensive AND poorly correlated with \"what did this commit touch\". Ship the model-free reranker FIRST with git+path+kind, A/B on the replay eval (mrr_at_10), treat any graph signal as opt-in only after a measured win.\n\n(Re-created after a `.rag-rat` index loss; originally mem_19efd9b3044.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783010911621,
+  "updated_at_ms": 1783010911621,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23bb6585_989c871605ea",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/search/hybrid.rs",
+    "path": "crates/rag-rat-core/src/search/hybrid.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783010911621
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "109",
+   "eval",
+   "git-recency",
+   "pagerank",
+   "reranker",
+   "signals",
+   "structure-aware"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23bb1d9d_aeaadcd39591",
+  "kind": "PerformanceNote",
+  "title": "Clone-graph precompute (#286): kernel validation \u2014 writer resumable/RAM-bounded, but drivers/net is pathologically \u03b8=0.7-dense (O(K\u00b2) sub_block edges)",
+  "body": "Validated the #286 clone-graph precompute on a real `rag-rat index` of the Linux kernel drivers/net (6162 files, 118,148 fingerprints). Ran `rag-rat clones --precompute` (the Phase-B writer).\n\nWHAT WORKED (architecture sound): the streaming generation-staged build is RESUMABLE (checkpoints cursor + edges per batch; survived two timeout kills and resumed) and RAM-BOUNDED (stayed under a 12G cgroup cap \u2014 flushes edges to disk per batch, never materializing all pairs in RAM, unlike live `find_clones` which OOM'd/hung >240s at query time). Off the query path. So for the COMMON case (cargo + normal large repos) it makes queries fast and the build tractable.\n\nWHAT THE VALIDATION REVEALED: drivers/net is PATHOLOGICALLY clone-dense. In the first 2874 processed functions the build wrote 5.67M edges \u2014 breakdown is the key: only 4,539 are `struct_hash` (identical) edges (groups tiny, K\u226411), while 5,671,293 are `sub_block` edges. So the blowup is NOT identical-clone cliques; it is \u03b8=0.7 SIMILARITY clusters \u2014 thousands of driver functions (probe/remove/ioctl boilerplate) each \u226570% token-overlap-similar to thousands of others. An O(K\u00b2)-in-cluster-size cost INHERENT to pairwise clone detection at \u03b8=0.7 on boilerplate code; persisting doesn't shrink it (full drivers/net graph would be tens-to-hundreds of millions of edges, a long build).\n\nIMPLICATION: the precompute is the right architecture and a clear win for normal repos, but does NOT by itself make a pathologically-dense huge subsystem cheap \u2014 it converts a query-time OOM/hang into a long, resumable, bounded BACKGROUND job (acceptable under \"mildly stale OK\"). The real lever for dense code is a CLUSTER-SIZE CAP (the #271 hot-token-cap INTENT, applied at the verified-cluster level, recall-gated via #279 / `clones --recall-symbols`): once a similarity cluster exceeds a size threshold, stop materializing its full O(K\u00b2) pairwise edges (a spanning subset preserves union-find components; coherence_split's clique-cover genuinely needs the density, so the cap interacts with #256/#282 and must be recall-measured). Natural follow-up after the #286 phases land. See [[mem_19ef9c6bc90_ca78f9df6d5b]] and [[mem_19ef6c3767e_242f2636ace6]].\n\n(Re-created after a `.rag-rat` index loss; originally mem_19efa2f98e8.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783010893213,
+  "updated_at_ms": 1783010893213,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23bb1d9d_aeaadcd39591",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/query_api/clones/precompute.rs",
+    "path": "crates/rag-rat-core/src/index/query_api/clones/precompute.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783010893213
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "286",
+   "clones",
+   "kernel",
+   "perf",
+   "precompute",
+   "scaling"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23bad715_3424224285cb",
+  "kind": "Risk",
+  "title": "Migration \"table absent at V(N-1)\" test breaks when V(N) adds it; assert deferred-absence against the migration DDL in isolation, not the full ladder",
+  "body": "SECOND breakage class, complements mem_19ef48db24d (the ledger-delete / hardcoded-LATEST footgun). When you add migration V(N) that CREATEs a table (or ADDs a column) whose ABSENCE an earlier migration test asserted, that earlier test breaks \u2014 and it is NOT a ledger/LATEST issue, so mem_19ef48db24d's checklist does not catch it.\n\nCONCRETE (hit landing V037, #296): migration_034_adds_content_anchored_clone_graph_tables (schema_bootstrap_tests/clones.rs) did apply -> revert clone tables -> truncate_schema_to(33) -> migrate_forward -> assert !conn_table_exists(\"clone_subblock_postings\"). That held only because NO migration <= LATEST created that table. migrate_forward ALWAYS replays every unrecorded migration up to LATEST (there is no \"migrate to version K\"; it is forward-to-tip), so once V037 adds clone_subblock_postings the post-migrate_forward end state now HAS it -> the absence assert fails. Same trap for a \"column absent\" assert once a later ALTER adds it.\n\nFIX (keep the deferral assertion, make it future-proof): assert absence against the SPECIFIC migration's DDL in ISOLATION, not the end state of the full ladder. Call that migration's applier on a bare in-memory conn and check the deferred table is absent there:\n  let v034_only = rusqlite::Connection::open_in_memory().unwrap();\n  crate::index::schema::apply_clone_graph_tables(&v034_only).unwrap();\n  assert!(!conn_table_exists(&v034_only, \"clone_subblock_postings\"));\nThe apply_* migration fns are pub(crate) (re-exported via `pub(crate) use migrations::*`), reachable from the in-crate #[cfg(test)] tests. This says exactly \"V034's DDL does not create X\" and survives every future migration that later DOES add X. The NEW test for V(N) then asserts presence after the full apply ladder.\n\nWHY isolation not \"drop X again\": migrate_forward can't stop before LATEST, so any full-ladder end-state check can only ever see the LATEST shape. Anchor absence to the migration function, not the ladder tip.\n\n(Re-created after a `.rag-rat` index loss; originally mem_19f23364305.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783010875157,
+  "updated_at_ms": 1783010875157,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23bad715_3424224285cb",
+    "binding_kind": "dir",
+    "binding_id": "crates/rag-rat-core/src/index/schema_bootstrap_tests",
+    "path": "crates/rag-rat-core/src/index/schema_bootstrap_tests",
+    "anchor_status": "current",
+    "created_at_ms": 1783010875157
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "footgun",
+   "migration",
+   "schema",
+   "tests"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23bab112_7f022d760792",
+  "kind": "Decision",
+  "title": "#296 phase 3: CloneCorpus trait unifies the postings fast path + RAM fallback; eligibility is EXACT-freshness (R1)",
+  "body": "Phase 3 (#392, merged) makes the write-time clone check (`clones_of_text`/`clones_of_texts`, of_text.rs) read the persisted `clone_subblock_postings` instead of building the whole RAM inverted index, when eligible.\n\n**`CloneCorpus` trait is the seam.** `CheckIndex` (RAM fallback) + `IndexedCorpus` (bounded postings fast path) expose `exact_partner_ids` + `near_candidate_bags` + `df_by_token`. The old `CheckIndex::check` became a FREE `check_against(corpus: &dyn CloneCorpus, ...)` so both modes share fingerprinting, the `verified_clone` verify, ref resolution, self-file exclusion \u2014 the fast path is a pure optimization (pinned by `fast_postings_path_equals_ram_fallback`). `load_clone_corpus` picks the mode.\n\n**Eligibility = `IndexDatabase::clone_check_indexed_generation` (precompute.rs, `pub` for the CLI hook).** EXACT-freshness, STRICTER than the find_clones edge fast path (review R1): Complete + `normalizer_version==NORM_VERSION` + `postings_written` + `source_revision == content_revision()` EXACTLY. Because a symbol's persisted sub-block tokens depend on `sub_block_tokens`' ordering by the CURRENT `clone_token_df`; drift \u2192 silent missed near-clone. Anything less \u2192 RAM fallback.\n\n**IndexedCorpus stays BOUNDED (R3):** near candidates from `clone_subblock_postings token_hash IN (\u2026)` (chunked HYDRATION_CHUNK), then ONLY those anchors hydrated via row-value `(files.path, symbols.start_byte) IN (VALUES \u2026)` over the scoped `files` view. Reproduces EVERY RAM filter (R4): scope, generated=0, is_test=0, language, NULL/corrupt token_bag skip; drops a posting whose anchor sha != current `files.sha256` (staleness); exact path adds `token_bag IS NOT NULL`.\n\n**THREE review fixes \u2014 DO NOT regress:**\n1. **Base-scope gate (footgun).** Clone graph is built in BASE scope; `content_revision()` is GLOBAL over `main.files` so can't encode scope. Under a linked-worktree OVERLAY the postings cover only base symbols while RAM reads branch-only symbols \u2192 serving the fast path silently misses overlay near-clones. `clone_check_indexed_generation` returns None when `self.active_scope_is_linked_overlay()` (lifecycle.rs: non-empty `active_worktree_id` differing from `worktree_id_of(source_root)` \u2014 NOT \"empty\"; base has its OWN non-empty id).\n2. **Read snapshot (TOCTOU).** `with_clone_read_snapshot` wraps the whole check in one deferred read txn when idle (`is_autocommit`), so a concurrent writer completing a new generation (`complete_generation` GCs the old) mid-check can't delete the postings out from under the fast path. No-op if a txn is already open.\n3. **df-freshness invalidation (subtle).** Postings freeze `sub_block_tokens`' df ordering at build. A FULL rebuild recomputes `clone_token_df` authoritatively (drift correction) WITHOUT changing content, so `content_revision()` stays equal \u2014 nothing else catches it. `refresh_clone_token_df` (rebuild.rs) now calls `invalidate_clone_graph_postings` (`UPDATE clone_graph_generations SET postings_written=0`) so the next maintenance pass rebuilds against the fresh df; the write-time check falls back to RAM until then. find_clones' edges store the verified overlap and are df-INDEPENDENT \u2014 unaffected. (Incremental df bumps ride content changes \u2192 already gated by `content_revision()`.) The rebuild.rs comment `df is selectivity-only, never a correctness input` is true for the LIVE path (both sides use the same df) but NOT the fast path (build-vs-read df split) \u2014 hence this gate.\n\n**Incidental:** `SymbolBag`/`TokenPosting` got `#[derive(Clone)]`; `TextCloneMatch` got `PartialEq`.\n\n**Phase 4 (#393, merged): #296 series complete.** `MAX_CLONE_CHECK_FUNCTIONS` (40k guard, claude_hook/mod.rs) is fallback-only: `clone_check` skips on size ONLY when `!db.clone_check_indexed_generation()?.is_some()`, via `clone_check_skipped_for_size(indexed, count)`. That's why `clone_check_indexed_generation` is `pub`.\n\n(Re-created after a `.rag-rat` index loss; originally mem_19f236abd85.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783010865426,
+  "updated_at_ms": 1783010865426,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23bab112_7f022d760792",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/query_api/clones/of_text.rs",
+    "path": "crates/rag-rat-core/src/index/query_api/clones/of_text.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783010865426
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "296",
+   "R1",
+   "R3",
+   "R4",
+   "clones",
+   "of_text",
+   "phase-3",
+   "write-time-check"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23ba2fdd_398c99486062",
+  "kind": "PerformanceNote",
+  "title": "#296 phase 2 postings size (measured): ~30 rows/function, ~164 B/row, ~0.8x clone_edges \u2014 no write-time cap in phase 2",
+  "body": "Measured the persisted `clone_subblock_postings` footprint (review R5 asked for this) on a real precompute of the rag-rat self-index (4,020 walked baseline functions, phase-2 debug binary, isolated DB copy):\n\n- postings rows: 121,219 \u2192 avg **30.2 postings/function** (\u2248 |sub_block_tokens(bag, \u03b8=0.7)| per symbol; density-INDEPENDENT \u2014 it tracks a function's distinct-token count, not how clone-dense the repo is, so ~30/fn holds on pathological corpora too).\n- on-disk (dbstat): `clone_subblock_postings` = 16.34 MB table + 2.62 MB `idx_clone_subblock_postings_token` = ~19 MB. For comparison `clone_edges` (86,104 rows) = 23.83 MB. So postings \u2248 **0.8\u00d7 the edge table** here \u2014 NOT a blowup.\n- per-row on-disk \u2248 164 B, dominated by the redundant 64-char hex `file_sha` + `path` TEXT stored inline per posting (content-anchoring, #248).\n- full clone-graph rebuild (edges+postings) in DEBUG: 58 s for 4,020 functions.\n\nExtrapolation: ~5 KB/function \u2192 ~570 MB at drivers/net's 118k-function scale (#286 memory), multi-GB for the full kernel. Large but BOUNDED to one live generation (superseded generations' postings are CASCADE-GC'd), consistent with #286's \"pathological huge subsystem = long, resumable, bounded background job\" contract.\n\nDECISION: do NOT add the R5 write-time posting-list cap in phase 2. Reasons: (1) real size is comparable to clone_edges on a normal repo \u2014 non-issue for the common case; (2) a cap breaks the EXACT-parity invariant (persisted postings == `build_sub_block_index` output, pinned by `precompute_postings_match_sub_block_index`), which phase 3's fast/fallback equivalence depends on \u2014 a cap would have to be mirrored into the phase-3 read path, so co-design it THERE if ever needed; (3) if size bites at kernel scale, the higher-leverage fix is interning `file_sha`/`path` (a dictionary, like the edge string-interning #79/#224) \u2014 a bigger separate design \u2014 NOT a recall-reducing per-token cap. Stated as a real cost, not a solved one.\n\n(Re-created after a `.rag-rat` index loss; originally mem_19f235237cf.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783010832349,
+  "updated_at_ms": 1783010832349,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23ba2fdd_398c99486062",
+    "binding_kind": "path",
+    "binding_id": "crates/rag-rat-core/src/index/query_api/clones/precompute.rs",
+    "path": "crates/rag-rat-core/src/index/query_api/clones/precompute.rs",
+    "anchor_status": "current",
+    "created_at_ms": 1783010832349
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "296",
+   "R5",
+   "clones",
+   "perf",
+   "phase-2",
+   "postings",
+   "scaling"
+  ]
+ },
+ {
+  "memory_id": "mem_19f23ba09d4_f8d3f3f099fd",
+  "kind": "Decision",
+  "title": "#296 phase 2: postings_written is a POSTINGS-AWARE flag set at Building creation \u2014 the R2 upgrade + leftover-Building discriminator",
+  "body": "Phase 2 (#387, merged #391) populates `clone_subblock_postings` in `reconcile_clone_edges_pass`/`flush_batch` (index/query_api/clones/precompute.rs). Non-obvious design worth not re-deriving:\n\n**`clone_graph_generations.postings_written` semantics (the R2 gate).** Set to 1 at *Building generation CREATION* (`open_building_generation` fresh INSERT), not only at Complete. Meaning: \"this generation is POSTINGS-AWARE \u2014 its postings are written in-band by a postings-aware binary.\" Because every walked symbol's postings are staged in the SAME transaction as its cursor advance (`flush_batch`), a postings-aware gen has postings for every symbol up to its cursor; a *Complete* postings-aware gen is therefore fully populated. So:\n- `pending_clone_graph` + the Phase-0 skip read it on the LIVE (Complete) gen as \"postings complete\" \u2192 a pre-feature Complete gen (postings_written=0, the V037 migration default) is pending and forces ONE rebuild that fills postings (else an upgraded DB keeps an empty postings table forever).\n- `open_building_generation` reads it on an existing Building gen as \"resumable without a postings gap\": a pre-feature leftover Building gen (postings_written=0) is DISCARDED (CASCADE drops its edges+postings) and restarted from symbol 0, NOT resumed \u2014 resuming would Complete a gen missing postings for its already-past cursor symbols (review R2 parenthetical). A new-binary Building gen (postings_written=1) resumes normally.\n\nWhy the create-time flag and NOT a \"zero postings rows \u2192 discard\" heuristic: the heuristic has a contrived non-convergence corner (an all-empty-sub_block_tokens prefix could loop discard\u2192restart). The create-time flag is O(1), no false discards, no convergence risk. Safe to overload because NOTHING reads a Building gen's postings_written as \"complete\" \u2014 only the LIVE/Complete gen is gated (via the meta live-pointer), and `complete_generation` re-affirms postings_written=1.\n\n**Writer mechanics (review R6):** postings emitted for EVERY walked symbol incl. zero-edge ones, before the cursor advances, INSERT OR IGNORE under the content-key PK (idempotent on resume). `PostingGroup{anchor, tokens}` clones (path, file_sha) ONCE per symbol not per token. `sub_block_tokens(bag, \u03b8)` computed once, shared by candidate-gen and postings, so the persisted set is a byte-for-byte mirror of `build_sub_block_index` (parity test `precompute_postings_match_sub_block_index`). Mid-loop flush triggers on EITHER accumulator (`batch.len()` OR `postings.len()` \u2265 batch_size) since postings are far more numerous than edges.\n\nPhases 3 (bounded read in CheckIndex/of_text.rs) + 4 (mode-aware 40k guard) are now MERGED (#392/#393). `precomputed_pairs_if_eligible` (the find_clones EDGE fast path) deliberately does NOT check postings_written \u2014 it reads edges, which are complete for any Complete gen; only the write-time postings fast path needs the postings gate.\n\n(Re-created after a `.rag-rat` index loss; originally mem_19f235009eb.)",
+  "confidence": "high",
+  "status": "active",
+  "created_at_ms": 1783010822612,
+  "updated_at_ms": 1783010822612,
+  "source": "agent",
+  "bindings": [
+   {
+    "memory_id": "mem_19f23ba09d4_f8d3f3f099fd",
+    "binding_kind": "logical_symbol",
+    "binding_id": "crates/rag-rat-core/src/index/query_api/clones/precompute.rs::reconcile_clone_edges_pass",
+    "path": "crates/rag-rat-core/src/index/query_api/clones/precompute.rs",
+    "start_line": 214,
+    "end_line": 333,
+    "id": "sym_42cac378d210d61a",
+    "chunk_id": 77444,
+    "symbol_kind": "function",
+    "signature_hash": "10ef9e119e8ab37f814f02aa4b0bc9a7a77d8b98b8c9b13f84638a68179a6009",
+    "anchor_status": "current",
+    "created_at_ms": 1783010822612
+   }
+  ],
+  "call_paths": [],
+  "tags": [
+   "296",
+   "R2",
+   "clones",
+   "phase-2",
+   "postings",
+   "precompute"
+  ]
+ }
+]

@@ -1,0 +1,9 @@
+# Doctored copy of ../../crates produced by harness/make-drift-tree.py (regenerated on demand).
+drift-crates/
+
+# Modal run outputs: summaries, judge verdicts, HHEM scores, scoreboards. Regenerated per run.
+results/
+
+# Python bytecode
+__pycache__/
+*.pyc
