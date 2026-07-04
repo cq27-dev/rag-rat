@@ -997,6 +997,17 @@ fn dream_worklist_is_repo_scoped_end_to_end() {
         .memory
         .memory_id;
 
+    // Cover the IndexDatabase `dream_model_work_pending` wrapper — the ephemeral zero-work-guard
+    // seam the `dream` command consults before cold-starting a paid GPU box. A has an active,
+    // never-verified memory, so the model pass has pending work (repo-scoped to A).
+    let work_opts = rag_rat_core::dream::DreamOptions { now_ms: 0, limit: 20, verify: true };
+    assert!(
+        open_scoped(&repo_a, &data_dir)
+            .dream_model_work_pending(work_opts, 20, true, true)
+            .unwrap(),
+        "A's model pass has pending work (an un-verified memory) — the guard would provision"
+    );
+
     // dream from A: FLAGS only_in_b.rs (absent from A's files) as stale, and never surfaces B's
     // memory or B's own-resolving path.
     let a_dream = run_ok(&repo_a, &data_dir, &cache, &["--json", "dream"]);
