@@ -552,11 +552,25 @@ def summarize_all():
         print(f"{model}: {status}")
 
 
+def _base_sweep_files():
+    """Round-one sweep outputs only — `summaries-{slug}.json`, EXCLUDING the v2 variant sweeps
+    (`summaries-v2{a,b,c,d}-{slug}.json`). Round-one judge/HHEM metrics group by MODEL alone, so
+    ingesting the variant files here would duplicate and pollute them against the fixed v1 gate
+    (the variants have their own `judge_v2`/`judge_v2d` entrypoints). Skips are logged, never
+    silent."""
+    files, skipped = [], []
+    for f in sorted(RESULTS.glob("summaries-*.json")):
+        (skipped if f.name.startswith("summaries-v2") else files).append(f)
+    if skipped:
+        print(f"skipping {len(skipped)} v2 variant file(s): {', '.join(s.name for s in skipped)}")
+    return files
+
+
 @app.local_entrypoint()
 def judge_all():
     items = json.loads(CORPUS.read_text())
     judge_prompts, keys = [], []
-    for f in sorted(RESULTS.glob("summaries-*.json")):
+    for f in _base_sweep_files():
         r = json.loads(f.read_text())
         if "error" in r:
             continue
@@ -579,7 +593,7 @@ def judge_all():
 def hhem_all():
     items = json.loads(CORPUS.read_text())
     out = {}
-    for f in sorted(RESULTS.glob("summaries-*.json")):
+    for f in _base_sweep_files():
         r = json.loads(f.read_text())
         if "error" in r:
             continue

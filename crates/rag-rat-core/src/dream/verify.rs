@@ -250,30 +250,80 @@ fn queue_reason(
     }))
 }
 
-/// sha256 over the sorted, de-duplicated current sha256s of the memory's bound files (through the
-/// `files` view, so it is repo- and generation-scoped) — the cheap churn comparator that beats a
-/// commit-ancestry walk. An empty bound-file set hashes to a stable sentinel.
+/// sha256 fingerprint of a memory's ENTIRE deterministic evidence pack — the churn comparator that
+/// beats a commit-ancestry walk. Named `checked_inputs_hash` after the column it is stamped into;
+/// it covers BOTH halves of what the verdict model is shown:
+///   - the memory's bound-file inputs, as the sorted `(path, sha)` MULTISET (not bare shas: a set
+///     of shas is blind to a rebind that keeps identical content — a same-sha rebind, or a
+///     duplicate-content child add/remove under a directory binding, would leave the hash unchanged
+///     while the stored verdict still points at the old path);
+///   - the memory's identifier RESOLUTIONS, as the sorted `(identifier, resolution)` pairs. A
+///     memory with no bound file (or only a dead binding) still has a verdict grounded purely in
+///     whole-tree identifier resolution, and that resolution flips when a named symbol/path is
+///     ADDED or REMOVED from the index. Folding it in is what makes such a memory re-queue — and
+///     its stored verdict / uncitable terminal row drop — when its ACTUAL evidence changes, not
+///     only when a bound file does (else an all-NOT_FOUND memory recorded uncitable would keep
+///     skipping after the code later adds the symbol, and an identifier-only `current` verdict
+///     would survive that evidence disappearing). The excerpt TEXT is a pure function of these two
+///     inputs (bound-file content by sha + identifier positions in the unchanged body), so hashing
+///     them fingerprints the whole pack without rebuilding excerpts.
 ///
 /// `pub(crate)` so the phase-B verdict pass (`verdict`) recomputes it EXACTLY as the queue's
 /// comparator does when it stamps `memory_reality.checked_inputs_hash` — same function, so the next
-/// run churn-skips instead of re-checking — and so the surfacing hydrator can gate a stale verdict
-/// marker on it the same way the queue and divergence finder do.
+/// run churn-skips instead of re-checking — and so the surfacing hydrator / divergence finder gate
+/// a stale verdict on it the same way the queue does. Cost note: resolving identifiers loads
+/// `indexed_file_paths` per call; acceptable for the deterministic pass (`unverifiable_findings`
+/// already resolves every memory's identifiers each run) and the opt-in `surface = "summary"` read.
 pub(crate) fn checked_inputs_hash(
     conn: &Connection,
     memory_id: &str,
     scope: &Option<String>,
 ) -> rusqlite::Result<String> {
-    // Hash the sorted `(path, sha)` MULTISET, not just unique shas: a set of bare shas is blind to
-    // binding changes that keep identical content — rebinding to a same-sha file, or
-    // adding/removing a duplicate-content child under a directory binding, would leave the hash
-    // (and thus the churn-skip) unchanged while the stored verdict/evidence still points at the
-    // old binding path.
-    let pairs: BTreeSet<String> = resolve_bound_files(conn, memory_id, scope)?
+    let file_pairs: BTreeSet<String> = resolve_bound_files(conn, memory_id, scope)?
         .into_iter()
         .map(|(path, _, sha)| format!("{path}\u{1f}{sha}"))
         .collect();
-    let joined = pairs.into_iter().collect::<Vec<_>>().join("\u{1e}");
-    Ok(crate::index::hex_sha256(joined.as_bytes()))
+    let ident_pairs: BTreeSet<String> = identifier_resolution_pairs(conn, memory_id, scope)?
+        .into_iter()
+        .map(|(ident, res)| format!("{ident}\u{1f}{res}"))
+        .collect();
+    let files = file_pairs.into_iter().collect::<Vec<_>>().join("\u{1e}");
+    let idents = ident_pairs.into_iter().collect::<Vec<_>>().join("\u{1e}");
+    // `\u{1d}` (group separator) splits the two sections so a path can never collide with an
+    // identifier pair.
+    Ok(crate::index::hex_sha256(format!("{files}\u{1d}{idents}").as_bytes()))
+}
+
+/// The `(identifier, resolution)` half of the evidence-pack fingerprint — the memory's identifiers
+/// (from title+body) each resolved against the whole-tree index EXACTLY as [`evidence_pack`] does,
+/// so the churn key matches what the model is actually shown. Empty when the memory is not visible
+/// in scope or carries no identifiers.
+fn identifier_resolution_pairs(
+    conn: &Connection,
+    memory_id: &str,
+    scope: &Option<String>,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mem_clause = schema::periphery_repo_scope_clause(scope, "repo_memories");
+    let row: Option<(String, String)> = conn
+        .query_row(
+            &format!("SELECT title, body FROM repo_memories WHERE id = ?1{mem_clause}"),
+            [memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((title, body)) = row else {
+        return Ok(Vec::new());
+    };
+    let identifiers = extract_identifiers(&title, &body);
+    if identifiers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let file_paths = indexed_file_paths(conn)?;
+    let mut out = Vec::with_capacity(identifiers.len());
+    for ident in &identifiers {
+        out.push((ident.clone(), resolve_identifier(conn, ident, &file_paths)?));
+    }
+    Ok(out)
 }
 
 /// Deterministic evidence pack for one memory. Returns an EMPTY pack when the memory is not visible
@@ -852,6 +902,31 @@ mod tests {
         assert_ne!(
             hash_a, hash_b,
             "rebinding to a same-content file at a different path changes the hash"
+        );
+    }
+
+    #[test]
+    fn checked_inputs_hash_tracks_identifier_resolution_with_no_bound_file() {
+        // Regression (PR #428 Codex P2): the churn key must fingerprint the WHOLE evidence pack,
+        // not just bound files. A memory with no binding whose identifier flips from
+        // NOT_FOUND to a real symbol (the index gained it) must change hash, so an
+        // all-NOT_FOUND uncitable memory re-queues once the code adds the symbol.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a note about `resolve_marker_token`", "r");
+        let scope = Some("r".to_string());
+        let before = checked_inputs_hash(&c, "m1", &scope).unwrap(); // identifier resolves NOT_FOUND
+        let fid = seed_file(&c, "src/x.rs", "fn f() {}\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','resolve_marker_token','function',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        let after = checked_inputs_hash(&c, "m1", &scope).unwrap(); // now resolves to a symbol
+        assert_ne!(
+            before, after,
+            "the identifier's resolution flip changes the evidence fingerprint"
         );
     }
 

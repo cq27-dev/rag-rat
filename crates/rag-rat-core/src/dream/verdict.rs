@@ -31,7 +31,7 @@ use crate::index::schema;
 
 /// The verdict prompt version, stamped into `memory_reality.prompt_version`. Bump on any change to
 /// [`VERDICT_PROMPT_HEAD`] or the pack rendering so a stale-prompt verdict is distinguishable.
-pub(super) const PROMPT_VERSION: &str = "verify-pack-v1";
+pub(crate) const PROMPT_VERSION: &str = "verify-pack-v1";
 
 /// Rank for a `memory_divergence` finding — high, but below a broken-anchor's pass-0 signal.
 const DIVERGENCE_RANK: f64 = 0.8;
@@ -557,20 +557,24 @@ struct DivergenceRow {
     evidence_json: Option<String>,
     stored_body_hash: String,
     stored_inputs_hash: Option<String>,
+    stored_prompt_version: Option<String>,
     body: String,
 }
 
 /// `memory_divergence` findings, derived EVERY run from the STORED `memory_reality` — every
-/// `verdict='diverged'` row whose memory is still active AND whose stored `body_hash` + stored
-/// `checked_inputs_hash` still match the memory's CURRENT body and bound-file inputs, repo-scoped.
-/// NOT from this run's fresh (budget-capped) checks: because `dream_findings` sync auto-resolves
-/// any finding not reported in a run, deriving from fresh checks would resolve findings for merely-
-/// SKIPPED memories. Reading the stored table means a divergence finding resolves exactly when a
-/// RE-CHECK flips the verdict to `current` (row no longer `diverged`), the memory goes inactive,
-/// its body is edited, OR a bound file changes — the verdict was checked against the OLD
-/// body/inputs and no longer applies (the same stale gates the queue's churn-skip uses; both hashes
-/// computed in Rust because SQLite has no sha256). A churn-SKIPPED but UNCHANGED memory keeps BOTH
-/// hashes matching, so its finding still surfaces — the resolve-trap protection holds. Mirrors how
+/// `verdict='diverged'` row whose memory is still active AND whose stored `body_hash`,
+/// `checked_inputs_hash`, and `prompt_version` still match the memory's CURRENT body, evidence, and
+/// the current verdict prompt, repo-scoped. NOT from this run's fresh (budget-capped) checks:
+/// because `dream_findings` sync auto-resolves any finding not reported in a run, deriving from
+/// fresh checks would resolve findings for merely-SKIPPED memories. Reading the stored table means
+/// a divergence finding resolves exactly when a RE-CHECK flips the verdict to `current` (row no
+/// longer `diverged`), the memory goes inactive, its body is edited, its evidence changes, OR the
+/// verdict `PROMPT_VERSION` is bumped — in the last case the stored verdict came from an obsolete
+/// prompt and is not comparable, so it must not keep refreshing a finding until a fresh verdict is
+/// recorded (the queue already re-queues it as `PromptChanged`; this is the matching surfacing
+/// gate). These are the SAME stale gates the queue's churn-skip uses (hashes computed in Rust
+/// because SQLite has no sha256). A churn-SKIPPED but UNCHANGED memory keeps all three matching, so
+/// its finding still surfaces — the resolve-trap protection holds. Mirrors how
 /// `verify::unverifiable_findings` runs over the full population for the same reason.
 pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
@@ -578,9 +582,9 @@ pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<Dre
     let reality_clause = schema::periphery_repo_scope_clause(&scope, "mr");
     let mut stmt = conn.prepare(&format!(
         "SELECT mr.memory_id, mr.direction, mr.evidence_json, mr.body_hash, \
-         mr.checked_inputs_hash, m.body FROM memory_reality mr JOIN repo_memories m ON m.id = \
-         mr.memory_id{mem_clause} WHERE mr.verdict = 'diverged' AND m.status = \
-         'active'{reality_clause} ORDER BY mr.memory_id"
+         mr.checked_inputs_hash, mr.prompt_version, m.body FROM memory_reality mr JOIN \
+         repo_memories m ON m.id = mr.memory_id{mem_clause} WHERE mr.verdict = 'diverged' AND \
+         m.status = 'active'{reality_clause} ORDER BY mr.memory_id"
     ))?;
     let rows: Vec<DivergenceRow> = stmt
         .query_map([], |r| {
@@ -590,16 +594,21 @@ pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<Dre
                 evidence_json: r.get(2)?,
                 stored_body_hash: r.get(3)?,
                 stored_inputs_hash: r.get(4)?,
-                body: r.get(5)?,
+                stored_prompt_version: r.get(5)?,
+                body: r.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    // Stale gates: the verdict was checked against `stored_body_hash` + `stored_inputs_hash`; drop
-    // it once the body is edited OR a bound file changes, so an out-of-date `diverged` verdict is
-    // not surfaced against code the author has since changed. (`checked_inputs_hash` is recomputed
+    // Stale gates: the verdict was checked against `stored_body_hash` + `stored_inputs_hash` under
+    // `stored_prompt_version`; drop it once the body is edited, the evidence changes, OR the prompt
+    // version is bumped, so an out-of-date `diverged` verdict is not surfaced against code the
+    // author has since changed or via an obsolete prompt. (`checked_inputs_hash` is recomputed
     // per diverged row — a small set — exactly as the queue's comparator does.)
     let mut out = Vec::new();
     for row in rows {
+        if row.stored_prompt_version.as_deref() != Some(PROMPT_VERSION) {
+            continue;
+        }
         if row.stored_body_hash != crate::index::hex_sha256(row.body.as_bytes()) {
             continue;
         }
@@ -1110,6 +1119,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(open, 0, "the stale divergence finding resolves once the body is edited");
+    }
+
+    #[test]
+    fn divergence_finding_drops_under_an_obsolete_prompt_version() {
+        // Regression (PR #428 Codex P2): a stored `diverged` verdict from an OLD verdict prompt is
+        // not comparable; after a `PROMPT_VERSION` bump it must not keep refreshing a finding until
+        // a fresh verdict is recorded (the queue re-queues it as `PromptChanged`; this is
+        // the matching surfacing gate). Symmetric to the stale-body case.
+        use super::super::{DreamOptions, dream_run, dream_run_with_passes};
+
+        let c = seeded_verifiable_repo();
+        let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
+        dream_run_with_passes(
+            &c,
+            DreamOptions { now_ms: 1000, limit: 10, verify: true },
+            Some(VerdictPass { model: &model, budget: 10 }),
+            None,
+        )
+        .unwrap();
+
+        // Simulate a PROMPT_VERSION bump: the stored verdict now predates the current prompt. No
+        // model pass on the re-run, so the row is not re-checked; the stale-prompt gate must drop
+        // it.
+        c.execute(
+            "UPDATE memory_reality SET prompt_version='verify-pack-OLD' WHERE memory_id='m1'",
+            [],
+        )
+        .unwrap();
+        let r = dream_run(&c, DreamOptions { now_ms: 2000, limit: 10, verify: true }).unwrap();
+        assert!(
+            divergence_subjects(&r.findings).is_empty(),
+            "a diverged verdict from an obsolete prompt is not surfaced"
+        );
+        let open: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM dream_findings WHERE kind='memory_divergence' AND \
+                 status='open'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 0, "the stale-prompt divergence finding resolves");
     }
 
     #[test]

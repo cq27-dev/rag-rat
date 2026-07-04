@@ -571,26 +571,41 @@ mod tests {
     }
 
     fn seed_summary(c: &Connection, id: &str, body: &str, summary: &str) {
+        // Stamp the current COMPACT_PROMPT_VERSION — the hydrator gates the summary read on it
+        // (like the compaction queue's coverage check), so a NULL/mismatched version drops
+        // the summary.
         c.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, \
-             generated_at_ms) VALUES (?1,'r',?2,?3,0)",
-            params![id, crate::index::hex_sha256(body.as_bytes()), summary],
+            "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, prompt_version, \
+             generated_at_ms) VALUES (?1,'r',?2,?3,?4,0)",
+            params![
+                id,
+                crate::index::hex_sha256(body.as_bytes()),
+                summary,
+                crate::dream::COMPACT_PROMPT_VERSION
+            ],
         )
         .unwrap();
     }
 
     fn seed_reality(c: &Connection, id: &str, body: &str, verdict: &str, commit: Option<&str>) {
-        // Key the reality row on the memory's TRUE body_hash AND its current bound-file inputs hash
-        // — the hydrator gates the verdict marker on BOTH (like the queue/divergence
-        // finder), so a mismatch on either silently drops the marker. These test memories
-        // have no bindings, so the inputs hash is the stable empty-set value
+        // Key the reality row on the memory's TRUE body_hash, its current evidence hash, AND the
+        // current verdict PROMPT_VERSION — the hydrator gates the marker on all three (like the
+        // queue/divergence finder), so a mismatch on any silently drops it. These test memories
+        // have no bindings/identifiers, so the evidence hash is the stable empty value
         // `checked_inputs_hash` computes.
         let inputs = crate::dream::checked_inputs_hash(c, id, &Some("r".to_string())).unwrap();
         c.execute(
             "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
-             checked_against_commit, checked_inputs_hash, checked_at_ms) VALUES \
-             (?1,'r',?2,?3,?4,?5,0)",
-            params![id, crate::index::hex_sha256(body.as_bytes()), verdict, commit, inputs],
+             checked_against_commit, checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
+             (?1,'r',?2,?3,?4,?5,?6,0)",
+            params![
+                id,
+                crate::index::hex_sha256(body.as_bytes()),
+                verdict,
+                commit,
+                inputs,
+                crate::dream::VERDICT_PROMPT_VERSION
+            ],
         )
         .unwrap();
     }
@@ -688,10 +703,16 @@ mod tests {
         // empty-set value, which this arbitrary value is not.
         let c = summary_conn();
         let body = "a note whose stored verdict predates a bound-file change";
+        // Stamp the CURRENT prompt version so the only mismatch is the inputs hash — otherwise the
+        // marker would drop for the wrong reason (prompt gate) and not exercise the inputs gate.
         c.execute(
             "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
-             checked_inputs_hash, checked_at_ms) VALUES ('m1','r',?1,'diverged','stale-inputs',0)",
-            params![crate::index::hex_sha256(body.as_bytes())],
+             checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
+             ('m1','r',?1,'diverged','stale-inputs',?2,0)",
+            params![
+                crate::index::hex_sha256(body.as_bytes()),
+                crate::dream::VERDICT_PROMPT_VERSION
+            ],
         )
         .unwrap();
         let compact =
@@ -699,6 +720,42 @@ mod tests {
         assert_eq!(
             compact.direct[0].verdict, None,
             "a verdict whose checked_inputs_hash no longer matches is not surfaced"
+        );
+    }
+
+    #[test]
+    fn summary_and_marker_drop_under_an_obsolete_prompt_version() {
+        // Regression (PR #428 Codex P2): the surfacing hydrator must apply the SAME prompt-version
+        // gate the compaction queue / verification queue use. A summary from an obsolete compact
+        // prompt or a verdict from an obsolete verdict prompt must not keep showing while the
+        // memory waits behind the budget (or a model failure) for a fresh one.
+        let c = summary_conn();
+        let body = "b";
+        let body_hash = crate::index::hex_sha256(body.as_bytes());
+        c.execute(
+            "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, prompt_version, \
+             generated_at_ms) VALUES ('m1','r',?1,'A three sentence summary. It holds. \
+             Done.','compact-OLD',0)",
+            params![body_hash],
+        )
+        .unwrap();
+        let inputs = crate::dream::checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
+             checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
+             ('m1','r',?1,'diverged',?2,'verify-OLD',0)",
+            params![body_hash, inputs],
+        )
+        .unwrap();
+        let compact =
+            evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
+        assert_eq!(
+            compact.direct[0].summary, None,
+            "a summary from an obsolete compact prompt is not surfaced"
+        );
+        assert_eq!(
+            compact.direct[0].verdict, None,
+            "a verdict from an obsolete verdict prompt is not surfaced"
         );
     }
 

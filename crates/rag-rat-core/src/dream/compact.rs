@@ -27,7 +27,7 @@ use crate::index::schema;
 /// The compaction prompt version, stamped into `memory_summaries.prompt_version`. Bump on any
 /// change to [`COMPACT_PROMPT_HEAD`] so a stale-prompt summary is distinguishable (and can be
 /// regenerated).
-pub(super) const COMPACT_PROMPT_VERSION: &str = "compact-v1";
+pub(crate) const COMPACT_PROMPT_VERSION: &str = "compact-v1";
 
 /// The compaction-pass configuration handed to [`run_compact_pass`]: the model to ask and how many
 /// queued memories it may compact this run. Mirrors [`super::VerdictPass`] — a borrowed model + a

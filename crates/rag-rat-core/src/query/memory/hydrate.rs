@@ -204,24 +204,32 @@ pub(crate) fn current_summary_and_verdict(
     // — they scope to the same active repo id.
     let scope = schema::periphery_repo_scope(conn, "memory_summaries")?;
     let summary_clause = schema::periphery_repo_scope_clause(&scope, "memory_summaries");
+    // Gate the summary on the SAME identity the compaction queue treats as "covered": current
+    // body_hash AND current `COMPACT_PROMPT_VERSION`. Without the version predicate a summary
+    // produced by an obsolete compact prompt/guards keeps surfacing while the memory waits
+    // behind the compaction budget (or a model failure) for a fresh one.
     let summary: Option<String> = conn
         .query_row(
             &format!(
-                "SELECT summary FROM memory_summaries WHERE memory_id = ?1 AND body_hash = \
-                 ?2{summary_clause}"
+                "SELECT summary FROM memory_summaries WHERE memory_id = ?1 AND body_hash = ?2 AND \
+                 prompt_version = ?3{summary_clause}"
             ),
-            params![memory_id, body_hash],
+            params![memory_id, body_hash, crate::dream::COMPACT_PROMPT_VERSION],
             |r| r.get(0),
         )
         .optional()?;
     let reality_clause = schema::periphery_repo_scope_clause(&scope, "memory_reality");
+    // Gate the verdict marker on the current verdict `PROMPT_VERSION` too (the SQL predicate), so a
+    // verdict from an obsolete prompt is not shown while the queue waits to re-check it. The
+    // remaining stale checks — body_hash (the WHERE) and the evidence-pack hash (below) — mirror
+    // the queue and divergence finder exactly.
     let reality: Option<(Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
             &format!(
                 "SELECT verdict, checked_against_commit, checked_inputs_hash FROM memory_reality \
-                 WHERE memory_id = ?1 AND body_hash = ?2{reality_clause}"
+                 WHERE memory_id = ?1 AND body_hash = ?2 AND prompt_version = ?3{reality_clause}"
             ),
-            params![memory_id, body_hash],
+            params![memory_id, body_hash, crate::dream::VERDICT_PROMPT_VERSION],
             |r| {
                 Ok((
                     r.get::<_, Option<String>>(0)?,
@@ -231,12 +239,12 @@ pub(crate) fn current_summary_and_verdict(
             },
         )
         .optional()?;
-    // Gate the marker on the SAME stale checks the queue and divergence finder use: a verdict is
-    // only shown when the memory's bound-file inputs still match what it was checked against,
-    // so a bound-source change (before a re-verify) drops the marker instead of showing a
-    // verdict checked against a prior file version. The inputs hash is recomputed ONLY when a
-    // body-matching verdict row exists (the rare case), so surfacing an unverified memory pays
-    // nothing.
+    // Gate the marker on the evidence-pack hash the SAME way the queue and divergence finder do: a
+    // verdict is only shown when the memory's current evidence (bound files + identifier
+    // resolutions) still matches what it was checked against, so an evidence change (before a
+    // re-verify) drops the marker instead of showing a verdict checked against prior code. The
+    // hash is recomputed ONLY when a body- and prompt-matching verdict row exists (the rare
+    // case), so surfacing an unverified memory pays nothing.
     let verdict_marker = match reality {
         Some((verdict, commit, stored_inputs)) => {
             let current_inputs = crate::dream::checked_inputs_hash(conn, memory_id, &scope)?;

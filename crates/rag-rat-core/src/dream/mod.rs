@@ -30,6 +30,11 @@ mod verify;
 
 // The phase-C model compaction pass: the `CompactPass` handle `dream_run_with_passes` consumes
 // (borrowed model + budget), reusing the same `VerdictModel` trait as the verdict pass.
+// The evidence-pack fingerprint + the two derived-row prompt versions, re-exported
+// crate-internally so the surfacing hydrator gates a stale verdict/summary on the SAME
+// identity the verify queue, divergence finder, and compaction queue use — a stale-evidence or
+// stale-prompt row is dropped consistently at every read seam, not just by the producer.
+pub(crate) use compact::COMPACT_PROMPT_VERSION;
 pub use compact::CompactPass;
 // Curated crate-facing surface (mod.rs is the index, not the junk drawer): the migration
 // ladder and `register_repo` adoption re-derive persisted finding ids after re-stamping
@@ -41,9 +46,8 @@ pub(crate) use findings::rederive_finding_ids;
 pub use model::{HttpVerdictModel, VerdictModel};
 use rusqlite::Connection;
 use serde::Serialize;
+pub(crate) use verdict::PROMPT_VERSION as VERDICT_PROMPT_VERSION;
 pub use verdict::VerdictPass;
-// The bound-file inputs hash, re-exported crate-internally so the surfacing hydrator can gate
-// a stale verdict marker on it the same way the verify queue and divergence finder do.
 pub(crate) use verify::checked_inputs_hash;
 // Dream v2 pass-0 substrate: the churn-skip verification queue + the deterministic,
 // citation-checkable evidence pack. Public so the phase-B model verdict pass (and later the
