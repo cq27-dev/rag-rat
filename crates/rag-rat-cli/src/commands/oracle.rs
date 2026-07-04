@@ -483,6 +483,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         (root, config)
@@ -532,6 +533,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         let config = config_with(vec!["**/*.rs".to_string()], Vec::new());

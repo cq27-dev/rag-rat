@@ -211,6 +211,7 @@ fn find_clones_rejects_nan_and_non_finite_min_similarity() {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     crate::IndexDatabase::rebuild(&config).unwrap();
@@ -795,6 +796,7 @@ fn recall_candidates_identical_blob_vs_postings_grouping() {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     let db = crate::IndexDatabase::rebuild(&config).unwrap();

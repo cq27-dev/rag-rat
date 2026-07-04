@@ -54,6 +54,11 @@ pub struct ImpactSurfaceOptions {
     /// bindings + call paths (#37). The agent-facing MCP default is compact; full detail stays one
     /// lookup away (`memory_for_symbol` / `memory_for_path` / `memory_for_call_path`).
     pub compact_memories: bool,
+    /// How the compact `repo_memories` headers render (`[memory] surface`). `Full` (the default)
+    /// keeps the mechanical header; `Summary` hydrates each header with the dream-compacted
+    /// summary and verdict marker for the memory's current body (dream v2 pass 2). Only
+    /// consulted when `compact_memories` is set; the full-body view is unaffected.
+    pub surface: crate::config::MemorySurface,
 }
 
 /// `impact_surface`'s `repo_memories` payload — compact by default (#37), full on request. The two
@@ -143,6 +148,7 @@ impl Default for ImpactSurfaceOptions {
             include_text_fallback: true,
             include_memories: true,
             compact_memories: true,
+            surface: crate::config::MemorySurface::default(),
         }
     }
 }
@@ -318,7 +324,15 @@ pub fn impact_surface_report_for_symbol(
     .unwrap_or(u64::MAX);
     let memory_stale = u64::try_from(repo_memories.stale.len()).unwrap_or(u64::MAX);
     let repo_memories = if options.compact_memories {
-        RepoMemoryEvidenceView::Compact(repo_memories.compact())
+        // Under `surface = "summary"` each compact header is hydrated with the dream summary +
+        // verdict marker for the memory's current body (a missing summary → the mechanical header);
+        // `full` keeps the purely mechanical projection. The full-BODY view (compact_memories =
+        // false) is unaffected — `memory show` remains the expand path there.
+        let compact = match options.surface {
+            crate::config::MemorySurface::Summary => repo_memories.compact_summary_first(conn)?,
+            crate::config::MemorySurface::Full => repo_memories.compact(),
+        };
+        RepoMemoryEvidenceView::Compact(compact)
     } else {
         RepoMemoryEvidenceView::Full(repo_memories)
     };

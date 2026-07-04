@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn diverged_opens_finding_then_skip_keeps_it_then_recheck_current_resolves_it() {
-        use super::super::{DreamOptions, dream_run_with_verdict};
+        use super::super::{DreamOptions, dream_run_with_passes};
 
         let c = seeded_verifiable_repo();
         let model = MockVerdictModel::new([
@@ -732,8 +732,9 @@ mod tests {
         let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true };
 
         // Run 1: diverged verdict → memory_divergence finding opens.
-        let r1 = dream_run_with_verdict(&c, opts, Some(VerdictPass { model: &model, budget: 10 }))
-            .unwrap();
+        let r1 =
+            dream_run_with_passes(&c, opts, Some(VerdictPass { model: &model, budget: 10 }), None)
+                .unwrap();
         assert_eq!(divergence_subjects(&r1.findings), vec!["m1".to_string()], "divergence opens");
         assert_eq!(model.calls(), 1);
 
@@ -741,8 +742,9 @@ mod tests {
         // is derived from the STORED diverged row, so it stays open (the resolve-trap
         // regression).
         let opts2 = DreamOptions { now_ms: 2000, ..opts };
-        let r2 = dream_run_with_verdict(&c, opts2, Some(VerdictPass { model: &model, budget: 10 }))
-            .unwrap();
+        let r2 =
+            dream_run_with_passes(&c, opts2, Some(VerdictPass { model: &model, budget: 10 }), None)
+                .unwrap();
         assert_eq!(model.calls(), 1, "run 2 churn-skips the model");
         assert_eq!(
             divergence_subjects(&r2.findings),
@@ -758,8 +760,9 @@ mod tests {
         )
         .unwrap();
         let opts3 = DreamOptions { now_ms: 3000, ..opts };
-        let r3 = dream_run_with_verdict(&c, opts3, Some(VerdictPass { model: &model, budget: 10 }))
-            .unwrap();
+        let r3 =
+            dream_run_with_passes(&c, opts3, Some(VerdictPass { model: &model, budget: 10 }), None)
+                .unwrap();
         assert_eq!(model.calls(), 2, "the body edit re-invokes the model");
         assert!(
             divergence_subjects(&r3.findings).is_empty(),
@@ -778,7 +781,7 @@ mod tests {
 
     #[test]
     fn model_pass_never_mutates_a_repo_memories_column() {
-        use super::super::{DreamOptions, dream_run_with_verdict};
+        use super::super::{DreamOptions, dream_run_with_passes};
 
         let c = seeded_verifiable_repo();
         let snap = |c: &Connection| -> (String, String, String) {
@@ -792,7 +795,8 @@ mod tests {
         let before = snap(&c);
         let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
         let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true };
-        dream_run_with_verdict(&c, opts, Some(VerdictPass { model: &model, budget: 10 })).unwrap();
+        dream_run_with_passes(&c, opts, Some(VerdictPass { model: &model, budget: 10 }), None)
+            .unwrap();
         assert_eq!(before, snap(&c), "the model verdict pass leaves repo_memories byte-identical");
         // ...but it DID write a diverged verdict into the sibling table.
         let verdict: String = c
@@ -805,7 +809,7 @@ mod tests {
 
     #[test]
     fn verdict_writes_and_divergence_are_repo_scoped() {
-        use super::super::{DreamOptions, dream_run_with_verdict};
+        use super::super::{DreamOptions, dream_run_with_passes};
 
         // `repo_memories.id` is a global PK, so the two repos hold DISTINCT ids (m1 in r1, m2 in
         // r2); isolation is proved by the `repo_id` scope predicates, not an id collision.
@@ -830,9 +834,13 @@ mod tests {
         seed_memory(&c, "m2", "note", "describes `thing_two`", "r2");
         let model_r2 = MockVerdictModel::new([current_citing("thing_two")]);
         let opts = DreamOptions { now_ms: 2000, limit: 10, verify: true };
-        let r2 =
-            dream_run_with_verdict(&c, opts, Some(VerdictPass { model: &model_r2, budget: 10 }))
-                .unwrap();
+        let r2 = dream_run_with_passes(
+            &c,
+            opts,
+            Some(VerdictPass { model: &model_r2, budget: 10 }),
+            None,
+        )
+        .unwrap();
         assert!(
             divergence_subjects(&r2.findings).is_empty(),
             "repo r2 does not see repo r1's diverged verdict as a divergence finding"

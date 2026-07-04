@@ -5,6 +5,7 @@ pub(crate) fn call_tool_with_db(
     name: &str,
     arguments: Value,
     graded_history: bool,
+    memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
     let result = match name {
         "semantic_search" => {
@@ -49,7 +50,7 @@ pub(crate) fn call_tool_with_db(
         "impact_surface" => {
             let args: ImpactArgs = serde_json::from_value(arguments)?;
             let resolution_mode = resolution_mode(args.resolution);
-            impact_tool(db, args, resolution_mode)?
+            impact_tool(db, args, resolution_mode, memory_surface)?
         },
         "repo_brief" => {
             let args: RepoBriefArgs = serde_json::from_value(arguments)?;
@@ -505,6 +506,7 @@ pub(crate) fn impact_tool(
     db: &IndexDatabase,
     args: ImpactArgs,
     resolution_mode: GraphResolutionMode,
+    memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
     let options = ImpactSurfaceOptions {
         resolution_mode,
@@ -515,6 +517,10 @@ pub(crate) fn impact_tool(
         include_text_fallback: included(&args.include, ImpactInclude::TextFallback, true),
         include_memories: included(&args.include, ImpactInclude::Memories, true),
         compact_memories: !args.full_memories,
+        // The primary MCP drive-by attachment renderer: the symbol-selected report path below
+        // honors `[memory] surface`. The query-string / allow-ambiguous fallbacks below still use
+        // the default (full) surface — noted for a follow-up.
+        surface: memory_surface,
     };
     if args.logical_symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
         let selector = SymbolSelector {

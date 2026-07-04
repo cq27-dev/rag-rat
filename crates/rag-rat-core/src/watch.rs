@@ -859,6 +859,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         }
     }
@@ -884,6 +885,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         let worktree = PathBuf::from("/wt/feat");
@@ -984,6 +986,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         // A linked checkout mirrors the layout: `<checkout>/crate/src/a.rs`.
@@ -1031,6 +1034,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         let ignore = IgnoreMatcher::compile(&root, &[]);
@@ -1096,6 +1100,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
 
@@ -1172,6 +1177,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
 
@@ -1320,6 +1326,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
 
@@ -1585,6 +1592,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from("src")]);

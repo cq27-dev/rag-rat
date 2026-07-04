@@ -140,6 +140,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: LogConfig { enabled, dir: dir.join("logs"), ..LogConfig::default() },
         }
     }

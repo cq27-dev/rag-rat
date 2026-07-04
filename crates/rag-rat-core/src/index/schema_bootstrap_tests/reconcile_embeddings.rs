@@ -845,6 +845,7 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();

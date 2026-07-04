@@ -181,6 +181,67 @@ pub(crate) fn ids_to_memories(
     }
     Ok(memories)
 }
+/// The dream summary + verdict marker for a memory's CURRENT body — the `[memory] surface =
+/// "summary"` hydration (dream v2 passes 1 & 2). Returns `(summary, verdict_marker)`:
+///   - `summary` is the `memory_summaries.summary` keyed on the memory's current `body_hash`
+///     (repo-scoped); a body edit changes the key, so a stale summary self-invalidates and this
+///     misses (title-only fallback) until the compaction pass regenerates it.
+///   - `verdict_marker` is a plain-text marker derived from the memory's `memory_reality` verdict
+///     (`[verdict: diverged]` / `[verdict: current @<short-commit>]`); `None` when there is no
+///     verdict row or the row's verdict is still NULL (a pass-0-only check).
+///
+/// Reads only the derived sibling tables — never a `repo_memories` column.
+pub(crate) fn current_summary_and_verdict(
+    conn: &Connection,
+    memory_id: &str,
+    body: &str,
+) -> rusqlite::Result<(Option<String>, Option<String>)> {
+    use crate::index::schema;
+    let body_hash = crate::index::hex_sha256(body.as_bytes());
+    // Scope both sibling reads by the active repo (both carry `repo_id`, V045). One probe suffices
+    // — they scope to the same active repo id.
+    let scope = schema::periphery_repo_scope(conn, "memory_summaries")?;
+    let summary_clause = schema::periphery_repo_scope_clause(&scope, "memory_summaries");
+    let summary: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT summary FROM memory_summaries WHERE memory_id = ?1 AND body_hash = \
+                 ?2{summary_clause}"
+            ),
+            params![memory_id, body_hash],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let reality_clause = schema::periphery_repo_scope_clause(&scope, "memory_reality");
+    let verdict_marker = conn
+        .query_row(
+            &format!(
+                "SELECT verdict, checked_against_commit FROM memory_reality WHERE memory_id = \
+                 ?1{reality_clause}"
+            ),
+            params![memory_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .and_then(|(verdict, commit)| render_verdict_marker(verdict.as_deref(), commit.as_deref()));
+    Ok((summary, verdict_marker))
+}
+
+/// A plain-text drive-by verdict marker (no emoji, matching the mechanical rendering style). A
+/// `current` verdict carries the short (7-hex) commit it was checked against when known; a
+/// `diverged` verdict stands alone. A NULL/unrecognized verdict (a pass-0-only reality row, before
+/// the model ran) has no marker.
+fn render_verdict_marker(verdict: Option<&str>, commit: Option<&str>) -> Option<String> {
+    match verdict {
+        Some("current") => Some(match commit.map(str::trim).filter(|c| !c.is_empty()) {
+            Some(c) => format!("[verdict: current @{}]", c.chars().take(7).collect::<String>()),
+            None => "[verdict: current]".to_string(),
+        }),
+        Some("diverged") => Some("[verdict: diverged]".to_string()),
+        _ => None,
+    }
+}
+
 pub(crate) fn split_active_stale(memories: Vec<RepoMemory>) -> (Vec<RepoMemory>, Vec<RepoMemory>) {
     let mut direct = Vec::new();
     let mut stale = Vec::new();

@@ -700,6 +700,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         crate::IndexDatabase::rebuild(&config).unwrap()
@@ -813,6 +814,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
@@ -880,6 +882,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
@@ -974,6 +977,7 @@ mod tests {
             oracle: Default::default(),
             search: Default::default(),
             dream: Default::default(),
+            memory: Default::default(),
             log: Default::default(),
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();

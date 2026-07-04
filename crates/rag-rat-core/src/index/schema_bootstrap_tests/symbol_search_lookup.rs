@@ -539,6 +539,7 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -1324,6 +1325,7 @@ where
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();

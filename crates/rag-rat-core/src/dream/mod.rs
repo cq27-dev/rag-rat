@@ -22,18 +22,22 @@
 //! tables (V045). Those sibling tables hold DERIVED, regenerable data, which is what preserves
 //! dream's "never mutates a `repo_memories` row" invariant even as verification lands.
 
+mod compact;
 mod findings;
 mod model;
 mod verdict;
 mod verify;
 
+// The phase-C model compaction pass: the `CompactPass` handle `dream_run_with_passes` consumes
+// (borrowed model + budget), reusing the same `VerdictModel` trait as the verdict pass.
+pub use compact::CompactPass;
 // Curated crate-facing surface (mod.rs is the index, not the junk drawer): the migration
 // ladder and `register_repo` adoption re-derive persisted finding ids after re-stamping
 // `repo_id`.
 pub(crate) use findings::rederive_finding_ids;
 // The phase-B model verdict pass: the out-of-process verdict-model trait + its HTTP client
 // (the CLI builds one from `[dream.model]`) and the `VerdictPass` handle
-// `dream_run_with_verdict` consumes.
+// `dream_run_with_passes` consumes.
 pub use model::{HttpVerdictModel, VerdictModel};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -93,7 +97,7 @@ fn effective_rank(base_rank: f64, first_seen_at_ms: i64, now_ms: i64) -> f64 {
 /// findings (dream v2 pass 0) AND the `memory_divergence` findings derived from the STORED
 /// `memory_reality` table (phase B) through the same identity-keyed sync — off by default, so a
 /// plain run is byte-identical to v1. This function does NOT run the model itself (it takes no
-/// model); the model verdict pass runs in [`dream_run_with_verdict`] and writes `memory_reality`
+/// model); the model verdict pass runs in [`dream_run_with_passes`] and writes `memory_reality`
 /// BEFORE this reads it. With no model ever run, the `memory_reality` verdict rows are absent, so
 /// the divergence set is empty — a harmless no-op.
 pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<DreamReport> {
@@ -144,24 +148,36 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<Drea
     Ok(DreamReport { findings: open, opened, refreshed, superseded, resolved })
 }
 
-/// [`dream_run`] plus the phase-B model verdict pass. When `verify` is set and a [`VerdictPass`] is
-/// supplied (the CLI builds one only when `[dream.model] enabled = true`), the model verdict pass
-/// runs FIRST — checking the budget-capped churn-skip queue and writing accepted verdicts into
-/// `memory_reality` — and THEN [`dream_run`] computes findings over the now-updated table (so a
-/// fresh `diverged` verdict opens a `memory_divergence` finding in the same run). `None` (model
-/// disabled) is exactly [`dream_run`]: pass 0 only, still 100% deterministic. Never writes a
-/// `repo_memories` column.
-pub fn dream_run_with_verdict(
+/// [`dream_run`] plus the phase-B model verdict pass and the phase-C model compaction pass. Both
+/// model passes run BEFORE the deterministic finding computation (the CLI builds each only when
+/// `[dream.model] enabled = true`):
+///   - the VERDICT pass (gated on `verify` + a supplied [`VerdictPass`]) checks the budget-capped
+///     churn-skip queue and writes accepted verdicts into `memory_reality`, which [`dream_run`]
+///     then reads to derive `memory_divergence` findings (so a fresh `diverged` verdict opens a
+///     finding in the same run);
+///   - the COMPACTION pass (gated only on a supplied [`CompactPass`] — `--compact` is independent
+///     of `--verify`) rewrites un-summarized memories into `memory_summaries`.
+///
+/// Both are budget-capped churn-skip passes over derived sibling tables; NEITHER writes a
+/// `repo_memories` column. `None`/`None` is exactly [`dream_run`]: pass 0 only, still 100%
+/// deterministic — so plain `rag-rat dream` stays byte-identical.
+pub fn dream_run_with_passes(
     conn: &Connection,
     opts: DreamOptions,
     verdict_pass: Option<VerdictPass<'_>>,
+    compact_pass: Option<CompactPass<'_>>,
 ) -> anyhow::Result<DreamReport> {
-    // Run the model verdict pass before the deterministic finding computation: it writes
-    // `memory_reality`, which `dream_run` then reads to derive `memory_divergence` findings.
+    // The verdict pass writes `memory_reality`, which `dream_run` then reads to derive
+    // `memory_divergence` findings — so it runs before the finding computation.
     if opts.verify
         && let Some(pass) = verdict_pass
     {
         verdict::run_verdict_pass(conn, pass, opts.now_ms)?;
+    }
+    // Compaction is independent of the verify findings (it writes `memory_summaries`, read only by
+    // the surfacing layer), so it is gated on its own supplied pass, not on `opts.verify`.
+    if let Some(pass) = compact_pass {
+        compact::run_compact_pass(conn, pass, opts.now_ms)?;
     }
     Ok(dream_run(conn, opts)?)
 }

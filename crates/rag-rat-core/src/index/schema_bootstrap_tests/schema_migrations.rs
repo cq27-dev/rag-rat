@@ -26,6 +26,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
 

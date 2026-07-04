@@ -891,6 +891,7 @@ fn mixed_config() -> (PathBuf, Config) {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     })
 }
@@ -918,6 +919,7 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     })
 }
@@ -942,6 +944,7 @@ fn rust_config(root: PathBuf) -> Config {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     }
 }

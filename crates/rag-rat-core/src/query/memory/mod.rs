@@ -237,6 +237,40 @@ impl RepoMemoryEvidence {
             stale: project(&self.stale),
         }
     }
+
+    /// [`Self::compact`] plus the dream summary + verdict marker for each memory's CURRENT body
+    /// (the `[memory] surface = "summary"` view). Each header is hydrated from the derived
+    /// `memory_summaries` / `memory_reality` siblings (repo-scoped, keyed on the current
+    /// body_hash), so a memory with no summary row falls back to the mechanical header
+    /// (title-only in practice). The full body is never included — `memory show` remains the
+    /// expand path.
+    pub fn compact_summary_first(
+        &self,
+        conn: &Connection,
+    ) -> rusqlite::Result<CompactRepoMemoryEvidence> {
+        let project = |memories: &[RepoMemory]| -> rusqlite::Result<Vec<CompactRepoMemory>> {
+            memories
+                .iter()
+                .map(|memory| {
+                    let mut compact = CompactRepoMemory::from(memory);
+                    let (summary, verdict) = hydrate::current_summary_and_verdict(
+                        conn,
+                        &memory.memory_id,
+                        &memory.body,
+                    )?;
+                    compact.summary = summary;
+                    compact.verdict = verdict;
+                    Ok(compact)
+                })
+                .collect()
+        };
+        Ok(CompactRepoMemoryEvidence {
+            direct: project(&self.direct)?,
+            path_crossed: project(&self.path_crossed)?,
+            call_path_crossed: project(&self.call_path_crossed)?,
+            stale: project(&self.stale)?,
+        })
+    }
 }
 
 /// Compact (default) view of `RepoMemoryEvidence` for `impact_surface` (#37) — same lane layout,
@@ -286,6 +320,18 @@ pub struct CompactRepoMemory {
         serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
     )]
     pub logical_symbol_id: Option<i64>,
+    /// The dream-compacted summary of the memory's CURRENT body, populated ONLY under `[memory]
+    /// surface = "summary"` when a `memory_summaries` row exists for the current body_hash (dream
+    /// v2 pass 2). `None` under the default `full` surface, or when no summary has been
+    /// generated — the title then stands alone (the title-only fallback). The full body is
+    /// always one lookup away via `memory show` / `memory_show`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// A plain-text verdict marker from the memory's `memory_reality` row (dream v2 pass 1), e.g.
+    /// `[verdict: diverged]` / `[verdict: current @<short-commit>]`. Populated alongside `summary`
+    /// under `surface = "summary"`; `None` under `full` or when the memory has no stored verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
@@ -319,6 +365,10 @@ impl From<&RepoMemory> for CompactRepoMemory {
                 _ => None,
             }),
             logical_symbol_id: primary.and_then(|binding| binding.logical_symbol_id),
+            // The mechanical projection carries no summary/verdict; the summary surface hydrates
+            // them from the sibling tables (see `RepoMemoryEvidence::compact_summary_first`).
+            summary: None,
+            verdict: None,
             tags: memory.tags.clone(),
         }
     }
@@ -478,5 +528,175 @@ mod tests {
             None,
         )]));
         assert_eq!(compact.binding_kind.as_deref(), Some(SCIP_MONIKER_BINDING_KIND));
+    }
+
+    // ── dream-summary surfacing (`[memory] surface = "summary"`) ─────────────────
+
+    /// A fresh in-memory index scoped to repo `r` — the fixture for the summary-surfacing tests.
+    fn summary_conn() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&c).unwrap();
+        c.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id','r')",
+            [],
+        )
+        .unwrap();
+        c
+    }
+
+    /// A minimal `RepoMemory` with a controlled id + body (no bindings).
+    fn memory_with_body(id: &str, body: &str) -> RepoMemory {
+        RepoMemory {
+            memory_id: id.to_string(),
+            kind: "Invariant".to_string(),
+            title: "t".to_string(),
+            body: body.to_string(),
+            confidence: "high".to_string(),
+            status: "active".to_string(),
+            created_by: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            source: "agent".to_string(),
+            source_text_hash: None,
+            input_hash: None,
+            memory_version: String::new(),
+            bindings: Vec::new(),
+            call_paths: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    fn seed_summary(c: &Connection, id: &str, body: &str, summary: &str) {
+        c.execute(
+            "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, \
+             generated_at_ms) VALUES (?1,'r',?2,?3,0)",
+            params![id, crate::index::hex_sha256(body.as_bytes()), summary],
+        )
+        .unwrap();
+    }
+
+    fn seed_reality(c: &Connection, id: &str, verdict: &str, commit: Option<&str>) {
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
+             checked_against_commit, checked_at_ms) VALUES (?1,'r','bh',?2,?3,0)",
+            params![id, verdict, commit],
+        )
+        .unwrap();
+    }
+
+    fn evidence(memories: Vec<RepoMemory>) -> RepoMemoryEvidence {
+        RepoMemoryEvidence {
+            direct: memories,
+            path_crossed: Vec::new(),
+            call_path_crossed: Vec::new(),
+            stale: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn summary_surface_renders_summary_and_verdict_marker() {
+        let c = summary_conn();
+        let body = "the full body worth compacting";
+        seed_summary(
+            &c,
+            "m1",
+            body,
+            "A compacted three-sentence summary. It preserves polarity. Done.",
+        );
+        seed_reality(&c, "m1", "diverged", None);
+
+        let compact =
+            evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
+        let header = &compact.direct[0];
+        assert_eq!(
+            header.summary.as_deref(),
+            Some("A compacted three-sentence summary. It preserves polarity. Done."),
+            "the compacted summary is hydrated under the summary surface"
+        );
+        assert_eq!(
+            header.verdict.as_deref(),
+            Some("[verdict: diverged]"),
+            "the verdict marker renders"
+        );
+    }
+
+    #[test]
+    fn summary_surface_falls_back_to_title_only_without_a_summary_row() {
+        let c = summary_conn();
+        // No memory_summaries / memory_reality rows → summary + verdict stay None (title-only).
+        let compact =
+            evidence(vec![memory_with_body("m1", "body")]).compact_summary_first(&c).unwrap();
+        let header = &compact.direct[0];
+        assert_eq!(header.summary, None, "no summary row → the title stands alone");
+        assert_eq!(header.verdict, None, "no reality row → no verdict marker");
+        assert_eq!(header.title, "t", "the title is still present");
+    }
+
+    #[test]
+    fn summary_surface_misses_a_stale_summary_after_a_body_edit() {
+        let c = summary_conn();
+        // A summary exists, but for the OLD body — the current body_hash differs, so the LEFT JOIN
+        // misses and the header falls back to title-only (the summary self-invalidated).
+        seed_summary(
+            &c,
+            "m1",
+            "old body",
+            "A stale summary from before. It no longer applies. Ignore.",
+        );
+        let compact =
+            evidence(vec![memory_with_body("m1", "new body")]).compact_summary_first(&c).unwrap();
+        assert_eq!(
+            compact.direct[0].summary, None,
+            "a summary keyed on a stale body_hash is not surfaced"
+        );
+    }
+
+    #[test]
+    fn verdict_marker_current_carries_the_short_commit() {
+        let c = summary_conn();
+        let body = "b";
+        seed_summary(&c, "m1", body, "One sentence summary here. Two now. Three done.");
+        seed_reality(&c, "m1", "current", Some("abcdef0123456789"));
+        let compact =
+            evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
+        assert_eq!(
+            compact.direct[0].verdict.as_deref(),
+            Some("[verdict: current @abcdef0]"),
+            "a current verdict carries the 7-hex short commit"
+        );
+    }
+
+    #[test]
+    fn full_surface_projection_carries_no_summary_or_verdict() {
+        // The default (`full`) compact projection is purely mechanical — no summary/verdict, even
+        // when sibling rows exist (they are only read by `compact_summary_first`).
+        let compact = CompactRepoMemory::from(&memory_with_body("m1", "body"));
+        assert_eq!(compact.summary, None);
+        assert_eq!(compact.verdict, None);
+    }
+
+    #[test]
+    fn memory_get_returns_the_full_body_even_when_a_summary_exists() {
+        // `memory show` / `memory_show` is surface-independent: the expand path always carries the
+        // full body regardless of any compacted summary.
+        let c = summary_conn();
+        let body = "the full body that memory show must always return";
+        c.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
+             ('m1','Invariant','t',?1,'high','active','agent',1,1,'agent','v1','r')",
+            [body],
+        )
+        .unwrap();
+        seed_summary(&c, "m1", body, "A short summary stands in for surfacing. Not for show. Ok.");
+        let fetched = memory_by_id(&c, "m1").unwrap().expect("memory present");
+        assert_eq!(
+            fetched.body, body,
+            "memory_get returns the full body regardless of the summary"
+        );
     }
 }

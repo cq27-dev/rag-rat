@@ -9,6 +9,7 @@ use std::str::FromStr;
 pub use catalog::*;
 pub(crate) use defaults::*;
 pub(crate) use handlers::*;
+use rag_rat_core::config::MemorySurface;
 use rag_rat_core::language::Language;
 use rag_rat_core::query::clusters::RepoClustersOptions;
 use rag_rat_core::query::graph::{GraphResolutionMode, GraphTraversalOptions};
@@ -36,9 +37,10 @@ fn included<T: PartialEq>(include: &Option<Vec<T>>, flag: T, default: bool) -> b
 
 pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Result<Value> {
     let db = IndexDatabase::open(database)?;
-    // The bare-path entry point has no `Config`, so the graded-git rerank is OFF here — it is a
-    // config-gated knob (`[search] graded_git_rerank`) only the `call_tool_for_config` path reads.
-    call_tool_with_db(&db, name, arguments, false)
+    // The bare-path entry point has no `Config`, so config-gated knobs default OFF here: the
+    // graded-git rerank (`[search] graded_git_rerank`) and the memory surface (`[memory] surface`)
+    // are only read on the `call_tool_for_config` path.
+    call_tool_with_db(&db, name, arguments, false, MemorySurface::default())
 }
 
 /// Tools that only read the index. They open a read-only connection so a concurrent writer can
@@ -95,7 +97,13 @@ pub fn call_tool_for_config(
         && let Some(mut db) = IndexDatabase::try_open_config_read_only(config)?
     {
         db.use_worktree_scope(&config.root, scope_worktree.as_deref())?;
-        match call_tool_with_db(&db, name, arguments.clone(), config.search.graded_git_rerank) {
+        match call_tool_with_db(
+            &db,
+            name,
+            arguments.clone(),
+            config.search.graded_git_rerank,
+            config.memory.surface,
+        ) {
             Ok(result) => return finalize_tool_result(config, name, result),
             Err(err) if rag_rat_core::storage::is_readonly_violation(&err) => {
                 // A lazy write hit the read-only connection — fall through to the read-write open.
@@ -122,7 +130,13 @@ pub fn call_tool_for_config(
         if is_read_only_tool(name) {
             db.use_worktree_scope(&config.root, scope_worktree.as_deref())?;
         }
-        call_tool_with_db(&db, name, arguments.clone(), config.search.graded_git_rerank)
+        call_tool_with_db(
+            &db,
+            name,
+            arguments.clone(),
+            config.search.graded_git_rerank,
+            config.memory.surface,
+        )
     })?;
     finalize_tool_result(config, name, result)
 }

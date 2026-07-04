@@ -1587,6 +1587,59 @@ fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
     );
 }
 
+/// Dream v2 pass 2 (poison-sibling discipline): the summary + verdict READ-JOIN that the
+/// `surface = "summary"` view uses (`current_summary_and_verdict`) must be repo-scoped. Both repos
+/// carry a `memory_summaries` + `memory_reality` row under the SAME (memory_id, body_hash) — a
+/// read that forgot its `repo_id` predicate would surface the wrong repo's summary/verdict. The
+/// scoped read must return each repo's OWN row.
+#[test]
+fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
+    use crate::query::memory::current_summary_and_verdict;
+    let conn = a5_scoped_two_repo_conn();
+    let body = "a body shared by both repos' notes";
+    let body_hash = crate::index::hex_sha256(body.as_bytes());
+
+    // Same (memory_id, body_hash) under BOTH repos — distinct summary text + verdict per repo.
+    for (repo, summary, verdict) in [
+        (A5_REPO_A, "repo A compacted summary", "diverged"),
+        (A5_REPO_B, "repo B compacted summary", "current"),
+    ] {
+        conn.execute(
+            "INSERT INTO memory_summaries(memory_id, repo_id, body_hash, summary, \
+             generated_at_ms) VALUES ('shared_mem', ?1, ?2, ?3, 0)",
+            rusqlite::params![repo, body_hash, summary],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, checked_at_ms) \
+             VALUES ('shared_mem', ?1, ?2, ?3, 0)",
+            rusqlite::params![repo, body_hash, verdict],
+        )
+        .unwrap();
+    }
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let (summary_a, verdict_a) = current_summary_and_verdict(&conn, "shared_mem", body).unwrap();
+    assert_eq!(
+        summary_a.as_deref(),
+        Some("repo A compacted summary"),
+        "repo A reads its OWN summary"
+    );
+    assert_eq!(verdict_a.as_deref(), Some("[verdict: diverged]"), "repo A reads its OWN verdict");
+
+    a5_set_active_repo(&conn, A5_REPO_B);
+    let (summary_b, verdict_b) = current_summary_and_verdict(&conn, "shared_mem", body).unwrap();
+    assert_eq!(
+        summary_b.as_deref(),
+        Some("repo B compacted summary"),
+        "repo B reads its OWN summary"
+    );
+    assert!(
+        verdict_b.as_deref().is_some_and(|v| v.starts_with("[verdict: current")),
+        "repo B reads its OWN verdict, not repo A's diverged: {verdict_b:?}"
+    );
+}
+
 /// A5 finding: `memory_id` folds the owning repo into its hash suffix, so two repos creating
 /// IDENTICAL content in the SAME millisecond derive distinct ids (the repo-scoped dedupe correctly
 /// passes both — a repo-blind id would explode on the global PK). Pre-A5 (`None` scope) keeps the

@@ -2131,6 +2131,7 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -2216,6 +2217,7 @@ fn repo_clusters_groups_cotouched_files() {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();

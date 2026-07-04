@@ -205,8 +205,15 @@ pub(crate) struct DreamArgs {
     /// Off by default, so plain `rag-rat dream` stays byte-identical.
     #[arg(long)]
     pub verify: bool,
-    /// Max memories the model verdict pass may check in one run (the budget the churn-skip queue
-    /// is capped at). Defaults to 20. Only meaningful with `--verify` and an enabled model.
+    /// Run the memory compaction pass (dream v2 pass 2). With `[dream.model] enabled = true` it
+    /// runs the out-of-process model compaction pass, rewriting un-summarized memories into 3–4
+    /// sentence summaries in `memory_summaries`. Off by default; independent of `--verify`, so
+    /// plain `rag-rat dream` stays byte-identical.
+    #[arg(long)]
+    pub compact: bool,
+    /// Max memories each model pass may process in one run (the budget the churn-skip queues are
+    /// capped at). Defaults to 20. Only meaningful with `--verify` / `--compact` and an enabled
+    /// model.
     #[arg(long)]
     pub max_memories: Option<u32>,
 }

@@ -71,6 +71,7 @@ pub fn bench_config(subdir: &str) -> Config {
         oracle: Default::default(),
         search: Default::default(),
         dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     }
 }
