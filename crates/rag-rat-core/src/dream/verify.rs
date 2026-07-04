@@ -62,16 +62,21 @@ pub enum VerificationReason {
     BodyChanged,
     /// A bound file changed since the last check (`checked_inputs_hash` mismatch).
     InputsChanged,
+    /// The stored verdict was produced by an older verdict `PROMPT_VERSION` — the prompt or
+    /// evidence-pack format changed, so the old verdict is not comparable and must be re-checked.
+    PromptChanged,
 }
 
 impl VerificationReason {
-    /// Priority rank: broken anchors first, then never-checked, then body churn, then input churn.
+    /// Priority rank: broken anchors first, then never-checked, then body churn, then input/prompt
+    /// churn (a stale-prompt row's verdict is at least self-consistent, so it ranks last).
     fn rank(self) -> f64 {
         match self {
             Self::AnchorBroken => 1.0,
             Self::NeverChecked => 0.75,
             Self::BodyChanged => 0.5,
             Self::InputsChanged => 0.25,
+            Self::PromptChanged => 0.2,
         }
     }
 }
@@ -94,6 +99,18 @@ pub struct EvidencePack {
     pub memory_id: String,
     pub identifiers: Vec<IdentifierResolution>,
     pub excerpts: Vec<FileExcerpt>,
+}
+
+impl EvidencePack {
+    /// Whether the pack has any content a verdict could cite. A prose-only / conceptual memory with
+    /// no extracted identifiers and no bound-file excerpts renders a pack of only boilerplate lines
+    /// (`(no identifiers extracted)` / `(no bound-file excerpts)`), which the fabrication guard
+    /// excludes — so ANY model verdict is discarded, the row is never written, and the memory
+    /// re-queues on every run, wasting a budget slot and starving later memories. The verdict pass
+    /// records a terminal (verdict-less) row for these instead of calling the model.
+    pub(super) fn is_citable(&self) -> bool {
+        !self.identifiers.is_empty() || !self.excerpts.is_empty()
+    }
 }
 
 /// One extracted identifier and where (if anywhere) it resolves in the whole-tree index.
@@ -184,17 +201,17 @@ fn queue_reason(
     scope: &Option<String>,
     reality_clause: &str,
 ) -> rusqlite::Result<Option<VerificationReason>> {
-    let stored: Option<(String, Option<String>)> = conn
+    let stored: Option<(String, Option<String>, Option<String>)> = conn
         .query_row(
             &format!(
-                "SELECT body_hash, checked_inputs_hash FROM memory_reality WHERE memory_id = \
-                 ?1{reality_clause}"
+                "SELECT body_hash, checked_inputs_hash, prompt_version FROM memory_reality WHERE \
+                 memory_id = ?1{reality_clause}"
             ),
             [memory_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((stored_body_hash, stored_inputs_hash)) = stored else {
+    let Some((stored_body_hash, stored_inputs_hash, stored_prompt_version)) = stored else {
         // Never checked → needs a first check; a broken anchor takes the top rank.
         return Ok(Some(if broken.contains(memory_id) {
             VerificationReason::AnchorBroken
@@ -205,7 +222,12 @@ fn queue_reason(
     let body_changed = stored_body_hash != crate::index::hex_sha256(body.as_bytes());
     let current_inputs = checked_inputs_hash(conn, memory_id, scope)?;
     let inputs_changed = stored_inputs_hash.as_deref() != Some(current_inputs.as_str());
-    if !body_changed && !inputs_changed {
+    // A row from an older verdict prompt/pack version is not comparable to a fresh check — re-queue
+    // it so a `PROMPT_VERSION` bump doesn't leave every unchanged memory driving markers/findings
+    // off a stale-prompt verdict forever. (An uncitable memory's terminal row is stamped with the
+    // current version too, so it also re-evaluates on a bump.)
+    let prompt_changed = stored_prompt_version.as_deref() != Some(super::verdict::PROMPT_VERSION);
+    if !body_changed && !inputs_changed && !prompt_changed {
         // Verified AND unchanged — churn-skip regardless of anchor status (the stored verdict
         // stands; anchor breakage is surfaced elsewhere).
         return Ok(None);
@@ -215,8 +237,10 @@ fn queue_reason(
         VerificationReason::AnchorBroken
     } else if body_changed {
         VerificationReason::BodyChanged
-    } else {
+    } else if inputs_changed {
         VerificationReason::InputsChanged
+    } else {
+        VerificationReason::PromptChanged
     }))
 }
 
@@ -234,15 +258,17 @@ pub(super) fn checked_inputs_hash(
 ) -> rusqlite::Result<String> {
     let mut shas = BTreeSet::new();
     for path in bound_file_paths(conn, memory_id, scope)? {
-        let sha: Option<String> = conn
-            .query_row(
-                "SELECT sha256 FROM files WHERE path = ?1 ORDER BY sha256 LIMIT 1",
-                [&path],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(sha) = sha {
-            shas.insert(sha);
+        // Match the bound path as a FILE (`path = ?1`) OR as a DIRECTORY, folding in every child
+        // file (`path LIKE ?1 || '/%'`). A `--dir` binding (including the repo root) stores a
+        // directory in `repo_memory_bindings.path` that never equals a `files.path`; without the
+        // child expansion its inputs hash would be the empty sentinel and stay fixed as files under
+        // it change, so a directory-scoped memory would churn-skip with a stale verdict forever. A
+        // real file path adds no spurious matches (files have no `<path>/…` children).
+        let mut stmt = conn
+            .prepare_cached("SELECT sha256 FROM files WHERE path = ?1 OR path LIKE ?1 || '/%'")?;
+        let rows = stmt.query_map([&path], |r| r.get::<_, String>(0))?;
+        for sha in rows {
+            shas.insert(sha?);
         }
     }
     let joined = shas.into_iter().collect::<Vec<_>>().join("\u{1f}");
@@ -614,12 +640,109 @@ mod tests {
         let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
         c.execute(
             "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_inputs_hash, \
-             checked_at_ms) VALUES ('m1','r',?1,?2,1000)",
-            rusqlite::params![body_hash("a plain note"), inputs],
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
+            rusqlite::params![
+                body_hash("a plain note"),
+                inputs,
+                crate::dream::verdict::PROMPT_VERSION
+            ],
         )
         .unwrap();
         let q = verification_queue(&c, 2000, 10).unwrap();
         assert!(q.is_empty(), "a verified + unchanged memory is churn-skipped: {q:?}");
+    }
+
+    #[test]
+    fn checked_inputs_hash_folds_child_files_of_a_directory_binding() {
+        // Regression (PR #428 Codex P2): a `--dir` binding stores a directory in
+        // repo_memory_bindings.path that never equals a files.path, so the inputs hash must fold in
+        // the directory's CHILD files — else it stays the empty sentinel and a dir-scoped memory
+        // churn-skips with a stale verdict as its files change.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a note about the whole module", "r");
+        seed_file(&c, "src/dir/a.rs", "fn a() {}\n", "r");
+        seed_file(&c, "src/dir/b.rs", "fn b() {}\n", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','dir','src/dir','src/dir','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let scope = Some("r".to_string());
+        let before = checked_inputs_hash(&c, "m1", &scope).unwrap();
+
+        // A child file's sha changing must change the directory binding's inputs hash.
+        c.execute("UPDATE main.files SET sha256 = 'sha-changed' WHERE path = 'src/dir/b.rs'", [])
+            .unwrap();
+        let after = checked_inputs_hash(&c, "m1", &scope).unwrap();
+        assert_ne!(before, after, "a child file change moves the directory binding's inputs hash");
+
+        // And it is NOT the empty sentinel (children were actually folded in).
+        let empty = {
+            let d = mem_db();
+            set_repo(&d, "r");
+            seed_memory(&d, "m2", "t", "note with no bindings", "r");
+            checked_inputs_hash(&d, "m2", &scope).unwrap()
+        };
+        assert_ne!(
+            before, empty,
+            "the directory binding hashed real child files, not the sentinel"
+        );
+    }
+
+    #[test]
+    fn queue_records_a_terminal_row_for_an_uncitable_memory_so_it_stops_re_queuing() {
+        // Regression (PR #428 Codex P2): a prose-only memory with no identifiers / excerpts yields
+        // an uncitable pack; the verdict pass must record a terminal (verdict-less) row so
+        // it churn-skips instead of consuming a budget slot forever.
+        use super::super::model::mock::MockVerdictModel;
+        use super::super::{VerdictPass, verdict};
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "note", "just prose, nothing to resolve", "r");
+        assert!(!evidence_pack(&c, "m1").unwrap().is_citable(), "the pack is uncitable");
+
+        // A model with NO queued responses panics if `complete` is called — proving the uncitable
+        // memory is handled deterministically and never reaches the model.
+        let model = MockVerdictModel::new(Vec::<String>::new());
+        verdict::run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 1000).unwrap();
+        assert_eq!(model.calls(), 0, "the uncitable memory never calls the model");
+        let (verdict_val, pv): (Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT verdict, prompt_version FROM memory_reality WHERE memory_id='m1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(verdict_val, None, "the terminal row has no verdict");
+        assert_eq!(pv.as_deref(), Some(verdict::PROMPT_VERSION), "stamped with the current prompt");
+
+        // Second run: unchanged → churn-skipped (empty queue), so it never re-consumes budget.
+        assert!(
+            verification_queue(&c, 2000, 10).unwrap().is_empty(),
+            "the uncitable memory churn-skips after its terminal row"
+        );
+    }
+
+    #[test]
+    fn queue_re_enqueues_when_the_verdict_prompt_version_changes() {
+        // Regression (PR #428 Codex P2): a stored verdict from an older PROMPT_VERSION is not
+        // comparable, so an unchanged memory must re-queue on a prompt bump instead of skipping.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a plain note", "r");
+        let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_inputs_hash, \
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,'an-old-prompt-version',1000)",
+            rusqlite::params![body_hash("a plain note"), inputs],
+        )
+        .unwrap();
+        let q = verification_queue(&c, 2000, 10).unwrap();
+        assert_eq!(q.len(), 1, "a stale-prompt-version row re-queues");
+        assert_eq!(q[0].reason, VerificationReason::PromptChanged);
     }
 
     #[test]
@@ -641,8 +764,12 @@ mod tests {
         let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
         c.execute(
             "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_inputs_hash, \
-             checked_at_ms) VALUES ('m1','r',?1,?2,1000)",
-            rusqlite::params![body_hash("a plain note"), inputs],
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
+            rusqlite::params![
+                body_hash("a plain note"),
+                inputs,
+                crate::dream::verdict::PROMPT_VERSION
+            ],
         )
         .unwrap();
         // Two never-checked memories that must still get slots.
@@ -678,8 +805,12 @@ mod tests {
         let inputs = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
         c.execute(
             "INSERT INTO memory_reality(memory_id, repo_id, body_hash, checked_inputs_hash, \
-             checked_at_ms) VALUES ('m1','r',?1,?2,1000)",
-            rusqlite::params![body_hash("note about src/lib.rs"), inputs],
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
+            rusqlite::params![
+                body_hash("note about src/lib.rs"),
+                inputs,
+                crate::dream::verdict::PROMPT_VERSION
+            ],
         )
         .unwrap();
         assert!(

@@ -143,13 +143,29 @@ pub(super) fn run_verdict_pass(
 
     for entry in queue {
         let pack = evidence_pack(conn, &entry.memory_id)?;
+        let inputs_hash = verify::checked_inputs_hash(conn, &entry.memory_id, &scope)?;
+        // An uncitable pack (no identifiers, no excerpts) can only produce a discarded verdict, so
+        // skip the model and record a TERMINAL verdict-less row: it stamps the churn-skip
+        // comparators so the memory does not re-queue every run (starving later memories), while a
+        // NULL verdict stays inert for verdict markers and divergence findings. A
+        // body/inputs/prompt change re-queues it exactly like any other row.
+        if !pack.is_citable() {
+            record_uncitable(conn, Uncitable {
+                memory_id: &entry.memory_id,
+                repo_id,
+                body: &entry.body,
+                checked_inputs_hash: &inputs_hash,
+                checked_against_commit: checked_against_commit.as_deref(),
+                now_ms,
+            })?;
+            continue;
+        }
         let pack_text = render_pack(&pack);
         let binding = binding_label(conn, &entry.memory_id, &scope)?;
         let prompt = render_verdict_prompt(&entry, &binding, &pack_text);
         let Some(accepted) = obtain_verdict(pass.model, &prompt, &pack_text) else {
             continue;
         };
-        let inputs_hash = verify::checked_inputs_hash(conn, &entry.memory_id, &scope)?;
         record_verdict(conn, RecordVerdict {
             memory_id: &entry.memory_id,
             repo_id,
@@ -448,6 +464,46 @@ fn record_verdict(conn: &Connection, r: RecordVerdict<'_>) -> rusqlite::Result<(
             r.checked_inputs_hash,
             evidence_json,
             r.model_id,
+            PROMPT_VERSION,
+            r.now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Params for a terminal, verdict-less `memory_reality` row — an uncitable memory the verdict pass
+/// checked but could not put to the model (see [`EvidencePack::is_citable`]).
+struct Uncitable<'a> {
+    memory_id: &'a str,
+    repo_id: &'a str,
+    body: &'a str,
+    checked_inputs_hash: &'a str,
+    checked_against_commit: Option<&'a str>,
+    now_ms: i64,
+}
+
+/// Record a TERMINAL, verdict-less `memory_reality` row for an uncitable memory: NULL
+/// `verdict`/`direction`/`model_id`, empty `evidence_json`, but the churn-skip comparators
+/// (`body_hash`, `checked_inputs_hash`) and current `prompt_version` stamped so the memory
+/// churn-skips instead of re-queuing every run. A NULL verdict is inert for verdict markers and
+/// divergence findings (both filter on a concrete verdict). Re-evaluated when the body, bound-file
+/// inputs, or `PROMPT_VERSION` change — exactly like a real verdict row.
+fn record_uncitable(conn: &Connection, r: Uncitable<'_>) -> rusqlite::Result<()> {
+    let body_hash = crate::index::hex_sha256(r.body.as_bytes());
+    conn.execute(
+        "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, direction, \
+         checked_against_commit, checked_inputs_hash, evidence_json, model_id, prompt_version, \
+         checked_at_ms) VALUES (?1,?2,?3,NULL,NULL,?4,?5,'[]',NULL,?6,?7) ON CONFLICT(repo_id, \
+         memory_id) DO UPDATE SET body_hash = excluded.body_hash, verdict = NULL, direction = \
+         NULL, checked_against_commit = excluded.checked_against_commit, checked_inputs_hash = \
+         excluded.checked_inputs_hash, evidence_json = '[]', model_id = NULL, prompt_version = \
+         excluded.prompt_version, checked_at_ms = excluded.checked_at_ms",
+        rusqlite::params![
+            r.memory_id,
+            r.repo_id,
+            body_hash,
+            r.checked_against_commit,
+            r.checked_inputs_hash,
             PROMPT_VERSION,
             r.now_ms,
         ],

@@ -102,15 +102,18 @@ fn compaction_queue(conn: &Connection, budget: usize) -> rusqlite::Result<Vec<Co
     let mut queue = Vec::new();
     for (memory_id, title, body) in mems {
         // The current body hash keys the summary; a stored summary under a DIFFERENT hash is stale
-        // (a body edit) and does NOT count as covered — so the memory re-queues.
+        // (a body edit) and does NOT count as covered — so the memory re-queues. The
+        // `prompt_version` predicate does the same for a `COMPACT_PROMPT_VERSION` bump: a summary
+        // produced by an older prompt/guards no longer counts as covered, so a prompt change
+        // regenerates every summary instead of surfacing stale ones indefinitely.
         let body_hash = crate::index::hex_sha256(body.as_bytes());
         let covered = conn
             .query_row(
                 &format!(
-                    "SELECT 1 FROM memory_summaries WHERE memory_id = ?1 AND body_hash = \
-                     ?2{summary_clause}"
+                    "SELECT 1 FROM memory_summaries WHERE memory_id = ?1 AND body_hash = ?2 AND \
+                     prompt_version = ?3{summary_clause}"
                 ),
-                rusqlite::params![memory_id, body_hash],
+                rusqlite::params![memory_id, body_hash, COMPACT_PROMPT_VERSION],
                 |_| Ok(()),
             )
             .optional()?

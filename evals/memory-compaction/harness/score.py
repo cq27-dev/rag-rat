@@ -73,7 +73,7 @@ for model, vs in sorted(models.items()):
                 if a == "TRUE":
                     flips.append((v["item"], "trap-inverted", p["claim"][:80]))
 
-    fmt_ok = words = 0
+    fmt_ok = 0
     wlist = []
     for iid, s in summaries[model].items():
         w = len(s.split())

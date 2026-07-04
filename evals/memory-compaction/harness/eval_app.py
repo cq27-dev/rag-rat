@@ -214,20 +214,23 @@ def _tool_read(path: str, start: int, end: int, root: str = "/repo") -> str:
 
 
 def _parse_call(text: str):
+    # Returns None for "not a CALL", else a fixed-length 4-tuple (tag, a, b, c) so callers never
+    # branch on tuple arity: grep uses (tag, pattern, None, None); read uses (tag, path, start, end);
+    # malformed uses (tag, None, None, None).
     t = text.strip()
     if not t.startswith("CALL "):
         return None
     body = t[5:].strip()
     if body.startswith("grep "):
-        return ("grep", body[5:].strip())
+        return ("grep", body[5:].strip(), None, None)
     if body.startswith("read "):
         parts = body[5:].split()
         if len(parts) >= 3:
             try:
                 return ("read", parts[0], int(parts[1]), int(parts[2]))
             except ValueError:
-                return ("malformed",)
-    return ("malformed",)
+                return ("malformed", None, None, None)
+    return ("malformed", None, None, None)
 
 
 @app.function(image=vllm_repo_image, gpu="L40S", volumes={CACHE_PATH: CACHE}, timeout=3600)
