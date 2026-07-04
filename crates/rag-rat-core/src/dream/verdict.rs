@@ -376,8 +376,29 @@ fn verdict_is_cited(pack_text: &str, parsed: &ParsedVerdict) -> bool {
     parsed.evidence.iter().all(|line| {
         let cite = normalize_ws(line);
         cite.chars().filter(|c| !c.is_whitespace()).count() >= MIN_CITATION_CHARS
+            && !is_bare_locator(&cite)
             && content.iter().any(|c| c.contains(&cite))
     })
+}
+
+/// Whether a citation is ONLY a `path:line` (or `path:line:`) locator with no source text after it.
+/// An excerpt content line renders as `path:line: <code>`, so a bare `src/lib.rs:12` is a substring
+/// of it and would satisfy the substring guard without citing any actual code or identifier — a
+/// content-free citation. Requiring text BEYOND the locator forces the model to cite the source it
+/// claims supports the verdict. A backticked identifier citation (`` `thing_two` ``) has no
+/// `:<line>` tail, so it is never a bare locator.
+fn is_bare_locator(cite: &str) -> bool {
+    let trimmed = cite.trim().trim_end_matches(':');
+    // Any whitespace means there is text beyond the locator token — not bare.
+    if trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    // A locator ends `<path>:<digits>`; treat that shape (nothing after the line number) as bare.
+    match trimmed.rsplit_once(':') {
+        Some((path, line)) =>
+            !path.is_empty() && !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
 }
 
 /// Whether a rendered pack line is CITABLE CONTENT — an identifier-table entry (`` - `ident` -> …
@@ -520,35 +541,38 @@ fn indexed_commit(conn: &Connection, scope: &Option<String>) -> rusqlite::Result
     }
 }
 
-/// `memory_divergence` findings, derived EVERY run from the STORED `memory_reality` — every
-/// `verdict='diverged'` row whose memory is still active AND whose stored `body_hash` still matches
-/// the memory's CURRENT body, repo-scoped. NOT from this run's fresh (budget-capped) checks:
-/// because `dream_findings` sync auto-resolves any finding not reported in a run, deriving from
-/// fresh checks would resolve findings for merely-SKIPPED memories. Reading the stored table means
-/// a divergence finding resolves exactly when a RE-CHECK flips the verdict to `current` (row no
-/// longer `diverged`), the memory goes inactive, OR its body is edited (the verdict was against the
-/// OLD body and no longer applies — the same stale-body gate the summary/verdict hydrator uses,
-/// `body_hash` computed in Rust because SQLite has no sha256). A churn-SKIPPED but UNEDITED memory
-/// keeps its `body_hash` match, so its finding still surfaces — the resolve-trap protection holds.
-/// Mirrors how `verify::unverifiable_findings` runs over the full population for the same reason.
-/// One `memory_reality` `diverged` row joined to its live memory body — the input to the
-/// stale-body gate in [`divergence_findings`].
+/// One `memory_reality` `diverged` row joined to its live memory body — the input to the stale
+/// gates in [`divergence_findings`].
 struct DivergenceRow {
     memory_id: String,
     direction: Option<String>,
     evidence_json: Option<String>,
     stored_body_hash: String,
+    stored_inputs_hash: Option<String>,
     body: String,
 }
 
+/// `memory_divergence` findings, derived EVERY run from the STORED `memory_reality` — every
+/// `verdict='diverged'` row whose memory is still active AND whose stored `body_hash` + stored
+/// `checked_inputs_hash` still match the memory's CURRENT body and bound-file inputs, repo-scoped.
+/// NOT from this run's fresh (budget-capped) checks: because `dream_findings` sync auto-resolves
+/// any finding not reported in a run, deriving from fresh checks would resolve findings for merely-
+/// SKIPPED memories. Reading the stored table means a divergence finding resolves exactly when a
+/// RE-CHECK flips the verdict to `current` (row no longer `diverged`), the memory goes inactive,
+/// its body is edited, OR a bound file changes — the verdict was checked against the OLD
+/// body/inputs and no longer applies (the same stale gates the queue's churn-skip uses; both hashes
+/// computed in Rust because SQLite has no sha256). A churn-SKIPPED but UNCHANGED memory keeps BOTH
+/// hashes matching, so its finding still surfaces — the resolve-trap protection holds. Mirrors how
+/// `verify::unverifiable_findings` runs over the full population for the same reason.
 pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
     let mem_clause = schema::periphery_repo_scope_clause(&scope, "m");
     let reality_clause = schema::periphery_repo_scope_clause(&scope, "mr");
     let mut stmt = conn.prepare(&format!(
-        "SELECT mr.memory_id, mr.direction, mr.evidence_json, mr.body_hash, m.body FROM \
-         memory_reality mr JOIN repo_memories m ON m.id = mr.memory_id{mem_clause} WHERE \
-         mr.verdict = 'diverged' AND m.status = 'active'{reality_clause} ORDER BY mr.memory_id"
+        "SELECT mr.memory_id, mr.direction, mr.evidence_json, mr.body_hash, \
+         mr.checked_inputs_hash, m.body FROM memory_reality mr JOIN repo_memories m ON m.id = \
+         mr.memory_id{mem_clause} WHERE mr.verdict = 'diverged' AND m.status = \
+         'active'{reality_clause} ORDER BY mr.memory_id"
     ))?;
     let rows: Vec<DivergenceRow> = stmt
         .query_map([], |r| {
@@ -557,32 +581,38 @@ pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<Dre
                 direction: r.get(1)?,
                 evidence_json: r.get(2)?,
                 stored_body_hash: r.get(3)?,
-                body: r.get(4)?,
+                stored_inputs_hash: r.get(4)?,
+                body: r.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(rows
-        .into_iter()
-        // Stale-body gate: the verdict was checked against `stored_body_hash`; drop it once the
-        // memory body has been edited (its current hash differs), so an out-of-date `diverged`
-        // verdict is not surfaced against a note the author has since changed.
-        .filter(|row| row.stored_body_hash == crate::index::hex_sha256(row.body.as_bytes()))
-        .map(|row| {
-            let direction = row.direction.unwrap_or_else(|| "unknown".to_string());
-            let cited = compact_evidence(row.evidence_json.as_deref());
-            DreamFinding {
-                kind: "memory_divergence".into(),
-                subject: row.memory_id,
-                // Evidence is derived from the STORED row, so it is stable across skip-runs
-                // (refresh, not supersede) and only changes when a re-check
-                // rewrites the row.
-                evidence: format!(
-                    "model verdict: diverged (direction: {direction}); cited: {cited} [reality]"
-                ),
-                rank: DIVERGENCE_RANK,
-            }
-        })
-        .collect())
+    // Stale gates: the verdict was checked against `stored_body_hash` + `stored_inputs_hash`; drop
+    // it once the body is edited OR a bound file changes, so an out-of-date `diverged` verdict is
+    // not surfaced against code the author has since changed. (`checked_inputs_hash` is recomputed
+    // per diverged row — a small set — exactly as the queue's comparator does.)
+    let mut out = Vec::new();
+    for row in rows {
+        if row.stored_body_hash != crate::index::hex_sha256(row.body.as_bytes()) {
+            continue;
+        }
+        let current_inputs = verify::checked_inputs_hash(conn, &row.memory_id, &scope)?;
+        if row.stored_inputs_hash.as_deref() != Some(current_inputs.as_str()) {
+            continue;
+        }
+        let direction = row.direction.unwrap_or_else(|| "unknown".to_string());
+        let cited = compact_evidence(row.evidence_json.as_deref());
+        out.push(DreamFinding {
+            kind: "memory_divergence".into(),
+            subject: row.memory_id,
+            // Evidence is derived from the STORED row, so it is stable across skip-runs (refresh,
+            // not supersede) and only changes when a re-check rewrites the row.
+            evidence: format!(
+                "model verdict: diverged (direction: {direction}); cited: {cited} [reality]"
+            ),
+            rank: DIVERGENCE_RANK,
+        });
+    }
+    Ok(out)
 }
 
 /// Render the stored `evidence_json` (a JSON array of cited pack lines) into a compact, stable,
@@ -735,6 +765,41 @@ mod tests {
         assert!(
             verdict_is_cited(&pack, &cited("`real_symbol` -> symbol src/lib.rs::real_symbol")),
             "a real identifier-table entry is still accepted"
+        );
+    }
+
+    #[test]
+    fn citation_guard_rejects_a_bare_locator_prefix() {
+        // Regression (PR #428 Codex P2): an excerpt renders as `path:line: <code>`, so a bare
+        // `path:line` locator is a substring of it and long enough — but cites no actual source.
+        // The guard must require text beyond the locator.
+        let pack = render_pack(&EvidencePack {
+            memory_id: "m1".to_string(),
+            identifiers: Vec::new(),
+            excerpts: vec![verify::FileExcerpt {
+                path: "crates/x/src/lib.rs".to_string(),
+                start_line: 12,
+                end_line: 12,
+                text: "let handle = spawn();".to_string(),
+            }],
+        });
+        let cited = |frag: &str| ParsedVerdict {
+            verdict: Verdict::Diverged,
+            direction: Direction::Unknown,
+            evidence: vec![frag.to_string()],
+        };
+        assert!(
+            !verdict_is_cited(&pack, &cited("crates/x/src/lib.rs:12")),
+            "a bare path:line locator cites no source and is rejected"
+        );
+        assert!(
+            !verdict_is_cited(&pack, &cited("crates/x/src/lib.rs:12:")),
+            "a bare path:line: locator is rejected too"
+        );
+        // The full excerpt line (locator + code) is real evidence and still accepted.
+        assert!(
+            verdict_is_cited(&pack, &cited("crates/x/src/lib.rs:12: let handle = spawn();")),
+            "the excerpt line with its source text is accepted"
         );
     }
 

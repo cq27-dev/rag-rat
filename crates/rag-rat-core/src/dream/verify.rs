@@ -102,14 +102,20 @@ pub struct EvidencePack {
 }
 
 impl EvidencePack {
-    /// Whether the pack has any content a verdict could cite. A prose-only / conceptual memory with
-    /// no extracted identifiers and no bound-file excerpts renders a pack of only boilerplate lines
-    /// (`(no identifiers extracted)` / `(no bound-file excerpts)`), which the fabrication guard
-    /// excludes — so ANY model verdict is discarded, the row is never written, and the memory
-    /// re-queues on every run, wasting a budget slot and starving later memories. The verdict pass
-    /// records a terminal (verdict-less) row for these instead of calling the model.
+    /// Whether the pack has any SUBSTANTIVE content a verdict could cite — at least one bound-file
+    /// excerpt, or at least one identifier that RESOLVED (not [`NOT_FOUND`]). Two memories look
+    /// uncitable and must stay out of the model pass:
+    ///   - a prose-only / conceptual note with no identifiers and no excerpts (only boilerplate);
+    ///   - a note whose EVERY identifier resolves to `NOT_FOUND` and has no live binding — pass 0
+    ///     already decides this `memory_unverifiable`, and counting those NOT_FOUND rows as citable
+    ///     would let the model be asked anyway and accept a `diverged` verdict citing "x -> NOT
+    ///     FOUND", opening `memory_divergence` and burning budget against the module contract that
+    ///     unverifiable is never asked of the model.
+    ///
+    /// The verdict pass records a terminal (verdict-less) row for an uncitable pack instead of
+    /// calling the model, so it churn-skips rather than re-queuing every run.
     pub(super) fn is_citable(&self) -> bool {
-        !self.identifiers.is_empty() || !self.excerpts.is_empty()
+        !self.excerpts.is_empty() || self.identifiers.iter().any(|id| id.resolution != NOT_FOUND)
     }
 }
 
@@ -256,21 +262,8 @@ pub(super) fn checked_inputs_hash(
     memory_id: &str,
     scope: &Option<String>,
 ) -> rusqlite::Result<String> {
-    let mut shas = BTreeSet::new();
-    for path in bound_file_paths(conn, memory_id, scope)? {
-        // Match the bound path as a FILE (`path = ?1`) OR as a DIRECTORY, folding in every child
-        // file (`path LIKE ?1 || '/%'`). A `--dir` binding (including the repo root) stores a
-        // directory in `repo_memory_bindings.path` that never equals a `files.path`; without the
-        // child expansion its inputs hash would be the empty sentinel and stay fixed as files under
-        // it change, so a directory-scoped memory would churn-skip with a stale verdict forever. A
-        // real file path adds no spurious matches (files have no `<path>/…` children).
-        let mut stmt = conn
-            .prepare_cached("SELECT sha256 FROM files WHERE path = ?1 OR path LIKE ?1 || '/%'")?;
-        let rows = stmt.query_map([&path], |r| r.get::<_, String>(0))?;
-        for sha in rows {
-            shas.insert(sha?);
-        }
-    }
+    let shas: BTreeSet<String> =
+        resolve_bound_files(conn, memory_id, scope)?.into_iter().map(|(_, _, sha)| sha).collect();
     let joined = shas.into_iter().collect::<Vec<_>>().join("\u{1f}");
     Ok(crate::index::hex_sha256(joined.as_bytes()))
 }
@@ -472,6 +465,54 @@ pub(super) fn bound_file_paths(
     .collect()
 }
 
+/// Every indexed `(path, file_id, sha256)` the memory's bindings cover, de-duplicated by file_id.
+/// Each binding `path` is resolved as one of:
+///   - the REPO ROOT — an empty path (a `--dir .` binding normalizes to `""`), which matches EVERY
+///     indexed file (a root-scoped note is invalidated by any repo change);
+///   - a DIRECTORY — `path LIKE ?1 || '/%'` folds in every child file;
+///   - a FILE — an exact `path = ?1` (a real file has no `<path>/…` children, so no spurious rows).
+///
+/// The single expansion both the churn hash and the excerpt builder share, so a directory (or root)
+/// binding hashes AND shows excerpts over its child files identically — without it, a directory
+/// binding's `files.path` never matches, leaving the empty inputs sentinel (stale churn-skip) and
+/// dropping every bound-source excerpt from the verdict prompt.
+fn resolve_bound_files(
+    conn: &Connection,
+    memory_id: &str,
+    scope: &Option<String>,
+) -> rusqlite::Result<Vec<(String, i64, String)>> {
+    // file_id -> (path, sha) so a file bound via both an exact path and its parent dir counts once.
+    let mut by_id: BTreeMap<i64, (String, String)> = BTreeMap::new();
+    for path in bound_file_paths(conn, memory_id, scope)? {
+        let mut push = |id: i64, p: String, sha: String| {
+            by_id.entry(id).or_insert((p, sha));
+        };
+        if path.is_empty() {
+            // Repo-root binding (`--dir .`): every indexed file in scope.
+            let mut stmt = conn.prepare_cached("SELECT id, path, sha256 FROM files")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })?;
+            for row in rows {
+                let (id, p, sha) = row?;
+                push(id, p, sha);
+            }
+        } else {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, path, sha256 FROM files WHERE path = ?1 OR path LIKE ?1 || '/%'",
+            )?;
+            let rows = stmt.query_map([&path], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })?;
+            for row in rows {
+                let (id, p, sha) = row?;
+                push(id, p, sha);
+            }
+        }
+    }
+    Ok(by_id.into_iter().map(|(id, (path, sha))| (path, id, sha)).collect())
+}
+
 /// Current-text excerpt windows around identifier hits in the memory's bound files, from the
 /// indexed chunk text (the index, not the filesystem, is dream's source of truth). Bounded at
 /// `MAX_EXCERPT_LINES` total, ordered by (path, start_line).
@@ -483,13 +524,13 @@ fn bound_file_excerpts(
 ) -> anyhow::Result<Vec<FileExcerpt>> {
     let mut excerpts = Vec::new();
     let mut used_lines = 0usize;
-    for path in bound_file_paths(conn, memory_id, scope)? {
+    // Resolve directory/root bindings to their child files (see `resolve_bound_files`) so a
+    // `--dir` note's verdict prompt carries the bound-source excerpts, not an empty section — an
+    // exact-file binding resolves to just itself.
+    for (path, file_id, _sha) in resolve_bound_files(conn, memory_id, scope)? {
         if used_lines >= MAX_EXCERPT_LINES {
             break;
         }
-        let Some(file_id) = file_id_for_path(conn, &path)? else {
-            continue;
-        };
         let lines = file_lines(conn, file_id)?;
         for (start, end) in identifier_windows(&lines, identifiers) {
             if used_lines >= MAX_EXCERPT_LINES {
@@ -510,13 +551,6 @@ fn bound_file_excerpts(
     }
     excerpts.sort_by(|a, b| a.path.cmp(&b.path).then(a.start_line.cmp(&b.start_line)));
     Ok(excerpts)
-}
-
-/// The active-repo `files.id` for `path` (through the view), or `None` when the path is not
-/// indexed.
-fn file_id_for_path(conn: &Connection, path: &str) -> rusqlite::Result<Option<i64>> {
-    conn.query_row("SELECT id FROM files WHERE path = ?1 ORDER BY id LIMIT 1", [path], |r| r.get(0))
-        .optional()
 }
 
 /// Reconstruct a file's absolute line-number → text map from its indexed chunk text (decoded
@@ -690,6 +724,58 @@ mod tests {
             before, empty,
             "the directory binding hashed real child files, not the sentinel"
         );
+    }
+
+    #[test]
+    fn checked_inputs_hash_folds_all_files_for_a_repo_root_binding() {
+        // Regression (PR #428 Codex P2): a `--dir .` binding normalizes to an empty path, which
+        // matches no `files.path` under the file-or-child pattern — it must instead fold in EVERY
+        // indexed file (a root-scoped note is invalidated by any repo change).
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a note about the whole repo", "r");
+        seed_file(&c, "src/a.rs", "fn a() {}\n", "r");
+        seed_file(&c, "docs/b.md", "# b\n", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES ('m1','dir','','','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let scope = Some("r".to_string());
+        let before = checked_inputs_hash(&c, "m1", &scope).unwrap();
+        // A change to ANY file moves a root binding's inputs hash.
+        c.execute("UPDATE main.files SET sha256 = 'sha-x' WHERE path = 'docs/b.md'", []).unwrap();
+        assert_ne!(
+            before,
+            checked_inputs_hash(&c, "m1", &scope).unwrap(),
+            "any file change counts"
+        );
+        let empty = {
+            let d = mem_db();
+            set_repo(&d, "r");
+            seed_memory(&d, "m2", "t", "no bindings", "r");
+            checked_inputs_hash(&d, "m2", &scope).unwrap()
+        };
+        assert_ne!(before, empty, "the root binding folded real files, not the empty sentinel");
+    }
+
+    #[test]
+    fn a_memory_whose_identifiers_all_resolve_nowhere_is_not_citable() {
+        // Regression (PR #428 Codex P2): a note whose every identifier resolves to NOT_FOUND and
+        // has no bound-file excerpts is the pass-0 unverifiable case and must NOT be
+        // citable, or the model would be asked and could open a divergence citing the
+        // NOT_FOUND rows.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a note about `never_defined_symbol` and nothing else", "r");
+        let pack = evidence_pack(&c, "m1").unwrap();
+        assert!(!pack.identifiers.is_empty(), "the identifier was extracted");
+        assert!(
+            pack.identifiers.iter().all(|id| id.resolution == NOT_FOUND),
+            "and it resolves nowhere"
+        );
+        assert!(!pack.is_citable(), "an all-NOT_FOUND, no-excerpt pack is uncitable");
     }
 
     #[test]
