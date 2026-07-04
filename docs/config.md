@@ -378,7 +378,7 @@ generative-model dependency. It is **out-of-process, opt-in, and gated by a dete
 enabled = false                     # off by default — the model turn is skipped
 endpoint = "http://localhost:11434" # OpenAI-compatible chat server (a local Ollama by default)
 model = "qwen3:4b-instruct"    # server-side model name sent in the request body
-request_timeout_s = 120             # per-request HTTP timeout (a 4B verdict on CPU is slow)
+request_timeout_s = 300             # per-request HTTP timeout (CPU inference over a large evidence pack is slow)
 ```
 
 The client speaks the standard `/v1/chat/completions` route (temperature 0, no streaming), so any
