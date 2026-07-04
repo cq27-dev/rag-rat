@@ -1610,10 +1610,15 @@ fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
             rusqlite::params![repo, body_hash, summary],
         )
         .unwrap();
+        // Stamp the current inputs hash (empty-set value — `shared_mem` has no bindings) so the
+        // hydrator's inputs-gate shows the marker; the point of THIS test is repo scoping.
+        let inputs =
+            crate::dream::checked_inputs_hash(&conn, "shared_mem", &Some(repo.to_string()))
+                .unwrap();
         conn.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, checked_at_ms) \
-             VALUES ('shared_mem', ?1, ?2, ?3, 0)",
-            rusqlite::params![repo, body_hash, verdict],
+            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
+             checked_inputs_hash, checked_at_ms) VALUES ('shared_mem', ?1, ?2, ?3, ?4, 0)",
+            rusqlite::params![repo, body_hash, verdict, inputs],
         )
         .unwrap();
     }

@@ -215,17 +215,39 @@ pub(crate) fn current_summary_and_verdict(
         )
         .optional()?;
     let reality_clause = schema::periphery_repo_scope_clause(&scope, "memory_reality");
-    let verdict_marker = conn
+    let reality: Option<(Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
             &format!(
-                "SELECT verdict, checked_against_commit FROM memory_reality WHERE memory_id = ?1 \
-                 AND body_hash = ?2{reality_clause}"
+                "SELECT verdict, checked_against_commit, checked_inputs_hash FROM memory_reality \
+                 WHERE memory_id = ?1 AND body_hash = ?2{reality_clause}"
             ),
             params![memory_id, body_hash],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
-        .optional()?
-        .and_then(|(verdict, commit)| render_verdict_marker(verdict.as_deref(), commit.as_deref()));
+        .optional()?;
+    // Gate the marker on the SAME stale checks the queue and divergence finder use: a verdict is
+    // only shown when the memory's bound-file inputs still match what it was checked against,
+    // so a bound-source change (before a re-verify) drops the marker instead of showing a
+    // verdict checked against a prior file version. The inputs hash is recomputed ONLY when a
+    // body-matching verdict row exists (the rare case), so surfacing an unverified memory pays
+    // nothing.
+    let verdict_marker = match reality {
+        Some((verdict, commit, stored_inputs)) => {
+            let current_inputs = crate::dream::checked_inputs_hash(conn, memory_id, &scope)?;
+            if stored_inputs.as_deref() == Some(current_inputs.as_str()) {
+                render_verdict_marker(verdict.as_deref(), commit.as_deref())
+            } else {
+                None
+            }
+        },
+        None => None,
+    };
     Ok((summary, verdict_marker))
 }
 

@@ -333,7 +333,15 @@ fn parse_verdict(output: &str) -> Option<ParsedVerdict> {
     for raw_line in output.lines() {
         let line = raw_line.trim();
         if let Some(rest) = strip_ci(line, "VERDICT:") {
+            // A new VERDICT section RESETS the accumulated fields: a model that emits a scratchpad
+            // / `<think>` block or self-corrects can produce more than one
+            // VERDICT/EVIDENCE section, and only the LAST one is the answer. Without
+            // the reset, evidence cited in an earlier (discarded) block could satisfy
+            // the fabrication guard for a final verdict that changed its mind or
+            // omitted evidence.
             verdict = Verdict::parse(rest);
+            direction = Direction::Unknown;
+            evidence.clear();
             in_evidence = false;
         } else if let Some(rest) = strip_ci(line, "DIRECTION:") {
             direction = Direction::parse(rest);
@@ -696,6 +704,25 @@ mod tests {
         assert_eq!(diverged.verdict, Verdict::Diverged);
         assert_eq!(diverged.direction, Direction::CodeAhead);
         assert_eq!(diverged.evidence, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parse_resets_on_a_new_verdict_section_ignoring_a_scratchpad() {
+        // Regression (PR #428 Codex P2): a model that emits a scratchpad VERDICT/EVIDENCE block and
+        // then a FINAL one must be parsed from the LAST section only — the scratchpad's evidence
+        // must not carry into (and back-justify) the final verdict.
+        let parsed = parse_verdict(
+            "VERDICT: diverged\nDIRECTION: code_ahead\nEVIDENCE:\n- scratchpad cite\nREASON: \
+             thinking...\nVERDICT: current\nEVIDENCE:\n- final cite\nREASON: done",
+        )
+        .unwrap();
+        assert_eq!(parsed.verdict, Verdict::Current, "the FINAL verdict wins");
+        assert_eq!(parsed.direction, Direction::Unknown, "the scratchpad direction is reset");
+        assert_eq!(
+            parsed.evidence,
+            vec!["final cite".to_string()],
+            "only the final section's evidence survives; the scratchpad cite is dropped"
+        );
     }
 
     #[test]

@@ -580,12 +580,17 @@ mod tests {
     }
 
     fn seed_reality(c: &Connection, id: &str, body: &str, verdict: &str, commit: Option<&str>) {
-        // Key the reality row on the memory's TRUE body_hash — the hydrator gates the verdict
-        // marker on `body_hash` (like the summary), so a mismatched hash would silently drop it.
+        // Key the reality row on the memory's TRUE body_hash AND its current bound-file inputs hash
+        // — the hydrator gates the verdict marker on BOTH (like the queue/divergence
+        // finder), so a mismatch on either silently drops the marker. These test memories
+        // have no bindings, so the inputs hash is the stable empty-set value
+        // `checked_inputs_hash` computes.
+        let inputs = crate::dream::checked_inputs_hash(c, id, &Some("r".to_string())).unwrap();
         c.execute(
             "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
-             checked_against_commit, checked_at_ms) VALUES (?1,'r',?2,?3,?4,0)",
-            params![id, crate::index::hex_sha256(body.as_bytes()), verdict, commit],
+             checked_against_commit, checked_inputs_hash, checked_at_ms) VALUES \
+             (?1,'r',?2,?3,?4,?5,0)",
+            params![id, crate::index::hex_sha256(body.as_bytes()), verdict, commit, inputs],
         )
         .unwrap();
     }
@@ -670,6 +675,30 @@ mod tests {
         assert_eq!(
             compact.direct[0].verdict, None,
             "a verdict keyed on a stale body_hash is not surfaced after a body edit"
+        );
+    }
+
+    #[test]
+    fn verdict_marker_misses_a_stale_verdict_after_a_bound_input_change() {
+        // Regression (PR #428 Codex P2): the marker is gated on `checked_inputs_hash`, not only
+        // `body_hash`. A stored verdict whose inputs hash no longer matches the memory's current
+        // bound-file inputs (a bound file changed since the check) must drop, like the divergence
+        // finder and queue treat an inputs mismatch. Seed a row with a deliberately-mismatched
+        // inputs hash — the current inputs hash for this binding-less memory is the
+        // empty-set value, which this arbitrary value is not.
+        let c = summary_conn();
+        let body = "a note whose stored verdict predates a bound-file change";
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, body_hash, verdict, \
+             checked_inputs_hash, checked_at_ms) VALUES ('m1','r',?1,'diverged','stale-inputs',0)",
+            params![crate::index::hex_sha256(body.as_bytes())],
+        )
+        .unwrap();
+        let compact =
+            evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
+        assert_eq!(
+            compact.direct[0].verdict, None,
+            "a verdict whose checked_inputs_hash no longer matches is not surfaced"
         );
     }
 

@@ -254,17 +254,25 @@ fn queue_reason(
 /// `files` view, so it is repo- and generation-scoped) — the cheap churn comparator that beats a
 /// commit-ancestry walk. An empty bound-file set hashes to a stable sentinel.
 ///
-/// `pub(super)` so the phase-B verdict pass (`verdict`) recomputes it EXACTLY as the queue's
+/// `pub(crate)` so the phase-B verdict pass (`verdict`) recomputes it EXACTLY as the queue's
 /// comparator does when it stamps `memory_reality.checked_inputs_hash` — same function, so the next
-/// run churn-skips instead of re-checking.
-pub(super) fn checked_inputs_hash(
+/// run churn-skips instead of re-checking — and so the surfacing hydrator can gate a stale verdict
+/// marker on it the same way the queue and divergence finder do.
+pub(crate) fn checked_inputs_hash(
     conn: &Connection,
     memory_id: &str,
     scope: &Option<String>,
 ) -> rusqlite::Result<String> {
-    let shas: BTreeSet<String> =
-        resolve_bound_files(conn, memory_id, scope)?.into_iter().map(|(_, _, sha)| sha).collect();
-    let joined = shas.into_iter().collect::<Vec<_>>().join("\u{1f}");
+    // Hash the sorted `(path, sha)` MULTISET, not just unique shas: a set of bare shas is blind to
+    // binding changes that keep identical content — rebinding to a same-sha file, or
+    // adding/removing a duplicate-content child under a directory binding, would leave the hash
+    // (and thus the churn-skip) unchanged while the stored verdict/evidence still points at the
+    // old binding path.
+    let pairs: BTreeSet<String> = resolve_bound_files(conn, memory_id, scope)?
+        .into_iter()
+        .map(|(path, _, sha)| format!("{path}\u{1f}{sha}"))
+        .collect();
+    let joined = pairs.into_iter().collect::<Vec<_>>().join("\u{1e}");
     Ok(crate::index::hex_sha256(joined.as_bytes()))
 }
 
@@ -441,6 +449,12 @@ fn resolve_file_segment(ident: &str, file_paths: &[String]) -> Option<String> {
     file_paths.iter().find(|p| p.ends_with(&suffix)).cloned()
 }
 
+/// Escape a string for use as a SQLite `LIKE` pattern under `ESCAPE '\'` — the three special chars
+/// `\`, `%`, `_` are backslash-escaped so a bound path with a literal `_`/`%` matches literally.
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 /// Every indexed file path for the active repo (through the `files` view), sorted for deterministic
 /// segment resolution.
 fn indexed_file_paths(conn: &Connection) -> rusqlite::Result<Vec<String>> {
@@ -498,10 +512,16 @@ fn resolve_bound_files(
                 push(id, p, sha);
             }
         } else {
+            // The directory pattern is `<dir>/%`, but `_` and `%` in the bound path are SQLite LIKE
+            // wildcards — an un-escaped `src/foo_bar` would also match `src/fooXbar/…`, folding an
+            // unrelated sibling's files into this memory's hash/excerpts. Escape the path and use
+            // an explicit ESCAPE char; the exact-file arm (`path = ?1`) needs no
+            // escaping.
+            let dir_pattern = format!("{}/%", like_escape(&path));
             let mut stmt = conn.prepare_cached(
-                "SELECT id, path, sha256 FROM files WHERE path = ?1 OR path LIKE ?1 || '/%'",
+                "SELECT id, path, sha256 FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
             )?;
-            let rows = stmt.query_map([&path], |r| {
+            let rows = stmt.query_map(rusqlite::params![&path, &dir_pattern], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
             })?;
             for row in rows {
@@ -536,6 +556,13 @@ fn bound_file_excerpts(
             if used_lines >= MAX_EXCERPT_LINES {
                 break;
             }
+            // Clamp THIS window to the remaining budget: `identifier_windows` merges adjacent hits
+            // into one range, so a single window over a generated table / repeated config key can
+            // be thousands of lines. Checking the cap only before appending would then
+            // blow the pack past MAX_EXCERPT_LINES in one push and overflow the model
+            // prompt — truncate the range.
+            let remaining = MAX_EXCERPT_LINES - used_lines;
+            let end = end.min(start + remaining as i64 - 1);
             let text = (start..=end)
                 .filter_map(|ln| lines.get(&ln).map(String::as_str))
                 .collect::<Vec<_>>()
@@ -758,6 +785,99 @@ mod tests {
             checked_inputs_hash(&d, "m2", &scope).unwrap()
         };
         assert_ne!(before, empty, "the root binding folded real files, not the empty sentinel");
+    }
+
+    #[test]
+    fn directory_binding_does_not_fold_a_like_wildcard_sibling() {
+        // Regression (PR #428 Codex P2): a bound dir path with a SQLite LIKE wildcard (`_`) must be
+        // escaped, or `src/foo_bar` also matches an unrelated `src/fooXbar/…`, folding a sibling's
+        // files into this memory's hash.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a note", "r");
+        seed_file(&c, "src/foo_bar/a.rs", "fn a() {}\n", "r");
+        seed_file(&c, "src/fooXbar/b.rs", "fn b() {}\n", "r"); // the wildcard-collision sibling
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','dir','src/foo_bar','src/foo_bar','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let scope = Some("r".to_string());
+        let before = checked_inputs_hash(&c, "m1", &scope).unwrap();
+        // Changing the SIBLING (fooXbar) must NOT move the hash — it isn't under the bound dir.
+        c.execute("UPDATE main.files SET sha256 = 'sha-x' WHERE path = 'src/fooXbar/b.rs'", [])
+            .unwrap();
+        assert_eq!(before, checked_inputs_hash(&c, "m1", &scope).unwrap(), "sibling is excluded");
+        // Changing the real child DOES move it.
+        c.execute("UPDATE main.files SET sha256 = 'sha-y' WHERE path = 'src/foo_bar/a.rs'", [])
+            .unwrap();
+        assert_ne!(
+            before,
+            checked_inputs_hash(&c, "m1", &scope).unwrap(),
+            "real child is included"
+        );
+    }
+
+    #[test]
+    fn checked_inputs_hash_reflects_the_bound_path_not_just_content() {
+        // Regression (PR #428 Codex P2): hashing only unique shas is blind to a rebind that keeps
+        // identical content — the (path, sha) multiset must change when the bound path changes.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "a note", "r");
+        seed_file(&c, "src/a.rs", "same\n", "r");
+        seed_file(&c, "src/b.rs", "same\n", "r"); // identical content → identical sha-{...}? no: sha-{path}
+        // seed_file stamps sha = sha-{path}, so force identical shas to isolate the path axis.
+        c.execute(
+            "UPDATE main.files SET sha256 = 'same-sha' WHERE path IN ('src/a.rs','src/b.rs')",
+            [],
+        )
+        .unwrap();
+        let bind = |path: &str| {
+            c.execute("DELETE FROM repo_memory_bindings WHERE memory_id='m1'", []).unwrap();
+            c.execute(
+                "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+                 anchor_status, created_at_ms, repo_id) VALUES ('m1','path',?1,?1,'current',0,'r')",
+                [path],
+            )
+            .unwrap();
+        };
+        let scope = Some("r".to_string());
+        bind("src/a.rs");
+        let hash_a = checked_inputs_hash(&c, "m1", &scope).unwrap();
+        bind("src/b.rs");
+        let hash_b = checked_inputs_hash(&c, "m1", &scope).unwrap();
+        assert_ne!(
+            hash_a, hash_b,
+            "rebinding to a same-content file at a different path changes the hash"
+        );
+    }
+
+    #[test]
+    fn evidence_pack_excerpts_respect_the_line_cap_across_a_merged_window() {
+        // Regression (PR #428 Codex P2): `identifier_windows` merges adjacent hits into ONE range,
+        // so an identifier repeated on hundreds of lines yields a single huge window. The
+        // cap must be enforced per-append (clamping the range), not only checked before it,
+        // or one push blows past MAX_EXCERPT_LINES and overflows the model prompt.
+        let c = mem_db();
+        set_repo(&c, "r");
+        // 400 lines each mentioning the identifier → one merged window far larger than the cap.
+        let body_text =
+            (0..400).map(|_| "let shared_marker_token = 1;").collect::<Vec<_>>().join("\n");
+        seed_file(&c, "src/big.rs", &body_text, "r");
+        seed_memory(&c, "m1", "t", "a note about `shared_marker_token`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/big.rs','src/big.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let pack = evidence_pack(&c, "m1").unwrap();
+        let total: i64 = pack.excerpts.iter().map(|e| e.end_line - e.start_line + 1).sum();
+        assert!(total <= MAX_EXCERPT_LINES as i64, "excerpt lines {total} exceed the cap");
     }
 
     #[test]
