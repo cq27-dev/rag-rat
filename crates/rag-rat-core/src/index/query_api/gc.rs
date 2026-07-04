@@ -55,8 +55,12 @@ impl IndexDatabase {
         live_worktrees: &[String],
     ) -> anyhow::Result<GcReport> {
         let conn = self.storage.connection();
-        let files_before = table_row_count(conn, "files")?;
-        let chunks_before = table_row_count(conn, "chunks")?;
+        // Counts are SCOPED to the active repo (the DELETEs below always were): on a consolidated
+        // DB a whole-table count would report the union across every repo — `files_remaining: 2`
+        // from a repo owning one file — and a sibling's index pass committing between the
+        // before/after reads would skew the derived pruned counts (saturating_sub can zero them).
+        let files_before = scoped_table_row_count(conn, "files", &self.active_repo_id)?;
+        let chunks_before = scoped_chunk_row_count(conn, &self.active_repo_id)?;
         // A6 (P2 review): sweep this repo's DEAD file GENERATIONS FIRST, and UNCONDITIONALLY —
         // BEFORE the empty-live-sets early return below. Generation liveness needs only
         // `repo_id` + the repo's live-generation pointer, never a git context, so the "no live
@@ -100,8 +104,8 @@ impl IndexDatabase {
         self.delete_staged_files_cascade(StagedSweep::DeadGeneration)?;
         conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
         if live_commits.is_empty() && live_worktrees.is_empty() {
-            let files_remaining = table_row_count(conn, "files")?;
-            let chunks_remaining = table_row_count(conn, "chunks")?;
+            let files_remaining = scoped_table_row_count(conn, "files", &self.active_repo_id)?;
+            let chunks_remaining = scoped_chunk_row_count(conn, &self.active_repo_id)?;
             return Ok(GcReport {
                 files_pruned: files_before.saturating_sub(files_remaining),
                 chunks_pruned: chunks_before.saturating_sub(chunks_remaining),
@@ -227,8 +231,8 @@ impl IndexDatabase {
             ",
             [],
         )?;
-        let files_remaining = table_row_count(conn, "files")?;
-        let chunks_remaining = table_row_count(conn, "chunks")?;
+        let files_remaining = scoped_table_row_count(conn, "files", &self.active_repo_id)?;
+        let chunks_remaining = scoped_chunk_row_count(conn, &self.active_repo_id)?;
         Ok(GcReport {
             files_pruned: files_before.saturating_sub(files_remaining),
             chunks_pruned: chunks_before.saturating_sub(chunks_remaining),

@@ -178,6 +178,40 @@ fn gc_of_one_repo_leaves_the_other_intact() {
         "repo B's identical (path, commit) dead row is NOT pruned by A's gc"
     );
 
+    // The REPORT is repo-scoped too (2nd adversary wave): `files_remaining`/`chunks_remaining`
+    // count the ACTIVE repo's slice, never the whole consolidated store — a whole-table count
+    // would include repo B's 2 files (and the poison sibling's), and a sibling's index pass
+    // committing between the before/after reads would skew the derived pruned counts.
+    let repo_a_files: i64 = fx
+        .db
+        .storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM main.files WHERE repo_id = ?1", [&fx.repo_a_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        report.files_remaining,
+        u64::try_from(repo_a_files).unwrap(),
+        "gc reports repo A's file slice, not the whole-store union",
+    );
+    let repo_a_chunks: i64 = fx
+        .db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM main.chunks c JOIN main.files f ON f.id = c.file_id WHERE \
+             f.repo_id = ?1",
+            [&fx.repo_a_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        report.chunks_remaining,
+        u64::try_from(repo_a_chunks).unwrap(),
+        "gc reports repo A's chunk slice, not the whole-store union",
+    );
+
     let _ = fs::remove_dir_all(fx.root_a);
 }
 
@@ -648,13 +682,18 @@ fn orientation_pins_the_fork_repo_over_a_shared_root_sibling() {
         "orientation threads the pin and installs the fork's scope",
     );
 
-    // WITHOUT the override: the identity route resolves the shared-root sibling (the mis-scope the
-    // pin fixes).
+    // WITHOUT the override: the identity route derives the shared-root UPSTREAM id, but this root
+    // is RECORDED under the fork's pin — the read-only owner mirror (Codex batch 4) now DECLINES
+    // instead of serving the sibling's scope, installing the deliberate empty "match nothing"
+    // scope. That matches the write path, which refuses this exact shape with the
+    // mismatched-root-owner remedy. (Pre-mirror, this phase pinned the sibling BIND as the
+    // documented mis-scope the pin fixes; the mirror upgrades it from "wrong scope" to "no
+    // scope + surfaced refusal on the write path".)
     crate::query::orientation::orientation(conn, &root, &root, None).unwrap();
     assert_eq!(
         schema::active_repo_id(conn).unwrap(),
-        upstream_id,
-        "no pin → orientation binds the shared-root upstream sibling",
+        "",
+        "no pin at a fork-owned root → the owner mirror declines rather than bind the sibling",
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -1525,6 +1564,146 @@ fn memory_summary_readers_exclude_a_sibling_repos_memory() {
     assert!(
         !orient.active_memory_titles.iter().any(|t| t == "REPO B SECRET"),
         "orientation leaked a sibling repo's active memory title",
+    );
+
+    let _ = fs::remove_dir_all(fx.root_a);
+}
+
+/// A7 (Codex batch 2 P2): the open-time model-manifest heal must never mutate a SIBLING repo's
+/// `repo_meta`. Pre-fix, the incremental pass's low-level open ran `ensure_model_manifest` BEFORE
+/// adoption, so its `active_repo_id` resolved the config-less sole pick — the lexicographically
+/// FIRST repo — and a heal-owed pass (`remove_legacy_models`) DELETED that repo's active-model
+/// meta while the command held only its own repo's lock. Post-fix the heal is deferred until after
+/// adopt + set_context, so it reads/clears only the config's own repo.
+#[test]
+fn incremental_open_heal_leaves_a_sibling_repos_model_meta_alone() {
+    let fx = two_repo_fixture();
+    let conn = fx.db.storage.connection();
+
+    // A sibling registered under an id that sorts FIRST (before any hex-derived id), carrying a
+    // LEGACY active-model value — exactly the row the pre-adoption sole-pick heal would delete.
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('0-first-sibling', \
+         's', 0)",
+        [],
+    )
+    .unwrap();
+    crate::index::meta::set_repo_meta(
+        conn,
+        "0-first-sibling",
+        "active_embedding_model",
+        "fastembed-all-minilm-l6-v2",
+    )
+    .unwrap();
+    // The fixture's DB is a shared temp file, not root_a/.rag-rat — reuse its path for the config.
+    let db_path = fx.db.database_path().to_path_buf();
+    drop(fx.db);
+
+    // A production incremental pass on repo A (the config's repo).
+    let mut config = source_config(fx.root_a.clone(), Language::Rust);
+    config.database = db_path;
+    let db = IndexDatabase::index_changed(&config).unwrap();
+
+    // The sibling's legacy meta row SURVIVES: the heal ran scoped to repo A, never the sole pick.
+    let sibling_meta = crate::index::meta::repo_meta(
+        db.storage.connection(),
+        "0-first-sibling",
+        "active_embedding_model",
+    )
+    .unwrap();
+    assert_eq!(
+        sibling_meta.as_deref(),
+        Some("fastembed-all-minilm-l6-v2"),
+        "the open-time manifest heal mutated a sibling repo's repo_meta (pre-adoption sole pick)",
+    );
+
+    let _ = fs::remove_dir_all(fx.root_a);
+}
+
+/// A7 (Codex batch 3, same class as the incremental finding — the CALLEE now enforces it): a
+/// config-less `IndexDatabase::migrate` on a MULTI-REPO DB must not run the model-manifest heal —
+/// its connection has no scope context, so `active_repo_id` would resolve the first-sorting repo
+/// and a heal-owed pass would delete THAT sibling's `repo_meta` model keys. This is exactly the
+/// connection `rag-rat consolidate` reaches migrate through BEFORE registering its repo. The
+/// witness gate in `ensure_model_manifest` skips + defers (the next config-bearing open heals
+/// scoped), regardless of which caller reaches it next.
+#[test]
+fn config_less_migrate_on_a_multi_repo_db_leaves_sibling_model_meta_alone() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let db_path = root.join("global.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        schema::apply(&conn).unwrap();
+        // Two real repos make the DB consolidated; the first-sorting one carries a LEGACY
+        // active-model value — the row a config-less heal would delete.
+        conn.execute_batch(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES
+                 ('0-first-sibling', 's', 0), ('zz-other', 'z', 0);
+             DELETE FROM repos WHERE repo_id = '__unassigned__';",
+        )
+        .unwrap();
+        crate::index::meta::set_repo_meta(
+            &conn,
+            "0-first-sibling",
+            "active_embedding_model",
+            "fastembed-all-minilm-l6-v2",
+        )
+        .unwrap();
+    }
+
+    IndexDatabase::migrate(&db_path).unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let sibling_meta =
+        crate::index::meta::repo_meta(&conn, "0-first-sibling", "active_embedding_model").unwrap();
+    assert_eq!(
+        sibling_meta.as_deref(),
+        Some("fastembed-all-minilm-l6-v2"),
+        "a config-less migrate healed (deleted) a sibling repo's model meta",
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A7 (Codex batch 4 — the source_root variant of the pre-adoption-pick family): an
+/// AdoptionPending open derives `source_root` from the config-less SOLE pick (a first-sorting
+/// SIBLING on a consolidated DB); adoption must RESET it from the config before any deferred heal,
+/// or `ensure_graph_index_current` re-reads changed files from the sibling's checkout while
+/// stamping the target's rows. The rule: adoption resets ALL connection-carried repo-derived state
+/// before any deferred heal.
+#[test]
+fn incremental_open_resets_source_root_from_the_config_before_heals() {
+    let fx = two_repo_fixture();
+    let conn = fx.db.storage.connection();
+    // A first-sorting sibling whose recorded source_root points at a NONEXISTENT checkout — the
+    // root the pre-adoption pick would carry into the deferred graph heal.
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('0-first-sibling', \
+         's', 0)",
+        [],
+    )
+    .unwrap();
+    crate::index::meta::set_repo_meta(
+        conn,
+        "0-first-sibling",
+        "source_root",
+        "/nonexistent-sibling-checkout",
+    )
+    .unwrap();
+    let db_path = fx.db.database_path().to_path_buf();
+    drop(fx.db);
+
+    let mut config = source_config(fx.root_a.clone(), Language::Rust);
+    config.database = db_path;
+    let db = IndexDatabase::index_changed(&config).unwrap();
+
+    assert_eq!(
+        db.storage.source_root(),
+        Some(config.root.as_path()),
+        "adoption must reset source_root from the config before the deferred heals — a stale \
+         sibling root would refresh the target's graph from the wrong checkout",
     );
 
     let _ = fs::remove_dir_all(fx.root_a);

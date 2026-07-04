@@ -35,6 +35,15 @@ pub(crate) fn recover_cached_fastembed_model_at(
     if !fastembed_cache_ready(cache_dir) {
         return Ok(());
     }
+    // SCOPED-REPO WITNESS (A7): recovery both REQUIRES the manifest rows (which the witness gate
+    // skips seeding on this connection shape) and — worse — ACTIVATES the recovered model by
+    // writing the active-model `repo_meta` keys via the context-less `active_repo_id` fallback,
+    // i.e. onto the arbitrary first-sorting repo of a multi-repo DB. Same skip + defer posture as
+    // `ensure_model_manifest` (the other open-time healer): a scoped open recovers/activates for
+    // its own repo.
+    if super::manifest::scoped_repo_witness(conn)?.is_none() {
+        return Ok(());
+    }
     let fastembed = model(conn, FASTEMBED_MODEL_ID)?;
     if !fastembed.installed || fastembed.status != "Ready" {
         conn.execute(

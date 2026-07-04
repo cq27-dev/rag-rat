@@ -194,6 +194,7 @@ fn find_clones_rejects_nan_and_non_finite_min_similarity() {
     std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
     let config = crate::Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![crate::config::ResolvedTarget {
@@ -776,6 +777,7 @@ fn recall_candidates_identical_blob_vs_postings_grouping() {
     .unwrap();
     let config = crate::Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![crate::config::ResolvedTarget {

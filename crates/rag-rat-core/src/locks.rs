@@ -138,6 +138,21 @@ pub fn schema_lock_path(database: &Path) -> PathBuf {
     database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-schema.lock")
 }
 
+/// The GLOBAL repo-registry lock path, beside the DB (A7): ONE per database file, taken by
+/// `register_repo` for its whole read-decide-write sequence. Registration reads the registered-repo
+/// set, DECIDES (idempotent / upgrade / refuse / fresh), then writes `repos`/`repo_roots` — two
+/// concurrent first-registrations on the shared global DB would otherwise interleave between the
+/// read and the write (a `SQLITE_BUSY_SNAPSHOT` on the deferred upgrade, or a `repos`-PK constraint
+/// on the same-id race). Per-repo write locks cannot serialize this: the writers hold DIFFERENT
+/// repo ids by construction. GLOBAL-LOCK ORDERING RULE (shared with [`schema_lock_path`]): a global
+/// lock is acquired while per-repo entry locks may already be held (per-repo → global), and any
+/// per-repo lock taken while a global lock is held (the upgrade path) must be BOUNDED — bounded
+/// edges self-break any cross-type cycle within their timeout, exactly like the canonical-order
+/// rule's out-of-order edges.
+pub fn registry_lock_path(database: &Path) -> PathBuf {
+    database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-registry.lock")
+}
+
 /// Per-DB, PER-REPO maintenance coordination lock, held by the running `rag-rat maintenance`
 /// command for its whole pass so the multiple git hooks a single amend/merge/rebase fires coalesce
 /// into one pass instead of each running a full discover (#267). Keyed by `repo_id` (A6) like
@@ -287,6 +302,18 @@ impl WriteLock {
         timeout: Duration,
     ) -> anyhow::Result<Option<WriteLock>> {
         Self::acquire_path_timeout(schema_lock_path(database), timeout)
+    }
+
+    /// Polls until the GLOBAL repo-registry lock ([`registry_lock_path`]) is acquired or `timeout`
+    /// elapses; `Ok(None)` on timeout. Taken by `register_repo` for its whole read-decide-write
+    /// sequence (A7) — registration decisions span all repos, so per-repo locks cannot serialize
+    /// them. Reentrant on the holding thread like the other write locks (a `consolidate` that
+    /// pre-registers, then imports, may re-enter registration idempotently).
+    pub fn acquire_registry_timeout(
+        database: &Path,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<WriteLock>> {
+        Self::acquire_path_timeout(registry_lock_path(database), timeout)
     }
 
     fn acquire_path_blocking(lock_path: PathBuf) -> anyhow::Result<WriteLock> {

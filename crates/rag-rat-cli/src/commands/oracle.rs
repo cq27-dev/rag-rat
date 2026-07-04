@@ -466,6 +466,7 @@ mod tests {
             .unwrap();
         let config = Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -513,6 +514,7 @@ mod tests {
         // (`include = ["**/*.rs"]`, no exclude), so the bindings-match check accepts it.
         let config_with = |include: Vec<String>, exclude: Vec<String>| Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: PathBuf::from("/x"),
             database: PathBuf::from("/x/db"),
             targets: vec![ResolvedTarget {

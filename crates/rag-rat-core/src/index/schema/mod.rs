@@ -3,22 +3,21 @@ mod migrations;
 mod registry;
 pub(crate) use baseline::*;
 pub(crate) use migrations::*;
-// `multiple_real_repos` lost its production callers when V042's real `repo_id` predicates
-// superseded the gc / clone-precompute seam guards (A5); it survives only as a
-// registry-internal check (`resolve_config_repo_id`) and a `multi_repo_scope` test assertion,
-// so the re-export is test-only now.
-#[cfg(test)]
+// `multiple_real_repos` lost its V042-era seam-guard callers (real `repo_id` predicates
+// superseded them, A5), but A7's bare-open fail-fast made it production again: a config-less
+// `IndexDatabase::open` refuses a multi-repo DB rather than silently scoping to the
+// lexicographically-first repo.
 pub(crate) use registry::multiple_real_repos;
 pub(crate) use registry::{
     CONNECTION_CONTEXT_GENERATION_KEY, CONNECTION_CONTEXT_REPO_KEY, LIVE_FILES_GENERATION_META_KEY,
     active_generation, active_repo_id, live_files_generation, periphery_repo_scope,
-    periphery_repo_scope_clause, resolve_config_repo_id, sole_repo_id,
+    periphery_repo_scope_clause, resolve_config_repo_id, scope_context_repo_id, sole_repo_id,
 };
 pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 43;
+pub const LATEST_SCHEMA_VERSION: u32 = 45;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -292,6 +291,22 @@ const MIGRATION_043_DESCRIPTION: &str =
      generation), so a full rebuild can stage a fresh generation of every file row alongside the \
      live one and flip readers over atomically instead of clearing-then-reinserting inside one \
      long write-locked transaction (memory-sync phase A6)";
+const MIGRATION_044_ID: &str = "044_github_natural_key_widening";
+const MIGRATION_044_CHECKSUM: &str = "sha256:rag-rat-github-natural-key-widening-v44";
+const MIGRATION_044_DESCRIPTION: &str =
+    "Fold repo_id into the (owner, repo, number)-style GitHub natural keys — widen github_issues \
+     / github_pull_requests UNIQUE and github_ref_sync PRIMARY KEY to (repo_id, owner, repo, \
+     number) and re-create idx_github_refs_unique with a leading repo_id — so two repos in a \
+     consolidated database can each cache the same external issue/PR/ref without one repo's sync \
+     overwriting the other's row (memory-sync phase A7)";
+const MIGRATION_045_ID: &str = "045_github_child_key_widening";
+const MIGRATION_045_CHECKSUM: &str = "sha256:rag-rat-github-child-key-widening-v45";
+const MIGRATION_045_DESCRIPTION: &str =
+    "Fold repo_id into the id-keyed GitHub child caches — rebuild github_comments / \
+     github_reviews / github_review_comments with (repo_id, id) uniqueness, backfilling one copy \
+     per owning-parent repo — so two repos sharing an external issue/PR each keep that item's \
+     comments and reviews in their scoped papertrail instead of last-syncer-owns restamping \
+     (memory-sync phase A7)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -649,6 +664,18 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_043_CHECKSUM,
         description: MIGRATION_043_DESCRIPTION,
         apply: apply_files_generation,
+    },
+    Migration {
+        id: MIGRATION_044_ID,
+        checksum: MIGRATION_044_CHECKSUM,
+        description: MIGRATION_044_DESCRIPTION,
+        apply: apply_github_natural_key_widening,
+    },
+    Migration {
+        id: MIGRATION_045_ID,
+        checksum: MIGRATION_045_CHECKSUM,
+        description: MIGRATION_045_DESCRIPTION,
+        apply: apply_github_child_key_widening,
     },
 ];
 

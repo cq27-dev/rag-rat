@@ -2114,6 +2114,7 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
 
     let config = Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
@@ -2197,6 +2198,7 @@ fn repo_clusters_groups_cotouched_files() {
 
     let config = Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

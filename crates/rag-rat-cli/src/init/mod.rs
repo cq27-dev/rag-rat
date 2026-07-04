@@ -22,7 +22,6 @@ use crate::{
     apply_embedding_runtime_env, git_paths, render_index_progress, render_reconcile_progress,
 };
 
-pub(crate) const DEFAULT_DATABASE: &str = ".rag-rat/index.sqlite";
 const SKIPPED_DIRS: &[&str] = &[
     ".git",
     ".rag-rat",
@@ -285,7 +284,17 @@ mod tests {
         let text = render_config(&plan);
 
         assert!(text.contains("[index]"));
-        assert!(text.contains("database = \".rag-rat/index.sqlite\""));
+        // A7: NO active `database` key — the keyless config resolves to the machine-global store.
+        // The deprecated per-repo opt-out is documented as a COMMENT only, so check for an active
+        // (uncommented) key, not the substring.
+        assert!(
+            !text.lines().any(|line| line.trim_start().starts_with("database")),
+            "a fresh config must not activate the deprecated per-repo `database` key:\n{text}"
+        );
+        assert!(
+            text.contains("# database = \".rag-rat/index.sqlite\""),
+            "the per-repo opt-out stays discoverable as a comment"
+        );
         assert!(text.contains("rust = [\"crates/app/src\"]"));
         assert!(text.contains("typescript = [\"web/src\", \"app/src\"]"));
         assert!(text.contains("[llm.embedding]"));
@@ -346,6 +355,48 @@ mod tests {
         assert!(config.watch.enabled);
         // Commented [log] falls back to its default (disabled).
         assert!(!config.log.enabled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A7: the freshly rendered config has NO `database` key, so `Config::load` resolves it to the
+    /// consolidated GLOBAL store — the flip covers the primary onboarding path, not just
+    /// hand-written configs. Path resolution only; nothing is created at the global path.
+    #[test]
+    fn rendered_config_is_keyless_and_resolves_to_the_global_database() {
+        let root =
+            std::env::temp_dir().join(format!("ragrat-render-globaldb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        // Identity-bearing root: the global default requires a derivable repo identity (a
+        // committed git repo); an identity-less root stays per-root.
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "t@e"],
+            &["config", "user.name", "t"],
+            &["add", "-A"],
+            &["commit", "-qm", "seed"],
+        ] {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+            assert!(out.status.success());
+        }
+        let plan = InitPlan {
+            root_value: ".".to_string(),
+            languages: vec![Language::Rust],
+            bindings: BTreeMap::from([(Language::Rust, vec![PathBuf::from("src")])]),
+            backend: EmbeddingBackend::fast_embed(),
+            oracle_auto_run: false,
+        };
+        std::fs::write(root.join("rag-rat.toml"), render_config(&plan)).unwrap();
+
+        let config = Config::load(root.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            config.database,
+            rag_rat_core::data_dir::global_database_path()
+                .expect("a data dir resolves in the test environment"),
+            "a fresh init's keyless config lands on the machine-global store",
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

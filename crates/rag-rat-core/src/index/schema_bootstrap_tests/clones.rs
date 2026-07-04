@@ -1069,6 +1069,7 @@ fn multi_language_clone_integration_finds_within_language_no_cross() {
 
     let config = Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![
@@ -1280,6 +1281,7 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
 
     let config = Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

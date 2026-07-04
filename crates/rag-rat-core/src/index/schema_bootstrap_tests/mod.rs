@@ -74,6 +74,7 @@ fn git_history_targets() -> Vec<ResolvedTarget> {
 fn rag_rat_config(root: &Path) -> Config {
     Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: git_history_targets(),
@@ -195,6 +196,7 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
 fn markdown_config_for_root(root: PathBuf) -> Config {
     Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
@@ -330,6 +332,7 @@ pub(crate) fn poison_test_config(tag: &str) -> (PathBuf, Config) {
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
@@ -676,6 +679,7 @@ fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
     run_git(&root, &["commit", "-m", "init"]);
     let config = Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
@@ -796,6 +800,7 @@ fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
     }
     let config = Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

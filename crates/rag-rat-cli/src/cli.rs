@@ -1,7 +1,7 @@
 //! Declarative command-line surface (clap derive). The parser owns `--help`/`-h`,
 //! `--version`/`-V`, per-subcommand help, and flag validation — `main.rs` only dispatches on
-//! the typed result. The global `--config` defaults to `rag-rat.toml` and may appear before or
-//! after the subcommand.
+//! the typed result. The global `--config` defaults to governing-path discovery and may appear
+//! before or after the subcommand.
 
 use std::path::PathBuf;
 
@@ -15,9 +15,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     propagate_version = true
 )]
 pub(crate) struct Cli {
-    /// Path to the rag-rat.toml config (relative to the current directory).
-    #[arg(long, global = true, default_value = "rag-rat.toml")]
-    pub config: String,
+    /// Path to the rag-rat.toml config (relative to the current directory). When omitted, the
+    /// config is DISCOVERED through the checkout's governing path: `rag-rat.toml` here, or — in a
+    /// linked git worktree with no local file — the main worktree's `rag-rat.toml`. An explicit
+    /// path is taken literally (no redirect).
+    #[arg(long, global = true)]
+    pub config: Option<String>,
 
     /// Emit JSON instead of the default TOON (Token-Oriented Object Notation). TOON is denser for
     /// LLM consumers; pass --json when a JSON parser must read the output. For commands that print
@@ -103,6 +106,10 @@ pub(crate) enum Command {
 
     /// SCIP-oracle pass: compiler-grade edge resolution from a language indexer.
     Oracle(OracleArgs),
+
+    /// Import this repo's legacy per-repo index into the consolidated global database, then rename
+    /// the legacy `.rag-rat/index.sqlite` so the repo uses the global store from then on.
+    Consolidate,
 
     /// Print the resolved configuration as JSON.
     DumpConfig,
@@ -617,7 +624,7 @@ mod tests {
     fn parses_global_config_after_subcommand() {
         let cli = Cli::try_parse_from(["rag-rat", "query", "--config", "x.toml", "foo", "bar"])
             .expect("parse");
-        assert_eq!(cli.config, "x.toml");
+        assert_eq!(cli.config.as_deref(), Some("x.toml"));
         match cli.command {
             Command::Query(args) => {
                 assert_eq!(args.query, vec!["foo", "bar"]);
@@ -628,9 +635,9 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_rag_rat_toml() {
+    fn config_defaults_to_discovery() {
         let cli = Cli::try_parse_from(["rag-rat", "gc"]).expect("parse");
-        assert_eq!(cli.config, "rag-rat.toml");
+        assert_eq!(cli.config, None, "no explicit --config ⇒ governing-path discovery");
     }
 
     #[test]

@@ -842,6 +842,7 @@ mod tests {
     fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
         Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: root.to_path_buf(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -865,6 +866,7 @@ mod tests {
     fn event_touches_worktree_matches_checkout_targets_and_registry() {
         let config = Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: PathBuf::from("/main"),
             database: PathBuf::from("/main/.rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -963,6 +965,7 @@ mod tests {
         let config_root = repo.join("crate").canonicalize().unwrap();
         let config = Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: config_root,
             database: repo.join("crate/.rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1008,6 +1011,7 @@ mod tests {
 
         let config = Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1071,6 +1075,7 @@ mod tests {
 
         let config = Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1145,6 +1150,7 @@ mod tests {
         let target_dirs = vec![PathBuf::from(".")];
         let config = Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: sub.clone(),
             database: sub.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1291,6 +1297,7 @@ mod tests {
         let sub = main.join("crate").canonicalize().unwrap(); // config.root is the subdir.
         let config = Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: sub.clone(),
             database: sub.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1554,6 +1561,7 @@ mod tests {
         let root = root.canonicalize().unwrap();
         let config = Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {

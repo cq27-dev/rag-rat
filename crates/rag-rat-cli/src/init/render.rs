@@ -1,10 +1,11 @@
 use super::*;
 
 /// Render a complete, commented `rag-rat.toml`. The lines that reflect *this* repo's choices —
-/// root/database, the language bindings, the chosen embedding model, the oracle opt-in — are
-/// active; every other table is emitted as commented defaults so the full config surface is
-/// discoverable without leaving the file (the bare-bindings stub used to hide it). See
-/// `docs/config.md`.
+/// root, the language bindings, the chosen embedding model, the oracle opt-in — are active; every
+/// other table is emitted as commented defaults so the full config surface is discoverable without
+/// leaving the file (the bare-bindings stub used to hide it). No `database` key is emitted: the
+/// keyless config resolves to the machine-global store (the A7 default), with the deprecated
+/// per-repo opt-out documented as a comment. See `docs/config.md`.
 pub(crate) fn render_config(plan: &InitPlan) -> String {
     let mut text = String::new();
     text.push_str(
@@ -15,7 +16,15 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
 
     text.push_str("[index]\n");
     text.push_str(&format!("root = {}\n", toml_string(&plan.root_value)));
-    text.push_str(&format!("database = {}\n\n", toml_string(DEFAULT_DATABASE)));
+    // No `database` key: the index + memories live in the machine-global store by default (A7),
+    // which is what makes them survive `git clean -fdx` / a deleted checkout. The commented line
+    // documents the deprecated per-repo opt-out without activating it.
+    text.push_str(
+        "# The index and repo memories live in the machine-global database by default\n# \
+         ($XDG_DATA_HOME/rag-rat/rag-rat.sqlite; override the location with RAG_RAT_DATA_DIR).\n# \
+         Uncomment to keep this repo on its own per-repo file instead (deprecated):\n# database = \
+         \".rag-rat/index.sqlite\"\n\n",
+    );
 
     text.push_str(
         "# Language → directories to index. Each language indexes its default file extensions in \

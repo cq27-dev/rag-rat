@@ -47,21 +47,24 @@
 //! by their globally-unique `build_generation`) is deliberately absent — seeding it would
 //! manufacture a FALSE tripwire against a legitimately cross-repo store.
 //!
-//! WHY THE SIBLING IS NOT REGISTERED IN `repos` (load-bearing at V040): the eight direct-scoped
-//! DATA tables (`files`, `packages`, `logical_symbols`, `docs`, `parser_failures`, `git_commits`,
-//! `git_file_changes`, and the file/symbol children) carry `repo_id` as a plain column with a
-//! `DEFAULT '__unassigned__'` and **no foreign key to `repos`** — so a tripwire row under
-//! `repo_id='poison-sibling'` is valid without a `repos` registry row. The harness deliberately
-//! does NOT insert into `repos`/`repo_roots`/`repo_meta`. If it did, the sibling would become a
-//! second REAL repo, and at phase A that (a) makes `sole_repo_id` (the config-blind fallback for
-//! the many NON-git fixtures, which stay under the `__unassigned__` placeholder) return the sibling
-//! instead of the fixture — hijacking every re-adoption — and (b) flips `multiple_real_repos`,
-//! changing the gc/precompute global-sweep guards. Neither is a production leak; both are phase-A
-//! single-repo assumptions. Seeding only the *scoped data* rows keeps the registry pristine (no
-//! hijack, no `multiple_real_repos` flip) while still tripping any genuinely unscoped
-//! read/count/delete. The cost is no tripwire for an unscoped `repo_meta`/`repos`/`repo_roots` read
-//! — those are covered by the dedicated registry + `multi_repo_scope` tests instead. (When A7 makes
-//! multi-repo the default, the sibling gets a real `repos` row and this note goes away.)
+//! REGISTRY REGISTRATION IS CONDITIONAL (A7): the sibling gets a REAL `repos` + `repo_roots` +
+//! `repo_meta` registry row **only when the fixture repo is itself a real (adopted) repo** — i.e.
+//! when the DB already holds a non-placeholder, non-sibling repo (see [`primary_is_real`]). That is
+//! the genuinely multi-repo shape A7 makes the default, and registering the sibling there closes
+//! the last tripwire gap: an unscoped `repos`/`repo_roots`/`repo_meta` read/count/delete now trips.
+//! The eight direct-scoped DATA tables carry `repo_id` as a plain column with **no foreign key to
+//! `repos`**, so the scoped-row tripwires are valid with or without the registry row.
+//!
+//! For a NON-git fixture (the many bare temp-dir fixtures that stay under the `__unassigned__`
+//! placeholder because `adopt_repo_from_config` reads them as `Absent`), the sibling stays
+//! registry-LESS: registering it as a second real repo would (a) make `sole_repo_id` — the
+//! config-blind fallback those fixtures rely on — return the sibling instead of the placeholder,
+//! hijacking their scope, and (b) flip `multiple_real_repos`. So the harness registers the sibling
+//! ONLY where a real repo already anchors the DB (a git fixture, resolved by
+//! identity/recorded-root, never by `sole_repo_id`), and leaves the registry pristine on
+//! placeholder DBs. The registry tripwires are correspondingly conditional — [`sibling_tripwires`]
+//! appends them only when `primary_is_real`, keyed on the fixture's own (never mutated) real repo
+//! row so a leak that deletes the sibling's registry rows is still caught.
 //!
 //! OPT-OUT: default-ON per test thread (see [`disable_poison_sibling`]). A test that legitimately
 //! asserts a scoped table's UNSCOPED total (a `full_rebuild_preserves_*` cache-total check, a
@@ -135,6 +138,16 @@ const POISON_MEMORY_ID: &str = "zz_poison_mem";
 /// any fixture's `MAX(generation)+1` allocation so a seeded clone row never collides.
 const POISON_GENERATION: i64 = 9_900_000_042;
 
+/// The poison sibling's recorded working-tree root (A7). A distinctive path that can never collide
+/// with a real fixture root, so registering the sibling in `repo_roots` never claims a fixture's
+/// root nor lets `real_root_owner` mis-resolve a fixture path to the sibling.
+const POISON_REPO_ROOT: &str = "/zz_poison_root";
+
+/// The poison sibling's `repo_meta` sentinel key/value (A7) — the tripwire for an unscoped
+/// `repo_meta` read/count/delete once the sibling is a REAL registered repo.
+const POISON_META_KEY: &str = "zz_poison_meta_key";
+const POISON_META_VALUE: &str = "zz_poison_meta_val";
+
 thread_local! {
     /// Whether [`seed_if_enabled`] seeds on this thread. Default ON. Thread-local (not a global
     /// static) so a `cargo test` run — which executes tests as parallel THREADS in one process —
@@ -150,6 +163,13 @@ impl Drop for PoisonDisabled {
     fn drop(&mut self) {
         POISON_ENABLED.with(|flag| flag.set(self.0));
     }
+}
+
+/// Whether seeding is currently disabled on THIS thread — for test helpers that spawn a WORKER
+/// thread (e.g. a paused rebuild) and must propagate the calling test's opt-out onto it (the
+/// thread-local default is ON, so a spawned rebuild would otherwise re-seed behind the opt-out).
+pub(crate) fn poison_disabled_on_this_thread() -> bool {
+    !POISON_ENABLED.with(Cell::get)
 }
 
 /// Disable poison-sibling seeding for the remainder of THIS test (until the returned guard drops).
@@ -643,7 +663,45 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
         ],
     )?;
 
+    // --- registry rows (A7): register the sibling as a REAL repo ONLY on a DB that already holds a
+    // real fixture repo (a git fixture). This is the genuinely multi-repo shape A7 makes the
+    // default, and it makes an unscoped `repos`/`repo_roots`/`repo_meta` read/count/delete trip a
+    // tripwire. On a placeholder-only (non-git) fixture the sibling stays registry-less — a second
+    // real repo would hijack `sole_repo_id` for the many fixtures that rely on it (see the module
+    // docs). `repo_roots` / `repo_meta` FK `repos(repo_id)` ON DELETE CASCADE, so insert the parent
+    // `repos` row FIRST (the connection runs `foreign_keys = ON`). ---
+    if primary_is_real(conn)? {
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?2, 0)",
+            params![POISON_REPO_ID, format!("{POISON_PREFIX}name")],
+        )?;
+        conn.execute(
+            "INSERT INTO repo_roots(repo_id, root, registered_at_ms) VALUES (?1, ?2, 0)",
+            params![POISON_REPO_ID, POISON_REPO_ROOT],
+        )?;
+        conn.execute("INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, ?3)", params![
+            POISON_REPO_ID,
+            POISON_META_KEY,
+            POISON_META_VALUE
+        ])?;
+    }
+
     Ok(())
+}
+
+/// Whether the DB already holds a REAL fixture repo — a `repos` row that is neither the
+/// `__unassigned__` placeholder nor the poison sibling itself. Gates whether [`seed_sibling`]
+/// registers the sibling as a real repo and whether [`sibling_tripwires`] appends the registry
+/// tripwires (see the module docs). Stable across the mutation under test: the fixture's own real
+/// repo row is never the target of the unscoped-read leaks the harness hunts, so a seed-time and an
+/// assert-time evaluation agree — a leak that deletes the SIBLING's registry rows is still caught.
+fn primary_is_real(conn: &Connection) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM repos WHERE repo_id != ?1 AND repo_id != ?2",
+        params![crate::index::schema::LEGACY_REPO_ID, POISON_REPO_ID],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// The lexicographically-first REAL (non-sibling) indexed path — the primary-repo path the
@@ -700,7 +758,13 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
          DELETE FROM repo_memory_fts WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM repo_memory_tags WHERE memory_id = '{POISON_MEMORY_ID}';
          DELETE FROM repo_memory_bindings WHERE repo_id = '{POISON_REPO_ID}';
-         DELETE FROM repo_memories WHERE repo_id = '{POISON_REPO_ID}';"
+         DELETE FROM repo_memories WHERE repo_id = '{POISON_REPO_ID}';
+         -- Registry rows (A7): child-first (repo_meta/repo_roots FK repos ON DELETE CASCADE), so a
+         -- re-seed on a git fixture starts from a clean slate. No-op when the sibling was never
+         -- registered (a placeholder-only fixture).
+         DELETE FROM repo_meta WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM repo_roots WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM repos WHERE repo_id = '{POISON_REPO_ID}';"
     ))?;
     Ok(())
 }
@@ -710,10 +774,10 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
 /// predicate pins every seeded column, so an in-place UPDATE stops matching) in one. The transitive
 /// children are matched through the poison file / logical symbol, exactly how a scoped reader would
 /// have to reach them.
-fn sibling_tripwires() -> Vec<(&'static str, String)> {
+fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, String)>> {
     let file_scope =
         format!("file_id IN (SELECT id FROM main.files WHERE repo_id = '{POISON_REPO_ID}')");
-    vec![
+    let mut tripwires = vec![
         ("git_commits", format!("repo_id = '{POISON_REPO_ID}' AND hash = '{POISON_COMMIT}'")),
         // Pinned to the distinct-path row's path so the same-path `git_file_changes` tripwire
         // (a second row under `POISON_REPO_ID`) doesn't inflate this count.
@@ -869,7 +933,22 @@ fn sibling_tripwires() -> Vec<(&'static str, String)> {
             "edge_oracle",
             format!("repo_id = '{POISON_REPO_ID}' AND scip_symbol = '{POISON_SAMEPATH_SCIP}'"),
         ),
-    ]
+    ];
+    // Registry tripwires (A7): present ONLY when the sibling is a REAL registered repo (a git
+    // fixture — see `primary_is_real`, which gates the matching seed). Each pins the sibling's own
+    // registry row, so an unscoped `repos` / `repo_roots` / `repo_meta` read/count/delete trips.
+    if primary_is_real(conn)? {
+        tripwires.push(("repos", format!("repo_id = '{POISON_REPO_ID}'")));
+        tripwires.push((
+            "repo_roots",
+            format!("repo_id = '{POISON_REPO_ID}' AND root = '{POISON_REPO_ROOT}'"),
+        ));
+        tripwires.push((
+            "repo_meta",
+            format!("repo_id = '{POISON_REPO_ID}' AND key = '{POISON_META_KEY}'"),
+        ));
+    }
+    Ok(tripwires)
 }
 
 /// Post-condition for a MUTATING test: assert the poison sibling survived intact — every seeded
@@ -880,7 +959,7 @@ fn sibling_tripwires() -> Vec<(&'static str, String)> {
 /// the sibling through the view. Call it on the fixture's connection at the end of the mutating
 /// step.
 pub(crate) fn assert_sibling_intact(conn: &Connection) {
-    for (table, predicate) in sibling_tripwires() {
+    for (table, predicate) in sibling_tripwires(conn).expect("read the sibling tripwire set") {
         let count: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"), [], |row| {
                 row.get(0)
@@ -1030,11 +1109,12 @@ mod tests {
         assert_eq!(sibling_files, 0, "opt-out must seed no poison rows");
     }
 
-    /// The sibling never touches the `repos` registry: even with the harness ON, the DB has exactly
-    /// one real repo (the fixture's), so `sole_repo_id` / `multiple_real_repos` are unperturbed and
-    /// the many non-git placeholder fixtures keep resolving to their own scope.
+    /// A7: on a git fixture (a REAL registered repo), the sibling now becomes a SECOND real repo —
+    /// `repos` + `repo_roots` + `repo_meta` rows — so the DB is a genuine multi-repo shape and an
+    /// unscoped registry read/count/delete trips a tripwire. The fixture resolves by identity /
+    /// recorded root (never `sole_repo_id`), so the second real repo does not hijack it.
     #[test]
-    fn the_sibling_does_not_perturb_the_repos_registry() {
+    fn the_sibling_is_a_real_repo_on_a_git_fixture() {
         let (_root, config) = poison_test_config("poison_registry");
         let db = IndexDatabase::rebuild(&config).unwrap();
         let conn = db.storage.connection();
@@ -1043,17 +1123,16 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(poison_registered, 0, "the sibling must NOT be registered in `repos`");
-        let real_repos: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM repos WHERE repo_id != ?1",
-                [crate::index::schema::LEGACY_REPO_ID],
-                |row| row.get(0),
-            )
-            .unwrap();
         assert_eq!(
-            real_repos, 1,
-            "only the fixture is a real repo — the sibling is scoped rows only"
+            poison_registered, 1,
+            "the sibling is registered as a real repo on a git fixture"
         );
+        assert!(
+            crate::index::schema::multiple_real_repos(conn).unwrap(),
+            "the fixture + the sibling make the DB genuinely multi-repo",
+        );
+        // The sibling's registry rows are counted by the intact check (the registry tripwires are
+        // appended because `primary_is_real`).
+        assert_sibling_intact(conn);
     }
 }

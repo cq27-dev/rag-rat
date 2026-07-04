@@ -8,10 +8,34 @@ pub(crate) fn read_meta(conn: &rusqlite::Connection, key: &str) -> anyhow::Resul
         .optional()?)
 }
 
+/// Whole-table row count — DELIBERATELY UNSCOPED, so on a consolidated multi-repo DB it reports
+/// the union across every repo. TEST-ONLY, structurally: the A7 sweep converted every production
+/// reporting caller to [`scoped_table_row_count`] (direct `repo_id` tables) or
+/// [`scoped_chunk_row_count`] (the files-transitive `chunks`), and the `#[cfg(test)]` gate keeps
+/// a future reporting path from reaching for the lying union count — single-repo test fixtures
+/// asserting whole-fixture totals are the only legitimate use.
+#[cfg(test)]
 pub(crate) fn table_row_count(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<u64> {
     // `table` is always an internal string literal, never user input.
     let count = conn
         .query_row(&format!("SELECT COUNT(*) FROM main.{table}"), [], |row| row.get::<_, i64>(0))?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// The repo's TOTAL chunk count across ALL its contexts and generations. `chunks` carries no
+/// `repo_id` of its own (it scopes transitively through `files`), so this joins `main.files`
+/// directly — NOT the scoped temp view, which filters to the active commit/worktree/generation
+/// and is narrower than a whole-repo report (gc prunes across all of a repo's contexts).
+pub(crate) fn scoped_chunk_row_count(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+) -> anyhow::Result<u64> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM main.chunks c JOIN main.files f ON f.id = c.file_id
+         WHERE f.repo_id = ?1",
+        [repo_id],
+        |row| row.get::<_, i64>(0),
+    )?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 

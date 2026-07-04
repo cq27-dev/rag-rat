@@ -268,6 +268,7 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "pub fn open_database() {}\n").unwrap();
         let config = Config {
             repo_id_override: None,
+            database_key_pinned: true,
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {

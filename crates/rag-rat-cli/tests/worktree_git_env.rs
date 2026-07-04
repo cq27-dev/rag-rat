@@ -95,3 +95,78 @@ fn worktree_overlay_ignores_inherited_git_dir_env() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+/// The DISCOVERY side of the governing seam (Codex batch 9): a linked worktree with no
+/// branch-local `rag-rat.toml` — exactly the state `init`'s linked-worktree refusal leaves — must
+/// find the MAIN worktree's config through default discovery instead of dying at the existence
+/// check. And in a truly config-less repo, the missing-config hint names the path where the
+/// config BELONGS: main's `rag-rat.toml`, not the linked checkout's.
+#[test]
+fn default_config_discovery_reaches_the_main_worktree_from_a_linked_checkout() {
+    let base = std::env::temp_dir().join(format!(
+        "rag-rat-wtdisc-{}-{}",
+        std::process::id(),
+        TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&base);
+    let main = base.join("main");
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), "pub fn discovery_anchor() {}\n").unwrap();
+    git(&main, &["init", "-q"]);
+    git(&main, &["config", "user.email", "t@e.com"]);
+    git(&main, &["config", "user.name", "t"]);
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-q", "-m", "seed"]);
+    let linked = base.join("wt");
+    git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+
+    // Truly config-less: the hint from the LINKED checkout names MAIN's path (where init runs).
+    let run = |dir: &Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rag-rat"))
+            .current_dir(dir)
+            .args(args)
+            .env("RAG_RAT_HOOK_DISABLE", "1")
+            .env("RAG_RAT_NO_WATCH", "1")
+            .env("RAG_RAT_DATA_DIR", base.join("data"))
+            .env("RAG_RAT_MODEL_CACHE", base.join("cache"))
+            .output()
+            .unwrap()
+    };
+    let out = run(&linked, &["gc"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let main_toml = main.canonicalize().unwrap().join("rag-rat.toml");
+    assert!(
+        stderr.contains(&main_toml.display().to_string()),
+        "the config-less hint names MAIN's config path from a linked checkout: {stderr}"
+    );
+
+    // The config exists in MAIN only (uncommitted — the linked checkout has NO rag-rat.toml,
+    // the post-refusal state). Every default-config command from the linked checkout works.
+    fs::write(
+        main.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+    assert!(!linked.join("rag-rat.toml").exists(), "the linked checkout has no branch config");
+    let out = run(&linked, &["index", "--full"]);
+    assert!(
+        out.status.success(),
+        "index from the linked checkout resolves main's config: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        main.join(".rag-rat/index.sqlite").exists(),
+        "the index landed at MAIN's configured database"
+    );
+    assert!(!linked.join(".rag-rat").exists(), "nothing resolved against the linked checkout");
+    let out = run(&linked, &["memory", "list"]);
+    assert!(
+        out.status.success(),
+        "a read command from the linked checkout works too: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}

@@ -70,12 +70,12 @@ fn main() -> anyhow::Result<()> {
     // These commands must work without a config file present — `init` creates one, and the
     // Claude Code hook entrypoint reads its event from stdin. Everything else needs a config.
     match &cli.command {
-        Cmd::Init(args) => return init::run(args, &cli.config),
+        Cmd::Init(args) => return init::run(args, cli.config.as_deref().unwrap_or("rag-rat.toml")),
         Cmd::ClaudeHook => return claude_hook::run(),
         _ => {},
     }
 
-    let config = load_config_or_hint(&cli.config)?;
+    let config = load_config_or_hint(cli.config.as_deref())?;
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
 
     // Debug logging (off unless `[log] enabled` or `RAG_RAT_LOG`). Writes are blocking (synchronous
@@ -150,6 +150,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "eval")]
         Cmd::BenchmarkEmbedding(args) => benchmark_embedding(&config, &args)?,
         Cmd::Oracle(args) => oracle(&config, &args)?,
+        Cmd::Consolidate => consolidate(&config)?,
         Cmd::DumpConfig => dump_config(&config)?,
         Cmd::VersionCheck => version_check(&config)?,
     }
@@ -347,11 +348,22 @@ fn now_epoch_ms() -> i64 {
 /// Load the config, mapping a missing file to a friendly hint instead of a raw IO error.
 /// `init`/`--help`/`--version` never reach here, so this only guards commands that genuinely
 /// need a configured repo.
-pub(crate) fn load_config_or_hint(path: &str) -> anyhow::Result<Config> {
-    if !Path::new(path).exists() {
+///
+/// `explicit` is the user's `--config` value, taken literally; `None` resolves through
+/// [`rag_rat_core::config::discover_config_path`] — the discovery side of the governing seam, so
+/// a linked worktree with no branch-local `rag-rat.toml` (the state `init`'s refusal leaves)
+/// finds the MAIN worktree's config instead of dying at the existence check, and the hint in a
+/// truly config-less repo names the path where the config BELONGS (main's, in a linked checkout).
+pub(crate) fn load_config_or_hint(explicit: Option<&str>) -> anyhow::Result<Config> {
+    let path = match explicit {
+        Some(path) => std::path::PathBuf::from(path),
+        None => rag_rat_core::config::discover_config_path(Path::new(".")),
+    };
+    if !path.exists() {
         anyhow::bail!(
-            "No rag-rat config found at `{path}`.\nRun `rag-rat init` to create one, or pass \
-             --config <path>."
+            "No rag-rat config found at `{}`.\nRun `rag-rat init` to create one, or pass --config \
+             <path>.",
+            path.display()
         );
     }
     Ok(Config::load(path)?)
@@ -428,7 +440,7 @@ mod tests {
         let missing =
             std::env::temp_dir().join(format!("rag-rat-no-config-{}-{n}.toml", std::process::id()));
         let _ = std::fs::remove_file(&missing);
-        let err = load_config_or_hint(missing.to_str().unwrap()).unwrap_err();
+        let err = load_config_or_hint(Some(missing.to_str().unwrap())).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("rag-rat init"), "expected init hint, got: {message}");
     }

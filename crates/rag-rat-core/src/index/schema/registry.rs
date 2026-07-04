@@ -94,6 +94,11 @@ const SHALLOW_BOUNDARY_META_KEY: &str = "shallow_boundary";
 /// refusal, never a silent re-point under a live writer.
 const UPGRADE_OUTGOING_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long [`register_repo`] waits for the DB-global registry lock (A7) before refusing — a
+/// registration is a millisecond-scale write, so a timeout means a wedged sibling process, and an
+/// explicit retryable refusal beats queueing forever.
+const REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Register `identity` in this database's `repos`/`repo_roots` registry, returning the stored
 /// `repo_id`.
 ///
@@ -104,17 +109,23 @@ const UPGRADE_OUTGOING_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::
 ///   `root` is recorded in `repo_roots`.
 /// - **Already this repo** → a no-op except that a not-yet-seen `root` is appended to `repo_roots`
 ///   (worktrees of one repo share a `repo_id`, so several roots on one machine are expected).
-/// - **A `local:` incumbent + an incoming `Portable` id** → *upgrade in place*: the DB was first
-///   indexed under a machine-local shallow-clone id, and the caller has since deepened it (`git
-///   fetch --unshallow`, our own remedy) or pinned a stable id, so the incoming identity is now
-///   portable. Every scoped row, `repo_meta`, `repo_roots`, and logical-symbol id is re-pointed
-///   from the local id to the portable one (the same adoption machinery), rather than stranding the
-///   existing index behind a refusal.
-/// - **Any other different real repo_id already owns the DB** → refuses (returns an error) rather
-///   than corrupting a single-repo DB: two genuinely-different portable repos, or a `LocalOnly`
-///   incoming against a real incumbent (a deepened clone must never DOWNGRADE a portable id back to
-///   machine-local). Multi-repo registration is deliberately out of scope until the default-path
-///   flip (phase A7); until then one DB == one repo.
+/// - **A `local:` incumbent + an incoming `Portable` id that proves the upgrade** → *upgrade in
+///   place*: the DB was first indexed under a machine-local shallow-clone id, and the caller has
+///   since deepened it (`git fetch --unshallow`, our own remedy) or pinned a stable id, so the
+///   incoming identity is now portable. Every scoped row, `repo_meta`, `repo_roots`, and
+///   logical-symbol id is re-pointed from the local id to the portable one (the same adoption
+///   machinery), rather than stranding the existing index behind a refusal. On a consolidated DB
+///   the incumbent is found by boundary reachability among ALL registered repos, so only the
+///   matching repo moves.
+/// - **A genuinely new repo joining the DB** → *fresh registration*: a new `repos` row and a
+///   `repo_roots` entry, nothing re-pointed. A7 makes several repos sharing one global database the
+///   default (replacing phase A's single-repo "refuse a second real repo" invariant).
+/// - **A new id whose working-tree `root` is already recorded under a DIFFERENT real repo** →
+///   refuses: a physical path belongs to exactly one repo, so an unregistered id at an
+///   already-owned root is a checkout whose identity changed without proving an upgrade (a
+///   re-shallowed clone downgrading a portable id, a deepened clone with no recorded boundary, or a
+///   rewritten root commit). Refusing avoids forking the repo across two ids; the remedy is to
+///   unshallow or pin `[index] repo_id`.
 ///
 /// `now_ms` is the injected clock (see the repo's time-injection convention), stamped as the
 /// registration time on adoption / first insert.
@@ -140,6 +151,43 @@ pub fn register_repo(
     }
 
     let root_str = root.to_string_lossy();
+
+    // REGISTRY LOCK (A7): serialize the WHOLE read-decide-write sequence across processes.
+    // Registration reads the registered-repo set, decides (idempotent / upgrade / refuse / fresh),
+    // then writes — two repos' concurrent FIRST registrations on the shared global DB would
+    // otherwise interleave between the read and the write (`SQLITE_BUSY_SNAPSHOT` on the deferred
+    // write upgrade, or a `repos`-PK constraint on the same-id race), and neither failure is
+    // retried on the CLI paths. Per-repo write locks cannot serialize this — the racing writers
+    // hold DIFFERENT repo ids by construction — so this is a DB-global lock like the schema lock,
+    // following the same ordering rule (per-repo entry locks → global lock; the per-repo locks the
+    // UPGRADE path takes while holding this are BOUNDED, so no cross-type cycle can hang — see
+    // `locks::registry_lock_path`). Bounded and reentrant; a timeout is a retryable refusal. A
+    // pathless (in-memory) connection skips it — no cross-process writer can exist for it.
+    let _registry_lock = match conn.path().filter(|p| !p.is_empty()) {
+        Some(db_path) => Some(
+            crate::locks::WriteLock::acquire_registry_timeout(
+                Path::new(db_path),
+                REGISTRY_LOCK_TIMEOUT,
+            )
+            .map_err(|err| {
+                registry_refusal(format!(
+                    "cannot register repo {}: failed acquiring the repo-registry lock: {err}",
+                    identity.repo_id
+                ))
+            })?
+            .ok_or_else(|| {
+                registry_refusal(format!(
+                    "cannot register repo {}: timed out waiting for a concurrent registration to \
+                     finish; re-run the command",
+                    identity.repo_id
+                ))
+            })?,
+        ),
+        None => None,
+    };
+    // Read the registered set INSIDE the registry lock, so the decision below cannot race a
+    // concurrent registration's write (a same-id racer that lost the lock re-reads a set already
+    // containing the id and collapses into the idempotent path).
     let real_ids = real_repo_ids(conn)?;
 
     // Already registered under this id → idempotent; just make sure the root is recorded (and, for
@@ -147,52 +195,69 @@ pub fn register_repo(
     // a later upgrade can prove against it — self-healing for an index first registered before
     // this gate).
     if real_ids.iter().any(|id| id == &identity.repo_id) {
+        // Even the idempotent path must not silently map one physical root onto TWO repos: a
+        // checkout whose identity changed to an ALREADY-REGISTERED id (an `[index] repo_id` pin
+        // switched to an existing repo, an in-place re-clone) would otherwise record its root
+        // under the second id and make `resolve_config_repo_id`'s recorded-root route
+        // non-deterministic (`LIMIT 1` over two owners). ONE exception before refusing: the
+        // LATE-upgrade merge — the owner is a `local:` incumbent whose (root ∧ boundary) proof
+        // holds for the incoming portable id, i.e. this is the SECOND shallow clone of an
+        // upstream deepening after a sibling clone already claimed the portable id. Refusing that
+        // shape would strand it permanently (the pin remedy re-enters this same guard); merging
+        // retires the local id into the registered one.
+        if let Some(owner) = real_root_owner(conn, &root_str, &identity.repo_id)? {
+            if late_upgrade_is_proven(conn, &owner, identity, root)? {
+                merge_local_incumbent_into_registered(conn, identity, &owner, &root_str, now_ms)?;
+                persist_shallow_boundary(conn, identity)?;
+                return Ok(identity.repo_id.clone());
+            }
+            return Err(registry_refusal(mismatched_root_owner_error(
+                &owner,
+                &identity.repo_id,
+                &root_str,
+            )));
+        }
         record_repo_root(conn, &identity.repo_id, &root_str, now_ms)?;
         persist_shallow_boundary(conn, identity)?;
         return Ok(identity.repo_id.clone());
     }
 
-    // A different real repo already owns this DB. The single-repo invariant refuses a second repo —
-    // with ONE exception: a shallow-clone UPGRADE. The DB was first indexed under a machine-local
-    // `local:` id (a cut shallow clone), and the caller has since deepened it (`git fetch
-    // --unshallow`, our own remedy) or pinned a stable id, so the incoming identity is now
-    // `Portable`. Re-point the DB from the local id onto the portable one in place (below) instead
-    // of stranding the existing index behind a refusal. Every OTHER mismatch still refuses:
-    // Portable↔different-Portable (two genuinely different repos), and a `LocalOnly` incoming
-    // against any existing real repo (a deepened clone must never DOWNGRADE a portable id back to
-    // machine-local). Guarded on exactly one real repo — a consolidated DB (post-A7) is never
-    // upgraded through this path.
-    let upgrade_from = match real_ids.as_slice() {
-        [] => None,
-        [incumbent]
-            if incumbent.starts_with(LOCAL_ONLY_ID_PREFIX)
-                && identity.class == RepoIdentityClass::Portable =>
-        {
-            // The `local:` prefix + Portable incoming is NECESSARY but not SUFFICIENT: a DB first
-            // indexed from a cut shallow clone, later opened from an UNRELATED full repo at the
-            // same database path (or with a mistaken pin), would otherwise silently
-            // re-point every scoped row, repo_meta, root, and logical id onto that
-            // unrelated id — data loss across two repos. Require PROOF the incoming
-            // clone is a DEEPENED version of THIS incumbent: the incumbent's recorded
-            // shallow-boundary commits must be reachable from the incoming clone's HEAD
-            // (a `git fetch --unshallow` keeps those commits in history; a different
-            // repo reaches none of them). No recorded boundary (a pre-gate registration) counts as
-            // NO PROOF. Verified BEFORE the adoption transaction so a refusal touches nothing.
-            let boundary = read_shallow_boundary(conn, incumbent)?;
-            let proven = !boundary.is_empty()
-                && crate::repo_identity::boundary_reachable_from_head(root, &boundary)
-                    .unwrap_or(false);
-            if !proven {
-                return Err(registry_refusal(unproven_upgrade_error(incumbent, &identity.repo_id)));
-            }
-            Some(incumbent.clone())
-        },
-        _ =>
-            return Err(registry_refusal(format!(
-                "cannot register repo {}: this index is already registered to a different repo {}",
-                identity.repo_id, real_ids[0]
-            ))),
-    };
+    // The incoming id is NOT yet registered. Three outcomes, decided BEFORE any lock or transaction
+    // so a refusal touches nothing:
+    //
+    //  (1) UPGRADE — the incoming id is Portable and some already-registered `local:` incumbent's
+    //      recorded shallow boundary is reachable from the incoming clone's HEAD: the caller
+    // deepened      that machine-local shallow clone (`git fetch --unshallow`, our own remedy)
+    // or opened a      full clone of the same repo, so re-point the incumbent onto the portable
+    // id IN PLACE      (below). Searching ALL registered ids — not a lone incumbent — is what
+    // makes this correct      on a CONSOLIDATED multi-repo DB (A7): only the matching repo's
+    // boundary is reachable, and      the re-point touches only that repo's rows, so every
+    // other registered repo is left alone.
+    //
+    //  (2) FRESH REGISTRATION — a genuinely NEW repo joining the DB. A7 makes several repos sharing
+    //      one global database the default, so a new id at an unclaimed working tree simply gets
+    // its      own `repos` row (no re-point). This is the behavior that replaces phase A's
+    // single-repo      "refuse a second real repo" invariant.
+    //
+    //  (3) REFUSAL — the incoming id is new AND its working-tree `root` is already recorded under a
+    //      DIFFERENT real repo (see [`real_root_owner`]). A physical path belongs to exactly one
+    //      repo, so this is a checkout whose identity changed WITHOUT proving an upgrade: a
+    //      re-shallowed clone (a `LocalOnly` incoming must never DOWNGRADE the portable id its root
+    //      already owns), a deepened clone whose shallow boundary was never recorded (unprovable
+    //      upgrade), or a rewritten root commit. Refuse rather than fork the repo across two ids;
+    //      the remedy is to unshallow or pin `[index] repo_id`. This generalizes the phase-A
+    //      single-repo "different real repo" / "unproven upgrade" / "no downgrade" refusals to the
+    //      multi-repo DB, keyed on the ROOT rather than a lone incumbent.
+    let upgrade_from = find_upgradeable_local_incumbent(conn, &real_ids, identity, root)?;
+    if upgrade_from.is_none()
+        && let Some(owner) = real_root_owner(conn, &root_str, &identity.repo_id)?
+    {
+        return Err(registry_refusal(mismatched_root_owner_error(
+            &owner,
+            &identity.repo_id,
+            &root_str,
+        )));
+    }
 
     // UPGRADE HOLDS BOTH REPO LOCKS (A6, batch-4/5 P2). Writers key their per-repo advisory flock
     // by the DERIVED repo id, and the derivation flips `local:` → portable the moment the clone
@@ -211,34 +276,8 @@ pub fn register_repo(
     // machine must still serialize on repo_id, which path-keying would break. A pathless
     // (in-memory) connection skips the locks — no cross-process writer can exist for it.
     let _upgrade_locks = match (&upgrade_from, conn.path().filter(|p| !p.is_empty())) {
-        (Some(local_id), Some(db_path)) => {
-            let db_path = Path::new(db_path);
-            let (first, second) =
-                crate::locks::canonical_lock_order(local_id.as_str(), &identity.repo_id);
-            let mut guards = Vec::with_capacity(2);
-            for repo in [first, second] {
-                guards.push(
-                    crate::locks::WriteLock::acquire_timeout(
-                        db_path,
-                        repo,
-                        UPGRADE_OUTGOING_LOCK_TIMEOUT,
-                    )
-                    .map_err(|err| {
-                        registry_refusal(format!(
-                            "cannot upgrade {local_id}: failed acquiring the write lock for \
-                             {repo}: {err}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        registry_refusal(format!(
-                            "cannot upgrade {local_id}: timed out waiting for an in-flight writer \
-                             holding the write lock for {repo}"
-                        ))
-                    })?,
-                );
-            }
-            Some(guards)
-        },
+        (Some(local_id), Some(db_path)) =>
+            Some(acquire_dual_repo_locks(Path::new(db_path), local_id, &identity.repo_id)?),
         _ => None,
     };
 
@@ -254,22 +293,40 @@ pub fn register_repo(
     // would break on. `unchecked_transaction` is the right tool on a shared `&Connection`
     // (rusqlite): it needs no `&mut`, commits on `.commit()`, and rolls back on drop. The fresh
     // path (no placeholder, no upgrade) runs in the same transaction for uniformity.
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE, not deferred (A7): the transaction is decided-then-written, and a deferred BEGIN
+    // that upgrades to a write mid-transaction can fail `SQLITE_BUSY_SNAPSHOT` (not retried by
+    // `busy_timeout`) if any other writer committed since the first read. `BEGIN IMMEDIATE` takes
+    // the write lock up front under the normal busy-timeout wait. The registry flock above already
+    // serializes registrations against each other; IMMEDIATE covers contention with NON-registry
+    // writers (an index pass on a sibling repo).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let placeholder_present = tx
         .query_row("SELECT 1 FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID], |_| Ok(()))
         .optional()?
         .is_some();
+    // `ON CONFLICT DO NOTHING` is defense in depth for the lockless (pathless/in-memory)
+    // connections the registry flock cannot serialize: a same-id racer that somehow landed first
+    // collapses this into a no-op instead of a PK constraint failure, and the row content it wrote
+    // is what an idempotent re-registration would have kept anyway.
     tx.execute(
-        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?2, ?3)",
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?2, ?3)
+         ON CONFLICT(repo_id) DO NOTHING",
         params![identity.repo_id, identity.display_name, now_ms],
     )?;
     // The id whose rows this registration re-points ONTO the new id: the machine-local incumbent on
     // a shallow-clone upgrade, else the `__unassigned__` placeholder on a fresh adoption. Both
     // cases re-point the same scoped tables + realign the same logical ids and then drop the
     // old `repos` row; only the upgrade path actually has `repo_roots` rows to move (the
-    // placeholder never does, so that UPDATE is a harmless no-op there).
-    let repoint_from =
-        upgrade_from.as_deref().or_else(|| placeholder_present.then_some(LEGACY_REPO_ID));
+    // placeholder never does, so that UPDATE is a harmless no-op there). The placeholder is adopted
+    // ONLY on a genuinely fresh legacy DB (no real repo yet): on a CONSOLIDATED DB that already
+    // holds real repos (A7), a new repo registers FRESH and must NOT claim any vestigial
+    // placeholder rows as its own — so `repoint_from` is `None` there and the block below is
+    // skipped entirely.
+    let repoint_from = match upgrade_from.as_deref() {
+        Some(local_id) => Some(local_id),
+        None if real_ids.is_empty() && placeholder_present => Some(LEGACY_REPO_ID),
+        None => None,
+    };
     if let Some(source_id) = repoint_from {
         // Move every source-id `repo_meta` row onto the new id EXCEPT the shallow-boundary record:
         // it describes the OLD `local:` clone's cut history and is meaningless under the portable
@@ -300,10 +357,15 @@ pub fn register_repo(
             if !adoption_table_present(&tx, table)? {
                 continue;
             }
-            tx.execute(&format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"), params![
-                identity.repo_id,
-                source_id
-            ])?;
+            // `main.`-qualified: adoption can run on a connection that already carries the
+            // temp `files` scope view (the incremental pass's bare open installs it BEFORE
+            // adopting), and an unqualified `UPDATE files` would hit that view — "cannot
+            // modify files because it is a view". The qualifier pins every re-point to the
+            // real table regardless of what temp views the connection carries.
+            tx.execute(
+                &format!("UPDATE main.{table} SET repo_id = ?1 WHERE repo_id = ?2"),
+                params![identity.repo_id, source_id],
+            )?;
         }
         // A5 periphery tables (clones/oracle/reconcile/memories). Their `repo_id` column lands in
         // V042; several of these tables predate it, so a partial-schema bootstrap fixture that
@@ -314,8 +376,9 @@ pub fn register_repo(
         // rows off the `local:` incumbent too, exactly like the core/github loop above.
         for table in A5_PERIPHERY_DIRECT_SCOPED_TABLES {
             if super::column_exists(&tx, table, "repo_id")? {
+                // `main.`-qualified for the same view-shadowing reason as the core loop above.
                 tx.execute(
-                    &format!("UPDATE {table} SET repo_id = ?1 WHERE repo_id = ?2"),
+                    &format!("UPDATE main.{table} SET repo_id = ?1 WHERE repo_id = ?2"),
                     params![identity.repo_id, source_id],
                 )?;
             }
@@ -370,6 +433,190 @@ pub fn register_repo(
     Ok(identity.repo_id.clone())
 }
 
+/// Acquire BOTH repo ids' per-repo write locks in the CANONICAL LEXICOGRAPHIC ORDER
+/// (`locks::canonical_lock_order`), each reentrant-instant when this thread already holds it and
+/// BOUNDED otherwise — the A6 rule that keeps identity-transition flows deadlock-free (in-order
+/// unbounded edges cannot cycle under a total order; bounded out-of-order edges self-break).
+/// Shared by the in-place LocalOnly→Portable upgrade and the LATE-upgrade merge, both of which
+/// re-point/move rows across an OUTGOING `local:` id and an incoming/target id and must serialize
+/// with writers holding EITHER lock (a pre-unshallow writer holds the `local:` one, a
+/// post-unshallow writer the portable one).
+fn acquire_dual_repo_locks(
+    db_path: &Path,
+    outgoing_id: &str,
+    target_id: &str,
+) -> rusqlite::Result<Vec<crate::locks::WriteLock>> {
+    let (first, second) = crate::locks::canonical_lock_order(outgoing_id, target_id);
+    let mut guards = Vec::with_capacity(2);
+    for repo in [first, second] {
+        guards.push(
+            crate::locks::WriteLock::acquire_timeout(db_path, repo, UPGRADE_OUTGOING_LOCK_TIMEOUT)
+                .map_err(|err| {
+                    registry_refusal(format!(
+                        "cannot upgrade {outgoing_id}: failed acquiring the write lock for \
+                         {repo}: {err}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    registry_refusal(format!(
+                        "cannot upgrade {outgoing_id}: timed out waiting for an in-flight writer \
+                         holding the write lock for {repo}"
+                    ))
+                })?,
+        );
+    }
+    Ok(guards)
+}
+
+/// The direct-scoped tables whose rows the LATE-upgrade merge DELETES under the retiring `local:`
+/// id (its DERIVED data): the A5 periphery list MINUS the three memory tables, which are AUTHORED
+/// and are MOVED onto the target id instead. Children fall via `ON DELETE CASCADE`
+/// (`clone_edges`/`clone_subblock_postings` off `clone_graph_generations`,
+/// `logical_symbol_members` off `logical_symbols` — deleted via [`DIRECT_SCOPED_ADOPTION_TABLES`]).
+const LATE_MERGE_DERIVED_PERIPHERY_TABLES: &[&str] = &[
+    "clone_graph_generations",
+    "clone_token_df",
+    "clone_refinements",
+    "oracle_runs",
+    "edge_oracle",
+    "logical_symbol_monikers",
+    "reconcile_attempts",
+    "dream_findings",
+];
+
+/// Whether the conflicting `owner` of the incoming root is a `local:` incumbent that PROVES a
+/// LATE upgrade onto the already-registered `identity`: the incoming id is Portable, the owner is
+/// machine-local, and the owner's recorded shallow boundary is reachable from the incoming root's
+/// HEAD — i.e. this checkout IS that shallow clone, deepened AFTER a sibling clone already
+/// upgraded their shared upstream id. Without this, the second clone is PERMANENTLY stranded: the
+/// idempotent branch's root-owner guard refuses, and pinning the portable id re-enters the same
+/// refusal.
+fn late_upgrade_is_proven(
+    conn: &Connection,
+    owner: &str,
+    identity: &RepoIdentity,
+    root: &Path,
+) -> rusqlite::Result<bool> {
+    if !owner.starts_with(LOCAL_ONLY_ID_PREFIX) || identity.class != RepoIdentityClass::Portable {
+        return Ok(false);
+    }
+    let boundary = read_shallow_boundary(conn, owner)?;
+    Ok(!boundary.is_empty()
+        && crate::repo_identity::boundary_reachable_from_head(root, &boundary).unwrap_or(false))
+}
+
+/// LATE-upgrade merge: retire the `local:` incumbent `owner` INTO the already-registered
+/// `target_id` (the second shallow clone of an upstream whose portable id a sibling clone already
+/// claimed). Unlike the in-place upgrade, the target has LIVE data — same upstream, so the same
+/// paths/commits — and a wholesale re-point would collide on the widened UNIQUE keys and the
+/// generation axis. So the merge takes the consolidate-shaped split:
+///
+///  * AUTHORED data MOVES: `repo_memories` (+ bindings / FTS mirror) re-point to `target_id` — the
+///    memory `id` is the bare PK, so a re-point can never collide. The bindings' LOCAL rowid
+///    columns and the call-paths' logical-symbol endpoints are NULLed (they reference the retiring
+///    id's derived rows, deleted below); the validate loop re-resolves them from the portable
+///    anchor after the next index pass — exactly the consolidate posture. Tags/call-paths follow
+///    via `memory_id`.
+///  * DERIVED data is DROPPED, not migrated: files (cascading chunks/symbols/edges), git history,
+///    github papertrail, clones, oracle, reconcile, dream rows under `owner` are deleted — a fresh
+///    index of this root re-derives them under `target_id`, and the carried `embedding_cache`
+///    (content-addressed, global) makes re-embedding a no-op. Leaving them "for gc" was rejected:
+///    gc sweeps are per-ACTIVE-repo, so rows under a retired id would be permanent invisible
+///    garbage.
+///  * The root and registration retire atomically: `repo_roots` moves to `target_id`, the `owner`
+///    repos row is deleted (cascading its `repo_meta`, including the now-meaningless shallow
+///    boundary). The target's own model-state meta is left as-is — same machine, same upstream.
+///
+/// Crash-convergent: everything runs in ONE IMMEDIATE transaction under the registry lock and BOTH
+/// ids' per-repo locks (canonical order, bounded — the caller-held entry lock for either id is
+/// reentrant-instant). A crash rolls the whole merge back to the pre-merge state, which re-proves
+/// and re-runs on the next open.
+///
+/// REGISTRY-STALL TRADEOFF (deliberate — do not split this transaction in an optimization pass
+/// without re-weighing it): the cascade-DELETE of the retiring repo's ENTIRE derived dataset runs
+/// inside the registry lock, so a very large late-merging repo stalls every OTHER repo's
+/// registering open for the DELETE's duration — worst case a bounded, RETRYABLE refusal after
+/// `REGISTRY_LOCK_TIMEOUT` (30s), never a hang, and read paths never take the registry lock.
+/// Accepted because a late merge happens at most once per shallow clone's lifetime and the
+/// alternative forfeits more: draining the derived rows in a PRIOR committed transaction (under
+/// the two per-repo locks only) would keep the registry lock hold at milliseconds, but gives up
+/// the single-transaction atomicity claim — a crash between the drain and the merge leaves
+/// derived-row-less-but-still-registered `local:` state that the next open's re-prove must
+/// tolerate (it does converge: the proof re-holds and the merge re-runs over the already-drained
+/// rows). That is the sketched escape hatch if the stall ever bites in practice.
+///
+/// TABLE COVERAGE: [`DIRECT_SCOPED_ADOPTION_TABLES`] + [`LATE_MERGE_DERIVED_PERIPHERY_TABLES`]
+/// were audited complete against every `repo_id`-carrying table at V044; V045 widened the github
+/// CHILD tables' keys but introduced no new `repo_id` table (they were already in the direct
+/// list via V041), so the disposition is unchanged. A future migration adding a NEW
+/// `repo_id`-scoped table must add it to one of these lists (or the authored-move set above).
+fn merge_local_incumbent_into_registered(
+    conn: &Connection,
+    identity: &RepoIdentity,
+    owner: &str,
+    root_str: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let _merge_locks = match conn.path().filter(|p| !p.is_empty()) {
+        Some(db_path) =>
+            Some(acquire_dual_repo_locks(Path::new(db_path), owner, &identity.repo_id)?),
+        None => None,
+    };
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // AUTHORED data moves. Call-path logical endpoints first (they key off the memories that are
+    // about to change repo_id), then bindings (repo_id + rowid NULLing in one pass), then the
+    // memories and the FTS mirror.
+    tx.execute(
+        "UPDATE repo_memory_call_paths SET start_logical_symbol_id = NULL, end_logical_symbol_id \
+         = NULL
+         WHERE memory_id IN (SELECT id FROM repo_memories WHERE repo_id = ?1)",
+        [owner],
+    )?;
+    tx.execute(
+        "UPDATE main.repo_memory_bindings SET repo_id = ?1, logical_symbol_id = NULL, symbol_id = \
+         NULL, chunk_id = NULL, edge_id = NULL WHERE repo_id = ?2",
+        params![identity.repo_id, owner],
+    )?;
+    tx.execute("UPDATE main.repo_memories SET repo_id = ?1 WHERE repo_id = ?2", params![
+        identity.repo_id,
+        owner
+    ])?;
+    if adoption_table_present(&tx, "repo_memory_fts")? {
+        tx.execute("UPDATE main.repo_memory_fts SET repo_id = ?1 WHERE repo_id = ?2", params![
+            identity.repo_id,
+            owner
+        ])?;
+    }
+    // DERIVED data drops (cascades take the transitive children).
+    for table in DIRECT_SCOPED_ADOPTION_TABLES {
+        if adoption_table_present(&tx, table)? {
+            tx.execute(&format!("DELETE FROM main.{table} WHERE repo_id = ?1"), [owner])?;
+        }
+    }
+    for table in LATE_MERGE_DERIVED_PERIPHERY_TABLES {
+        if super::column_exists(&tx, table, "repo_id")? {
+            tx.execute(&format!("DELETE FROM main.{table} WHERE repo_id = ?1"), [owner])?;
+        }
+    }
+    // Registration retires: roots move BEFORE the repos delete (its FK cascades), then the owner
+    // row falls, taking its repo_meta (shallow boundary included) with it.
+    tx.execute("UPDATE repo_roots SET repo_id = ?1 WHERE repo_id = ?2", params![
+        identity.repo_id,
+        owner
+    ])?;
+    tx.execute("DELETE FROM repos WHERE repo_id = ?1", [owner])?;
+    record_repo_root(&tx, &identity.repo_id, root_str, now_ms)?;
+    tx.commit()?;
+    tracing::warn!(
+        old_repo_id = %owner,
+        new_repo_id = %identity.repo_id,
+        "late shallow-clone upgrade: this checkout's machine-local id was retired into the \
+         already-registered portable id (a sibling clone upgraded it first). Its memories moved \
+         over; its derived index rows were dropped and will re-derive on the next index pass."
+    );
+    Ok(())
+}
+
 /// Whether `table` exists in the schema (a plain or FTS5-virtual table both register in
 /// `sqlite_master` as `type = 'table'`) — the adoption loop's guard so a partial isolation
 /// fixture's absent direct-scoped table is skipped rather than tripping a `no such table` failure.
@@ -422,17 +669,100 @@ fn read_shallow_boundary(conn: &Connection, repo_id: &str) -> rusqlite::Result<V
         .unwrap_or_default())
 }
 
-/// The refusal message for a LocalOnly→Portable upgrade that could not be PROVEN: the incoming
-/// portable clone does not reach the machine-local incumbent's recorded shallow boundary (or none
-/// was recorded), so re-pointing the index onto it risks migrating one repo's data onto an
-/// unrelated id. Names the pin escape hatch to force it when the two genuinely ARE the same repo.
-fn unproven_upgrade_error(incumbent: &str, incoming: &str) -> String {
+/// The already-registered `local:` incumbent, if any, that the INCOMING identity upgrades in place:
+/// a Portable incoming from the SAME recorded working tree whose HEAD reaches that incumbent's
+/// recorded shallow boundary — proof the incoming clone is a DEEPENED version of the machine-local
+/// one (`git fetch --unshallow` keeps the boundary commits in history; an unrelated repo reaches
+/// none of them).
+///
+/// BOTH conditions are load-bearing (root ∧ boundary): with two shallow clones of the SAME upstream
+/// registered under distinct `local:` ids — an ordinary shape on the shared global DB — a deepened
+/// checkout's HEAD reaches BOTH boundaries, so a boundary-only scan would re-point whichever
+/// incumbent SORTS first, hijacking the sibling clone's index and stranding the actually-deepened
+/// one behind the root-owner refusal. Deepening happens in place (`git fetch --unshallow` mutates
+/// the working tree that registered shallow), so the deepened clone's root IS the incumbent's
+/// recorded root — require that match first, then the boundary proof on top (a root match alone
+/// could be a re-cloned unrelated repo at a reused path).
+///
+/// `None` for a LocalOnly incoming (an upgrade only runs Portable-ward — a deepened clone must
+/// never downgrade), for a root-matching incumbent with no recorded boundary (a pre-gate
+/// registration ⇒ no proof — falls through to the root-owner refusal, which names the pin remedy),
+/// or when no root-matching `local:` incumbent exists (a genuinely new clone registers fresh).
+/// Runs inside the registry lock, before any transaction, so a non-match touches nothing.
+fn find_upgradeable_local_incumbent(
+    conn: &Connection,
+    real_ids: &[String],
+    identity: &RepoIdentity,
+    root: &Path,
+) -> rusqlite::Result<Option<String>> {
+    if identity.class != RepoIdentityClass::Portable {
+        return Ok(None);
+    }
+    let root_str = root.to_string_lossy();
+    for id in real_ids {
+        if !id.starts_with(LOCAL_ONLY_ID_PREFIX) {
+            continue;
+        }
+        if !repo_has_recorded_root(conn, id, &root_str)? {
+            continue;
+        }
+        let boundary = read_shallow_boundary(conn, id)?;
+        if !boundary.is_empty()
+            && crate::repo_identity::boundary_reachable_from_head(root, &boundary).unwrap_or(false)
+        {
+            return Ok(Some(id.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `repo_id` has `root` recorded in `repo_roots` — the upgrade scan's working-tree match
+/// (both sides store the identical `to_string_lossy` rendering of a `Config::load`-canonicalized
+/// root, so equality is exact).
+fn repo_has_recorded_root(conn: &Connection, repo_id: &str, root: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM repo_roots WHERE repo_id = ?1 AND root = ?2)",
+        params![repo_id, root],
+        |row| row.get(0),
+    )
+}
+
+/// The real repo id — other than `exclude_id` and the placeholder — that already records `root` in
+/// `repo_roots`, or `None` when no OTHER real repo claims this working-tree path. A physical path
+/// belongs to exactly one repo, so a recorded owner that differs from the incoming id signals an
+/// identity change that must not silently fork the repo — [`register_repo`] refuses it on BOTH the
+/// fresh path (unless the incoming proved an upgrade) and the idempotent path (an identity change
+/// ONTO an already-registered id). `exclude_id` is the incoming id itself, so the idempotent
+/// re-registration of a root under its own repo never self-trips (on the fresh path the incoming id
+/// is unregistered and cannot own roots, so the exclusion is a no-op there).
+fn real_root_owner(
+    conn: &Connection,
+    root: &str,
+    exclude_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT repo_id FROM repo_roots WHERE root = ?1 AND repo_id != ?2 AND repo_id != ?3 LIMIT \
+         1",
+        params![root, LEGACY_REPO_ID, exclude_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+/// The refusal message for an unregistered incoming id whose working-tree `root` is already
+/// recorded under a DIFFERENT real repo, without proving a shallow-clone upgrade. Covers all three
+/// phase-A refusals now keyed on the root: a re-shallowed clone downgrading a portable id, a
+/// deepened clone whose shallow boundary was never recorded (unprovable upgrade), and a rewritten
+/// root commit. Names both remedies (unshallow / pin) to force it when the two genuinely ARE the
+/// same repo.
+fn mismatched_root_owner_error(owner: &str, incoming: &str, root: &str) -> String {
     format!(
-        "cannot upgrade the machine-local repo id {incumbent} to {incoming}: could not prove the \
-         incoming repository is a deepened clone of this index (its history does not reach the \
-         recorded shallow boundary, or no boundary was recorded). Refusing rather than re-point \
-         this index onto a possibly-different repo. If they ARE the same repository, pin `[index] \
-         repo_id = \"{incoming}\"` in rag-rat.toml to force it."
+        "cannot register repo {incoming} for {root}: that working tree is already registered to a \
+         different repo {owner}, and the incoming identity did not prove a shallow-clone upgrade \
+         (its history does not reach the recorded shallow boundary, or a machine-local id would \
+         downgrade a portable one). Refusing rather than fork the repo across two ids. If they \
+         ARE the same repository, unshallow the clone (`git fetch --unshallow`) or pin `[index] \
+         repo_id = \"{incoming}\"` in rag-rat.toml."
     )
 }
 
@@ -500,6 +830,15 @@ pub(crate) fn periphery_repo_scope_clause(scope: &Option<String>, qualifier: &st
         Some(repo_id) => format!(" AND {qualifier}.repo_id = '{}'", repo_id.replace('\'', "''")),
         None => String::new(),
     }
+}
+
+/// The repo id INSTALLED in the per-connection scope context, or `None` when no context row exists
+/// — the public probe for "is this connection scoped?". Unlike [`active_repo_id`] it NEVER falls
+/// back to [`sole_repo_id`], so a caller can distinguish a genuinely scoped connection from the
+/// config-less sole-repo pick (the manifest heal's witness needs exactly that distinction: on a
+/// multi-repo DB the sole pick is an arbitrary first-sorting repo, not an honest attribution).
+pub(crate) fn scope_context_repo_id(conn: &Connection) -> Option<String> {
+    context_repo_id(conn)
 }
 
 /// Read the active repo id from the per-connection scope context, tolerating the common absence of
@@ -575,11 +914,10 @@ pub(crate) fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
 }
 
 /// Whether this DB holds MORE THAN ONE real (adopted) repo — the interim guard for global-scope
-/// destructive sweeps over tables that do not yet carry `repo_id` (`oracle_runs`,
-/// `clone_graph_generations`; both gain the column in V042). When true, a per-repo caller must SKIP
-/// the global cleanup rather than wipe a sibling repo's rows. Today `register_repo` keeps this at
-/// one real repo until the A7 default-path flip, so the guard is dormant but present for the V042
-/// seam.
+/// destructive sweeps over tables that did not yet carry `repo_id` (superseded by V042's real
+/// predicates) — and, since A7 made multi-repo the default, the bare-open fail-fast: a config-less
+/// `IndexDatabase::open` refuses a DB where this is true rather than silently scoping to the
+/// lexicographically-first repo, and `resolve_config_repo_id` declines its sole-repo fallback.
 pub(crate) fn multiple_real_repos(conn: &Connection) -> rusqlite::Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM repos WHERE repo_id != ?1",
@@ -622,9 +960,20 @@ pub(crate) fn resolve_config_repo_id(
     repo_id_override: Option<&str>,
 ) -> rusqlite::Result<Option<String>> {
     match crate::repo_identity::resolve_repo_identity(root, repo_id_override) {
-        // Route 1: a derivable id that is registered scopes correctly even in a consolidated DB.
-        Ok(identity) if repo_id_is_registered(conn, &identity.repo_id)? =>
-            Ok(Some(identity.repo_id)),
+        // Route 1: a derivable id that is registered scopes correctly even in a consolidated DB —
+        // UNLESS this root is recorded under a DIFFERENT real repo. That is the read-only MIRROR
+        // of `register_repo`'s root-owner refusal: after an `[index] repo_id` pin is switched to a
+        // SIBLING's id, the write path refuses, but without this check the read-only fast path
+        // (MCP reads, hooks) would silently serve the sibling's scope. Returning `None` declines
+        // the fast path, so the caller falls back to the read-write open where the refusal
+        // surfaces with its remedy.
+        Ok(identity) if repo_id_is_registered(conn, &identity.repo_id)? => {
+            let root_str = root.to_string_lossy();
+            if real_root_owner(conn, &root_str, &identity.repo_id)?.is_some() {
+                return Ok(None);
+            }
+            Ok(Some(identity.repo_id))
+        },
         // A RESOLVED but UNREGISTERED identity — a new/changed `[index] repo_id` pin, or a shallow
         // clone that now derives a portable id — must NOT silently bind the OLD scope. Return None
         // so the read-only open declines to the read-write open, which registers/upgrades

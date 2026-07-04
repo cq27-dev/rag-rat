@@ -2,6 +2,19 @@ use super::super::*;
 use crate::embedding_models::{EMBEDDING_MODELS, HASH_MODEL_ID};
 
 pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
+    // SCOPED-REPO WITNESS (A7): the heal's repo-scoped mutations (`remove_legacy_models` clears
+    // the ACTIVE repo's `repo_meta` active-model keys) must only ever land on a repo this
+    // connection can honestly attribute them to. On a CONFIG-LESS connection to a MULTI-REPO DB
+    // there is none — `active_repo_id` would resolve the arbitrary first-sorting repo, and a
+    // heal-owed pass would delete THAT sibling's model meta under whatever lock (if any) the
+    // caller holds. This is a CALLEE-level invariant precisely because the caller set kept
+    // growing: the incremental pre-adoption open (batch 2) and consolidate's pre-registration
+    // `migrate` (batch 3) both reached here config-less. SKIP + DEFER: every production query
+    // path opens through a config-bearing open that re-runs this heal after adopt + set_context,
+    // so a skipped heal is only ever postponed, never lost.
+    if scoped_repo_witness(conn)?.is_none() {
+        return Ok(());
+    }
     // Read-first: skip the (write-locking) DML entirely when the manifest already matches what we
     // would write. `ensure_model_manifest` runs on EVERY `IndexDatabase::open*`, so issuing
     // unconditional INSERT/UPDATE/DELETE here made every open — including read-only MCP tools —
@@ -21,6 +34,30 @@ pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
     }
     normalize_embedding_model_versions(conn)?;
     Ok(())
+}
+
+/// The repo an open-time heal may attribute its repo-scoped `repo_meta` mutations to: the
+/// INSTALLED scope context when present (authoritative — even the deliberate empty "match
+/// nothing" scope, whose repo_meta reads/deletes then match no rows), else the sole repo of a
+/// single-repo DB (unambiguous), else `None` on a config-less connection to a multi-repo DB — the
+/// caller-independent skip condition. Shared by [`ensure_model_manifest`] and the fastembed cache
+/// recovery (`recover_cached_fastembed_model_at`), the two open-time healers that read/write the
+/// active-model `repo_meta` keys.
+///
+/// LIMIT: the sole-repo arm is only valid when the operation's SUBJECT is a registered repo (a
+/// normal open of an existing index). A caller whose subject may be UNREGISTERED — consolidate
+/// importing a repo into a one-repo global DB, or any future importer — must not reach the
+/// healers through a config-less connection at all: the sole registered repo is then a SIBLING of
+/// the subject, and "single repo ⇒ unambiguous" silently attributes the heal to it. Those callers
+/// use the schema-only migration path (`IndexDatabase::migrate_schema_only`) instead.
+pub(super) fn scoped_repo_witness(conn: &Connection) -> anyhow::Result<Option<String>> {
+    if let Some(repo_id) = crate::index::schema::scope_context_repo_id(conn) {
+        return Ok(Some(repo_id));
+    }
+    if crate::index::schema::multiple_real_repos(conn)? {
+        return Ok(None);
+    }
+    Ok(Some(crate::index::schema::sole_repo_id(conn)?))
 }
 
 /// Read-only test of whether `ensure_model_manifest` would be a no-op — i.e. the manifest is

@@ -25,8 +25,16 @@ pub struct Config {
     pub search: SearchConfig,
     /// Optional `[index] repo_id` override for the consolidated global store — pins the repo's
     /// identity instead of deriving it from the root-commit hash. `None` = derive. Consumed by
-    /// `crate::repo_identity::resolve_repo_identity`; it does NOT influence the database path.
+    /// `crate::repo_identity::resolve_repo_identity`. An EXPLICIT `database` path never depends on
+    /// it; a KEYLESS config's default does only through the identity-existence gate (a pin makes a
+    /// non-git root identity-bearing, so it resolves to the global store instead of per-root).
     pub repo_id_override: Option<String>,
+    /// Whether the GOVERNING config sets an explicit `[index] database` key. "Governing" is
+    /// main-worktree-anchored (see `main_database_key`): in a linked worktree the MAIN checkout's
+    /// config decides, exactly as it does for `repo_id` — a branch-local config can neither pin
+    /// nor un-pin the repo's database. `rag-rat consolidate` keys its pinned-config refusal off
+    /// this, so the refusal and `database` resolution can never disagree.
+    pub database_key_pinned: bool,
 }
 
 /// Search-ranking knobs (`[search]`). Default OFF so the shipped fuse is byte-identical to today;
@@ -666,68 +674,170 @@ impl Config {
         }
     }
 
+    /// Load a config, resolving WHICH `rag-rat.toml` GOVERNS at one seam: in a linked git
+    /// worktree, the MAIN worktree's config file is authoritative for the WHOLE config — identity,
+    /// database location, targets, models, everything. A branch-local `rag-rat.toml` (an older
+    /// branch, a divergent checkout) cannot fork any of it; when its content differs from main's
+    /// it is ignored with a one-line warning naming the ignored file. This subsumes the historical
+    /// per-key anchoring (root #218/#219, targets #219, `repo_id` #413, `database` A7) — the
+    /// question "which config governs this repo" is answered once, so new keys are main-anchored
+    /// by default and cannot re-open the split-brain class.
+    ///
+    /// DECLARED WORKTREE-LOCAL ALLOW-LIST (the only keys that legitimately vary per worktree):
+    ///  * `target_bindings` / `[[target]]` — FOR THE OVERLAY INDEX ONLY, read by
+    ///    [`Config::for_linked_worktree_overlay`] from the linked checkout's own file, because a
+    ///    branch may add/remove source dirs and its overlay must index its own file set (#219). The
+    ///    BASE config's targets remain main-anchored here.
+    ///
+    /// Everything else, present and future, resolves from the governing (main) config.
+    ///
+    /// EDGE POSTURES:
+    ///  * Main worktree resolvable but CONFIG-LESS → the local config governs, with a warning (the
+    ///    repo's config belongs in main; until it exists there, the branch copy is all we have —
+    ///    best-effort, mirroring the old per-key fallbacks).
+    ///  * Main config exists but FAILS to parse/read → the error PROPAGATES: loading from any
+    ///    worktree must behave like loading from main, errors included (silently falling back to
+    ///    the branch config would fork the repo exactly when main is briefly broken).
+    ///  * No resolvable main (bare-repo hubs, pruned main, custom GIT_DIR, non-git roots) →
+    ///    `main_worktree_root` is `None`, the local config governs unchanged — there is no
+    ///    designated main to defer to.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let text = fs::read_to_string(path)?;
-        let raw: RawConfig = toml::from_str(&text)?;
-        // Reject the renamed `[local_ai]` table loudly (#317) — a silently-ignored old table would
-        // drop the user's embedding settings on upgrade. See `RawConfig::local_ai`.
-        if raw.local_ai.is_some() {
-            return Err(ConfigError::LocalAiTableRenamed);
-        }
-        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let root = config_dir.join(raw.index.root.unwrap_or_else(|| ".".to_string()));
-        // The root of the checkout the config was actually READ from (a linked worktree has its own
-        // checked-out `rag-rat.toml`). Targets are validated against THIS, not the anchored main
-        // root below: a linked branch can add a target dir that exists only in that branch, and the
-        // launch must not fail with `MissingDirectory` against the main checkout (#219 review).
-        let local_root = normalize_existing_dir(&root)?;
-        // Anchor `root` to the MAIN worktree root, so EVERY invocation resolves to the same root
-        // and thus the same base commit for the one shared index — whether launched from
-        // the main checkout, a linked worktree, or any cwd (`root="."` resolves against the
-        // launch dir, and a linked worktree has its OWN checked-out config). Per-worktree
-        // results come from the `worktree` QUERY scope, never a per-worktree config root:
-        // otherwise two processes rooted at different worktrees (different base commits)
-        // write CONFLICTING overlay rows to the shared DB — a file present on one branch
-        // races between readable and tombstone (#218/#219). The main worktree (and non-git
-        // dirs) resolve to themselves, so single-worktree users see no change.
-        let root = anchor_root_to_main_worktree(&local_root);
-        // One database per repo, shared across worktrees: a relative path resolves against the MAIN
-        // worktree TOP — NOT `root`, which may be a subdirectory — so every worktree of a repo AND
-        // any `root="<subdir>"` config land on the SAME index. An absolute path is honored as-is.
-        let database = match raw.index.database {
+        // Parse the LOCAL file but DO NOT fail yet: when a main config governs, the branch-local
+        // file's contents are irrelevant by design — a parse/validation failure there must fold
+        // into the divergence warning, never block every command from the linked checkout (Codex
+        // batch 8, finding 2). Wherever the local config GOVERNS, the error is fatal as always.
+        // The `[local_ai]` rejection (#317) is part of local validity — see `RawConfig::local_ai`.
+        let local_parse: Result<RawConfig, ConfigError> =
+            toml::from_str::<RawConfig>(&text).map_err(ConfigError::from).and_then(|raw| {
+                if raw.local_ai.is_some() { Err(ConfigError::LocalAiTableRenamed) } else { Ok(raw) }
+            });
+        let local_config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        // The topology subject must be a discoverable directory: a RELATIVE config path like
+        // `rag-rat.toml` has the EMPTY path as its parent (`Path::parent` yields `Some("")`, not
+        // `None`), which git discovery cannot open — it means the process cwd.
+        let local_checkout =
+            if local_config_dir.as_os_str().is_empty() { Path::new(".") } else { local_config_dir };
+
+        // THE GOVERNING SEAM (see the doc comment). Linked-ness comes from git TOPOLOGY — the
+        // checkout holding the config file vs the repo's designated main worktree
+        // ([`linked_worktree_main_root`]) — and governance is UNCONDITIONAL on that predicate.
+        // It must never hang off a root-anchoring proxy: a branch-only `[index] root` makes
+        // `anchor_root_to_main_worktree` return the local root unchanged, and an equality trigger
+        // would then let the branch config govern database/identity/models — the exact
+        // split-brain the seam exists to prevent (Codex batch 8, finding 3). Anchoring outcomes
+        // affect ROOT resolution only, never who governs.
+        let (mut raw, config_dir, root, target_validation_root) =
+            match linked_worktree_main_root(local_checkout) {
+                Some(main_top) => match governing_main_config(&main_top)? {
+                    Some((main_raw, main_config_dir)) => {
+                        let divergent = match &local_parse {
+                            Ok(local_raw) => *local_raw != main_raw,
+                            Err(_) => true,
+                        };
+                        if divergent {
+                            let ignored =
+                                path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                            let invalid_note =
+                                if local_parse.is_err() { " (also invalid)" } else { "" };
+                            eprintln!(
+                                "rag-rat: ignoring branch config{invalid_note} {} — in a linked \
+                                 worktree the main worktree's config governs ({}); edit that file \
+                                 instead",
+                                ignored.display(),
+                                main_config_dir.join("rag-rat.toml").display(),
+                            );
+                        }
+                        // Re-derive root from MAIN's own config, exactly as loading it directly
+                        // would (its root is already the main worktree — anchoring is identity).
+                        let main_root =
+                            normalize_existing_dir(&main_config_dir.join(
+                                main_raw.index.root.clone().unwrap_or_else(|| ".".to_string()),
+                            ))?;
+                        (main_raw, main_config_dir, main_root.clone(), main_root)
+                    },
+                    None => {
+                        // Config-less main: the LOCAL config governs (best-effort, loudly), so
+                        // its validity is fatal exactly as in a non-linked checkout.
+                        let local_raw = local_parse?;
+                        eprintln!(
+                            "rag-rat: the main worktree has no rag-rat.toml; using {} until one \
+                             exists there (the repo's config belongs in the main worktree)",
+                            path.display(),
+                        );
+                        // Root stays anchored so the shared index still keys off the main
+                        // checkout; targets validate against the local checkout where they
+                        // exist (#219).
+                        let local_root = normalize_existing_dir(&local_config_dir.join(
+                            local_raw.index.root.clone().unwrap_or_else(|| ".".to_string()),
+                        ))?;
+                        let anchored_root = anchor_root_to_main_worktree(&local_root);
+                        (local_raw, local_config_dir.to_path_buf(), anchored_root, local_root)
+                    },
+                },
+                None => {
+                    // The config's own checkout is the main worktree (or there is no designated
+                    // main): the local config governs and its validity is fatal. Root anchoring
+                    // still applies for the exotic `[index] root` pointing into a linked
+                    // checkout (#218/#219) — an anchoring concern, not a governance one.
+                    let local_raw = local_parse?;
+                    let local_root = normalize_existing_dir(
+                        &local_config_dir
+                            .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
+                    )?;
+                    let anchored_root = anchor_root_to_main_worktree(&local_root);
+                    (local_raw, local_config_dir.to_path_buf(), anchored_root, local_root)
+                },
+            };
+
+        // The database path (A7 default flip): an explicit `database` key is honored as-is — the
+        // deprecated per-repo deployment, that repo stays un-consolidated and never syncs. ABSENT,
+        // the default is the CONSOLIDATED GLOBAL store, EXCEPT a pre-existing legacy
+        // `.rag-rat/index.sqlite` is kept (with a deprecation nudge toward `rag-rat consolidate`).
+        // Relative explicit paths (and the legacy path) resolve against the MAIN worktree TOP —
+        // NOT `root`, which may be a subdirectory — so every worktree of a repo AND any
+        // `root="<subdir>"` config land on the SAME index.
+        let db_base = main_worktree_root(&root).unwrap_or_else(|| root.clone());
+        let repo_id_override =
+            raw.index.repo_id.take().map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
+        let governing_database_key = raw.index.database.take();
+        let database_key_pinned = governing_database_key.is_some();
+        let database = match governing_database_key {
             Some(db) if Path::new(&db).is_absolute() => PathBuf::from(db),
-            other => {
-                let relative = other.unwrap_or_else(|| ".rag-rat/index.sqlite".to_string());
-                main_worktree_root(&root).unwrap_or_else(|| root.clone()).join(relative)
-            },
+            Some(db) => db_base.join(db),
+            // The keyless default probes the repo IDENTITY (root + the governing `[index]
+            // repo_id` pin): only an identity-BEARING root may land in the shared global store —
+            // see `default_database_with_disposition`.
+            None => resolve_default_database(&db_base, &root, repo_id_override.as_deref()),
         };
-        // Validate directories against the local checkout (`local_root`), where the config — and
-        // any branch-only target dir — actually lives; the stored `Config.root` stays
-        // anchored to main so every worktree shares one base index.
-        // `ResolvedTarget.directories` are root-relative, so the stored targets are
-        // identical either way (#219 review).
-        let local_targets = resolve_targets(&local_root, raw.target_bindings, raw.target)?;
-        // The stored `Config.targets` are the BASE targets — they drive discovery over the anchored
-        // `root` (= main). When this config was read from a LINKED worktree, its branch
-        // `rag-rat.toml` may NARROW or DROP a target that still exists on main; using the
-        // branch targets for base discovery would classify the now-undiscovered main files
-        // as deleted and tombstone them in the BASE scope, hiding committed files from main
-        // queries. So when anchoring to a different (main) root, re-resolve the base
-        // targets from MAIN's own `rag-rat.toml`. The branch's targets are NOT lost: the
-        // overlay refresh reloads each linked worktree's own config
-        // (`refresh_worktree_overlays`) and indexes the branch with its own target set (#219
-        // review).
-        let targets = main_base_targets(&root, &local_root).unwrap_or(local_targets);
+        // The identity gate's SECOND entrance (Codex batch 8, finding 5): an explicit pin AT the
+        // consolidated global store bypasses the keyless identity gate above, and an
+        // identity-less root (non-git, unborn HEAD) opening the shared store would fall through
+        // to adoption's sole-repo fallback — scoping this project onto whichever SIBLING repo
+        // sorts first. Refuse at resolution with the remedy. (The structural backstop for every
+        // other shared-path pin shape lives in `adopt_repo_from_config`: an identity-less open
+        // never sole-picks on a multi-repo database.)
+        if database_key_pinned
+            && Some(database.as_path()) == crate::data_dir::global_database_path().as_deref()
+            && !crate::repo_identity::identity_is_resolvable(&root, repo_id_override.as_deref())
+        {
+            return Err(ConfigError::GlobalPinWithoutIdentity);
+        }
+        // Targets resolve from the GOVERNING config; validation runs against the checkout that
+        // config describes (main when main governs; the local checkout on the config-less-main
+        // fallback, tolerating branch-only dirs — #219). `ResolvedTarget.directories` are
+        // root-relative, so the stored targets are checkout-independent either way. A linked
+        // branch's own target set is NOT lost: the overlay refresh reads the branch config via
+        // `for_linked_worktree_overlay` and indexes the branch with it (#219).
+        let targets = resolve_targets(&target_validation_root, raw.target_bindings, raw.target)?;
         let mut llm = LlmConfig::try_from(raw.llm)?;
-        // Resolve a RELATIVE cookbook recipe PATH against the config dir, not the process CWD (R6):
-        // the recipe is handed to `node`/`npx`, which resolve it against wherever reconcile/the
-        // watcher runs — ENOENT from a subdir or a daemon. npm-package specs (`@scope/pkg`) are
-        // left untouched. Done here (not in the config TryFrom) because only `load` knows
-        // the config dir.
+        // Resolve a RELATIVE cookbook recipe PATH against the GOVERNING config dir, not the
+        // process CWD (R6): the recipe is handed to `node`/`npx`, which resolve it against
+        // wherever reconcile/the watcher runs — ENOENT from a subdir or a daemon.
         if let Some(remote) = llm.embedding.remote.as_mut()
             && let Some(cookbook) = remote.cookbook.as_ref()
-            && let Some(resolved) = resolve_relative_cookbook_path(cookbook, config_dir)
+            && let Some(resolved) = resolve_relative_cookbook_path(cookbook, &config_dir)
         {
             remote.cookbook = Some(resolved);
         }
@@ -737,7 +847,7 @@ impl Config {
         let search = raw.search.into();
         let mut log = LogConfig::try_from(raw.log)?;
         // Finalize `dir`: empty (unset) → sibling of the db (`<db_parent>/logs`); a set value is
-        // resolved relative to the config dir (absolute honored). Mirrors the cookbook-path rule.
+        // resolved relative to the GOVERNING config dir (absolute honored).
         log.dir = if log.dir.as_os_str().is_empty() {
             database.parent().map(|p| p.join("logs")).unwrap_or_else(|| PathBuf::from("logs"))
         } else if log.dir.is_absolute() {
@@ -746,15 +856,6 @@ impl Config {
             config_dir.join(&log.dir)
         };
 
-        // The branch-local override (trim + drop empty), then ANCHORED to the MAIN worktree's
-        // config. Repo IDENTITY is per-repo, not per-branch: every worktree of a repo must resolve
-        // the SAME override regardless of which checkout launched — consistent with the
-        // root/database/targets anchoring above. A linked branch whose `rag-rat.toml` omits or pins
-        // a DIFFERENT `[index] repo_id` would otherwise split identity by launch point. Parse-only:
-        // the override never affects the database path resolved above.
-        let local_repo_id_override =
-            raw.index.repo_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
-        let repo_id_override = main_repo_id_override(&root, &local_root, local_repo_id_override);
         Ok(Self {
             root,
             database,
@@ -766,8 +867,30 @@ impl Config {
             search,
             log,
             repo_id_override,
+            database_key_pinned,
         })
     }
+}
+
+/// The MAIN worktree's parsed config, when one exists — the governing side of `Config::load`'s
+/// seam. `main_top` is the already-derived main worktree top ([`linked_worktree_main_root`]).
+/// `Ok(None)` = main has NO `rag-rat.toml` (the local-governs fallback); a main config that
+/// exists but cannot be read or parsed PROPAGATES its error (loading from a linked worktree must
+/// behave like loading from main, errors included). Returns the main worktree TOP as the
+/// governing config dir.
+fn governing_main_config(main_top: &Path) -> Result<Option<(RawConfig, PathBuf)>, ConfigError> {
+    let main_top = main_top.to_path_buf();
+    let main_config_path = main_top.join("rag-rat.toml");
+    let text = match fs::read_to_string(&main_config_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let raw: RawConfig = toml::from_str(&text)?;
+    if raw.local_ai.is_some() {
+        return Err(ConfigError::LocalAiTableRenamed);
+    }
+    Ok(Some((raw, main_top)))
 }
 
 fn resolve_targets(
@@ -866,83 +989,50 @@ fn anchor_root_to_main_worktree(root: &Path) -> PathBuf {
     if anchored.is_dir() { anchored } else { root.to_path_buf() }
 }
 
-/// The BASE targets for a config that was read from a LINKED worktree: the MAIN checkout's
-/// `rag-rat.toml` targets, resolved against the anchored (main) `root`. `None` — so the caller
-/// keeps the local (branch) targets — when this config is NOT anchored away from its own checkout
-/// (`root == local_root`: the main checkout or a non-git dir), when main has no readable
-/// `rag-rat.toml`, or when main's targets don't validate against `root` (e.g. a main target dir
-/// that only the subdir layout reaches). Reading main's config keeps base DISCOVERY faithful to
-/// main, so a branch that narrows/drops a target can't tombstone main's committed files in the base
-/// scope (#219 review). The branch's own targets still drive its overlay via
-/// `refresh_worktree_overlays`.
-fn main_base_targets(root: &Path, local_root: &Path) -> Option<Vec<ResolvedTarget>> {
-    if root == local_root {
-        return None; // not anchored away — the local config IS the base config
-    }
-    let main_config_path = main_worktree_root(root)?.join("rag-rat.toml");
-    let text = fs::read_to_string(&main_config_path).ok()?;
-    let raw: RawConfig = toml::from_str(&text).ok()?;
-    // Main's targets are root-relative; validate (and store) them against the anchored `root`,
-    // which is the equivalent path under the main worktree the base index is discovered from.
-    resolve_targets(root, raw.target_bindings, raw.target).ok()
-}
-
-/// The `[index] repo_id` override anchored to the MAIN worktree's `rag-rat.toml`, mirroring
-/// [`main_base_targets`]: repo identity is per-repo, so every worktree must resolve the same override
-/// no matter which checkout launched. `local_override` (already trimmed + non-empty-or-`None`) is
-/// returned unchanged when this config is NOT anchored away from its own checkout (`root ==
-/// local_root`: the main checkout or a non-git dir), or when main's `rag-rat.toml` is unreadable /
-/// unparsable (best-effort fallback, exactly as `main_base_targets` does for targets).
-///
-/// When anchored to main, MAIN's value is authoritative — INCLUDING when main OMITS the override
-/// (→ `None`, derive from the root commit): honoring the branch's pin there would make identity
-/// launch-point-dependent, the exact split this guards. A branch that pins a DIFFERENT non-empty id
-/// than main is warned (identity is per-repo; main wins), matching how the base-target anchoring
-/// silently prefers main. This re-reads main's config rather than sharing `main_base_targets`'
-/// read, because the two have different fallback semantics (targets fall back on VALIDATION
-/// failure; the override has nothing to validate) — a second read of one small TOML at load time.
-fn main_repo_id_override(
-    root: &Path,
-    local_root: &Path,
-    local_override: Option<String>,
-) -> Option<String> {
-    if root == local_root {
-        return local_override; // not anchored away — the local config IS the base config
-    }
-    // Anchored to a different (main) root. Read MAIN's config; its `[index] repo_id` is the
-    // per-repo identity. If main's config can't be located/read/parsed, fall back to the local
-    // override (best effort, as `main_base_targets` does).
-    let Some(main_config_path) = main_worktree_root(root).map(|main| main.join("rag-rat.toml"))
-    else {
-        return local_override;
-    };
-    let Ok(text) = fs::read_to_string(&main_config_path) else {
-        return local_override;
-    };
-    let Ok(raw) = toml::from_str::<RawConfig>(&text) else {
-        return local_override;
-    };
-    let main_override =
-        raw.index.repo_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
-    // A linked branch pinning a different non-empty id than main is a divergence: identity is
-    // per-repo, so main's value wins. Warn (eprintln, this file's only user-facing channel) so the
-    // mismatch is visible rather than silently dropped.
-    if let Some(local) = local_override.as_deref()
-        && local != main_override.as_deref().unwrap_or_default()
-    {
-        eprintln!(
-            "rag-rat: [index] repo_id in the linked worktree config ({local}) differs from the \
-             main worktree config ({}); using the main worktree's value so every worktree of this \
-             repo shares one identity",
-            main_override.as_deref().unwrap_or("<derived from root commit>")
-        );
-    }
-    main_override
-}
-
 /// The main worktree root, derived from the git common dir (`<main>/.git`). Returns `None` outside
 /// a standard git repo (bare repo, custom `GIT_DIR`, git unavailable) so resolution falls back to
 /// `root` — never guess.
+/// The DEFAULT config path for the checkout containing `dir` — the DISCOVERY side of the
+/// governing seam. [`Config::load`]'s seam decides which config WINS once a file is loaded; this
+/// decides where the CLI LOOKS when no explicit `--config` was given. Without it, a linked
+/// worktree with no branch-local `rag-rat.toml` (the state `init`'s refusal deliberately leaves)
+/// dies at the existence check before the seam ever runs (Codex batch 9). Resolution:
+///  * a local `rag-rat.toml` exists → use it. In a linked worktree the seam then governs from main
+///    AND emits the divergence warning — routing discovery straight to main when a branch file
+///    exists would silently skip that warning, so the file's presence keeps the load going through
+///    the seam (governance is identical either way).
+///  * no local file, linked worktree → the MAIN worktree's `rag-rat.toml` (whether or not it exists
+///    yet — a missing-config hint should name the path where the config BELONGS).
+///  * no local file, main/non-git → the local path (the hint names it).
+///
+/// An EXPLICIT `--config` path never routes through this — a user override is taken literally.
+pub fn discover_config_path(dir: &Path) -> PathBuf {
+    let local = dir.join("rag-rat.toml");
+    if local.exists() {
+        return local;
+    }
+    match linked_worktree_main_root(dir) {
+        Some(main_top) => main_top.join("rag-rat.toml"),
+        None => local,
+    }
+}
+
+/// The MAIN worktree top for `root` when `root` sits in a LINKED git worktree — `None` when the
+/// checkout containing `root` IS the main worktree (or the layout has no designated main:
+/// bare-repo hubs, custom `GIT_DIR`, non-git dirs). This is THE linked-ness predicate — derived
+/// from git topology (the discovered checkout's WORKDIR vs the common dir's main), never from a
+/// path-equality proxy: comparing `root` itself to main falsely classifies a SUBDIRECTORY of the
+/// main worktree as linked, and root-anchoring success is defeated by a branch-only `[index]
+/// root` (Codex batch 8, findings 1+3). Both `Config::load`'s governing seam and the CLI's
+/// `init` refusal resolve linked-ness through this one helper.
+pub fn linked_worktree_main_root(root: &Path) -> Option<PathBuf> {
+    let repo = crate::index::discover_repo(root).ok()?;
+    let main = main_worktree_root(root)?;
+    let workdir = repo.workdir()?;
+    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    (main != workdir).then_some(main)
+}
+
 fn main_worktree_root(root: &Path) -> Option<PathBuf> {
     let repo = crate::index::discover_repo(root).ok()?;
     let common_dir = repo.common_dir().canonicalize().ok()?;
@@ -952,6 +1042,122 @@ fn main_worktree_root(root: &Path) -> Option<PathBuf> {
     }
     let main_root = common_dir.parent()?.to_path_buf();
     main_root.is_dir().then_some(main_root)
+}
+
+/// The database path a `rag-rat.toml` WITHOUT a `database` key resolves to (A7), pure — no logging,
+/// no filesystem writes. The default is the CONSOLIDATED GLOBAL store (`data_dir()/rag-rat.sqlite`)
+/// — one database per machine — with two exceptions that keep an upgrade safe:
+///  1. A pre-existing legacy `<main_worktree>/.rag-rat/index.sqlite` is honored, so a repo indexed
+///     before the flip never silently abandons its authored memories; once `rag-rat consolidate`
+///     imports and renames the file away, resolution falls through to the global path.
+///  2. When no data dir resolves at all (no `HOME`/XDG on this platform), fall back to the legacy
+///     per-repo path rather than failing — the pre-A7 behavior.
+///
+/// `db_base` is the directory a relative/legacy path anchors to (the main worktree top — see
+/// `Config::load`). Public so the init wizard can display where a keyless config will land without
+/// loading one.
+pub fn default_database_path(
+    db_base: &Path,
+    identity_root: &Path,
+    repo_id_override: Option<&str>,
+) -> PathBuf {
+    let (path, _) = default_database_with_disposition(db_base, identity_root, repo_id_override);
+    path
+}
+
+/// How a keyless config's default database resolved — the load path warns per variant.
+enum DefaultDatabaseDisposition {
+    /// The root has NO derivable repo identity (non-git dir, unborn `git init`, no pin): the
+    /// per-root legacy path, exactly the pre-flip posture.
+    IdentityLess,
+    /// The legacy per-repo file is in use (awaiting `rag-rat consolidate`).
+    Legacy,
+    /// The global store (or the no-data-dir legacy fallback path, which does not exist on disk).
+    Global,
+    /// The global store, with a STRAY legacy file present DESPITE the `.imported` marker — an old
+    /// binary, a backup restore, or a stray process re-created it after consolidation.
+    GlobalWithStrayLegacy,
+}
+
+/// [`default_database_path`] plus the [`DefaultDatabaseDisposition`] the resolution took.
+///
+/// IDENTITY GATE (first, before everything): the global default REQUIRES a resolvable repo
+/// identity (`repo_identity::identity_is_resolvable` — a pin, or a git repo with a born HEAD).
+/// An identity-less root stays on its per-root `.rag-rat/index.sqlite` exactly as pre-flip:
+/// in the shared global store every such root would pool under the ONE `__unassigned__`
+/// placeholder scope — two fresh non-git projects would see and overwrite each other — and an
+/// unborn repo would strand its placeholder rows the moment its first commit mints a real id.
+/// Per-root, the placeholder stays a single-repo-DB concept with its existing adoption flow
+/// (first commit → the placeholder adopts in the per-root DB → consolidate when ready).
+///
+/// The `.imported` marker is a STAY-GLOBAL LATCH: once `rag-rat consolidate` has renamed the legacy
+/// file away, a keyless repo resolves to the global store even if a legacy `index.sqlite`
+/// REAPPEARS beside the marker (an old binary, a restored backup, a stray process) — otherwise the
+/// stray would silently divert the repo off the store its memories were imported into.
+fn default_database_with_disposition(
+    db_base: &Path,
+    identity_root: &Path,
+    repo_id_override: Option<&str>,
+) -> (PathBuf, DefaultDatabaseDisposition) {
+    let legacy = db_base.join(".rag-rat/index.sqlite");
+    if !crate::repo_identity::identity_is_resolvable(identity_root, repo_id_override) {
+        return (legacy, DefaultDatabaseDisposition::IdentityLess);
+    }
+    let marker = db_base.join(".rag-rat/index.sqlite.imported");
+    let global = crate::data_dir::global_database_path();
+    if marker.exists()
+        && let Some(global) = global
+    {
+        let disposition = if legacy.exists() {
+            DefaultDatabaseDisposition::GlobalWithStrayLegacy
+        } else {
+            DefaultDatabaseDisposition::Global
+        };
+        return (global, disposition);
+    }
+    if legacy.exists() {
+        return (legacy, DefaultDatabaseDisposition::Legacy);
+    }
+    (global.unwrap_or(legacy), DefaultDatabaseDisposition::Global)
+}
+
+/// The load-time wrapper around [`default_database_path`]: same resolution, plus a one-line notice
+/// per disposition — the deprecation nudge toward `rag-rat consolidate` while the legacy file is
+/// what keeps the repo off the global store, and a stray-file warning when a legacy file reappears
+/// after consolidation (it is ignored, never silently adopted). An identity-less root is SILENT:
+/// it is the pre-flip posture, and `rag-rat consolidate` refuses identity-less repos, so a nudge
+/// would dead-end.
+fn resolve_default_database(
+    db_base: &Path,
+    identity_root: &Path,
+    repo_id_override: Option<&str>,
+) -> PathBuf {
+    let (path, disposition) =
+        default_database_with_disposition(db_base, identity_root, repo_id_override);
+    match disposition {
+        DefaultDatabaseDisposition::Legacy => tracing::warn!(
+            path = %path.display(),
+            "using the legacy per-repo index at `.rag-rat/index.sqlite`; the default database is now \
+             the consolidated global store. Run `rag-rat consolidate` to import this repo's memories \
+             and switch to it."
+        ),
+        DefaultDatabaseDisposition::GlobalWithStrayLegacy => tracing::warn!(
+            "a stray `.rag-rat/index.sqlite` exists beside the `.imported` consolidation marker; \
+             ignoring it and staying on the consolidated global store. Delete the stray file (its \
+             contents were NOT imported)."
+        ),
+        DefaultDatabaseDisposition::Global | DefaultDatabaseDisposition::IdentityLess => {},
+    }
+    path
+}
+
+/// The DEFAULT legacy per-repo path a KEYLESS config at `root` would consult
+/// (`<main_worktree_top>/.rag-rat/index.sqlite`) — what `rag-rat consolidate` compares a pinned
+/// `database` path against to pick the right remedy: a pin AT this path just needs the key
+/// removed, while a CUSTOM pin must also move its file here first (keyless resolution never looks
+/// anywhere else, so removing the key alone would strand the custom file unimported).
+pub fn default_legacy_database_path(root: &Path) -> PathBuf {
+    main_worktree_root(root).unwrap_or_else(|| root.to_path_buf()).join(".rag-rat/index.sqlite")
 }
 
 fn normalize_existing_dir(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -964,7 +1170,7 @@ fn normalize_existing_dir(path: &Path) -> Result<PathBuf, ConfigError> {
     Ok(canonical)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 struct RawConfig {
     #[serde(default)]
     index: RawIndex,
@@ -993,7 +1199,7 @@ struct RawConfig {
     target: Vec<RawTarget>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawWatch {
     enabled: Option<bool>,
     debounce_ms: Option<u64>,
@@ -1013,7 +1219,7 @@ impl From<RawWatch> for WatchConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawLog {
     enabled: Option<bool>,
     level: Option<String>,
@@ -1052,7 +1258,7 @@ impl TryFrom<RawLog> for LogConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawVersionCheck {
     enabled: Option<bool>,
 }
@@ -1063,7 +1269,7 @@ impl From<RawVersionCheck> for VersionCheckConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawOracle {
     auto_run: Option<bool>,
     auto_run_quiet_period_secs: Option<u64>,
@@ -1085,7 +1291,7 @@ impl From<RawOracle> for OracleConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawSearch {
     graded_git_rerank: Option<bool>,
 }
@@ -1100,7 +1306,7 @@ impl From<RawSearch> for SearchConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawIndex {
     root: Option<String>,
     database: Option<String>,
@@ -1111,7 +1317,7 @@ struct RawIndex {
     repo_id: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawLlm {
     #[serde(default)]
     embedding: RawEmbedding,
@@ -1125,7 +1331,7 @@ impl TryFrom<RawLlm> for LlmConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawEmbedding {
     /// `model = "<model_id>" | "none"` — the embedding model selector, the registry model_id (the
     /// HF path, e.g. `sentence-transformers/all-MiniLM-L6-v2`; no aliases, #317).
@@ -1166,7 +1372,7 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawRemoteEmbedding {
     model: Option<String>,
     backend: Option<String>,
@@ -1336,7 +1542,7 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 struct RawEmbeddingRuntime {
     batch_size: Option<u32>,
     ort_threads: Option<u32>,
@@ -1356,7 +1562,7 @@ impl From<RawEmbeddingRuntime> for EmbeddingRuntimeConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 struct RawTarget {
     name: String,
     language: String,
@@ -1376,6 +1582,12 @@ pub enum ConfigError {
     Language(#[from] LanguageError),
     #[error("unknown target kind `{0}`")]
     UnknownTargetKind(String),
+    #[error(
+        "`database` points at the consolidated global store, but this root has no resolvable repo \
+         identity (not a committed git repo). Add `[index] repo_id = \"...\"` to pin an identity, \
+         or point `database` at a per-repo file (e.g. `.rag-rat/index.sqlite`)"
+    )]
+    GlobalPinWithoutIdentity,
     #[error(
         "unknown embedding model `{0}` (expected a registered model id — the HF path, e.g. \
          `sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`, \
@@ -1476,7 +1688,8 @@ mod tests {
         std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
         std::fs::write(
             main.join("rag-rat.toml"),
-            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+            "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n[target_bindings]\nrust \
+             = [\"src\"]\n",
         )
         .unwrap();
         git(&main, &["init", "-q"]);
@@ -1516,8 +1729,8 @@ mod tests {
         std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
         std::fs::write(
             tmp.join("rag-rat.toml"),
-            "[index]\nroot = \".\"\nrepo_id = \"  pinned-id  \"\n[target_bindings]\nrust = \
-             [\"src\"]\n",
+            "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\nrepo_id = \"  pinned-id  \
+             \"\n[target_bindings]\nrust = [\"src\"]\n",
         )
         .unwrap();
 
@@ -1527,11 +1740,601 @@ mod tests {
             Some("pinned-id"),
             "the [index] repo_id override is parsed and trimmed",
         );
-        // Parse-only: the override must NOT influence path resolution — the database stays at the
-        // per-repo default beside `root`.
+        // Parse-only: the override must NOT influence path resolution — the explicit database stays
+        // at the per-repo path beside `root`.
         assert_eq!(config.database, config.root.join(".rag-rat/index.sqlite"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Seed a minimal COMMITTED git repo at `dir` — the identity-bearing fixture the global
+    /// default requires (a keyless config resolves globally only for a root with a derivable repo
+    /// identity).
+    fn git_commit_all(dir: &Path) {
+        let git = |args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e"]);
+        git(&["config", "user.name", "t"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "seed"]);
+    }
+
+    /// A7 default flip: a keyless config in an IDENTITY-BEARING repo (a committed git root) with
+    /// no legacy `.rag-rat/index.sqlite` resolves to the consolidated GLOBAL store. Compared
+    /// against `global_database_path()` in the CURRENT environment (no env mutation ⇒ no
+    /// cross-test race); `Config::load` only RESOLVES the path, it never opens or creates the DB,
+    /// so this never touches a developer's real global store.
+    #[test]
+    fn config_load_without_a_database_key_resolves_to_the_global_database() {
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-globaldb-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            tmp.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        git_commit_all(&tmp);
+
+        let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
+        let expected = crate::data_dir::global_database_path()
+            .expect("a data dir resolves in the test environment (HOME is set)");
+        assert_eq!(
+            config.database, expected,
+            "a keyless config defaults to the consolidated global database",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The GOVERNING SEAM: in a linked worktree the MAIN config governs the WHOLE config, not a
+    /// per-key subset — a divergent branch-local file cannot fork the embedding model (or any
+    /// other key) even though no per-key anchoring was ever written for `[llm]`. The two loads
+    /// must produce the SAME resolved `Config`.
+    #[test]
+    fn config_load_in_a_linked_worktree_is_governed_wholesale_by_the_main_config() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-wholecfg-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\ndatabase = \"main.sqlite\"\n[watch]\ndebounce_ms = \
+             1111\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+
+        // The branch config diverges on a key with NO historical per-key anchoring: `[watch]`.
+        std::fs::write(
+            linked.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\ndatabase = \"branch.sqlite\"\n[watch]\ndebounce_ms = \
+             9999\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        let from_main = Config::load(main.join("rag-rat.toml")).unwrap();
+        let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            from_linked.watch.debounce_ms, from_main.watch.debounce_ms,
+            "the divergent branch config is IGNORED wholesale — keys with no per-key anchoring \
+             history included",
+        );
+        assert_eq!(from_linked.watch.debounce_ms, 1111, "main's value, not the branch's 9999");
+        assert_eq!(from_linked.database, from_main.database);
+        assert_eq!(from_linked.root, from_main.root);
+        assert_eq!(from_linked.targets, from_main.targets);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Config-less-main fallback posture: main is resolvable but has NO `rag-rat.toml`, so the
+    /// linked worktree's local config governs best-effort (with a warning) — root still anchors
+    /// to main so the shared index keys off one base checkout.
+    #[test]
+    fn config_load_falls_back_to_the_local_config_when_main_has_none() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp =
+            std::env::temp_dir().join(format!("ragrat-nomaincfg-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+
+        // Only the LINKED checkout has a config (e.g. authored on a branch, not yet merged).
+        std::fs::write(
+            linked.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\ndatabase = \"branch.sqlite\"\n[target_bindings]\nrust = \
+             [\"src\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(linked.join("rag-rat.toml")).unwrap();
+        let canonical_main = main.canonicalize().unwrap();
+        assert_eq!(cfg.root, canonical_main, "root anchors to main even on the fallback");
+        assert_eq!(
+            cfg.database,
+            canonical_main.join("branch.sqlite"),
+            "the local key governs (resolved against the main top) until main gains a config",
+        );
+        assert!(cfg.database_key_pinned);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The DISCOVERY resolver matrix (Codex batch 9): local file wins wherever it exists (the
+    /// seam then governs + warns), a linked checkout without one resolves to MAIN's path (even
+    /// when that file doesn't exist yet — hints must name where the config belongs), and
+    /// main/non-git checkouts stay local.
+    #[test]
+    fn discover_config_path_resolves_the_governing_checkout() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-discover-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+        let main_c = main.canonicalize().unwrap();
+
+        // Linked, no local file, main config not yet written: MAIN's path (where it belongs).
+        assert_eq!(discover_config_path(&linked), main_c.join("rag-rat.toml"));
+        // Main checkout: always local, present or not.
+        assert_eq!(discover_config_path(&main), main.join("rag-rat.toml"));
+        // Linked WITH a local (divergent) file: the local path — the load then routes through
+        // the governing seam, which warns; discovery must not silently skip that.
+        std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+        assert_eq!(discover_config_path(&linked), linked.join("rag-rat.toml"));
+        // Non-git: local.
+        let plain = tmp.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(discover_config_path(&plain), plain.join("rag-rat.toml"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The linked-ness PRIMITIVE (Codex batch 8, findings 1+3): topology-derived — the discovered
+    /// checkout's workdir vs the designated main — so a SUBDIRECTORY of the main worktree is NOT
+    /// linked (pre-fix, `init` from `main/src` falsely refused), while any path inside a linked
+    /// checkout (its top OR a subdir) is.
+    #[test]
+    fn linked_worktree_main_root_derives_linkedness_from_topology() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-linkpred-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+        let main_c = main.canonicalize().unwrap();
+
+        assert_eq!(linked_worktree_main_root(&main), None, "the main worktree is not linked");
+        assert_eq!(
+            linked_worktree_main_root(&main.join("src")),
+            None,
+            "a SUBDIRECTORY of main is main — not linked (the false-refusal bug)",
+        );
+        assert_eq!(linked_worktree_main_root(&linked), Some(main_c.clone()));
+        assert_eq!(
+            linked_worktree_main_root(&linked.join("src")),
+            Some(main_c),
+            "a subdir of a linked checkout is still linked",
+        );
+        let plain = tmp.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(linked_worktree_main_root(&plain), None, "non-git has no designated main");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Validation ORDERING (Codex batch 8, finding 2): the governing config is chosen FIRST; hard
+    /// validation applies only to the config actually used. A branch-local file that fails to
+    /// parse (or trips the `[local_ai]` rejection) in a linked worktree folds into the divergence
+    /// warning — it must never make every command from the linked checkout fatal, because its
+    /// contents are irrelevant by design when main governs.
+    #[test]
+    fn config_load_ignores_an_invalid_branch_config_when_main_governs() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-brokecfg-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\ndatabase = \"main.sqlite\"\n[target_bindings]\nrust = \
+             [\"src\"]\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+
+        // Unparseable garbage on the branch: main still governs.
+        std::fs::write(linked.join("rag-rat.toml"), "this is [not toml").unwrap();
+        let cfg = Config::load(linked.join("rag-rat.toml"))
+            .expect("a broken branch config is ignored when main governs");
+        let main_c = main.canonicalize().unwrap();
+        assert_eq!(cfg.database, main_c.join("main.sqlite"));
+
+        // The deprecated `[local_ai]` table on the branch: same posture (it is a VALIDATION
+        // failure, not a parse failure — both fold into the warning).
+        std::fs::write(
+            linked.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[local_ai]\nmodel = \"x\"\n[target_bindings]\nrust = \
+             [\"src\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(linked.join("rag-rat.toml")).unwrap();
+        assert_eq!(cfg.database, main_c.join("main.sqlite"));
+
+        // In the checkout that GOVERNS (main), the same brokenness stays fatal.
+        std::fs::write(main.join("rag-rat.toml"), "this is [not toml").unwrap();
+        assert!(
+            Config::load(main.join("rag-rat.toml")).is_err(),
+            "the governing config's validation is fatal as always",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The seam's trigger is TOPOLOGY, not the root-anchoring proxy (Codex batch 8, finding 3): a
+    /// branch-only `[index] root` makes `anchor_root_to_main_worktree` keep the local root (the
+    /// dir doesn't exist in main), which under the old `anchored != local` trigger concluded
+    /// "not linked" and let the branch config govern database/watch/models — the exact
+    /// split-brain the seam prevents. Governance must be unconditional on linked-ness.
+    #[test]
+    fn config_load_governs_from_main_even_when_a_branch_only_root_defeats_anchoring() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp =
+            std::env::temp_dir().join(format!("ragrat-branchroot-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\ndatabase = \"main.sqlite\"\n[watch]\ndebounce_ms = \
+             1111\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+
+        // The branch config points `[index] root` at a dir that exists ONLY on the branch —
+        // anchoring keeps the local root (missing in main), defeating the old equality proxy.
+        std::fs::create_dir_all(linked.join("branch_only/src")).unwrap();
+        std::fs::write(linked.join("branch_only/src/lib.rs"), "pub fn b() {}\n").unwrap();
+        assert!(!main.join("branch_only").exists(), "main never had this dir");
+        std::fs::write(
+            linked.join("rag-rat.toml"),
+            "[index]\nroot = \"branch_only\"\ndatabase = \"branch.sqlite\"\n[watch]\ndebounce_ms \
+             = 9999\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(linked.join("rag-rat.toml")).unwrap();
+        let main_c = main.canonicalize().unwrap();
+        assert_eq!(
+            cfg.database,
+            main_c.join("main.sqlite"),
+            "main's database governs — the branch-only root cannot defeat the seam",
+        );
+        assert_eq!(cfg.watch.debounce_ms, 1111, "main's watch config governs too");
+        assert_eq!(cfg.root, main_c, "root comes from MAIN's config when main governs");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The identity gate's SECOND entrance (Codex batch 8, finding 5a): an EXPLICIT pin at the
+    /// consolidated global store from an identity-less root is refused at resolution — the
+    /// keyless gate never sees a pinned config, and letting it open the shared store would land
+    /// this project on adoption's sole-repo pick (a SIBLING repo). A `repo_id` pin restores the
+    /// identity and lifts the refusal. Compares against `global_database_path()` in the CURRENT
+    /// environment (no env mutation ⇒ parallel-safe); `load` only resolves, never writes there.
+    #[test]
+    fn config_load_refuses_an_identity_less_pin_at_the_global_store() {
+        let Some(global) = crate::data_dir::global_database_path() else {
+            return; // no resolvable data dir on this platform — the gate cannot trigger
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-globpin-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        let config_path = tmp.join("rag-rat.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[index]\nroot = \".\"\ndatabase = \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
+                global.display()
+            ),
+        )
+        .unwrap();
+        let err = Config::load(&config_path).expect_err("identity-less global pin is refused");
+        assert!(
+            matches!(err, ConfigError::GlobalPinWithoutIdentity),
+            "the refusal names the remedy: {err}",
+        );
+
+        // A `repo_id` pin IS a resolvable identity — the same config with one loads fine.
+        std::fs::write(
+            &config_path,
+            format!(
+                "[index]\nroot = \".\"\nrepo_id = \"pinned-project\"\ndatabase = \
+                 \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
+                global.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&config_path).expect("a repo_id pin lifts the refusal");
+        assert_eq!(cfg.database, global);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The `database` decision is MAIN-WORKTREE-ANCHORED (Codex batch 7): a linked worktree's
+    /// branch-local config can neither UN-PIN (a branch toml omitting the key while main pins —
+    /// pre-fix that split the repo across the global store and main's per-repo file) nor RE-PIN
+    /// (a branch adding its own key) the repo's database. Main's config is authoritative, exactly
+    /// as it is for `repo_id`.
+    #[test]
+    fn config_load_anchors_the_database_key_to_the_main_worktree() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-dbanchor-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        // MAIN pins an explicit per-repo database.
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\ndatabase = \"custom/pinned.sqlite\"\n[target_bindings]\nrust \
+             = [\"src\"]\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+
+        // The BRANCH config omits the key (a branch predating the pin): pre-fix the keyless
+        // default resolved the linked checkout to the GLOBAL store — a different DB than main's.
+        std::fs::write(
+            linked.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        let from_main = Config::load(main.join("rag-rat.toml")).unwrap();
+        let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            from_linked.database, from_main.database,
+            "a branch omitting the key must not divert the linked worktree off main's pin",
+        );
+        assert!(from_linked.database_key_pinned, "the GOVERNING (main) key decision travels too");
+
+        // The BRANCH config pinning its OWN key: main (keyless here) stays authoritative — a
+        // branch cannot fork the repo onto a private database.
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            linked.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\ndatabase = \"branch/fork.sqlite\"\n[target_bindings]\nrust = \
+             [\"src\"]\n",
+        )
+        .unwrap();
+        let from_main = Config::load(main.join("rag-rat.toml")).unwrap();
+        let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            from_linked.database, from_main.database,
+            "a branch-local pin must not fork the repo onto its own database",
+        );
+        assert!(!from_linked.database_key_pinned, "main keyless ⇒ governing decision is keyless");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A7 legacy interplay: a keyless config in a repo that ALREADY has a `.rag-rat/index.sqlite`
+    /// (indexed before the flip, or a fresh `rag-rat init` over an old checkout) keeps resolving to
+    /// that legacy file — never silently abandoning its memories — until `rag-rat consolidate`
+    /// imports and renames it, after which resolution falls through to the global store.
+    #[test]
+    fn config_load_without_a_database_key_prefers_an_existing_legacy_index() {
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-legacydb-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.join(".rag-rat")).unwrap();
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(tmp.join(".rag-rat/index.sqlite"), b"legacy").unwrap();
+        std::fs::write(
+            tmp.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        git_commit_all(&tmp);
+
+        let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            config.database,
+            tmp.canonicalize().unwrap().join(".rag-rat/index.sqlite"),
+            "a pre-existing legacy index wins over the global default until consolidated",
+        );
+
+        // Once consolidated (the legacy file renamed away), the same config resolves globally.
+        std::fs::rename(
+            tmp.join(".rag-rat/index.sqlite"),
+            tmp.join(".rag-rat/index.sqlite.imported"),
+        )
+        .unwrap();
+        let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            config.database,
+            crate::data_dir::global_database_path().expect("data dir resolves"),
+            "after consolidation the keyless config falls through to the global store",
+        );
+
+        // The `.imported` marker is a STAY-GLOBAL LATCH: a stray legacy file REAPPEARING beside it
+        // (an old binary, a restored backup) must not silently divert the repo off the global
+        // store its memories were imported into.
+        std::fs::write(tmp.join(".rag-rat/index.sqlite"), b"stray").unwrap();
+        let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            config.database,
+            crate::data_dir::global_database_path().expect("data dir resolves"),
+            "a stray legacy file beside the .imported marker is ignored, not adopted",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The IDENTITY GATE on the global default: a keyless config at a root with NO derivable repo
+    /// identity (non-git, or a `git init` with an unborn HEAD) stays on its PER-ROOT legacy path —
+    /// in the shared global store every identity-less root would pool under the one
+    /// `__unassigned__` placeholder scope, so two fresh non-git projects would see and overwrite
+    /// each other's rows, and an unborn repo would strand its placeholder rows once its first
+    /// commit mints a real id. Two identity-less roots therefore NEVER share a database.
+    #[test]
+    fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
+        let keyless_config = |tag: &str| {
+            let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+            let tmp = std::env::temp_dir()
+                .join(format!("ragrat-noident-{tag}-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(tmp.join("src")).unwrap();
+            std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+            std::fs::write(
+                tmp.join("rag-rat.toml"),
+                "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+            )
+            .unwrap();
+            tmp
+        };
+
+        // Two NON-GIT roots: each resolves to its OWN per-root legacy path — never the shared
+        // global store, and never each other's.
+        let a = keyless_config("a");
+        let b = keyless_config("b");
+        let config_a = Config::load(a.join("rag-rat.toml")).unwrap();
+        let config_b = Config::load(b.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            config_a.database,
+            a.canonicalize().unwrap().join(".rag-rat/index.sqlite"),
+            "an identity-less root stays on its per-root legacy path",
+        );
+        assert_eq!(
+            config_b.database,
+            b.canonicalize().unwrap().join(".rag-rat/index.sqlite"),
+            "each identity-less root gets its own database",
+        );
+        assert_ne!(config_a.database, config_b.database, "identity-less roots never share scope");
+
+        // An UNBORN repo (`git init`, no commit yet) is identity-less too: it lands per-root, so
+        // its placeholder rows adopt IN THAT DB when the first commit mints a real id (the
+        // existing single-repo adoption flow), instead of stranding in the global store.
+        let unborn = keyless_config("unborn");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&unborn)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        git(&["init", "-q"]);
+        let config = Config::load(unborn.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            config.database,
+            unborn.canonicalize().unwrap().join(".rag-rat/index.sqlite"),
+            "an unborn repo stays per-root until its first commit mints an identity",
+        );
+        // A `[index] repo_id` pin IS an identity: the same root then resolves globally.
+        std::fs::write(
+            unborn.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\nrepo_id = \"pinned-project\"\n[target_bindings]\nrust = \
+             [\"src\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(unborn.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            config.database,
+            crate::data_dir::global_database_path().expect("data dir resolves"),
+            "a pinned repo_id makes the root identity-bearing, so the global default applies",
+        );
+
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&unborn);
     }
 
     #[test]
@@ -1575,7 +2378,8 @@ mod tests {
         // Main's config indexes only `src`.
         std::fs::write(
             main.join("rag-rat.toml"),
-            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+            "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n[target_bindings]\nrust \
+             = [\"src\"]\n",
         )
         .unwrap();
         git(&main, &["init", "-q"]);
@@ -1753,7 +2557,8 @@ mod tests {
         // Main OMITS repo_id.
         std::fs::write(
             main.join("rag-rat.toml"),
-            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+            "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n[target_bindings]\nrust \
+             = [\"src\"]\n",
         )
         .unwrap();
         git(&main, &["init", "-q"]);

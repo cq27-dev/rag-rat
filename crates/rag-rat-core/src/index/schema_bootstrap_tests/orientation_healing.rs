@@ -165,6 +165,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
 
     let config = Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

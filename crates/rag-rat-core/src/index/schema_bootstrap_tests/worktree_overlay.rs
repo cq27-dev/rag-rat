@@ -583,7 +583,9 @@ fn maintenance_pass_refreshes_a_linked_worktree_overlay() {
     // A watcher maintenance pass auto-refreshes the overlay — no manual `index --worktree`.
     crate::watch::maintenance_pass(&config, false).unwrap();
 
-    let mut db = IndexDatabase::open(&config.database).unwrap();
+    // A fresh reader on the shared DB: config-bearing (post-A7 a bare open refuses the
+    // multi-repo shape the poison sibling makes real on this git fixture).
+    let mut db = IndexDatabase::open_config(&config).unwrap();
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
     assert_eq!(
         names_in_scope(&db, "src/a.rs"),
@@ -928,8 +930,9 @@ fn worktree_overlay_committed_added_file_symbol_resolves_cross_connection() {
         assert!(report.indexed >= 1, "the added file is indexed into the overlay");
     }
 
-    // A FRESH connection (the MCP server querying after the CLI wrote the overlay).
-    let mut db = IndexDatabase::open(&config.database).unwrap();
+    // A FRESH connection (the MCP server querying after the CLI wrote the overlay) —
+    // config-bearing, the post-A7 MCP posture (a bare open refuses the poisoned multi-repo DB).
+    let mut db = IndexDatabase::open_config(&config).unwrap();
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
     assert!(
         !db.symbols("added_fn", Some(Language::Rust), 10).unwrap().is_empty(),
@@ -1029,7 +1032,7 @@ fn worktree_overlay_stable_when_main_removed_a_file_a_nested_branch_keeps() {
 
     for pass in 0..3 {
         crate::watch::maintenance_pass(&config, pass == 2).unwrap(); // gc on the last pass
-        let mut db = IndexDatabase::open(&config.database).unwrap();
+        let mut db = IndexDatabase::open_config(&config).unwrap();
         db.use_worktree_scope(&main, Some(&linked)).unwrap();
         assert_eq!(
             names_in_scope(&db, "src/reinf.rs"),

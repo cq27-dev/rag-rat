@@ -47,6 +47,8 @@ tikv-jemalloc-ctl = "0.6"
 # MCP tool results render as TOON; integration tests decode them back to JSON Values to assert.
 toon-format.workspace = true
 tempfile.workspace = true
+# The consolidate integration tests assert sibling-repo repo_meta state directly in the global DB.
+rusqlite.workspace = true
 
 [features]
 default = ["fastembed", "model2vec"]

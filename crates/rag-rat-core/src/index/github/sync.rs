@@ -193,11 +193,10 @@ pub(crate) fn mark_ref_sync(
         "
         INSERT INTO github_ref_sync(owner, repo, number, status, synced_at_ms, last_error, repo_id)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        ON CONFLICT(owner, repo, number) DO UPDATE SET
+        ON CONFLICT(repo_id, owner, repo, number) DO UPDATE SET
             status = excluded.status,
             synced_at_ms = excluded.synced_at_ms,
-            last_error = excluded.last_error,
-            repo_id = excluded.repo_id
+            last_error = excluded.last_error
         ",
         params![
             reference.owner,

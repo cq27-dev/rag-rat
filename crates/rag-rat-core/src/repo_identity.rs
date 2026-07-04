@@ -165,6 +165,28 @@ pub fn resolve_repo_identity(
     Ok(RepoIdentity { repo_id, display_name, class, shallow_boundary })
 }
 
+/// Whether `root` has a DERIVABLE repo identity at all — a non-empty `[index] repo_id` pin, or a
+/// git repository with a born HEAD. The cheap existence probe behind the A7 default-database
+/// resolution: an identity-LESS root (non-git dir, unborn `git init`) must stay on its per-root
+/// legacy database rather than resolve to the machine-global store, where every such root would
+/// pool under the shared `__unassigned__` placeholder scope (mutual visibility/overwrite) and an
+/// unborn repo would strand its placeholder rows the moment its first commit mints a real id.
+///
+/// Deliberately NEVER walks history (`Config::load` runs on every command): it answers only
+/// "would [`resolve_repo_identity`] return [`Absent`](RepoIdentityError::Absent)?" — the
+/// Portable/LocalOnly split and Rejected-pin surfacing still happen at open time. A non-empty pin
+/// counts as resolvable even when reserved (a Rejected pin must surface through the open's
+/// actionable error, not silently divert the database path).
+pub fn identity_is_resolvable(root: &Path, override_id: Option<&str>) -> bool {
+    if override_id.map(str::trim).is_some_and(|id| !id.is_empty()) {
+        return true;
+    }
+    let Ok(repo) = crate::index::discover_repo(root) else {
+        return false;
+    };
+    repo.head_id().is_ok()
+}
+
 /// The remedy-naming error for pinning the reserved placeholder id: it marks a pre-adoption
 /// single-repo DB, so adopting under it would rewrite the placeholder PK to itself and leave the DB
 /// unadopted while reporting success (see [`register_repo`]).

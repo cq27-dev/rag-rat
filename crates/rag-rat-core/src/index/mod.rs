@@ -11,6 +11,8 @@ pub mod schema;
 pub mod symbols;
 pub mod walker;
 
+pub mod consolidate;
+
 pub(crate) mod chunk_text_store;
 pub(crate) mod clones;
 mod discovery;

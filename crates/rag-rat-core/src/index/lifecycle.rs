@@ -6,9 +6,23 @@ use super::*;
 /// half-open.
 const SCHEMA_MIGRATE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How a config-less open resolves its repo scope — the two callers of
+/// [`IndexDatabase::open_bare`] want opposite postures on a multi-repo DB.
+pub(super) enum BareOpenMode {
+    /// A genuinely CONFIG-LESS open (`IndexDatabase::open`: the MCP `call_tool(database, …)` path,
+    /// tests, tooling): scope stays the sole repo for the connection's lifetime, so a multi-repo
+    /// DB is REFUSED up front (A7) and the graph/generated-flags heal runs for the sole repo.
+    ConfigLess,
+    /// The incremental pass's low-level first step: `adopt_repo_from_config` + `set_context`
+    /// follow immediately, so the multi-repo refusal must NOT fire (the config supplies the scope)
+    /// and the graph heal is DEFERRED until after adoption (it is `active_repo_id`-scoped and
+    /// would otherwise heal the pre-adoption sole-repo pick).
+    AdoptionPending,
+}
+
 impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        Self::open_with_graph_check(path, true)
+        Self::open_bare(path, BareOpenMode::ConfigLess)
     }
 
     pub fn database_path(&self) -> &Path {
@@ -57,13 +71,37 @@ impl IndexDatabase {
         Ok(storage)
     }
 
-    pub(super) fn open_with_graph_check(path: &Path, check_graph: bool) -> anyhow::Result<Self> {
+    pub(super) fn open_bare(path: &Path, mode: BareOpenMode) -> anyhow::Result<Self> {
         let mut storage = Self::open_and_migrate(path)?;
-        ai::ensure_model_manifest(storage.connection())?;
         // A bare `open` has no config identity to register, so it scopes to the SOLE repo of a
-        // single-repo DB (a consolidated multi-repo DB is only reached through `open_config`, which
-        // registers). The model-manifest heal above resolves the same sole repo via the no-context
-        // fallback in `schema::active_repo_id`.
+        // single-repo DB. On a CONSOLIDATED multi-repo DB (A7) there is no sole repo to pick —
+        // `sole_repo_id`'s deterministic lexicographic tiebreak would silently serve whichever repo
+        // sorts first, the exact ambient-scope assumption phase A exists to kill — so a
+        // [`ConfigLess`](BareOpenMode::ConfigLess) open FAILS FAST with the config-bearing remedy
+        // instead of degrading. Gated BEFORE the model-manifest heal, which itself resolves
+        // `active_repo_id` (⇒ the same first-sorting pick) and could otherwise seed per-repo meta
+        // under the wrong repo. An [`AdoptionPending`](BareOpenMode::AdoptionPending) open is
+        // exempt: the caller adopts the config's repo immediately after, which re-scopes the
+        // connection before any repo-scoped heal runs.
+        if matches!(mode, BareOpenMode::ConfigLess)
+            && schema::multiple_real_repos(storage.connection())?
+        {
+            anyhow::bail!(
+                "this database holds multiple repos; a bare open cannot choose one. Open through \
+                 a rag-rat.toml config (run from the repo's checkout, or pass --config) so the \
+                 repo scope is explicit."
+            );
+        }
+        // The model-manifest heal resolves `active_repo_id` — context-less, the sole-repo pick —
+        // and on a heal-owed pass its `remove_legacy_models` DELETES that repo's `repo_meta`
+        // active-model keys. Safe here only for ConfigLess (the fail-fast above guarantees a
+        // single repo, so the pick IS the repo); an AdoptionPending open on a multi-repo DB would
+        // mutate the FIRST-SORTING repo's meta while the caller holds only its own repo's lock —
+        // so the heal is DEFERRED to the caller, after adopt + set_context scope the connection
+        // (the exact ordering `open_config` uses).
+        if matches!(mode, BareOpenMode::ConfigLess) {
+            ai::ensure_model_manifest(storage.connection())?;
+        }
         let repo_id = schema::sole_repo_id(storage.connection())?;
         if let Some(root) = repo_meta(storage.connection(), &repo_id, "source_root")? {
             storage.set_source_root(PathBuf::from(root));
@@ -89,7 +127,7 @@ impl IndexDatabase {
             config: None,
             _identity_lock: None,
         };
-        if check_graph {
+        if matches!(mode, BareOpenMode::ConfigLess) {
             db.ensure_graph_index_current()?;
             db.ensure_generated_flags_current()?;
         }
@@ -151,7 +189,25 @@ impl IndexDatabase {
             config.repo_id_override.as_deref(),
         ) {
             Ok(identity) => schema::register_repo(conn, &identity, &config.root, schema::now_ms())?,
-            Err(err) if err.is_absent() => schema::sole_repo_id(conn)?,
+            Err(err) if err.is_absent() => {
+                // STRUCTURAL BACKSTOP (Codex batch 8, finding 5): an identity-less root may
+                // sole-pick only on a SINGLE-repo database. On a multi-repo store (an explicit
+                // `database` pin at the global file or any shared path), `sole_repo_id`'s
+                // lexicographic tiebreak would silently adopt a SIBLING repo's scope and write
+                // this project's rows under it. Refuse with the remedy instead — the same
+                // doctrine as the config-less bare-open fail-fast and the healers' witness: no
+                // entrance may guess a repo on a multi-repo database. (`Config::load` already
+                // refuses the global-pin shape at resolution; this closes every other entrance.)
+                if schema::multiple_real_repos(conn)? {
+                    anyhow::bail!(
+                        "this root has no resolvable repo identity (not a committed git repo), \
+                         and the configured database holds multiple repos — refusing to guess \
+                         which one this project is. Add `[index] repo_id = \"...\"` to pin an \
+                         identity, or point `database` at a per-repo file"
+                    );
+                }
+                schema::sole_repo_id(conn)?
+            },
             Err(err) => return Err(err.into()),
         };
         // FENCE-GAP CLOSE (A6, batch-5 P2): a LOCK-DISCIPLINED writer's held lock must match the
@@ -277,6 +333,30 @@ impl IndexDatabase {
 
     pub fn migrate(path: &Path) -> anyhow::Result<schema::SchemaStatus> {
         Self::migrate_with_fastembed_cache(path, None)
+    }
+
+    /// Bring the schema at `path` current and NOTHING ELSE — no model-manifest heal, no fastembed
+    /// cache recovery. For callers whose operation's SUBJECT REPO IS NOT REGISTERED YET
+    /// (`rag-rat consolidate`, future importers): the open-time healers attribute their per-repo
+    /// `repo_meta` reads/writes via the scoped-repo witness, and the witness's single-repo arm
+    /// picks the sole REGISTERED repo — which for an unregistered subject is a SIBLING, healed
+    /// under the wrong repo's locks. Such callers must use this schema-only path; any owed sibling
+    /// heal belongs to that sibling's own next scoped open.
+    pub fn migrate_schema_only(path: &Path) -> anyhow::Result<schema::SchemaStatus> {
+        let storage = IndexConnection::open(path)?;
+        let status = schema::status(storage.connection())?;
+        match status.state {
+            schema::SchemaState::Newer | schema::SchemaState::Dirty => {
+                anyhow::bail!("{}", status.message);
+            },
+            schema::SchemaState::Compatible => {},
+            schema::SchemaState::Missing | schema::SchemaState::Older => {
+                // Serializes on the GLOBAL schema lock and re-checks under it, like every
+                // schema-apply path (see `apply_schema_under_lock`).
+                Self::apply_schema_under_lock(path, storage.connection())?;
+            },
+        }
+        schema::status(storage.connection())
     }
 
     pub(super) fn migrate_with_fastembed_cache(

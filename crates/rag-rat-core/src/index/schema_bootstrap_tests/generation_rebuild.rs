@@ -89,14 +89,19 @@ fn reader_sees_path(db_path: &Path, root: &Path, path: &str) -> bool {
         .unwrap()
 }
 
-/// V043 is the schema tip: `files` gains `generation` and the UNIQUE widens to include it, so two
-/// rows identical except in generation coexist while a true duplicate still violates the key.
+/// V043 adds `files.generation` and widens the UNIQUE to include it, so two rows identical except
+/// in generation coexist while a true duplicate still violates the key. (The ABSOLUTE schema-tip
+/// pin lives in the NEWEST migration's test — see `v044_widens_the_github_natural_keys_...` — so
+/// this checks the tip SYMBOLICALLY and never needs a bump when a later migration lands.)
 #[test]
-fn schema_at_latest_after_apply_is_v043() {
+fn migration_043_adds_generation_to_the_files_unique_key() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 43, "V043 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 43, "schema at LATEST after apply");
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply",
+    );
     assert!(
         conn_table_columns(&conn, "files").contains(&"generation".to_string()),
         "files gains a generation column"
@@ -873,7 +878,13 @@ fn spawn_paused_rebuild(
         )
     };
     let rebuild_config = config.clone();
+    // Propagate the calling test's poison opt-out onto the worker thread: the harness flag is
+    // THREAD-local (deliberately — parallel `cargo test` isolation), so a spawned rebuild would
+    // otherwise re-seed the sibling behind a test that disabled it.
+    let poison_disabled = crate::index::poison_sibling::poison_disabled_on_this_thread();
     let handle = std::thread::spawn(move || {
+        let _poison_off =
+            poison_disabled.then(crate::index::poison_sibling::disable_poison_sibling);
         // `rebuild_with_progress` acquires the per-repo write flock ITSELF (batch 6) — every
         // rebuild entry holds it by construction, which is what gc's `!= live` deadness predicate
         // relies on (holding the flock proves no rebuild is mid-flight, so above-live rows are
@@ -1005,6 +1016,10 @@ fn a_lockless_heal_mid_rebuild_does_not_remove_the_staged_row() {
 /// generation after the flip while the superseded one lingers pre-gc.
 #[test]
 fn a_bare_open_reader_is_generation_scoped() {
+    // Single-repo by nature: post-A7 the bare open is DEFINED only for a single-repo DB (it
+    // refuses the multi-repo shape the registered poison sibling would make real on this git
+    // fixture), and this test's subject is exactly that bare-open path.
+    let _poison_off = crate::index::poison_sibling::disable_poison_sibling();
     let (root, config) = generation_fixture(&[
         ("a.rs", "pub fn a() -> u32 { 1 }\n"),
         ("b.rs", "pub fn b() -> u32 { 2 }\n"),

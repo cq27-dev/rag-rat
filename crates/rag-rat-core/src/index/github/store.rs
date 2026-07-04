@@ -1,22 +1,28 @@
 use super::*;
 
-// UPSERT-RECLAIM INVARIANT (all seven github writers): the github tables keep their natural keys
-// WITHOUT `repo_id` (the deliberate V041 phase-A deviation — one repo per DB until A7), so on a
-// consolidated DB a row stranded under the `'__unassigned__'` placeholder (the V041 backfill's
-// leave-at-placeholder path) OCCUPIES the key. Every writer must therefore RECLAIM on conflict —
-// re-stamp `repo_id` and refresh the content — never `INSERT OR IGNORE`, which would silently keep
-// the stale placeholder row forever and break the migration's "the next sync reclaims" promise.
-// Last-syncer-owns is the documented phase-A posture for the un-qualified keys; the `github_fts`
-// mirror follows automatically because every sync path ends in the whole-table [`rebuild_fts`],
-// which re-derives each mirror row's `repo_id` from its reclaimed base row. The id-keyed writers
-// (`store_comment` / `store_review` / `store_review_comment`) reclaim via `INSERT OR REPLACE`
-// (REPLACE deletes the conflicting row and re-inserts with the new stamp).
+// KEY SCOPING (V044 + V045, phase A7): every github cache key folds `repo_id`. The `(owner,
+// repo, number)`-style natural keys are `(repo_id, owner, repo, number)` (V044:
+// `github_issues` / `github_pull_requests` UNIQUE, `github_ref_sync` PK, `idx_github_refs_unique`
+// leading column), and the id-keyed CHILD caches (`github_comments` / `github_reviews` /
+// `github_review_comments`) are `(repo_id, id)` unique (V045). So on a consolidated DB two repos
+// referencing the SAME external item each own a full copy — parent AND children — and a conflict
+// only ever fires WITHIN one repo (this repo re-syncing its own item). The natural-key writers'
+// `ON CONFLICT` targets name the widened keys and refresh content in place; the id-keyed writers
+// keep `INSERT OR REPLACE`, which resolves through the widened unique index — a same-repo re-sync
+// replaces in place, a sibling repo's sync inserts its own row, and neither can restamp the
+// other's copy (the pre-V045 last-syncer-owns oscillation: repo A's scoped papertrail lost a
+// shared PR's comments the moment repo B synced). The `github_fts` mirror follows automatically
+// because every sync path ends in the whole-table [`rebuild_fts`], which re-derives each mirror
+// row's `repo_id` from its base row.
 
 pub(crate) fn store_ref(conn: &Connection, reference: &GitHubRef) -> anyhow::Result<()> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
-    // The `WHERE repo_id changes` guard keeps the old first-discovery semantics for a repo
-    // re-discovering its OWN ref (no rewrite, `discovered_at_ms` keeps the first sighting) while
-    // reclaiming + refreshing a row another owner (the placeholder, pre-A7) holds on this key.
+    // The widened `idx_github_refs_unique` (V044) leads with `repo_id`, so a conflict is always
+    // THIS repo re-discovering its OWN ref — keep the first-sighting row untouched (`DO
+    // NOTHING` preserves the original `discovered_at_ms`/`ref_kind`, the pre-V044 same-repo
+    // semantics). A sibling repo referencing the same `(owner, repo, number)` gets its own
+    // distinct row rather than conflicting, so the old cross-owner reclaim guard is no longer
+    // reachable.
     conn.execute(
         "
         INSERT INTO github_refs(
@@ -24,12 +30,8 @@ pub(crate) fn store_ref(conn: &Connection, reference: &GitHubRef) -> anyhow::Res
          discovered_at_ms, repo_id
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-        ON CONFLICT(owner, repo, number, source_kind, COALESCE(source_path, ''), \
-         COALESCE(source_commit, ''), source_text) DO UPDATE SET
-            ref_kind = excluded.ref_kind,
-            discovered_at_ms = excluded.discovered_at_ms,
-            repo_id = excluded.repo_id
-        WHERE github_refs.repo_id != excluded.repo_id
+        ON CONFLICT(repo_id, owner, repo, number, source_kind, COALESCE(source_path, ''), \
+         COALESCE(source_commit, ''), source_text) DO NOTHING
         ",
         params![
             reference.owner,
@@ -53,11 +55,11 @@ pub(crate) fn store_issue(conn: &Connection, issue: &GitHubIssue) -> anyhow::Res
         INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, author, \
          created_at, updated_at, is_pull_request, synced_at_ms, repo_id)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-        ON CONFLICT(owner, repo, number) DO UPDATE SET
+        ON CONFLICT(repo_id, owner, repo, number) DO UPDATE SET
             html_url = excluded.html_url, state = excluded.state, title = excluded.title,
             body = excluded.body, author = excluded.author, created_at = excluded.created_at,
             updated_at = excluded.updated_at, is_pull_request = excluded.is_pull_request,
-            synced_at_ms = excluded.synced_at_ms, repo_id = excluded.repo_id
+            synced_at_ms = excluded.synced_at_ms
         ",
         params![
             issue.owner,
@@ -108,11 +110,11 @@ pub(crate) fn store_pull(conn: &Connection, pull: &GitHubPullRequest) -> anyhow:
         INSERT INTO github_pull_requests(owner, repo, number, html_url, state, title, body, \
          author, created_at, updated_at, merged_at, synced_at_ms, repo_id)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-        ON CONFLICT(owner, repo, number) DO UPDATE SET
+        ON CONFLICT(repo_id, owner, repo, number) DO UPDATE SET
             html_url = excluded.html_url, state = excluded.state, title = excluded.title,
             body = excluded.body, author = excluded.author, created_at = excluded.created_at,
             updated_at = excluded.updated_at, merged_at = excluded.merged_at,
-            synced_at_ms = excluded.synced_at_ms, repo_id = excluded.repo_id
+            synced_at_ms = excluded.synced_at_ms
         ",
         params![
             pull.owner,

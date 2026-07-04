@@ -91,6 +91,13 @@ pub(crate) fn current_embedding_count(conn: &Connection, model_id: &str) -> anyh
         SELECT COUNT(*)
         FROM chunk_embeddings
         JOIN chunks ON chunks.id = chunk_embeddings.chunk_id
+        -- Scope through the active `files` view (temp.files: repo_id + live generation), exactly \
+         as
+        -- the `current_artifact_count` sibling does — otherwise this counts every repo's and every
+        -- staged generation's embeddings on a consolidated DB. Without a connection context, \
+         `files`
+        -- falls back to the base table (all commits), preserving the single-repo behavior.
+        JOIN files ON files.id = chunks.file_id
         JOIN ai_models ON ai_models.model_id = chunk_embeddings.model_id
         WHERE chunk_embeddings.model_id = ?1
           AND ai_models.installed = 1

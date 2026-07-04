@@ -3324,6 +3324,7 @@ dependencies = [
  "rag-rat-core",
  "rag-rat-mcp",
  "ratatui",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

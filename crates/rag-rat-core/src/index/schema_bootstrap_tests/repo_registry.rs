@@ -349,20 +349,25 @@ fn register_repo_appends_a_second_root() {
     assert_eq!(root_count(&conn, "repo-abc"), 2, "both roots recorded");
 }
 
-/// Once a real repo owns the DB, registering a DIFFERENT real repo is REFUSED (the single-repo
-/// invariant for phase A — multi-repo registration lands with the default-path flip).
+/// A7: once a real repo owns the DB, registering a DIFFERENT real repo at an unclaimed root
+/// REGISTERS IT — several repos sharing one global database is the multi-repo default (replacing
+/// phase A's single-repo "refuse a second real repo" invariant). Both repos coexist; neither is
+/// re-pointed.
 #[test]
-fn register_repo_refuses_a_different_real_repo() {
+fn register_repo_registers_a_second_repo_in_a_consolidated_db() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     schema::apply(&conn).expect("apply");
     register_repo(&conn, &identity("repo-abc", "a"), Path::new("/src/a"), 1).unwrap();
 
-    let err = register_repo(&conn, &identity("repo-xyz", "b"), Path::new("/src/b"), 2)
-        .expect_err("a different real repo must be refused");
-    assert!(err.to_string().contains("repo-abc"), "refusal names the incumbent repo: {err}");
-    // The incumbent is untouched; the intruder never landed.
+    let registered = register_repo(&conn, &identity("repo-xyz", "b"), Path::new("/src/b"), 2)
+        .expect("a different real repo at an unclaimed root registers as a second repo");
+    assert_eq!(registered, "repo-xyz");
+    // Both repos are real, each with its own recorded root; neither was re-pointed.
     assert_eq!(repo_row_count(&conn, "repo-abc"), 1);
-    assert_eq!(repo_row_count(&conn, "repo-xyz"), 0);
+    assert_eq!(repo_row_count(&conn, "repo-xyz"), 1);
+    assert_eq!(root_count(&conn, "repo-abc"), 1);
+    assert_eq!(root_count(&conn, "repo-xyz"), 1);
+    assert!(schema::multiple_real_repos(&conn).unwrap(), "the DB now holds two real repos");
 }
 
 // --- V039: per-repo meta relocation (memory-sync phase A2) ---
@@ -1509,12 +1514,14 @@ fn head_commit_hash(root: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-/// PROOF is REQUIRED, not just a `local:` prefix (round-6 P2 #4): a DB first indexed from a cut
-/// shallow clone of repo X, later opened from an UNRELATED full repo Y at the same DB path, must be
-/// REFUSED — Y's HEAD reaches NONE of X's boundary commits, so re-pointing the index onto Y's id
-/// would migrate one repo's data onto another. The refusal names the pin escape hatch.
+/// PROOF gates the RE-POINT, not the registration (A7): a DB first indexed from a cut shallow clone
+/// of repo X, later opened from an UNRELATED full repo Y at a NEW root, must NOT upgrade X's local
+/// id onto Y — Y's HEAD reaches NONE of X's boundary commits, so re-pointing would migrate one
+/// repo's data onto another. Instead Y registers as its OWN repo (the multi-repo default) and X's
+/// `local:` index is left exactly as it was. The critical safety — no cross-repo data migration —
+/// holds because the upgrade did not fire.
 #[test]
-fn register_repo_refuses_a_portable_upgrade_from_an_unrelated_repo() {
+fn register_repo_adds_an_unrelated_repo_without_upgrading_the_local_incumbent() {
     let repo_x = real_git_repo("origin-x");
     let x_boundary = head_commit_hash(&repo_x);
     let repo_y = real_git_repo("unrelated-y"); // an independent root — no shared history with X.
@@ -1530,15 +1537,13 @@ fn register_repo_refuses_a_portable_upgrade_from_an_unrelated_repo() {
     )
     .expect("the shallow clone of X adopts under its local id, recording X's boundary");
 
-    let err = register_repo(&conn, &identity("y-portable-root", "y"), repo_y.as_path(), 2)
-        .expect_err(
-            "an unrelated repo's HEAD does not reach X's boundary → the upgrade is refused",
-        );
-    let msg = err.to_string();
-    assert!(msg.contains("could not prove"), "refusal explains the missing proof: {msg}");
-    assert!(msg.contains("repo_id"), "refusal names the pin escape hatch: {msg}");
-    assert_eq!(schema::sole_repo_id(&conn).unwrap(), local_id, "the incumbent is untouched");
-    assert_eq!(repo_row_count(&conn, "y-portable-root"), 0, "the unrelated id never landed");
+    let registered = register_repo(&conn, &identity("y-portable-root", "y"), repo_y.as_path(), 2)
+        .expect("an unrelated repo at a new root registers as its own repo — no upgrade attempted");
+    assert_eq!(registered, "y-portable-root");
+    // X's local incumbent is untouched (NOT re-pointed onto Y); both repos now coexist.
+    assert_eq!(repo_row_count(&conn, local_id), 1, "X's local id is left as-is, never upgraded");
+    assert_eq!(repo_row_count(&conn, "y-portable-root"), 1, "Y registered as a separate repo");
+    assert!(schema::multiple_real_repos(&conn).unwrap(), "the DB now holds two real repos");
     let _ = fs::remove_dir_all(&repo_x);
     let _ = fs::remove_dir_all(&repo_y);
 }
@@ -1564,39 +1569,390 @@ fn register_repo_refuses_a_local_upgrade_without_a_recorded_boundary() {
     let _ = fs::remove_dir_all(&repo);
 }
 
-/// The upgrade is NARROW: only a `local:` incumbent upgrades. Two genuinely-different PORTABLE
-/// repos still trip the single-repo refusal — a Portable incoming must never silently re-point a
-/// Portable incumbent (that would be data loss across two real repos).
+/// A7: a second PORTABLE repo at a DIFFERENT root registers fresh (like any new repo) and NEVER
+/// re-points the incumbent — the upgrade machinery is reserved for a `local:` incumbent, so a
+/// Portable incoming can only ever add a new repo, never silently migrate one portable repo's rows
+/// onto another (which would be data loss). The incumbent is left exactly as it was.
 #[test]
-fn register_repo_refuses_a_portable_incoming_against_a_portable_incumbent() {
+fn register_repo_adds_a_second_portable_repo_without_repointing_the_incumbent() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     schema::apply(&conn).expect("apply");
     register_repo(&conn, &identity("portable-a", "a"), Path::new("/src/a"), 1).unwrap();
 
-    let err = register_repo(&conn, &identity("portable-b", "b"), Path::new("/src/b"), 2)
-        .expect_err("a second portable repo is refused — only a local: incumbent upgrades");
-    assert!(err.to_string().contains("portable-a"), "refusal names the incumbent: {err}");
-    assert_eq!(schema::sole_repo_id(&conn).unwrap(), "portable-a", "incumbent untouched");
-    assert_eq!(repo_row_count(&conn, "portable-b"), 0, "the intruder never landed");
+    register_repo(&conn, &identity("portable-b", "b"), Path::new("/src/b"), 2)
+        .expect("a second portable repo at an unclaimed root registers as its own repo");
+    // The incumbent is untouched (still one row, its own root); portable-b is a distinct repo.
+    assert_eq!(repo_row_count(&conn, "portable-a"), 1, "incumbent untouched — not re-pointed");
+    assert_eq!(root_count(&conn, "portable-a"), 1);
+    assert_eq!(repo_row_count(&conn, "portable-b"), 1, "the second portable repo landed");
 }
 
-/// A `LocalOnly` incoming against an existing REAL repo is refused — a deepened clone (or a second
-/// shallow clone) must never DOWNGRADE a portable id back to machine-local. The upgrade only runs
-/// in the Portable direction.
+/// The SECOND shallow clone of one upstream must not be stranded once the portable id exists
+/// (Codex batch 5): clones A and B register under distinct `local:` ids; A deepens and claims the
+/// portable id P; B deepens LATER — register_repo(P at B's root) hits the idempotent branch, whose
+/// root-owner guard would refuse (and pinning P re-enters the same refusal). The LATE-upgrade
+/// merge instead retires B's local id INTO P: B's AUTHORED memories move (rowid anchors nulled for
+/// re-resolution), B's DERIVED rows drop (a fresh index re-derives them under P), both roots land
+/// under P, and P's existing data — A's — is untouched.
 #[test]
-fn register_repo_refuses_a_local_only_incoming_against_a_real_incumbent() {
+fn second_shallow_clone_late_upgrades_into_the_existing_portable_repo() {
+    let root_b = real_git_repo("late-b");
+    let boundary_b = head_commit_hash(&root_b);
+
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+
+    // A's story already completed: the portable id P is registered at A's root (the in-place
+    // upgrade path, covered by its own tests) and carries A's authored + derived data.
+    register_repo(&conn, &identity("P-portable", "up"), Path::new("/src/clone-a"), 1).unwrap();
+    conn.execute(
+        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms,          updated_at_ms, source, memory_version, repo_id)
+         VALUES ('mem-a', 'Invariant', 'a title', 'a body', 'high', 'active', 0, 0, 'agent',          'v1', 'P-portable')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,          commit_sha, worktree_id, repo_id, generation)
+         VALUES ('src/shared.rs', 'rust', 'source', 'a-sha', 0, 0, 'c1', '', 'P-portable', 0)",
+        [],
+    )
+    .unwrap();
+
+    // B registers as a shallow clone at its own (real) root, with its boundary recorded, and
+    // authors a memory (full anchor set) plus a derived file row.
+    register_repo(
+        &conn,
+        &identity_local("local:bbbb", "clone-b", vec![boundary_b]),
+        root_b.as_path(),
+        2,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms,          updated_at_ms, source, memory_version, repo_id)
+         VALUES ('mem-b', 'Decision', 'b title', 'b body', 'high', 'active', 0, 0, 'agent',          'v1', 'local:bbbb')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path,          \
+         logical_symbol_id, symbol_id, chunk_id, edge_id, anchor_status, created_at_ms, repo_id)
+         VALUES ('mem-b', 'path', 'bind-b', 'src/b.rs', 11, 22, 33, 44, 'current', 0,          \
+         'local:bbbb')",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO repo_memory_tags(memory_id, tag) VALUES ('mem-b', 'tag-b')", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO repo_memory_call_paths(memory_id, start_logical_symbol_id,          \
+         end_logical_symbol_id, edge_sequence_hash, path_summary, created_at_ms)
+         VALUES ('mem-b', 55, 66, 'hash-b', 'x -> y', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)
+         VALUES ('local:bbbb', 'mem-b', 'b title', 'b body', 'Decision', 'tag-b')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,          commit_sha, worktree_id, repo_id, generation)
+         VALUES ('src/shared.rs', 'rust', 'source', 'b-sha', 0, 0, 'c1', '', 'local:bbbb', 0)",
+        [],
+    )
+    .unwrap();
+
+    // B deepens: the incoming portable identity is the ALREADY-REGISTERED P at B's root — the
+    // late-upgrade merge, not a refusal.
+    let registered = register_repo(&conn, &identity("P-portable", "up"), root_b.as_path(), 3)
+        .expect("the second clone's late upgrade must complete, never strand");
+    assert_eq!(registered, "P-portable");
+
+    // The local id is retired; BOTH roots live under P.
+    assert_eq!(repo_row_count(&conn, "local:bbbb"), 0, "B's local id retired");
+    for root in ["/src/clone-a", &root_b.to_string_lossy()] {
+        let owned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM repo_roots WHERE repo_id = 'P-portable' AND root = ?1",
+                [root],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owned, 1, "root {root} recorded under P");
+    }
+
+    // B's memory MOVED with correct attribution: repo_id = P, rowid anchors nulled, portable
+    // anchor + tag + call-path + FTS row intact.
+    let (repo, ls, sy, path_col): (String, Option<i64>, Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT m.repo_id, b.logical_symbol_id, b.symbol_id, b.path
+             FROM repo_memories m JOIN repo_memory_bindings b ON b.memory_id = m.id
+             WHERE m.id = 'mem-b'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(repo, "P-portable", "B's memory re-attributed to P");
+    assert_eq!((ls, sy), (None, None), "rowid anchors nulled for re-resolution");
+    assert_eq!(path_col.as_deref(), Some("src/b.rs"), "portable anchor survives");
+    let (cp_start, fts_repo): (Option<i64>, String) = conn
+        .query_row(
+            "SELECT cp.start_logical_symbol_id, f.repo_id
+             FROM repo_memory_call_paths cp, repo_memory_fts f
+             WHERE cp.memory_id = 'mem-b' AND f.memory_id = 'mem-b'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(cp_start, None, "call-path endpoints nulled");
+    assert_eq!(fts_repo, "P-portable", "FTS mirror row follows the memory");
+
+    // B's DERIVED row dropped (re-derived by the next index); A's data untouched.
+    let b_files: i64 = conn
+        .query_row("SELECT COUNT(*) FROM main.files WHERE sha256 = 'b-sha'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(b_files, 0, "B's derived rows dropped, not migrated");
+    let (a_mem, a_files): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM repo_memories WHERE id='mem-a' AND              \
+             repo_id='P-portable' AND title='a title'),
+                    (SELECT COUNT(*) FROM main.files WHERE sha256='a-sha' AND              \
+             repo_id='P-portable')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((a_mem, a_files), (1, 1), "P's existing (A's) data untouched by the merge");
+
+    // The flow is now plainly idempotent: P at B's root re-registers without drama.
+    register_repo(&conn, &identity("P-portable", "up"), root_b.as_path(), 4)
+        .expect("post-merge re-registration is the plain idempotent path");
+    let _ = fs::remove_dir_all(&root_b);
+}
+
+/// The read-only resolver MIRRORS `register_repo`'s root-owner refusal: an `[index] repo_id` pin
+/// switched to a SIBLING's id at a root recorded under another repo must NOT resolve on the
+/// read-only fast path (MCP reads / hooks would silently serve the sibling's scope while the
+/// write path refuses). `None` declines the fast path so the read-write open surfaces the refusal.
+#[test]
+fn read_only_resolver_declines_a_pin_onto_a_root_owned_by_another_repo() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    register_repo(&conn, &identity("repo-a", "a"), Path::new("/src/a"), 1).unwrap();
+    register_repo(&conn, &identity("repo-b", "b"), Path::new("/src/b"), 2).unwrap();
+
+    // The pin names repo-b, but /src/a is recorded under repo-a → decline (mirror of the write
+    // path's mismatched-root refusal).
+    let resolved =
+        schema::resolve_config_repo_id(&conn, Path::new("/src/a"), Some("repo-b")).unwrap();
+    assert_eq!(resolved, None, "a sibling-id pin at an owned root must not fast-path resolve");
+
+    // Control: the OWNING repo's own pin at its root still resolves.
+    let resolved =
+        schema::resolve_config_repo_id(&conn, Path::new("/src/a"), Some("repo-a")).unwrap();
+    assert_eq!(resolved.as_deref(), Some("repo-a"), "self-ownership resolves normally");
+}
+
+/// Adoption re-points write the REAL tables even when the connection carries a temp `files` scope
+/// view — the incremental pass's bare open installs one BEFORE `adopt_repo_from_config` runs, and
+/// an unqualified `UPDATE files` resolves to the view ("cannot modify files because it is a
+/// view"), aborting the first index of a fresh keyless DB in an identity-bearing repo.
+#[test]
+fn adoption_repoints_files_through_a_connection_carrying_the_scope_view() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    // A placeholder-scoped file row awaiting adoption.
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id, repo_id, generation)
+         VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0, '', '', '__unassigned__', 0)",
+        [],
+    )
+    .unwrap();
+    // The temp `files` view a bare open installs (shape irrelevant — its EXISTENCE is what
+    // shadows the table name for unqualified writes).
+    conn.execute_batch(
+        "CREATE TEMP VIEW files AS SELECT * FROM main.files WHERE repo_id = '__unassigned__'",
+    )
+    .unwrap();
+
+    register_repo(&conn, &identity("repo-viewed", "v"), Path::new("/src/v"), 1)
+        .expect("adoption must write main.files through the shadowing temp view");
+    let adopted: i64 = conn
+        .query_row("SELECT COUNT(*) FROM main.files WHERE repo_id = 'repo-viewed'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(adopted, 1, "the placeholder file row re-pointed to the adopted id");
+}
+
+/// The upgrade scan matches on (root AND boundary), never boundary alone: with TWO shallow clones
+/// of the same upstream registered under distinct `local:` ids — an ordinary shape on the shared
+/// global DB — a deepened checkout's HEAD reaches BOTH boundaries, and a boundary-only pick would
+/// re-point whichever incumbent SORTS first, hijacking the sibling clone's index and stranding the
+/// actually-deepened one. The root match pins the upgrade to the working tree that was deepened.
+#[test]
+fn upgrade_picks_the_root_matching_incumbent_among_two_shallow_clones() {
+    let repo = real_git_repo("two-shallow"); // clone B's working tree — the one that deepens.
+    let boundary = head_commit_hash(&repo);
+
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    // Clone A: a SIBLING shallow clone of the same upstream at a DIFFERENT root, whose id sorts
+    // FIRST — the incumbent a boundary-only scan would wrongly pick (its boundary is equally
+    // reachable from the deepened HEAD).
+    register_repo(
+        &conn,
+        &identity_local("local:aaa", "clone-a", vec![boundary.clone()]),
+        Path::new("/src/clone-a"),
+        1,
+    )
+    .expect("sibling shallow clone registers fresh at its own root");
+    // Clone B: the clone that will be deepened, registered at the REAL working tree.
+    register_repo(
+        &conn,
+        &identity_local("local:bbb", "clone-b", vec![boundary]),
+        repo.as_path(),
+        2,
+    )
+    .expect("second shallow clone registers fresh at its own root");
+
+    // B deepens (its HEAD reaches both recorded boundaries) and re-registers portable from B's
+    // root: ONLY B's incumbent upgrades.
+    register_repo(&conn, &identity("portable-root", "b"), repo.as_path(), 3)
+        .expect("the deepened clone upgrades its own incumbent");
+    assert_eq!(repo_row_count(&conn, "local:bbb"), 0, "B's local id upgraded in place");
+    assert_eq!(repo_row_count(&conn, "portable-root"), 1);
+    assert_eq!(
+        repo_row_count(&conn, "local:aaa"),
+        1,
+        "the first-sorting SIBLING incumbent is untouched — never hijacked by boundary alone",
+    );
+    // And the untouched sibling is not bricked: its own re-registration stays idempotent.
+    register_repo(
+        &conn,
+        &identity_local("local:aaa", "clone-a", vec![]),
+        Path::new("/src/clone-a"),
+        4,
+    )
+    .expect("the sibling clone keeps re-registering under its own id");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+/// The IDEMPOTENT path carries the root-owner guard too: a checkout whose identity changes to an
+/// ALREADY-REGISTERED id (a pin switched to an existing repo, an in-place re-clone) must not
+/// silently record one physical root under TWO repos — that would make `resolve_config_repo_id`'s
+/// recorded-root route (`LIMIT 1` over two owners) non-deterministic.
+#[test]
+fn idempotent_reregistration_refuses_a_root_owned_by_another_repo() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    register_repo(&conn, &identity("repo-abc", "a"), Path::new("/src/a"), 1).unwrap();
+    register_repo(&conn, &identity("repo-xyz", "b"), Path::new("/src/b"), 2).unwrap();
+
+    // repo-xyz (already registered) shows up at repo-abc's root — an identity change, not a new
+    // worktree of xyz. Refused; the root stays mapped to exactly one repo.
+    let err = register_repo(&conn, &identity("repo-xyz", "b"), Path::new("/src/a"), 3)
+        .expect_err("an owned root must not be recorded under a second repo");
+    assert!(err.to_string().contains("repo-abc"), "refusal names the owning repo: {err}");
+    let owners: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT repo_id) FROM repo_roots WHERE root = '/src/a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(owners, 1, "one physical root maps to exactly one repo");
+    // The same repo's own root re-registration stays idempotent (self-ownership never trips).
+    register_repo(&conn, &identity("repo-xyz", "b"), Path::new("/src/b"), 4)
+        .expect("re-registering an owned root under its OWN repo is idempotent");
+}
+
+/// Two repos' concurrent FIRST registrations on one shared file DB both succeed (A7): the
+/// DB-global registry lock serializes the read-decide-write sequence, so neither writer sees the
+/// torn middle (`SQLITE_BUSY_SNAPSHOT` on a deferred upgrade, or a `repos`-PK constraint on the
+/// same-id race). The same-id pair collapses the loser into the idempotent path.
+#[test]
+fn concurrent_registrations_on_a_shared_db_both_succeed() {
+    use std::sync::{Arc, Barrier};
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let db_path = root.join("global.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        schema::apply(&conn).unwrap();
+    }
+
+    // Round 1: two DIFFERENT repos race their first registration.
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = ["repo-one", "repo-two"]
+        .into_iter()
+        .map(|id| {
+            let barrier = Arc::clone(&barrier);
+            let db_path = db_path.clone();
+            std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+                barrier.wait();
+                register_repo(&conn, &identity(id, id), Path::new(&format!("/src/{id}")), 1)
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().expect("a concurrent first registration must succeed");
+    }
+
+    // Round 2: the SAME repo races itself (two worktrees' first open) — winner registers, loser
+    // collapses into the idempotent path; never a PK constraint.
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let db_path = db_path.clone();
+            std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+                barrier.wait();
+                register_repo(&conn, &identity("repo-same", "s"), Path::new("/src/same"), 2)
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().expect("a same-id registration race must collapse idempotently");
+    }
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    for id in ["repo-one", "repo-two", "repo-same"] {
+        assert_eq!(repo_row_count(&conn, id), 1, "{id} registered exactly once");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A `LocalOnly` incoming for a working tree ALREADY registered under a real repo is refused — a
+/// re-shallowed clone must never DOWNGRADE the portable id its root already owns. Keyed on the ROOT
+/// (`real_root_owner`): the same physical path resolving to a machine-local id while it is recorded
+/// under a portable one is exactly the downgrade the refusal guards. (A LocalOnly incoming at a
+/// NEW, unclaimed root is instead a genuinely new shallow repo and registers fresh.)
+#[test]
+fn register_repo_refuses_a_local_only_downgrade_of_an_owned_root() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     schema::apply(&conn).expect("apply");
     register_repo(&conn, &identity("portable-a", "a"), Path::new("/src/a"), 1).unwrap();
 
+    // Same root as portable-a: a re-shallowed clone of A resolving to a machine-local id.
     let err = register_repo(
         &conn,
         &identity_local("local:beef", "shallow", vec![]),
-        Path::new("/src/s"),
+        Path::new("/src/a"),
         2,
     )
-    .expect_err("a LocalOnly incoming must not downgrade a portable incumbent");
-    assert!(err.to_string().contains("portable-a"), "refusal names the incumbent: {err}");
+    .expect_err("a LocalOnly incoming must not downgrade the portable id its root already owns");
+    assert!(err.to_string().contains("portable-a"), "refusal names the owning repo: {err}");
     assert_eq!(schema::sole_repo_id(&conn).unwrap(), "portable-a", "portable id stays");
     assert_eq!(repo_row_count(&conn, "local:beef"), 0, "the local id never landed");
 }
@@ -1931,6 +2287,51 @@ fn open_config_falls_back_to_the_sole_repo_on_a_non_git_root() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// The STRUCTURAL BACKSTOP for the identity gate's second entrance (Codex batch 8, finding 5): an
+/// identity-less root (non-git) whose explicit `database` pin lands on a MULTI-repo store must
+/// never sole-pick — `sole_repo_id`'s lexicographic tiebreak would silently adopt the first
+/// SIBLING repo and write this project's rows under it. The open REFUSES with the remedy, and the
+/// siblings' registry state is untouched. (The global-path pin shape is already refused at
+/// `Config::load`; this closes every other shared-path entrance — the same doctrine as the
+/// config-less bare-open fail-fast and the healers' witness.)
+#[test]
+fn an_identity_less_open_refuses_to_sole_pick_on_a_multi_repo_db() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let mut config = source_config(root.clone(), Language::Rust);
+    // The pin points at a SHARED store that already holds two sibling repos.
+    config.database = root.join("shared.sqlite");
+    IndexDatabase::migrate(&config.database).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        for repo in ["repo-alpha", "repo-beta"] {
+            conn.execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
+                [repo],
+            )
+            .unwrap();
+        }
+    }
+
+    let err = IndexDatabase::open_config(&config)
+        .expect_err("an identity-less root must not guess a repo on a multi-repo store");
+    assert!(
+        err.to_string().contains("no resolvable repo identity")
+            && err.to_string().contains("repo_id"),
+        "the refusal names the problem and the remedy: {err}"
+    );
+    // The siblings are untouched — no adoption, no placeholder re-point, no root recorded.
+    let conn = rusqlite::Connection::open(&config.database).unwrap();
+    let repos: i64 = conn
+        .query_row("SELECT COUNT(*) FROM repos WHERE repo_id != ?1", [LEGACY_REPO_ID], |r| r.get(0))
+        .unwrap();
+    assert_eq!(repos, 2, "both siblings still registered, nothing adopted");
+    let roots: i64 = conn.query_row("SELECT COUNT(*) FROM repo_roots", [], |r| r.get(0)).unwrap();
+    assert_eq!(roots, 0, "no root was recorded for the refused open");
+    let _ = fs::remove_dir_all(root);
+}
+
 // --- V041: repo_id scoping on the GitHub papertrail tables (memory-sync phase A4) ---
 
 /// The pre-V041 shape of the seven GitHub tables + `github_fts` (no `repo_id`) plus the V038
@@ -2246,14 +2647,14 @@ fn migration_041_leaves_github_rows_at_the_placeholder_on_a_consolidated_db() {
     }
 }
 
-/// The reclamation half of the consolidated-DB gate: the github tables keep natural keys WITHOUT
-/// `repo_id`, so a placeholder-stranded row OCCUPIES its key — a conflict-ignoring writer could
-/// never repopulate it and the cache would be stranded forever. The writers upsert-reclaim
-/// instead: the next sync that touches a stranded key re-stamps `repo_id`, refreshes the content,
-/// and the sync-tail `rebuild_fts` re-derives the mirror. Rows the sync does NOT touch stay under
-/// the placeholder (they wait for their own repo's sync).
+/// V044 widens the github natural keys to fold `repo_id`, so a placeholder-stranded row no longer
+/// OCCUPIES a real repo's key: a syncing repo writes its OWN row (fresh content, its `repo_id`)
+/// ALONGSIDE the stranded placeholder row rather than clobbering it or reclaiming it. Cross-repo
+/// isolation is the win — the placeholder rows are re-pointed separately at ADOPTION (see
+/// `register_repo_repoints_github_papertrail_rows_to_the_real_id`). This supersedes the V041
+/// upsert-reclaim workaround (which existed only because the keys were un-widened before A7).
 #[test]
-fn v041_placeholder_github_rows_are_reclaimed_by_the_next_sync() {
+fn v044_a_syncing_repo_is_isolated_from_stranded_placeholder_github_rows() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
     // The state the consolidated-DB gate leaves: github rows stranded under the placeholder on a
@@ -2317,26 +2718,35 @@ fn v041_placeholder_github_rows_are_reclaimed_by_the_next_sync() {
     // The sync tail: the whole-table mirror rebuild follows the reclaimed base rows.
     crate::index::github::rebuild_fts(&conn).unwrap();
 
-    // The touched rows are re-stamped to repo-a with refreshed content…
-    let (issue_repo, issue_title): (String, String) = conn
-        .query_row("SELECT repo_id, title FROM github_issues WHERE number = 7", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+    // repo-a's sync wrote its OWN issue row with fresh content, under its own repo_id…
+    let a_title: String = conn
+        .query_row(
+            "SELECT title FROM github_issues WHERE number = 7 AND repo_id = 'repo-a'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert_eq!(issue_repo, "repo-a", "the stranded issue row is reclaimed by the syncing repo");
-    assert_eq!(issue_title, "fresh title", "reclaim refreshes the content, not just the stamp");
-    for table in ["github_refs", "github_ref_sync"] {
-        let repo: String = conn
-            .query_row(&format!("SELECT repo_id FROM {table} WHERE number = 7"), [], |r| r.get(0))
+    assert_eq!(a_title, "fresh title", "repo-a's sync wrote its own fresh row");
+    // …and the stranded placeholder row for the SAME (owner, repo, number) is UNTOUCHED — the
+    // widened key keeps them distinct instead of one clobbering the other.
+    let placeholder_title: String = conn
+        .query_row(
+            &format!(
+                "SELECT title FROM github_issues WHERE number = 7 AND repo_id = '{LEGACY_REPO_ID}'"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(placeholder_title, "stale title", "the stranded placeholder row is not reclaimed");
+    // Each base table now holds TWO rows for o/r#7 — repo-a's and the placeholder's — coexisting.
+    for table in ["github_issues", "github_refs", "github_ref_sync"] {
+        let rows: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE number = 7"), [], |r| r.get(0))
             .unwrap();
-        assert_eq!(repo, "repo-a", "{table}: stranded row reclaimed");
+        assert_eq!(rows, 2, "{table}: repo-a's row coexists with the stranded placeholder row");
     }
-    // …the FTS mirror is consistent with the reclaimed base rows…
-    let fts_repo: String = conn
-        .query_row("SELECT repo_id FROM github_fts WHERE number = 7", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(fts_repo, "repo-a", "the mirror row follows the reclaimed base row");
-    // …a scoped read now sees the papertrail…
+    // A scoped read for repo-a sees exactly its own fresh row, never the placeholder's.
     let visible: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM github_issues WHERE repo_id = 'repo-a' AND number = 7",
@@ -2344,14 +2754,12 @@ fn v041_placeholder_github_rows_are_reclaimed_by_the_next_sync() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(visible, 1, "the reclaimed row is visible to repo-a's scoped reads");
-    // …and the row the sync did NOT touch stays under the placeholder for its own repo's sync.
-    for table in ["github_issues", "github_fts"] {
-        let repo: String = conn
-            .query_row(&format!("SELECT repo_id FROM {table} WHERE number = 8"), [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(repo, LEGACY_REPO_ID, "{table}: untouched stranded row stays placeholder");
-    }
+    assert_eq!(visible, 1, "repo-a's scoped read sees exactly its own row");
+    // The row the sync did NOT touch (o/r#8) stays under the placeholder for its own repo's sync.
+    let untouched: String = conn
+        .query_row("SELECT repo_id FROM github_issues WHERE number = 8", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(untouched, LEGACY_REPO_ID, "the untouched stranded row stays placeholder");
 }
 
 /// A V040 index forward-migrates to V041 on `migrate_forward` — reaching LATEST.
@@ -2419,9 +2827,10 @@ fn seed_pre_v042_periphery_schema(conn: &rusqlite::Connection) {
 fn migration_042_is_the_latest_tip_and_scopes_periphery() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V042 is no longer the ABSOLUTE tip (V043 adds files.generation on top); the tip pin moves to
-    // the newest migration's test (`schema_at_latest_after_apply_is_v043` in generation_rebuild).
-    // Here just assert `apply` reaches LATEST — V042's periphery scoping is on the way to the tip.
+    // V042 is no longer the ABSOLUTE tip (V043 adds files.generation, V044 widens the github keys);
+    // the tip pin lives with the newest migration's test (`v044_widens_the_github_natural_keys_...`
+    // in github_papertrail). Here just assert `apply` reaches LATEST — V042 is on the way to the
+    // tip.
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,

@@ -47,15 +47,15 @@ impl IndexDatabase {
             return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
 
-        // Open with the graph check DEFERRED (`check_graph = false`). `Self::open`'s eager check
-        // runs `ensure_graph_index_current` — a repo-scoped edge DELETE+rebuild keyed on
-        // `active_repo_id` — during the open itself, BEFORE this pass adopts the config's repo. On
-        // a consolidated DB `Self::open` scopes to the config-blind SOLE repo (the
-        // lexicographically-first), so the eager check would refresh/wipe the WRONG repo's graph
-        // (or skip the config repo's own stale graph) before adoption switches scope. Adopt
-        // + install the scope context FIRST, then run the graph/generated-flags heal for
-        // the correct repo — the exact sequence `open_config` uses.
-        let mut db = Self::open_with_graph_check(&config.database, false)?;
+        // Open in ADOPTION-PENDING mode: the multi-repo fail-fast must not fire (the config below
+        // supplies the scope, unlike a genuinely config-less `Self::open`), and the graph check is
+        // DEFERRED — its `ensure_graph_index_current` is a repo-scoped edge DELETE+rebuild keyed
+        // on `active_repo_id`, which pre-adoption would resolve the config-blind SOLE-repo pick
+        // and refresh/wipe the WRONG repo's graph (or skip the config repo's own stale graph).
+        // Adopt + install the scope context FIRST, then run the graph/generated-flags heal for the
+        // correct repo — the exact sequence `open_config` uses.
+        let mut db =
+            Self::open_bare(&config.database, super::lifecycle::BareOpenMode::AdoptionPending)?;
         // Register/adopt the config's repo BEFORE `set_context` stamps `active_repo_id` into the
         // scope view (A3). `Self::open` scoped to the SOLE repo via the config-blind fallback; on a
         // consolidated DB that would pick the lexicographically-first repo, so this incremental
@@ -66,6 +66,26 @@ impl IndexDatabase {
         db.adopt_repo_from_config(config)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
+        // ADOPTION RESETS ALL CONNECTION-CARRIED REPO-DERIVED STATE BEFORE ANY DEFERRED HEAL (the
+        // rule that closes the pre-adoption-pick family). `open_bare` derived per-repo state from
+        // the config-less SOLE pick — on a consolidated DB, a first-sorting SIBLING — and each
+        // piece must be re-derived for the adopted repo before a heal consumes it:
+        //  * `active_repo_id` / scope view / `active_generation` — re-derived by
+        //    `adopt_repo_from_config` + `set_context` above;
+        //  * `source_root` — reset HERE from the config: `ensure_graph_index_current` re-reads
+        //    changed files from `source_root.join(path)` while stamping the ADOPTED repo, so a
+        //    stale sibling root would refresh the target's graph from the WRONG CHECKOUT;
+        //  * the model-manifest heal — deferred below, so its `repo_meta` reads/writes resolve the
+        //    adopted repo, not the pick.
+        // (`active_commit_sha` / `active_worktree_id` were set by `set_context`; the GitHub
+        // context and `_identity_lock` are not repo-pick-derived.)
+        db.storage.set_source_root(config.root.clone());
+        // The DEFERRED model-manifest heal (open_bare skips it in AdoptionPending mode): now that
+        // the scope context names the CONFIG's repo, a heal-owed pass reads/clears the RIGHT
+        // repo's `repo_meta` active-model keys under the lock this command actually holds —
+        // pre-adoption it resolved the sole-repo pick, mutating a first-sorting SIBLING's meta on
+        // a consolidated DB. The `open_config` ordering, mirrored.
+        ai::ensure_model_manifest(db.storage.connection())?;
         // Now that the config's repo is adopted and its scope is installed, run the deferred graph
         // + generated-flags heal against the RIGHT repo (the graph check's edge DELETE is
         // scoped by `active_repo_id`, so it must not run under the pre-adoption sole-repo

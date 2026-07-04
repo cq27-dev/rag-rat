@@ -54,6 +54,7 @@ pub fn temp_db_path() -> PathBuf {
 pub fn bench_config(subdir: &str) -> Config {
     Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: corpus_dir(),
         database: temp_db_path(),
         targets: vec![ResolvedTarget {

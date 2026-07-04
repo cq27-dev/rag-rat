@@ -9,6 +9,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
 
     let config = Config {
         repo_id_override: None,
+        database_key_pinned: true,
         root: root.clone(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {

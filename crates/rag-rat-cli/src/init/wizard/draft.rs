@@ -16,7 +16,7 @@ use toml_edit::{Array, DocumentMut, Item, Table};
 
 use crate::init::render::{config_root_value, display_rel, render_config};
 use crate::init::scan::{candidate_dirs, estimated_chunks, recommend_backend};
-use crate::init::{DEFAULT_DATABASE, InitPlan, RepoScan};
+use crate::init::{InitPlan, RepoScan};
 
 /// The embedding remote connection mode, derived from `RemoteEmbeddingConfig`.
 ///
@@ -214,12 +214,14 @@ pub(crate) struct WizardDraft {
     /// Resolved absolute repo root, for dir-existence validation; NOT serialized — only
     /// `root_value` renders to TOML.
     pub root_abs: PathBuf,
-    /// The `[index] database` value.
+    /// The RESOLVED database path — where this repo's index actually lands, for display.
     ///
-    /// Captured from the existing config (reconfigure) so a future Database step can surface/edit
-    /// it, but NOT yet emitted: `write_fresh` uses `DEFAULT_DATABASE` and `patch_existing` only
-    /// touches `[index] root` (toml_edit preserves any existing `database` key untouched).
-    /// Reserved seam — keep the narrow allow until a step writes it back.
+    /// For a fresh draft this is the keyless default (`config::default_database_path`: the
+    /// machine-global store, or a pre-existing legacy `.rag-rat/index.sqlite`); for a reconfigure
+    /// it is `Config::load`'s resolved `database` (an explicit key, or the same keyless default).
+    /// NOT emitted: `write_fresh` renders a keyless config (the A7 global default) and
+    /// `patch_existing` never touches `database` (toml_edit preserves an existing explicit key
+    /// untouched). Reserved seam — keep the narrow allow until a step surfaces/edits it.
     #[allow(dead_code)]
     pub db_path: String,
     /// Per-language directory bindings (`[target_bindings]`).
@@ -292,10 +294,16 @@ impl WizardDraft {
         let backend = recommend_backend(estimated_chunks(scan.total_source_bytes()));
         let oracle = OracleConfig::default();
 
+        // The RESOLVED landing spot for the keyless config this draft renders (display only):
+        // the machine-global store, or a pre-existing legacy `.rag-rat/index.sqlite`.
+        let db_path = rag_rat_core::config::default_database_path(&root_abs, &root_abs, None)
+            .display()
+            .to_string();
+
         Self {
             root_value,
             root_abs,
-            db_path: DEFAULT_DATABASE.to_string(),
+            db_path,
             bindings,
             has_rich_targets: false,
             rich_target_names: BTreeSet::new(),
@@ -733,6 +741,41 @@ mod tests {
         assert!(!RUNPOD_GPUS.contains(&"NVIDIA A100"));
         assert!(!RUNPOD_GPUS.contains(&"NVIDIA H100"));
         assert!(!RUNPOD_GPUS.contains(&"NVIDIA RTX 4090"));
+    }
+
+    /// A7 reconfigure invariant: an EXPLICIT `[index] database` key in the original TOML survives
+    /// `patch_existing` byte-for-byte — the wizard never un-migrates a deliberately per-repo config
+    /// (and never adds a key to a keyless one; `write_fresh` renders keyless).
+    #[test]
+    fn patch_existing_preserves_an_explicit_database_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let config_path = dir.path().join("rag-rat.toml");
+        let raw = "[index]\nroot = \".\"\ndatabase = \
+                   \"custom/index.sqlite\"\n\n[llm.embedding]\nmodel = \
+                   \"none\"\n\n[target_bindings]\nrust = [\"src\"]\n";
+        std::fs::write(&config_path, raw).unwrap();
+        let cfg = rag_rat_core::config::Config::load(&config_path).unwrap();
+
+        let d = WizardDraft::from_existing(raw, &cfg, &config_path);
+        // The display seam shows the RESOLVED path (the explicit key, made absolute by load).
+        assert!(
+            d.db_path.ends_with("custom/index.sqlite"),
+            "reconfigure displays the explicit database path, got {}",
+            d.db_path
+        );
+        let patched = d.patch_existing(raw).unwrap();
+        assert!(
+            patched.contains("database = \"custom/index.sqlite\""),
+            "the explicit key must survive a reconfigure untouched:\n{patched}"
+        );
+
+        // The fresh-write path is the keyless counterpart: no active `database` key rendered.
+        let fresh = d.write_fresh();
+        assert!(
+            !fresh.lines().any(|line| line.trim_start().starts_with("database")),
+            "write_fresh must render a keyless config:\n{fresh}"
+        );
     }
 
     #[test]

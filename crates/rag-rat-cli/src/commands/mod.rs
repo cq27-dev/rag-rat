@@ -6,6 +6,7 @@
 
 mod clones;
 mod config_info;
+mod consolidate;
 mod format;
 mod hooks;
 mod index_ops;
@@ -17,6 +18,7 @@ mod search;
 
 pub(crate) use clones::{clones, clones_for};
 pub(crate) use config_info::{dump_config, version_check};
+pub(crate) use consolidate::consolidate;
 pub(crate) use format::{output_format, set_output_format};
 pub(crate) use hooks::{claude_hooks, github, hooks};
 pub(crate) use index_ops::{doctor, index, maintenance, reconcile};

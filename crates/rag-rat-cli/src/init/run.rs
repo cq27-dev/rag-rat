@@ -7,6 +7,18 @@ pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Res
     let _terminal_reset = TerminalResetGuard::install_if_interactive(!options.yes)?;
     let root = env::current_dir()?.canonicalize()?;
 
+    // A config authored in a LINKED worktree is a trap: `Config::load`'s governing seam resolves
+    // every worktree of a repo through the MAIN worktree's `rag-rat.toml`, so a branch-local file
+    // would be ignored the moment main gains one (and governs only by fallback until then).
+    // Refuse with the pointer instead of writing a file that doesn't do what it says.
+    if let Some(main_root) = rag_rat_core::config::linked_worktree_main_root(&root) {
+        anyhow::bail!(
+            "this is a linked git worktree; the repo's rag-rat.toml lives in the main worktree — \
+             run `rag-rat init` there instead: {}",
+            main_root.display()
+        );
+    }
+
     // The interactive path runs the full-screen ratatui wizard. `--yes` keeps the legacy
     // `default_plan` + `render_config` flow; `--dry-run` remains interactive unless paired with
     // `--yes`, so the preview reflects the wizard choices.
@@ -302,7 +314,12 @@ pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
 }
 pub(crate) fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
     eprintln!("init: migrating SQLite schema");
-    let migration = IndexDatabase::migrate(&config.database)?;
+    // SCHEMA-ONLY: init's subject repo is NOT registered yet (this is its very first index), so on
+    // a global DB that already holds another repo the healing `migrate`'s open-time healers would
+    // attribute an owed heal to that SIBLING via the witness's sole-repo arm — the same
+    // unregistered-subject rule consolidate follows (see `scoped_repo_witness`'s limit). The
+    // config-bearing index open below registers the new repo and runs the heals correctly scoped.
+    let migration = IndexDatabase::migrate_schema_only(&config.database)?;
     if migration.state != rag_rat_core::index::schema::SchemaState::Compatible {
         anyhow::bail!("{}", migration.message);
     }
