@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.12.0...rag-rat-core-v0.13.0) - 2026-07-05
+
+### Added
+
+- *(dream)* human review surface — dream <id> --accept|--dismiss|--reset ([#262](https://github.com/cq27-dev/rag-rat/pull/262)) ([#440](https://github.com/cq27-dev/rag-rat/pull/440))
+- *(dream)* run the verdict/compaction model on an ephemeral remote GPU (`[llm.dream.remote]`) ([#438](https://github.com/cq27-dev/rag-rat/pull/438))
+- *(dream)* v2 memory passes — reality verdicts + compact summaries ([#428](https://github.com/cq27-dev/rag-rat/pull/428))
+- *(index)* global database by default, rag-rat consolidate importer ([#402](https://github.com/cq27-dev/rag-rat/pull/402)) ([#419](https://github.com/cq27-dev/rag-rat/pull/419))
+- *(index)* generation-staged full rebuild, per-repo write locks (V043) ([#416](https://github.com/cq27-dev/rag-rat/pull/416))
+- *(index)* repo-scoped clones, oracle, reconcile, memories (V042) ([#415](https://github.com/cq27-dev/rag-rat/pull/415))
+- *(search)* repo-scoped FTS and papertrail queries (V041) ([#414](https://github.com/cq27-dev/rag-rat/pull/414))
+- *(index)* V040 — repo_id scoping on core tables, scope view, gc (#398 phase A3) ([#413](https://github.com/cq27-dev/rag-rat/pull/413))
+- *(schema)* V039 — move per-repo meta singletons to repo_meta (#397 phase A2) ([#412](https://github.com/cq27-dev/rag-rat/pull/412))
+- *(schema)* V038 repos registry, repo identity, and data_dir helper (#396 phase A1) ([#408](https://github.com/cq27-dev/rag-rat/pull/408))
+
+### Fixed
+
+- *(locks)* release flock explicitly on drop — close alone races fork-inherited fds ([#409](https://github.com/cq27-dev/rag-rat/pull/409)) ([#410](https://github.com/cq27-dev/rag-rat/pull/410))
+
 ## [0.12.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.11.0...rag-rat-core-v0.12.0) - 2026-07-02
 
 ### Added
