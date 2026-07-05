@@ -1463,6 +1463,17 @@ mod tests {
         false
     }
 
+    // Linux/inotify only: this asserts the watch-PLACEMENT optimization (an ignored subtree gets no
+    // watch, so its edits are never delivered) — the mitigation for inotify `max_user_watches`
+    // exhaustion that motivated #331/#332. inotify places one NON-recursive watch per directory, so
+    // a dir that is never watched delivers nothing. The other backends coalesce differently:
+    // `ReadDirectoryChangesW` (Windows) and FSEvents (macOS) report the ignored DIRECTORY entry's
+    // mtime bump from a nested write on the parent's watch, so placement can't suppress delivery
+    // and the outcome is timing-dependent (this test fails on Windows and flakes on macOS).
+    // That is harmless — the CLASSIFICATION filter (`event_is_relevant`) drops the ignored path
+    // before any indexing, and THAT guarantee is verified on every OS by
+    // `event_is_relevant_skips_gitignored_paths_consistently_with_walker`. See #446.
+    #[cfg(target_os = "linux")]
     #[test]
     fn gitignored_subdir_under_a_target_is_not_watched() {
         // ISSUE #331: a gitignored directory under a target dir must NOT receive an inotify watch
@@ -1791,6 +1802,11 @@ mod tests {
         assert!(pkg_seen, "a new dir under the target must still be watched");
     }
 
+    // Linux/inotify only — same rationale as `gitignored_subdir_under_a_target_is_not_watched`:
+    // this asserts watch PLACEMENT (a nested-ignored moved-in subdir gets no watch). On
+    // Windows/macOS the nested write bumps the ignored dir entry's mtime and the parent watch
+    // reports it; classification still drops it. See #446.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_moved_in_dir_with_a_nested_gitignore_prunes_against_it() {
         // ISSUE #332 (P2): a dir MOVED into a target carrying its OWN nested `.gitignore` must be

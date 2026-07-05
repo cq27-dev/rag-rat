@@ -123,10 +123,22 @@ fn lock_discriminator(repo_id: &str) -> String {
 /// still contend. The concurrent access to the SQLite file itself is serialized by WAL, not this
 /// lock. Resolve `repo_id` before opening via [`write_lock_repo_id`].
 pub fn write_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    database
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("rag-rat-write-{}.lock", lock_discriminator(repo_id)))
+    lock_dir(database).join(format!("rag-rat-write-{}.lock", lock_discriminator(repo_id)))
+}
+
+/// The directory lock files live in: the database's parent, CANONICALIZED. Two symlink-aliased
+/// renderings of the same database path — macOS `/tmp`→`/private/tmp` and `/var`→`/private/var`, or
+/// a worktree reached via two paths — must map to ONE lock file and ONE reentrancy-registry key.
+/// Otherwise a lock keyed off `config.database` (a CLI entry lock) and a reentrant re-acquire keyed
+/// off the connection's own `conn.path()` rendering (the identity-upgrade path) miss each other and
+/// SELF-DEADLOCK on the same underlying flock until timeout — an aliased-path hang seen only where
+/// the OS aliases the temp root (macOS). Same rationale as [`election_lock_path`]. Falls back to
+/// the raw parent when the directory does not exist yet: no lock file could exist under a canonical
+/// name then either, so both key sites stay consistent (and the pre-existence case is not
+/// reentrant).
+fn lock_dir(database: &Path) -> PathBuf {
+    let parent = database.parent().unwrap_or_else(|| Path::new("."));
+    parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf())
 }
 
 /// The GLOBAL schema-migration lock path, beside the DB (A6): ONE per database file, taken only by
@@ -135,7 +147,7 @@ pub fn write_lock_path(database: &Path, repo_id: &str) -> PathBuf {
 /// per-repo [`write_lock_path`]. Keeping it separate means a repo's ordinary write is neither
 /// blocked by nor blocks an unrelated repo except during the brief migration itself.
 pub fn schema_lock_path(database: &Path) -> PathBuf {
-    database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-schema.lock")
+    lock_dir(database).join("rag-rat-schema.lock")
 }
 
 /// The GLOBAL repo-registry lock path, beside the DB (A7): ONE per database file, taken by
@@ -150,7 +162,7 @@ pub fn schema_lock_path(database: &Path) -> PathBuf {
 /// edges self-break any cross-type cycle within their timeout, exactly like the canonical-order
 /// rule's out-of-order edges.
 pub fn registry_lock_path(database: &Path) -> PathBuf {
-    database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-registry.lock")
+    lock_dir(database).join("rag-rat-registry.lock")
 }
 
 /// Per-DB, PER-REPO maintenance coordination lock, held by the running `rag-rat maintenance`
@@ -160,20 +172,14 @@ pub fn registry_lock_path(database: &Path) -> PathBuf {
 /// repo's. Separate from the write lock so it only coordinates CLI maintenance invocations — the
 /// pass itself still takes the write lock internally.
 pub fn maintenance_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    database
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("rag-rat-maintenance-{}.lock", lock_discriminator(repo_id)))
+    lock_dir(database).join(format!("rag-rat-maintenance-{}.lock", lock_discriminator(repo_id)))
 }
 
 /// Marker a coalesced `maintenance` trigger sets to ask the in-flight runner to run one more pass
 /// after the current one, so a change that arrived mid-pass is still covered (#267). Per-repo (A6),
 /// pairing with the per-repo [`maintenance_lock_path`].
 pub fn maintenance_pending_path(database: &Path, repo_id: &str) -> PathBuf {
-    database
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("rag-rat-maintenance-{}.pending", lock_discriminator(repo_id)))
+    lock_dir(database).join(format!("rag-rat-maintenance-{}.pending", lock_discriminator(repo_id)))
 }
 
 /// Order two repo ids by the CANONICAL LOCK ORDER (see the module doc): lexicographic on the
@@ -199,7 +205,9 @@ pub fn thread_holds_write_lock(database: &Path, repo_id: &str) -> bool {
 /// repo id it writes under": only a flow that IS lock-disciplined must extend its coverage when
 /// the resolved id differs; a lockless flow stays lockless.
 pub fn thread_holds_any_repo_write_lock(database: &Path) -> bool {
-    let dir = database.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    // Canonicalize the same way the lock-file path does, so a `database` reaching a held lock via a
+    // symlink-aliased rendering still matches the stored (canonical) registry key.
+    let dir = lock_dir(database);
     HELD_WRITE_LOCKS.with_borrow(|held| {
         held.iter().any(|(path, &depth)| {
             depth > 0

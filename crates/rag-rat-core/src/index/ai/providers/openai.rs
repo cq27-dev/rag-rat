@@ -618,6 +618,11 @@ mod tests {
 
     /// Read headers, parse Content-Length, then read exactly the request body bytes.
     fn read_request_body(stream: &mut TcpStream) -> String {
+        // macOS/BSD accepted sockets inherit the non-blocking listener's `O_NONBLOCK`, which makes
+        // `set_read_timeout` a no-op and lets `read` return `WouldBlock` (treated as `Err → break`
+        // below) before a multi-segment body is fully drained. Force blocking so the timeout
+        // governs.
+        stream.set_nonblocking(false).ok();
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
         let mut raw = Vec::new();
         let mut buf = [0u8; 8192];

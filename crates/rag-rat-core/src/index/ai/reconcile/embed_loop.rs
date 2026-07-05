@@ -882,6 +882,14 @@ mod freshness_version_tests {
     }
 
     fn read_request_body(stream: &mut TcpStream) -> String {
+        // The listener is non-blocking (poll-accept), and on macOS/BSD an accepted socket INHERITS
+        // the listener's `O_NONBLOCK` (Linux/Windows do not). On a non-blocking socket `read`
+        // returns `WouldBlock` the instant no bytes are buffered — which the body loop
+        // below treats as `Err → break`, TRUNCATING a request whose body spans multiple TCP
+        // segments (the 1005-item batch). Force the accepted stream back to blocking so
+        // `set_read_timeout` (SO_RCVTIMEO) governs the reads and a large body is drained in
+        // full.
+        stream.set_nonblocking(false).ok();
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
         let mut raw = Vec::new();
         let mut buf = [0u8; 8192];
