@@ -693,6 +693,72 @@ mod tests {
         assert_eq!(failures, 0, "a successful summary clears the stale failure row");
     }
 
+    #[test]
+    fn zero_budget_does_not_call_model_or_report_pending_compaction() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        let model = MockVerdictModel::new([GOOD_SUMMARY]);
+
+        run_compact_pass(&c, CompactPass { model: &model, budget: 0 }, 1000).unwrap();
+
+        assert_eq!(model.calls(), 0, "budget zero stops before the first model turn");
+        assert!(
+            !compaction_pending(&c, 0, "mock-verdict-model").unwrap(),
+            "budget zero is no pending model work"
+        );
+        assert!(summary_rows(&c, "m1").is_empty(), "no summary is written at budget zero");
+    }
+
+    #[test]
+    fn current_compact_failure_suppresses_pending_compaction() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        let content_hash = crate::dream::note_content_hash("note", "a body worth compacting");
+        let stamp = FailureStamp {
+            memory_id: "m1",
+            repo_id: "r",
+            pass: DreamModelPass::Compact,
+            content_hash: &content_hash,
+            checked_inputs_hash: None,
+            prompt_version: COMPACT_PROMPT_VERSION,
+            model_id: "mock-verdict-model",
+        };
+        let failure = DreamModelFailure::new(DreamFailureReason::SummaryGuardRejected);
+        failure::record_failure(&c, RecordFailure { stamp, failure: &failure, now_ms: 1 }).unwrap();
+
+        assert!(
+            !compaction_pending(&c, 10, "mock-verdict-model").unwrap(),
+            "a current deterministic compact failure means the memory is already annotated"
+        );
+    }
+
+    #[test]
+    fn model_error_records_retryable_compact_failure() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        let model = MockVerdictModel::new(Vec::<String>::new());
+
+        run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
+
+        let (reason, detail): (String, String) = c
+            .query_row(
+                "SELECT reason, detail FROM memory_model_failures WHERE repo_id='r' AND \
+                 memory_id='m1' AND pass='compact'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, DreamFailureReason::ModelCallFailed.as_db_str());
+        assert!(detail.contains("no responses"), "the transient model error is stored for audit");
+        assert!(
+            compaction_pending(&c, 10, "mock-verdict-model").unwrap(),
+            "model-call failures remain retryable work"
+        );
+    }
+
     // ── write-path stamps + churn / invalidation ─────────────────────────────────
 
     #[test]

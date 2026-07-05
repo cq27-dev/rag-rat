@@ -1069,3 +1069,42 @@ fn dream_worklist_is_repo_scoped_end_to_end() {
 
     cleanup(&[&repo_a, &repo_b, &data_dir, &cache]);
 }
+
+#[test]
+fn dream_ephemeral_zero_work_guard_skips_cli_provisioning() {
+    let data_dir = unique_dir("dream-zero-data");
+    let cache = unique_dir("dream-zero-cache");
+    let repo = build_repo(
+        "dream-zero",
+        &[("lib.rs", chunky_fn("dream_zero_anchor"))],
+        concat!(
+            "[index]\n",
+            "root = \".\"\n\n",
+            "[target_bindings]\n",
+            "rust = [\"src\"]\n\n",
+            "[llm.dream]\n",
+            "enabled = true\n\n",
+            "[llm.dream.remote]\n",
+            "backend = \"vllm\"\n",
+            "cookbook = \"./missing-dream-cookbook.mjs\"\n",
+            "model = \"Qwen/Qwen3-4B-Instruct\"\n",
+        ),
+    );
+
+    run_ok(&repo, &data_dir, &cache, &["index", "--full"]);
+    let out =
+        run(&repo, &data_dir, &cache, &["dream", "--verify", "--compact", "--max-memories", "500"]);
+
+    assert!(
+        out.status.success(),
+        "zero-work dream run should not try to spawn the missing cookbook: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("skipping the ephemeral `[llm.dream.remote]` GPU box"),
+        "expected the CLI zero-work guard note, got stderr:\n{stderr}"
+    );
+
+    cleanup(&[&repo, &data_dir, &cache]);
+}

@@ -195,6 +195,18 @@ mod tests {
     use super::*;
     use crate::dream::tests::mem_db;
 
+    fn stamp() -> FailureStamp<'static> {
+        FailureStamp {
+            memory_id: "m1",
+            repo_id: "r",
+            pass: DreamModelPass::Verify,
+            content_hash: "content",
+            checked_inputs_hash: Some("inputs"),
+            prompt_version: "prompt",
+            model_id: "model",
+        }
+    }
+
     #[test]
     fn persisted_enums_round_trip() {
         for pass in DreamModelPass::ALL {
@@ -276,5 +288,50 @@ mod tests {
             !blocking_failure_is_current(&c, &active_stamp).unwrap(),
             "a sibling repo's failure row must not suppress active-repo work"
         );
+    }
+
+    #[test]
+    fn failure_detail_is_trimmed_bounded_and_attempts_are_counted() {
+        let c = mem_db();
+        let long_detail = format!("  {}  ", "x".repeat(501));
+        let failure =
+            DreamModelFailure::with_detail(DreamFailureReason::MalformedVerdict, long_detail);
+
+        record_failure(&c, RecordFailure { stamp: stamp(), failure: &failure, now_ms: 1 }).unwrap();
+        record_failure(&c, RecordFailure { stamp: stamp(), failure: &failure, now_ms: 2 }).unwrap();
+
+        let (detail, attempts): (String, i64) = c
+            .query_row(
+                "SELECT detail, attempts FROM memory_model_failures WHERE repo_id='r' AND \
+                 memory_id='m1' AND pass='verify'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(detail.chars().count(), 503, "500 chars plus an ellipsis marker are stored");
+        assert!(detail.ends_with("..."), "oversized detail is explicitly marked as truncated");
+        assert!(!detail.starts_with(' '), "detail is trimmed before storage");
+        assert_eq!(attempts, 2, "same failure/input increments the audit attempt count");
+    }
+
+    #[test]
+    fn unknown_reason_does_not_block_and_clear_removes_the_row() {
+        let c = mem_db();
+        c.execute(
+            "INSERT INTO memory_model_failures(memory_id, repo_id, pass, content_hash, \
+             checked_inputs_hash, model_id, prompt_version, reason, failed_at_ms) VALUES \
+             ('m1','r','verify','content','inputs','model','prompt','legacy_reason',1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !blocking_failure_is_current(&c, &stamp()).unwrap(),
+            "unknown persisted reasons are audit-only and must not suppress work"
+        );
+
+        clear_failure(&c, &stamp()).unwrap();
+        let remaining: i64 =
+            c.query_row("SELECT COUNT(*) FROM memory_model_failures", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 0, "clear_failure deletes the current row");
     }
 }

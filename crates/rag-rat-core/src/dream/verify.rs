@@ -829,6 +829,11 @@ mod tests {
                 .unwrap(),
             "a citable never-checked memory is verify-pending"
         );
+        assert!(
+            !crate::dream::model_work_pending(&c, opts, 0, true, false, "mock-verdict-model")
+                .unwrap(),
+            "budget zero stops before considering the citable verify entry"
+        );
         let inputs = checked_inputs_hash(&c, "m2", &Some("r".to_string())).unwrap();
         let content_hash = content_hash("t", "a note about `resolve_marker_token`");
         let stamp = crate::dream::failure::FailureStamp {

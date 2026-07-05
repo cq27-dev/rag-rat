@@ -893,6 +893,33 @@ mod tests {
         assert_eq!(model.calls(), 2, "retried exactly once");
     }
 
+    #[test]
+    fn obtain_verdict_records_model_call_failure() {
+        let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
+        let model = MockVerdictModel::new(Vec::<String>::new());
+
+        let err = obtain_verdict(&model, "prompt", pack).expect_err("model error fails");
+
+        assert_eq!(err.reason, DreamFailureReason::ModelCallFailed);
+        assert!(
+            err.detail.as_deref().is_some_and(|detail| detail.contains("no responses")),
+            "the model-call error detail is preserved"
+        );
+        assert_eq!(model.calls(), 1, "transport/model errors are not retried");
+    }
+
+    #[test]
+    fn obtain_verdict_discards_malformed_without_retry() {
+        let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
+        let model =
+            MockVerdictModel::new(["not a verdict".to_string(), current_citing("real_symbol")]);
+
+        let err = obtain_verdict(&model, "prompt", pack).expect_err("malformed verdict fails");
+
+        assert_eq!(err.reason, DreamFailureReason::MalformedVerdict);
+        assert_eq!(model.calls(), 1, "malformed completions are discarded without retry");
+    }
+
     // ── prompt + pack rendering ──────────────────────────────────────────────────
 
     #[test]
@@ -970,6 +997,44 @@ mod tests {
         assert_eq!(row.3, PROMPT_VERSION);
         assert_eq!(row.4, verify::note_content_hash("note", "describes `resolvable_thing`"));
         assert_eq!(row.5, 5000);
+    }
+
+    #[test]
+    fn verdict_pass_budget_stops_before_second_memory() {
+        let c = seeded_verifiable_repo();
+        seed_symbol_file(&c, "src/other.rs", "second_thing", "r");
+        seed_memory(&c, "m2", "note", "describes `second_thing`", "r");
+        let model = MockVerdictModel::new([
+            current_citing("resolvable_thing"),
+            current_citing("second_thing"),
+        ]);
+
+        run_verdict_pass(&c, VerdictPass { model: &model, budget: 1 }, 5000).unwrap();
+
+        assert_eq!(model.calls(), 1, "budget one verifies only the first queued memory");
+        let rows: i64 =
+            c.query_row("SELECT COUNT(*) FROM memory_reality", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "the second queued memory is left for a later run");
+    }
+
+    #[test]
+    fn failed_verdict_completion_records_failure_row() {
+        let c = seeded_verifiable_repo();
+        let model = MockVerdictModel::new(["not a verdict"]);
+
+        run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 5000).unwrap();
+
+        let (reason, attempts): (String, i64) = c
+            .query_row(
+                "SELECT reason, attempts FROM memory_model_failures WHERE repo_id='r' AND \
+                 memory_id='m1' AND pass='verify'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, DreamFailureReason::MalformedVerdict.as_db_str());
+        assert_eq!(attempts, 1);
+        assert_eq!(model.calls(), 1);
     }
 
     #[test]

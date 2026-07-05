@@ -1053,6 +1053,24 @@ mod tests {
         assert_sibling_intact(conn);
     }
 
+    #[test]
+    fn poison_sibling_seeds_memory_model_failure_tripwire() {
+        let (_root, config) = poison_test_config("poison_failure");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let conn = db.storage.connection();
+
+        let (pass, reason): (String, String) = conn
+            .query_row(
+                "SELECT pass, reason FROM memory_model_failures WHERE repo_id = ?1 AND memory_id \
+                 = ?2",
+                [POISON_REPO_ID, POISON_MEMORY_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pass, "compact");
+        assert_eq!(reason, "summary_guard_rejected");
+    }
+
     /// SAME-PATH tripwire liveness: the harness must seed a sibling row whose join key COLLIDES
     /// with a real primary-repo path, and an intentionally path-keyed UNSCOPED aggregate must see
     /// it — proving the harness can trip a join-by-path leak (the class the distinct-path rows
