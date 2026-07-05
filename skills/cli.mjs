@@ -24,17 +24,25 @@ import { spawnSync } from "node:child_process";
 /** rag-rat's canonical skill directory on GitHub (walked one level deep: <name>/SKILL.md). */
 const SOURCE = "https://github.com/cq27-dev/rag-rat/tree/main/.agents/skills";
 
+/** rag-rat's own skills — used to scope destructive/refresh subcommands to ONLY these. */
+const RAG_RAT_SKILLS = ["using-rag-rat", "dream-review"];
+
 /** Subcommands that mean "install" — mapped to `skills add <SOURCE>`. */
 const INSTALL = new Set(["add", "install", "i"]);
+
+/** Subcommands scoped to rag-rat's own skills when the user didn't name a skill themselves — a bare
+ * `skills remove`/`update` would otherwise act over EVERY installed skill (a selector / update-all),
+ * and a branded "remove them" must never touch unrelated skills. */
+const SCOPED = new Set(["remove", "rm", "update"]);
 
 function usage() {
   process.stdout.write(
     `@rag-rat/skills — install rag-rat's agent skills (using-rag-rat, dream-review)\n\n` +
       `Usage:\n` +
       `  npx @rag-rat/skills [add|install]   install into your agent(s) (default)\n` +
-      `  npx @rag-rat/skills update          refresh installed skills\n` +
+      `  npx @rag-rat/skills update          refresh rag-rat's installed skills\n` +
       `  npx @rag-rat/skills list            list installed skills\n` +
-      `  npx @rag-rat/skills remove          remove installed skills\n\n` +
+      `  npx @rag-rat/skills remove          remove rag-rat's skills\n\n` +
       `Flags are forwarded to the underlying \`skills\` CLI, e.g.:\n` +
       `  -a, --agent <name>   target a specific agent (claude-code, codex, cursor, …)\n` +
       `  -s, --skill <name>   install one skill by name\n` +
@@ -67,11 +75,24 @@ function main() {
   if (isInstall) {
     const rest = sub !== undefined && INSTALL.has(sub) ? argv.slice(1) : argv;
     skillsArgs = ["add", SOURCE, ...rest];
+  } else if (SCOPED.has(sub)) {
+    // `remove`/`update` with no explicit skill → scope to OUR skills, so the branded command never
+    // removes/refreshes unrelated skills. If the user named a skill (`-s`/`--skill`), respect it.
+    const rest = argv.slice(1);
+    const userNamed = rest.some((a) => a === "-s" || a === "--skill");
+    const scope = userNamed ? [] : RAG_RAT_SKILLS.flatMap((n) => ["-s", n]);
+    skillsArgs = [sub, ...rest, ...scope];
   } else {
     skillsArgs = argv;
   }
 
-  const res = spawnSync("npx", ["-y", "skills", ...skillsArgs], { stdio: "inherit" });
+  const res = spawnSync("npx", ["-y", "skills", ...skillsArgs], {
+    stdio: "inherit",
+    // On Windows `npx` is a `.cmd` shim that spawn can't execute directly (ENOENT); run it through
+    // the shell so cmd.exe resolves it. Our args carry no spaces, so no shell-quoting hazard. POSIX
+    // needs no shell (and keeping it off there preserves exact arg passing).
+    shell: process.platform === "win32",
+  });
   if (res.error) {
     process.stderr.write(
       `failed to run the \`skills\` CLI via npx: ${res.error.message}\n` +

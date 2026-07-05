@@ -21,10 +21,13 @@ That installs the skills into whichever agents it detects (Claude Code → `.cla
 
 ```bash
 npx @rag-rat/skills                 # install (default)
-npx @rag-rat/skills update          # refresh installed skills to the latest
+npx @rag-rat/skills update          # refresh rag-rat's skills to the latest
 npx @rag-rat/skills list            # list installed skills
-npx @rag-rat/skills remove          # remove them
+npx @rag-rat/skills remove          # remove rag-rat's skills
 ```
+
+`update` and `remove` are scoped to rag-rat's own skills (`using-rag-rat`, `dream-review`) — they
+never touch unrelated skills you've installed. Pass `-s <name>` to target one explicitly.
 
 Flags are forwarded to the underlying installer:
 
