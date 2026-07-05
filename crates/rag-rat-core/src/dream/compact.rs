@@ -5,8 +5,8 @@
 //! deliberately spartan: one model turn per memory, NO tools, NO code context, NO evidence pack —
 //! the note body is the whole input (the offline eval measured that code context DEGRADES
 //! compaction fidelity). Accepted summaries land in `memory_summaries` (PK `(repo_id, memory_id,
-//! content_hash)`, so a title/body edit self-invalidates and re-queues); a rejected one stores
-//! NOTHING, and the absence of a summary row IS the title-only fallback at surfacing.
+//! content_hash)`, so a title/body edit self-invalidates and re-queues); a rejected one records a
+//! failure row while the absence of a summary row remains the title-only fallback at surfacing.
 //!
 //! Two surfaces the rest of dream consumes:
 //!   - [`run_compact_pass`] — the budgeted runner: queue (active memories with no summary for their
@@ -21,6 +21,9 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
+use super::failure::{
+    self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, RecordFailure,
+};
 use super::model::VerdictModel;
 use crate::index::schema;
 
@@ -51,25 +54,51 @@ struct CompactionEntry {
 /// Run the compaction pass over the churn-skip queue (budget-capped). For each queued memory:
 /// render the prompt (note body only), ask the model, run the deterministic acceptance guards
 /// (retry once), and on accept UPSERT `memory_summaries` (pruning superseded rows). A
-/// rejected-twice or errored completion writes nothing — the absence of a row is the title-only
-/// fallback at surfacing, and the next run re-queues the memory. Repo-scoped; never writes a
-/// `repo_memories` column.
+/// rejected-twice completion records `memory_model_failures`; a transient model-call error is
+/// recorded for audit but remains retryable. The absence of a summary row is still the title-only
+/// fallback at surfacing. Repo-scoped; never writes a `repo_memories` column.
 pub(super) fn run_compact_pass(
     conn: &Connection,
     pass: CompactPass<'_>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let queue = compaction_queue(conn, pass.budget)?;
+    let queue = compaction_queue(conn, usize::MAX)?;
     if queue.is_empty() {
         return Ok(());
     }
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
     let repo_id = scope.as_deref().unwrap_or("__unassigned__");
 
+    let mut processed = 0usize;
     for entry in queue {
-        let prompt = render_compact_prompt(&entry.title, &entry.body);
-        let Some(summary) = obtain_summary(conn, pass.model, &prompt)? else {
+        if processed >= pass.budget {
+            break;
+        }
+        let content_hash = super::verify::note_content_hash(&entry.title, &entry.body);
+        let failure_stamp = FailureStamp {
+            memory_id: &entry.memory_id,
+            repo_id,
+            pass: DreamModelPass::Compact,
+            content_hash: &content_hash,
+            checked_inputs_hash: None,
+            prompt_version: COMPACT_PROMPT_VERSION,
+            model_id: pass.model.model_id(),
+        };
+        if failure::blocking_failure_is_current(conn, &failure_stamp)? {
             continue;
+        }
+        processed += 1;
+        let prompt = render_compact_prompt(&entry.title, &entry.body);
+        let summary = match obtain_summary(conn, pass.model, &prompt)? {
+            Ok(summary) => summary,
+            Err(failure) => {
+                failure::record_failure(conn, RecordFailure {
+                    stamp: failure_stamp,
+                    failure: &failure,
+                    now_ms,
+                })?;
+                continue;
+            },
         };
         record_summary(conn, RecordSummary {
             memory_id: &entry.memory_id,
@@ -80,6 +109,16 @@ pub(super) fn run_compact_pass(
             model_id: pass.model.model_id(),
             now_ms,
         })?;
+        let failure_stamp = FailureStamp {
+            memory_id: &entry.memory_id,
+            repo_id,
+            pass: DreamModelPass::Compact,
+            content_hash: &content_hash,
+            checked_inputs_hash: None,
+            prompt_version: COMPACT_PROMPT_VERSION,
+            model_id: pass.model.model_id(),
+        };
+        failure::clear_failure(conn, &failure_stamp)?;
     }
     Ok(())
 }
@@ -131,35 +170,63 @@ fn compaction_queue(conn: &Connection, budget: usize) -> rusqlite::Result<Vec<Co
 /// Whether the compaction queue has ANY pending memory (budget-capped) — the compaction half of the
 /// ephemeral zero-work guard ([`super::model_work_pending`]). Cheap: the same churn-skip query the
 /// pass runs, short-circuited to emptiness so a fully-summarized repo never cold-starts a paid box.
-pub(super) fn compaction_pending(conn: &Connection, budget: usize) -> rusqlite::Result<bool> {
-    Ok(!compaction_queue(conn, budget)?.is_empty())
+pub(super) fn compaction_pending(
+    conn: &Connection,
+    budget: usize,
+    model_id: &str,
+) -> rusqlite::Result<bool> {
+    if budget == 0 {
+        return Ok(false);
+    }
+    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_id = scope.as_deref().unwrap_or("__unassigned__");
+    for entry in compaction_queue(conn, usize::MAX)? {
+        let content_hash = super::verify::note_content_hash(&entry.title, &entry.body);
+        let failure_stamp = FailureStamp {
+            memory_id: &entry.memory_id,
+            repo_id,
+            pass: DreamModelPass::Compact,
+            content_hash: &content_hash,
+            checked_inputs_hash: None,
+            prompt_version: COMPACT_PROMPT_VERSION,
+            model_id,
+        };
+        if failure::blocking_failure_is_current(conn, &failure_stamp)? {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Ask the model once, strip any think block, and run the deterministic acceptance guards. On a
-/// guard failure RETRY ONCE (same prompt); a second failure returns `Ok(None)` — store nothing (the
-/// title-only fallback). A model call error also yields `None` (this memory is skipped, re-queued
-/// next run); a DB error in the guards propagates. Small models drift, so the guards are
-/// load-bearing — an unchecked summary would surface a wrong 3-line claim as if authoritative.
+/// guard failure RETRY ONCE (same prompt); a second failure returns a typed deterministic failure.
+/// A model call error also returns a typed failure, but that reason does not suppress future work;
+/// a DB error in the guards propagates. Small models drift, so the guards are load-bearing — an
+/// unchecked summary would surface a wrong 3-line claim as if authoritative.
 fn obtain_summary(
     conn: &Connection,
     model: &dyn VerdictModel,
     prompt: &str,
-) -> rusqlite::Result<Option<String>> {
+) -> rusqlite::Result<Result<String, DreamModelFailure>> {
     for attempt in 1..=2 {
         let raw = match model.complete(prompt) {
             Ok(raw) => raw,
             Err(err) => {
                 tracing::warn!(target: "rag_rat_core::dream::compact", attempt, %err, "compaction model call failed; skipping this memory");
-                return Ok(None);
+                return Ok(Err(DreamModelFailure::with_detail(
+                    DreamFailureReason::ModelCallFailed,
+                    err.to_string(),
+                )));
             },
         };
         let summary = strip_think(&raw);
         if guards::accepts(conn, summary)? {
-            return Ok(Some(summary.to_string()));
+            return Ok(Ok(summary.to_string()));
         }
         tracing::warn!(target: "rag_rat_core::dream::compact", attempt, "compaction summary failed the acceptance guards");
     }
-    Ok(None)
+    Ok(Err(DreamModelFailure::new(DreamFailureReason::SummaryGuardRejected)))
 }
 
 /// Drop a leading `<think>…</think>` reasoning block a thinking model may prepend (the default
@@ -598,6 +665,32 @@ mod tests {
             summary_rows(&c, "m1").is_empty(),
             "two guard failures store nothing (title-only fallback)"
         );
+        let reason: String = c
+            .query_row(
+                "SELECT reason FROM memory_model_failures WHERE repo_id='r' AND memory_id='m1' \
+                 AND pass='compact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, DreamFailureReason::SummaryGuardRejected.as_db_str());
+
+        run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 6000).unwrap();
+        assert_eq!(model.calls(), 2, "the current deterministic failure suppresses another retry");
+
+        c.execute("UPDATE repo_memories SET body='edited body' WHERE id='m1'", []).unwrap();
+        let good = MockVerdictModel::new([GOOD_SUMMARY]);
+        run_compact_pass(&c, CompactPass { model: &good, budget: 10 }, 7000).unwrap();
+        assert_eq!(good.calls(), 1, "a content change invalidates the failure row");
+        assert_eq!(summary_rows(&c, "m1").len(), 1, "the changed memory can be summarized");
+        let failures: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM memory_model_failures WHERE repo_id='r' AND memory_id='m1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 0, "a successful summary clears the stale failure row");
     }
 
     // ── write-path stamps + churn / invalidation ─────────────────────────────────

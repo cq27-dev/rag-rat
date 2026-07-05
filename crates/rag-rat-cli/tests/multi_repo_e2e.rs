@@ -1008,7 +1008,7 @@ fn dream_worklist_is_repo_scoped_end_to_end() {
     };
     assert!(
         open_scoped(&repo_a, &data_dir)
-            .dream_model_work_pending(work_opts, 20, true, true)
+            .dream_model_work_pending(work_opts, 20, true, true, "mock-verdict-model")
             .unwrap(),
         "A's model pass has pending work (an un-verified memory) — the guard would provision"
     );

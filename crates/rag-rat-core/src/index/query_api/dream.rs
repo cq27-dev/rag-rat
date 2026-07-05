@@ -31,16 +31,24 @@ impl IndexDatabase {
 
     /// Whether the model passes have pending work (the zero-work guard for ephemeral
     /// `[llm.dream.remote]`): peek the verify/compact churn-skip queues without touching the model,
-    /// so the CLI skips cold-starting a paid GPU box when the queues are already drained. See
-    /// [`crate::dream::model_work_pending`].
+    /// considering current model-specific failure annotations, so the CLI skips cold-starting a
+    /// paid GPU box when the queues are already drained. See [`crate::dream::model_work_pending`].
     pub fn dream_model_work_pending(
         &self,
         opts: DreamOptions,
         budget: usize,
         verify: bool,
         compact: bool,
+        model_id: &str,
     ) -> anyhow::Result<bool> {
-        crate::dream::model_work_pending(self.storage.connection(), opts, budget, verify, compact)
+        crate::dream::model_work_pending(
+            self.storage.connection(),
+            opts,
+            budget,
+            verify,
+            compact,
+            model_id,
+        )
     }
 
     /// Apply a human review verdict (accept / dismiss / reset) to a dream finding by id or prefix —

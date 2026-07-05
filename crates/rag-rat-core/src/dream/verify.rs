@@ -796,7 +796,8 @@ mod tests {
             include_reviewed: false,
         };
         assert!(
-            !crate::dream::model_work_pending(&c, opts, 10, true, true).unwrap(),
+            !crate::dream::model_work_pending(&c, opts, 10, true, true, "mock-verdict-model")
+                .unwrap(),
             "empty repo → no work"
         );
 
@@ -804,11 +805,13 @@ mod tests {
         // but compaction WILL summarize it.
         seed_memory(&c, "m1", "t", "a prose note with no identifiers", "r");
         assert!(
-            !crate::dream::model_work_pending(&c, opts, 10, true, false).unwrap(),
+            !crate::dream::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model")
+                .unwrap(),
             "an all-uncitable verify queue is NOT model work — never cold-start a box for it"
         );
         assert!(
-            crate::dream::model_work_pending(&c, opts, 10, false, true).unwrap(),
+            crate::dream::model_work_pending(&c, opts, 10, false, true, "mock-verdict-model")
+                .unwrap(),
             "the same memory IS compact-pending (compaction has no uncitable short-circuit)"
         );
 
@@ -822,12 +825,39 @@ mod tests {
         .unwrap();
         seed_memory(&c, "m2", "t", "a note about `resolve_marker_token`", "r");
         assert!(
-            crate::dream::model_work_pending(&c, opts, 10, true, false).unwrap(),
+            crate::dream::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model")
+                .unwrap(),
             "a citable never-checked memory is verify-pending"
+        );
+        let inputs = checked_inputs_hash(&c, "m2", &Some("r".to_string())).unwrap();
+        let content_hash = content_hash("t", "a note about `resolve_marker_token`");
+        let stamp = crate::dream::failure::FailureStamp {
+            memory_id: "m2",
+            repo_id: "r",
+            pass: crate::dream::failure::DreamModelPass::Verify,
+            content_hash: &content_hash,
+            checked_inputs_hash: Some(&inputs),
+            prompt_version: crate::dream::verdict::PROMPT_VERSION,
+            model_id: "mock-verdict-model",
+        };
+        let failed = crate::dream::failure::DreamModelFailure::new(
+            crate::dream::failure::DreamFailureReason::FabricatedEvidence,
+        );
+        crate::dream::failure::record_failure(&c, crate::dream::failure::RecordFailure {
+            stamp,
+            failure: &failed,
+            now_ms: 2,
+        })
+        .unwrap();
+        assert!(
+            !crate::dream::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model")
+                .unwrap(),
+            "a current deterministic failure is annotated work, not pending model work"
         );
 
         assert!(
-            !crate::dream::model_work_pending(&c, opts, 10, false, false).unwrap(),
+            !crate::dream::model_work_pending(&c, opts, 10, false, false, "mock-verdict-model")
+                .unwrap(),
             "neither flag → never pending"
         );
     }

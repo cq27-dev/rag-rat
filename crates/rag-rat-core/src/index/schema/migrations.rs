@@ -1181,6 +1181,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_044_ID => Some(44),
             MIGRATION_045_ID => Some(45),
             MIGRATION_046_ID => Some(46),
+            MIGRATION_047_ID => Some(47),
             _ => None,
         })
         .max()
@@ -1236,6 +1237,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_044_ID
             | MIGRATION_045_ID
             | MIGRATION_046_ID
+            | MIGRATION_047_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1288,6 +1290,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_044_ID => migration.checksum != MIGRATION_044_CHECKSUM,
         MIGRATION_045_ID => migration.checksum != MIGRATION_045_CHECKSUM,
         MIGRATION_046_ID => migration.checksum != MIGRATION_046_CHECKSUM,
+        MIGRATION_047_ID => migration.checksum != MIGRATION_047_CHECKSUM,
         _ => false,
     }
 }
@@ -2713,6 +2716,45 @@ pub(crate) fn apply_memory_verification_tables(conn: &Connection) -> rusqlite::R
             generated_at_ms INTEGER NOT NULL,
             PRIMARY KEY (repo_id, memory_id, content_hash)
         ) STRICT;
+        ",
+    );
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return result;
+    }
+    conn.execute_batch("COMMIT;")
+}
+
+/// V047: record deterministic dream model failures in a derived sibling table.
+///
+/// The table is keyed one current row per `(repo_id, memory_id, pass)`, with the same freshness
+/// stamps the queues already consult (`content_hash`, optional `checked_inputs_hash`,
+/// `prompt_version`, `model_id`). A current row whose persisted enum reason is deterministic
+/// suppresses another model call; content/evidence/prompt/model churn invalidates it.
+pub(crate) fn apply_memory_model_failures_table(conn: &Connection) -> rusqlite::Result<()> {
+    if column_exists(conn, "memory_model_failures", "reason")? {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS memory_model_failures;
+        CREATE TABLE memory_model_failures(
+            memory_id           TEXT    NOT NULL,
+            repo_id             TEXT    NOT NULL DEFAULT '__unassigned__',
+            pass                TEXT    NOT NULL,
+            content_hash        TEXT    NOT NULL,
+            checked_inputs_hash TEXT,
+            model_id            TEXT    NOT NULL,
+            prompt_version      TEXT    NOT NULL,
+            reason              TEXT    NOT NULL,
+            detail              TEXT,
+            failed_at_ms        INTEGER NOT NULL,
+            attempts            INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (repo_id, memory_id, pass)
+        ) STRICT;
+        CREATE INDEX idx_memory_model_failures_reason
+            ON memory_model_failures(repo_id, pass, reason);
         ",
     );
     if result.is_err() {

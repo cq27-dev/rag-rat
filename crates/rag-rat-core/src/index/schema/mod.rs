@@ -17,7 +17,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 46;
+pub const LATEST_SCHEMA_VERSION: u32 = 47;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -315,6 +315,12 @@ const MIGRATION_046_DESCRIPTION: &str =
      content_hash) so a body edit self-invalidates), both STRICT and repo_id-scoped. They hold \
      derived, regenerable data so dream verifies memories without ever mutating a repo_memories \
      row (dream v2 pass 0)";
+const MIGRATION_047_ID: &str = "047_memory_model_failures";
+const MIGRATION_047_CHECKSUM: &str = "sha256:rag-rat-memory-model-failures-v47";
+const MIGRATION_047_DESCRIPTION: &str =
+    "Add memory_model_failures, a repo_id-scoped dream sibling table that records deterministic \
+     verdict/compaction model failures with stable enum tokens and input/model freshness stamps, \
+     so rejected current attempts do not rerun every dream pass";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -690,6 +696,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_046_CHECKSUM,
         description: MIGRATION_046_DESCRIPTION,
         apply: apply_memory_verification_tables,
+    },
+    Migration {
+        id: MIGRATION_047_ID,
+        checksum: MIGRATION_047_CHECKSUM,
+        description: MIGRATION_047_DESCRIPTION,
+        apply: apply_memory_model_failures_table,
     },
 ];
 

@@ -3126,11 +3126,18 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
         rusqlite::params![crate::index::clones::NORM_VERSION, LEGACY_REPO_ID],
     )
     .unwrap();
-    // A V045 dream-v2 verification sibling — repo_id-scoped from birth. Adoption must re-point it
+    // A V046 dream-v2 verification sibling — repo_id-scoped from birth. Adoption must re-point it
     // like the rest of the A5 periphery set (it is NOT part of V042; the sibling landed later).
     conn.execute(
         "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, checked_at_ms)
          VALUES ('m1', ?1, 'bh', 'current', 0)",
+        [LEGACY_REPO_ID],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memory_model_failures(memory_id, repo_id, pass, content_hash, model_id, \
+         prompt_version, reason, failed_at_ms)
+         VALUES ('m1', ?1, 'compact', 'bh', 'model', 'prompt', 'summary_guard_rejected', 0)",
         [LEGACY_REPO_ID],
     )
     .unwrap();
@@ -3167,6 +3174,7 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
         ("oracle_runs", "tool = 'scip'"),
         ("clone_graph_generations", "generation = 1"),
         ("memory_reality", "memory_id = 'm1'"),
+        ("memory_model_failures", "memory_id = 'm1'"),
     ] {
         assert_eq!(
             placeholder_count(&format!(
@@ -3208,6 +3216,11 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
     assert_eq!(
         real_repo("SELECT repo_id FROM memory_reality WHERE memory_id = 'm1'"),
         "repo-real",
-        "adoption re-points the V045 memory_reality verification sibling"
+        "adoption re-points the V046 memory_reality verification sibling"
+    );
+    assert_eq!(
+        real_repo("SELECT repo_id FROM memory_model_failures WHERE memory_id = 'm1'"),
+        "repo-real",
+        "adoption re-points the V047 memory_model_failures sibling"
     );
 }

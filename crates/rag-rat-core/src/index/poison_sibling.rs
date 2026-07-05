@@ -41,8 +41,8 @@
 //! `logical_symbol_monikers` (now direct, no longer only transitive), `oracle_runs`, `edge_oracle`,
 //! `clone_graph_generations`, `clone_token_df`, `clone_refinements`, `dream_findings`, and
 //! `reconcile_attempts` (with `repo_memory_tags` scoped transitively through `repo_memories`) — AND
-//! the V046 dream-verification siblings `memory_reality` / `memory_summaries`, each of which
-//! carries its own `repo_id`.
+//! the dream-verification siblings `memory_reality` / `memory_summaries` /
+//! `memory_model_failures`, each of which carries its own `repo_id`.
 //! [`seed_sibling`] seeds a tripwire row into every one of those. Nothing repo-scoped is left
 //! unseeded; a table without a `repo_id` dimension (content-addressed pools like
 //! `name_strings` / `embedding_cache`, the FTS-derived `chunk_fts`, `clone_edges`/postings scoped
@@ -579,9 +579,9 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
         params![format!("{POISON_PREFIX}status"), POISON_REPO_ID],
     )?;
 
-    // --- Dream v2 verification siblings (V046): memory_reality + memory_summaries each carry their
-    // own `repo_id`, so a sibling row is now valid and any unscoped verification-queue / evidence /
-    // summary read/count/delete trips a tripwire. Both hang off the poison memory id. ---
+    // --- Dream v2 verification siblings: each carries its own `repo_id`, so a sibling row is now
+    // valid and any unscoped verification-queue / evidence / summary / failure read/count/delete
+    // trips a tripwire. They all hang off the poison memory id. ---
     conn.execute(
         "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_at_ms)
          VALUES (?1, ?2, ?3, 0)",
@@ -595,6 +595,18 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
             POISON_REPO_ID,
             format!("{POISON_PREFIX}bodyhash"),
             format!("{POISON_PREFIX}summary")
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO memory_model_failures(memory_id, repo_id, pass, content_hash, model_id, \
+         prompt_version, reason, failed_at_ms)
+         VALUES (?1, ?2, 'compact', ?3, ?4, ?5, 'summary_guard_rejected', 0)",
+        params![
+            POISON_MEMORY_ID,
+            POISON_REPO_ID,
+            format!("{POISON_PREFIX}bodyhash"),
+            format!("{POISON_PREFIX}model"),
+            format!("{POISON_PREFIX}prompt")
         ],
     )?;
 
@@ -772,6 +784,7 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
          DELETE FROM reconcile_attempts WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM memory_reality WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM memory_summaries WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM memory_model_failures WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM dream_findings WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM clone_refinements WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM clone_token_df WHERE repo_id = '{POISON_REPO_ID}';
@@ -946,14 +959,17 @@ fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, Str
         ("clone_refinements", format!("repo_id = '{POISON_REPO_ID}'")),
         ("dream_findings", format!("repo_id = '{POISON_REPO_ID}'")),
         ("reconcile_attempts", format!("repo_id = '{POISON_REPO_ID}'")),
-        // Dream v2 verification siblings (V046): each pinned by the sibling repo_id + poison
-        // memory.
+        // Dream v2 verification siblings: each pinned by the sibling repo_id + poison memory.
         (
             "memory_reality",
             format!("repo_id = '{POISON_REPO_ID}' AND memory_id = '{POISON_MEMORY_ID}'"),
         ),
         (
             "memory_summaries",
+            format!("repo_id = '{POISON_REPO_ID}' AND memory_id = '{POISON_MEMORY_ID}'"),
+        ),
+        (
+            "memory_model_failures",
             format!("repo_id = '{POISON_REPO_ID}' AND memory_id = '{POISON_MEMORY_ID}'"),
         ),
         // SAME-PATH tripwires (V042): the memory binding and oracle edge whose path (and, for the

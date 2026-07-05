@@ -704,15 +704,17 @@ fn discover_mode_indexes_new_files_and_removes_deleted_files() {
 }
 
 /// V046 (dream v2 pass 0): fresh `schema::apply` creates the `memory_reality` / `memory_summaries`
-/// sibling tables, both STRICT + repo_id-scoped with the documented PKs. Carries the ABSOLUTE
-/// schema-tip pin now that V046 is the newest migration; re-applying is idempotent (the
-/// `memory_reality` existence sentinel short-circuits).
+/// sibling tables, both STRICT + repo_id-scoped with the documented PKs. The absolute schema-tip
+/// pin lives on the newest migration's test; this one uses only symbolic latest checks.
 #[test]
 fn migration_046_creates_the_verification_tables_on_fresh_apply() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 46, "V046 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 46, "schema at LATEST after apply");
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     let table_sql = |table: &str| -> String {
         conn.query_row("SELECT sql FROM sqlite_master WHERE name = ?1", [table], |r| r.get(0))
@@ -751,6 +753,99 @@ fn migration_046_creates_the_verification_tables_on_fresh_apply() {
     // Re-apply is a no-op (the memory_reality existence sentinel short-circuits).
     schema::apply(&conn).unwrap();
     assert!(conn_table_exists(&conn, "memory_reality"), "tables survive a re-apply");
+}
+
+/// V047: fresh `schema::apply` creates `memory_model_failures`, the dream model-failure sibling
+/// table. Carries the absolute schema-tip pin now that V047 is newest.
+#[test]
+fn migration_047_creates_the_model_failure_table_on_fresh_apply() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 47, "V047 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 47, "schema at LATEST after apply");
+
+    let table_sql = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE name = 'memory_model_failures'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap();
+    assert!(table_sql.contains("STRICT"), "memory_model_failures is STRICT");
+    for column in [
+        "memory_id",
+        "repo_id",
+        "pass",
+        "content_hash",
+        "checked_inputs_hash",
+        "model_id",
+        "prompt_version",
+        "reason",
+        "failed_at_ms",
+        "attempts",
+    ] {
+        assert!(
+            conn_table_columns(&conn, "memory_model_failures").contains(&column.to_string()),
+            "memory_model_failures carries {column}"
+        );
+    }
+    let pk_cols: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM pragma_table_info('memory_model_failures') WHERE pk > 0 ORDER BY pk",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        pk_cols,
+        vec!["repo_id".to_string(), "memory_id".to_string(), "pass".to_string()],
+        "one current failure row per repo/memory/pass"
+    );
+
+    schema::apply(&conn).unwrap();
+    assert!(conn_table_exists(&conn, "memory_model_failures"), "failure table survives a re-apply");
+}
+
+#[test]
+fn migration_047_deferred_absence_and_reconverges_from_torn_state() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE memory_model_failures(leftover INTEGER);").unwrap();
+    assert!(
+        !conn_table_columns(&conn, "memory_model_failures").contains(&"reason".to_string()),
+        "torn table lacks the sentinel column"
+    );
+
+    schema::apply_memory_model_failures_table(&conn).unwrap();
+
+    assert!(
+        conn_table_columns(&conn, "memory_model_failures").contains(&"reason".to_string()),
+        "V047 drops the torn scratch table and creates the real shape"
+    );
+    schema::apply_memory_model_failures_table(&conn).expect("replay is a no-op");
+    conn.execute(
+        "INSERT INTO memory_model_failures(memory_id, repo_id, pass, content_hash, model_id, \
+         prompt_version, reason, failed_at_ms) VALUES \
+         ('m','r','verify','h','model','prompt','fabricated_evidence',0)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO memory_model_failures(memory_id, repo_id, pass, content_hash, model_id, \
+             prompt_version, reason, failed_at_ms) VALUES \
+             ('m','r','verify','h2','model','prompt','malformed_verdict',1)",
+            [],
+        )
+        .is_err(),
+        "PK(repo_id, memory_id, pass) rejects a second current failure for the same pass"
+    );
+    conn.execute(
+        "INSERT INTO memory_model_failures(memory_id, repo_id, pass, content_hash, model_id, \
+         prompt_version, reason, failed_at_ms) VALUES \
+         ('m','r','compact','h','model','prompt','summary_guard_rejected',0)",
+        [],
+    )
+    .expect("verify and compact failures are distinct pass rows");
 }
 
 /// V046 in ISOLATION against a bare connection: the sibling tables are ABSENT before the migration

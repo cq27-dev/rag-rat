@@ -23,6 +23,9 @@
 use rusqlite::Connection;
 
 use super::DreamFinding;
+use super::failure::{
+    self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, RecordFailure,
+};
 use super::model::VerdictModel;
 use super::verify::{
     self, EvidencePack, VerificationQueueEntry, evidence_pack, verification_queue,
@@ -124,14 +127,15 @@ struct AcceptedVerdict {
 /// Run the model verdict pass over the churn-skip queue (budget-capped). For each queued memory:
 /// build the deterministic evidence pack, render the prompt, ask the model, guard citations, and on
 /// accept UPSERT `memory_reality`. A discarded verdict (unverifiable/malformed/fabricated-twice) or
-/// a memory not visible in scope simply writes nothing — the next run re-queues it. Repo-scoped;
+/// a memory not visible in scope writes no verdict; deterministic model rejections are recorded in
+/// `memory_model_failures` so unchanged inputs do not re-call the model every run. Repo-scoped;
 /// never writes a `repo_memories` column.
 pub(super) fn run_verdict_pass(
     conn: &Connection,
     pass: VerdictPass<'_>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let queue = verification_queue(conn, now_ms, pass.budget)?;
+    let queue = verification_queue(conn, now_ms, usize::MAX)?;
     if queue.is_empty() {
         return Ok(());
     }
@@ -141,9 +145,27 @@ pub(super) fn run_verdict_pass(
     // unmerged in-flight work is reviewable rather than looking arbitrarily stale.
     let checked_against_commit = indexed_commit(conn, &scope)?;
 
+    let mut processed = 0usize;
     for entry in queue {
+        if processed >= pass.budget {
+            break;
+        }
         let pack = evidence_pack(conn, &entry.memory_id)?;
         let inputs_hash = verify::checked_inputs_hash(conn, &entry.memory_id, &scope)?;
+        let content_hash = verify::note_content_hash(&entry.title, &entry.body);
+        let failure_stamp = FailureStamp {
+            memory_id: &entry.memory_id,
+            repo_id,
+            pass: DreamModelPass::Verify,
+            content_hash: &content_hash,
+            checked_inputs_hash: Some(&inputs_hash),
+            prompt_version: PROMPT_VERSION,
+            model_id: pass.model.model_id(),
+        };
+        if failure::blocking_failure_is_current(conn, &failure_stamp)? {
+            continue;
+        }
+        processed += 1;
         // An uncitable pack (no identifiers, no excerpts) can only produce a discarded verdict, so
         // skip the model and record a TERMINAL verdict-less row: it stamps the churn-skip
         // comparators so the memory does not re-queue every run (starving later memories), while a
@@ -159,13 +181,22 @@ pub(super) fn run_verdict_pass(
                 checked_against_commit: checked_against_commit.as_deref(),
                 now_ms,
             })?;
+            failure::clear_failure(conn, &failure_stamp)?;
             continue;
         }
         let pack_text = render_pack(&pack);
         let binding = binding_label(conn, &entry.memory_id, &scope)?;
         let prompt = render_verdict_prompt(&entry, &binding, &pack_text);
-        let Some(accepted) = obtain_verdict(pass.model, &prompt, &pack_text) else {
-            continue;
+        let accepted = match obtain_verdict(pass.model, &prompt, &pack_text) {
+            Ok(accepted) => accepted,
+            Err(failure) => {
+                failure::record_failure(conn, RecordFailure {
+                    stamp: failure_stamp,
+                    failure: &failure,
+                    now_ms,
+                })?;
+                continue;
+            },
         };
         record_verdict(conn, RecordVerdict {
             memory_id: &entry.memory_id,
@@ -178,6 +209,16 @@ pub(super) fn run_verdict_pass(
             model_id: pass.model.model_id(),
             now_ms,
         })?;
+        let failure_stamp = FailureStamp {
+            memory_id: &entry.memory_id,
+            repo_id,
+            pass: DreamModelPass::Verify,
+            content_hash: &content_hash,
+            checked_inputs_hash: Some(&inputs_hash),
+            prompt_version: PROMPT_VERSION,
+            model_id: pass.model.model_id(),
+        };
+        failure::clear_failure(conn, &failure_stamp)?;
     }
     Ok(())
 }
@@ -191,22 +232,25 @@ fn obtain_verdict(
     model: &dyn VerdictModel,
     prompt: &str,
     pack_text: &str,
-) -> Option<AcceptedVerdict> {
+) -> Result<AcceptedVerdict, DreamModelFailure> {
     for attempt in 1..=2 {
         let raw = match model.complete(prompt) {
             Ok(raw) => raw,
             Err(err) => {
                 tracing::warn!(target: "rag_rat_core::dream::verdict", attempt, %err, "verdict model call failed; discarding this memory's verdict");
-                return None;
+                return Err(DreamModelFailure::with_detail(
+                    DreamFailureReason::ModelCallFailed,
+                    err.to_string(),
+                ));
             },
         };
         let Some(parsed) = parse_verdict(&raw) else {
             // Malformed or a stray `unverifiable` — discard, no retry (not a citation fault).
             tracing::debug!(target: "rag_rat_core::dream::verdict", "discarding unparseable/unverifiable verdict completion");
-            return None;
+            return Err(DreamModelFailure::new(DreamFailureReason::MalformedVerdict));
         };
         if verdict_is_cited(pack_text, &parsed) {
-            return Some(AcceptedVerdict {
+            return Ok(AcceptedVerdict {
                 verdict: parsed.verdict,
                 direction: parsed.direction,
                 evidence: parsed.evidence,
@@ -215,7 +259,7 @@ fn obtain_verdict(
         // Fabricated citation. Retry once, then discard.
         tracing::warn!(target: "rag_rat_core::dream::verdict", attempt, "verdict cited a line absent from the evidence pack (possible fabrication)");
     }
-    None
+    Err(DreamModelFailure::new(DreamFailureReason::FabricatedEvidence))
 }
 
 // ── Prompt + pack rendering ──────────────────────────────────────────────────────────────────
@@ -844,10 +888,8 @@ mod tests {
     fn obtain_verdict_discards_after_two_fabrications() {
         let pack = "IDENTIFIERS:\n- `real_symbol` -> symbol src/lib.rs::real_symbol\n";
         let model = MockVerdictModel::new([current_citing("ghost_a"), current_citing("ghost_b")]);
-        assert!(
-            obtain_verdict(&model, "prompt", pack).is_none(),
-            "two fabrications discard the verdict"
-        );
+        let err = obtain_verdict(&model, "prompt", pack).expect_err("two fabrications fail");
+        assert_eq!(err.reason, DreamFailureReason::FabricatedEvidence);
         assert_eq!(model.calls(), 2, "retried exactly once");
     }
 
@@ -957,6 +999,46 @@ mod tests {
         .unwrap();
         run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 3000).unwrap();
         assert_eq!(model.calls(), 2, "a body edit re-invokes the model");
+    }
+
+    #[test]
+    fn current_failed_verdict_attempt_skips_model_until_input_changes() {
+        let c = seeded_verifiable_repo();
+        let scope = Some("r".to_string());
+        let inputs = verify::checked_inputs_hash(&c, "m1", &scope).unwrap();
+        let content_hash = verify::note_content_hash("note", "describes `resolvable_thing`");
+        let stamp = FailureStamp {
+            memory_id: "m1",
+            repo_id: "r",
+            pass: DreamModelPass::Verify,
+            content_hash: &content_hash,
+            checked_inputs_hash: Some(&inputs),
+            prompt_version: PROMPT_VERSION,
+            model_id: "mock-verdict-model",
+        };
+        let failed = DreamModelFailure::new(DreamFailureReason::FabricatedEvidence);
+        failure::record_failure(&c, RecordFailure { stamp, failure: &failed, now_ms: 1000 })
+            .unwrap();
+
+        let model = MockVerdictModel::new([current_citing("resolvable_thing")]);
+        run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 2000).unwrap();
+        assert_eq!(model.calls(), 0, "a current deterministic failure row suppresses the retry");
+
+        c.execute(
+            "UPDATE repo_memories SET body='describes `resolvable_thing` v2' WHERE id='m1'",
+            [],
+        )
+        .unwrap();
+        run_verdict_pass(&c, VerdictPass { model: &model, budget: 10 }, 3000).unwrap();
+        assert_eq!(model.calls(), 1, "a content change invalidates the failure row");
+        let failures: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM memory_model_failures WHERE repo_id='r' AND memory_id='m1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 0, "a successful verdict clears the stale failure row");
     }
 
     // ── divergence-finding lifecycle (the resolve trap) ──────────────────────────

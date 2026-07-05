@@ -97,7 +97,13 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     let mut _provisioned = None;
     let model = if model_enabled && (args.verify || args.compact) {
         if remote.is_ephemeral() {
-            if db.dream_model_work_pending(opts, budget, args.verify, args.compact)? {
+            if db.dream_model_work_pending(
+                opts,
+                budget,
+                args.verify,
+                args.compact,
+                remote.model.trim(),
+            )? {
                 let (m, provisioned) = rag_rat_core::dream::provision_verdict_model(remote)?;
                 _provisioned = Some(provisioned);
                 Some(m)

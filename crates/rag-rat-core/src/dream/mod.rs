@@ -19,10 +19,11 @@
 //! The v2 verification pass (`verify`) also exposes [`verification_queue`] and [`evidence_pack`] —
 //! the deterministic substrate the phase-B model verdict pass consumes (churn-skip queue + a
 //! citation-checkable evidence pack), reading the `memory_reality` / `memory_summaries` sibling
-//! tables (V045). Those sibling tables hold DERIVED, regenerable data, which is what preserves
+//! tables (V046+). Those sibling tables hold DERIVED, regenerable data, which is what preserves
 //! dream's "never mutates a `repo_memories` row" invariant even as verification lands.
 
 mod compact;
+mod failure;
 mod findings;
 mod model;
 mod verdict;
@@ -245,15 +246,37 @@ pub fn model_work_pending(
     budget: usize,
     verify: bool,
     compact: bool,
+    model_id: &str,
 ) -> anyhow::Result<bool> {
     if verify {
-        for entry in verify::verification_queue(conn, opts.now_ms, budget)? {
+        let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
+        let repo_id = scope.as_deref().unwrap_or("__unassigned__");
+        let mut considered = 0usize;
+        for entry in verify::verification_queue(conn, opts.now_ms, usize::MAX)? {
+            if considered >= budget {
+                break;
+            }
+            let inputs_hash = verify::checked_inputs_hash(conn, &entry.memory_id, &scope)?;
+            let content_hash = verify::note_content_hash(&entry.title, &entry.body);
+            let failure_stamp = failure::FailureStamp {
+                memory_id: &entry.memory_id,
+                repo_id,
+                pass: failure::DreamModelPass::Verify,
+                content_hash: &content_hash,
+                checked_inputs_hash: Some(&inputs_hash),
+                prompt_version: verdict::PROMPT_VERSION,
+                model_id,
+            };
+            if failure::blocking_failure_is_current(conn, &failure_stamp)? {
+                continue;
+            }
+            considered += 1;
             if verify::evidence_pack(conn, &entry.memory_id)?.is_citable() {
                 return Ok(true);
             }
         }
     }
-    if compact && compact::compaction_pending(conn, budget)? {
+    if compact && compact::compaction_pending(conn, budget, model_id)? {
         return Ok(true);
     }
     Ok(false)
