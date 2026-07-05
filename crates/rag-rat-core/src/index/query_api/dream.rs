@@ -40,12 +40,6 @@ impl IndexDatabase {
         verify: bool,
         compact: bool,
     ) -> anyhow::Result<bool> {
-        Ok(crate::dream::model_work_pending(
-            self.storage.connection(),
-            opts,
-            budget,
-            verify,
-            compact,
-        )?)
+        crate::dream::model_work_pending(self.storage.connection(), opts, budget, verify, compact)
     }
 }
