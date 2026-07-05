@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+use path_slash::PathExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1737,10 +1738,11 @@ fn resolve_relative_cookbook_path(cookbook: &str, config_dir: &Path) -> Option<S
         return None; // npm spec or already absolute → leave verbatim
     }
     let resolved = config_dir.join(first);
-    // Normalize to forward slashes: this string is a COMMAND arg for `node`/`npx tsx <path>`, not a
-    // filesystem op, and `Path::join` emits `\` on Windows. node accepts `/` on every platform, and
-    // a `\`-separated recipe path would otherwise reach the spawn verbatim.
-    let mut out = resolved.to_string_lossy().replace('\\', "/");
+    // Forward-slash the SEPARATOR only: this string is a COMMAND arg for `node`/`npx tsx <path>`,
+    // not a filesystem op, and `Path::join` emits `\` on Windows. `to_slash_lossy` (path-slash)
+    // rewrites the separator on Windows but leaves a literal backslash in a Unix filename intact —
+    // a blanket `\`→`/` replace would corrupt `/tmp/repo\x/recipe.mts` on Unix.
+    let mut out = resolved.to_slash_lossy().into_owned();
     for arg in tokens {
         out.push(' ');
         out.push_str(arg);
@@ -2463,9 +2465,10 @@ mod tests {
             &config_path,
             format!(
                 "[index]\nroot = \".\"\ndatabase = \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
-                // Forward-slash: a Windows `C:\…` path has invalid TOML escapes (`\U`, …); `/` is
-                // TOML-safe and `Path` treats the separators as equivalent on Windows.
-                global.display().to_string().replace('\\', "/")
+                // Forward-slash (path-slash): a Windows `C:\…` path has invalid TOML escapes
+                // (`\U`, …); `/` is TOML-safe and `Path` treats the separators as equivalent
+                // there.
+                global.to_slash_lossy()
             ),
         )
         .unwrap();
@@ -2481,9 +2484,10 @@ mod tests {
             format!(
                 "[index]\nroot = \".\"\nrepo_id = \"pinned-project\"\ndatabase = \
                  \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
-                // Forward-slash: a Windows `C:\…` path has invalid TOML escapes (`\U`, …); `/` is
-                // TOML-safe and `Path` treats the separators as equivalent on Windows.
-                global.display().to_string().replace('\\', "/")
+                // Forward-slash (path-slash): a Windows `C:\…` path has invalid TOML escapes
+                // (`\U`, …); `/` is TOML-safe and `Path` treats the separators as equivalent
+                // there.
+                global.to_slash_lossy()
             ),
         )
         .unwrap();
@@ -3553,8 +3557,25 @@ mod tests {
         // npm package specs and a bare token are LEFT VERBATIM (None).
         assert_eq!(resolve_relative_cookbook_path("@rag-rat/cookbook modal", dir), None);
         assert_eq!(resolve_relative_cookbook_path("some-pkg", dir), None);
-        // An ALREADY-ABSOLUTE recipe path is left verbatim (None).
-        assert_eq!(resolve_relative_cookbook_path("/abs/recipe.mjs runpod", dir), None);
+        // An ALREADY-ABSOLUTE recipe path is left verbatim (None). Use a platform-absolute path: a
+        // bare `/abs/...` is NOT absolute on Windows (no drive), so it wouldn't reach the
+        // absolute-bailout branch there.
+        #[cfg(windows)]
+        let abs_recipe = "C:/abs/recipe.mjs runpod";
+        #[cfg(not(windows))]
+        let abs_recipe = "/abs/recipe.mjs runpod";
+        assert_eq!(resolve_relative_cookbook_path(abs_recipe, dir), None);
+
+        // Drive-agnostic on Windows: a NON-C drive resolves the same (path-slash preserves the
+        // `E:` prefix, converting only the separator). An absolute `E:\…` recipe is left verbatim.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                resolve_relative_cookbook_path("./r/x.mts", Path::new(r"E:\proj")).as_deref(),
+                Some("E:/proj/./r/x.mts")
+            );
+            assert_eq!(resolve_relative_cookbook_path(r"E:\abs\recipe.mjs", dir), None);
+        }
     }
 
     #[test]

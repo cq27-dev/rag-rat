@@ -42,11 +42,12 @@ pub fn unique_dir(tag: &str) -> PathBuf {
 
 /// A filesystem path formatted for embedding inside a double-quoted TOML string value. On Windows a
 /// raw `db.display()` yields `C:\Users\…`, whose `\U`/`\R`/… are invalid TOML escape sequences
-/// (`too few unicode value digits` at parse) — so replace `\` with `/`. Windows accepts `/` in
-/// paths and Rust's `Path` treats `/` and `\` as equivalent separators there, so the parsed config
-/// still compares equal to the original `PathBuf`. On Unix this is a no-op.
+/// (`too few unicode value digits` at parse). `to_slash_lossy` (path-slash) rewrites the SEPARATOR
+/// to `/` on Windows — TOML-safe, and `Path` treats `/`≡`\` there so the parsed config still equals
+/// the original `PathBuf` — while leaving a literal backslash in a Unix filename intact.
 pub fn toml_path(path: &Path) -> String {
-    path.display().to_string().replace('\\', "/")
+    use path_slash::PathExt;
+    path.to_slash_lossy().into_owned()
 }
 
 /// Run `git -C dir args`, asserting success. Use [`git_commit`] for commits so the commit carries a

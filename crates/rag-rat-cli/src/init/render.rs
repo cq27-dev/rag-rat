@@ -165,14 +165,15 @@ pub(crate) fn supported_languages() -> Vec<Language> {
     Language::all().to_vec()
 }
 
-#[cfg(test)]
+// Unix-only: the sole test needs a real symlink (`std::os::unix::fs::symlink`), so gate the whole
+// module — otherwise `use super::*` is an unused import on Windows under `-D unused-imports`.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     // A canonicalized `root` vs a symlinked `parent` must still resolve to "." — the macOS-only
     // failure (`/tmp` → `/private/tmp`) reproduced on Linux with a real symlink (#446). Before the
     // canonicalize-both fix, `strip_prefix` failed and this emitted the absolute path.
-    #[cfg(unix)]
     #[test]
     fn absolute_root_value_is_dot_when_parent_reaches_root_through_a_symlink() {
         use std::os::unix::fs::symlink;

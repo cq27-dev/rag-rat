@@ -49,6 +49,8 @@ toon-format.workspace = true
 tempfile.workspace = true
 # The consolidate integration tests assert sibling-repo repo_meta state directly in the global DB.
 rusqlite.workspace = true
+# Test helpers embed a temp path into a TOML value; path-slash makes it TOML-safe cross-platform.
+path-slash.workspace = true
 
 [features]
 default = ["fastembed", "model2vec"]
