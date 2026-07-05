@@ -48,8 +48,8 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
 /// newly added read tool is read-only by default (worst case: it falls back to a read-write open).
 /// Every tool listed here mutates the index — keep it in sync with the write handlers in
 /// `handlers.rs` (`tool_classification_covers_every_tool` guards that no tool is missed).
-fn is_read_only_tool(name: &str) -> bool {
-    !matches!(
+pub(crate) fn is_write_tool(name: &str) -> bool {
+    matches!(
         name,
         "heal_index"
             | "memory_create"
@@ -58,6 +58,10 @@ fn is_read_only_tool(name: &str) -> bool {
             | "memory_mark_obsolete"
             | "memory_validate"
     )
+}
+
+fn is_read_only_tool(name: &str) -> bool {
+    !is_write_tool(name)
 }
 
 /// Read tools that compare indexed graph/symbol data against LIVE on-disk source text, read through
