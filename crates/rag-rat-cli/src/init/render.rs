@@ -127,7 +127,18 @@ pub(crate) fn config_root_value(root: &Path, config_path: &Path) -> String {
     }
 }
 pub(crate) fn absolute_config_root_value(root: &Path, parent: &Path) -> String {
-    if let Ok(relative_parent) = parent.strip_prefix(root) {
+    // `root` comes from `Config::load`, which CANONICALIZES it (symlinks resolved); `parent` comes
+    // straight from the config path and does NOT. On any symlinked prefix — macOS `/tmp` →
+    // `/private/tmp`, a symlinked `$HOME` — the two forms diverge and `strip_prefix` fails, so we
+    // wrongly emit an absolute `[index] root` instead of `.`/`..`. Canonicalize BOTH before
+    // stripping so they share one form (no-op when there's no symlink, i.e. everywhere on Linux
+    // CI). Fall back to the raw path if canonicalize fails (e.g. the dir doesn't exist yet) —
+    // same behavior as before for that edge. (#446)
+    let root_canon = root.canonicalize();
+    let parent_canon = parent.canonicalize();
+    let root_ref = root_canon.as_deref().unwrap_or(root);
+    let parent_ref = parent_canon.as_deref().unwrap_or(parent);
+    if let Ok(relative_parent) = parent_ref.strip_prefix(root_ref) {
         return relative_config_root_value(relative_parent);
     }
     root.display().to_string()
@@ -152,4 +163,35 @@ pub(crate) fn display_rel(path: &Path) -> String {
 }
 pub(crate) fn supported_languages() -> Vec<Language> {
     Language::all().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A canonicalized `root` vs a symlinked `parent` must still resolve to "." — the macOS-only
+    // failure (`/tmp` → `/private/tmp`) reproduced on Linux with a real symlink (#446). Before the
+    // canonicalize-both fix, `strip_prefix` failed and this emitted the absolute path.
+    #[cfg(unix)]
+    #[test]
+    fn absolute_root_value_is_dot_when_parent_reaches_root_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        // `root` = canonicalized real dir (what Config::load stores); `parent` reaches the same dir
+        // through the symlink (what a config path under `link/` yields).
+        let root = real.canonicalize().unwrap();
+        assert_ne!(link, root, "the symlinked path must differ from the canonical one");
+        assert_eq!(config_root_value(&root, &link.join("rag-rat.toml")), ".");
+
+        // One level deeper through the symlink → "..".
+        let sub = link.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(config_root_value(&root, &sub.join("rag-rat.toml")), "..");
+    }
 }
