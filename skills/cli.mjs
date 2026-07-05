@@ -19,7 +19,11 @@
  * skill exactly once.
  */
 
-import { spawnSync } from "node:child_process";
+// cross-spawn, not node:child_process — on Windows `npx` is a `.cmd` shim that Node can only run
+// through a shell, and forwarding user tokens (`find` queries, `--skill` values) through cmd.exe
+// would let shell metacharacters like `&`/`|` execute. cross-spawn resolves the shim and escapes
+// args itself, so we never enable `shell` and untrusted args pass through verbatim.
+import spawn from "cross-spawn";
 
 /** rag-rat's canonical skill directory on GitHub (walked one level deep: <name>/SKILL.md). */
 const SOURCE = "https://github.com/cq27-dev/rag-rat/tree/main/.agents/skills";
@@ -38,13 +42,14 @@ const INSTALL = new Set(["add", "install", "i", "a"]);
 const SCOPED = new Set(["remove", "rm", "r", "update", "check", "upgrade"]);
 
 /** The ONLY args we combine with an injected default rag-rat skill list: pure scope/confirm toggles
- * that carry no skill/agent SELECTION and take no value. We deliberately do NOT reimplement
- * upstream's arg grammar (variadic `--agent`, `--all` precedence, `--skill=` forms). Instead, we
- * inject our skills as explicit positional targets only when EVERY arg is one of these known-safe
- * flags (or there are none). Anything else — an agent filter, `--all`, `--skill`, a positional name,
- * or any unknown flag — means the user is driving `skills` directly, so we forward verbatim and never
- * risk injecting a wrong scope. */
-const SAFE_MAINT_FLAGS = new Set(["-g", "--global", "-y", "--yes"]);
+ * that carry no skill/agent SELECTION and take no value. Enumerated from upstream's option parsers
+ * (`parseRemoveOptions` / `parseUpdateOptions`): scope = -g/--global, -p/--project; confirm =
+ * -y/--yes. We deliberately do NOT reimplement upstream's arg grammar (variadic `--agent`, `--all`
+ * precedence, `--skill=` forms). We inject our skills as explicit positional targets only when EVERY
+ * arg is one of these known-safe flags (or there are none). Anything else — an agent filter, `--all`,
+ * `--skill`, a positional name, or any unknown flag — means the user is driving `skills` directly, so
+ * we forward verbatim and never risk injecting a wrong scope. */
+const SAFE_MAINT_FLAGS = new Set(["-g", "--global", "-p", "--project", "-y", "--yes"]);
 
 function usage() {
   process.stdout.write(
@@ -98,13 +103,7 @@ function main() {
     skillsArgs = argv;
   }
 
-  const res = spawnSync("npx", ["-y", "skills", ...skillsArgs], {
-    stdio: "inherit",
-    // On Windows `npx` is a `.cmd` shim that spawn can't execute directly (ENOENT); run it through
-    // the shell so cmd.exe resolves it. Our args carry no spaces, so no shell-quoting hazard. POSIX
-    // needs no shell (and keeping it off there preserves exact arg passing).
-    shell: process.platform === "win32",
-  });
+  const res = spawn.sync("npx", ["-y", "skills", ...skillsArgs], { stdio: "inherit" });
   if (res.error) {
     process.stderr.write(
       `failed to run the \`skills\` CLI via npx: ${res.error.message}\n` +
