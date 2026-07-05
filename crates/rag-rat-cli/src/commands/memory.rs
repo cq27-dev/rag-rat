@@ -78,7 +78,7 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
                 None
             }
         } else {
-            Some(rag_rat_core::dream::HttpVerdictModel::from_config(remote))
+            Some(rag_rat_core::dream::HttpVerdictModel::from_config(remote)?)
         }
     } else {
         None

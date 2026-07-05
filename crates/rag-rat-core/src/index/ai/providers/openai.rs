@@ -452,7 +452,7 @@ fn response_excerpt(body: &str) -> String {
 /// auth (`Ok(None)`); a named-but-missing/empty value → `Err` (the operator asked for auth but the
 /// token isn't there). Closure-injected so the env-mutation footgun (unsafe + flaky under nextest's
 /// parallel runner in Rust 2024) never enters the test path.
-fn resolve_auth_header(
+pub(crate) fn resolve_auth_header(
     auth_env: Option<&str>,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<Option<String>> {
@@ -462,8 +462,7 @@ fn resolve_auth_header(
     let token =
         lookup(var).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).ok_or_else(|| {
             anyhow::anyhow!(
-                "remote embedding auth env var `{var}` is set in config but missing or empty in \
-                 the environment"
+                "auth env var `{var}` is set in config but missing or empty in the environment"
             )
         })?;
     Ok(Some(format!("Bearer {token}")))

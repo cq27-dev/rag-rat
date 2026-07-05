@@ -27,6 +27,7 @@ pub use providers::Model2VecEmbedder;
 pub use providers::provision_box_for_benchmark;
 pub(crate) use providers::{
     ChunkEmbedder, acquire_chunk_embedder, active_embedder, provision_and_build,
+    resolve_auth_header,
 };
 // Curate the provider surface onto the `index::ai` path so existing `super::*` callers
 // (`reconcile`, `status`, `helpers`) and the external `ai::Embedder` /

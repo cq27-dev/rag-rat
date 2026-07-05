@@ -76,10 +76,10 @@ pub struct HttpVerdictModel {
     chat_url: String,
     /// The server-side model name sent in the request body (`[llm.dream.remote] model`).
     model: String,
-    /// Bearer token sent as `Authorization: Bearer <token>` when present — the value of the
-    /// `[llm.dream.remote] auth_env` variable (connect mode) or the ephemeral box's tunnel token
-    /// (`from_provisioned`). `None` for a local server that needs no auth.
-    auth_token: Option<String>,
+    /// The full `Authorization` header value (`"Bearer <token>"`) sent when the server needs auth
+    /// — from the `[llm.dream.remote] auth_env` variable (connect) or the ephemeral box's
+    /// tunnel token (`from_provisioned`). `None` for a local server that needs no auth.
+    auth_header: Option<String>,
 }
 
 impl HttpVerdictModel {
@@ -88,49 +88,51 @@ impl HttpVerdictModel {
     /// Ollama routed through a corporate proxy 403s), matching the embedder client. `endpoint` is
     /// optional on the config, so an absent value falls back to the local-Ollama default (the same
     /// default `RemoteDreamConfig::default` carries). A configured `auth_env` names the environment
-    /// variable holding the bearer token, read once here.
-    pub fn from_config(cfg: &RemoteDreamConfig) -> Self {
+    /// variable holding the bearer token; a NAMED-but-unset/empty var is a CONFIG ERROR (the same
+    /// `resolve_auth_header` the embedder uses), so this is fallible — an authenticated endpoint
+    /// must fail fast at startup, not send unauthenticated requests that 401 later.
+    pub fn from_config(cfg: &RemoteDreamConfig) -> anyhow::Result<Self> {
         let endpoint = cfg
             .endpoint
             .as_deref()
             .unwrap_or("http://localhost:11434")
             .trim()
             .trim_end_matches('/');
-        let auth_token = cfg
-            .auth_env
-            .as_deref()
-            .and_then(|var| std::env::var(var).ok())
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
-        Self::build(endpoint, cfg.model.trim(), auth_token, cfg.request_timeout_s)
+        let auth_header = crate::index::ai::resolve_auth_header(cfg.auth_env.as_deref(), |var| {
+            std::env::var(var).ok()
+        })?;
+        Ok(Self::build(endpoint, cfg.model.trim(), auth_header, cfg.request_timeout_s))
     }
 
     /// Build the verdict client against an EPHEMERAL box just provisioned by the cookbook: the
     /// tunnel `endpoint` + `auth_token` come from the `ready` handshake (NOT config), the model +
     /// per-request timeout from `[llm.dream.remote]`. The box's tunnel is a public HTTPS URL (not
-    /// loopback), so the proxy bypass does not apply. Pair with [`provision_verdict_model`], which
-    /// keeps the `ProvisionedBox` alive for the model's lifetime.
+    /// loopback), so the proxy bypass does not apply. The `auth_token` here is a DIRECT credential
+    /// (not an env-var name), so it is wrapped into the header as-is. Pair with
+    /// [`provision_verdict_model`], which keeps the `ProvisionedBox` alive for the model's
+    /// lifetime.
     pub fn from_provisioned(
         endpoint: &str,
         auth_token: Option<&str>,
         model: &str,
         request_timeout_s: u64,
     ) -> Self {
-        let auth_token = auth_token.map(str::to_string).filter(|t| !t.is_empty());
+        let auth_header =
+            auth_token.map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("Bearer {t}"));
         Self::build(
             endpoint.trim().trim_end_matches('/'),
             model.trim(),
-            auth_token,
+            auth_header,
             request_timeout_s,
         )
     }
 
     /// Shared constructor for both modes: precompute the chat URL, build the `ureq` agent (loopback
-    /// proxy bypass), and store the bearer token.
+    /// proxy bypass), and store the resolved `Authorization` header.
     fn build(
         endpoint: &str,
         model: &str,
-        auth_token: Option<String>,
+        auth_header: Option<String>,
         request_timeout_s: u64,
     ) -> Self {
         let chat_url = format!("{endpoint}/v1/chat/completions");
@@ -142,7 +144,7 @@ impl HttpVerdictModel {
             builder = builder.proxy(None);
         }
         let agent: ureq::Agent = builder.build().into();
-        Self { agent, chat_url, model: model.to_string(), auth_token }
+        Self { agent, chat_url, model: model.to_string(), auth_header }
     }
 }
 
@@ -165,8 +167,8 @@ impl VerdictModel for HttpVerdictModel {
             .map_err(|e| anyhow::anyhow!("failed to serialize verdict request: {e}"))?;
 
         let mut request = self.agent.post(&self.chat_url).content_type("application/json");
-        if let Some(token) = &self.auth_token {
-            request = request.header("authorization", format!("Bearer {token}"));
+        if let Some(header) = &self.auth_header {
+            request = request.header("authorization", header.as_str());
         }
         let mut response = request
             .send(body)
@@ -431,12 +433,24 @@ mod http_tests {
     }
 
     #[test]
+    fn from_config_errors_when_auth_env_var_is_unset() {
+        // Connect mode naming an env var that does not resolve is a CONFIG error — fail fast rather
+        // than send unauthenticated requests. Uses a var name that is not set in the environment.
+        let cfg = RemoteDreamConfig {
+            auth_env: Some("RAG_RAT_DEFINITELY_UNSET_DREAM_AUTH_VAR".to_string()),
+            ..RemoteDreamConfig::default()
+        };
+        let err = HttpVerdictModel::from_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("auth env"), "surfaces the unresolved auth var: {err}");
+    }
+
+    #[test]
     fn constructors_set_the_model_id() {
         let cfg = RemoteDreamConfig {
             model: "qwen3:4b-instruct".to_string(),
             ..RemoteDreamConfig::default()
         };
-        assert_eq!(HttpVerdictModel::from_config(&cfg).model_id(), "qwen3:4b-instruct");
+        assert_eq!(HttpVerdictModel::from_config(&cfg).unwrap().model_id(), "qwen3:4b-instruct");
         assert_eq!(
             HttpVerdictModel::from_provisioned(
                 "https://box.modal.run",

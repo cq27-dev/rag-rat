@@ -43,6 +43,10 @@ pub use self::model2vec::Model2VecEmbedder;
 pub use self::openai::OpenAiEmbedder;
 // The tuning sweep (index::ai::throughput_tune) builds embedders at varied concurrencies.
 pub(crate) use self::openai::ProvisionedEmbedderParams;
+// The shared connect-mode auth resolver — reused by the dream verdict client
+// (`dream/model.rs`) so a configured-but-unresolved `auth_env` errors identically for
+// embeddings and the dream model.
+pub(crate) use self::openai::resolve_auth_header;
 use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
 use crate::index::ai::{

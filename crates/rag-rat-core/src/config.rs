@@ -867,10 +867,17 @@ impl Config {
         // file's contents are irrelevant by design — a parse/validation failure there must fold
         // into the divergence warning, never block every command from the linked checkout (Codex
         // batch 8, finding 2). Wherever the local config GOVERNS, the error is fatal as always.
-        // The `[local_ai]` rejection (#317) is part of local validity — see `RawConfig::local_ai`.
+        // The `[local_ai]` / `[dream]` rejections are part of local validity — see the
+        // `RawConfig` presence-capture fields.
         let local_parse: Result<RawConfig, ConfigError> =
             toml::from_str::<RawConfig>(&text).map_err(ConfigError::from).and_then(|raw| {
-                if raw.local_ai.is_some() { Err(ConfigError::LocalAiTableRenamed) } else { Ok(raw) }
+                if raw.local_ai.is_some() {
+                    Err(ConfigError::LocalAiTableRenamed)
+                } else if raw.dream.is_some() {
+                    Err(ConfigError::DreamTableMoved)
+                } else {
+                    Ok(raw)
+                }
             });
         let local_config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         // The topology subject must be a discoverable directory: a RELATIVE config path like
@@ -1059,6 +1066,9 @@ fn governing_main_config(main_top: &Path) -> Result<Option<(RawConfig, PathBuf)>
     let raw: RawConfig = toml::from_str(&text)?;
     if raw.local_ai.is_some() {
         return Err(ConfigError::LocalAiTableRenamed);
+    }
+    if raw.dream.is_some() {
+        return Err(ConfigError::DreamTableMoved);
     }
     Ok(Some((raw, main_top)))
 }
@@ -1353,6 +1363,13 @@ struct RawConfig {
     /// misconfiguring silently.
     #[serde(default)]
     local_ai: Option<toml::Value>,
+    /// Presence-capture for the OLD top-level `[dream]` table (the dream model config moved to
+    /// `[llm.dream]` / `[llm.dream.remote]`). Serde would otherwise SILENTLY DROP it, so an
+    /// upgrade from `[dream.model] enabled = true` would load `[llm.dream] enabled = false`
+    /// and run the deterministic passes only, never the model. Captured so `load` rejects it
+    /// loudly with a migration instruction instead of silently downgrading.
+    #[serde(default)]
+    dream: Option<toml::Value>,
     #[serde(default)]
     watch: RawWatch,
     #[serde(default)]
@@ -1982,6 +1999,13 @@ pub enum ConfigError {
          `[local_ai.embedding.runtime]` → `[llm.embedding.remote]` / `[llm.embedding.runtime]`)"
     )]
     LocalAiTableRenamed,
+    #[error(
+        "the dream model config moved from `[dream.model]` to `[llm.dream]` / \
+         `[llm.dream.remote]`. Update your rag-rat.toml: rename `[dream.model] enabled = true` → \
+         `[llm.dream] enabled = true`, and put the server config (endpoint/model, or a \
+         cookbook/backend/gpu for a remote GPU) under `[llm.dream.remote]`"
+    )]
+    DreamTableMoved,
     #[error("duplicate target name `{0}`")]
     DuplicateTarget(String),
     #[error("configured directory does not exist: {0}")]
@@ -3700,6 +3724,27 @@ mod tests {
         assert!(
             matches!(err, ConfigError::LocalAiTableRenamed),
             "[local_ai] table → LocalAiTableRenamed, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn the_legacy_dream_table_is_rejected_with_a_migration_message() {
+        // The dream model config moved from [dream.model] → [llm.dream]. An old config's top-level
+        // [dream] table must error LOUDLY: serde would otherwise silently DROP it, so an upgrade
+        // from `[dream.model] enabled = true` would run the deterministic passes only (never the
+        // model). Fires in Config::load before any directory resolution.
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-dream-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[dream.model]\nenabled = true\n",
+        )
+        .unwrap();
+        let err = Config::load(tmp.join("rag-rat.toml")).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DreamTableMoved),
+            "[dream] table → DreamTableMoved, got {err:?}",
         );
     }
 
