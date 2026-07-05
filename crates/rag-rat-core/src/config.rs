@@ -1737,7 +1737,10 @@ fn resolve_relative_cookbook_path(cookbook: &str, config_dir: &Path) -> Option<S
         return None; // npm spec or already absolute → leave verbatim
     }
     let resolved = config_dir.join(first);
-    let mut out = resolved.to_string_lossy().into_owned();
+    // Normalize to forward slashes: this string is a COMMAND arg for `node`/`npx tsx <path>`, not a
+    // filesystem op, and `Path::join` emits `\` on Windows. node accepts `/` on every platform, and
+    // a `\`-separated recipe path would otherwise reach the spawn verbatim.
+    let mut out = resolved.to_string_lossy().replace('\\', "/");
     for arg in tokens {
         out.push(' ');
         out.push_str(arg);
@@ -2460,7 +2463,9 @@ mod tests {
             &config_path,
             format!(
                 "[index]\nroot = \".\"\ndatabase = \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
-                global.display()
+                // Forward-slash: a Windows `C:\…` path has invalid TOML escapes (`\U`, …); `/` is
+                // TOML-safe and `Path` treats the separators as equivalent on Windows.
+                global.display().to_string().replace('\\', "/")
             ),
         )
         .unwrap();
@@ -2476,7 +2481,9 @@ mod tests {
             format!(
                 "[index]\nroot = \".\"\nrepo_id = \"pinned-project\"\ndatabase = \
                  \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
-                global.display()
+                // Forward-slash: a Windows `C:\…` path has invalid TOML escapes (`\U`, …); `/` is
+                // TOML-safe and `Path` treats the separators as equivalent on Windows.
+                global.display().to_string().replace('\\', "/")
             ),
         )
         .unwrap();

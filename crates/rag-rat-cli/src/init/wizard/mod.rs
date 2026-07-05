@@ -758,6 +758,21 @@ mod tests {
         RepoScan::default()
     }
 
+    /// A synthetic ABSOLUTE path for these logic tests. A bare `/repo/sub` is absolute on Unix but
+    /// NOT on Windows (no drive), which would send `config_root_value` down its relative branch and
+    /// mis-count depth. Prefix a drive on Windows so `is_absolute()` holds on both. `Path` treats
+    /// `/` and `\` as equivalent separators on Windows, so the forward slashes are fine.
+    fn abs(unix_style: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            std::path::PathBuf::from(format!("C:{unix_style}"))
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from(unix_style)
+        }
+    }
+
     #[test]
     fn fresh_draft_roots_relative_to_config_file_parent() {
         let root = std::path::PathBuf::from("/repo");
@@ -768,9 +783,10 @@ mod tests {
 
     #[test]
     fn fresh_initial_draft_uses_scan_root_not_cwd() {
-        let root = std::path::PathBuf::from("/repo/sub");
+        let root = abs("/repo/sub");
+        let config_path = abs("/repo/sub/rag-rat.toml");
         let (draft, original, cookbooks) =
-            initial_draft(&test_scan(), None, Path::new("/repo/sub/rag-rat.toml"), root.clone());
+            initial_draft(&test_scan(), None, &config_path, root.clone());
 
         assert_eq!(draft.root_abs, root);
         assert_eq!(draft.root_value, ".");

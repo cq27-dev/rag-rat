@@ -40,6 +40,15 @@ pub fn unique_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// A filesystem path formatted for embedding inside a double-quoted TOML string value. On Windows a
+/// raw `db.display()` yields `C:\Users\…`, whose `\U`/`\R`/… are invalid TOML escape sequences
+/// (`too few unicode value digits` at parse) — so replace `\` with `/`. Windows accepts `/` in
+/// paths and Rust's `Path` treats `/` and `\` as equivalent separators there, so the parsed config
+/// still compares equal to the original `PathBuf`. On Unix this is a no-op.
+pub fn toml_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 /// Run `git -C dir args`, asserting success. Use [`git_commit`] for commits so the commit carries a
 /// deterministic, unique date (a plain `git(dir, &["commit", ...])` would commit on the wall clock
 /// and could collide on `repo_id`).

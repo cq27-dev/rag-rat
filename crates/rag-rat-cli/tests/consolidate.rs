@@ -293,7 +293,7 @@ fn consolidate_refuses_a_pin_at_a_missing_path_and_accepts_a_pin_at_global() {
         root.join("rag-rat.toml"),
         format!(
             "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[target_bindings]\nrust = [\"src\"]\n",
-            global.display()
+            common::toml_path(&global)
         ),
     )
     .unwrap();
@@ -466,7 +466,7 @@ fn consolidate_imports_a_lingering_legacy_under_a_pin_at_global() {
         root.join("rag-rat.toml"),
         format!(
             "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[target_bindings]\nrust = [\"src\"]\n",
-            global.display()
+            common::toml_path(&global)
         ),
     )
     .unwrap();

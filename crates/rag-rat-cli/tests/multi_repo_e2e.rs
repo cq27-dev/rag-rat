@@ -142,7 +142,7 @@ fn scoped_config(root: &Path, data_dir: &Path) -> Config {
         &lib_toml,
         format!(
             "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[target_bindings]\nrust = [\"src\"]\n",
-            db.display()
+            common::toml_path(&db)
         ),
     )
     .unwrap();
@@ -697,7 +697,7 @@ fn consolidate_lands_a_third_legacy_repos_memories_fts_searchable() {
         &legacy_lib,
         format!(
             "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[target_bindings]\nrust = [\"src\"]\n",
-            legacy.display()
+            common::toml_path(&legacy)
         ),
     )
     .unwrap();

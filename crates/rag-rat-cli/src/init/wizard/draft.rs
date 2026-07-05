@@ -759,8 +759,10 @@ mod tests {
 
         let d = WizardDraft::from_existing(raw, &cfg, &config_path);
         // The display seam shows the RESOLVED path (the explicit key, made absolute by load).
+        // Normalize separators: the display path uses `\` on Windows (correct for the user), but
+        // the suffix check is separator-agnostic.
         assert!(
-            d.db_path.ends_with("custom/index.sqlite"),
+            d.db_path.replace('\\', "/").ends_with("custom/index.sqlite"),
             "reconfigure displays the explicit database path, got {}",
             d.db_path
         );

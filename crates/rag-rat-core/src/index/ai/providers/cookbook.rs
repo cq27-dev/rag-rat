@@ -56,7 +56,10 @@ pub const COOKBOOK_INPUT_ENV: &str = "RAG_RAT_COOKBOOK_INPUT";
 /// + pulling a model can take a couple of minutes; 5 minutes is a generous ceiling.
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How long to wait after SIGTERM before escalating to SIGKILL during teardown.
+/// How long to wait after SIGTERM before escalating to SIGKILL during teardown. Unix-only: the
+/// SIGTERM→SIGKILL escalation (`teardown_group`, the signal handler, `abort_active_provisioning`)
+/// is all `#[cfg(unix)]`, so on Windows this const is dead (`-D dead-code` in CI).
+#[cfg(unix)]
 const TEARDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// Cap on a single drained stdout/stderr line: a cookbook is arbitrary npx code, so a giant line

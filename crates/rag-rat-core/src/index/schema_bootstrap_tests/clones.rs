@@ -2412,6 +2412,10 @@ fn load_refine_members_returns_up_to_value_cap() {
         "capped members must be the first MEMBER_VALUE_CAP in canonical (struct_hash, id) order"
     );
 
+    // Close the SQLite connection before deleting its dir: Windows refuses to remove a file with a
+    // live handle (`os error 32`), whereas Unix unlinks it lazily. Dropping `db` first makes the
+    // strict teardown pass on both.
+    drop(db);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2474,6 +2478,10 @@ fn refine_member_carries_spans_len_eq_seq() {
         }
     }
 
+    // Close the SQLite connection before deleting its dir: Windows refuses to remove a file with a
+    // live handle (`os error 32`), whereas Unix unlinks it lazily. Dropping `db` first makes the
+    // strict teardown pass on both.
+    drop(db);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2934,6 +2942,10 @@ fn build_class_surfaces_medoid_symbol_id() {
         "medoid_symbol_id must be deterministic across repeated calls"
     );
 
+    // Close the SQLite connection before deleting its dir: Windows refuses to remove a file with a
+    // live handle (`os error 32`), whereas Unix unlinks it lazily. Dropping `db` first makes the
+    // strict teardown pass on both.
+    drop(db);
     fs::remove_dir_all(root).unwrap();
 }
 
