@@ -450,8 +450,8 @@ pub struct ImpactArgs {
     pub include: Option<Vec<ImpactInclude>>,
     /// Return full memory bodies + every binding + call paths instead of the default compact,
     /// scannable per-memory headers (#37). To expand ONE memory by id (e.g. the `memory_id` from a
-    /// `surface="summary"` compact attachment), call `memory_show`; full detail for a symbol/path is
-    /// also reachable via `memory_for_symbol` / `memory_for_path` / `memory_for_call_path`.
+    /// `surface="summary"` compact attachment), call `memory_show`; full detail for a symbol/path
+    /// is also reachable via `memory_for_symbol` / `memory_for_path` / `memory_for_call_path`.
     #[serde(default)]
     pub full_memories: bool,
     /// Absolute path to a linked git worktree you're working in; serves that worktree's branch
