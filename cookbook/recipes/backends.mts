@@ -86,6 +86,17 @@ const INFINITY_PORT = 7997;
 /** vLLM's OpenAI server default port. */
 const VLLM_PORT = 8000;
 
+/**
+ * Chat context cap. Without `--max-model-len`, vLLM sizes its KV cache for the model's FULL native
+ * context — for a modern instruct model that is huge (Qwen3's is 262144), needing ~36 GiB of KV
+ * cache, so on a modest GPU (an L4 holds ~12 GiB of KV → ~86K tokens) vLLM aborts engine startup
+ * with a ValueError and the box never becomes ready. The dream verdict/compaction prompts are
+ * small, so a bounded window is ample and keeps startup inside a single-GPU budget. Applied to CHAT
+ * only: embed models' native contexts are small (they fit unclamped), and a cap ABOVE a model's
+ * context makes vLLM error the other way.
+ */
+const VLLM_CHAT_MAX_MODEL_LEN = 32768;
+
 const OLLAMA_SPEC: BackendServerSpec = {
   backend: "ollama",
   port: OLLAMA_PORT,
@@ -159,6 +170,9 @@ const VLLM_SPEC: BackendServerSpec = {
     const args = [input.model];
     if (capability === "embed") {
       args.push("--runner", "pooling");
+    } else {
+      // chat: bound the context so vLLM's KV cache fits a single-GPU budget (see the const above).
+      args.push("--max-model-len", String(VLLM_CHAT_MAX_MODEL_LEN));
     }
     args.push("--host", "0.0.0.0", "--port", String(VLLM_PORT));
     // Map the concurrency cap to vLLM's max concurrent sequences when set.
