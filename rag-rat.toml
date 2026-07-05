@@ -32,6 +32,24 @@ ort_threads = 4
 omp_threads = 1
 max_embedding_chars = 2000    # conservative retry: ~500 tokens/chunk (well within jina's 8192 window)
 
+# Dream v2 MODEL passes (verdict + compaction). OFF until enabled — `rag-rat dream` stays 100%
+# deterministic otherwise. The serving config lives under `[llm.dream.remote]`, mirroring
+# `[llm.embedding.remote]`.
+[llm.dream]
+enabled = true
+
+# EPHEMERAL mode (`cookbook`, not `endpoint`): `rag-rat dream --verify/--compact` provisions a fresh
+# Modal GPU box running vLLM (generation), runs the budget-capped verdict/compaction passes against
+# its OpenAI-compatible `/v1/chat/completions`, then tears the box down. A zero-work guard skips
+# provisioning entirely when the churn-skip queues are already drained, so an idle run never
+# cold-starts a paid box. (infinity is embed-only and rejected here — chat needs ollama or vllm.)
+[llm.dream.remote]
+cookbook = "@rag-rat/cookbook modal"    # same ephemeral Modal recipe as embeddings (published npm)
+backend  = "vllm"                       # generation runner; serves /v1/chat/completions
+model    = "Qwen/Qwen3-8B"              # server-side HF id vLLM launches (Qwen3-4B-Instruct-2507 = lighter, eval-validated)
+gpu      = "L4"                         # 24GB fits Qwen3-8B in fp16 (matches the embedding box class)
+request_timeout_s = 900                 # generous per-request budget (a dense evidence pack is slow on first token)
+
 [target_bindings]
 rust = ["crates"]
 markdown = ["docs"]
