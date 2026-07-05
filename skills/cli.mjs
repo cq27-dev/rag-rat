@@ -30,37 +30,21 @@ const RAG_RAT_SKILLS = ["using-rag-rat", "dream-review"];
 /** "install" verbs — mapped to `skills add <SOURCE>`. Includes every upstream `add` alias. */
 const INSTALL = new Set(["add", "install", "i", "a"]);
 
-/** Maintenance verbs scoped to rag-rat's own skills when the user didn't name a skill themselves — a
- * bare `skills remove`/`update` acts over EVERY installed skill (a selector / update-all), so a
- * branded "remove them"/"update them" must never touch unrelated skills. Includes ALL upstream
- * aliases (verified against the `skills` CLI source: remove = rm|r, update = check|upgrade) — an
- * un-listed alias would slip through unscoped. */
+/** Maintenance verbs (remove/update) whose DEFAULT is scoped to rag-rat's own skills — a bare
+ * `skills remove`/`update` acts over EVERY installed skill (a selector / update-all), so a branded
+ * "remove them"/"update them" must not. Includes ALL upstream aliases (verified against the `skills`
+ * CLI source: remove = rm|r, update = check|upgrade) — an un-listed alias would slip through
+ * unscoped. */
 const SCOPED = new Set(["remove", "rm", "r", "update", "check", "upgrade"]);
 
-/** Flags that consume the NEXT token as their value (so that value is not mistaken for a positional
- * skill name). */
-const VALUE_FLAGS = new Set(["-a", "--agent", "-s", "--skill"]);
-
-/** Did the user already name a skill to act on — via `-s`/`--skill` OR a bare positional token? If
- * so, the scoped verbs must NOT append the default rag-rat skill set (that would widen the action to
- * skills the user didn't ask for). Walks args, skipping the value of value-taking flags so `-a
- * claude-code` is not read as the positional skill `claude-code`. */
-function namesASkill(rest) {
-  for (let i = 0; i < rest.length; i++) {
-    const t = rest[i];
-    if (t === "-s" || t === "--skill" || t.startsWith("-s=") || t.startsWith("--skill=")) {
-      return true;
-    }
-    if (VALUE_FLAGS.has(t)) {
-      i++; // consume this flag's value
-      continue;
-    }
-    if (!t.startsWith("-")) {
-      return true; // a bare positional = a skill name
-    }
-  }
-  return false;
-}
+/** The ONLY args we combine with an injected default rag-rat skill list: pure scope/confirm toggles
+ * that carry no skill/agent SELECTION and take no value. We deliberately do NOT reimplement
+ * upstream's arg grammar (variadic `--agent`, `--all` precedence, `--skill=` forms). Instead, we
+ * inject our skills as explicit positional targets only when EVERY arg is one of these known-safe
+ * flags (or there are none). Anything else — an agent filter, `--all`, `--skill`, a positional name,
+ * or any unknown flag — means the user is driving `skills` directly, so we forward verbatim and never
+ * risk injecting a wrong scope. */
+const SAFE_MAINT_FLAGS = new Set(["-g", "--global", "-y", "--yes"]);
 
 function usage() {
   process.stdout.write(
@@ -103,12 +87,13 @@ function main() {
     const rest = sub !== undefined && INSTALL.has(sub) ? argv.slice(1) : argv;
     skillsArgs = ["add", SOURCE, ...rest];
   } else if (SCOPED.has(sub)) {
-    // `remove`/`update` (+ aliases) with no explicit skill → scope to OUR skills, so the branded
-    // command never removes/refreshes unrelated skills. If the user named a skill (via `-s`/`--skill`
-    // OR a positional), respect their selection and add nothing.
+    // Inject rag-rat's skills as explicit POSITIONAL targets (upstream's `remove|update [skills…]`
+    // form) ONLY when every arg is a known-safe scope/confirm flag — then the action is provably
+    // limited to our skills. Otherwise the user passed a selection/widening arg we won't second-guess
+    // (agent filter, --all, a skill name, …), so forward verbatim.
     const rest = argv.slice(1);
-    const scope = namesASkill(rest) ? [] : RAG_RAT_SKILLS.flatMap((n) => ["-s", n]);
-    skillsArgs = [sub, ...rest, ...scope];
+    const scopable = rest.every((t) => SAFE_MAINT_FLAGS.has(t));
+    skillsArgs = scopable ? [sub, ...rest, ...RAG_RAT_SKILLS] : [sub, ...rest];
   } else {
     skillsArgs = argv;
   }

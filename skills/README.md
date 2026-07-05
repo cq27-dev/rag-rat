@@ -26,8 +26,10 @@ npx @rag-rat/skills list            # list installed skills
 npx @rag-rat/skills remove          # remove rag-rat's skills
 ```
 
-`update` and `remove` are scoped to rag-rat's own skills (`using-rag-rat`, `dream-review`) — they
-never touch unrelated skills you've installed. Pass `-s <name>` to target one explicitly.
+`update` and `remove` (plain, or with only `-g`/`-y`) default to rag-rat's own skills
+(`using-rag-rat`, `dream-review`) — they won't touch unrelated skills you've installed. Pass your
+own targets — a skill name, `--agent`, or `--all` — to drive the underlying `skills` CLI directly
+instead.
 
 Flags are forwarded to the underlying installer:
 
