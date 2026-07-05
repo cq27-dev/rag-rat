@@ -365,8 +365,9 @@ pub struct ReviewedFinding {
 /// `reviewed_at_ms`; `Reset` clears the human verdict (back to `open`, `reviewed_at_ms` NULL). The
 /// verdict SURVIVES churn re-runs — [`sync`]'s refresh branch preserves `accepted`/`dismissed`.
 ///
-/// Prefix resolution scans the active repo's reviewable findings (a small set) and matches in Rust,
-/// so a `_`/`%` in the input can't act as a SQL `LIKE` wildcard.
+/// Prefix resolution scans ALL of the active repo's findings (a small set) and matches in Rust — so
+/// a `_`/`%` in the input can't act as a SQL `LIKE` wildcard, AND a prefix that also hits a
+/// terminal row is rejected as ambiguous rather than silently acting on the one reviewable match.
 pub(crate) fn review_dream_finding(
     conn: &Connection,
     id_or_prefix: &str,
@@ -379,36 +380,30 @@ pub(crate) fn review_dream_finding(
     }
     let scope = dream_repo_scope(conn)?;
     let repo_clause = dream_repo_scope_clause(&scope);
-    let reviewable: Vec<(String, String, String)> = conn
+    // Match the prefix against ALL of this repo's findings — reviewable AND terminal
+    // (resolved/superseded/archived). A prefix that also hits a terminal row is NOT unambiguous
+    // even if only one match is reviewable, so a stale short prefix can never silently act on a
+    // *different* open finding than the one the user remembers. `WHERE 1` + `{repo_clause}` (which
+    // starts with ` AND`) keeps every status in scope.
+    let all: Vec<(String, String, String, String)> = conn
         .prepare(&format!(
-            "SELECT id, kind, subject FROM dream_findings WHERE status IN \
-             ('open','accepted','dismissed'){repo_clause} ORDER BY id"
+            "SELECT id, kind, subject, status FROM dream_findings WHERE 1{repo_clause} ORDER BY id"
         ))?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let matches: Vec<&(String, String, String)> =
-        reviewable.iter().filter(|(id, ..)| id.starts_with(prefix)).collect();
+    let matches: Vec<&(String, String, String, String)> =
+        all.iter().filter(|(id, ..)| id.starts_with(prefix)).collect();
     let (id, kind, subject) = match matches.as_slice() {
-        [one] => (*one).clone(),
-        [] => {
-            // Distinguish "no such id" from "matched a TERMINAL (non-reviewable) finding".
-            let terminal: bool = conn
-                .prepare(&format!(
-                    "SELECT id FROM dream_findings WHERE status IN \
-                     ('resolved','superseded','archived'){repo_clause}"
-                ))?
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .iter()
-                .any(|id| id.starts_with(prefix));
-            if terminal {
+        [(id, kind, subject, status)] => {
+            if !matches!(status.as_str(), "open" | "accepted" | "dismissed") {
                 anyhow::bail!(
-                    "finding `{prefix}` is resolved/superseded/archived — not reviewable (the \
-                     code moved on; there's nothing to act on)"
+                    "finding `{prefix}` is {status} — not reviewable (the code moved on; there's \
+                     nothing to act on)"
                 );
             }
-            anyhow::bail!("no open/accepted/dismissed finding matches id `{prefix}`");
+            (id.clone(), kind.clone(), subject.clone())
         },
+        [] => anyhow::bail!("no finding matches id `{prefix}`"),
         many => {
             let ids = many.iter().map(|(id, ..)| id.as_str()).collect::<Vec<_>>().join(", ");
             anyhow::bail!("id `{prefix}` is ambiguous — matches {} findings: {ids}", many.len());
@@ -531,9 +526,32 @@ mod tests {
             "zzz999"
         );
         let none = review_dream_finding(&c, "qqq", ReviewVerdict::Accept, 10).unwrap_err();
-        assert!(none.to_string().contains("no open"), "got: {none}");
+        assert!(none.to_string().contains("no finding matches"), "got: {none}");
         let amb = review_dream_finding(&c, "abc", ReviewVerdict::Accept, 10).unwrap_err();
         assert!(amb.to_string().contains("ambiguous"), "got: {amb}");
+    }
+
+    #[test]
+    fn review_prefix_that_also_hits_a_terminal_finding_is_ambiguous() {
+        // A stale short prefix that matches BOTH an open and a resolved finding must be rejected as
+        // ambiguous — never silently act on the open one (PR #440 review). The match considers ALL
+        // findings, not just the reviewable set.
+        let c = mem_db();
+        set_repo(&c, "r");
+        for (id, subj, status) in [("abcd11", "s1", "open"), ("abcd22", "s2", "resolved")] {
+            c.execute(
+                "INSERT INTO dream_findings(repo_id, id, kind, subject, claim_hash, evidence, \
+                 base_rank, status, first_seen_at_ms, last_seen_at_ms) \
+                 VALUES('r',?1,'coverage_gap',?2,'ch',?2,0.5,?3,1,1)",
+                rusqlite::params![id, subj, status],
+            )
+            .unwrap();
+        }
+        let err = review_dream_finding(&c, "abcd", ReviewVerdict::Dismiss, 10).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "got: {err}");
+        // the open finding must be untouched
+        let (status, _) = status_and_reviewed(&c, "abcd11");
+        assert_eq!(status, "open", "the open finding was not silently dismissed");
     }
 
     #[test]
@@ -544,7 +562,7 @@ mod tests {
         let id = seed_one_finding(&c, "x::F", 1000);
         set_repo(&c, "repo-b");
         let err = review_dream_finding(&c, &id, ReviewVerdict::Dismiss, 2000).unwrap_err();
-        assert!(err.to_string().contains("no open"), "got: {err}");
+        assert!(err.to_string().contains("no finding matches"), "got: {err}");
         set_repo(&c, "repo-a");
         assert_eq!(status_and_reviewed(&c, &id).0, "open", "repo-a's finding is untouched");
     }
