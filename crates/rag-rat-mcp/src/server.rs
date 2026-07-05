@@ -368,4 +368,47 @@ mod tests {
         assert!(svc.call("definitely_not_a_tool", json!({})).is_err(), "unknown tool must error");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn memory_show_expands_a_memory_to_its_full_body_by_id() {
+        // The expand path: given the `memory_id` from a compact summary (surface="summary"),
+        // `memory_show` returns the COMPLETE original body — no shelling out to the CLI.
+        let (root, config) = config_over_temp_repo();
+        let db_path = &config.database;
+        let created = crate::tools::call_tool(
+            db_path,
+            "memory_create",
+            json!({
+                "kind": "Invariant",
+                "title": "t",
+                "body": "FULL-BODY-MARKER expand text",
+                "confidence": "high",
+                "bind": { "path": "src/lib.rs" }
+            }),
+        )
+        .unwrap();
+        // memory_create returns RepoMemoryCreateResult { memory, duplicate } — the id is nested.
+        let id = created["memory"]["memory_id"]
+            .as_str()
+            .expect("created memory carries a memory_id")
+            .to_string();
+
+        let shown =
+            crate::tools::call_tool(db_path, "memory_show", json!({ "memory_id": id })).unwrap();
+        assert_eq!(
+            shown["body"].as_str(),
+            Some("FULL-BODY-MARKER expand text"),
+            "returns the full body"
+        );
+        assert_eq!(shown["title"].as_str(), Some("t"));
+
+        // An unknown id errors, not a silent null.
+        assert!(
+            crate::tools::call_tool(db_path, "memory_show", json!({ "memory_id": "mem_nope" }))
+                .is_err(),
+            "unknown memory id must error",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

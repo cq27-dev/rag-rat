@@ -193,6 +193,15 @@ pub(crate) fn call_tool_with_db(
             let args: MemoryForCallPathArgs = serde_json::from_value(arguments)?;
             json!(db.memory_for_call_path_hash(&args.edge_sequence_hash, args.limit)?)
         },
+        "memory_show" => {
+            let args: MemoryIdArgs = serde_json::from_value(arguments)?;
+            // The EXPAND path: full body by id, surface-independent (mirrors the CLI `memory
+            // show`).
+            let Some(memory) = db.memory_get(&args.memory_id)? else {
+                anyhow::bail!("memory `{}` not found", args.memory_id);
+            };
+            json!(memory)
+        },
         "memory_validate" => json!(db.memory_validate()?),
         "memory_doctor" => json!(db.memory_doctor()?),
         "memory_mark_obsolete" => {

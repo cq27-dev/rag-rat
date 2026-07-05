@@ -38,6 +38,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "memory_for_symbol",
     "memory_for_path",
     "memory_for_call_path",
+    "memory_show",
     "memory_validate",
     "memory_doctor",
     "memory_mark_obsolete",
@@ -191,6 +192,11 @@ pub fn description(name: &str) -> &'static str {
         "memory_for_path" => "Return repo memories bound to a path.",
         "memory_for_call_path" =>
             "Return repo memories bound to a specific call-path edge sequence.",
+        "memory_show" =>
+            "Expand ONE repo memory to its FULL body by `memory_id` — the expand path for a \
+             compact summary. When `[memory] surface = \"summary\"` renders drive-by attachments \
+             (e.g. impact_surface) as the dream-compacted summary, call this with the attachment's \
+             `memory_id` to get the complete original. Surface-independent: always the full body.",
         "memory_validate" =>
             "Re-anchor every repo memory against current source and mark each current / relocated \
              / stale / gone. Runs automatically after indexing.",
@@ -239,7 +245,7 @@ pub fn schema(name: &str) -> Value {
         "memory_for_symbol" => schema_for::<MemoryForSymbolArgs>(),
         "memory_for_path" => schema_for::<MemoryForPathArgs>(),
         "memory_for_call_path" => schema_for::<MemoryForCallPathArgs>(),
-        "memory_mark_obsolete" => schema_for::<MemoryIdArgs>(),
+        "memory_mark_obsolete" | "memory_show" => schema_for::<MemoryIdArgs>(),
         "llm_status" | "github_sync_status" | "index_status" | "memory_validate"
         | "memory_doctor" => schema_for::<EmptyArgs>(),
         _ => json!({"type": "object"}),
