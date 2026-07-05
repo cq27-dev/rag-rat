@@ -781,10 +781,12 @@ mod tests {
     }
 
     #[test]
-    fn model_work_pending_reflects_the_queues_and_flags() {
-        // The ephemeral zero-work guard: `verify` peeks the verification queue, `compact` the
-        // compaction queue; neither flag → never pending, so a paid GPU box is never cold-started
-        // for nothing.
+    fn model_work_pending_is_citability_aware_for_verify() {
+        // The ephemeral zero-work guard. VERIFY counts only CITABLE entries — an uncitable
+        // prose-only / all-NOT_FOUND memory records a terminal row WITHOUT a model call, so
+        // it is zero model work and must NOT cold-start a paid box (PR #438 review).
+        // COMPACT counts the whole queue (every memory is summarized). Neither flag → never
+        // pending.
         let c = mem_db();
         set_repo(&c, "r");
         let opts = crate::dream::DreamOptions { now_ms: 1, limit: 10, verify: true };
@@ -792,15 +794,33 @@ mod tests {
             !crate::dream::model_work_pending(&c, opts, 10, true, true).unwrap(),
             "empty repo → no work"
         );
-        seed_memory(&c, "m1", "t", "a note", "r");
+
+        // An UNCITABLE prose-only memory (no identifiers, no bindings): verify is NOT model work,
+        // but compaction WILL summarize it.
+        seed_memory(&c, "m1", "t", "a prose note with no identifiers", "r");
         assert!(
-            crate::dream::model_work_pending(&c, opts, 10, true, false).unwrap(),
-            "a never-checked memory is verify-pending"
+            !crate::dream::model_work_pending(&c, opts, 10, true, false).unwrap(),
+            "an all-uncitable verify queue is NOT model work — never cold-start a box for it"
         );
         assert!(
             crate::dream::model_work_pending(&c, opts, 10, false, true).unwrap(),
-            "an un-summarized memory is compact-pending"
+            "the same memory IS compact-pending (compaction has no uncitable short-circuit)"
         );
+
+        // A CITABLE memory whose identifier resolves to a real symbol → verify IS model work.
+        let fid = seed_file(&c, "src/x.rs", "fn f() {}\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','resolve_marker_token','function',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        seed_memory(&c, "m2", "t", "a note about `resolve_marker_token`", "r");
+        assert!(
+            crate::dream::model_work_pending(&c, opts, 10, true, false).unwrap(),
+            "a citable never-checked memory is verify-pending"
+        );
+
         assert!(
             !crate::dream::model_work_pending(&c, opts, 10, false, false).unwrap(),
             "neither flag → never pending"

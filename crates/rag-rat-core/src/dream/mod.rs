@@ -196,21 +196,31 @@ pub fn dream_run_with_passes(
     Ok(dream_run(conn, opts)?)
 }
 
-/// Whether the model passes would have ANY work this run — the zero-work guard for EPHEMERAL
-/// `[llm.dream.remote]`. `verify` peeks the verification queue, `compact` the compaction queue
-/// (both budget-capped exactly as the passes consume them); either non-empty → `true`. A fully
-/// churn-skipped repo returns `false`, so `rag-rat dream --verify/--compact` never cold-starts a
-/// paid GPU box with nothing to check — mirroring the embedding path's "never provision for zero
-/// work" rule. Reads only the churn-skip queues; never touches the model.
+/// Whether the model passes would call the model AT ALL this run — the zero-work guard for
+/// EPHEMERAL `[llm.dream.remote]`. A fully churn-skipped (or all-uncitable) repo returns `false`,
+/// so `rag-rat dream --verify/--compact` never cold-starts a paid GPU box that would then do zero
+/// inference — mirroring the embedding path's "never provision for zero work" rule.
+///
+/// `verify` is CITABILITY-aware, not just queue-emptiness: `run_verdict_pass` records an UNCITABLE
+/// entry (prose-only / all-`NOT FOUND`, no excerpts) as a terminal row WITHOUT calling the model,
+/// so a queue whose every entry is uncitable is zero model work. The guard therefore builds each
+/// queued entry's evidence pack and returns `true` on the FIRST citable one — matching exactly what
+/// reaches the model. `compact` has no uncitable short-circuit (every queued memory is summarized),
+/// so a non-empty compaction queue IS model work. Runs once before provisioning, budget-capped, and
+/// short-circuits — the paid box it gates makes the extra pack builds worth it.
 pub fn model_work_pending(
     conn: &Connection,
     opts: DreamOptions,
     budget: usize,
     verify: bool,
     compact: bool,
-) -> rusqlite::Result<bool> {
-    if verify && !verify::verification_queue(conn, opts.now_ms, budget)?.is_empty() {
-        return Ok(true);
+) -> anyhow::Result<bool> {
+    if verify {
+        for entry in verify::verification_queue(conn, opts.now_ms, budget)? {
+            if verify::evidence_pack(conn, &entry.memory_id)?.is_citable() {
+                return Ok(true);
+            }
+        }
     }
     if compact && compact::compaction_pending(conn, budget)? {
         return Ok(true);
