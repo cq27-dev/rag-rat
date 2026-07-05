@@ -27,13 +27,40 @@ const SOURCE = "https://github.com/cq27-dev/rag-rat/tree/main/.agents/skills";
 /** rag-rat's own skills — used to scope destructive/refresh subcommands to ONLY these. */
 const RAG_RAT_SKILLS = ["using-rag-rat", "dream-review"];
 
-/** Subcommands that mean "install" — mapped to `skills add <SOURCE>`. */
-const INSTALL = new Set(["add", "install", "i"]);
+/** "install" verbs — mapped to `skills add <SOURCE>`. Includes every upstream `add` alias. */
+const INSTALL = new Set(["add", "install", "i", "a"]);
 
-/** Subcommands scoped to rag-rat's own skills when the user didn't name a skill themselves — a bare
- * `skills remove`/`update` would otherwise act over EVERY installed skill (a selector / update-all),
- * and a branded "remove them" must never touch unrelated skills. */
-const SCOPED = new Set(["remove", "rm", "update"]);
+/** Maintenance verbs scoped to rag-rat's own skills when the user didn't name a skill themselves — a
+ * bare `skills remove`/`update` acts over EVERY installed skill (a selector / update-all), so a
+ * branded "remove them"/"update them" must never touch unrelated skills. Includes ALL upstream
+ * aliases (verified against the `skills` CLI source: remove = rm|r, update = check|upgrade) — an
+ * un-listed alias would slip through unscoped. */
+const SCOPED = new Set(["remove", "rm", "r", "update", "check", "upgrade"]);
+
+/** Flags that consume the NEXT token as their value (so that value is not mistaken for a positional
+ * skill name). */
+const VALUE_FLAGS = new Set(["-a", "--agent", "-s", "--skill"]);
+
+/** Did the user already name a skill to act on — via `-s`/`--skill` OR a bare positional token? If
+ * so, the scoped verbs must NOT append the default rag-rat skill set (that would widen the action to
+ * skills the user didn't ask for). Walks args, skipping the value of value-taking flags so `-a
+ * claude-code` is not read as the positional skill `claude-code`. */
+function namesASkill(rest) {
+  for (let i = 0; i < rest.length; i++) {
+    const t = rest[i];
+    if (t === "-s" || t === "--skill" || t.startsWith("-s=") || t.startsWith("--skill=")) {
+      return true;
+    }
+    if (VALUE_FLAGS.has(t)) {
+      i++; // consume this flag's value
+      continue;
+    }
+    if (!t.startsWith("-")) {
+      return true; // a bare positional = a skill name
+    }
+  }
+  return false;
+}
 
 function usage() {
   process.stdout.write(
@@ -76,11 +103,11 @@ function main() {
     const rest = sub !== undefined && INSTALL.has(sub) ? argv.slice(1) : argv;
     skillsArgs = ["add", SOURCE, ...rest];
   } else if (SCOPED.has(sub)) {
-    // `remove`/`update` with no explicit skill → scope to OUR skills, so the branded command never
-    // removes/refreshes unrelated skills. If the user named a skill (`-s`/`--skill`), respect it.
+    // `remove`/`update` (+ aliases) with no explicit skill → scope to OUR skills, so the branded
+    // command never removes/refreshes unrelated skills. If the user named a skill (via `-s`/`--skill`
+    // OR a positional), respect their selection and add nothing.
     const rest = argv.slice(1);
-    const userNamed = rest.some((a) => a === "-s" || a === "--skill");
-    const scope = userNamed ? [] : RAG_RAT_SKILLS.flatMap((n) => ["-s", n]);
+    const scope = namesASkill(rest) ? [] : RAG_RAT_SKILLS.flatMap((n) => ["-s", n]);
     skillsArgs = [sub, ...rest, ...scope];
   } else {
     skillsArgs = argv;
