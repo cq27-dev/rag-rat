@@ -35,10 +35,41 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
+
+    // REVIEW mode: `rag-rat dream <FINDING_ID> --accept|--dismiss|--reset` applies a human verdict
+    // to ONE finding and prints it — it does NOT run the worklist/model passes. The verdict is
+    // preserved across future runs (the sync refresh keeps accepted/dismissed).
+    if let Some(finding) = &args.finding {
+        let verdict = match (args.accept, args.dismiss, args.reset) {
+            (true, false, false) => rag_rat_core::dream::ReviewVerdict::Accept,
+            (false, true, false) => rag_rat_core::dream::ReviewVerdict::Dismiss,
+            (false, false, true) => rag_rat_core::dream::ReviewVerdict::Reset,
+            _ => anyhow::bail!(
+                "reviewing `{finding}` needs exactly one of --accept / --dismiss / --reset"
+            ),
+        };
+        if args.verify || args.compact {
+            anyhow::bail!(
+                "--verify / --compact run the worklist; they can't combine with reviewing a \
+                 finding"
+            );
+        }
+        let reviewed = db.review_dream_finding(finding, verdict, now_ms)?;
+        return print_output(&reviewed);
+    }
+    // A verdict flag with no finding id is a mistake (clap keeps the three verdicts mutually
+    // exclusive; this catches "flag but no id").
+    if args.accept || args.dismiss || args.reset {
+        anyhow::bail!("--accept / --dismiss / --reset need a <FINDING_ID> to review");
+    }
+
     let opts = rag_rat_core::dream::DreamOptions {
         now_ms,
         limit: args.limit.unwrap_or(20) as usize,
         verify: args.verify,
+        // `--all` also lists the human-reviewed (accepted/dismissed) findings, so you can see and
+        // `--reset` them; the default worklist is the open (needs-attention) set.
+        include_reviewed: args.all,
     };
     // The model passes run only when the operator asked for the matching flag AND enabled the model
     // in config — the generative-model dependency stays strictly opt-in (#122). One client is built

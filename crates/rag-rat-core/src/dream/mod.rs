@@ -39,7 +39,8 @@ pub use compact::CompactPass;
 // Curated crate-facing surface (mod.rs is the index, not the junk drawer): the migration
 // ladder and `register_repo` adoption re-derive persisted finding ids after re-stamping
 // `repo_id`.
-pub(crate) use findings::rederive_finding_ids;
+pub use findings::{ReviewVerdict, ReviewedFinding};
+pub(crate) use findings::{rederive_finding_ids, review_dream_finding};
 // The phase-B model verdict pass: the out-of-process verdict-model trait + its HTTP client
 // (the CLI builds one from `[llm.dream.remote]`) and the `VerdictPass` handle
 // `dream_run_with_passes` consumes.
@@ -58,6 +59,9 @@ pub use verify::{
 };
 pub(crate) use verify::{checked_inputs_hash, note_content_hash};
 
+/// A finding as PRODUCED by a finding kind (`coverage_gap` / `stale_reference` /
+/// `memory_unverifiable` / `memory_divergence`) — the INPUT to [`findings::sync`], which derives
+/// the stable id. It carries no id/status because neither exists until the sync writes the row.
 #[derive(Debug, Clone, Serialize)]
 pub struct DreamFinding {
     pub kind: String,
@@ -66,9 +70,23 @@ pub struct DreamFinding {
     pub rank: f64,
 }
 
+/// A finding as EMITTED in the worklist (post-sync), carrying the stable `dream_findings.id` a
+/// reviewer passes to `rag-rat dream <id> --accept|--dismiss|--reset`, plus its `status` (`open` in
+/// the default worklist; `accepted`/`dismissed` also shown under `--all`).
+#[derive(Debug, Clone, Serialize)]
+pub struct WorklistFinding {
+    pub id: String,
+    pub kind: String,
+    pub subject: String,
+    pub evidence: String,
+    pub rank: f64,
+    pub status: String,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct DreamReport {
-    pub findings: Vec<DreamFinding>, // the open worklist, ranked
+    pub findings: Vec<WorklistFinding>, /* the worklist (open, ranked; + accepted/dismissed
+                                         * under --all) */
     pub opened: usize,
     pub refreshed: usize,
     pub superseded: usize,
@@ -84,6 +102,10 @@ pub struct DreamOptions {
     /// OFF by default so plain `rag-rat dream` stays byte-identical to the v1 run; the model
     /// verdict / compaction passes (phases B/C) layer on top of the same `verify` substrate.
     pub verify: bool,
+    /// Also emit the human-reviewed findings (`accepted` / `dismissed`) in the worklist, not just
+    /// `open` — the `--all` listing, so a reviewer can see (and `--reset`) a finding they
+    /// previously dismissed. Off by default: the worklist is the "needs attention" (open) set.
+    pub include_reviewed: bool,
 }
 
 /// Half-life for worklist rank decay: an unreviewed finding loses half its rank every 2 weeks, so a
@@ -135,19 +157,28 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<Drea
     // sinks below fresh ones (the documented anti-rot, now real, not just base_rank DESC). Scoped
     // to the active repo so the emitted worklist never mixes in a sibling repo's open findings.
     let repo_clause = findings::dream_repo_scope_clause(&findings::dream_repo_scope(conn)?);
-    let mut open: Vec<DreamFinding> = conn
+    // Default worklist = the 'open' (needs-attention) set. `--all` (include_reviewed) also surfaces
+    // the human-reviewed 'accepted'/'dismissed' rows so a reviewer can see + `--reset` them.
+    let status_filter = if opts.include_reviewed {
+        "status IN ('open','accepted','dismissed')"
+    } else {
+        "status = 'open'"
+    };
+    let mut open: Vec<WorklistFinding> = conn
         .prepare(&format!(
-            "SELECT kind, subject, evidence, base_rank, first_seen_at_ms FROM dream_findings \
-             WHERE status = 'open'{repo_clause}"
+            "SELECT id, kind, subject, evidence, base_rank, first_seen_at_ms, status FROM \
+             dream_findings WHERE {status_filter}{repo_clause}"
         ))?
         .query_map([], |r| {
-            let base: f64 = r.get(3)?;
-            let first_seen: i64 = r.get(4)?;
-            Ok(DreamFinding {
-                kind: r.get(0)?,
-                subject: r.get(1)?,
-                evidence: r.get(2)?,
+            let base: f64 = r.get(4)?;
+            let first_seen: i64 = r.get(5)?;
+            Ok(WorklistFinding {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                subject: r.get(2)?,
+                evidence: r.get(3)?,
                 rank: effective_rank(base, first_seen, opts.now_ms),
+                status: r.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -257,6 +288,55 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn worklist_surfaces_ids_and_hides_dismissed_unless_include_reviewed() {
+        // memory_divergence is a VERIFY finding kind: a plain dream_run(verify=false) neither
+        // recomputes nor resolves it (resolve is kind-scoped to the kinds the run computed), so
+        // these synthetic rows survive the run — isolating the emit's id surfacing + status
+        // filter.
+        let c = mem_db();
+        set_repo(&c, "r");
+        for (id, subj, status) in [("d0001", "mA", "open"), ("d0002", "mB", "dismissed")] {
+            c.execute(
+                "INSERT INTO dream_findings(repo_id, id, kind, subject, claim_hash, evidence, \
+                 base_rank, status, first_seen_at_ms, last_seen_at_ms) \
+                 VALUES('r',?1,'memory_divergence',?2,'ch',?2,0.6,?3,1,1)",
+                rusqlite::params![id, subj, status],
+            )
+            .unwrap();
+        }
+        let default = dream_run(&c, DreamOptions {
+            now_ms: 10,
+            limit: 10,
+            verify: false,
+            include_reviewed: false,
+        })
+        .unwrap();
+        assert_eq!(
+            default.findings.iter().map(|f| f.subject.as_str()).collect::<Vec<_>>(),
+            vec!["mA"],
+            "the default worklist shows only open findings",
+        );
+        assert_eq!(default.findings[0].id, "d0001", "the stable finding id is surfaced");
+        assert_eq!(default.findings[0].status, "open");
+
+        let all = dream_run(&c, DreamOptions {
+            now_ms: 10,
+            limit: 10,
+            verify: false,
+            include_reviewed: true,
+        })
+        .unwrap();
+        let mut pairs: Vec<(&str, &str)> =
+            all.findings.iter().map(|f| (f.subject.as_str(), f.status.as_str())).collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![("mA", "open"), ("mB", "dismissed")],
+            "--all also surfaces the human-reviewed (dismissed) finding, with its status",
+        );
+    }
+
+    #[test]
     fn dream_run_never_mutates_any_memory_column() {
         let c = mem_db();
         // seed a memory whose body references a gone path so stale_reference is forced to READ it
@@ -299,7 +379,13 @@ pub(super) mod tests {
         // Run with the verification pass ON so the new pass-0 reads/writes are covered by the
         // invariant (memory_reality / memory_summaries writes are ALLOWED; repo_memories must stay
         // byte-identical).
-        let report = dream_run(&c, DreamOptions { now_ms: 1000, limit: 10, verify: true }).unwrap();
+        let report = dream_run(&c, DreamOptions {
+            now_ms: 1000,
+            limit: 10,
+            verify: true,
+            include_reviewed: false,
+        })
+        .unwrap();
         assert_eq!(before, snap(&c), "dream_run must leave EVERY repo_memories column unchanged");
         assert!(
             report.findings.iter().any(|f| f.kind == "stale_reference" && f.subject == "m1"),
@@ -323,8 +409,13 @@ pub(super) mod tests {
         )
         .unwrap();
         // verify OFF: no memory_unverifiable finding is emitted (v1-identical worklist).
-        let report =
-            dream_run(&c, DreamOptions { now_ms: 1000, limit: 10, verify: false }).unwrap();
+        let report = dream_run(&c, DreamOptions {
+            now_ms: 1000,
+            limit: 10,
+            verify: false,
+            include_reviewed: false,
+        })
+        .unwrap();
         assert!(
             !report.findings.iter().any(|f| f.kind == "memory_unverifiable"),
             "the verify pass must be dormant when DreamOptions::verify is false"

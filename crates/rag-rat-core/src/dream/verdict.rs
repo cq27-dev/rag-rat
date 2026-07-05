@@ -961,7 +961,7 @@ mod tests {
 
     // ── divergence-finding lifecycle (the resolve trap) ──────────────────────────
 
-    fn divergence_subjects(findings: &[DreamFinding]) -> Vec<String> {
+    fn divergence_subjects(findings: &[crate::dream::WorklistFinding]) -> Vec<String> {
         findings
             .iter()
             .filter(|f| f.kind == "memory_divergence")
@@ -978,7 +978,7 @@ mod tests {
             diverged_citing("resolvable_thing"), // run 1: opens the divergence finding
             current_citing("resolvable_thing"),  // run 3 (after body edit): flips to current
         ]);
-        let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true };
+        let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
 
         // Run 1: diverged verdict → memory_divergence finding opens.
         let r1 =
@@ -1037,7 +1037,8 @@ mod tests {
 
         let c = seeded_verifiable_repo();
         let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
-        let verify_opts = DreamOptions { now_ms: 1000, limit: 10, verify: true };
+        let verify_opts =
+            DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
         let r1 = dream_run_with_passes(
             &c,
             verify_opts,
@@ -1050,7 +1051,8 @@ mod tests {
         // A plain deterministic run (verify OFF): the divergence kind is not computed, so its open
         // finding is left untouched — not resolved as "no longer seen". The emitted worklist reads
         // ALL open findings from the store, so the still-open divergence finding is still listed.
-        let plain_opts = DreamOptions { now_ms: 2000, limit: 10, verify: false };
+        let plain_opts =
+            DreamOptions { now_ms: 2000, limit: 10, verify: false, include_reviewed: false };
         let r2 = dream_run(&c, plain_opts).unwrap();
         assert_eq!(
             divergence_subjects(&r2.findings),
@@ -1077,7 +1079,8 @@ mod tests {
 
         let c = seeded_verifiable_repo();
         let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
-        let verify_opts = DreamOptions { now_ms: 1000, limit: 10, verify: true };
+        let verify_opts =
+            DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
         dream_run_with_passes(
             &c,
             verify_opts,
@@ -1095,7 +1098,13 @@ mod tests {
             [],
         )
         .unwrap();
-        let r = dream_run(&c, DreamOptions { now_ms: 2000, limit: 10, verify: true }).unwrap();
+        let r = dream_run(&c, DreamOptions {
+            now_ms: 2000,
+            limit: 10,
+            verify: true,
+            include_reviewed: false,
+        })
+        .unwrap();
         assert!(
             divergence_subjects(&r.findings).is_empty(),
             "a diverged verdict against the pre-edit body is not surfaced against the new note"
@@ -1123,7 +1132,7 @@ mod tests {
         let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
         dream_run_with_passes(
             &c,
-            DreamOptions { now_ms: 1000, limit: 10, verify: true },
+            DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false },
             Some(VerdictPass { model: &model, budget: 10 }),
             None,
         )
@@ -1137,7 +1146,13 @@ mod tests {
             [],
         )
         .unwrap();
-        let r = dream_run(&c, DreamOptions { now_ms: 2000, limit: 10, verify: true }).unwrap();
+        let r = dream_run(&c, DreamOptions {
+            now_ms: 2000,
+            limit: 10,
+            verify: true,
+            include_reviewed: false,
+        })
+        .unwrap();
         assert!(
             divergence_subjects(&r.findings).is_empty(),
             "a diverged verdict from an obsolete prompt is not surfaced"
@@ -1168,7 +1183,7 @@ mod tests {
         };
         let before = snap(&c);
         let model = MockVerdictModel::new([diverged_citing("resolvable_thing")]);
-        let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true };
+        let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
         dream_run_with_passes(&c, opts, Some(VerdictPass { model: &model, budget: 10 }), None)
             .unwrap();
         assert_eq!(before, snap(&c), "the model verdict pass leaves repo_memories byte-identical");
@@ -1207,7 +1222,7 @@ mod tests {
         seed_symbol_file(&c, "src/b.rs", "thing_two", "r2");
         seed_memory(&c, "m2", "note", "describes `thing_two`", "r2");
         let model_r2 = MockVerdictModel::new([current_citing("thing_two")]);
-        let opts = DreamOptions { now_ms: 2000, limit: 10, verify: true };
+        let opts = DreamOptions { now_ms: 2000, limit: 10, verify: true, include_reviewed: false };
         let r2 = dream_run_with_passes(
             &c,
             opts,
@@ -1243,6 +1258,11 @@ mod tests {
         // And back in r1, its divergence finding is intact.
         set_repo(&c, "r1");
         let r1_divergence = divergence_findings(&c).unwrap();
-        assert_eq!(divergence_subjects(&r1_divergence), vec!["m1".to_string()]);
+        // `divergence_findings` already returns only `memory_divergence` rows, so map subjects
+        // directly (the `divergence_subjects` helper is for the WorklistFinding-typed dream_run
+        // output).
+        assert_eq!(r1_divergence.iter().map(|f| f.subject.clone()).collect::<Vec<_>>(), vec![
+            "m1".to_string()
+        ]);
     }
 }

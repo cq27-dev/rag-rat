@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use regex::Regex;
 use rusqlite::Connection;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::DreamFinding;
@@ -339,10 +340,214 @@ fn sync_in_tx(
     Ok((opened, refreshed, superseded, resolved))
 }
 
+/// The human verdict a reviewer applies to a dream finding via
+/// `rag-rat dream <id> --accept|--dismiss|--reset`.
+#[derive(Debug, Clone, Copy)]
+pub enum ReviewVerdict {
+    Accept,
+    Dismiss,
+    Reset,
+}
+
+/// The outcome of a review transition, echoed back to the operator.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewedFinding {
+    pub id: String,
+    pub kind: String,
+    pub subject: String,
+    pub status: String,
+}
+
+/// Apply a human review verdict to a dream finding by id — a full id or an unambiguous PREFIX
+/// (git-style). Repo-scoped: only the active repo's findings resolve. Only a NON-terminal finding
+/// (status `open`/`accepted`/`dismissed`) is reviewable — a `resolved`/`superseded`/`archived` row
+/// is rejected (the world moved on; nothing to act on). `Accept`/`Dismiss` set the status +
+/// `reviewed_at_ms`; `Reset` clears the human verdict (back to `open`, `reviewed_at_ms` NULL). The
+/// verdict SURVIVES churn re-runs — [`sync`]'s refresh branch preserves `accepted`/`dismissed`.
+///
+/// Prefix resolution scans the active repo's reviewable findings (a small set) and matches in Rust,
+/// so a `_`/`%` in the input can't act as a SQL `LIKE` wildcard.
+pub(crate) fn review_dream_finding(
+    conn: &Connection,
+    id_or_prefix: &str,
+    verdict: ReviewVerdict,
+    now_ms: i64,
+) -> anyhow::Result<ReviewedFinding> {
+    let prefix = id_or_prefix.trim();
+    if prefix.is_empty() {
+        anyhow::bail!("a finding id is required");
+    }
+    let scope = dream_repo_scope(conn)?;
+    let repo_clause = dream_repo_scope_clause(&scope);
+    let reviewable: Vec<(String, String, String)> = conn
+        .prepare(&format!(
+            "SELECT id, kind, subject FROM dream_findings WHERE status IN \
+             ('open','accepted','dismissed'){repo_clause} ORDER BY id"
+        ))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let matches: Vec<&(String, String, String)> =
+        reviewable.iter().filter(|(id, ..)| id.starts_with(prefix)).collect();
+    let (id, kind, subject) = match matches.as_slice() {
+        [one] => (*one).clone(),
+        [] => {
+            // Distinguish "no such id" from "matched a TERMINAL (non-reviewable) finding".
+            let terminal: bool = conn
+                .prepare(&format!(
+                    "SELECT id FROM dream_findings WHERE status IN \
+                     ('resolved','superseded','archived'){repo_clause}"
+                ))?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .any(|id| id.starts_with(prefix));
+            if terminal {
+                anyhow::bail!(
+                    "finding `{prefix}` is resolved/superseded/archived — not reviewable (the \
+                     code moved on; there's nothing to act on)"
+                );
+            }
+            anyhow::bail!("no open/accepted/dismissed finding matches id `{prefix}`");
+        },
+        many => {
+            let ids = many.iter().map(|(id, ..)| id.as_str()).collect::<Vec<_>>().join(", ");
+            anyhow::bail!("id `{prefix}` is ambiguous — matches {} findings: {ids}", many.len());
+        },
+    };
+    let new_status = match verdict {
+        ReviewVerdict::Accept => "accepted",
+        ReviewVerdict::Dismiss => "dismissed",
+        ReviewVerdict::Reset => "open",
+    };
+    // Reset clears the human verdict; accept/dismiss stamp when it was reviewed.
+    let reviewed_at = match verdict {
+        ReviewVerdict::Reset => None,
+        _ => Some(now_ms),
+    };
+    conn.execute(
+        &format!(
+            "UPDATE dream_findings SET status = ?2, reviewed_at_ms = ?3 WHERE id = ?1{repo_clause}"
+        ),
+        rusqlite::params![id, new_status, reviewed_at],
+    )?;
+    Ok(ReviewedFinding { id, kind, subject, status: new_status.to_string() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{mem_db, set_repo};
     use super::*;
+
+    // A single coverage_gap finding, synced into the active repo; returns its id.
+    fn seed_one_finding(c: &Connection, subject: &str, now_ms: i64) -> String {
+        let f = vec![DreamFinding {
+            kind: "coverage_gap".into(),
+            subject: subject.into(),
+            evidence: "7 callers".into(),
+            rank: 0.5,
+        }];
+        sync(c, &f, now_ms, BASE_FINDING_KINDS).unwrap();
+        // By subject alone (not status): a re-sync after a review leaves the row non-'open', and
+        // the caller still needs its id.
+        c.query_row("SELECT id FROM dream_findings WHERE subject = ?1", [subject], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn status_and_reviewed(c: &Connection, id: &str) -> (String, Option<i64>) {
+        c.query_row("SELECT status, reviewed_at_ms FROM dream_findings WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn review_accept_dismiss_reset_toggle_status_and_reviewed_at() {
+        // The human-review transitions (#262): the write-dead accepted/dismissed/reviewed_at_ms
+        // fields are now set. Reset clears the human verdict entirely (back to open, timestamp
+        // NULL).
+        let c = mem_db();
+        set_repo(&c, "r");
+        let id = seed_one_finding(&c, "x::F", 1000);
+        assert_eq!(status_and_reviewed(&c, &id), ("open".into(), None));
+
+        let r = review_dream_finding(&c, &id, ReviewVerdict::Accept, 2000).unwrap();
+        assert_eq!(r.status, "accepted");
+        assert_eq!(status_and_reviewed(&c, &id), ("accepted".into(), Some(2000)));
+
+        review_dream_finding(&c, &id, ReviewVerdict::Dismiss, 3000).unwrap();
+        assert_eq!(status_and_reviewed(&c, &id), ("dismissed".into(), Some(3000)));
+
+        review_dream_finding(&c, &id, ReviewVerdict::Reset, 4000).unwrap();
+        assert_eq!(status_and_reviewed(&c, &id), ("open".into(), None), "reset clears the verdict");
+    }
+
+    #[test]
+    fn review_verdict_survives_a_refresh() {
+        // #262 depends on this: a re-run that STILL reports the finding must not revert the human
+        // verdict — sync's refresh branch keeps accepted/dismissed.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let id = seed_one_finding(&c, "x::F", 1000);
+        review_dream_finding(&c, &id, ReviewVerdict::Accept, 2000).unwrap();
+        // re-sync the same finding (a refresh)
+        seed_one_finding(&c, "x::F", 3000);
+        assert_eq!(
+            status_and_reviewed(&c, &id).0,
+            "accepted",
+            "refresh preserves the human verdict"
+        );
+    }
+
+    #[test]
+    fn review_rejects_a_terminal_finding() {
+        // A resolved/superseded/archived finding is not reviewable — the code moved on.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let id = seed_one_finding(&c, "x::F", 1000);
+        // A run that reports nothing resolves the open finding.
+        sync(&c, &[], 2000, BASE_FINDING_KINDS).unwrap();
+        assert_eq!(status_and_reviewed(&c, &id).0, "resolved");
+        let err = review_dream_finding(&c, &id, ReviewVerdict::Accept, 3000).unwrap_err();
+        assert!(err.to_string().contains("not reviewable"), "got: {err}");
+    }
+
+    #[test]
+    fn review_prefix_matches_uniquely_and_errors_on_none_or_ambiguous() {
+        // Real ids are sha256 hex (no forceable shared prefix), so insert controlled ids to
+        // exercise the git-style prefix resolution.
+        let c = mem_db();
+        set_repo(&c, "r");
+        for (id, subj) in [("abc111", "s1"), ("abc222", "s2"), ("zzz999", "s3")] {
+            c.execute(
+                "INSERT INTO dream_findings(repo_id, id, kind, subject, claim_hash, evidence, \
+                 base_rank, status, first_seen_at_ms, last_seen_at_ms) \
+                 VALUES('r',?1,'coverage_gap',?2,'ch','e',0.5,'open',1,1)",
+                rusqlite::params![id, subj],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            review_dream_finding(&c, "zzz", ReviewVerdict::Accept, 10).unwrap().id,
+            "zzz999"
+        );
+        let none = review_dream_finding(&c, "qqq", ReviewVerdict::Accept, 10).unwrap_err();
+        assert!(none.to_string().contains("no open"), "got: {none}");
+        let amb = review_dream_finding(&c, "abc", ReviewVerdict::Accept, 10).unwrap_err();
+        assert!(amb.to_string().contains("ambiguous"), "got: {amb}");
+    }
+
+    #[test]
+    fn review_is_repo_scoped() {
+        // A finding in repo-a is invisible to (and untouched by) a review run in repo-b.
+        let c = mem_db();
+        set_repo(&c, "repo-a");
+        let id = seed_one_finding(&c, "x::F", 1000);
+        set_repo(&c, "repo-b");
+        let err = review_dream_finding(&c, &id, ReviewVerdict::Dismiss, 2000).unwrap_err();
+        assert!(err.to_string().contains("no open"), "got: {err}");
+        set_repo(&c, "repo-a");
+        assert_eq!(status_and_reviewed(&c, &id).0, "open", "repo-a's finding is untouched");
+    }
 
     /// A5 finding: `finding_id` folds the owning repo. Two repos minting the SAME
     /// `(kind, subject, claim_hash)` derive DISTINCT ids — a repo-blind id would make the second

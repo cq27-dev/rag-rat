@@ -1334,8 +1334,13 @@ fn dream_run_leaves_a_sibling_repos_findings_untouched() {
     // Run dream on repo A. Its (empty) index reports nothing this run, so the resolve pass resolves
     // repo A's own unreported finding — but repo B's finding must be left OPEN and unemitted.
     a5_set_active_repo(&conn, A5_REPO_A);
-    let report =
-        dream_run(&conn, DreamOptions { limit: 50, now_ms: 1_000, verify: false }).unwrap();
+    let report = dream_run(&conn, DreamOptions {
+        limit: 50,
+        now_ms: 1_000,
+        verify: false,
+        include_reviewed: false,
+    })
+    .unwrap();
 
     let a_status: String = conn
         .query_row("SELECT status FROM dream_findings WHERE id = 'a-open'", [], |r| r.get(0))
@@ -1426,8 +1431,13 @@ fn dream_candidate_builders_ignore_a_sibling_repos_memories() {
     .unwrap();
 
     a5_set_active_repo(&conn, A5_REPO_A);
-    let report =
-        dream_run(&conn, DreamOptions { limit: 10, now_ms: 1_000, verify: false }).unwrap();
+    let report = dream_run(&conn, DreamOptions {
+        limit: 10,
+        now_ms: 1_000,
+        verify: false,
+        include_reviewed: false,
+    })
+    .unwrap();
 
     assert!(
         report

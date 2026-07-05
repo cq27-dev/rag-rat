@@ -216,6 +216,27 @@ pub(crate) struct DreamArgs {
     /// model.
     #[arg(long)]
     pub max_memories: Option<u32>,
+    /// A dream finding id (or unambiguous prefix, git-style) to REVIEW instead of running the
+    /// worklist. Pair with exactly one of `--accept` / `--dismiss` / `--reset`; the verdict is
+    /// preserved across future runs.
+    #[arg(value_name = "FINDING_ID")]
+    pub finding: Option<String>,
+    /// Review verdict: mark the finding ACCEPTED (acknowledged, action pending). Requires
+    /// `<FINDING_ID>`.
+    #[arg(long, conflicts_with_all = ["dismiss", "reset"])]
+    pub accept: bool,
+    /// Review verdict: DISMISS the finding (false positive / won't-fix) — hidden from the default
+    /// worklist. Requires `<FINDING_ID>`.
+    #[arg(long, conflicts_with_all = ["accept", "reset"])]
+    pub dismiss: bool,
+    /// Review verdict: RESET a previously accepted/dismissed finding back to open. Requires
+    /// `<FINDING_ID>`.
+    #[arg(long, conflicts_with_all = ["accept", "dismiss"])]
+    pub reset: bool,
+    /// In the worklist listing, ALSO show human-reviewed findings (accepted / dismissed), not just
+    /// open — so you can see (and `--reset`) what you previously reviewed.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]

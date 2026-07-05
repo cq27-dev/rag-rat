@@ -435,6 +435,25 @@ reference it cites must resolve in the indexed papertrail); a failing summary is
 dropped (no row is stored, so the surface falls back to the title). The pass **never** writes a
 `repo_memories` column.
 
+### Reviewing findings (`rag-rat dream <id> --accept|--dismiss|--reset`)
+
+The worklist `rag-rat dream` prints carries a stable `id` per finding. Dream only *proposes*; a
+human (or strong agent) resolves a finding by that id — a full id or an unambiguous prefix
+(git-style):
+
+```bash
+rag-rat dream                     # print the open worklist (each row has an id + status)
+rag-rat dream 3f9a1c22 --accept   # acknowledge it (real, action pending)
+rag-rat dream 3f9a1c22 --dismiss  # a false positive / won't-fix — hidden from the worklist
+rag-rat dream 3f9a1c22 --reset    # undo a verdict, back to open
+rag-rat dream --all               # also list the accepted/dismissed findings (to find one to --reset)
+```
+
+A verdict is **preserved across future runs**: a re-run that still reports the finding keeps your
+`accepted`/`dismissed` decision, while a finding the code makes obsolete resolves on its own. Only an
+`open`/`accepted`/`dismissed` finding is reviewable — a `resolved`/`superseded` one is not (the code
+moved on, so there is nothing to act on). Reviewing is repo-scoped and never runs the model.
+
 ## Memory surfacing (`[memory] surface`)
 
 `[memory] surface` controls how drive-by memory attachments render. The default is `full`

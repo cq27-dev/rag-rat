@@ -42,4 +42,16 @@ impl IndexDatabase {
     ) -> anyhow::Result<bool> {
         crate::dream::model_work_pending(self.storage.connection(), opts, budget, verify, compact)
     }
+
+    /// Apply a human review verdict (accept / dismiss / reset) to a dream finding by id or prefix —
+    /// the `rag-rat dream <id> --accept|--dismiss|--reset` surface. Repo-scoped; only a
+    /// non-terminal finding is reviewable. See [`crate::dream::review_dream_finding`].
+    pub fn review_dream_finding(
+        &self,
+        id_or_prefix: &str,
+        verdict: crate::dream::ReviewVerdict,
+        now_ms: i64,
+    ) -> anyhow::Result<crate::dream::ReviewedFinding> {
+        crate::dream::review_dream_finding(self.storage.connection(), id_or_prefix, verdict, now_ms)
+    }
 }

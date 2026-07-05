@@ -789,7 +789,12 @@ mod tests {
         // pending.
         let c = mem_db();
         set_repo(&c, "r");
-        let opts = crate::dream::DreamOptions { now_ms: 1, limit: 10, verify: true };
+        let opts = crate::dream::DreamOptions {
+            now_ms: 1,
+            limit: 10,
+            verify: true,
+            include_reviewed: false,
+        };
         assert!(
             !crate::dream::model_work_pending(&c, opts, 10, true, true).unwrap(),
             "empty repo → no work"
