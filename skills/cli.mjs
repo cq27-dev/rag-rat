@@ -54,14 +54,19 @@ function main() {
     return 0;
   }
 
-  // No subcommand, or an install alias → `skills add <SOURCE> [flags]`.
-  // Any other subcommand (update/list/ls/remove/rm/find/use) → forwarded verbatim to `skills`,
-  // which operates on the already-installed set (source not needed).
+  // Dispatch. The INSTALL path is `skills add <SOURCE> [flags]`; it fires for:
+  //   - no subcommand           (`npx @rag-rat/skills`)
+  //   - an install alias        (`add` / `install` / `i`) — its own token is dropped
+  //   - a LEADING FLAG          (`-a`, `-s`, `-g`, `--copy`, `-y`, …) — these are `skills add`
+  //     options, so the documented `npx @rag-rat/skills -a claude-code` forms must install, not
+  //     forward a bare `skills -a …` (which the upstream CLI rejects).
+  // Only a real subcommand word (update / list / ls / remove / rm / find / use / init) is forwarded
+  // verbatim — those operate on the already-installed set, so no source is needed.
+  const isInstall = sub === undefined || INSTALL.has(sub) || sub.startsWith("-");
   let skillsArgs;
-  if (sub === undefined) {
-    skillsArgs = ["add", SOURCE];
-  } else if (INSTALL.has(sub)) {
-    skillsArgs = ["add", SOURCE, ...argv.slice(1)];
+  if (isInstall) {
+    const rest = sub !== undefined && INSTALL.has(sub) ? argv.slice(1) : argv;
+    skillsArgs = ["add", SOURCE, ...rest];
   } else {
     skillsArgs = argv;
   }
