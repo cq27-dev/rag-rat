@@ -107,13 +107,16 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
   const sandboxName = `${APP_NAME}-${Date.now()}-${randomUUID().slice(0, 8)}`;
 
   // The backend spec supplies the entrypoint ARGS (never the entrypoint) + env + the served port.
+  // Resolve the args first — the vLLM chat path is async (it sizes --max-model-len from the model's
+  // HF context).
+  const entrypointArgs = await spec.entrypointArgs(input);
   let sb: Sandbox;
   const createRef: { promise?: Promise<Sandbox> } = {};
   try {
     sb = await withBudget(deadline, "sandboxes.create", () => {
       createRef.promise = modal.sandboxes.create(app, image, {
         name: sandboxName,
-        command: [...spec.entrypointArgs(input)],
+        command: [...entrypointArgs],
         env: spec.env(input),
         encryptedPorts: [port],
         readinessProbe: Probe.withTcp(port, { intervalMs: 1000 }),

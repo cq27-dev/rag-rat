@@ -66,8 +66,11 @@ export interface BackendServerSpec {
    * itself — that's baked into the image. Capability-aware via `input.capability` (default `embed`):
    * vLLM includes `--runner pooling` (embedding mode) for `embed` and OMITS it for `chat` (the
    * default generation runner). Absent/null capability → `embed`, so existing callers are unaffected.
+   *
+   * MAY be async: the vLLM chat path fetches the model's context length from HuggingFace to size
+   * `--max-model-len` (see {@link chatMaxModelLen}). Providers `await` the result.
    */
-  entrypointArgs(input: CookbookInput): readonly string[];
+  entrypointArgs(input: CookbookInput): readonly string[] | Promise<readonly string[]>;
   /** Container env as a plain record; a provider maps it to its own shape. */
   env(input: CookbookInput): Record<string, string>;
   /**
@@ -87,15 +90,37 @@ const INFINITY_PORT = 7997;
 const VLLM_PORT = 8000;
 
 /**
- * Chat context cap. Without `--max-model-len`, vLLM sizes its KV cache for the model's FULL native
- * context — for a modern instruct model that is huge (Qwen3's is 262144), needing ~36 GiB of KV
- * cache, so on a modest GPU (an L4 holds ~12 GiB of KV → ~86K tokens) vLLM aborts engine startup
- * with a ValueError and the box never becomes ready. The dream verdict/compaction prompts are
- * small, so a bounded window is ample and keeps startup inside a single-GPU budget. Applied to CHAT
- * only: embed models' native contexts are small (they fit unclamped), and a cap ABOVE a model's
- * context makes vLLM error the other way.
+ * The chat context cap. Without `--max-model-len`, vLLM sizes its KV cache for the model's FULL
+ * native context — for a modern instruct model that is huge (Qwen3's is 262144), needing ~36 GiB of
+ * KV cache, so on a modest GPU (an L4 holds ~12 GiB of KV → ~86K tokens) vLLM aborts engine startup
+ * with a ValueError and the box never becomes ready. The dream verdict/compaction prompts are small,
+ * so bounding the window is ample and keeps startup inside a single-GPU budget.
  */
-const VLLM_CHAT_MAX_MODEL_LEN = 32768;
+const VLLM_CHAT_MAX_MODEL_LEN_CAP = 32768;
+
+/**
+ * `--max-model-len` for a vLLM CHAT box: the cap, but NEVER above the model's own context (a
+ * `--max-model-len` larger than the model's `max_position_embeddings` makes vLLM error the other
+ * way — so a small 4K/8K chat model must not be forced to 32K). We fetch the model's context from
+ * its public HuggingFace `config.json` (the box downloads from the same host anyway) and take the
+ * min. On any fetch/parse failure we fall back to the cap: dream models are large-context, where the
+ * cap is exactly what's needed, and a config fetch failing for a model vLLM is about to download is
+ * unlikely.
+ */
+async function chatMaxModelLen(model: string): Promise<number> {
+  const cap = VLLM_CHAT_MAX_MODEL_LEN_CAP;
+  try {
+    const res = await fetch(`https://huggingface.co/${model}/resolve/main/config.json`, {
+      headers: { accept: "application/json" },
+    });
+    if (!res.ok) return cap;
+    const cfg = (await res.json()) as { max_position_embeddings?: unknown };
+    const ctx = cfg.max_position_embeddings;
+    return typeof ctx === "number" && ctx > 0 ? Math.min(cap, ctx) : cap;
+  } catch {
+    return cap;
+  }
+}
 
 const OLLAMA_SPEC: BackendServerSpec = {
   backend: "ollama",
@@ -165,14 +190,15 @@ const VLLM_SPEC: BackendServerSpec = {
   // is deprecated as of v0.11); for `chat` we OMIT it so vLLM uses its default GENERATION runner and
   // serves `/v1/chat/completions`. Passing `--runner pooling` for chat would force embedding mode and
   // 404 the chat route — the whole reason chat drops the flag.
-  entrypointArgs: (input) => {
+  entrypointArgs: async (input) => {
     const capability = input.capability ?? "embed";
     const args = [input.model];
     if (capability === "embed") {
       args.push("--runner", "pooling");
     } else {
-      // chat: bound the context so vLLM's KV cache fits a single-GPU budget (see the const above).
-      args.push("--max-model-len", String(VLLM_CHAT_MAX_MODEL_LEN));
+      // chat: bound the context so vLLM's KV cache fits a single-GPU budget, capped at the model's
+      // own context so a shorter model isn't forced past its limit (see chatMaxModelLen).
+      args.push("--max-model-len", String(await chatMaxModelLen(input.model)));
     }
     args.push("--host", "0.0.0.0", "--port", String(VLLM_PORT));
     // Map the concurrency cap to vLLM's max concurrent sequences when set.

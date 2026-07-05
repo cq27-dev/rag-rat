@@ -128,6 +128,10 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
     `deploying RunPod pod (backend=${spec.backend}, model=${input.model}, gpu=${gpuTypeId})`,
   );
 
+  // Resolve the entrypoint args first — the vLLM chat path is async (it sizes --max-model-len from
+  // the model's HF context).
+  const dockerArgs = (await spec.entrypointArgs(input)).join(" ");
+
   // Deploy the pod. The backend spec supplies the image, the dockerArgs (entrypoint args joined),
   // and the container env; `ports "<port>/http"` exposes the proxy. No persistent volume (ephemeral).
   //
@@ -148,7 +152,7 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
           gpuTypeId,
           name: podName,
           imageName: spec.image(input),
-          dockerArgs: spec.entrypointArgs(input).join(" "),
+          dockerArgs,
           ports: `${port}/http`,
           containerDiskInGb: CONTAINER_DISK_GB,
           volumeInGb: 0,
