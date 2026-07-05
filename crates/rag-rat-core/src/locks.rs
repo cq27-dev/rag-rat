@@ -132,13 +132,39 @@ pub fn write_lock_path(database: &Path, repo_id: &str) -> PathBuf {
 /// Otherwise a lock keyed off `config.database` (a CLI entry lock) and a reentrant re-acquire keyed
 /// off the connection's own `conn.path()` rendering (the identity-upgrade path) miss each other and
 /// SELF-DEADLOCK on the same underlying flock until timeout — an aliased-path hang seen only where
-/// the OS aliases the temp root (macOS). Same rationale as [`election_lock_path`]. Falls back to
-/// the raw parent when the directory does not exist yet: no lock file could exist under a canonical
-/// name then either, so both key sites stay consistent (and the pre-existence case is not
-/// reentrant).
+/// the OS aliases the temp root (macOS). Same rationale as [`election_lock_path`].
+///
+/// Canonicalizes the nearest EXISTING ancestor and re-appends the not-yet-created tail, so the key
+/// is stable whether or not the DB dir exists yet. A plain `parent.canonicalize()` would be
+/// UNSTABLE across a first index: the outer write lock is taken before `FileLock::open` creates the
+/// dir, so it would fall back to the raw parent, then the dir is created, and the reentrant inner
+/// acquire (`rebuild_with_progress` re-takes the lock) would canonicalize to a DIFFERENT string — a
+/// reentrancy miss that self-deadlocks on its own flock. Re-appending the tail to a canonicalized
+/// existing ancestor yields the SAME value before and after creation (#446 review, P1).
 fn lock_dir(database: &Path) -> PathBuf {
     let parent = database.parent().unwrap_or_else(|| Path::new("."));
-    parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf())
+    // Walk up to the nearest ancestor that exists (and so canonicalizes), stashing the components
+    // we skip; canonicalize it, then push the skipped tail back on. `create_dir_all` later
+    // creates the tail as real dirs UNDER that ancestor (introducing no new symlink), so
+    // canonicalizing the whole path post-creation lands on the identical result.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = parent;
+    loop {
+        if let Ok(canonical) = cur.canonicalize() {
+            let mut out = canonical;
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(grandparent)) => {
+                tail.push(name.to_os_string());
+                cur = grandparent;
+            },
+            // No existing ancestor canonicalizes (unreachable for a real absolute lock path — the
+            // filesystem root always does): fall back to the raw parent.
+            _ => return parent.to_path_buf(),
+        }
+    }
 }
 
 /// The GLOBAL schema-migration lock path, beside the DB (A6): ONE per database file, taken only by
@@ -624,6 +650,41 @@ mod tests {
         assert!(schema_lock_path(db).to_string_lossy().ends_with("rag-rat-schema.lock"));
         // A `local:`-prefixed id sanitizes to alphanumerics (the `:` is dropped), still per-repo.
         assert_eq!(write_lock_path(db, "local:abcdef01"), write_lock_path(db, "local:abcdef01"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_dir_key_is_stable_across_db_dir_creation_through_a_symlinked_ancestor() {
+        // #446 review P1: on a symlink-aliased path the write-lock key MUST be identical before and
+        // after the DB directory is created — else a first index (outer lock taken pre-create, then
+        // the reentrant `rebuild_with_progress` acquire post-create) misses the thread-local
+        // reentrancy entry and self-deadlocks on its own flock. Mirror macOS's
+        // `/tmp`->`/private/tmp` aliasing on Linux with an explicit symlink so the raw and
+        // canonical forms diverge.
+        let real = temp_dir();
+        let link = real.parent().unwrap().join(format!(
+            "ragrat-lock-link-{}-{}",
+            std::process::id(),
+            LOCK_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // A DB whose `.rag-rat/` parent does NOT exist yet, reached through the symlink.
+        let db_via_link = link.join(".rag-rat").join("index.sqlite");
+        let before = write_lock_path(&db_via_link, "abcd12345678");
+
+        // Create the parent exactly as `FileLock::open` does on the first lock.
+        fs::create_dir_all(db_via_link.parent().unwrap()).unwrap();
+        let after = write_lock_path(&db_via_link, "abcd12345678");
+        assert_eq!(before, after, "lock key must not change when the DB dir is created");
+
+        // The aliased path and the real path resolve to ONE lock file (the alias is collapsed).
+        let via_real = write_lock_path(&real.join(".rag-rat").join("index.sqlite"), "abcd12345678");
+        assert_eq!(after, via_real, "aliased and canonical paths share one lock file");
+
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_dir_all(&real);
     }
 
     #[test]
