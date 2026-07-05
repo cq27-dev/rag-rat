@@ -46,10 +46,25 @@ enabled = true
 [llm.dream.remote]
 cookbook = "@rag-rat/cookbook modal"    # same ephemeral Modal recipe as embeddings (published npm)
 backend  = "vllm"                       # generation runner; serves /v1/chat/completions
-model    = "Qwen/Qwen3-8B"              # server-side HF id vLLM launches (Qwen3-4B-Instruct-2507 = lighter, eval-validated)
-gpu      = "L4"                         # 24GB fits Qwen3-8B in fp16 (matches the embedding box class)
+model    = "Qwen/Qwen3-4B-Instruct-2507" # the memory-compaction eval winner (0 negation flips); lighter than 8B, proven for this task
+gpu      = "L4"                          # 24GB comfortably fits the 4B in fp16 (matches the embedding box class)
 request_timeout_s = 900                 # generous per-request budget (a dense evidence pack is slow on first token)
+
+# Render drive-by memory attachments as the dream-COMPACTED summary + a verdict marker instead of the
+# full mechanical body. The `dream --compact` pass writes these summaries (memory_summaries); a memory
+# with no summary for its current body falls back to title-only. `memory show` / `memory_show` ALWAYS
+# return the full body — this only changes the compact attachment, and the full text is one call away.
+[memory]
+surface = "summary"
 
 [target_bindings]
 rust = ["crates"]
 markdown = ["docs"]
+
+# DIAGNOSTIC: observe the git-hook maintenance / reconcile / embedder lifecycle (#378 / #360).
+# Per-process files under .rag-rat/logs/ (liveness-aware retention, gitignored). info baseline +
+# debug for the maintenance + ai (reconcile/providers/embed) targets.
+[log]
+enabled = true
+level = "info"
+filter = "rag_rat_core::maintenance=debug,rag_rat_core::index::ai=debug"
