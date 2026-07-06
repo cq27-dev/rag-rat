@@ -866,6 +866,22 @@ mod tests {
             .collect()
     }
 
+    fn post_stub_embedding_request(url: &str, text: &str) {
+        let addr = url.strip_prefix("http://").expect("stub URL has http scheme");
+        let mut stream = TcpStream::connect(addr).expect("connect to counting stub");
+        let body = format!(r#"{{"input":["{text}"]}}"#);
+        let request = format!(
+            "POST /v1/embeddings HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: \
+             close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).expect("write stub request");
+        stream.flush().expect("flush stub request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read stub response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "unexpected response: {response}");
+    }
+
     fn raise_max(max_seen: &std::sync::atomic::AtomicUsize, value: usize) {
         use std::sync::atomic::Ordering;
 
@@ -962,6 +978,25 @@ mod tests {
             "the first sub-batch response should be held until a later response completes"
         );
         assert_eq!(first_components(&got), vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn parallel_counting_stub_wait_branch_is_deterministic() {
+        use std::sync::atomic::Ordering;
+
+        let (url, handle, requests, _, waits_satisfied) =
+            spawn_parallel_counting_stub_with_waits(2, Vec::new(), vec![0]);
+        let first_url = url.clone();
+        let first = thread::spawn(move || post_stub_embedding_request(&first_url, "text 0"));
+        thread::sleep(Duration::from_millis(20));
+        let second = thread::spawn(move || post_stub_embedding_request(&url, "text 1"));
+
+        first.join().unwrap();
+        second.join().unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(waits_satisfied.load(Ordering::SeqCst), 1);
     }
 
     #[test]
