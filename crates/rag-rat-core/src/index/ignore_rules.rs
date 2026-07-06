@@ -40,9 +40,10 @@
 //!    In a non-git tree the base is just `config.root`.
 //!
 //! **Discovery is scoped to the target trees** (finding from round 3): nested `.gitignore` files
-//! are collected only along the configured `target.directories`, never by recursing the whole
-//! `config.root` into large unindexed sibling directories.
+//! are collected only along the configured `target.directories` and their ancestor chain, never by
+//! recursing the whole `config.root` into large unindexed sibling directories.
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use ignore::Match;
@@ -177,13 +178,15 @@ impl IgnoreMatcher {
         // fix) — not a recursive sweep of the whole `root`. Each target dir is walked top-down with
         // parent-exclusion pruning (finding 2). Dedup so a `.gitignore` under overlapping target
         // dirs is compiled once.
-        let scan_roots = if target_dirs.is_empty() {
-            vec![root.to_path_buf()]
+        if target_dirs.is_empty() {
+            matcher.collect_nested_gitignores(root);
         } else {
-            target_dirs.iter().map(|dir| root.join(dir)).collect()
-        };
-        for scan_root in scan_roots {
-            matcher.collect_nested_gitignores(&scan_root);
+            for dir in target_ancestor_dirs(root, target_dirs) {
+                matcher.push_gitignore_in(&dir);
+            }
+            for target_dir in target_dirs {
+                matcher.collect_nested_gitignores(&root.join(target_dir));
+            }
         }
 
         // Outermost first: shortest rel_dir sorts before its descendants, making the precedence
@@ -346,6 +349,33 @@ impl IgnoreMatcher {
             self.stack.push(ScopedGitignore { rel_dir, gitignore });
         }
     }
+}
+
+/// Directories between `root` and each configured target root, excluding `root` itself.
+///
+/// These are not scan roots: they can carry `.gitignore` files that govern nested targets such as
+/// `src/generated`, but recursively walking them would scan unindexed siblings under `src/`. Keep
+/// this path-prefix expansion shared so watcher subscriptions and ignore compilation agree on the
+/// same ancestor surface.
+pub(crate) fn target_ancestor_dirs(root: &Path, target_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    let mut dirs = Vec::new();
+    for target_dir in target_dirs {
+        let mut dir = root.to_path_buf();
+        for component in target_dir.components() {
+            match component {
+                Component::Normal(name) => {
+                    dir.push(name);
+                    if seen.insert(dir.clone()) {
+                        dirs.push(dir.clone());
+                    }
+                },
+                Component::CurDir => {},
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => break,
+            }
+        }
+    }
+    dirs
 }
 
 /// Whether any component of the (`config.root`-relative) `rel` path is a floor directory name.
@@ -605,6 +635,26 @@ mod tests {
         assert!(
             !m.is_ignored(&root.join("huge/marker.rs"), false),
             "sibling outside target trees is not scanned for nested gitignores (scoping)",
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn target_ancestor_gitignore_governs_nested_target_without_scanning_siblings() {
+        let root = tempdir();
+        write(&root.join("src/.gitignore"), "generated/\n");
+        write(&root.join("src/generated/lib.rs"), "x\n");
+        write(&root.join("src/sibling/.gitignore"), "marker.rs\n");
+        write(&root.join("src/sibling/marker.rs"), "x\n");
+
+        let m = IgnoreMatcher::compile(&root, &[PathBuf::from("src/generated")]);
+        assert!(
+            m.is_ignored(&root.join("src/generated/lib.rs"), false),
+            "target ancestor .gitignore must govern nested target files",
+        );
+        assert!(
+            !m.is_ignored(&root.join("src/sibling/marker.rs"), false),
+            "target ancestor compilation must not recursively scan unindexed siblings",
         );
         fs::remove_dir_all(&root).ok();
     }

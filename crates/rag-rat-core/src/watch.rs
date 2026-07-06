@@ -25,7 +25,7 @@ use notify::{Event, RecursiveMode, Watcher as _, recommended_watcher};
 use crate::config::Config;
 use crate::fleet;
 use crate::index::ai::ReconcileOptions;
-use crate::index::ignore_rules::IgnoreMatcher;
+use crate::index::ignore_rules::{IgnoreMatcher, target_ancestor_dirs};
 use crate::index::{IndexDatabase, target_for_path};
 use crate::locks::{self, FileLock};
 
@@ -391,13 +391,11 @@ impl LinkedWorktreeWatch {
     fn place_watches(&self, watcher: &mut impl notify::Watcher) {
         watch_configured_trees(watcher, &self.config, &self.target_dirs, &self.ignore);
         watch_gitignore_rule_dirs(watcher, &self.config.root, &self.target_dirs);
-        if let Some(root) =
-            missing_config_root_bootstrap_dir(&self.config.root, &self.checkout_root)
-        {
-            // The linked checkout may not have this subdir on the current branch yet. Keep a narrow
-            // bootstrap on the checkout root so the first recreated config-root component is
-            // observed without returning to a recursive whole-checkout watch.
-            let _ = watcher.watch(root, RecursiveMode::NonRecursive);
+        for root in missing_config_root_bootstrap_dirs(&self.config.root, &self.checkout_root) {
+            // The linked checkout may not have this subdir on the current branch yet. Keep narrow
+            // bootstraps on the existing ancestor chain so the next recreated config-root component
+            // is observed without returning to a recursive whole-checkout watch.
+            let _ = watcher.watch(&root, RecursiveMode::NonRecursive);
         }
     }
 
@@ -515,15 +513,34 @@ fn path_between_bootstrap_and_config_root(
     path.starts_with(bootstrap_root) && config_root.starts_with(path)
 }
 
-fn missing_config_root_bootstrap_dir<'a>(
-    config_root: &Path,
-    checkout_root: &'a Path,
-) -> Option<&'a Path> {
-    (config_root != checkout_root
-        && path_between_bootstrap_and_config_root(checkout_root, checkout_root, config_root)
-        && !config_root.exists()
-        && checkout_root.is_dir())
-    .then_some(checkout_root)
+fn missing_config_root_bootstrap_dirs(config_root: &Path, checkout_root: &Path) -> Vec<PathBuf> {
+    if config_root == checkout_root
+        || !path_between_bootstrap_and_config_root(checkout_root, checkout_root, config_root)
+        || config_root.exists()
+        || !checkout_root.is_dir()
+    {
+        return Vec::new();
+    }
+    let Ok(rel) = config_root.strip_prefix(checkout_root) else {
+        return Vec::new();
+    };
+
+    let mut dirs = vec![checkout_root.to_path_buf()];
+    let mut dir = checkout_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => {
+                dir.push(name);
+                if dir == config_root || !dir.is_dir() {
+                    break;
+                }
+                dirs.push(dir.clone());
+            },
+            Component::CurDir => {},
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => break,
+        }
+    }
+    dirs
 }
 
 /// The `worktree_id` of the worktree that ENCLOSES `root`, canonicalized to match the ids
@@ -574,19 +591,9 @@ fn gitignore_rule_watch_dirs(root: &Path, target_dirs: &[PathBuf]) -> Vec<PathBu
             dirs.push(dir);
         }
     }
-    for target_dir in target_dirs {
-        let mut dir = root.to_path_buf();
-        for component in target_dir.components() {
-            match component {
-                Component::Normal(name) => {
-                    dir.push(name);
-                    if seen.insert(dir.clone()) {
-                        dirs.push(dir.clone());
-                    }
-                },
-                Component::CurDir => {},
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => break,
-            }
+    for dir in target_ancestor_dirs(root, target_dirs) {
+        if seen.insert(dir.clone()) {
+            dirs.push(dir);
         }
     }
     dirs
@@ -1133,6 +1140,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_config_root_bootstrap_dirs_use_existing_ancestor_chain() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let checkout = std::env::temp_dir()
+            .join(format!("ragrat-bootstrap-chain-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&checkout);
+        std::fs::create_dir_all(checkout.join("packages")).unwrap();
+        let checkout = checkout.canonicalize().unwrap();
+        let packages = checkout.join("packages");
+        let config_root = packages.join("crate");
+
+        assert_eq!(
+            missing_config_root_bootstrap_dirs(&config_root, &checkout),
+            vec![checkout.clone(), packages.clone()],
+            "the deepest existing ancestor must be watched so its missing child creation is \
+             delivered",
+        );
+        assert!(
+            missing_config_root_bootstrap_dirs(&config_root, &checkout.join("sibling")).is_empty(),
+            "unrelated bootstrap roots must not gain watches",
+        );
+        std::fs::create_dir_all(&config_root).unwrap();
+        assert!(
+            missing_config_root_bootstrap_dirs(&config_root, &checkout).is_empty(),
+            "no bootstrap is needed once the config root exists",
+        );
+
+        std::fs::remove_dir_all(&checkout).ok();
+    }
+
+    #[test]
     fn created_dir_placement_classifies_target_ancestors_and_subtrees() {
         let root = PathBuf::from("/repo");
         let nested = vec![PathBuf::from("src/generated")];
@@ -1492,6 +1531,37 @@ mod tests {
     }
 
     #[test]
+    fn linked_worktree_target_ancestor_gitignore_is_compiled() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let worktree = std::env::temp_dir()
+            .join(format!("ragrat-wt-ancestor-ignore-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(worktree.join("src/generated")).unwrap();
+        std::fs::create_dir_all(worktree.join("src/sibling")).unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::write(worktree.join("src/.gitignore"), "generated/\n").unwrap();
+        std::fs::write(worktree.join("src/sibling/.gitignore"), "marker.rs\n").unwrap();
+
+        let target_dirs = vec![PathBuf::from("src/generated")];
+        let config = whole_root_config(&worktree, &target_dirs);
+        let mut watcher = RecordingWatcher::default();
+        let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+        let ignore = &worktrees.states[0].ignore;
+
+        assert!(
+            ignore.is_ignored(&worktree.join("src/generated/lib.rs"), false),
+            "target ancestor .gitignore rules must govern nested linked targets",
+        );
+        assert!(
+            !ignore.is_ignored(&worktree.join("src/sibling/marker.rs"), false),
+            "compiling target ancestors must not scan unindexed siblings below that ancestor",
+        );
+
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
     fn linked_subdir_root_watch_placement_keeps_checkout_root_when_config_root_missing() {
         use std::process::Command;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1503,8 +1573,8 @@ mod tests {
             .join(format!("ragrat-wt-missing-root-linked-{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&checkout);
-        std::fs::create_dir_all(repo.join("crate/src")).unwrap();
-        std::fs::write(repo.join("crate/src/lib.rs"), "fn lib() {}\n").unwrap();
+        std::fs::create_dir_all(repo.join("packages/crate/src")).unwrap();
+        std::fs::write(repo.join("packages/crate/src/lib.rs"), "fn lib() {}\n").unwrap();
         for args in [
             vec!["init", "-q", "-b", "main"],
             vec!["config", "user.email", "t@e"],
@@ -1515,15 +1585,15 @@ mod tests {
             let output = Command::new("git").args(&args).current_dir(&repo).output().unwrap();
             assert!(output.status.success(), "git {args:?} failed: {output:?}");
         }
-        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(checkout.join("packages")).unwrap();
         let checkout = checkout.canonicalize().unwrap();
-        let config_root = repo.join("crate").canonicalize().unwrap();
+        let config_root = repo.join("packages/crate").canonicalize().unwrap();
         let target_dirs = vec![PathBuf::from("src")];
         let config = whole_root_config(&config_root, &target_dirs);
 
         let mut watcher = RecordingWatcher::default();
         let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![checkout.clone()]);
-        let linked_root = checkout.join("crate");
+        let linked_root = checkout.join("packages/crate");
 
         assert_eq!(worktrees.states[0].config.root, linked_root);
         assert!(!linked_root.exists(), "the linked branch has not created the configured root yet");
@@ -1533,6 +1603,11 @@ mod tests {
                 .iter()
                 .any(|(path, mode)| path == &checkout && *mode == RecursiveMode::NonRecursive),
             "a missing linked subdir-root needs a non-recursive checkout-root bootstrap watch",
+        );
+        assert!(
+            watcher.watched.iter().any(|(path, mode)| path == &checkout.join("packages")
+                && *mode == RecursiveMode::NonRecursive),
+            "an existing parent of the missing linked root must be watched for the final component",
         );
         assert!(
             watcher.watched.iter().all(|(_, mode)| *mode == RecursiveMode::NonRecursive),
