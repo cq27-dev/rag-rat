@@ -367,44 +367,65 @@ fn event_is_relevant(config: &Config, ignore: &IgnoreMatcher, event: &Event) -> 
     })
 }
 
+#[derive(Debug)]
+struct LinkedWorktreeWatch {
+    checkout_root: PathBuf,
+    config: Config,
+    target_dirs: Vec<PathBuf>,
+    ignore: IgnoreMatcher,
+}
+
+impl LinkedWorktreeWatch {
+    fn new(base_config: &Config, checkout_root: PathBuf) -> Self {
+        // Overlay indexing deliberately keeps the base root/database while swapping in the linked
+        // branch's targets. Watch placement needs those branch targets, but paths must be matched
+        // against the linked checkout's equivalent of `base_config.root`.
+        let mut config = base_config.for_linked_worktree_overlay(&checkout_root);
+        config.root = checkout_root.join(config_subdir_prefix(base_config));
+        let target_dirs = config.target_directories();
+        let ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+        Self { checkout_root, config, target_dirs, ignore }
+    }
+
+    fn recompile_ignore_and_place_watches(&mut self, watcher: &mut impl notify::Watcher) {
+        self.ignore = IgnoreMatcher::compile(&self.config.root, &self.target_dirs);
+        watch_configured_trees(watcher, &self.config, &self.target_dirs, &self.ignore);
+    }
+}
+
 /// Whether `event` should fire a pass for the LINKED-worktree layer (#219): a content mutation to a
 /// configured target inside a linked worktree checkout (its overlay needs refreshing), or any
 /// change in the worktree registry (`<common_dir>/worktrees`, i.e. a worktree add/remove). Separate
-/// from [`event_is_relevant`] so the base-tree classification — and its tests — stay untouched. The
-/// `config.root` ignore matcher doesn't govern paths outside `config.root`, so a worktree path is
-/// matched by the target globs alone (the overlay pass does its own delta + target filtering).
+/// from [`event_is_relevant`] so the base-tree classification — and its tests — stay untouched.
+/// Each linked checkout has its own target set and ignore matcher, so the watcher does not fire on
+/// paths the overlay walker would drop (including `target/` or branch-local gitignored dirs).
 fn event_touches_worktree(
-    config: &Config,
     event: &Event,
-    worktree_roots: &[PathBuf],
+    worktrees: &[LinkedWorktreeWatch],
     registry: Option<&Path>,
 ) -> bool {
+    if event.need_rescan() {
+        return !worktrees.is_empty() || registry.is_some();
+    }
     if !kind_is_mutation(&event.kind) {
         return false;
     }
-    // `config.root` may be a SUBDIR of the repo. A linked checkout mirrors that layout, so its
-    // event paths are `<checkout_root>/<config_subdir>/<target>/…`. After stripping the
-    // checkout root the remainder is still `<config_subdir>/<target>/…`, but `target_for_path`
-    // expects a CONFIG-ROOT- relative path (`<target>/…`) — so a subdir-rooted config would
-    // reject every linked edit and never debounce an overlay refresh. Strip the config subdir
-    // too (#219 review).
-    let config_subdir = config_subdir_prefix(config);
     event.paths.iter().any(|path| {
         if registry.is_some_and(|reg| path.starts_with(reg)) {
             return true;
         }
-        // A `.gitignore` edit in the linked checkout changes its ignored/unignored set, so the
-        // overlay must refresh — mirror the base classifier's `.gitignore` handling (#219 review).
-        // Bound it to the watched checkout roots so an unrelated repo's `.gitignore` is ignored.
-        if is_gitignore_path(path) && worktree_roots.iter().any(|root| path.starts_with(root)) {
-            return true;
-        }
-        worktree_roots.iter().any(|root| {
-            let Ok(rel) = path.strip_prefix(root) else {
+        worktrees.iter().any(|worktree| {
+            // A `.gitignore` edit anywhere in the linked checkout can affect the branch overlay's
+            // ignored/unignored set, including ancestor rules above a subdir-rooted config.
+            if is_gitignore_path(path) && path.starts_with(&worktree.checkout_root) {
+                return true;
+            }
+            if worktree.ignore.is_ignored(path, false) {
                 return false;
-            };
-            let rel = rel.strip_prefix(&config_subdir).unwrap_or(rel);
-            target_for_path(config, rel).is_some()
+            }
+            path.strip_prefix(&worktree.config.root)
+                .ok()
+                .is_some_and(|rel| target_for_path(&worktree.config, rel).is_some())
         })
     })
 }
@@ -448,6 +469,34 @@ fn worktree_watch_targets(config: &Config) -> (Vec<PathBuf>, Option<PathBuf>) {
         .ok()
         .map(|repo| repo.common_dir().join("worktrees"));
     (roots, registry)
+}
+
+fn watch_configured_trees(
+    watcher: &mut impl notify::Watcher,
+    config: &Config,
+    target_dirs: &[PathBuf],
+    ignore: &IgnoreMatcher,
+) {
+    for dir in target_dirs {
+        watch_tree_pruned(watcher, &config.root.join(dir), ignore);
+    }
+}
+
+fn watch_gitignore_rule_dirs(watcher: &mut impl notify::Watcher, root: &Path) {
+    for dir in gitignore_watch_dirs(root) {
+        let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+    }
+}
+
+fn watch_linked_worktree(
+    watcher: &mut impl notify::Watcher,
+    base_config: &Config,
+    checkout_root: PathBuf,
+) -> LinkedWorktreeWatch {
+    let state = LinkedWorktreeWatch::new(base_config, checkout_root);
+    watch_configured_trees(watcher, &state.config, &state.target_dirs, &state.ignore);
+    watch_gitignore_rule_dirs(watcher, &state.config.root);
+    state
 }
 
 /// Whether `event` touches the installed binary path — the fleet hot-upgrade trigger. Matches by
@@ -656,11 +705,7 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     // watcher can start. `event_is_relevant` already drops events from ignored paths; placing the
     // watches the same way keeps the watch count proportional to the *indexed* tree, not the whole
     // working directory.
-    for target in &config.targets {
-        for dir in &target.directories {
-            watch_tree_pruned(&mut notify_watcher, &config.root.join(dir), &ignore);
-        }
-    }
+    watch_configured_trees(&mut notify_watcher, &config, &target_dirs, &ignore);
     // Round-3 finding 1: when `config.root` is a subdirectory of a larger Git worktree, the target
     // dirs are below `config.root`, so a watch scoped to them never sees an edit to the
     // *worktree-root* (or any ancestor) `.gitignore` that lives ABOVE them — those root-rule
@@ -670,9 +715,7 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     // `gitignore_watch_dirs` returns the chain (always including `config.root`); the
     // non-recursive watch only delivers events for files directly in each dir, which is exactly
     // where each ancestor `.gitignore` sits.
-    for dir in gitignore_watch_dirs(&config.root) {
-        let _ = notify_watcher.watch(&dir, RecursiveMode::NonRecursive);
-    }
+    watch_gitignore_rule_dirs(&mut notify_watcher, &config.root);
     // Fleet hot-upgrade: also watch the installed binary's directory so a new `cargo install`
     // rename triggers a fleet-wide upgrade. Watch the directory (not the file) so the atomic
     // rename — which replaces the inode — is still observed.
@@ -680,16 +723,15 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     if let Some(dir) = fleet_dir {
         let _ = notify_watcher.watch(dir, RecursiveMode::NonRecursive);
     }
-    // Linked worktrees (#219): watch each branch checkout recursively so its edits refresh the
-    // overlay, and the worktree registry non-recursively so a `git worktree add`/`remove` fires a
+    // Linked worktrees (#219): watch each branch checkout's configured targets, pruned by that
+    // checkout's own gitignore rules, so overlay refreshes do not subscribe to ignored build trees.
+    // The worktree registry is still watched non-recursively so `git worktree add/remove` fires a
     // pass. `linked_worktrees` is reconciled after each pass to pick up newly-added worktrees.
-    // NOTE (#331): these remain `Recursive` — the secondary inotify consumer. Pruning them needs a
-    // per-worktree `IgnoreMatcher` (the `config.root` matcher doesn't govern paths outside it, and
-    // each branch carries its own targets/`.gitignore`), which #331 scopes out (target dirs first).
-    let (mut linked_worktrees, worktree_registry) = worktree_watch_targets(&config);
-    for worktree in &linked_worktrees {
-        let _ = notify_watcher.watch(worktree, RecursiveMode::Recursive);
-    }
+    let (linked_worktree_roots, worktree_registry) = worktree_watch_targets(&config);
+    let mut linked_worktrees = linked_worktree_roots
+        .into_iter()
+        .map(|root| watch_linked_worktree(&mut notify_watcher, &config, root))
+        .collect::<Vec<_>>();
     if let Some(registry) = &worktree_registry {
         let _ = notify_watcher.watch(registry, RecursiveMode::NonRecursive);
     }
@@ -732,9 +774,17 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
                 // firing. Gates each path on real-dir + under-a-target + not-ignored, and
                 // recompiles the matcher for a moved-in nested `.gitignore` (#332).
                 watch_created_dirs(&mut notify_watcher, &event, &config, &target_dirs, &mut ignore);
+                for worktree in &mut linked_worktrees {
+                    watch_created_dirs(
+                        &mut notify_watcher,
+                        &event,
+                        &worktree.config,
+                        &worktree.target_dirs,
+                        &mut worktree.ignore,
+                    );
+                }
                 if event_is_relevant(&config, &ignore, &event)
                     || event_touches_worktree(
-                        &config,
                         &event,
                         &linked_worktrees,
                         worktree_registry.as_deref(),
@@ -754,16 +804,11 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
                         // fire. notify's `watch()` is idempotent for an
                         // already-watched path, so re-walking only ADDS the
                         // newly-eligible dirs. (A newly-IGNORED subtree keeps its
-                        // now-stale watches — harmless wasted watches, same as the linked-worktree
-                        // path; full unwatch bookkeeping is deferred.)
-                        for target in &config.targets {
-                            for dir in &target.directories {
-                                watch_tree_pruned(
-                                    &mut notify_watcher,
-                                    &config.root.join(dir),
-                                    &ignore,
-                                );
-                            }
+                        // now-stale watches — harmless wasted watches; full unwatch bookkeeping is
+                        // deferred.)
+                        watch_configured_trees(&mut notify_watcher, &config, &target_dirs, &ignore);
+                        for worktree in &mut linked_worktrees {
+                            worktree.recompile_ignore_and_place_watches(&mut notify_watcher);
                         }
                     }
                 }
@@ -787,9 +832,12 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
             // (harmless; their overlay is GC-pruned) — avoids unwatch bookkeeping.
             let (current, _) = worktree_watch_targets(&config);
             for worktree in current {
-                if !linked_worktrees.contains(&worktree) {
-                    let _ = notify_watcher.watch(&worktree, RecursiveMode::Recursive);
-                    linked_worktrees.push(worktree);
+                if !linked_worktrees.iter().any(|state| state.checkout_root == worktree) {
+                    linked_worktrees.push(watch_linked_worktree(
+                        &mut notify_watcher,
+                        &config,
+                        worktree,
+                    ));
                 }
             }
         }
@@ -861,6 +909,39 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingWatcher {
+        watched: Vec<(PathBuf, RecursiveMode)>,
+    }
+
+    impl notify::Watcher for RecordingWatcher {
+        fn new<F: notify::EventHandler>(
+            _event_handler: F,
+            _config: notify::Config,
+        ) -> notify::Result<Self>
+        where
+            Self: Sized,
+        {
+            Ok(Self::default())
+        }
+
+        fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
+            self.watched.push((path.to_path_buf(), recursive_mode));
+            Ok(())
+        }
+
+        fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+            Ok(())
+        }
+
+        fn kind() -> notify::WatcherKind
+        where
+            Self: Sized,
+        {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
     #[test]
     fn event_touches_worktree_matches_checkout_targets_and_registry() {
         let config = Config {
@@ -886,55 +967,143 @@ mod tests {
         };
         let worktree = PathBuf::from("/wt/feat");
         let registry = PathBuf::from("/main/.git/worktrees");
-        let roots = [worktree.clone()];
+        let worktrees = [LinkedWorktreeWatch::new(&config, worktree.clone())];
 
         // A target file in a linked worktree fires (its overlay needs refreshing).
         assert!(event_touches_worktree(
-            &config,
             &mutation_event(worktree.join("src/a.rs")),
-            &roots,
+            &worktrees,
             Some(&registry),
         ));
         // A non-target file in the worktree does not.
         assert!(!event_touches_worktree(
-            &config,
             &mutation_event(worktree.join("README.md")),
-            &roots,
+            &worktrees,
             Some(&registry),
         ));
         // A change in the worktree registry (a `git worktree add`/`remove`) fires.
         assert!(event_touches_worktree(
-            &config,
             &mutation_event(registry.join("feat/HEAD")),
-            &roots,
+            &worktrees,
             Some(&registry),
         ));
         // A `.gitignore` edit in the linked checkout fires (it changes the overlay's ignored set),
         // mirroring the base classifier (#219 review).
         assert!(event_touches_worktree(
-            &config,
             &mutation_event(worktree.join(".gitignore")),
-            &roots,
+            &worktrees,
             Some(&registry),
         ));
         // A `.gitignore` OUTSIDE any watched checkout does not.
         assert!(!event_touches_worktree(
-            &config,
             &mutation_event(PathBuf::from("/elsewhere/.gitignore")),
-            &roots,
+            &worktrees,
             Some(&registry),
         ));
         // A read event never fires (anti-feedback, same as the base watcher).
         let read = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
             .add_path(worktree.join("src/a.rs"));
-        assert!(!event_touches_worktree(&config, &read, &roots, Some(&registry)));
+        assert!(!event_touches_worktree(&read, &worktrees, Some(&registry)));
         // No worktrees and no registry → nothing fires.
-        assert!(!event_touches_worktree(
-            &config,
-            &mutation_event(worktree.join("src/a.rs")),
-            &[],
-            None,
-        ));
+        assert!(!event_touches_worktree(&mutation_event(worktree.join("src/a.rs")), &[], None,));
+    }
+
+    #[test]
+    fn linked_worktree_events_honor_its_ignore_rules() {
+        // A linked worktree can be watched for a whole-root target, but ignored subtrees must still
+        // be dropped before they fire an overlay refresh. This is the classification half of the
+        // linked-watch fix: without the per-worktree IgnoreMatcher, `ignored_dir/out.rs` and
+        // `target/debug/build.rs` both matched `**/*.rs` and armed the debounce.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let worktree =
+            std::env::temp_dir().join(format!("ragrat-wt-ign-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::create_dir_all(worktree.join("ignored_dir")).unwrap();
+        std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::write(worktree.join(".gitignore"), "ignored_dir/\ntarget/\n").unwrap();
+
+        let config = whole_root_config(&worktree, &[PathBuf::from(".")]);
+        let worktrees = [LinkedWorktreeWatch::new(&config, worktree.clone())];
+
+        assert!(
+            event_touches_worktree(&mutation_event(worktree.join("src/lib.rs")), &worktrees, None),
+            "an unignored linked target file still fires",
+        );
+        assert!(
+            !event_touches_worktree(
+                &mutation_event(worktree.join("ignored_dir/out.rs")),
+                &worktrees,
+                None
+            ),
+            "a linked worktree gitignored source-looking path must not fire",
+        );
+        assert!(
+            !event_touches_worktree(
+                &mutation_event(worktree.join("target/debug/build.rs")),
+                &worktrees,
+                None
+            ),
+            "a linked worktree floor/gitignored build path must not fire",
+        );
+        assert!(
+            event_touches_worktree(&mutation_event(worktree.join(".gitignore")), &worktrees, None),
+            "a linked worktree .gitignore edit still fires so rules can be recompiled",
+        );
+
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
+    fn linked_worktree_watch_placement_uses_configured_pruned_targets() {
+        // Placement half of the linked-watch fix: linked checkouts used to be subscribed with one
+        // `Recursive` watch on the checkout root, which descended into `target/` and any ignored
+        // dependency/build tree. They should get the same non-recursive, gitignore-pruned target
+        // placement as the main checkout.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let worktree =
+            std::env::temp_dir().join(format!("ragrat-wt-place-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(worktree.join("src/kept")).unwrap();
+        std::fs::create_dir_all(worktree.join("src/ignored_dir")).unwrap();
+        std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::write(worktree.join(".gitignore"), "src/ignored_dir/\ntarget/\n").unwrap();
+
+        let config = whole_root_config(&worktree, &[PathBuf::from("src")]);
+        let mut watcher = RecordingWatcher::default();
+        let state = watch_linked_worktree(&mut watcher, &config, worktree.clone());
+
+        assert_eq!(state.config.root, worktree);
+        assert!(
+            watcher.watched.iter().any(|(path, mode)| path == &state.config.root.join("src")
+                && *mode == RecursiveMode::NonRecursive),
+            "the configured target root must be watched non-recursively",
+        );
+        assert!(
+            watcher.watched.iter().any(|(path, mode)| path == &state.config.root.join("src/kept")
+                && *mode == RecursiveMode::NonRecursive),
+            "non-ignored target subdirs must be watched",
+        );
+        assert!(
+            watcher.watched.iter().all(|(_, mode)| *mode == RecursiveMode::NonRecursive),
+            "linked worktrees must not receive a recursive checkout watch: {:?}",
+            watcher.watched,
+        );
+        assert!(
+            watcher
+                .watched
+                .iter()
+                .all(|(path, _)| !path.starts_with(state.config.root.join("target"))
+                    && !path.starts_with(state.config.root.join("src/ignored_dir"))),
+            "ignored or non-target build trees must not be watched: {:?}",
+            watcher.watched,
+        );
+
+        std::fs::remove_dir_all(&state.config.root).ok();
     }
 
     #[test]
@@ -987,12 +1156,11 @@ mod tests {
         // A linked checkout mirrors the layout: `<checkout>/crate/src/a.rs`.
         let checkout =
             std::env::temp_dir().join(format!("ragrat-wt-subdir-co-{}-{id}", std::process::id()));
-        let roots = [checkout.clone()];
+        let worktrees = [LinkedWorktreeWatch::new(&config, checkout.clone())];
         assert!(
             event_touches_worktree(
-                &config,
                 &mutation_event(checkout.join("crate/src/a.rs")),
-                &roots,
+                &worktrees,
                 None,
             ),
             "a subdir-rooted config must fire on a linked edit under <checkout>/<subdir>/<target>"
