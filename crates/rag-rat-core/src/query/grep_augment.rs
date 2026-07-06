@@ -205,6 +205,7 @@ pub fn compose(
     raw_pattern: &str,
     search_path: Option<&str>,
     dedupe: &DedupeFilter,
+    surface: crate::config::MemorySurface,
 ) -> anyhow::Result<Option<GrepAugment>> {
     let normalized = normalize_pattern(raw_pattern);
     if normalized.is_empty() {
@@ -276,6 +277,10 @@ pub fn compose(
     }
     // Apply session-level dedupe filter last (after insertion-order dedup above).
     memories.retain(|m| !dedupe.memory_ids.contains(&m.memory_id));
+    // Honor `[memory] surface`: under `Summary` each memory renders its dream summary + verdict
+    // marker (title-only fallback) instead of the clamped body — the hook context stays terse and
+    // the full body is one `memory show` away.
+    memory::apply_memory_surface(conn, &mut memories, surface)?;
 
     // Lexical lane: only when the symbol lane found nothing (never had any raw hits). Relevance
     // gate: keep only hits within LEXICAL_RELATIVE_FLOOR of the best hit's score, so the weak tail
@@ -362,16 +367,25 @@ fn render(
     if !memories.is_empty() {
         let items = memories
             .into_iter()
-            .map(|m| RenderItem {
-                line: format!(
-                    "- [{} | {}] {} — {} (rag-rat: memory_search)",
-                    m.kind,
-                    m.status,
-                    m.title,
-                    clamp_body(&m.body),
-                ),
-                memory_id: Some(m.memory_id),
-                symbol_key: None,
+            .map(|m| {
+                // The gist: the summary under `surface = "summary"`, else the clamped body. Both
+                // empty (a summary-surface memory with no summary) → title-only, no `— …`.
+                let gist = match &m.summary {
+                    Some(summary) => summary.clone(),
+                    None => clamp_body(&m.body),
+                };
+                let gist_part =
+                    if gist.is_empty() { String::new() } else { format!(" — {gist}") };
+                let verdict_part =
+                    m.verdict.as_deref().map(|v| format!(" {v}")).unwrap_or_default();
+                RenderItem {
+                    line: format!(
+                        "- [{} | {}] {}{}{} (rag-rat: memory_search)",
+                        m.kind, m.status, m.title, gist_part, verdict_part,
+                    ),
+                    memory_id: Some(m.memory_id),
+                    symbol_key: None,
+                }
             })
             .collect();
         sections.push(Section {
@@ -566,9 +580,15 @@ mod tests {
             )
             .unwrap();
         }
-        let out = compose(&conn, "foo", None, &DedupeFilter::default())
-            .unwrap()
-            .expect("symbol lane augments");
+        let out = compose(
+            &conn,
+            "foo",
+            None,
+            &DedupeFilter::default(),
+            crate::config::MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("symbol lane augments");
         assert_eq!(
             out.context.matches("`a::foo`").count(),
             1,
@@ -672,9 +692,15 @@ mod tests {
     #[test]
     fn compose_identifier_pattern_yields_symbol_and_memory() {
         let conn = seeded_conn();
-        let out = compose(&conn, r"watcher_main\b", None, &DedupeFilter::default())
-            .unwrap()
-            .expect("payload expected");
+        let out = compose(
+            &conn,
+            r"watcher_main\b",
+            None,
+            &DedupeFilter::default(),
+            crate::config::MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("payload expected");
         assert!(out.context.contains("src/watch.rs"), "symbol location present");
         assert!(out.context.contains("One watcher per worktree"), "memory title present");
         let memory_pos = out.context.find("One watcher per worktree").unwrap();
@@ -686,16 +712,88 @@ mod tests {
     }
 
     #[test]
+    fn compose_summary_surface_renders_the_summary_and_verdict_not_the_full_body() {
+        let conn = seeded_conn();
+        // Seed a dream summary + verdict for the seeded memory, keyed on its id, repo scope, and
+        // current content_hash / prompt versions — exactly what the surfacing hydrator gates on.
+        let (id, repo_id): (String, String) = conn
+            .query_row("SELECT id, repo_id FROM repo_memories LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let title = "One watcher per worktree";
+        let body = "The election lock guarantees a single watcher; never bind without it.";
+        conn.execute(
+            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+             prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,0)",
+            rusqlite::params![
+                id,
+                repo_id,
+                crate::dream::note_content_hash(title, body),
+                "Election lock ensures exactly one watcher; bind only under it.",
+                crate::dream::COMPACT_PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+        let inputs = crate::dream::checked_inputs_hash(&conn, &id, &Some(repo_id.clone())).unwrap();
+        conn.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
+             checked_against_commit, checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
+             (?1,?2,?3,'diverged',NULL,?4,?5,0)",
+            rusqlite::params![
+                id,
+                repo_id,
+                crate::dream::note_content_hash(title, body),
+                inputs,
+                crate::dream::VERDICT_PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+
+        let out = compose(
+            &conn,
+            r"watcher_main\b",
+            None,
+            &DedupeFilter::default(),
+            crate::config::MemorySurface::Summary,
+        )
+        .unwrap()
+        .expect("payload expected");
+        assert!(
+            out.context.contains("Election lock ensures exactly one watcher"),
+            "the summary renders in place of the body: {}",
+            out.context
+        );
+        assert!(
+            !out.context.contains("never bind without it"),
+            "the full body is deferred under summary: {}",
+            out.context
+        );
+        assert!(out.context.contains("diverged"), "the verdict marker renders: {}", out.context);
+        assert!(out.context.contains(title), "the title still renders: {}", out.context);
+    }
+
+    #[test]
     fn compose_respects_dedupe_filter_and_returns_none_when_everything_filtered() {
         let conn = seeded_conn();
-        let first = compose(&conn, "watcher_main", None, &DedupeFilter::default())
-            .unwrap()
-            .expect("first payload");
+        let first = compose(
+            &conn,
+            "watcher_main",
+            None,
+            &DedupeFilter::default(),
+            crate::config::MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("first payload");
         let filter = DedupeFilter {
             memory_ids: first.memory_ids.iter().cloned().collect::<HashSet<_>>(),
             symbol_keys: first.symbol_keys.iter().cloned().collect::<HashSet<_>>(),
         };
-        assert!(compose(&conn, "watcher_main", None, &filter).unwrap().is_none());
+        assert!(
+            compose(&conn, "watcher_main", None, &filter, crate::config::MemorySurface::Full)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -718,9 +816,15 @@ mod tests {
     #[test]
     fn compose_definition_pattern_routes_to_symbol_lane_not_lexical() {
         let conn = seeded_conn();
-        let out = compose(&conn, r"fn watcher_main", None, &DedupeFilter::default())
-            .unwrap()
-            .expect("payload expected");
+        let out = compose(
+            &conn,
+            r"fn watcher_main",
+            None,
+            &DedupeFilter::default(),
+            crate::config::MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("payload expected");
         // Resolves to the symbol + its bound memory; the redundant lexical echo is suppressed.
         assert!(out.context.contains("watch::watcher_main"), "symbol lane fired");
         assert!(out.context.contains("One watcher per worktree"), "bound memory surfaced");
@@ -735,9 +839,15 @@ mod tests {
     #[test]
     fn compose_non_identifier_pattern_uses_lexical_lane() {
         let conn = seeded_conn();
-        let out = compose(&conn, "election retry loop", None, &DedupeFilter::default())
-            .unwrap()
-            .expect("lexical payload");
+        let out = compose(
+            &conn,
+            "election retry loop",
+            None,
+            &DedupeFilter::default(),
+            crate::config::MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("lexical payload");
         assert!(out.context.contains("src/watch.rs"));
     }
 
@@ -745,7 +855,15 @@ mod tests {
     fn compose_unknown_pattern_yields_none() {
         let conn = seeded_conn();
         assert!(
-            compose(&conn, "zzqqyyxx_nothing", None, &DedupeFilter::default()).unwrap().is_none()
+            compose(
+                &conn,
+                "zzqqyyxx_nothing",
+                None,
+                &DedupeFilter::default(),
+                crate::config::MemorySurface::Full
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -887,9 +1005,15 @@ mod tests {
         );
 
         // ── Run compose ────────────────────────────────────────────────────────────────
-        let out = compose(&conn, "watcher_main", None, &DedupeFilter::default())
-            .unwrap()
-            .expect("payload expected");
+        let out = compose(
+            &conn,
+            "watcher_main",
+            None,
+            &DedupeFilter::default(),
+            crate::config::MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("payload expected");
 
         // (a) Context must not exceed the cap.
         assert!(

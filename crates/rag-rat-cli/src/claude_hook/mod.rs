@@ -743,6 +743,7 @@ fn fallback_compose(config: &Config, cwd: &str, search: &Search) -> Option<Strin
         &search.pattern,
         search.search_path.as_deref(),
         &grep_augment::DedupeFilter::default(),
+        config.memory.surface,
     )
     .ok()
     .flatten()

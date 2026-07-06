@@ -457,15 +457,18 @@ moved on, so there is nothing to act on). Reviewing is repo-scoped and never run
 ## Memory surfacing (`[memory] surface`)
 
 `[memory] surface` controls how drive-by memory attachments render. The default is `full`
-(byte-identical to today's mechanical header). Set it to `summary` to have the primary MCP
-attachment (`impact_surface`'s compact `repo_memories`) show the dream-compacted summary plus a
-plain-text verdict marker (`[verdict: diverged]` / `[verdict: current @<short-commit>]`) for each
-memory that has one:
+(byte-identical to today's mechanical view). Set it to `summary` to have memory attachments show the
+dream-compacted summary plus a plain-text verdict marker (`[verdict: diverged]` /
+`[verdict: current @<short-commit>]`) in place of the full body, for each memory that has one:
 
 ```toml
 [memory]
 surface = "full"   # or "summary" — render title + compacted summary + verdict marker
 ```
 
-A memory with no summary for its current body falls back to title-only. `memory show` /
-`memory_show` **always** return the full body, regardless of this setting — it is the expand path.
+`summary` applies across every drive-by renderer: `impact_surface`'s compact `repo_memories`, the
+`symbol_lookup` / `find_callers` / `trace_callees` attached memories, `read_chunk`'s memories,
+`memory_for_symbol` / `memory_for_path` (which keep the full binding/call-path structure but defer
+the body), and the grep-augmentation hook context. A memory with no summary for its current body
+falls back to title-only. `memory show` / `memory_show` **always** return the full body, regardless
+of this setting — it is the expand path.

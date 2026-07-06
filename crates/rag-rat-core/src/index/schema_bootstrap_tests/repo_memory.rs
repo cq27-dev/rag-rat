@@ -62,7 +62,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
     assert!(!created.duplicate);
     assert_eq!(created.memory.bindings[0].binding_kind, "logical_symbol");
 
-    let memories = db.memory_for_symbol(&symbol, 10).unwrap();
+    let memories = db.memory_for_symbol(&symbol, 10, crate::config::MemorySurface::Full).unwrap();
     assert_eq!(memories.len(), 1);
     assert_eq!(memories[0].kind, "Invariant");
     let chunk_id = memories[0].bindings[0].chunk_id.expect("bound chunk");
@@ -328,7 +328,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
     // Re-validation re-anchors the binding to keystone's new location, not "gone".
     db.memory_validate().unwrap();
     let symbol = db.select_symbol(&selector).unwrap().unwrap().expect("symbol after move");
-    let anchored = db.memory_for_symbol(&symbol, 10).unwrap();
+    let anchored = db.memory_for_symbol(&symbol, 10, crate::config::MemorySurface::Full).unwrap();
     assert_eq!(anchored.len(), 1, "memory did not re-anchor to moved symbol");
     assert_ne!(anchored[0].bindings[0].anchor_status, "gone");
 
@@ -409,14 +409,14 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
         .unwrap();
     let report = db.memory_validate().unwrap();
     assert_eq!(report.stale, 1);
-    let stale = db.memory_for_symbol(&symbol, 10).unwrap();
+    let stale = db.memory_for_symbol(&symbol, 10, crate::config::MemorySurface::Full).unwrap();
     assert_eq!(stale[0].memory_id, created.memory.memory_id);
     assert_eq!(stale[0].bindings[0].anchor_status, "stale");
 
     db.storage.connection().execute("DELETE FROM chunks WHERE id = ?1", [chunk_id]).unwrap();
     let report = db.memory_validate().unwrap();
     assert_eq!(report.gone, 1);
-    let gone = db.memory_for_symbol(&symbol, 10).unwrap();
+    let gone = db.memory_for_symbol(&symbol, 10, crate::config::MemorySurface::Full).unwrap();
     assert_eq!(gone[0].bindings[0].anchor_status, "gone");
 
     let _ = fs::remove_dir_all(root);
@@ -849,6 +849,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
             .unwrap()
             .expect("target in b.rs"),
             10,
+            crate::config::MemorySurface::Full,
         )
         .unwrap()[0]
         .bindings[0]

@@ -376,7 +376,16 @@ impl IndexDatabase {
     }
 
     pub fn read_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<crate::query::ReadChunk>> {
-        self.read_chunk_with_graph_and_memories(chunk_id, GraphMetaMode::Full, 20, true)
+        // Internal/CLI/test entry — always the FULL memory bodies; the surface-aware path is the
+        // MCP `read_chunk` tool, which calls `read_chunk_with_graph_and_memories` with the
+        // config surface.
+        self.read_chunk_with_graph_and_memories(
+            chunk_id,
+            GraphMetaMode::Full,
+            20,
+            true,
+            crate::config::MemorySurface::Full,
+        )
     }
 
     pub fn read_chunk_with_graph(
@@ -385,7 +394,14 @@ impl IndexDatabase {
         graph_mode: GraphMetaMode,
         graph_limit: u32,
     ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
-        self.read_chunk_with_graph_and_memories(chunk_id, graph_mode, graph_limit, false)
+        // `include_memories = false`, so the surface never applies — pass `Full`.
+        self.read_chunk_with_graph_and_memories(
+            chunk_id,
+            graph_mode,
+            graph_limit,
+            false,
+            crate::config::MemorySurface::Full,
+        )
     }
 
     pub fn read_chunk_with_graph_and_memories(
@@ -394,6 +410,7 @@ impl IndexDatabase {
         graph_mode: GraphMetaMode,
         graph_limit: u32,
         include_memories: bool,
+        surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
         let Some(mut chunk) = self.read_chunk_current(chunk_id)? else {
             return Ok(None);
@@ -405,8 +422,12 @@ impl IndexDatabase {
             graph_limit,
         )?;
         if include_memories {
-            chunk.memories =
-                crate::query::memory::memories_for_chunk(self.storage.connection(), chunk_id, 20)?;
+            let conn = self.storage.connection();
+            chunk.memories = crate::query::memory::memories_for_chunk(conn, chunk_id, 20)?;
+            // Drive-by chunk attachments honor `[memory] surface`: under `Summary` each memory's
+            // body is deferred to `memory show`, leaving the summary + verdict marker
+            // (title-only fallback).
+            crate::query::memory::apply_memory_surface(conn, &mut chunk.memories, surface)?;
         }
         Ok(Some(chunk))
     }

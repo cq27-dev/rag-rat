@@ -33,7 +33,22 @@ pub struct RepoMemory {
     pub memory_id: String,
     pub kind: String,
     pub title: String,
+    // Skipped when EMPTY so the `[memory] surface = "summary"` view can defer the full prose to
+    // `memory show` (the summary-first renderers empty this and populate `summary` instead).
+    // Stored bodies are never empty, so `full` surface and `memory_show` always serialize it.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub body: String,
+    /// The dream-compacted summary of the CURRENT body, populated ONLY by the summary-first
+    /// renderers under `[memory] surface = "summary"` when a `memory_summaries` row exists for the
+    /// current content_hash. `None` under `full` (and for every non-surfacing tool). Title-only
+    /// fallback when absent — the full body is one `memory show` away.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Plain-text verdict marker from the memory's `memory_reality` row (e.g. `[verdict:
+    /// diverged]`), populated alongside `summary` under `surface = "summary"`. `None`
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
     pub confidence: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,6 +287,53 @@ impl RepoMemoryEvidence {
             stale: project(&self.stale)?,
         })
     }
+
+    /// Apply `[memory] surface` to every lane's FULL memories IN PLACE (Option A: defer bodies,
+    /// keep structure) — the graph-traversal (`find_callers` / `trace_callees`) counterpart to
+    /// [`Self::compact_summary_first`], used where the evidence is emitted full rather than
+    /// compact. Under `Full` every lane is untouched.
+    pub(crate) fn apply_surface(
+        &mut self,
+        conn: &Connection,
+        surface: crate::config::MemorySurface,
+    ) -> rusqlite::Result<()> {
+        for lane in
+            [&mut self.direct, &mut self.path_crossed, &mut self.call_path_crossed, &mut self.stale]
+        {
+            apply_memory_surface(conn, lane, surface)?;
+        }
+        Ok(())
+    }
+}
+
+/// Apply the `[memory] surface` view to a hydrated FULL memory list IN PLACE (the direct-query
+/// counterpart to [`RepoMemoryEvidence::compact_summary_first`]). Under `Summary` each memory's
+/// full body is DEFERRED to `memory show`: the current-body summary + verdict marker are hydrated
+/// from the derived `memory_summaries` / `memory_reality` siblings (repo-scoped, keyed on the
+/// current content_hash, prompt-version-gated), the body is emptied, and a memory with no summary
+/// falls back to title-only. Unlike the compact projection this KEEPS the full binding/call-path
+/// structure a direct `memory_for_symbol` / `memory_for_path` query relies on — only the prose is
+/// compacted. Under `Full` the list is untouched (byte-identical output).
+pub(crate) fn apply_memory_surface(
+    conn: &Connection,
+    memories: &mut [RepoMemory],
+    surface: crate::config::MemorySurface,
+) -> rusqlite::Result<()> {
+    if !matches!(surface, crate::config::MemorySurface::Summary) {
+        return Ok(());
+    }
+    for memory in memories.iter_mut() {
+        let (summary, verdict) = hydrate::current_summary_and_verdict(
+            conn,
+            &memory.memory_id,
+            &memory.title,
+            &memory.body,
+        )?;
+        memory.summary = summary;
+        memory.verdict = verdict;
+        memory.body = String::new();
+    }
+    Ok(())
 }
 
 /// Compact (default) view of `RepoMemoryEvidence` for `impact_surface` (#37) — same lane layout,
@@ -488,6 +550,8 @@ mod tests {
             kind: "Invariant".to_string(),
             title: "t".to_string(),
             body: "b".to_string(),
+            summary: None,
+            verdict: None,
             confidence: "high".to_string(),
             status: "active".to_string(),
             created_by: None,
@@ -556,6 +620,8 @@ mod tests {
             kind: "Invariant".to_string(),
             title: "t".to_string(),
             body: body.to_string(),
+            summary: None,
+            verdict: None,
             confidence: "high".to_string(),
             status: "active".to_string(),
             created_by: None,
@@ -804,5 +870,53 @@ mod tests {
             fetched.body, body,
             "memory_get returns the full body regardless of the summary"
         );
+    }
+
+    #[test]
+    fn apply_memory_surface_summary_defers_the_body_and_hydrates_summary_and_verdict() {
+        // The direct-query / read_chunk / grep counterpart to `compact_summary_first`: under
+        // `Summary` the full body is emptied (deferred to `memory show`) and the current-body
+        // summary + verdict marker are hydrated in its place.
+        let c = summary_conn();
+        let body = "the full body worth compacting";
+        seed_summary(&c, "m1", body, "A compacted summary in place of the body.");
+        seed_reality(&c, "m1", body, "diverged", None);
+        let mut memories = vec![memory_with_body("m1", body)];
+        apply_memory_surface(&c, &mut memories, crate::config::MemorySurface::Summary).unwrap();
+        assert_eq!(memories[0].body, "", "the full body is deferred under summary");
+        assert_eq!(
+            memories[0].summary.as_deref(),
+            Some("A compacted summary in place of the body.")
+        );
+        assert!(
+            memories[0].verdict.as_deref().unwrap_or_default().contains("diverged"),
+            "the verdict marker is set: {:?}",
+            memories[0].verdict
+        );
+    }
+
+    #[test]
+    fn apply_memory_surface_summary_falls_back_to_title_only_without_a_summary_row() {
+        // No `memory_summaries` / `memory_reality` rows → summary + verdict stay None, but the body
+        // is still deferred: the reader sees the title (+ structure) and expands via `memory show`.
+        let c = summary_conn();
+        let mut memories = vec![memory_with_body("m1", "some body")];
+        apply_memory_surface(&c, &mut memories, crate::config::MemorySurface::Summary).unwrap();
+        assert_eq!(memories[0].body, "", "body deferred even without a summary (title-only)");
+        assert_eq!(memories[0].summary, None);
+        assert_eq!(memories[0].verdict, None);
+    }
+
+    #[test]
+    fn apply_memory_surface_full_is_a_noop() {
+        // `Full` keeps the body byte-identical and never hydrates a summary, even when one exists.
+        let c = summary_conn();
+        let body = "kept verbatim in full mode";
+        seed_summary(&c, "m1", body, "would-be summary");
+        let mut memories = vec![memory_with_body("m1", body)];
+        apply_memory_surface(&c, &mut memories, crate::config::MemorySurface::Full).unwrap();
+        assert_eq!(memories[0].body, body, "full surface keeps the body");
+        assert_eq!(memories[0].summary, None, "full surface never hydrates a summary");
+        assert_eq!(memories[0].verdict, None);
     }
 }

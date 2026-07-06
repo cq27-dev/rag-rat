@@ -29,17 +29,17 @@ pub(crate) fn call_tool_with_db(
         },
         "symbol_lookup" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;
-            symbol_lookup_tool(db, args)?
+            symbol_lookup_tool(db, args, memory_surface)?
         },
         "find_callers" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = resolution_mode(args.resolution);
-            graph_tool(db, args, resolution_mode, true)?
+            graph_tool(db, args, resolution_mode, true, memory_surface)?
         },
         "trace_callees" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = resolution_mode(args.resolution);
-            graph_tool(db, args, resolution_mode, false)?
+            graph_tool(db, args, resolution_mode, false, memory_surface)?
         },
         "compare_graph_to_text" => {
             let args: CompareGraphTextArgs = serde_json::from_value(arguments)?;
@@ -88,7 +88,8 @@ pub(crate) fn call_tool_with_db(
                 args.chunk_id,
                 GraphMetaMode::parse(args.include_graph.as_str())?,
                 args.graph_limit,
-                included(&args.include, MemoriesInclude::Memories, true)
+                included(&args.include, MemoriesInclude::Memories, true),
+                memory_surface,
             )?)
         },
         "commit_search" => {
@@ -183,11 +184,11 @@ pub(crate) fn call_tool_with_db(
         },
         "memory_for_symbol" => {
             let args: MemoryForSymbolArgs = serde_json::from_value(arguments)?;
-            memory_for_symbol_tool(db, args)?
+            memory_for_symbol_tool(db, args, memory_surface)?
         },
         "memory_for_path" => {
             let args: MemoryForPathArgs = serde_json::from_value(arguments)?;
-            json!(db.memory_for_path(&args.path, args.limit)?)
+            json!(db.memory_for_path(&args.path, args.limit, memory_surface)?)
         },
         "memory_for_call_path" => {
             let args: MemoryForCallPathArgs = serde_json::from_value(arguments)?;
@@ -221,7 +222,11 @@ pub(crate) fn call_tool_with_db(
     Ok(result)
 }
 
-pub(crate) fn symbol_lookup_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow::Result<Value> {
+pub(crate) fn symbol_lookup_tool(
+    db: &IndexDatabase,
+    args: SymbolArgs,
+    memory_surface: MemorySurface,
+) -> anyhow::Result<Value> {
     let include_memories = included(&args.include, SymbolInclude::Memories, true);
     let include_generated = included(&args.include, SymbolInclude::Generated, false);
     let lookup = db.symbol_candidates(&symbol_selector(args)?, include_generated)?;
@@ -236,7 +241,7 @@ pub(crate) fn symbol_lookup_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow
     // serialized candidates no longer expose it (#149), so the old read of `candidate["symbol_id"]`
     // found nothing and dropped every memory — zip by position against the source hits instead.
     for (candidate, hit) in candidates.iter_mut().zip(&lookup.candidates) {
-        let memories = db.memory_for_symbol(hit, 10)?;
+        let memories = db.memory_for_symbol(hit, 10, memory_surface)?;
         if !memories.is_empty() {
             candidate["memories"] = json!(memories);
         }
@@ -249,6 +254,7 @@ pub(crate) fn graph_tool(
     args: SymbolGraphArgs,
     resolution_mode: GraphResolutionMode,
     reverse: bool,
+    memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
     let limit = args.limit;
     let include_references = included(&args.include, GraphInclude::References, false);
@@ -296,7 +302,8 @@ pub(crate) fn graph_tool(
                     &symbol,
                     caller_edge_ids,
                     callee_edge_ids,
-                    10
+                    10,
+                    memory_surface,
                 )?);
             }
             Ok(value)
@@ -526,9 +533,10 @@ pub(crate) fn impact_tool(
         include_text_fallback: included(&args.include, ImpactInclude::TextFallback, true),
         include_memories: included(&args.include, ImpactInclude::Memories, true),
         compact_memories: !args.full_memories,
-        // The primary MCP drive-by attachment renderer: the symbol-selected report path below
-        // honors `[memory] surface`. The query-string / allow-ambiguous fallbacks below still use
-        // the default (full) surface — noted for a follow-up.
+        // The symbol-selected report path below honors `[memory] surface` via this field. The
+        // query-string / allow-ambiguous fallbacks return the flat `Vec<ImpactItem>` shape, which
+        // carries NO repo_memories lane at all (it emits only structural/textual/historical items),
+        // so the surface knob does not apply there — there is nothing to render summary-first.
         surface: memory_surface,
     };
     if args.logical_symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
@@ -564,6 +572,7 @@ pub(crate) fn impact_tool(
 pub(crate) fn memory_for_symbol_tool(
     db: &IndexDatabase,
     args: MemoryForSymbolArgs,
+    memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
     let selector = SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
@@ -575,7 +584,7 @@ pub(crate) fn memory_for_symbol_tool(
         limit: args.limit,
     };
     match db.select_symbol(&selector)? {
-        Ok(Some(symbol)) => Ok(json!(db.memory_for_symbol(&symbol, args.limit)?)),
+        Ok(Some(symbol)) => Ok(json!(db.memory_for_symbol(&symbol, args.limit, memory_surface)?)),
         Ok(None) => Ok(Value::Null),
         Err(disambiguation) => Ok(json!(disambiguation)),
     }

@@ -82,6 +82,10 @@ pub(crate) fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemory
         kind: row.get("kind")?,
         title: row.get("title")?,
         body: row.get("body")?,
+        // Populated only by the summary-first surface (see `apply_memory_surface`); the mechanical
+        // hydration always yields the full body.
+        summary: None,
+        verdict: None,
         confidence: row.get("confidence")?,
         status: row.get("status")?,
         created_by: row.get("created_by")?,

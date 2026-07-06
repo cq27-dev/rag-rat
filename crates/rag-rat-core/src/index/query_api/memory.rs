@@ -37,16 +37,24 @@ impl IndexDatabase {
         &self,
         symbol: &crate::query::symbol::SymbolHit,
         limit: u32,
+        surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
-        crate::query::memory::memories_for_symbol(self.storage.connection(), symbol, limit)
+        let conn = self.storage.connection();
+        let mut memories = crate::query::memory::memories_for_symbol(conn, symbol, limit)?;
+        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+        Ok(memories)
     }
 
     pub fn memory_for_path(
         &self,
         path: &str,
         limit: u32,
+        surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
-        crate::query::memory::memories_for_path(self.storage.connection(), path, limit)
+        let conn = self.storage.connection();
+        let mut memories = crate::query::memory::memories_for_path(conn, path, limit)?;
+        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+        Ok(memories)
     }
 
     pub fn memory_for_edges(
@@ -63,17 +71,23 @@ impl IndexDatabase {
         caller_edge_ids: &[i64],
         callee_edge_ids: &[i64],
         limit: u32,
+        surface: crate::config::MemorySurface,
     ) -> anyhow::Result<crate::query::memory::RepoMemoryEvidence> {
         // This wrapper exposes only the evidence; the impact builder consumes the truncation flag
-        // directly from the core fn.
-        crate::query::memory::memory_evidence_for_symbol_and_edges(
-            self.storage.connection(),
+        // directly from the core fn. `find_callers` / `trace_callees` emit the evidence FULL (not
+        // compact), so honor `[memory] surface` here by deferring each lane's bodies under
+        // `Summary`.
+        let conn = self.storage.connection();
+        let mut evidence = crate::query::memory::memory_evidence_for_symbol_and_edges(
+            conn,
             symbol,
             caller_edge_ids,
             callee_edge_ids,
             limit,
         )
-        .map(|(evidence, _truncated)| evidence)
+        .map(|(evidence, _truncated)| evidence)?;
+        evidence.apply_surface(conn, surface)?;
+        Ok(evidence)
     }
 
     pub fn memory_for_call_path_hash(

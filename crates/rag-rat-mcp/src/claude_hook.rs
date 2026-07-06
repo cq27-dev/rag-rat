@@ -157,6 +157,7 @@ mod listener {
                 let database = config.database.clone();
                 let config_root = config.root.clone();
                 let repo_id_override = config.repo_id_override.clone();
+                let memory_surface = config.memory.surface;
                 // Scope to the session's worktree overlay (#219). Absent cwd (older client) → the
                 // config root, which resolves to the base scope. This also fixes the listener's
                 // prior lack of ANY scope install: compose queries the `files` view, so without
@@ -188,6 +189,7 @@ mod listener {
                         &pattern,
                         search_path.as_deref(),
                         &filter,
+                        memory_surface,
                     )
                 })
                 .await??;
