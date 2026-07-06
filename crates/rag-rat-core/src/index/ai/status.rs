@@ -288,11 +288,47 @@ pub(crate) fn model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelInfo> 
 #[cfg(test)]
 mod ollama_install_tests {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
     use crate::embedding_models::FASTEMBED_MODEL_ID;
+
+    /// Fully consume the request (headers + Content-Length body) before replying. A single read is
+    /// NOT enough: on Windows the request can arrive in multiple TCP segments, leaving the tail in
+    /// the socket's recv buffer — and closing a socket with unread received data is an ABORTIVE
+    /// (RST) close there, which the client (ureq) surfaces as a transport error instead of the HTTP
+    /// response, so the probe's install/dim-mismatch assertions fail. Draining fully leaves the
+    /// recv buffer empty so the stub's drop is a graceful FIN and the client reads the
+    /// response.
+    fn drain_request(stream: &mut TcpStream) {
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                let content_len = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let need = end + 4 + content_len;
+                while raw.len() < need {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                return;
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
 
     /// One-shot HTTP/1.1 stub on an ephemeral port that replies to the probe's single
     /// `/v1/embeddings` POST with `{"data":[{"embedding":[<dim floats>],"index":0}]}`. Returns the
@@ -302,8 +338,7 @@ mod ollama_install_tests {
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                drain_request(&mut stream);
                 let nums = vec!["0.1"; dim].join(",");
                 let body = format!("{{\"data\":[{{\"embedding\":[{nums}],\"index\":0}}]}}");
                 let response = format!(

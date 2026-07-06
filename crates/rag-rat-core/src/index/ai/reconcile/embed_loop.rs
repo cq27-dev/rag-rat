@@ -791,8 +791,11 @@ mod freshness_version_tests {
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                // Fully drain the request (not a one-shot read): a partial drain leaves unread
+                // bytes that make Windows do an abortive RST close, surfacing to
+                // the client as a transport error instead of the response. See
+                // `read_request_body`.
+                let _ = read_request_body(&mut stream);
                 let nums = vec!["0.1"; dim].join(",");
                 let body = format!("{{\"data\":[{{\"embedding\":[{nums}],\"index\":0}}]}}");
                 let response = format!(
