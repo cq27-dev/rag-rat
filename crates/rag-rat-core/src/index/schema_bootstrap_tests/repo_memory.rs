@@ -2279,3 +2279,163 @@ fn worktree_overlay_committed_modification_shadows_base() {
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
 }
+
+#[test]
+fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
+    // #426: memory_for_symbol / memory_for_path / read_chunk / memory_evidence_for_symbol_and_edges
+    // all honor `[memory] surface = "summary"` — the full body is deferred to `memory show`, the
+    // compacted summary + verdict marker take its place, and the binding structure is preserved.
+    use crate::config::MemorySurface;
+    use crate::query::graph_meta::GraphMetaMode;
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("selected symbol");
+
+    let sym_title = "Target invariant";
+    let sym_body = "The target function must keep its full documented invariant intact.";
+    let sym_mem = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: sym_title.to_string(),
+            body: sym_body.to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec![],
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: symbol.logical_symbol_id,
+                ..Default::default()
+            },
+        })
+        .unwrap()
+        .memory;
+
+    let path_title = "Path note";
+    let path_body = "A note anchored to the file, not a symbol; its body is long enough to matter.";
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: path_title.to_string(),
+        body: path_body.to_string(),
+        confidence: "medium".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            path: Some("src/lib.rs".to_string()),
+            ..Default::default()
+        },
+    })
+    .unwrap();
+
+    // Seed compacted summaries + one verdict, keyed exactly like the dream passes stamp them.
+    let conn = db.storage.connection();
+    let repo_id: String = conn
+        .query_row("SELECT repo_id FROM repo_memories WHERE id = ?1", [&sym_mem.memory_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let seed_summary = |id: &str, title: &str, body: &str, summary: &str| {
+        conn.execute(
+            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+             prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,0)",
+            rusqlite::params![
+                id,
+                repo_id,
+                crate::dream::note_content_hash(title, body),
+                summary,
+                crate::dream::COMPACT_PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+    };
+    seed_summary(&sym_mem.memory_id, sym_title, sym_body, "Keep target's invariant.");
+    let path_id: String = conn
+        .query_row("SELECT id FROM repo_memories WHERE title = ?1", [path_title], |r| r.get(0))
+        .unwrap();
+    seed_summary(&path_id, path_title, path_body, "File-level note gist.");
+    let inputs =
+        crate::dream::checked_inputs_hash(conn, &sym_mem.memory_id, &Some(repo_id.clone()))
+            .unwrap();
+    conn.execute(
+        "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
+         checked_against_commit, checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
+         (?1,?2,?3,'diverged',NULL,?4,?5,0)",
+        rusqlite::params![
+            sym_mem.memory_id,
+            repo_id,
+            crate::dream::note_content_hash(sym_title, sym_body),
+            inputs,
+            crate::dream::VERDICT_PROMPT_VERSION
+        ],
+    )
+    .unwrap();
+
+    // memory_for_symbol: body deferred, summary + verdict present, structure kept.
+    let by_symbol = db.memory_for_symbol(&symbol, 10, MemorySurface::Summary).unwrap();
+    let m = by_symbol.iter().find(|m| m.memory_id == sym_mem.memory_id).expect("symbol memory");
+    assert_eq!(m.body, "", "body deferred under summary");
+    assert_eq!(m.summary.as_deref(), Some("Keep target's invariant."));
+    assert!(
+        m.verdict.as_deref().unwrap_or_default().contains("diverged"),
+        "verdict: {:?}",
+        m.verdict
+    );
+    assert!(!m.bindings.is_empty(), "the full binding structure is preserved under summary");
+
+    // Full surface leaves the body intact and hydrates nothing.
+    let full = db.memory_for_symbol(&symbol, 10, MemorySurface::Full).unwrap();
+    let mf = full.iter().find(|m| m.memory_id == sym_mem.memory_id).unwrap();
+    assert_eq!(mf.body, sym_body, "full surface keeps the body");
+    assert_eq!(mf.summary, None);
+    let chunk_id = mf.bindings.iter().find_map(|b| b.chunk_id).expect("bound chunk");
+
+    // memory_for_path: the path-bound note defers its body too.
+    let by_path = db.memory_for_path("src/lib.rs", 10, MemorySurface::Summary).unwrap();
+    let mp = by_path.iter().find(|m| m.memory_id == path_id).expect("path memory");
+    assert_eq!(mp.body, "");
+    assert_eq!(mp.summary.as_deref(), Some("File-level note gist."));
+
+    // read_chunk memory attachments (and the include_memories=false wrapper stays exercised).
+    let chunk = db
+        .read_chunk_with_graph_and_memories(
+            chunk_id,
+            GraphMetaMode::Full,
+            20,
+            true,
+            MemorySurface::Summary,
+        )
+        .unwrap()
+        .expect("chunk");
+    let cm =
+        chunk.memories.iter().find(|m| m.memory_id == sym_mem.memory_id).expect("chunk memory");
+    assert_eq!(cm.body, "");
+    assert_eq!(cm.summary.as_deref(), Some("Keep target's invariant."));
+    assert!(db.read_chunk_with_graph(chunk_id, GraphMetaMode::Full, 20).unwrap().is_some());
+
+    // find_callers / trace_callees evidence.
+    let evidence = db
+        .memory_evidence_for_symbol_and_edges(&symbol, &[], &[], 10, MemorySurface::Summary)
+        .unwrap();
+    let em =
+        evidence.direct.iter().find(|m| m.memory_id == sym_mem.memory_id).expect("evidence memory");
+    assert_eq!(em.body, "");
+    assert_eq!(em.summary.as_deref(), Some("Keep target's invariant."));
+
+    let _ = fs::remove_dir_all(&root);
+}
