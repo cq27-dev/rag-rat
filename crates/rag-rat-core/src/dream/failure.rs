@@ -8,7 +8,8 @@
 use rusqlite::{Connection, OptionalExtension};
 
 /// Which model pass attempted a memory. Persisted in `memory_model_failures.pass`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum DreamModelPass {
     Verify,
     Compact,
@@ -19,24 +20,18 @@ impl DreamModelPass {
     pub(crate) const ALL: [Self; 2] = [Self::Verify, Self::Compact];
 
     pub(crate) fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Verify => "verify",
-            Self::Compact => "compact",
-        }
+        self.into()
     }
 
     #[cfg(test)]
     pub(crate) fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "verify" => Some(Self::Verify),
-            "compact" => Some(Self::Compact),
-            _ => None,
-        }
+        value.parse().ok()
     }
 }
 
 /// Why a model attempt failed. Persisted in `memory_model_failures.reason`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum DreamFailureReason {
     /// Transport/server failure. Audited, but not used to suppress future model calls because it is
     /// often transient.
@@ -59,22 +54,11 @@ impl DreamFailureReason {
     ];
 
     pub(crate) fn as_db_str(self) -> &'static str {
-        match self {
-            Self::ModelCallFailed => "model_call_failed",
-            Self::MalformedVerdict => "malformed_verdict",
-            Self::FabricatedEvidence => "fabricated_evidence",
-            Self::SummaryGuardRejected => "summary_guard_rejected",
-        }
+        self.into()
     }
 
     pub(crate) fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "model_call_failed" => Some(Self::ModelCallFailed),
-            "malformed_verdict" => Some(Self::MalformedVerdict),
-            "fabricated_evidence" => Some(Self::FabricatedEvidence),
-            "summary_guard_rejected" => Some(Self::SummaryGuardRejected),
-            _ => None,
-        }
+        value.parse().ok()
     }
 
     /// Whether an unchanged input should be considered already annotated for this model.
@@ -209,12 +193,19 @@ mod tests {
 
     #[test]
     fn persisted_enums_round_trip() {
-        for pass in DreamModelPass::ALL {
+        for (pass, token) in DreamModelPass::ALL.into_iter().zip(["verify", "compact"]) {
+            assert_eq!(pass.as_db_str(), token);
             assert_eq!(DreamModelPass::from_db_str(pass.as_db_str()), Some(pass));
         }
         assert_eq!(DreamModelPass::from_db_str("nope"), None);
 
-        for reason in DreamFailureReason::ALL {
+        for (reason, token) in DreamFailureReason::ALL.into_iter().zip([
+            "model_call_failed",
+            "malformed_verdict",
+            "fabricated_evidence",
+            "summary_guard_rejected",
+        ]) {
+            assert_eq!(reason.as_db_str(), token);
             assert_eq!(DreamFailureReason::from_db_str(reason.as_db_str()), Some(reason));
         }
         assert_eq!(DreamFailureReason::from_db_str("nope"), None);

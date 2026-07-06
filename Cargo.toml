@@ -46,6 +46,7 @@ schemars = { version = "1.2.1", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-std"] }
 # Minimal blocking HTTP for the crates.io version check (and future GitHub/GitLab/Bitbucket REST).

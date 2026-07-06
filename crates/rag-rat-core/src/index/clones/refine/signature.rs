@@ -22,8 +22,9 @@ use crate::language::Language;
 /// into this enum), so a new variant is additive: no migration, no reader change. A stale cached
 /// row written before this variant existed surfaces the OLD label until the class is recomputed,
 /// which is a less-honest label, never an over-claim.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum Typedness {
     /// Every promoted param was assigned a CONCRETE type (from an AST annotation or a
     /// literal-bucket coarse mapping) AND there are no `unresolved_type_slots`. The signature
@@ -56,12 +57,7 @@ pub(crate) enum Typedness {
 
 impl Typedness {
     pub(crate) fn as_db_str(&self) -> &'static str {
-        match self {
-            Typedness::Syntactic => "syntactic",
-            Typedness::Structural => "structural",
-            Typedness::Partial => "partial",
-            Typedness::Unknown => "unknown",
-        }
+        (*self).into()
     }
 }
 
@@ -708,6 +704,22 @@ mod tests {
         (members, template, sig)
     }
 
+    #[test]
+    fn typedness_db_str_matches_serde_for_all_variants() {
+        for (typedness, token) in [
+            (Typedness::Syntactic, "syntactic"),
+            (Typedness::Structural, "structural"),
+            (Typedness::Partial, "partial"),
+            (Typedness::Unknown, "unknown"),
+        ] {
+            assert_eq!(typedness.as_db_str(), token);
+            assert_eq!(
+                serde_json::to_value(typedness).unwrap(),
+                serde_json::Value::String(token.into())
+            );
+        }
+    }
+
     // ── Test 1: a STABLE type position → Syntactic ───────────────────────────────────────────────
 
     #[test]
@@ -1092,7 +1104,7 @@ mod tests {
         // The serialized/DB string is the new `structural` token (additive — opaque to readers).
         assert_eq!(sig.typedness.as_db_str(), "structural");
         assert_eq!(
-            serde_json::to_value(&sig.typedness).unwrap(),
+            serde_json::to_value(sig.typedness).unwrap(),
             serde_json::Value::String("structural".to_string()),
             "serde must serialize Structural to the same `structural` token as as_db_str"
         );

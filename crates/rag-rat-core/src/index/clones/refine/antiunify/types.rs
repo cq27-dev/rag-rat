@@ -9,8 +9,9 @@ use super::super::score::Confidence;
 /// `serde` serializes each variant to its `as_db_str` machine string (`value_param`,
 /// `closure_param`, `type_param`, `gapped`) so the persisted `variation_points_json` is legible
 /// without consulting the Rust enum (matches the `_json` column convention).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum MetavarKind {
     /// A single compatible leaf (local identifier or literal) — a plain by-value parameter.
     ValueParam,
@@ -27,12 +28,7 @@ pub(crate) enum MetavarKind {
 impl MetavarKind {
     /// Stable lower-case machine string. Used both as the persisted role and as `extraction_role`.
     pub(crate) fn as_db_str(&self) -> &'static str {
-        match self {
-            MetavarKind::ValueParam => "value_param",
-            MetavarKind::ClosureParam => "closure_param",
-            MetavarKind::TypeParam => "type_param",
-            MetavarKind::Gapped => "gapped",
-        }
+        (*self).into()
     }
 }
 
@@ -235,6 +231,27 @@ impl EmittedSpan {
             EmittedSpan::Raw(_, hi)
             | EmittedSpan::Statement { hi, .. }
             | EmittedSpan::Classified { hi, .. } => hi,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metavar_kind_db_str_matches_serde_for_all_variants() {
+        for (kind, token) in [
+            (MetavarKind::ValueParam, "value_param"),
+            (MetavarKind::ClosureParam, "closure_param"),
+            (MetavarKind::TypeParam, "type_param"),
+            (MetavarKind::Gapped, "gapped"),
+        ] {
+            assert_eq!(kind.as_db_str(), token);
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String(token.into())
+            );
         }
     }
 }

@@ -57,7 +57,8 @@ pub(crate) const MIN_TOKENS: usize = 20;
 
 /// Which token space a fingerprint was computed in. Baseline is always present and is the only
 /// input to candidate recall; Scip is an optional precision signal (Plan 3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum NormalizerKind {
     Baseline,
     Scip,
@@ -65,18 +66,11 @@ pub(crate) enum NormalizerKind {
 
 impl NormalizerKind {
     pub(crate) fn as_db_str(self) -> &'static str {
-        match self {
-            NormalizerKind::Baseline => "baseline",
-            NormalizerKind::Scip => "scip",
-        }
+        self.into()
     }
 
     pub(crate) fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "baseline" => Some(NormalizerKind::Baseline),
-            "scip" => Some(NormalizerKind::Scip),
-            _ => None,
-        }
+        value.parse().ok()
     }
 }
 
@@ -164,6 +158,17 @@ mod tests {
     use super::*;
     use crate::index::{parser, symbols};
     use crate::language::Language;
+
+    #[test]
+    fn normalizer_kind_db_str_round_trips() {
+        for (kind, token) in
+            [(NormalizerKind::Baseline, "baseline"), (NormalizerKind::Scip, "scip")]
+        {
+            assert_eq!(kind.as_db_str(), token);
+            assert_eq!(NormalizerKind::from_db_str(kind.as_db_str()), Some(kind));
+        }
+        assert_eq!(NormalizerKind::from_db_str("bogus"), None);
+    }
 
     /// Generalized fingerprint harness (#232): parse `src` with `language` (under `path`), select
     /// the target symbol — the one whose subtree normalizes to the MOST tokens, language-agnostic

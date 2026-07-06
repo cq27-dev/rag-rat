@@ -10,8 +10,11 @@
 /// `serde` serializes to the same lower-case band (`high`/`medium`/`low`) as
 /// [`Confidence::as_db_str`] so the band reads identically whether it comes from the dedicated
 /// column or the embedded `variation_points_json` / `proposed_signature_json` payloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::EnumString, strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum Confidence {
     High,
     Medium,
@@ -20,21 +23,13 @@ pub(crate) enum Confidence {
 
 impl Confidence {
     pub(crate) fn as_db_str(&self) -> &'static str {
-        match self {
-            Confidence::High => "high",
-            Confidence::Medium => "medium",
-            Confidence::Low => "low",
-        }
+        (*self).into()
     }
 
     /// Parse the persisted lower-case band back (cache read-through). An unknown value degrades to
     /// `Low` rather than erroring — a stale/foreign band should never crash a read.
     pub(crate) fn from_db_str(value: &str) -> Self {
-        match value {
-            "high" => Confidence::High,
-            "medium" => Confidence::Medium,
-            _ => Confidence::Low,
-        }
+        value.parse().unwrap_or(Confidence::Low)
     }
 }
 
@@ -233,7 +228,10 @@ mod tests {
 
     #[test]
     fn confidence_db_str_round_trips() {
-        for c in [Confidence::High, Confidence::Medium, Confidence::Low] {
+        for (c, token) in
+            [(Confidence::High, "high"), (Confidence::Medium, "medium"), (Confidence::Low, "low")]
+        {
+            assert_eq!(c.as_db_str(), token);
             assert_eq!(Confidence::from_db_str(c.as_db_str()), c);
         }
         // unknown → Low (never panics).

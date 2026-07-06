@@ -637,7 +637,8 @@ pub(crate) fn current_oracle_comparisons(
 /// The oracle tool that produced a SCIP index. Phase 1 ships only the Rust backend (consumed from a
 /// pre-built `.scip`); the enum is the registry seam phase 2 (#69) extends. Persisted enum →
 /// `as_db_str` / `from_db_str` per `rust-modern-style`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
 pub enum OracleTool {
     /// `rust-analyzer scip` — Rust (phase 2, #69).
     RustAnalyzer,
@@ -673,24 +674,11 @@ impl OracleTool {
     ];
 
     pub fn as_db_str(self) -> &'static str {
-        match self {
-            Self::RustAnalyzer => "rust-analyzer",
-            Self::ScipClang => "scip-clang",
-            Self::ScipPython => "scip-python",
-            Self::ScipTypescript => "scip-typescript",
-            Self::ScipJava => "scip-java",
-        }
+        self.into()
     }
 
     pub fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "rust-analyzer" => Some(Self::RustAnalyzer),
-            "scip-clang" => Some(Self::ScipClang),
-            "scip-python" => Some(Self::ScipPython),
-            "scip-typescript" => Some(Self::ScipTypescript),
-            "scip-java" => Some(Self::ScipJava),
-            _ => None,
-        }
+        value.parse().ok()
     }
 
     /// Whether this backend's non-zero EXIT CODE reflects source DIAGNOSTICS rather than indexing
@@ -729,7 +717,8 @@ impl OracleTool {
 
 /// What the oracle concluded about one edge candidate. The names mirror the #61 design taxonomy.
 /// Persisted on `edge_oracle.kind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
 pub enum OracleResolutionKind {
     /// An unresolved / `NameOnly` / `Ambiguous` edge whose callee the oracle resolved to a symbol
     /// inside the corpus — a recovery the heuristic missed or under-resolved.
@@ -747,22 +736,11 @@ pub enum OracleResolutionKind {
 
 impl OracleResolutionKind {
     pub fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Upgrade => "upgrade",
-            Self::ResolvedExternal => "resolved-external",
-            Self::Confirm => "confirm",
-            Self::Contradict => "contradict",
-        }
+        self.into()
     }
 
     pub fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "upgrade" => Some(Self::Upgrade),
-            "resolved-external" => Some(Self::ResolvedExternal),
-            "confirm" => Some(Self::Confirm),
-            "contradict" => Some(Self::Contradict),
-            _ => None,
-        }
+        value.parse().ok()
     }
 }
 

@@ -385,8 +385,20 @@ impl Default for EmbeddingRuntimeConfig {
 /// the selector only routes ephemeral provisioning (which cookbook container), the freshness /
 /// vector- identity marker (different backends can produce slightly different vectors), the tune
 /// cache key, and the `ai_models.runtime` install marker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum RemoteBackend {
     /// ollama, via its `/v1/embeddings` OpenAI-compatibility route (the default; back-compat).
     #[default]
@@ -401,22 +413,13 @@ impl RemoteBackend {
     /// The stable wire/DB string (matches the serde repr): the `ai_models.runtime` marker, and the
     /// backend discriminator folded into the freshness key + the tune cache key.
     pub fn as_db_str(self) -> &'static str {
-        match self {
-            RemoteBackend::Ollama => "ollama",
-            RemoteBackend::Infinity => "infinity",
-            RemoteBackend::Vllm => "vllm",
-        }
+        self.into()
     }
 
     /// Parse a config `backend = "..."` value (case-insensitive). `None` for an unknown value — the
     /// config layer turns that into `ConfigError::RemoteBackendUnknown`.
     pub fn from_db_str(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "ollama" => Some(RemoteBackend::Ollama),
-            "infinity" => Some(RemoteBackend::Infinity),
-            "vllm" => Some(RemoteBackend::Vllm),
-            _ => None,
-        }
+        s.trim().parse().ok()
     }
 
     /// The HTTP path (appended to the endpoint) of this backend's embeddings route. The

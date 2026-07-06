@@ -171,8 +171,11 @@ pub struct CloneCompleteness {
 /// `Generated` ⊃ `StaleNormalizerVersion` ⊃ `NonFunctionKind` ⊃ `BelowMinTokens`.
 ///
 /// [`classify_ineligibility_reason`]: super::resolve::classify_ineligibility_reason
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::EnumString, strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum CloneIneligibilityReason {
     /// The symbol's file is generated (`files.generated = 1` — a `kind = generated` target or a
     /// path-heuristic codegen file like `src/generated/…`/`.d.ts`). Generated code is excluded from
@@ -201,23 +204,12 @@ pub enum CloneIneligibilityReason {
 impl CloneIneligibilityReason {
     /// The stable wire/DB token for this reason (matches the `serde` snake_case rename).
     pub fn as_db_str(self) -> &'static str {
-        match self {
-            CloneIneligibilityReason::Generated => "generated",
-            CloneIneligibilityReason::NonFunctionKind => "non_function_kind",
-            CloneIneligibilityReason::StaleNormalizerVersion => "stale_normalizer_version",
-            CloneIneligibilityReason::BelowMinTokens => "below_min_tokens",
-        }
+        self.into()
     }
 
     /// Parse a wire/DB token back into a reason (inverse of [`as_db_str`](Self::as_db_str)).
     pub fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "generated" => Some(CloneIneligibilityReason::Generated),
-            "non_function_kind" => Some(CloneIneligibilityReason::NonFunctionKind),
-            "stale_normalizer_version" => Some(CloneIneligibilityReason::StaleNormalizerVersion),
-            "below_min_tokens" => Some(CloneIneligibilityReason::BelowMinTokens),
-            _ => None,
-        }
+        value.parse().ok()
     }
 }
 
@@ -302,4 +294,27 @@ pub enum CloneSymbolSelector {
     Ref(String),
     /// The tightest-spanning in-scope symbol whose line range contains `line` in `path`.
     PathLine { path: String, line: i64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_ineligibility_reason_db_str_matches_serde_for_all_variants() {
+        for (reason, token) in [
+            (CloneIneligibilityReason::Generated, "generated"),
+            (CloneIneligibilityReason::NonFunctionKind, "non_function_kind"),
+            (CloneIneligibilityReason::StaleNormalizerVersion, "stale_normalizer_version"),
+            (CloneIneligibilityReason::BelowMinTokens, "below_min_tokens"),
+        ] {
+            assert_eq!(reason.as_db_str(), token);
+            assert_eq!(CloneIneligibilityReason::from_db_str(reason.as_db_str()), Some(reason));
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::Value::String(token.into())
+            );
+        }
+        assert_eq!(CloneIneligibilityReason::from_db_str("bogus"), None);
+    }
 }
