@@ -762,6 +762,22 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        let (url, handle, requests, max_in_flight, _) =
+            spawn_parallel_counting_stub_with_waits(max_conns, delays, Vec::new());
+        (url, handle, requests, max_in_flight)
+    }
+
+    fn spawn_parallel_counting_stub_with_waits(
+        max_conns: usize,
+        delays: Vec<(usize, Duration)>,
+        wait_for_prior_response: Vec<usize>,
+    ) -> (
+        String,
+        thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -770,9 +786,12 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let waits_satisfied = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&requests);
         let delays = Arc::new(delays);
+        let wait_for_prior_response = Arc::new(wait_for_prior_response);
         let max_seen = Arc::clone(&max_in_flight);
+        let waits_seen = Arc::clone(&waits_satisfied);
         let handle = thread::spawn(move || {
             let mut workers = Vec::new();
             for _ in 0..max_conns {
@@ -781,6 +800,8 @@ mod tests {
                 let in_flight = Arc::clone(&in_flight);
                 let max_seen = Arc::clone(&max_seen);
                 let delays = Arc::clone(&delays);
+                let wait_for_prior_response = Arc::clone(&wait_for_prior_response);
+                let waits_seen = Arc::clone(&waits_seen);
                 workers.push(thread::spawn(move || {
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     raise_max(&max_seen, now);
@@ -791,7 +812,19 @@ mod tests {
                     {
                         thread::sleep(*delay);
                     }
-                    counter.fetch_add(1, Ordering::SeqCst);
+                    if let Some(first) = indices.first().copied()
+                        && wait_for_prior_response.contains(&first)
+                    {
+                        let started = std::time::Instant::now();
+                        while counter.load(Ordering::SeqCst) == 0
+                            && started.elapsed() < Duration::from_secs(2)
+                        {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        if counter.load(Ordering::SeqCst) > 0 {
+                            waits_seen.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
                     let vector_ids = if indices.is_empty() { vec![0] } else { indices };
                     let vectors: Vec<Vec<f32>> = vector_ids
                         .into_iter()
@@ -809,6 +842,7 @@ mod tests {
                     );
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
+                    counter.fetch_add(1, Ordering::SeqCst);
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                 }));
             }
@@ -816,7 +850,7 @@ mod tests {
                 let _ = worker.join();
             }
         });
-        (format!("http://127.0.0.1:{port}"), handle, requests, max_in_flight)
+        (format!("http://127.0.0.1:{port}"), handle, requests, max_in_flight, waits_satisfied)
     }
 
     fn request_text_indices(body: &str) -> Vec<usize> {
@@ -912,8 +946,8 @@ mod tests {
 
     #[test]
     fn embed_batch_keeps_output_order_when_later_requests_finish_first() {
-        let (url, handle, _, max_in_flight) =
-            spawn_parallel_counting_stub(2, vec![(0, Duration::from_millis(200))]);
+        let (url, handle, _, _, delayed_until_later_response) =
+            spawn_parallel_counting_stub_with_waits(2, Vec::new(), vec![0]);
         let mut cfg = config_for(&url, 5);
         cfg.batch_size = 1;
         cfg.concurrency = 2;
@@ -922,9 +956,10 @@ mod tests {
         let got = embedder.embed_batch(&indexed_texts(2)).expect("out-of-order responses succeed");
         handle.join().unwrap();
 
-        assert!(
-            max_in_flight.load(std::sync::atomic::Ordering::SeqCst) > 1,
-            "test must overlap the delayed and fast requests"
+        assert_eq!(
+            delayed_until_later_response.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first sub-batch response should be held until a later response completes"
         );
         assert_eq!(first_components(&got), vec![0.0, 1.0]);
     }
