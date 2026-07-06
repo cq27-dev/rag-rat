@@ -67,14 +67,22 @@ pub(crate) use build::{anti_unify, anti_unify_global};
 #[cfg(test)]
 use build::{anti_unify_with_budget, collapse_recurring};
 #[cfg(test)]
-use classify::run_in_callee_position;
+use classify::{classify_run, run_in_callee_position};
+#[cfg(test)]
+use render::coverage_from_mask;
 #[cfg(test)]
 use render::render_template;
 #[cfg(test)]
-use types::RunMetavar;
+use spans::any_member_inserts_within;
 #[allow(unused_imports)]
 pub(crate) use types::{ClassAlignment, OccSpan};
+#[cfg(test)]
+use types::{EmittedSpan, RunMetavar};
 pub(crate) use types::{MetavarKind, Template, VariationPoint};
+#[cfg(test)]
+use values::recover_values;
+#[cfg(test)]
+use widen::{annotation_type_context, widen_string_content_run};
 
 #[cfg(test)]
 use super::RefineMember;

@@ -604,3 +604,274 @@ fn emit_member_only_inserts(
         });
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::language::Language;
+
+    fn span(start_byte: usize, end_byte: usize, kind: &'static str, is_leaf: bool) -> NodeSpan {
+        NodeSpan { start_byte, end_byte, kind, is_leaf }
+    }
+
+    fn fixture_member(
+        symbol_id: i64,
+        text: &str,
+        seq: Vec<&str>,
+        node_spans: Vec<NodeSpan>,
+    ) -> RefineMember {
+        RefineMember {
+            symbol_id,
+            lang: Language::Rust,
+            struct_hash: seq.join("\u{1}"),
+            seq: seq.into_iter().map(str::to_string).collect(),
+            node_spans,
+            text: Arc::from(text),
+        }
+    }
+
+    fn statement_parts(span: &EmittedSpan) -> Option<(usize, usize, Vec<String>, bool)> {
+        match span {
+            EmittedSpan::Statement { lo, hi, per_member_values, zero_width } =>
+                Some((*lo, *hi, per_member_values.clone(), *zero_width)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn statement_alignment_and_member_insert_edges_are_covered() {
+        let anchor_skeletons = vec!["A".to_string(), "B".to_string()];
+        let member_stmts = vec![
+            MemberStatement {
+                skeleton: "A".to_string(),
+                source: "a();".to_string(),
+                token_start: 0,
+                token_len: 1,
+            },
+            MemberStatement {
+                skeleton: "X".to_string(),
+                source: "x();".to_string(),
+                token_start: 1,
+                token_len: 1,
+            },
+            MemberStatement {
+                skeleton: "B".to_string(),
+                source: "b();".to_string(),
+                token_start: 2,
+                token_len: 1,
+            },
+        ];
+
+        let aligned = align_member_statements(&anchor_skeletons, &member_stmts);
+        assert_eq!(aligned.matched.len(), 2);
+        assert_eq!(aligned.matched[0].as_ref().map(|s| s.source.as_str()), Some("a();"));
+        assert_eq!(aligned.matched[1].as_ref().map(|s| s.source.as_str()), Some("b();"));
+        assert_eq!(aligned.inserts, vec![(1, "x();".to_string())]);
+
+        let per_member = vec![
+            None,
+            Some(MemberStmtAlign {
+                matched: Vec::new(),
+                inserts: vec![(0, "lead();".to_string()), (2, "tail();".to_string())],
+            }),
+        ];
+        let mut emitted = Vec::new();
+        emit_member_only_inserts(&[(10, 12), (20, 22)], &per_member, 2, &mut emitted);
+
+        assert_eq!(statement_parts(&EmittedSpan::Raw(0, 0)), None);
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(
+            statement_parts(&emitted[0]),
+            Some((10, 10, vec!["".to_string(), "lead();".to_string()], true))
+        );
+        assert_eq!(
+            statement_parts(&emitted[1]),
+            Some((22, 22, vec!["".to_string(), "tail();".to_string()], true))
+        );
+    }
+
+    #[test]
+    fn block_statement_indel_handles_empty_and_unaligned_members() {
+        let lone_leaf = fixture_member(1, "x", vec!["ID0"], vec![span(0, 1, "identifier", true)]);
+        let one_member_alignment = ClassAlignment {
+            anchor_idx: 0,
+            sampled: false,
+            aligned: vec![true],
+            col_map: vec![vec![Some(0)]],
+            member_inserts: vec![BTreeMap::new()],
+            spent_cells: 0,
+        };
+        let mut budget = CellBudget::new(100);
+        let mut sampled = false;
+        let mut emitted = Vec::new();
+        assert!(!emit_block_statement_indel(
+            std::slice::from_ref(&lone_leaf),
+            &one_member_alignment,
+            &lone_leaf,
+            &[true],
+            0,
+            0,
+            &mut budget,
+            &mut sampled,
+            &mut emitted,
+        ));
+
+        let anchor =
+            fixture_member(10, "{a;}", vec!["block", "expression_statement", "ID0", ";"], vec![
+                span(0, 4, "block", false),
+                span(1, 3, "expression_statement", false),
+                span(1, 2, "identifier", true),
+                span(2, 3, ";", true),
+            ]);
+        let member_without_statement =
+            fixture_member(11, "{}", vec!["block"], vec![span(0, 2, "block", false)]);
+        let unaligned_member =
+            fixture_member(12, "{b;}", vec!["block", "expression_statement", "ID0", ";"], vec![
+                span(0, 4, "block", false),
+                span(1, 3, "expression_statement", false),
+                span(1, 2, "identifier", true),
+                span(2, 3, ";", true),
+            ]);
+        let members = vec![anchor, member_without_statement, unaligned_member];
+        let alignment = ClassAlignment {
+            anchor_idx: 0,
+            sampled: false,
+            aligned: vec![true, true, false],
+            col_map: vec![
+                vec![Some(0), Some(1), Some(2), Some(3)],
+                vec![Some(0), None, None, None],
+                vec![None, None, None, None],
+            ],
+            member_inserts: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+            spent_cells: 0,
+        };
+        let mut budget = CellBudget::new(100);
+        let mut sampled = false;
+        let mut emitted = Vec::new();
+
+        assert!(emit_block_statement_indel(
+            &members,
+            &alignment,
+            &members[0],
+            &[true, true, true, true],
+            0,
+            3,
+            &mut budget,
+            &mut sampled,
+            &mut emitted,
+        ));
+
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            statement_parts(&emitted[0]),
+            Some((1, 3, vec!["a;".to_string(), String::new(), String::new()], false))
+        );
+    }
+
+    #[test]
+    fn matched_statement_redescent_defensive_returns_are_covered() {
+        let short = fixture_member(20, "a", vec!["ID0"], vec![span(0, 1, "identifier", true)]);
+        let malformed = vec![Some(MemberStmtAlign {
+            matched: vec![Some(MatchedStmt {
+                source: "a".to_string(),
+                token_start: 0,
+                token_len: 2,
+            })],
+            inserts: Vec::new(),
+        })];
+        let mut budget = CellBudget::new(100);
+        let mut sampled = false;
+        let mut emitted = Vec::new();
+        emit_matched_statement_redescent(
+            std::slice::from_ref(&short),
+            0,
+            &malformed,
+            0,
+            0,
+            0,
+            &mut budget,
+            &mut sampled,
+            &mut emitted,
+        );
+        assert!(emitted.is_empty());
+
+        let sparse_anchor =
+            fixture_member(20, "a", vec!["ID0"], vec![span(0, 1, "identifier", true)]);
+        let skipped_member =
+            fixture_member(21, "b", vec!["ID0"], vec![span(0, 1, "identifier", true)]);
+        let sparse_members = vec![sparse_anchor, skipped_member];
+        let sparse = vec![
+            Some(MemberStmtAlign {
+                matched: vec![Some(MatchedStmt {
+                    source: "a".to_string(),
+                    token_start: 0,
+                    token_len: 1,
+                })],
+                inserts: Vec::new(),
+            }),
+            None,
+        ];
+        let mut budget = CellBudget::new(100);
+        let mut sampled = false;
+        emit_matched_statement_redescent(
+            &sparse_members,
+            0,
+            &sparse,
+            0,
+            0,
+            0,
+            &mut budget,
+            &mut sampled,
+            &mut emitted,
+        );
+        assert!(emitted.is_empty());
+
+        let parent_anchor = fixture_member(30, "ab", vec!["fixed", "A"], vec![
+            span(0, 1, "identifier", true),
+            span(1, 2, "identifier", true),
+        ]);
+        let other = fixture_member(31, "ac", vec!["fixed", "B"], vec![
+            span(0, 1, "identifier", true),
+            span(1, 2, "identifier", true),
+        ]);
+        let parent_members = vec![parent_anchor, other];
+        let per_member = vec![
+            Some(MemberStmtAlign {
+                matched: vec![Some(MatchedStmt {
+                    source: "ab".to_string(),
+                    token_start: 0,
+                    token_len: 2,
+                })],
+                inserts: Vec::new(),
+            }),
+            Some(MemberStmtAlign {
+                matched: vec![Some(MatchedStmt {
+                    source: "ac".to_string(),
+                    token_start: 0,
+                    token_len: 2,
+                })],
+                inserts: Vec::new(),
+            }),
+        ];
+        let mut budget = CellBudget::new(100);
+        let mut sampled = false;
+        emit_matched_statement_redescent(
+            &parent_members,
+            0,
+            &per_member,
+            0,
+            0,
+            0,
+            &mut budget,
+            &mut sampled,
+            &mut emitted,
+        );
+        assert!(
+            emitted.is_empty(),
+            "a sub-template occurrence beyond the parent span is defensively ignored"
+        );
+    }
+}

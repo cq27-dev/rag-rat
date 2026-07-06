@@ -2732,3 +2732,194 @@ fn generic_type_head_diff_widens_to_whole_type() {
         t3.text
     );
 }
+
+#[test]
+fn defensive_member_sample_cap_marks_tail_members_unaligned() {
+    let member_count = super::align::LCS_MEMBER_SAMPLE + 1;
+    let members: Vec<RefineMember> =
+        (0..member_count).map(|i| synthetic_member(i as i64, &format!("m{i:03}"), 1)).collect();
+
+    let alignment = align_to_anchor(&members, 0);
+
+    assert!(alignment.sampled, "tail members beyond the defensive sample cap mark sampling");
+    assert!(alignment.aligned[0], "the anchor remains aligned");
+    assert!(alignment.aligned[super::align::LCS_MEMBER_SAMPLE - 1]);
+    assert!(!alignment.aligned[super::align::LCS_MEMBER_SAMPLE]);
+    assert_eq!(alignment.col_map[super::align::LCS_MEMBER_SAMPLE], vec![None]);
+    assert!(alignment.member_inserts[super::align::LCS_MEMBER_SAMPLE].is_empty());
+}
+
+#[test]
+fn call_node_differing_callee_classifies_low_with_flag() {
+    let members = vec![
+        RefineMember {
+            symbol_id: 1,
+            lang: Language::Rust,
+            struct_hash: "call".to_string(),
+            seq: vec!["call_expression".to_string()],
+            node_spans: vec![NodeSpan {
+                start_byte: 0,
+                end_byte: 5,
+                kind: "call_expression",
+                is_leaf: false,
+            }],
+            text: Arc::from("foo()"),
+        },
+        RefineMember {
+            symbol_id: 2,
+            lang: Language::Rust,
+            struct_hash: "call".to_string(),
+            seq: vec!["call_expression".to_string()],
+            node_spans: vec![NodeSpan {
+                start_byte: 0,
+                end_byte: 5,
+                kind: "call_expression",
+                is_leaf: false,
+            }],
+            text: Arc::from("bar()"),
+        },
+    ];
+    let alignment = ClassAlignment {
+        anchor_idx: 0,
+        sampled: false,
+        aligned: vec![true, true],
+        col_map: vec![vec![Some(0)], vec![Some(0)]],
+        member_inserts: vec![BTreeMap::new(), BTreeMap::new()],
+        spent_cells: 0,
+    };
+
+    let class = classify_run(&members, &alignment, &members[0], 0, 0, &[
+        "foo()".to_string(),
+        "bar()".to_string(),
+    ]);
+
+    assert_eq!(class.kind, MetavarKind::ClosureParam);
+    assert_eq!(class.confidence, Confidence::Low);
+    assert!(class.differing_callee);
+    assert!(class.type_hint.is_none());
+}
+
+#[test]
+fn split_helper_defensive_paths_are_covered() {
+    assert!((coverage_from_mask(&[]) - 1.0).abs() < f64::EPSILON);
+
+    let one_member_alignment = ClassAlignment {
+        anchor_idx: 0,
+        sampled: false,
+        aligned: vec![true],
+        col_map: vec![vec![Some(0)]],
+        member_inserts: vec![BTreeMap::new()],
+        spent_cells: 0,
+    };
+    assert!(!any_member_inserts_within(&one_member_alignment, 2, 1));
+
+    let raw = EmittedSpan::Raw(2, 4);
+    let statement =
+        EmittedSpan::Statement { lo: 1, hi: 6, per_member_values: Vec::new(), zero_width: false };
+    let classified = EmittedSpan::Classified {
+        lo: 1,
+        hi: 8,
+        per_member_values: Vec::new(),
+        kind: MetavarKind::ValueParam,
+        type_hint: None,
+        confidence: Confidence::High,
+        differing_callee: false,
+        zero_width: false,
+    };
+    assert_eq!(raw.hi(), 4);
+    assert_eq!(statement.hi(), 6);
+    assert_eq!(classified.hi(), 8);
+
+    let invalid_utf8_slice = RefineMember {
+        symbol_id: 1,
+        lang: Language::Rust,
+        struct_hash: "utf8".to_string(),
+        seq: vec!["ID0".to_string()],
+        node_spans: vec![NodeSpan {
+            start_byte: 1,
+            end_byte: 2,
+            kind: "identifier",
+            is_leaf: true,
+        }],
+        text: Arc::from("é"),
+    };
+    assert_eq!(recover_values(&[invalid_utf8_slice], &one_member_alignment, 0, 0), vec![
+        "ID0".to_string()
+    ]);
+
+    let empty_anchor = RefineMember {
+        symbol_id: 2,
+        lang: Language::Rust,
+        struct_hash: "empty".to_string(),
+        seq: Vec::new(),
+        node_spans: Vec::new(),
+        text: Arc::from(""),
+    };
+    assert_eq!(annotation_type_context(&empty_anchor, 0), None);
+
+    let invalid_type_slice = RefineMember {
+        symbol_id: 3,
+        lang: Language::Rust,
+        struct_hash: "bad-type".to_string(),
+        seq: vec![":".to_string(), "ID0".to_string()],
+        node_spans: vec![
+            NodeSpan { start_byte: 0, end_byte: 1, kind: ":", is_leaf: true },
+            NodeSpan { start_byte: 2, end_byte: 3, kind: "type_identifier", is_leaf: true },
+        ],
+        text: Arc::from(":é"),
+    };
+    assert_eq!(annotation_type_context(&invalid_type_slice, 1), None);
+
+    let colon_without_type = RefineMember {
+        symbol_id: 4,
+        lang: Language::Rust,
+        struct_hash: "no-type".to_string(),
+        seq: vec![":".to_string(), "ID0".to_string()],
+        node_spans: vec![
+            NodeSpan { start_byte: 0, end_byte: 1, kind: ":", is_leaf: true },
+            NodeSpan { start_byte: 1, end_byte: 2, kind: "identifier", is_leaf: true },
+        ],
+        text: Arc::from(":x"),
+    };
+    assert_eq!(annotation_type_context(&colon_without_type, 1), None);
+
+    let interpolated_template = RefineMember {
+        symbol_id: 5,
+        lang: Language::TypeScript,
+        struct_hash: "template".to_string(),
+        seq: vec![
+            "template_string".to_string(),
+            "`".to_string(),
+            "string_fragment".to_string(),
+            "template_substitution".to_string(),
+            "`".to_string(),
+        ],
+        node_spans: vec![
+            NodeSpan { start_byte: 0, end_byte: 7, kind: "template_string", is_leaf: false },
+            NodeSpan { start_byte: 0, end_byte: 1, kind: "`", is_leaf: true },
+            NodeSpan { start_byte: 1, end_byte: 2, kind: "string_fragment", is_leaf: true },
+            NodeSpan { start_byte: 2, end_byte: 6, kind: "template_substitution", is_leaf: false },
+            NodeSpan { start_byte: 6, end_byte: 7, kind: "`", is_leaf: true },
+        ],
+        text: Arc::from("`a${b}`"),
+    };
+    assert_eq!(widen_string_content_run(&interpolated_template, 2, 2), (2, 2));
+
+    let duplicate_string_candidates = RefineMember {
+        symbol_id: 6,
+        lang: Language::Rust,
+        struct_hash: "duplicate-strings".to_string(),
+        seq: vec![
+            "string_literal".to_string(),
+            "string_literal".to_string(),
+            "string_content".to_string(),
+        ],
+        node_spans: vec![
+            NodeSpan { start_byte: 0, end_byte: 4, kind: "string_literal", is_leaf: false },
+            NodeSpan { start_byte: 0, end_byte: 4, kind: "string_literal", is_leaf: false },
+            NodeSpan { start_byte: 1, end_byte: 2, kind: "string_content", is_leaf: true },
+        ],
+        text: Arc::from("\"a\""),
+    };
+    assert_eq!(widen_string_content_run(&duplicate_string_candidates, 2, 2), (0, 2));
+}
