@@ -672,17 +672,36 @@ fn watch_tree_pruned(watcher: &mut impl notify::Watcher, dir: &Path, ignore: &Ig
     }
 }
 
-/// Whether `path` is inside a configured target directory (so it could ever satisfy
-/// `target_for_path`). `config.root` itself is watched non-recursively (the `gitignore_watch_dirs`
-/// ancestor chain), so a top-level create OUTSIDE a target — `vendor/`, a sibling of `src/`, or an
-/// ancestor of `config.root` — is also delivered to the event loop; without this gate
-/// [`watch_created_dirs`] would watch it even though it can never be indexed, re-exhausting inotify
-/// (#332). A whole-root target (`directories = ["."]`) matches any path under `config.root`.
-fn dir_under_a_target(config: &Config, target_dirs: &[PathBuf], path: &Path) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreatedDirPlacement {
+    OutsideTargets,
+    TargetAncestor,
+    TargetSubtree,
+}
+
+/// How a newly appeared directory relates to the configured target set. `config.root` itself is
+/// watched non-recursively (the `gitignore_watch_dirs` ancestor chain), so a top-level create
+/// OUTSIDE a target — `vendor/`, a sibling of `src/`, or an ancestor of `config.root` — is also
+/// delivered to the event loop; without this gate [`watch_created_dirs`] would watch it even though
+/// it can never be indexed, re-exhausting inotify (#332). A whole-root target (`directories =
+/// ["."]`) treats every directory below `config.root` as a target subtree.
+fn created_dir_placement(
+    config: &Config,
+    target_dirs: &[PathBuf],
+    path: &Path,
+) -> CreatedDirPlacement {
     let Ok(rel) = path.strip_prefix(&config.root) else {
-        return false; // outside config.root entirely (an ancestor-chain event).
+        return CreatedDirPlacement::OutsideTargets;
     };
-    target_dirs.iter().any(|d| d == Path::new(".") || rel.starts_with(d))
+    if target_dirs.iter().any(|d| d == Path::new(".") || rel.starts_with(d)) {
+        return CreatedDirPlacement::TargetSubtree;
+    }
+    if !rel.as_os_str().is_empty()
+        && target_dirs.iter().any(|d| d != Path::new(".") && d.starts_with(rel))
+    {
+        return CreatedDirPlacement::TargetAncestor;
+    }
+    CreatedDirPlacement::OutsideTargets
 }
 
 /// Place a pruned watch on any newly-appeared, in-target, non-ignored *real* directory among an
@@ -695,8 +714,10 @@ fn dir_under_a_target(config: &Config, target_dirs: &[PathBuf], path: &Path) -> 
 ///    `config.root` (e.g. a link to a dep cache) and re-exhaust inotify; the index walker likewise
 ///    skips symlinks. Dir-ness comes from the filesystem, not the notify `CreateKind`, because the
 ///    inotify backend commonly reports `CreateKind::Any`.
-/// 2. **under a target** — [`dir_under_a_target`]; a non-target top-level dir can never be indexed.
-/// 3. **not ignored** — by the current matcher.
+/// 2. **target relation** — [`created_dir_placement`]; a non-target top-level dir can never be
+///    indexed, while a newly-created ancestor of a nested target (`src/` for `src/generated`) must
+///    be watched non-recursively so the later target creation is delivered.
+/// 3. **not ignored for target subtrees** — by the current matcher.
 /// 4. **recompile + re-check** — a directory MOVED in can carry its own nested `.gitignore`, which
 ///    the long-lived matcher (compiled before that subtree existed) doesn't know about; recompiling
 ///    here picks the nested rules up so `watch_tree_pruned` prunes against them, not stale rules.
@@ -726,19 +747,30 @@ fn watch_created_dirs(
         if !is_real_dir {
             continue;
         }
-        if !dir_under_a_target(config, target_dirs, path) {
-            continue;
+        match created_dir_placement(config, target_dirs, path) {
+            CreatedDirPlacement::OutsideTargets => continue,
+            CreatedDirPlacement::TargetAncestor => {
+                // A nested target's leading directory can appear after startup. Watch the ancestor
+                // non-recursively so the eventual target dir creation is delivered, and re-place
+                // target watches too in case a fast `mkdir -p target/path` already created it.
+                watch_gitignore_rule_dirs(watcher, &config.root, target_dirs);
+                *ignore = IgnoreMatcher::compile(&config.root, target_dirs);
+                watch_configured_trees(watcher, config, target_dirs, ignore);
+            },
+            CreatedDirPlacement::TargetSubtree => {
+                if ignore.is_ignored(path, true) {
+                    continue;
+                }
+                // A moved-in dir may carry a nested `.gitignore` the long-lived matcher predates;
+                // recompile so the subtree is pruned against current (incl. nested) rules, then
+                // re-check the root.
+                *ignore = IgnoreMatcher::compile(&config.root, target_dirs);
+                if ignore.is_ignored(path, true) {
+                    continue;
+                }
+                watch_tree_pruned(watcher, path, ignore);
+            },
         }
-        if ignore.is_ignored(path, true) {
-            continue;
-        }
-        // A moved-in dir may carry a nested `.gitignore` the long-lived matcher predates; recompile
-        // so the subtree is pruned against current (incl. nested) rules, then re-check the root.
-        *ignore = IgnoreMatcher::compile(&config.root, target_dirs);
-        if ignore.is_ignored(path, true) {
-            continue;
-        }
-        watch_tree_pruned(watcher, path, ignore);
     }
 }
 
@@ -846,7 +878,7 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
                 // (Create/rename + is-dir + not-ignored) makes calling it on every
                 // event correct; the maintenance pass a relevant event fires
                 // re-discovers the dir's current files, and the watch keeps SUBSEQUENT edits
-                // firing. Gates each path on real-dir + under-a-target + not-ignored, and
+                // firing. Gates each path on real-dir + target relation + not-ignored, and
                 // recompiles the matcher for a moved-in nested `.gitignore` (#332).
                 watch_created_dirs(&mut notify_watcher, &event, &config, &target_dirs, &mut ignore);
                 linked_worktrees.watch_created_dirs(&mut notify_watcher, &event);
@@ -943,7 +975,7 @@ mod tests {
 
     /// A single-Rust-target `Config` rooted at `root` watching `target_dirs` — the inline builder
     /// the real-watcher placement tests share so they can call `watch_created_dirs` (which needs a
-    /// `&Config` for the under-a-target gate, #332).
+    /// `&Config` for the target-relation gate, #332).
     fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
         Config {
             repo_id_override: None,
@@ -1017,6 +1049,57 @@ mod tests {
         );
         let unique = dirs.iter().collect::<std::collections::BTreeSet<_>>();
         assert_eq!(dirs.len(), unique.len(), "watch directories are de-duplicated");
+
+        let rejected = gitignore_rule_watch_dirs(&root, &[
+            PathBuf::from("../outside"),
+            PathBuf::from("/absolute"),
+        ]);
+        assert_eq!(rejected, vec![root], "non-relative target components are ignored");
+    }
+
+    #[test]
+    fn recording_watcher_trait_methods_are_covered() {
+        let mut watcher =
+            <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+        watcher.watch(Path::new("repo/src"), RecursiveMode::NonRecursive).unwrap();
+        watcher.unwatch(Path::new("repo/src")).unwrap();
+        assert_eq!(<RecordingWatcher as notify::Watcher>::kind(), notify::WatcherKind::NullWatcher,);
+        assert_eq!(watcher.watched.len(), 1);
+    }
+
+    #[test]
+    fn created_dir_placement_classifies_target_ancestors_and_subtrees() {
+        let root = PathBuf::from("/repo");
+        let nested = vec![PathBuf::from("src/generated")];
+        let config = whole_root_config(&root, &nested);
+
+        assert_eq!(
+            created_dir_placement(&config, &nested, &PathBuf::from("/elsewhere/src")),
+            CreatedDirPlacement::OutsideTargets,
+        );
+        assert_eq!(
+            created_dir_placement(&config, &nested, &root.join("vendor")),
+            CreatedDirPlacement::OutsideTargets,
+        );
+        assert_eq!(
+            created_dir_placement(&config, &nested, &root.join("src")),
+            CreatedDirPlacement::TargetAncestor,
+        );
+        assert_eq!(
+            created_dir_placement(&config, &nested, &root.join("src/generated")),
+            CreatedDirPlacement::TargetSubtree,
+        );
+        assert_eq!(
+            created_dir_placement(&config, &nested, &root.join("src/generated/pkg")),
+            CreatedDirPlacement::TargetSubtree,
+        );
+
+        let whole_root = vec![PathBuf::from(".")];
+        let whole_config = whole_root_config(&root, &whole_root);
+        assert_eq!(
+            created_dir_placement(&whole_config, &whole_root, &root.join("anything")),
+            CreatedDirPlacement::TargetSubtree,
+        );
     }
 
     #[test]
@@ -1263,6 +1346,88 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
+    fn linked_worktree_watch_set_handles_created_target_ancestors() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let worktree =
+            std::env::temp_dir().join(format!("ragrat-wt-ancestor-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&worktree).unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::write(worktree.join(".gitignore"), "").unwrap();
+
+        let target_dirs = vec![PathBuf::from("src/generated")];
+        let config = whole_root_config(&worktree, &target_dirs);
+        let mut watcher = RecordingWatcher::default();
+        let mut worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+
+        watcher.watched.clear();
+        let ancestor = worktree.join("src");
+        std::fs::create_dir_all(&ancestor).unwrap();
+        let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(ancestor.clone());
+        worktrees.watch_created_dirs(&mut watcher, &create);
+
+        assert!(
+            watcher
+                .watched
+                .iter()
+                .any(|(path, mode)| path == &ancestor && *mode == RecursiveMode::NonRecursive),
+            "a newly-created linked target ancestor must be watched non-recursively",
+        );
+        assert!(
+            watcher.watched.iter().any(|(path, _)| path == &worktree.join("src/generated")),
+            "created ancestors should re-place configured target watches in case the target \
+             already exists",
+        );
+        assert!(
+            watcher.watched.iter().all(|(_, mode)| *mode == RecursiveMode::NonRecursive),
+            "ancestor handling must not reintroduce recursive checkout watches",
+        );
+
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
+    fn watch_created_dirs_skips_dirs_ignored_before_or_after_recompile() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("ragrat-watch-created-ignore-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(root.join("src/already_ignored")).unwrap();
+        std::fs::create_dir_all(root.join("src/newly_ignored")).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "src/already_ignored/\n").unwrap();
+
+        let target_dirs = vec![PathBuf::from("src")];
+        let config = whole_root_config(&root, &target_dirs);
+        let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
+        let mut watcher = RecordingWatcher::default();
+
+        let already = root.join("src/already_ignored");
+        let create_already =
+            Event::new(EventKind::Create(CreateKind::Folder)).add_path(already.clone());
+        watch_created_dirs(&mut watcher, &create_already, &config, &target_dirs, &mut ignore);
+        assert!(
+            watcher.watched.iter().all(|(path, _)| path != &already),
+            "a dir ignored before recompile should not be watched",
+        );
+
+        std::fs::write(root.join(".gitignore"), "src/already_ignored/\nsrc/newly_ignored/\n")
+            .unwrap();
+        let newly = root.join("src/newly_ignored");
+        let create_newly =
+            Event::new(EventKind::Create(CreateKind::Folder)).add_path(newly.clone());
+        watch_created_dirs(&mut watcher, &create_newly, &config, &target_dirs, &mut ignore);
+        assert!(
+            watcher.watched.iter().all(|(path, _)| path != &newly),
+            "a dir ignored only after recompile should not be watched",
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2077,9 +2242,9 @@ mod tests {
     fn a_non_target_top_level_dir_is_not_watched() {
         // ISSUE #332 (P2): config.root is watched NON-recursively (the gitignore-chain ancestor
         // watches), so a create of a top-level dir OUTSIDE any target (`vendor/`, a sibling of the
-        // `src` target) is delivered to the loop too. `watch_created_dirs` must gate on
-        // `dir_under_a_target` so it never watches such a dir — it can't be indexed and would just
-        // burn inotify watches. A new subdir UNDER the target still gets watched.
+        // `src` target) is delivered to the loop too. `watch_created_dirs` must gate on the
+        // target relation so it never watches such a dir — it can't be indexed and would just burn
+        // inotify watches. A new subdir UNDER the target still gets watched.
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
