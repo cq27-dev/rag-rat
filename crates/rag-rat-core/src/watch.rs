@@ -398,8 +398,8 @@ impl LinkedWorktreeWatch {
         self.place_watches(watcher);
     }
 
-    fn watch_created_dirs(&mut self, watcher: &mut impl notify::Watcher, event: &Event) {
-        watch_created_dirs(watcher, event, &self.config, &self.target_dirs, &mut self.ignore);
+    fn watch_created_dirs(&mut self, watcher: &mut impl notify::Watcher, event: &Event) -> bool {
+        watch_created_dirs(watcher, event, &self.config, &self.target_dirs, &mut self.ignore)
     }
 
     fn touches_event(&self, path: &Path) -> bool {
@@ -438,10 +438,12 @@ impl LinkedWorktreeWatches {
         self.states = states;
     }
 
-    fn watch_created_dirs(&mut self, watcher: &mut impl notify::Watcher, event: &Event) {
+    fn watch_created_dirs(&mut self, watcher: &mut impl notify::Watcher, event: &Event) -> bool {
+        let mut placed_target_watch = false;
         for state in &mut self.states {
-            state.watch_created_dirs(watcher, event);
+            placed_target_watch |= state.watch_created_dirs(watcher, event);
         }
+        placed_target_watch
     }
 
     fn recompile_ignore_and_place_watches(&mut self, watcher: &mut impl notify::Watcher) {
@@ -727,7 +729,7 @@ fn watch_created_dirs(
     config: &Config,
     target_dirs: &[PathBuf],
     ignore: &mut IgnoreMatcher,
-) {
+) -> bool {
     // A directory APPEARS either as a Create or — when moved/renamed INTO a watched target
     // (`mv /tmp/pkg src/pkg`) — as a name Modify (`RenameMode::To`/`Both`) (#332). Both need a
     // fresh pruned watch, because the parent is watched NonRecursive (#331) so notify won't
@@ -738,8 +740,9 @@ fn watch_created_dirs(
             EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both))
         );
     if !dir_appeared {
-        return;
+        return false;
     }
+    let mut placed_target_watch = false;
     for path in &event.paths {
         // `symlink_metadata` does NOT follow links: a symlink pointing at a directory is reported
         // as a symlink (`is_dir() == false`) → skipped, so we never recurse through it (#332).
@@ -756,6 +759,7 @@ fn watch_created_dirs(
                 watch_gitignore_rule_dirs(watcher, &config.root, target_dirs);
                 *ignore = IgnoreMatcher::compile(&config.root, target_dirs);
                 watch_configured_trees(watcher, config, target_dirs, ignore);
+                placed_target_watch = true;
             },
             CreatedDirPlacement::TargetSubtree => {
                 if ignore.is_ignored(path, true) {
@@ -769,9 +773,11 @@ fn watch_created_dirs(
                     continue;
                 }
                 watch_tree_pruned(watcher, path, ignore);
+                placed_target_watch = true;
             },
         }
     }
+    placed_target_watch
 }
 
 fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
@@ -876,13 +882,24 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
                 // MOVED in (`mv pkg src/pkg`) arrives as a rename, not a Create —
                 // `watch_created_dirs` handles both. Its own cheap filter
                 // (Create/rename + is-dir + not-ignored) makes calling it on every
-                // event correct; the maintenance pass a relevant event fires
-                // re-discovers the dir's current files, and the watch keeps SUBSEQUENT edits
-                // firing. Gates each path on real-dir + target relation + not-ignored, and
-                // recompiles the matcher for a moved-in nested `.gitignore` (#332).
-                watch_created_dirs(&mut notify_watcher, &event, &config, &target_dirs, &mut ignore);
-                linked_worktrees.watch_created_dirs(&mut notify_watcher, &event);
-                if event_is_relevant(&config, &ignore, &event)
+                // event correct. When it places a watch, arm the debounce even if the directory
+                // event itself is extensionless and therefore not relevant: the newly-created dir
+                // can already contain files that need the pass to discover them. The watch keeps
+                // SUBSEQUENT edits firing. Gates each path on real-dir + target relation +
+                // not-ignored, and recompiles the matcher for a moved-in nested `.gitignore`
+                // (#332).
+                let created_dir_watch_placed = watch_created_dirs(
+                    &mut notify_watcher,
+                    &event,
+                    &config,
+                    &target_dirs,
+                    &mut ignore,
+                );
+                let linked_created_dir_watch_placed =
+                    linked_worktrees.watch_created_dirs(&mut notify_watcher, &event);
+                if created_dir_watch_placed
+                    || linked_created_dir_watch_placed
+                    || event_is_relevant(&config, &ignore, &event)
                     || event_touches_worktree(
                         &event,
                         &linked_worktrees,
@@ -1332,7 +1349,10 @@ mod tests {
         let fresh = worktree.join("src/fresh");
         std::fs::create_dir_all(&fresh).unwrap();
         let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(fresh.clone());
-        worktrees.watch_created_dirs(&mut watcher, &create);
+        assert!(
+            worktrees.watch_created_dirs(&mut watcher, &create),
+            "created target dirs should request a maintenance pass",
+        );
         assert!(
             watcher.watched.iter().any(|(path, _)| path == &fresh),
             "created target dirs are watched through the centralized linked-worktree state",
@@ -1368,7 +1388,10 @@ mod tests {
         let ancestor = worktree.join("src");
         std::fs::create_dir_all(&ancestor).unwrap();
         let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(ancestor.clone());
-        worktrees.watch_created_dirs(&mut watcher, &create);
+        assert!(
+            worktrees.watch_created_dirs(&mut watcher, &create),
+            "created target ancestors should request a maintenance pass after placing watches",
+        );
 
         assert!(
             watcher
@@ -1388,6 +1411,92 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
+    fn linked_created_target_dir_requests_maintenance_when_directory_event_is_not_relevant() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let worktree =
+            std::env::temp_dir().join(format!("ragrat-wt-create-pass-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        std::fs::write(worktree.join(".gitignore"), "").unwrap();
+
+        let target_dirs = vec![PathBuf::from("src")];
+        let config = whole_root_config(&worktree, &target_dirs);
+        let mut watcher = RecordingWatcher::default();
+        let mut worktrees = watch_linked_worktrees(&mut watcher, &config, vec![worktree.clone()]);
+
+        watcher.watched.clear();
+        let pkg = worktree.join("src/pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("lib.rs"), "fn pkg() {}\n").unwrap();
+        let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(pkg.clone());
+
+        assert!(
+            !event_touches_worktree(&create, &worktrees, None),
+            "extensionless directory events are not target-file events",
+        );
+        assert!(
+            worktrees.watch_created_dirs(&mut watcher, &create),
+            "placing a linked target-dir watch must request a maintenance pass",
+        );
+        assert!(
+            watcher.watched.iter().any(|(path, _)| path == &pkg),
+            "the linked target directory is still watched for subsequent edits",
+        );
+
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
+    fn linked_created_dir_watch_signal_does_not_short_circuit_state_updates() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let first = std::env::temp_dir()
+            .join(format!("ragrat-wt-create-all-a-{}-{id}", std::process::id()));
+        let second = std::env::temp_dir()
+            .join(format!("ragrat-wt-create-all-b-{}-{id}", std::process::id()));
+        for root in [&first, &second] {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join(".gitignore"), "").unwrap();
+        }
+        let first = first.canonicalize().unwrap();
+        let second = second.canonicalize().unwrap();
+
+        let target_dirs = vec![PathBuf::from("src")];
+        let config = whole_root_config(&first, &target_dirs);
+        let mut watcher = RecordingWatcher::default();
+        let mut worktrees =
+            watch_linked_worktrees(&mut watcher, &config, vec![first.clone(), second.clone()]);
+
+        watcher.watched.clear();
+        let first_pkg = first.join("src/pkg");
+        let second_pkg = second.join("src/pkg");
+        std::fs::create_dir_all(&first_pkg).unwrap();
+        std::fs::create_dir_all(&second_pkg).unwrap();
+        let create = Event::new(EventKind::Create(CreateKind::Folder))
+            .add_path(first_pkg.clone())
+            .add_path(second_pkg.clone());
+
+        assert!(
+            worktrees.watch_created_dirs(&mut watcher, &create),
+            "at least one linked target dir was watched",
+        );
+        assert!(
+            watcher.watched.iter().any(|(path, _)| path == &first_pkg),
+            "the first linked state should still be updated",
+        );
+        assert!(
+            watcher.watched.iter().any(|(path, _)| path == &second_pkg),
+            "the second linked state should still be updated after the first returns true",
+        );
+
+        std::fs::remove_dir_all(&first).ok();
+        std::fs::remove_dir_all(&second).ok();
     }
 
     #[test]
