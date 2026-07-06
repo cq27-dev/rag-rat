@@ -391,6 +391,14 @@ impl LinkedWorktreeWatch {
     fn place_watches(&self, watcher: &mut impl notify::Watcher) {
         watch_configured_trees(watcher, &self.config, &self.target_dirs, &self.ignore);
         watch_gitignore_rule_dirs(watcher, &self.config.root, &self.target_dirs);
+        if let Some(root) =
+            missing_config_root_bootstrap_dir(&self.config.root, &self.checkout_root)
+        {
+            // The linked checkout may not have this subdir on the current branch yet. Keep a narrow
+            // bootstrap on the checkout root so the first recreated config-root component is
+            // observed without returning to a recursive whole-checkout watch.
+            let _ = watcher.watch(root, RecursiveMode::NonRecursive);
+        }
     }
 
     fn recompile_ignore_and_place_watches(&mut self, watcher: &mut impl notify::Watcher) {
@@ -399,7 +407,14 @@ impl LinkedWorktreeWatch {
     }
 
     fn watch_created_dirs(&mut self, watcher: &mut impl notify::Watcher, event: &Event) -> bool {
-        watch_created_dirs(watcher, event, &self.config, &self.target_dirs, &mut self.ignore)
+        watch_created_dirs(
+            watcher,
+            event,
+            &self.config,
+            &self.target_dirs,
+            &mut self.ignore,
+            Some(&self.checkout_root),
+        )
     }
 
     fn touches_event(&self, path: &Path) -> bool {
@@ -490,6 +505,25 @@ fn config_subdir_prefix(config: &Config) -> PathBuf {
         .and_then(|wt| crate::index::ignore_rules::base_under_worktree(&config.root, &wt))
         .and_then(|base| config.root.strip_prefix(&base).ok().map(Path::to_path_buf))
         .unwrap_or_default()
+}
+
+fn path_between_bootstrap_and_config_root(
+    path: &Path,
+    bootstrap_root: &Path,
+    config_root: &Path,
+) -> bool {
+    path.starts_with(bootstrap_root) && config_root.starts_with(path)
+}
+
+fn missing_config_root_bootstrap_dir<'a>(
+    config_root: &Path,
+    checkout_root: &'a Path,
+) -> Option<&'a Path> {
+    (config_root != checkout_root
+        && path_between_bootstrap_and_config_root(checkout_root, checkout_root, config_root)
+        && !config_root.exists()
+        && checkout_root.is_dir())
+    .then_some(checkout_root)
 }
 
 /// The `worktree_id` of the worktree that ENCLOSES `root`, canonicalized to match the ids
@@ -683,18 +717,29 @@ enum CreatedDirPlacement {
 
 /// How a newly appeared directory relates to the configured target set. `config.root` itself is
 /// watched non-recursively (the `gitignore_watch_dirs` ancestor chain), so a top-level create
-/// OUTSIDE a target — `vendor/`, a sibling of `src/`, or an ancestor of `config.root` — is also
-/// delivered to the event loop; without this gate [`watch_created_dirs`] would watch it even though
-/// it can never be indexed, re-exhausting inotify (#332). A whole-root target (`directories =
-/// ["."]`) treats every directory below `config.root` as a target subtree.
+/// OUTSIDE a target — `vendor/` or a sibling of `src/` — is also delivered to the event loop;
+/// without this gate [`watch_created_dirs`] would watch it even though it can never be indexed,
+/// re-exhausting inotify (#332). A linked checkout can also bootstrap an absent subdir-rooted
+/// `config.root`: the checkout root and any newly-created ancestors between it and `config.root`
+/// are target ancestors, not indexable subtrees. A whole-root target (`directories = ["."]`) treats
+/// every directory below `config.root` as a target subtree.
 fn created_dir_placement(
     config: &Config,
     target_dirs: &[PathBuf],
     path: &Path,
+    bootstrap_root: Option<&Path>,
 ) -> CreatedDirPlacement {
     let Ok(rel) = path.strip_prefix(&config.root) else {
+        if let Some(root) = bootstrap_root
+            && path_between_bootstrap_and_config_root(path, root, &config.root)
+        {
+            return CreatedDirPlacement::TargetAncestor;
+        }
         return CreatedDirPlacement::OutsideTargets;
     };
+    if rel.as_os_str().is_empty() {
+        return CreatedDirPlacement::TargetAncestor;
+    }
     if target_dirs.iter().any(|d| d == Path::new(".") || rel.starts_with(d)) {
         return CreatedDirPlacement::TargetSubtree;
     }
@@ -729,6 +774,7 @@ fn watch_created_dirs(
     config: &Config,
     target_dirs: &[PathBuf],
     ignore: &mut IgnoreMatcher,
+    bootstrap_root: Option<&Path>,
 ) -> bool {
     // A directory APPEARS either as a Create or — when moved/renamed INTO a watched target
     // (`mv /tmp/pkg src/pkg`) — as a name Modify (`RenameMode::To`/`Both`) (#332). Both need a
@@ -750,12 +796,13 @@ fn watch_created_dirs(
         if !is_real_dir {
             continue;
         }
-        match created_dir_placement(config, target_dirs, path) {
+        match created_dir_placement(config, target_dirs, path, bootstrap_root) {
             CreatedDirPlacement::OutsideTargets => continue,
             CreatedDirPlacement::TargetAncestor => {
                 // A nested target's leading directory can appear after startup. Watch the ancestor
                 // non-recursively so the eventual target dir creation is delivered, and re-place
                 // target watches too in case a fast `mkdir -p target/path` already created it.
+                let _ = watcher.watch(path, RecursiveMode::NonRecursive);
                 watch_gitignore_rule_dirs(watcher, &config.root, target_dirs);
                 *ignore = IgnoreMatcher::compile(&config.root, target_dirs);
                 watch_configured_trees(watcher, config, target_dirs, ignore);
@@ -894,6 +941,7 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
                     &config,
                     &target_dirs,
                     &mut ignore,
+                    None,
                 );
                 let linked_created_dir_watch_placed =
                     linked_worktrees.watch_created_dirs(&mut notify_watcher, &event);
@@ -1091,31 +1139,61 @@ mod tests {
         let config = whole_root_config(&root, &nested);
 
         assert_eq!(
-            created_dir_placement(&config, &nested, &PathBuf::from("/elsewhere/src")),
+            created_dir_placement(&config, &nested, &PathBuf::from("/elsewhere/src"), None),
             CreatedDirPlacement::OutsideTargets,
         );
         assert_eq!(
-            created_dir_placement(&config, &nested, &root.join("vendor")),
+            created_dir_placement(&config, &nested, &root.join("vendor"), None),
             CreatedDirPlacement::OutsideTargets,
         );
         assert_eq!(
-            created_dir_placement(&config, &nested, &root.join("src")),
+            created_dir_placement(&config, &nested, &root, None),
             CreatedDirPlacement::TargetAncestor,
         );
         assert_eq!(
-            created_dir_placement(&config, &nested, &root.join("src/generated")),
+            created_dir_placement(&config, &nested, &root.join("src"), None),
+            CreatedDirPlacement::TargetAncestor,
+        );
+        assert_eq!(
+            created_dir_placement(&config, &nested, &root.join("src/generated"), None),
             CreatedDirPlacement::TargetSubtree,
         );
         assert_eq!(
-            created_dir_placement(&config, &nested, &root.join("src/generated/pkg")),
+            created_dir_placement(&config, &nested, &root.join("src/generated/pkg"), None),
             CreatedDirPlacement::TargetSubtree,
         );
 
         let whole_root = vec![PathBuf::from(".")];
         let whole_config = whole_root_config(&root, &whole_root);
         assert_eq!(
-            created_dir_placement(&whole_config, &whole_root, &root.join("anything")),
+            created_dir_placement(&whole_config, &whole_root, &root.join("anything"), None),
             CreatedDirPlacement::TargetSubtree,
+        );
+
+        let checkout = PathBuf::from("/checkout");
+        let subdir_root = checkout.join("packages/crate");
+        let subdir_config = whole_root_config(&subdir_root, &nested);
+        assert_eq!(
+            created_dir_placement(
+                &subdir_config,
+                &nested,
+                &checkout.join("packages"),
+                Some(&checkout)
+            ),
+            CreatedDirPlacement::TargetAncestor,
+        );
+        assert_eq!(
+            created_dir_placement(&subdir_config, &nested, &subdir_root, Some(&checkout)),
+            CreatedDirPlacement::TargetAncestor,
+        );
+        assert_eq!(
+            created_dir_placement(
+                &subdir_config,
+                &nested,
+                &checkout.join("vendor"),
+                Some(&checkout)
+            ),
+            CreatedDirPlacement::OutsideTargets,
         );
     }
 
@@ -1414,6 +1492,161 @@ mod tests {
     }
 
     #[test]
+    fn linked_subdir_root_watch_placement_keeps_checkout_root_when_config_root_missing() {
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let repo = std::env::temp_dir()
+            .join(format!("ragrat-wt-missing-root-main-{}-{id}", std::process::id()));
+        let checkout = std::env::temp_dir()
+            .join(format!("ragrat-wt-missing-root-linked-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&checkout);
+        std::fs::create_dir_all(repo.join("crate/src")).unwrap();
+        std::fs::write(repo.join("crate/src/lib.rs"), "fn lib() {}\n").unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@e"],
+            vec!["config", "user.name", "t"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "base"],
+        ] {
+            let output = Command::new("git").args(&args).current_dir(&repo).output().unwrap();
+            assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        }
+        std::fs::create_dir_all(&checkout).unwrap();
+        let checkout = checkout.canonicalize().unwrap();
+        let config_root = repo.join("crate").canonicalize().unwrap();
+        let target_dirs = vec![PathBuf::from("src")];
+        let config = whole_root_config(&config_root, &target_dirs);
+
+        let mut watcher = RecordingWatcher::default();
+        let worktrees = watch_linked_worktrees(&mut watcher, &config, vec![checkout.clone()]);
+        let linked_root = checkout.join("crate");
+
+        assert_eq!(worktrees.states[0].config.root, linked_root);
+        assert!(!linked_root.exists(), "the linked branch has not created the configured root yet");
+        assert!(
+            watcher
+                .watched
+                .iter()
+                .any(|(path, mode)| path == &checkout && *mode == RecursiveMode::NonRecursive),
+            "a missing linked subdir-root needs a non-recursive checkout-root bootstrap watch",
+        );
+        assert!(
+            watcher.watched.iter().all(|(_, mode)| *mode == RecursiveMode::NonRecursive),
+            "missing-root bootstrapping must not restore recursive checkout watches",
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&checkout).ok();
+    }
+
+    #[test]
+    fn watch_created_dirs_reinstalls_watches_for_recreated_config_root() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("ragrat-watch-recreated-root-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "").unwrap();
+        let root = root.canonicalize().unwrap();
+        let target_dirs = vec![PathBuf::from("src")];
+        let config = whole_root_config(&root, &target_dirs);
+        let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
+        let mut watcher = RecordingWatcher::default();
+        let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(root.clone());
+
+        assert!(
+            watch_created_dirs(&mut watcher, &create, &config, &target_dirs, &mut ignore, None),
+            "recreated config roots should re-place target watches and request maintenance",
+        );
+        assert!(
+            watcher
+                .watched
+                .iter()
+                .any(|(path, mode)| path == &root && *mode == RecursiveMode::NonRecursive),
+            "the recreated config root itself should stay watched non-recursively",
+        );
+        assert!(
+            watcher
+                .watched
+                .iter()
+                .any(|(path, mode)| path == &root.join("src")
+                    && *mode == RecursiveMode::NonRecursive),
+            "configured targets below the recreated root should be watched again",
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn watch_created_dirs_bootstraps_missing_linked_subdir_root_ancestors() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let checkout = std::env::temp_dir()
+            .join(format!("ragrat-watch-linked-ancestor-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&checkout);
+        std::fs::create_dir_all(checkout.join("packages")).unwrap();
+        std::fs::create_dir_all(checkout.join("vendor")).unwrap();
+        let checkout = checkout.canonicalize().unwrap();
+        let packages = checkout.join("packages");
+        let target_dirs = vec![PathBuf::from("src")];
+        let config = whole_root_config(&packages.join("crate"), &target_dirs);
+        let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+        let mut watcher = RecordingWatcher::default();
+        let create_packages =
+            Event::new(EventKind::Create(CreateKind::Folder)).add_path(packages.clone());
+
+        assert!(
+            watch_created_dirs(
+                &mut watcher,
+                &create_packages,
+                &config,
+                &target_dirs,
+                &mut ignore,
+                Some(&checkout),
+            ),
+            "an intermediate ancestor of a missing linked config root must keep the bootstrap \
+             moving",
+        );
+        assert!(
+            watcher
+                .watched
+                .iter()
+                .any(|(path, mode)| path == &packages && *mode == RecursiveMode::NonRecursive),
+            "the appeared ancestor itself must be watched for the next path component",
+        );
+        assert!(
+            watcher.watched.iter().all(|(_, mode)| *mode == RecursiveMode::NonRecursive),
+            "missing linked-root ancestors must not reintroduce recursive checkout watches",
+        );
+
+        watcher.watched.clear();
+        let vendor = checkout.join("vendor");
+        let create_vendor =
+            Event::new(EventKind::Create(CreateKind::Folder)).add_path(vendor.clone());
+        assert!(
+            !watch_created_dirs(
+                &mut watcher,
+                &create_vendor,
+                &config,
+                &target_dirs,
+                &mut ignore,
+                Some(&checkout),
+            ),
+            "sibling directories under the checkout are outside the missing config root",
+        );
+        assert!(watcher.watched.is_empty(), "outside siblings should not gain watches");
+
+        std::fs::remove_dir_all(&checkout).ok();
+    }
+
+    #[test]
     fn linked_created_target_dir_requests_maintenance_when_directory_event_is_not_relevant() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
@@ -1519,7 +1752,7 @@ mod tests {
         let already = root.join("src/already_ignored");
         let create_already =
             Event::new(EventKind::Create(CreateKind::Folder)).add_path(already.clone());
-        watch_created_dirs(&mut watcher, &create_already, &config, &target_dirs, &mut ignore);
+        watch_created_dirs(&mut watcher, &create_already, &config, &target_dirs, &mut ignore, None);
         assert!(
             watcher.watched.iter().all(|(path, _)| path != &already),
             "a dir ignored before recompile should not be watched",
@@ -1530,7 +1763,7 @@ mod tests {
         let newly = root.join("src/newly_ignored");
         let create_newly =
             Event::new(EventKind::Create(CreateKind::Folder)).add_path(newly.clone());
-        watch_created_dirs(&mut watcher, &create_newly, &config, &target_dirs, &mut ignore);
+        watch_created_dirs(&mut watcher, &create_newly, &config, &target_dirs, &mut ignore, None);
         assert!(
             watcher.watched.iter().all(|(path, _)| path != &newly),
             "a dir ignored only after recompile should not be watched",
@@ -2150,7 +2383,7 @@ mod tests {
         std::fs::create_dir_all(&fresh).unwrap();
         // Feed the create event through the same handler watcher_main runs, which places the watch.
         let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(fresh.clone());
-        watch_created_dirs(&mut w, &create, &config, &target_dirs, &mut ignore);
+        watch_created_dirs(&mut w, &create, &config, &target_dirs, &mut ignore, None);
 
         // A write inside the freshly-watched dir must now be delivered.
         std::fs::write(fresh.join("c.rs"), "// c\n").unwrap();
@@ -2247,7 +2480,7 @@ mod tests {
         std::fs::create_dir_all(&moved).unwrap();
         let rename =
             Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(moved.clone());
-        watch_created_dirs(&mut w, &rename, &config, &target_dirs, &mut ignore);
+        watch_created_dirs(&mut w, &rename, &config, &target_dirs, &mut ignore, None);
         std::fs::write(moved.join("d.rs"), "// d\n").unwrap();
         let seen = drain_until_path_under(&rx, &moved, 3);
         drop(w);
@@ -2334,7 +2567,7 @@ mod tests {
         let link = root.join("linked");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(link.clone());
-        watch_created_dirs(&mut w, &create, &config, &target_dirs, &mut ignore);
+        watch_created_dirs(&mut w, &create, &config, &target_dirs, &mut ignore, None);
 
         // An edit to the file INSIDE the link target must NOT be delivered (the link wasn't
         // watched, and the outside dir is not under config.root at all).
@@ -2386,7 +2619,7 @@ mod tests {
         let vendor_sub = vendor.join("sub");
         std::fs::create_dir_all(&vendor_sub).unwrap();
         let vendor_ev = Event::new(EventKind::Create(CreateKind::Folder)).add_path(vendor.clone());
-        watch_created_dirs(&mut w, &vendor_ev, &config, &target_dirs, &mut ignore);
+        watch_created_dirs(&mut w, &vendor_ev, &config, &target_dirs, &mut ignore, None);
         std::fs::write(vendor_sub.join("v.rs"), "// v\n").unwrap();
         let vendor_seen = drain_until_path_under(&rx, &vendor_sub, 2);
 
@@ -2394,7 +2627,7 @@ mod tests {
         let pkg = root.join("src/pkg");
         std::fs::create_dir_all(&pkg).unwrap();
         let pkg_ev = Event::new(EventKind::Create(CreateKind::Folder)).add_path(pkg.clone());
-        watch_created_dirs(&mut w, &pkg_ev, &config, &target_dirs, &mut ignore);
+        watch_created_dirs(&mut w, &pkg_ev, &config, &target_dirs, &mut ignore, None);
         std::fs::write(pkg.join("p.rs"), "// p\n").unwrap();
         let pkg_seen = drain_until_path_under(&rx, &pkg, 3);
 
@@ -2447,7 +2680,7 @@ mod tests {
         std::fs::write(pkg.join("kept_sub/y.rs"), "// y\n").unwrap();
         let rename =
             Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(pkg.clone());
-        watch_created_dirs(&mut w, &rename, &config, &target_dirs, &mut ignore);
+        watch_created_dirs(&mut w, &rename, &config, &target_dirs, &mut ignore, None);
 
         // The nested-ignored subdir must NOT be watched; the kept sibling MUST be.
         std::fs::write(pkg.join("ignored_sub/x.rs"), "// x edited\n").unwrap();
