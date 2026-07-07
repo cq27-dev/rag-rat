@@ -17,12 +17,23 @@ pub(crate) fn create_memory(
     validate_len("body", &request.body, MAX_MEMORY_BODY_LEN)?;
     let source = request.source.clone().unwrap_or_else(|| "agent".to_string());
     validate_source(&source)?;
+    validate_payload(request.payload_json.as_deref())?;
     // `None` = an UNANCHORED node (#463): a `Concept` / standalone `Task` with no code anchor.
     let binding = resolve_binding(conn, &request.bind)?;
-    let input_hash = memory_input_hash(&request.kind, &request.title, &request.body, &request.tags);
-    if let Some(existing_id) =
-        duplicate_memory_id(conn, &request.title, &request.body, binding.as_ref())?
-    {
+    let input_hash = memory_input_hash(
+        &request.kind,
+        &request.title,
+        &request.body,
+        &request.tags,
+        request.payload_json.as_deref(),
+    );
+    if let Some(existing_id) = duplicate_memory_id(
+        conn,
+        &request.title,
+        &request.body,
+        request.payload_json.as_deref(),
+        binding.as_ref(),
+    )? {
         let memory = memory_by_id(conn, &existing_id)?
             .ok_or_else(|| anyhow::anyhow!("duplicate memory `{existing_id}` disappeared"))?;
         return Ok(RepoMemoryCreateResult { memory, duplicate: true });
@@ -39,9 +50,9 @@ pub(crate) fn create_memory(
         "
         INSERT INTO repo_memories(
             id, kind, title, body, confidence, status, created_by, created_at_ms, updated_at_ms,
-            source, source_text_hash, input_hash, memory_version
+            source, payload_json, source_text_hash, input_hash, memory_version
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?7, ?8, ?9, ?10, 'v1')
+        VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?7, ?8, ?9, ?10, ?11, 'v1')
         ",
         params![
             id,
@@ -52,6 +63,7 @@ pub(crate) fn create_memory(
             request.created_by,
             now,
             source,
+            request.payload_json,
             binding.as_ref().and_then(|b| b.source_text_hash.clone()),
             input_hash
         ],
@@ -100,6 +112,7 @@ pub(crate) fn update_memory(
     if let Some(body) = update.body.as_deref() {
         validate_len("body", body, MAX_MEMORY_BODY_LEN)?;
     }
+    validate_payload(update.payload_json.as_deref())?;
     let now = now_ms();
     conn.execute(
         "
@@ -109,6 +122,7 @@ pub(crate) fn update_memory(
             body = ?4,
             confidence = ?5,
             status = ?6,
+            payload_json = ?8,
             updated_at_ms = ?7
         WHERE id = ?1
         ",
@@ -119,7 +133,9 @@ pub(crate) fn update_memory(
             update.body.unwrap_or(current.body),
             update.confidence.unwrap_or(current.confidence),
             update.status.unwrap_or(current.status),
-            now
+            now,
+            // `None` leaves the stored payload unchanged (like the other fields above).
+            update.payload_json.or(current.payload_json)
         ],
     )?;
     if let Some(tags) = update.tags {
@@ -139,6 +155,7 @@ pub(crate) fn mark_obsolete(conn: &Connection, memory_id: &str) -> anyhow::Resul
         confidence: None,
         status: Some("obsolete".to_string()),
         tags: None,
+        payload_json: None,
     })
 }
 pub(crate) fn memory_by_id(
@@ -169,6 +186,7 @@ pub(crate) fn memory_by_id(
                    created_at_ms AS created_at_ms,
                    updated_at_ms AS updated_at_ms,
                    source AS source,
+                   payload_json AS payload_json,
                    source_text_hash AS source_text_hash,
                    input_hash AS input_hash,
                    memory_version AS memory_version

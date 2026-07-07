@@ -268,6 +268,11 @@ fn queue_reason(
 ///
 /// `pub(crate)` so the surfacing hydrator recomputes it identically to the queue / verdict-pass
 /// stamp.
+/// The dream content-identity key over a memory's CURRENT note (title + body). NOTE (#465): the
+/// polymorphic `payload_json` is NOT folded here yet — the canonical payload fold is deferred to
+/// phase B (#404) with the rest of the §5.5 canonicalization. This is not a live staleness bug: the
+/// derived summary/verdict rows are over title+body, which a payload-only edit does not change, so
+/// they stay correct. (Create-time dedup DOES fold the payload — see `memory_input_hash`.)
 pub(crate) fn note_content_hash(title: &str, body: &str) -> String {
     crate::index::hex_sha256(format!("{}\n{}", title.trim(), body.trim()).as_bytes())
 }
@@ -380,9 +385,12 @@ pub fn evidence_pack(conn: &Connection, memory_id: &str) -> anyhow::Result<Evide
     Ok(EvidencePack { memory_id: memory_id.to_string(), identifiers: resolutions, excerpts })
 }
 
-/// The deterministic `memory_unverifiable` findings: active memories whose bindings are all
-/// gone/absent (no live non-`scip_moniker` binding) AND none of whose identifiers resolve anywhere
-/// in the whole-tree index. Repo-scoped; the evidence names exactly what was checked. Folded into
+/// The deterministic `memory_unverifiable` findings: active memories that WERE anchored but whose
+/// bindings are now all gone (no live non-`scip_moniker` binding, yet ≥1 binding row) — OR a
+/// zero-binding ORPHAN of a should-be-anchored kind — AND none of whose identifiers resolve
+/// anywhere in the whole-tree index. An intentional UNANCHORED node (a `Task`/`Concept` with zero
+/// binding rows — #463/#465) is EXCLUDED: it is anchorless BY DESIGN, not broken, so flagging it
+/// would be spurious noise. Repo-scoped; the evidence names exactly what was checked. Folded into
 /// the identity-keyed `dream_findings` lifecycle by `dream_run` (so a memory that becomes
 /// verifiable again is resolved), which is why this runs over the full active population, not the
 /// budget.
@@ -391,14 +399,24 @@ pub(super) fn unverifiable_findings(conn: &Connection) -> rusqlite::Result<Vec<D
     let mem_clause = schema::periphery_repo_scope_clause(&scope, "repo_memories");
     let file_paths = indexed_file_paths(conn)?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, title, body FROM repo_memories WHERE status = 'active'{mem_clause} ORDER BY id"
+        "SELECT id, kind, title, body FROM repo_memories WHERE status = 'active'{mem_clause} \
+         ORDER BY id"
     ))?;
-    let mems: Vec<(String, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let mems: Vec<(String, String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
     let mut out = Vec::new();
-    for (memory_id, title, body) in mems {
+    for (memory_id, kind, title, body) in mems {
+        // Intentional UNANCHORED node (#463/#465): a `Task`/`Concept` legitimately has no code
+        // anchor, so a zero-binding one is NOT "unverifiable". A zero-binding memory of any OTHER
+        // kind is an orphan (all should-be-anchored) and is still flagged below, as is any memory
+        // whose bindings all went `gone` (≥1 row, none live).
+        if matches!(kind.as_str(), "Task" | "Concept")
+            && !memory_has_any_binding(conn, &memory_id, &scope)?
+        {
+            continue;
+        }
         if memory_has_live_binding(conn, &memory_id, &scope)? {
             continue;
         }
@@ -438,6 +456,24 @@ fn memory_has_live_binding(
             "SELECT COUNT(*) FROM repo_memory_bindings WHERE memory_id = ?1 AND binding_kind != \
              'scip_moniker' AND anchor_status != 'gone'{bind_clause}"
         ),
+        [memory_id],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Whether `memory_id` has ANY binding row at all (any kind, any `anchor_status`). Distinguishes an
+/// intentional UNANCHORED node (#463/#465 — zero rows, anchorless by design) from a broken memory
+/// whose anchors all went `gone` (≥1 row): only the intentional case is excused from
+/// `memory_unverifiable`, and only for the `Task`/`Concept` kinds.
+fn memory_has_any_binding(
+    conn: &Connection,
+    memory_id: &str,
+    scope: &Option<String>,
+) -> rusqlite::Result<bool> {
+    let bind_clause = schema::periphery_repo_scope_clause(scope, "repo_memory_bindings");
+    let count: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM repo_memory_bindings WHERE memory_id = ?1{bind_clause}"),
         [memory_id],
         |r| r.get(0),
     )?;
@@ -754,6 +790,17 @@ mod tests {
         .unwrap();
     }
 
+    /// Seed an active memory of an explicit `kind` (for the #465 Task/Concept cases).
+    fn seed_memory_kind(c: &Connection, id: &str, kind: &str, title: &str, body: &str, repo: &str) {
+        c.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
+             (?1,?2,?3,?4,'high','active','agent',1,1,'agent','v1',?5)",
+            rusqlite::params![id, kind, title, body, repo],
+        )
+        .unwrap();
+    }
+
     /// Seed a file + one chunk carrying `text`, under `repo_id`. Returns the file id.
     fn seed_file(c: &Connection, path: &str, text: &str, repo_id: &str) -> i64 {
         c.execute(
@@ -778,6 +825,45 @@ mod tests {
 
     fn content_hash(title: &str, body: &str) -> String {
         note_content_hash(title, body)
+    }
+
+    /// #465: dream-verify excuses an intentional unanchored node (a zero-binding `Task`/`Concept`)
+    /// from `memory_unverifiable`, but still flags a zero-binding ORPHAN of a should-be-anchored
+    /// kind and a memory whose bindings all went `gone`.
+    #[test]
+    fn unverifiable_excuses_unanchored_task_concept_but_flags_orphans() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        // Zero-binding Concept + Task — intentional unanchored nodes; must NOT be flagged.
+        seed_memory_kind(
+            &c,
+            "concept",
+            "Concept",
+            "event log over polling",
+            "prose, no anchor",
+            "r",
+        );
+        seed_memory_kind(&c, "task", "Task", "do the thing", "prose, no anchor", "r");
+        // Zero-binding Invariant — an orphan of a should-be-anchored kind; MUST be flagged.
+        seed_memory(&c, "orphan", "gone note", "refs `no_such_symbol_xyz`", "r");
+        // A gone-binding memory — broken; MUST be flagged.
+        seed_memory(&c, "broken", "another", "refs `also_missing_xyz`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, anchor_status, \
+             created_at_ms, repo_id) VALUES ('broken','symbol','old','gone',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let subjects: Vec<String> =
+            unverifiable_findings(&c).unwrap().into_iter().map(|f| f.subject).collect();
+        assert!(!subjects.iter().any(|s| s == "concept"), "unanchored Concept excused");
+        assert!(!subjects.iter().any(|s| s == "task"), "unanchored Task excused");
+        assert!(
+            subjects.iter().any(|s| s == "orphan"),
+            "a zero-binding orphan of a normal kind is still flagged"
+        );
+        assert!(subjects.iter().any(|s| s == "broken"), "an all-gone memory is still flagged");
     }
 
     #[test]

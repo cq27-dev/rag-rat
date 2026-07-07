@@ -648,7 +648,8 @@ fn copy_memories(
     }
     let mut stmt = source.prepare(
         "SELECT id, kind, title, body, confidence, status, created_by, created_at_ms, \
-         updated_at_ms, source, source_text_hash, input_hash, memory_version FROM repo_memories",
+         updated_at_ms, source, source_text_hash, input_hash, memory_version, payload_json FROM \
+         repo_memories",
     )?;
     let mut rows = stmt.query([])?;
     let mut count = 0u64;
@@ -662,25 +663,25 @@ fn copy_memories(
         let changed = tx.execute(
             "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
              created_at_ms, updated_at_ms, source, source_text_hash, input_hash, memory_version, \
-             repo_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             payload_json, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET
                kind = excluded.kind, title = excluded.title, body = excluded.body,
                confidence = excluded.confidence, status = excluded.status,
                created_by = excluded.created_by, created_at_ms = excluded.created_at_ms,
                updated_at_ms = excluded.updated_at_ms, source = excluded.source,
                source_text_hash = excluded.source_text_hash, input_hash = excluded.input_hash,
-               memory_version = excluded.memory_version
+               memory_version = excluded.memory_version, payload_json = excluded.payload_json
              WHERE repo_memories.repo_id = excluded.repo_id
                AND (repo_memories.kind, repo_memories.title, repo_memories.body, \
              repo_memories.confidence, repo_memories.status, repo_memories.created_by, \
              repo_memories.created_at_ms, repo_memories.updated_at_ms, repo_memories.source, \
              repo_memories.source_text_hash, repo_memories.input_hash, \
-             repo_memories.memory_version)
+             repo_memories.memory_version, repo_memories.payload_json)
                IS NOT (excluded.kind, excluded.title, excluded.body, excluded.confidence, \
              excluded.status, excluded.created_by, excluded.created_at_ms, \
              excluded.updated_at_ms, excluded.source, excluded.source_text_hash, \
-             excluded.input_hash, excluded.memory_version)",
+             excluded.input_hash, excluded.memory_version, excluded.payload_json)",
             params![
                 target_id,
                 row.get::<_, String>(1)?,
@@ -695,6 +696,7 @@ fn copy_memories(
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, Option<String>>(11)?,
                 row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(13)?,
                 repo_id,
             ],
         )?;
@@ -1137,6 +1139,12 @@ mod tests {
             )
             .unwrap();
         }
+        // #465: m1 carries a polymorphic payload — it must survive import verbatim, not be NULLed.
+        conn.execute(
+            r#"UPDATE repo_memories SET payload_json = '{"priority":1}' WHERE id = 'm1'"#,
+            [],
+        )
+        .unwrap();
         // A binding on m1 with the LOCAL rowid columns populated (must be NULLed on import) and
         // EVERY portable field set (must survive verbatim), including the moniker relocation
         // provenance.
@@ -1378,12 +1386,16 @@ mod tests {
         );
         // Zero-diff content: the no-edit retry converged — the target rows still carry the
         // source content verbatim (the gated upsert wrote NOTHING, it didn't rewrite in place).
-        let (title, body): (String, String) = target
-            .query_row("SELECT title, body FROM repo_memories WHERE id='m1'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+        let (title, body, payload): (String, String, Option<String>) = target
+            .query_row(
+                "SELECT title, body, payload_json FROM repo_memories WHERE id='m1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
         assert_eq!((title.as_str(), body.as_str()), ("one", "body"));
+        // #465: the payload was carried through the consolidation upsert (not turned into NULL).
+        assert_eq!(payload.as_deref(), Some(r#"{"priority":1}"#), "m1 payload survives import");
     }
 
     /// The CRASH-CREATED divergence window (Codex batch 8, finding 4): the import txn commits,

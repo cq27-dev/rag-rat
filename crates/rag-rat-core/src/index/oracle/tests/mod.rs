@@ -483,6 +483,7 @@ fn create_target_memory(h: &Harness, symbol_id: i64) -> String {
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget { symbol_id: Some(symbol_id), ..Default::default() },
     })
     .unwrap();

@@ -18,6 +18,7 @@ fn dir_memory_binds_to_a_directory() {
             created_by: Some("test-agent".to_string()),
             source: Some("agent".to_string()),
             tags: vec![],
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
@@ -89,6 +90,7 @@ fn dir_memory_validation_current_and_gone() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: vec![],
+        payload_json: None,
         bind: dir_bind(Some("src".to_string())),
     })
     .unwrap();
@@ -103,6 +105,7 @@ fn dir_memory_validation_current_and_gone() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: vec![],
+        payload_json: None,
         bind: dir_bind(Some("does/not/exist".to_string())),
     })
     .unwrap();
@@ -116,6 +119,7 @@ fn dir_memory_validation_current_and_gone() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: vec![],
+        payload_json: None,
         bind: dir_bind(Some("".to_string())),
     })
     .unwrap();
@@ -186,6 +190,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: vec![],
+            payload_json: None,
             bind: dir_bind(Some("src".to_string())),
         })
         .unwrap();
@@ -200,6 +205,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: vec![],
+            payload_json: None,
             bind: path_bind("src/lib.rs".to_string()),
         })
         .unwrap();

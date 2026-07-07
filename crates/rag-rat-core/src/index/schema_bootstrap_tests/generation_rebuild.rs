@@ -749,6 +749,7 @@ fn a_memory_written_mid_rebuild_survives_the_flip_intact() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: Vec::new(),
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 chunk_id: Some(live_chunk_id),
                 ..Default::default()

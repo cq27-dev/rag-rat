@@ -56,6 +56,12 @@ pub struct RepoMemory {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub source: String,
+    /// Opaque, `schema_version`-tagged JSON payload for polymorphic nodes (#465) — the
+    /// kind-specific structured data a `Task` / `Concept` carries (e.g. a task's
+    /// priority/estimate). `None` for a plain note. Stored verbatim; the core does not type
+    /// it. (content_hash folds it in phase B.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_json: Option<String>,
     // Internal anchoring/dedup mechanics — never actionable for a reader, so kept off the wire.
     #[serde(skip_serializing)]
     pub source_text_hash: Option<String>,
@@ -155,6 +161,11 @@ pub struct RepoMemoryCreate {
     pub confidence: String,
     pub created_by: Option<String>,
     pub source: Option<String>,
+    /// Opaque JSON payload for a polymorphic node (#465) — a `Task`/`Concept`'s kind-specific
+    /// data. Validated as a JSON object with no node/edge references (payload-closure); stored
+    /// verbatim.
+    #[serde(default)]
+    pub payload_json: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     pub bind: RepoMemoryBindTarget,
@@ -226,6 +237,9 @@ pub struct RepoMemoryUpdate {
     pub confidence: Option<String>,
     pub status: Option<String>,
     pub tags: Option<Vec<String>>,
+    /// Set the node's payload (#465). `None` leaves the stored payload unchanged (like the other
+    /// fields); a `Some` value replaces it. Clearing a payload to null is not supported yet.
+    pub payload_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -569,6 +583,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             source: "agent".to_string(),
+            payload_json: None,
             source_text_hash: None,
             input_hash: None,
             memory_version: String::new(),
@@ -639,6 +654,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             source: "agent".to_string(),
+            payload_json: None,
             source_text_hash: None,
             input_hash: None,
             memory_version: String::new(),

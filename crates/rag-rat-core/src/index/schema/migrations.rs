@@ -1182,6 +1182,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_045_ID => Some(45),
             MIGRATION_046_ID => Some(46),
             MIGRATION_047_ID => Some(47),
+            MIGRATION_048_ID => Some(48),
             _ => None,
         })
         .max()
@@ -1238,6 +1239,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_045_ID
             | MIGRATION_046_ID
             | MIGRATION_047_ID
+            | MIGRATION_048_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1291,6 +1293,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_045_ID => migration.checksum != MIGRATION_045_CHECKSUM,
         MIGRATION_046_ID => migration.checksum != MIGRATION_046_CHECKSUM,
         MIGRATION_047_ID => migration.checksum != MIGRATION_047_CHECKSUM,
+        MIGRATION_048_ID => migration.checksum != MIGRATION_048_CHECKSUM,
         _ => false,
     }
 }
@@ -3371,6 +3374,17 @@ fn rebuild_repo_memory_fts_with_repo_id(conn: &Connection) -> rusqlite::Result<(
 /// `parser::detect_is_test`) so clone detection can keep tests out of the corpus. Idempotent via
 /// `add_column_if_missing`. Existing rows default to 0 (non-test) until the next reindex
 /// repopulates them — accurate `is_test` needs a reindex with this binary.
+/// V048 (#465): `repo_memories.payload_json` — a nullable opaque canonical-JSON payload for
+/// polymorphic memory nodes. The `Task` / `Concept` kinds carry a kind-specific,
+/// `schema_version`-tagged payload here; the core stores it verbatim and folds its canonical form
+/// into `content_hash` (`dream::note_content_hash`), so a payload edit self-invalidates the derived
+/// dream summary/verdict rows exactly as a title/body edit does. Additive + nullable: existing rows
+/// read back `NULL` (no payload).
+pub(crate) fn apply_memory_payload_json(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "repo_memories", "payload_json", "TEXT")?;
+    Ok(())
+}
+
 pub(crate) fn apply_symbols_is_test(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "symbols", "is_test", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(())

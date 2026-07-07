@@ -499,6 +499,8 @@ pub enum McpMemoryKind {
     FollowUp,
     OpenQuestion,
     Obsolete,
+    Task,
+    Concept,
 }
 
 impl McpMemoryKind {
@@ -517,6 +519,8 @@ impl McpMemoryKind {
             Self::FollowUp => "FollowUp",
             Self::OpenQuestion => "OpenQuestion",
             Self::Obsolete => "Obsolete",
+            Self::Task => "Task",
+            Self::Concept => "Concept",
         }
     }
 }
@@ -638,6 +642,10 @@ pub struct MemoryCreateArgs {
     pub source: Option<McpMemorySource>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Optional structured payload (#465) for a polymorphic node — a `Task`/`Concept`'s
+    /// kind-specific JSON object (e.g. a task's priority/estimate). Must be a JSON object.
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
     /// Optional (#463): omit to create an UNANCHORED node (a `Concept` or standalone `Task` that
     /// lives only as a graph node). When present, names exactly one code/anchor binding.
     #[serde(default)]
@@ -661,6 +669,9 @@ pub struct MemoryUpdateArgs {
     pub confidence: Option<McpMemoryConfidence>,
     pub status: Option<McpMemoryStatus>,
     pub tags: Option<Vec<String>>,
+    /// Set the node's structured payload (#465). Omit to leave the stored payload unchanged; a
+    /// JSON object replaces it.
+    pub payload: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -756,6 +767,7 @@ impl MemoryCreateArgs {
             created_by: self.created_by,
             source: self.source.map(|source| source.as_str().to_string()),
             tags: self.tags,
+            payload_json: self.payload.map(|payload| payload.to_string()),
             bind: self.bind.into(),
         }
     }
@@ -771,6 +783,7 @@ impl MemoryUpdateArgs {
             confidence: self.confidence.map(|confidence| confidence.as_str().to_string()),
             status: self.status.map(|status| status.as_str().to_string()),
             tags: self.tags,
+            payload_json: self.payload.map(|payload| payload.to_string()),
         }
     }
 }

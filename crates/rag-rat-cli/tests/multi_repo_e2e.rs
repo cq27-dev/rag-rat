@@ -278,6 +278,7 @@ fn ref_memory(title: &str, gone_path: &str, bind_path: &str) -> RepoMemoryCreate
         created_by: Some("a8-matrix".into()),
         source: Some("agent".into()),
         tags: vec![],
+        payload_json: None,
         bind: RepoMemoryBindTarget { path: Some(bind_path.into()), ..Default::default() },
     }
 }
@@ -446,6 +447,7 @@ fn memories_are_isolated_across_repos() {
         created_by: Some("a8".into()),
         source: Some("agent".into()),
         tags: vec![],
+        payload_json: None,
         bind: RepoMemoryBindTarget { path: Some("src/common.rs".into()), ..Default::default() },
     };
     let a_mem = open_scoped(&repo_a, &data_dir)
@@ -510,6 +512,7 @@ fn memories_are_isolated_across_repos() {
             created_by: Some("a8".into()),
             source: Some("agent".into()),
             tags: vec![],
+            payload_json: None,
             bind: RepoMemoryBindTarget {
                 path: Some("src/vanished_a.rs".into()),
                 ..Default::default()
@@ -635,6 +638,7 @@ fn gc_of_one_repo_leaves_the_other_intact_and_reports_per_repo() {
             created_by: Some("a8".into()),
             source: Some("agent".into()),
             tags: vec![],
+            payload_json: None,
             bind: RepoMemoryBindTarget { path: Some("src/b1.rs".into()), ..Default::default() },
         })
         .unwrap();
@@ -711,6 +715,7 @@ fn consolidate_lands_a_third_legacy_repos_memories_fts_searchable() {
             created_by: Some("a8".into()),
             source: Some("agent".into()),
             tags: vec![],
+            payload_json: None,
             bind: RepoMemoryBindTarget { path: Some("src/common.rs".into()), ..Default::default() },
         })
         .unwrap()
@@ -804,6 +809,7 @@ fn concurrent_index_of_a_and_write_on_b_are_lock_disjoint() {
             created_by: Some("a8".into()),
             source: Some("agent".into()),
             tags: vec![],
+            payload_json: None,
             bind: RepoMemoryBindTarget { path: Some("src/common.rs".into()), ..Default::default() },
         })
         .expect("B's memory write completes while its own flock is held and A is reindexing");
@@ -900,6 +906,7 @@ fn linked_worktree_resolves_through_main_config() {
             created_by: Some("a8".into()),
             source: Some("agent".into()),
             tags: vec![],
+            payload_json: None,
             bind: RepoMemoryBindTarget { path: Some("src/common.rs".into()), ..Default::default() },
         })
         .unwrap()

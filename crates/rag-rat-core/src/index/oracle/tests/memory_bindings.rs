@@ -27,6 +27,7 @@ fn path_binding_status_after_validate(h: &Harness, path: &str) -> String {
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget { path: Some(path.to_string()), ..Default::default() },
     })
     .unwrap();
@@ -88,6 +89,7 @@ fn spanned_path_binding_to_unindexed_file_is_unverified() {
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget {
             path: Some("tools/build.sh".to_string()),
             start_line: Some(1),
@@ -121,6 +123,7 @@ fn dir_binding_to_unindexed_dir_present_on_disk_is_current() {
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget { dir: Some("scripts".to_string()), ..Default::default() },
     })
     .unwrap();
@@ -146,6 +149,7 @@ fn dir_binding_to_missing_dir_is_gone() {
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget {
             dir: Some("does/not/exist".to_string()),
             ..Default::default()
@@ -218,6 +222,7 @@ fn validate_prefers_active_root_over_persisted_meta() {
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget {
             path: Some("tools/notes.Containerfile".to_string()),
             ..Default::default()
@@ -483,6 +488,7 @@ fn bare_path_binding_survives_file_edit_spanned_goes_stale() {
             created_by: None,
             source: None,
             tags: Vec::new(),
+            payload_json: None,
             bind: RepoMemoryBindTarget {
                 path: Some("notes.rs".to_string()),
                 start_line: start,

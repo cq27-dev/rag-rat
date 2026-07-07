@@ -18,7 +18,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 47;
+pub const LATEST_SCHEMA_VERSION: u32 = 48;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -322,6 +322,12 @@ const MIGRATION_047_DESCRIPTION: &str =
     "Add memory_model_failures, a repo_id-scoped dream sibling table that records deterministic \
      verdict/compaction model failures with stable enum tokens and input/model freshness stamps, \
      so rejected current attempts do not rerun every dream pass";
+const MIGRATION_048_ID: &str = "048_memory_payload_json";
+const MIGRATION_048_CHECKSUM: &str = "sha256:rag-rat-memory-payload-json-v48";
+const MIGRATION_048_DESCRIPTION: &str =
+    "Add repo_memories.payload_json, a nullable opaque canonical-JSON payload for polymorphic \
+     memory nodes (the Task / Concept kinds), folded into the content_hash so a payload edit \
+     self-invalidates the derived dream summary/verdict rows exactly as a title/body edit does";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -703,6 +709,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_047_CHECKSUM,
         description: MIGRATION_047_DESCRIPTION,
         apply: apply_memory_model_failures_table,
+    },
+    Migration {
+        id: MIGRATION_048_ID,
+        checksum: MIGRATION_048_CHECKSUM,
+        description: MIGRATION_048_DESCRIPTION,
+        apply: apply_memory_payload_json,
     },
 ];
 

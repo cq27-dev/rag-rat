@@ -878,6 +878,7 @@ fn orientation_composes_read_only() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: vec![],
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget {
             path: Some("src/a/x.rs".to_string()),
             logical_symbol_id: None,

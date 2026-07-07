@@ -960,6 +960,7 @@ fn a5_create_memory(
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget { commit_hash: Some(commit.to_string()), ..Default::default() },
     })
     .unwrap()
@@ -1213,6 +1214,7 @@ fn memory_by_id_read_and_mutations_refuse_a_sibling_repos_memory() {
             confidence: None,
             status: None,
             tags: None,
+            payload_json: None,
         })
         .is_err(),
         "update_memory must refuse a sibling repo's memory id",

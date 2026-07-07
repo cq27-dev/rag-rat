@@ -663,6 +663,7 @@ fn impact_report_flags_a_section_truncated_at_limit() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: vec![],
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 symbol_id: Some(hub.symbol_id),
                 ..Default::default()

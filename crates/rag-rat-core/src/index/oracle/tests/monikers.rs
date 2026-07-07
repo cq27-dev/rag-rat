@@ -300,6 +300,7 @@ fn logical_symbol_binding_survives_chunk_id_churn_on_reindex() {
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget { logical_symbol_id: Some(1001), ..Default::default() },
     })
     .unwrap();
@@ -361,6 +362,7 @@ fn memory_body_cap_is_8000_chars() {
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget { path: Some("a.rs".to_string()), ..Default::default() },
     };
     assert!(create_memory(&h.conn, make("x".repeat(8000))).is_ok(), "8000 chars is accepted");
@@ -381,6 +383,7 @@ fn doctor_attention_count_counts_active_gone_and_stale_bindings() {
         created_by: None,
         source: None,
         tags: Vec::new(),
+        payload_json: None,
         bind: RepoMemoryBindTarget { path: Some("a.rs".to_string()), ..Default::default() },
     })
     .unwrap();
@@ -429,6 +432,7 @@ fn memory_attention_count_reads_file_db_and_fails_open() {
             created_by: None,
             source: None,
             tags: Vec::new(),
+            payload_json: None,
             bind: RepoMemoryBindTarget { path: Some("a.rs".to_string()), ..Default::default() },
         })
         .unwrap();

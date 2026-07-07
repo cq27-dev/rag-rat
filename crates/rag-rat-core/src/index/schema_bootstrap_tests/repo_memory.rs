@@ -38,6 +38,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
             created_by: Some("test-agent".to_string()),
             source: Some("agent".to_string()),
             tags: vec!["cfg".to_string(), "graph".to_string()],
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(logical_symbol_id),
                 symbol_id: None,
@@ -118,6 +119,7 @@ fn compact_repo_memory_view_projects_primary_binding_then_full_mode_round_trips(
             created_by: Some("test-agent".to_string()),
             source: Some("agent".to_string()),
             tags: vec!["runtime".to_string()],
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(logical_symbol_id),
                 ..Default::default()
@@ -216,6 +218,7 @@ fn compact_repo_memory_view_separates_the_stale_lane() {
             created_by: Some("test-agent".to_string()),
             source: Some("agent".to_string()),
             tags: Vec::new(),
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 chunk_id: Some(chunk_id),
                 ..Default::default()
@@ -290,6 +293,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: Vec::new(),
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 symbol_id: Some(symbol.symbol_id),
                 logical_symbol_id: None,
@@ -381,6 +385,7 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
             created_by: Some("test-agent".to_string()),
             source: Some("agent".to_string()),
             tags: Vec::new(),
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
@@ -468,6 +473,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
             created_by: Some("test-agent".to_string()),
             source: Some("agent".to_string()),
             tags: vec!["edge".to_string()],
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
@@ -518,6 +524,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
             created_by: Some("test-agent".to_string()),
             source: Some("agent".to_string()),
             tags: vec!["call-path".to_string()],
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
@@ -598,6 +605,7 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: Vec::new(),
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
@@ -705,6 +713,7 @@ fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: Vec::new(),
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget {
             logical_symbol_id: None,
             symbol_id: None,
@@ -801,6 +810,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: Vec::new(),
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 symbol_id: Some(symbol.symbol_id),
                 logical_symbol_id: None,
@@ -899,6 +909,7 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: Vec::new(),
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget {
             symbol_id: Some(symbol.symbol_id),
             logical_symbol_id: None,
@@ -997,6 +1008,7 @@ fn relocation_persists_refreshed_symbol_and_logical_ids() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: Vec::new(),
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget {
             symbol_id: Some(original.symbol_id),
             logical_symbol_id: None,
@@ -1143,6 +1155,7 @@ fn memory_stays_gone_when_moved_symbol_body_changed() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: Vec::new(),
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget {
             symbol_id: Some(symbol.symbol_id),
             logical_symbol_id: None,
@@ -1222,6 +1235,7 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: Vec::new(),
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget {
             symbol_id: Some(symbol_id),
             logical_symbol_id: None,
@@ -1332,6 +1346,7 @@ fn memory_logical_binding_relocates_across_files() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: Vec::new(),
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: Some(logical_symbol_id),
                 symbol_id: None,
@@ -1458,6 +1473,7 @@ fn memory_chunk_binding_relocates_by_hash() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: Vec::new(),
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: None,
                 symbol_id: None,
@@ -1586,6 +1602,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: Vec::new(),
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 symbol_id: Some(src_symbol.symbol_id),
                 logical_symbol_id: None,
@@ -1761,6 +1778,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: Vec::new(),
+        payload_json: None,
         bind: bind_target(alpha.symbol_id),
     })
     .unwrap();
@@ -1773,6 +1791,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: Vec::new(),
+        payload_json: None,
         bind: bind_target(beta.symbol_id),
     })
     .unwrap();
@@ -1823,6 +1842,7 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: Vec::new(),
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget {
             symbol_id: Some(src_symbol.symbol_id),
             logical_symbol_id: None,
@@ -1951,6 +1971,7 @@ fn memory_doctor_dedupes_cfg_split_candidates() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: Vec::new(),
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget {
             symbol_id: Some(original),
             ..Default::default()
@@ -2322,6 +2343,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
             created_by: Some("test".to_string()),
             source: Some("agent".to_string()),
             tags: vec![],
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 logical_symbol_id: symbol.logical_symbol_id,
                 ..Default::default()
@@ -2340,6 +2362,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: vec![],
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget {
             path: Some("src/lib.rs".to_string()),
             ..Default::default()
@@ -2466,6 +2489,7 @@ fn unanchored_node_is_created_listed_and_deduped() {
         created_by: Some("test-agent".to_string()),
         source: Some("agent".to_string()),
         tags: vec![],
+        payload_json: None,
         bind: crate::query::memory::RepoMemoryBindTarget::default(), // empty → unanchored
     };
 
@@ -2522,6 +2546,7 @@ fn rebind_still_requires_a_binding_target() {
             created_by: Some("test-agent".to_string()),
             source: Some("agent".to_string()),
             tags: vec![],
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget::default(),
         })
         .unwrap();
@@ -2562,6 +2587,7 @@ fn a_partial_binding_is_rejected_not_silently_unanchored() {
             created_by: Some("test-agent".to_string()),
             source: Some("agent".to_string()),
             tags: vec![],
+            payload_json: None,
             bind: crate::query::memory::RepoMemoryBindTarget {
                 github_owner: Some("o".to_string()),
                 github_repo: Some("r".to_string()),
@@ -2573,6 +2599,120 @@ fn a_partial_binding_is_rejected_not_silently_unanchored() {
         err.to_string().contains("binding is incomplete"),
         "a partial binding must be rejected, got: {err}"
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #465: a polymorphic node (a `Task`/`Concept` kind) stores and round-trips an opaque JSON payload
+/// through create → read → update. A non-object payload is rejected.
+#[test]
+fn a_polymorphic_node_stores_and_round_trips_its_payload() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // A `Task` node (a new #465 kind), unanchored, carrying a structured payload.
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Task".to_string(),
+            title: "Wire the payload column".to_string(),
+            body: "Track the polymorphic payload work.".to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec![],
+            payload_json: Some(r#"{"estimate":"1d","priority":2}"#.to_string()),
+            bind: crate::query::memory::RepoMemoryBindTarget::default(),
+        })
+        .unwrap();
+    assert!(!created.duplicate);
+    assert_eq!(created.memory.kind, "Task");
+    assert!(created.memory.bindings.is_empty(), "a Task node is unanchored");
+    assert_eq!(
+        created.memory.payload_json.as_deref(),
+        Some(r#"{"estimate":"1d","priority":2}"#),
+        "the payload round-trips verbatim on create"
+    );
+
+    // Read back independently.
+    let fetched = db.memory_get(&created.memory.memory_id).unwrap().expect("memory");
+    assert_eq!(fetched.payload_json.as_deref(), Some(r#"{"estimate":"1d","priority":2}"#));
+
+    // Update just the payload; `None` on the other fields leaves them unchanged.
+    let updated = db
+        .memory_update(crate::query::memory::RepoMemoryUpdate {
+            memory_id: created.memory.memory_id.clone(),
+            kind: None,
+            title: None,
+            body: None,
+            confidence: None,
+            status: None,
+            tags: None,
+            payload_json: Some(r#"{"priority":1}"#.to_string()),
+        })
+        .unwrap();
+    assert_eq!(updated.payload_json.as_deref(), Some(r#"{"priority":1}"#));
+    assert_eq!(updated.title, "Wire the payload column", "other fields unchanged");
+
+    // A non-object payload (an array) is rejected.
+    let err = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Concept".to_string(),
+            title: "bad payload".to_string(),
+            body: "an array is not a valid payload".to_string(),
+            confidence: "low".to_string(),
+            created_by: None,
+            source: Some("agent".to_string()),
+            tags: vec![],
+            payload_json: Some("[1,2,3]".to_string()),
+            bind: crate::query::memory::RepoMemoryBindTarget::default(),
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("must be a JSON object"),
+        "a non-object payload must be rejected, got: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #465: dedup folds the payload — two polymorphic nodes with identical text but DIFFERENT payloads
+/// are distinct (neither silently collapses onto the other, dropping its payload); identical text
+/// AND payload dedups.
+#[test]
+fn payload_bearing_nodes_dedupe_on_payload_not_just_text() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let make = |payload: &str| crate::query::memory::RepoMemoryCreate {
+        kind: "Task".to_string(),
+        title: "same title".to_string(),
+        body: "same body".to_string(),
+        confidence: "medium".to_string(),
+        created_by: Some("test-agent".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        payload_json: Some(payload.to_string()),
+        bind: crate::query::memory::RepoMemoryBindTarget::default(),
+    };
+
+    let a = db.memory_create(make(r#"{"priority":1}"#)).unwrap();
+    assert!(!a.duplicate);
+    // Same text, DIFFERENT payload → a distinct node, not a duplicate.
+    let b = db.memory_create(make(r#"{"priority":2}"#)).unwrap();
+    assert!(!b.duplicate, "a different payload must not dedup onto the first node");
+    assert_ne!(a.memory.memory_id, b.memory.memory_id);
+    // Same text AND payload → a duplicate.
+    let c = db.memory_create(make(r#"{"priority":1}"#)).unwrap();
+    assert!(c.duplicate, "identical text and payload dedups");
+    assert_eq!(c.memory.memory_id, a.memory.memory_id);
 
     let _ = fs::remove_dir_all(&root);
 }

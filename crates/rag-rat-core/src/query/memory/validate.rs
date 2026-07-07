@@ -493,10 +493,31 @@ pub(crate) fn validate_kind(kind: &str) -> anyhow::Result<()> {
         | "PlatformQuirk"
         | "FollowUp"
         | "OpenQuestion"
-        | "Obsolete" => Ok(()),
+        | "Obsolete"
+        // Polymorphic graph-node kinds (#465): legitimately unanchored (a Concept / standalone
+        // Task lives as a graph node with no code binding — see resolve_binding / #463).
+        | "Task"
+        | "Concept" => Ok(()),
         _ => anyhow::bail!("invalid memory kind `{kind}`"),
     }
 }
+/// A polymorphic node's payload (#465) must be a JSON OBJECT — so it round-trips, and so it can be
+/// folded into `content_hash` in phase B. An array/scalar/malformed value is rejected; `None` (no
+/// payload) is fine. Payload-closure (a payload carries no node/edge references) is enforced once
+/// the edge model (#464) defines what a reference IS — a payload cannot "reference a node" before
+/// nodes are referenceable, so there is nothing to reject here yet.
+pub(crate) fn validate_payload(payload_json: Option<&str>) -> anyhow::Result<()> {
+    let Some(payload) = payload_json else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|e| anyhow::anyhow!("payload_json is not valid JSON: {e}"))?;
+    if !value.is_object() {
+        anyhow::bail!("payload_json must be a JSON object");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_confidence(confidence: &str) -> anyhow::Result<()> {
     match confidence {
         "high" | "medium" | "low" => Ok(()),
@@ -542,12 +563,29 @@ pub(crate) fn memory_id(now: i64, input_hash: &str, scope: &Option<String>) -> S
     };
     format!("mem_{now:x}_{suffix}")
 }
-pub(crate) fn memory_input_hash(kind: &str, title: &str, body: &str, tags: &[String]) -> String {
+pub(crate) fn memory_input_hash(
+    kind: &str,
+    title: &str,
+    body: &str,
+    tags: &[String],
+    payload_json: Option<&str>,
+) -> String {
     let mut normalized_tags = tags.iter().map(|tag| tag.trim()).collect::<Vec<_>>();
     normalized_tags.sort_unstable();
+    // The payload is folded RAW (not canonicalized): this is the create-time dedup / id seed, which
+    // wants EXACT-input identity so two nodes with identical text but different payloads get
+    // different ids and neither collapses onto the other (#465). This is NOT the dream content
+    // identity — `dream::note_content_hash` is separate, and its CANONICAL payload fold is deferred
+    // to phase B (#404).
     hex_sha256(
-        format!("{kind}\n{}\n{}\n{}", title.trim(), body.trim(), normalized_tags.join(","))
-            .as_bytes(),
+        format!(
+            "{kind}\n{}\n{}\n{}\n{}",
+            title.trim(),
+            body.trim(),
+            normalized_tags.join(","),
+            payload_json.unwrap_or("")
+        )
+        .as_bytes(),
     )
 }
 pub(crate) fn hex_sha256(bytes: &[u8]) -> String {

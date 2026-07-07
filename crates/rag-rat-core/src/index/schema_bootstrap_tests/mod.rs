@@ -417,6 +417,7 @@ fn create_dir_memory(db: &IndexDatabase, title: &str, dir: Option<String>) {
         created_by: Some("test".to_string()),
         source: Some("agent".to_string()),
         tags: vec![],
+        payload_json: None,
         bind: dir_bind_target(dir),
     })
     .unwrap();

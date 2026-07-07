@@ -766,8 +766,13 @@ fn migration_046_creates_the_verification_tables_on_fresh_apply() {
 fn migration_047_creates_the_model_failure_table_on_fresh_apply() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 47, "V047 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 47, "schema at LATEST after apply");
+    // The absolute-tip pin moved to `migration_048_*` (V048 is the tip now); this test keeps the
+    // symbolic "schema at LATEST after apply" check and its V047 table coverage.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     let table_sql = conn
         .query_row("SELECT sql FROM sqlite_master WHERE name = 'memory_model_failures'", [], |r| {
@@ -809,6 +814,26 @@ fn migration_047_creates_the_model_failure_table_on_fresh_apply() {
 
     schema::apply(&conn).unwrap();
     assert!(conn_table_exists(&conn, "memory_model_failures"), "failure table survives a re-apply");
+}
+
+#[test]
+fn migration_048_adds_the_memory_payload_json_column() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V048 is the schema tip — the absolute pin (the previous tip test, migration_047_*, dropped to
+    // the symbolic `current_version == LATEST` check when this landed).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 48, "V048 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 48, "schema at LATEST after apply");
+    assert!(
+        conn_table_columns(&conn, "repo_memories").contains(&"payload_json".to_string()),
+        "repo_memories carries the payload_json column (#465)"
+    );
+    // Additive + nullable: a re-apply is idempotent and the column survives.
+    schema::apply(&conn).unwrap();
+    assert!(
+        conn_table_columns(&conn, "repo_memories").contains(&"payload_json".to_string()),
+        "payload_json survives a re-apply"
+    );
 }
 
 #[test]

@@ -658,6 +658,7 @@ mod tests {
             created_by: Some("test".to_string()),
             source: None,
             tags: vec![],
+            payload_json: None,
             bind: RepoMemoryBindTarget {
                 symbol_id: Some(1),
                 logical_symbol_id: None,
@@ -960,6 +961,7 @@ mod tests {
                 created_by: Some("test".to_string()),
                 source: None,
                 tags: vec![],
+                payload_json: None,
                 bind: RepoMemoryBindTarget {
                     symbol_id: Some(1),
                     logical_symbol_id: None,
