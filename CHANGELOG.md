@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.13.0...rag-rat-core-v0.14.0) - 2026-07-07
+
+### Added
+
+- *(index)* make explicit-config adoption loud and refuse empty indexes ([#458](https://github.com/cq27-dev/rag-rat/pull/458))
+- *(memory)* apply [memory] surface="summary" to every drive-by renderer ([#426](https://github.com/cq27-dev/rag-rat/pull/426)) ([#453](https://github.com/cq27-dev/rag-rat/pull/453))
+
+### Fixed
+
+- reduce incremental index churn ([#460](https://github.com/cq27-dev/rag-rat/pull/460))
+- *(watch)* prune linked worktree watches ([#454](https://github.com/cq27-dev/rag-rat/pull/454))
+- *(cross-platform)* full request drain in the ollama-probe and embed stubs ([#446](https://github.com/cq27-dev/rag-rat/pull/446)) ([#452](https://github.com/cq27-dev/rag-rat/pull/452))
+- *(cross-platform)* TOML path escaping, cookbook slash, clone teardown, Windows clippy ([#446](https://github.com/cq27-dev/rag-rat/pull/446)) ([#449](https://github.com/cq27-dev/rag-rat/pull/449))
+- *(dream)* persist failed model attempts ([#450](https://github.com/cq27-dev/rag-rat/pull/450))
+
+### Other
+
+- derive enum strings with strum ([#457](https://github.com/cq27-dev/rag-rat/pull/457))
+- Split oracle tests and antiunify module ([#456](https://github.com/cq27-dev/rag-rat/pull/456))
+- *(watch)* cover watcher state helpers ([#455](https://github.com/cq27-dev/rag-rat/pull/455))
+
 ## [0.13.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.12.0...rag-rat-core-v0.13.0) - 2026-07-05
 
 ### Added

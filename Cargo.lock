@@ -3320,7 +3320,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rag-rat"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -3387,7 +3387,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-mcp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "libc",
