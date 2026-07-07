@@ -514,9 +514,14 @@ pub(crate) fn is_polymorphic_node_kind(kind: &str) -> bool {
 /// Validate a memory's `payload_json` for its `kind`. Only the polymorphic graph-node kinds
 /// (`is_polymorphic_node_kind`) may carry a payload, and it must be a JSON OBJECT (so it
 /// round-trips and can be folded into the identity hash). A payload on a plain-note kind, or a
-/// non-object payload, is rejected; `None` (no payload) is always fine. Payload-closure (a payload
-/// carries no node/edge references) is enforced once the edge model (#464) defines what a reference
-/// IS.
+/// non-object payload, is rejected; `None` (no payload) is always fine.
+///
+/// Payload-closure — that a relationship between nodes lives in a typed EDGE (#464
+/// `repo_node_edges`) rather than embedded in an opaque payload — is a documented CONVENTION,
+/// deliberately NOT a hard validator: reliably detecting a "node reference" inside arbitrary JSON
+/// isn't feasible without false positives (a reserved-word scan would reject a legitimate
+/// `{"tracks": [...]}` domain field, since `tracks` is also an edge relation). It is steered by the
+/// edge API + tool docs, not rejected here.
 pub(crate) fn validate_payload(kind: &str, payload_json: Option<&str>) -> anyhow::Result<()> {
     let Some(payload) = payload_json else {
         return Ok(());

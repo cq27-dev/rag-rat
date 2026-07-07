@@ -55,6 +55,8 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
             | "memory_create"
             | "memory_rebind"
             | "memory_update"
+            | "memory_edge_add"
+            | "memory_edge_remove"
             | "memory_mark_obsolete"
             | "memory_validate"
     )

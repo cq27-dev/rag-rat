@@ -42,7 +42,8 @@
 //! `clone_graph_generations`, `clone_token_df`, `clone_refinements`, `dream_findings`, and
 //! `reconcile_attempts` (with `repo_memory_tags` scoped transitively through `repo_memories`) — AND
 //! the dream-verification siblings `memory_reality` / `memory_summaries` /
-//! `memory_model_failures`, each of which carries its own `repo_id`.
+//! `memory_model_failures`, each of which carries its own `repo_id` — AND the typed-edge set
+//! `repo_node_edges` (V049), owner-scoped by `repo_id`.
 //! [`seed_sibling`] seeds a tripwire row into every one of those. Nothing repo-scoped is left
 //! unseeded; a table without a `repo_id` dimension (content-addressed pools like
 //! `name_strings` / `embedding_cache`, the FTS-derived `chunk_fts`, `clone_edges`/postings scoped
@@ -524,6 +525,19 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
             format!("{POISON_PREFIX}tag")
         ],
     )?;
+    // A sibling typed edge (#464, V049): owned by the poison repo, authored on the poison memory.
+    // Any UNSCOPED `edges_from` / `edges_into` / count would surface it and trip a tripwire.
+    conn.execute(
+        "INSERT INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, target_repo_id, \
+         target_kind, target_anchor, target_node_id, anchor_status, created_at_ms)
+         VALUES (?1, ?2, ?3, 'depends_on', ?2, 'node', ?4, NULL, 'unresolved', 0)",
+        params![
+            format!("{POISON_PREFIX}edge_key"),
+            POISON_REPO_ID,
+            POISON_MEMORY_ID,
+            format!("{POISON_PREFIX}target"),
+        ],
+    )?;
     conn.execute(
         "INSERT INTO oracle_runs(tool, tool_version, commit_sha, worktree_id, started_at, status, \
          stats_json, repo_id)
@@ -794,6 +808,10 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
          DELETE FROM repo_memory_fts WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM repo_memory_tags WHERE memory_id = '{POISON_MEMORY_ID}';
          DELETE FROM repo_memory_bindings WHERE repo_id = '{POISON_REPO_ID}';
+         -- #464: cleared EXPLICITLY (not just via the source FK cascade) so a reseed is idempotent
+         -- even with `foreign_keys` off or an orphaned row — else the next INSERT trips the \
+         edge_key PK.
+         DELETE FROM repo_node_edges WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM repo_memories WHERE repo_id = '{POISON_REPO_ID}';
          -- Registry rows (A7): child-first (repo_meta/repo_roots FK repos ON DELETE CASCADE), so a
          -- re-seed on a git fixture starts from a clean slate. No-op when the sibling was never
@@ -943,6 +961,10 @@ fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, Str
         (
             "repo_memory_fts",
             format!("repo_id = '{POISON_REPO_ID}' AND memory_id = '{POISON_MEMORY_ID}'"),
+        ),
+        (
+            "repo_node_edges",
+            format!("repo_id = '{POISON_REPO_ID}' AND edge_key = '{POISON_PREFIX}edge_key'"),
         ),
         ("oracle_runs", format!("repo_id = '{POISON_REPO_ID}'")),
         // Pinned to the distinct-path edge's `scip_symbol` so the same-path edge tripwire doesn't

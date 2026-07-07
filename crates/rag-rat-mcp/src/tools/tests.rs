@@ -396,6 +396,67 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
 }
 
 #[test]
+fn mcp_edge_tools_add_traverse_and_remove() {
+    let (root, config) = mixed_config();
+    IndexDatabase::rebuild(&config).unwrap();
+
+    let create = |title: &str| -> String {
+        let v = call_tool_for_config(
+            &config,
+            "memory_create",
+            json!({"kind": "Task", "title": title, "body": "b", "confidence": "low", "bind": {}}),
+        )
+        .unwrap();
+        v["memory"]["memory_id"].as_str().unwrap().to_string()
+    };
+    let a = create("task a");
+    let b = create("task b");
+
+    // add a --depends_on--> b via the MCP surface; forward + reverse traversal see it.
+    let edge = call_tool_for_config(
+        &config,
+        "memory_edge_add",
+        json!({"source_node_id": a, "relation": "depends_on", "target_node_id": b}),
+    )
+    .unwrap();
+    assert_eq!(edge["relation"], "depends_on");
+    let key = edge["edge_key"].as_str().unwrap().to_string();
+    let from =
+        call_tool_for_config(&config, "memory_edges", json!({"direction": "from", "node_id": a}))
+            .unwrap();
+    assert_eq!(from.as_array().unwrap().len(), 1);
+    let into =
+        call_tool_for_config(&config, "memory_edges", json!({"direction": "into", "node_id": b}))
+            .unwrap();
+    assert_eq!(into.as_array().unwrap().len(), 1);
+
+    // a `tracks` github edge, reachable by the REVERSE traversal on the github ref.
+    call_tool_for_config(
+        &config,
+        "memory_edge_add",
+        json!({"source_node_id": a, "relation": "tracks",
+               "github_owner": "o", "github_repo": "r", "github_number": 5}),
+    )
+    .unwrap();
+    let tracking = call_tool_for_config(
+        &config,
+        "memory_edges",
+        json!({"direction": "into", "github_owner": "o", "github_repo": "r", "github_number": 5}),
+    )
+    .unwrap();
+    assert_eq!(tracking.as_array().unwrap().len(), 1);
+    assert_eq!(tracking[0]["source_node_id"], a);
+
+    // remove by edge_key.
+    assert_eq!(
+        call_tool_for_config(&config, "memory_edge_remove", json!({"edge_key": key})).unwrap(),
+        json!(true)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
     let root = unique_temp_root();
     fs::create_dir_all(root.join("src")).unwrap();
@@ -1215,6 +1276,8 @@ fn read_only_classification_covers_every_tool_and_denies_writers() {
         "memory_create",
         "memory_rebind",
         "memory_update",
+        "memory_edge_add",
+        "memory_edge_remove",
         "memory_mark_obsolete",
         "memory_validate",
     ];

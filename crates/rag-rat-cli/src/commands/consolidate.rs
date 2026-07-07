@@ -36,6 +36,7 @@ pub(crate) fn consolidate(config: &Config) -> anyhow::Result<()> {
             "tags": summary.tags,
             "call_paths": summary.call_paths,
             "call_path_edges": summary.call_path_edges,
+            "edges": summary.edges,
             "embedding_cache_rows": summary.embedding_cache_rows,
             "meta_keys": summary.meta_keys,
             "next": "run `rag-rat index --full` to rebuild the derived index — the carried \

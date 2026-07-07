@@ -2872,3 +2872,166 @@ fn dedup_and_unanchored_create_are_kind_aware() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// #464: typed edges — a task `depends_on` another (forward `edges_from` + reverse `edges_into`), a
+/// task `tracks` a github issue, `edge_key` is stable/idempotent, `remove` works, self-loops are
+/// rejected, and an edge into an ABSENT repo is stored `unresolved` (not an error).
+#[test]
+fn typed_edges_add_traverse_and_resolve() {
+    use crate::query::memory::EdgeTarget;
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let task = |title: &str| crate::query::memory::RepoMemoryCreate {
+        kind: "Task".to_string(),
+        title: title.to_string(),
+        body: "b".to_string(),
+        confidence: "medium".to_string(),
+        created_by: Some("t".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        payload_json: None,
+        bind: crate::query::memory::RepoMemoryBindTarget::default(),
+    };
+    let a = db.memory_create(task("task A")).unwrap().memory.memory_id;
+    let b = db.memory_create(task("task B")).unwrap().memory.memory_id;
+    let node = |id: &str| EdgeTarget::Node { repo_id: None, node_id: id.to_string() };
+
+    // A depends_on B (same repo).
+    let edge = db.memory_edge_add(&a, "depends_on", node(&b)).unwrap();
+    assert_eq!(edge.relation, "depends_on");
+    assert_eq!(edge.target_node_id.as_deref(), Some(b.as_str()));
+    assert_eq!(edge.anchor_status, "current");
+
+    // Forward: edges_from(A) sees it. Reverse: edges_into(B) is the reverse traversal.
+    let from = db.memory_edges_from(&a).unwrap();
+    assert_eq!(from.len(), 1);
+    assert_eq!(from[0].target_node_id.as_deref(), Some(b.as_str()));
+    let into = db.memory_edges_into(node(&b)).unwrap();
+    assert_eq!(into.len(), 1);
+    assert_eq!(into[0].source_node_id, a);
+
+    // Idempotent: re-adding the same logical edge keeps the SAME edge_key (no duplicate row).
+    let again = db.memory_edge_add(&a, "depends_on", node(&b)).unwrap();
+    assert_eq!(again.edge_key, edge.edge_key);
+    assert_eq!(db.memory_edges_from(&a).unwrap().len(), 1);
+
+    // A tracks a github issue — reverse-bindable "issue <- task".
+    let gh = || EdgeTarget::Github { owner: "o".to_string(), repo: "r".to_string(), number: 42 };
+    db.memory_edge_add(&a, "tracks", gh()).unwrap();
+    let tracking = db.memory_edges_into(gh()).unwrap();
+    assert_eq!(tracking.len(), 1);
+    assert_eq!(tracking[0].source_node_id, a);
+    assert_eq!(tracking[0].relation, "tracks");
+
+    // A cross-repo edge into an ABSENT repo is stored `unresolved`, never a hard failure.
+    let cross = db
+        .memory_edge_add(&a, "relates_to", EdgeTarget::Node {
+            repo_id: Some("some-other-repo".to_string()),
+            node_id: "mem_absent".to_string(),
+        })
+        .unwrap();
+    assert_eq!(cross.anchor_status, "unresolved");
+    assert!(cross.target_node_id.is_none());
+
+    // Re-resolution on READ: once the previously-absent target is indexed, a later read shows the
+    // edge `current` with its target self-healed (the stored `unresolved` was only an add-time
+    // snapshot). Seed the target node directly under its sibling repo (id copied from `a`, repo
+    // overridden) so the id lookup finds it.
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, input_hash, memory_version, repo_id) SELECT \
+             'mem_absent', kind, title, body, confidence, status, created_by, created_at_ms, \
+             updated_at_ms, source, 'reresolve-hash', memory_version, 'some-other-repo' FROM \
+             repo_memories WHERE id = ?1",
+            [&a],
+        )
+        .unwrap();
+    let healed = db.memory_edges_from(&a).unwrap();
+    let cross_now = healed.iter().find(|e| e.edge_key == cross.edge_key).unwrap();
+    assert_eq!(
+        cross_now.anchor_status, "current",
+        "an unresolved edge re-resolves once its target is indexed"
+    );
+    assert_eq!(cross_now.target_node_id.as_deref(), Some("mem_absent"));
+    assert_eq!(
+        cross_now.target_repo_id, "some-other-repo",
+        "target_repo_id self-heals from the node"
+    );
+
+    // An IMPLICIT cross-repo target (no explicit repo_id) that resolves to a SIBLING repo is
+    // rejected — `mem_absent` now lives in `some-other-repo`, so a bare `node()` edge to it must be
+    // made explicit. (The `relates_to` edge above was allowed only because it named the repo.)
+    let implicit = db.memory_edge_add(&a, "depends_on", node("mem_absent")).unwrap_err();
+    assert!(implicit.to_string().contains("is not a node in this repo"), "{implicit}");
+
+    // EXPLICIT cross-repo whose id resolves to a DIFFERENT repo than named → rejected (`mem_absent`
+    // lives in `some-other-repo`, not the named `wrong-repo`).
+    let mismatch = db
+        .memory_edge_add(&a, "depends_on", crate::query::memory::EdgeTarget::Node {
+            repo_id: Some("wrong-repo".to_string()),
+            node_id: "mem_absent".to_string(),
+        })
+        .unwrap_err();
+    assert!(mismatch.to_string().contains("not the named `wrong-repo`"), "{mismatch}");
+
+    // EXPLICIT cross-repo into a REGISTERED repo but the node is absent → a typo, rejected. (An
+    // UNREGISTERED repo is instead a legitimate deferred `unresolved` reference — the `relates_to`
+    // edge above.)
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES \
+             ('some-other-repo', 'other', 0)",
+            [],
+        )
+        .unwrap();
+    let typo = db
+        .memory_edge_add(&a, "depends_on", crate::query::memory::EdgeTarget::Node {
+            repo_id: Some("some-other-repo".to_string()),
+            node_id: "mem_ghost".to_string(),
+        })
+        .unwrap_err();
+    assert!(typo.to_string().contains("is not a node in repo `some-other-repo`"), "{typo}");
+
+    // A self-loop is rejected.
+    let err = db.memory_edge_add(&a, "relates_to", node(&a)).unwrap_err();
+    assert!(err.to_string().contains("cannot point a node at itself"), "{err}");
+
+    // A SAME-repo target that doesn't exist is a typo → rejected (a cross-repo absent target is
+    // fine, as the `relates_to` edge above stored `unresolved`).
+    let missing = db.memory_edge_add(&a, "depends_on", node("mem_nonexistent")).unwrap_err();
+    assert!(missing.to_string().contains("is not a node in this repo"), "{missing}");
+
+    // Remove by edge_key.
+    assert!(db.memory_edge_remove(&edge.edge_key).unwrap());
+    assert!(db.memory_edges_from(&a).unwrap().iter().all(|e| e.edge_key != edge.edge_key));
+
+    // An obsoleted SOURCE node's edges drop out of both traversals — a hidden node's relationships
+    // are dead. `a` still owns the `tracks` and (now-resolved) `relates_to` edges here.
+    assert!(
+        !db.memory_edges_from(&a).unwrap().is_empty(),
+        "sanity: a has live edges before obsolete"
+    );
+    db.memory_mark_obsolete(&a).unwrap();
+    assert!(
+        db.memory_edges_from(&a).unwrap().is_empty(),
+        "obsolete source has no live outgoing edges"
+    );
+    assert!(
+        db.memory_edges_into(gh()).unwrap().is_empty(),
+        "reverse traversal drops an obsolete source's edges"
+    );
+    // ...and you cannot author a NEW edge FROM an obsolete source (the add-time twin of the
+    // filter).
+    let from_dead = db.memory_edge_add(&a, "depends_on", node(&b)).unwrap_err();
+    assert!(from_dead.to_string().contains("not found or is obsolete"), "{from_dead}");
+
+    let _ = fs::remove_dir_all(&root);
+}

@@ -178,6 +178,30 @@ pub(crate) fn call_tool_with_db(
             let args: MemoryUpdateArgs = serde_json::from_value(arguments)?;
             json!(db.memory_update(args.core())?)
         },
+        "memory_edge_add" => {
+            let args: MemoryEdgeAddArgs = serde_json::from_value(arguments)?;
+            json!(db.memory_edge_add(&args.source_node_id, args.relation_str(), args.target()?)?)
+        },
+        "memory_edge_remove" => {
+            let args: MemoryEdgeRemoveArgs = serde_json::from_value(arguments)?;
+            json!(db.memory_edge_remove(&args.edge_key)?)
+        },
+        "memory_edges" => {
+            let args: MemoryEdgesArgs = serde_json::from_value(arguments)?;
+            let edges = match args.direction {
+                // A source node's OUTGOING edges — a github issue has none, so `node_id` is
+                // required.
+                McpEdgeDirection::From => {
+                    let source = args.node_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("memory_edges direction=from needs a source node_id")
+                    })?;
+                    db.memory_edges_from(source)?
+                },
+                // Reverse traversal INTO a node OR a github issue (e.g. tasks that track it).
+                McpEdgeDirection::Into => db.memory_edges_into(args.reverse_target()?)?,
+            };
+            json!(edges)
+        },
         "memory_search" => {
             let args: MemorySearchArgs = serde_json::from_value(arguments)?;
             json!(db.memory_search(&args.query, args.limit)?)

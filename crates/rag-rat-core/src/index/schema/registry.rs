@@ -82,6 +82,11 @@ const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     "memory_reality",
     "memory_summaries",
     "memory_model_failures",
+    // The typed node-edge set (#464, V049): `repo_id` is the OWNER repo (the source node's), so a
+    // LocalOnly→Portable adoption re-points it exactly like the other periphery tables. Its
+    // `target_repo_id` is a REFERENCE and is deliberately NOT re-pointed here (it may name a
+    // sibling).
+    "repo_node_edges",
 ];
 
 /// The placeholder `repo_id` a freshly-migrated single-repo DB carries until it is adopted (see the
@@ -435,6 +440,17 @@ fn register_repo_inner(
                 )?;
             }
         }
+        // repo_node_edges (#464): the loop above re-pointed the OWNER `repo_id`; a SAME-repo
+        // `target_repo_id` must move with it (a cross-repo target names a sibling and is left
+        // alone). Edge reads self-heal `target_repo_id` from the live node, but keep the
+        // stored column honest here too. Guarded like the loop (a partial-schema fixture
+        // can lack the V049 column).
+        if super::column_exists(&tx, "repo_node_edges", "repo_id")? {
+            tx.execute(
+                "UPDATE main.repo_node_edges SET target_repo_id = ?1 WHERE target_repo_id = ?2",
+                params![identity.repo_id, source_id],
+            )?;
+        }
         // `dream_findings.id` folds `repo_id` (the `logical_symbols.stable_id` precedent), so the
         // periphery re-point above changed the id every finding SHOULD have — re-derive them (and
         // the in-table `superseded_by` references) under the adopted id: the dream twin of the
@@ -638,6 +654,21 @@ fn merge_local_incumbent_into_registered(
     ])?;
     if adoption_table_present(&tx, "repo_memory_fts")? {
         tx.execute("UPDATE main.repo_memory_fts SET repo_id = ?1 WHERE repo_id = ?2", params![
+            identity.repo_id,
+            owner
+        ])?;
+    }
+    // Node edges (#464) are AUTHORED — move the owner's edges onto the target id, else they orphan
+    // under a `repo_id` whose `repos` row is about to be deleted (no FK cascades them). Re-point
+    // the OWNER `repo_id` and any SAME-repo `target_repo_id` (a cross-repo target names a
+    // sibling, left alone). The `edge_key` folds node ids (stable across a repo-id move), not
+    // repo ids, so no recompute is needed. Guarded for a partial-schema fixture.
+    if super::column_exists(&tx, "repo_node_edges", "repo_id")? {
+        tx.execute(
+            "UPDATE main.repo_node_edges SET target_repo_id = ?1 WHERE target_repo_id = ?2",
+            params![identity.repo_id, owner],
+        )?;
+        tx.execute("UPDATE main.repo_node_edges SET repo_id = ?1 WHERE repo_id = ?2", params![
             identity.repo_id,
             owner
         ])?;

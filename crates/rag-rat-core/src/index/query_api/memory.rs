@@ -25,6 +25,39 @@ impl IndexDatabase {
         crate::query::memory::mark_obsolete(self.storage.connection(), memory_id)
     }
 
+    /// Add a typed graph edge from a source node to another node or a GitHub issue (#464).
+    pub fn memory_edge_add(
+        &self,
+        source_node_id: &str,
+        relation: &str,
+        target: crate::query::memory::EdgeTarget,
+    ) -> anyhow::Result<crate::query::memory::NodeEdge> {
+        let relation = crate::query::memory::EdgeRelation::from_db_str(relation)?;
+        crate::query::memory::add_edge(self.storage.connection(), source_node_id, relation, &target)
+    }
+
+    /// Remove a graph edge by its stable `edge_key` (#464). `false` when the key is unknown.
+    pub fn memory_edge_remove(&self, edge_key: &str) -> anyhow::Result<bool> {
+        crate::query::memory::remove_edge(self.storage.connection(), edge_key)
+    }
+
+    /// Every edge OUT of a node — its outgoing graph (deps / mind-map links / tracks) (#464).
+    pub fn memory_edges_from(
+        &self,
+        source_node_id: &str,
+    ) -> anyhow::Result<Vec<crate::query::memory::NodeEdge>> {
+        crate::query::memory::edges_from(self.storage.connection(), source_node_id)
+    }
+
+    /// Every edge INTO a target — the reverse traversal (e.g. tasks tracking a github issue)
+    /// (#464).
+    pub fn memory_edges_into(
+        &self,
+        target: crate::query::memory::EdgeTarget,
+    ) -> anyhow::Result<Vec<crate::query::memory::NodeEdge>> {
+        crate::query::memory::edges_into(self.storage.connection(), &target)
+    }
+
     pub fn memory_search(
         &self,
         query: &str,

@@ -42,6 +42,9 @@ pub const TOOL_NAMES: &[&str] = &[
     "memory_validate",
     "memory_doctor",
     "memory_mark_obsolete",
+    "memory_edge_add",
+    "memory_edge_remove",
+    "memory_edges",
 ];
 
 pub fn list_tools() -> Value {
@@ -207,6 +210,17 @@ pub fn description(name: &str) -> &'static str {
              Rebind the listed memories with memory_rebind.",
         "memory_mark_obsolete" =>
             "Mark a repo memory obsolete — kept for audit, hidden from active recall.",
+        "memory_edge_add" =>
+            "Add a typed graph edge from a source node to another node or a GitHub issue. \
+             Relations: depends_on (task DAG), relates_to (mind-map link), supersedes, \
+             derived_from, tracks (issue <- task). Give exactly ONE target: a target_node_id (with \
+             an optional target_repo_id for a cross-repo edge) or a full github ref (owner + repo \
+             + number).",
+        "memory_edge_remove" => "Remove a graph edge by its stable edge_key.",
+        "memory_edges" =>
+            "List a node's typed edges: direction=from returns its outgoing edges (deps / links / \
+             tracks); direction=into is the reverse traversal (e.g. tasks that track an issue, or \
+             nodes that depend on this one).",
         _ => "Unknown tool.",
     }
 }
@@ -248,6 +262,9 @@ pub fn schema(name: &str) -> Value {
         "memory_mark_obsolete" | "memory_show" => schema_for::<MemoryIdArgs>(),
         "llm_status" | "github_sync_status" | "index_status" | "memory_validate"
         | "memory_doctor" => schema_for::<EmptyArgs>(),
+        "memory_edge_add" => schema_for::<MemoryEdgeAddArgs>(),
+        "memory_edge_remove" => schema_for::<MemoryEdgeRemoveArgs>(),
+        "memory_edges" => schema_for::<MemoryEdgesArgs>(),
         _ => json!({"type": "object"}),
     }
 }

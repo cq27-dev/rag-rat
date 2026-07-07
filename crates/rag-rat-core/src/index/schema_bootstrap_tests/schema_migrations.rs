@@ -820,10 +820,13 @@ fn migration_047_creates_the_model_failure_table_on_fresh_apply() {
 fn migration_048_adds_the_memory_payload_json_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V048 is the schema tip — the absolute pin (the previous tip test, migration_047_*, dropped to
-    // the symbolic `current_version == LATEST` check when this landed).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 48, "V048 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 48, "schema at LATEST after apply");
+    // The absolute-tip pin moved to `migration_049_*` (V049 is the tip now); this keeps the
+    // symbolic "schema at LATEST after apply" check and its V048 column coverage.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
     assert!(
         conn_table_columns(&conn, "repo_memories").contains(&"payload_json".to_string()),
         "repo_memories carries the payload_json column (#465)"
@@ -834,6 +837,53 @@ fn migration_048_adds_the_memory_payload_json_column() {
         conn_table_columns(&conn, "repo_memories").contains(&"payload_json".to_string()),
         "payload_json survives a re-apply"
     );
+}
+
+#[test]
+fn migration_049_adds_the_repo_node_edges_table() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V049 is the schema tip — the absolute pin (migration_048_* dropped to symbolic when this
+    // landed).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 49, "V049 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 49, "schema at LATEST after apply");
+
+    let table_sql = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE name = 'repo_node_edges'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap();
+    assert!(table_sql.contains("STRICT"), "repo_node_edges is STRICT");
+    for column in [
+        "edge_key",
+        "repo_id",
+        "source_node_id",
+        "relation",
+        "target_repo_id",
+        "target_kind",
+        "target_anchor",
+        "target_node_id",
+        "target_logical_symbol_id",
+        "anchor_status",
+        "created_at_ms",
+    ] {
+        assert!(
+            conn_table_columns(&conn, "repo_node_edges").contains(&column.to_string()),
+            "repo_node_edges carries {column}"
+        );
+    }
+    let pk_cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('repo_node_edges') WHERE pk > 0 ORDER BY pk")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(pk_cols, vec!["edge_key".to_string()], "edge_key is the stable PK");
+
+    // Idempotent re-apply.
+    schema::apply(&conn).unwrap();
+    assert!(conn_table_exists(&conn, "repo_node_edges"), "edge table survives a re-apply");
 }
 
 #[test]

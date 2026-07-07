@@ -18,7 +18,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 48;
+pub const LATEST_SCHEMA_VERSION: u32 = 49;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -328,6 +328,13 @@ const MIGRATION_048_DESCRIPTION: &str =
     "Add repo_memories.payload_json, a nullable opaque canonical-JSON payload for polymorphic \
      memory nodes (the Task / Concept kinds), folded into the content_hash so a payload edit \
      self-invalidates the derived dream summary/verdict rows exactly as a title/body edit does";
+const MIGRATION_049_ID: &str = "049_repo_node_edges";
+const MIGRATION_049_CHECKSUM: &str = "sha256:rag-rat-repo-node-edges-v49";
+const MIGRATION_049_DESCRIPTION: &str =
+    "Add repo_node_edges, the typed content-addressed cross-repo edge set (#464): relation-typed \
+     edges from a memory node to another node or a code/github target, with explicit owner + \
+     target repo ids and a stable edge_key, no FK to volatile graph rows (only the durable source \
+     memory)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -715,6 +722,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_048_CHECKSUM,
         description: MIGRATION_048_DESCRIPTION,
         apply: apply_memory_payload_json,
+    },
+    Migration {
+        id: MIGRATION_049_ID,
+        checksum: MIGRATION_049_CHECKSUM,
+        description: MIGRATION_049_DESCRIPTION,
+        apply: apply_repo_node_edges,
     },
 ];
 

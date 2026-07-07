@@ -130,6 +130,7 @@ pub struct ImportSummary {
     pub tags: u64,
     pub call_paths: u64,
     pub call_path_edges: u64,
+    pub edges: u64,
     pub embedding_cache_rows: u64,
     pub meta_keys: u64,
 }
@@ -295,6 +296,7 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
         tags: counts.tags,
         call_paths: counts.call_paths,
         call_path_edges: counts.call_path_edges,
+        edges: counts.edges,
         embedding_cache_rows: counts.embedding_cache_rows,
         meta_keys: counts.meta_keys,
     }))
@@ -456,6 +458,7 @@ struct ImportCounts {
     tags: u64,
     call_paths: u64,
     call_path_edges: u64,
+    edges: u64,
     embedding_cache_rows: u64,
     meta_keys: u64,
 }
@@ -525,6 +528,7 @@ fn import_from_source(
         tags: copy_tags(source, &tx, &id_map)?,
         call_paths: copy_call_paths(source, &tx, &id_map)?,
         call_path_edges: copy_call_path_edges(source, &tx, &id_map)?,
+        edges: copy_node_edges(source, &tx, repo_id, &id_map)?,
         embedding_cache_rows: copy_embedding_cache(source, &tx)?,
         meta_keys: copy_model_state(source, &tx, repo_id)?,
     };
@@ -538,6 +542,7 @@ fn import_from_source(
         } else {
             raw.call_path_edges
         },
+        edges: if pre.edges == post.edges { 0 } else { raw.edges },
         ..raw
     };
     rebuild_memory_fts_for_repo(&tx, repo_id)?;
@@ -554,6 +559,7 @@ struct ChildSliceDigests {
     bindings: [u8; 32],
     call_paths: [u8; 32],
     call_path_edges: [u8; 32],
+    edges: [u8; 32],
 }
 
 fn child_slice_digests(
@@ -561,21 +567,29 @@ fn child_slice_digests(
     id_map: &BTreeMap<String, String>,
 ) -> anyhow::Result<ChildSliceDigests> {
     Ok(ChildSliceDigests {
-        tags: child_slice_digest(tx, "repo_memory_tags", id_map)?,
-        bindings: child_slice_digest(tx, "repo_memory_bindings", id_map)?,
-        call_paths: child_slice_digest(tx, "repo_memory_call_paths", id_map)?,
-        call_path_edges: child_slice_digest(tx, "repo_memory_call_path_edges", id_map)?,
+        tags: child_slice_digest(tx, "repo_memory_tags", "memory_id", id_map)?,
+        bindings: child_slice_digest(tx, "repo_memory_bindings", "memory_id", id_map)?,
+        call_paths: child_slice_digest(tx, "repo_memory_call_paths", "memory_id", id_map)?,
+        call_path_edges: child_slice_digest(
+            tx,
+            "repo_memory_call_path_edges",
+            "memory_id",
+            id_map,
+        )?,
+        // Node edges key on `source_node_id` (the owning node), not `memory_id`.
+        edges: child_slice_digest(tx, "repo_node_edges", "source_node_id", id_map)?,
     })
 }
 
 fn child_slice_digest(
     tx: &Connection,
     table: &str,
+    id_column: &str,
     id_map: &BTreeMap<String, String>,
 ) -> anyhow::Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
-    // `table` is a compile-time constant at every call site, never user input.
-    let mut stmt = tx.prepare(&format!("SELECT * FROM {table} WHERE memory_id = ?1"))?;
+    // `table` / `id_column` are compile-time constants at every call site, never user input.
+    let mut stmt = tx.prepare(&format!("SELECT * FROM {table} WHERE {id_column} = ?1"))?;
     let mut lines: Vec<String> = Vec::new();
     for target_id in id_map.values() {
         let mut rows = stmt.query([target_id])?;
@@ -740,6 +754,9 @@ fn refresh_children(tx: &Connection, id_map: &BTreeMap<String, String>) -> anyho
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE memory_id = ?1"), [id])?;
         }
+        // Node edges (#464) key on `source_node_id`, not `memory_id` — delete them here too so the
+        // subsequent `copy_node_edges` REPLACES the source's edge set (the mirror invariant).
+        tx.execute("DELETE FROM repo_node_edges WHERE source_node_id = ?1", [id])?;
     }
     Ok(())
 }
@@ -852,6 +869,74 @@ fn source_column_or_null(source: &Connection, column: &str) -> anyhow::Result<St
 
 /// Copy `repo_memory_tags` (scoped transitively via `memory_id` — no `repo_id` column; both
 /// columns copied, the full table shape).
+/// Copy `repo_node_edges` (#464), stamping the OWNER `repo_id` and REMAPPING both endpoints through
+/// the id map. An edge's SOURCE must map — an edge of an unmapped memory is a dangling orphan in
+/// the source, dropped, never attached to a stranger (the child-ownership invariant). A NODE target
+/// that ALSO maps is remapped (id + repo) and `current`; a node target that does NOT map is kept
+/// verbatim as an `unresolved` cross-repo reference; a github target re-homes to the import repo
+/// and stays `current`. The `edge_key` is RECOMPUTED from the remapped coordinates — it
+/// content-addresses owner+source+target, all of which change on import. Local rowid columns are
+/// NOT copied (re-resolved on read); `INSERT OR IGNORE` because `refresh_children` cleared the
+/// source's edge set this run.
+fn copy_node_edges(
+    source: &Connection,
+    tx: &Connection,
+    repo_id: &str,
+    id_map: &BTreeMap<String, String>,
+) -> anyhow::Result<u64> {
+    if !schema::table_exists(source, "repo_node_edges")? {
+        return Ok(0);
+    }
+    let mut stmt = source.prepare(
+        "SELECT source_node_id, relation, target_repo_id, target_kind, target_anchor, \
+         created_at_ms FROM repo_node_edges",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut count = 0u64;
+    while let Some(row) = rows.next()? {
+        // Child-ownership: only edges whose SOURCE this import owns; an unmapped source is dropped.
+        let Some(source_node_id) = id_map.get(&row.get::<_, String>(0)?) else {
+            continue;
+        };
+        let relation = row.get::<_, String>(1)?;
+        let src_target_repo = row.get::<_, String>(2)?;
+        let target_kind = row.get::<_, String>(3)?;
+        let src_target_anchor = row.get::<_, String>(4)?;
+        let created_at_ms = row.get::<_, i64>(5)?;
+        let (target_repo_id, target_anchor, target_node_id, anchor_status) =
+            match target_kind.as_str() {
+                "node" => match id_map.get(&src_target_anchor) {
+                    Some(mapped) =>
+                        (repo_id.to_string(), mapped.clone(), Some(mapped.clone()), "current"),
+                    None => (src_target_repo, src_target_anchor.clone(), None, "unresolved"),
+                },
+                _ => (repo_id.to_string(), src_target_anchor.clone(), None, "current"),
+            };
+        let key =
+            crate::query::memory::edge_key(source_node_id, &relation, &target_kind, &target_anchor);
+        let changed = tx.execute(
+            "INSERT OR IGNORE INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, \
+             target_repo_id, target_kind, target_anchor, target_node_id, \
+             target_logical_symbol_id, symbol_kind, signature_hash, anchor_status, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10)",
+            params![
+                key,
+                repo_id,
+                source_node_id,
+                relation,
+                target_repo_id,
+                target_kind,
+                target_anchor,
+                target_node_id,
+                anchor_status,
+                created_at_ms
+            ],
+        )?;
+        count += changed as u64;
+    }
+    Ok(count)
+}
+
 fn copy_tags(
     source: &Connection,
     tx: &Connection,
@@ -1173,6 +1258,27 @@ mod tests {
             [],
         )
         .unwrap();
+        // #464: a node edge m1 --depends_on--> m2. Its `edge_key` is RECOMPUTED on import from the
+        // (possibly remapped) endpoints, so the seed's placeholder key here is intentionally not
+        // the real one.
+        // Three edge shapes exercise every `copy_node_edges` branch on import: a node target that
+        // IS carried (remapped, current), a github target (re-homed to the import repo, current),
+        // and a node target that is NOT carried (kept as an `unresolved` cross-repo
+        // reference).
+        for (key, relation, target_repo, kind, anchor, node, status) in [
+            ("seed-node", "depends_on", "legacy-repo", "node", "m2", "m2", "current"),
+            ("seed-gh", "tracks", "legacy-repo", "github", "o/r#7", "", "current"),
+            ("seed-ext", "relates_to", "other-repo", "node", "external-node", "", "unresolved"),
+        ] {
+            let node_id: Option<&str> = (!node.is_empty()).then_some(node);
+            conn.execute(
+                "INSERT INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, \
+                 target_repo_id, target_kind, target_anchor, target_node_id, anchor_status, \
+                 created_at_ms) VALUES (?1, 'legacy-repo', 'm1', ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                rusqlite::params![key, relation, target_repo, kind, anchor, node_id, status],
+            )
+            .unwrap();
+        }
         for (hash, dim) in [("ih1", 384), ("ih2", 768)] {
             conn.execute(
                 "INSERT INTO embedding_cache(input_hash, model_id, embedding_dim, vector_blob, \
@@ -1366,6 +1472,7 @@ mod tests {
         let target = fresh_target();
         let first = import_from_source(&source, &target, "global-repo").unwrap();
         assert_eq!(first.memories, 3);
+        assert_eq!(first.edges, 3, "all three edges (node, github, cross-repo) were carried");
         // A second import (a retry after a rename that never happened) inserts no duplicates AND
         // reports ZERO copies — the summary must not claim work the `INSERT OR IGNORE`s skipped.
         let second = import_from_source(&source, &target, "global-repo").unwrap();
@@ -1374,6 +1481,7 @@ mod tests {
         assert_eq!(second.tags, 0);
         assert_eq!(second.call_paths, 0);
         assert_eq!(second.call_path_edges, 0);
+        assert_eq!(second.edges, 0, "a no-edit re-import reports zero edges (honest count)");
         assert_eq!(second.embedding_cache_rows, 0);
         assert_eq!(second.meta_keys, 0);
         assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 3);
@@ -1396,6 +1504,26 @@ mod tests {
         assert_eq!((title.as_str(), body.as_str()), ("one", "body"));
         // #465: the payload was carried through the consolidation upsert (not turned into NULL).
         assert_eq!(payload.as_deref(), Some(r#"{"priority":1}"#), "m1 payload survives import");
+        // #464: all three edges carried under the global repo — a node edge to a carried target
+        // (current), a github `tracks` edge re-homed to the import repo (current), and a node edge
+        // whose target was NOT carried (kept `unresolved`).
+        let edge = |kind: &str, anchor: &str| -> (String, String) {
+            target
+                .query_row(
+                    "SELECT anchor_status, target_repo_id FROM repo_node_edges WHERE repo_id = \
+                     'global-repo' AND target_kind = ?1 AND target_anchor = ?2",
+                    [kind, anchor],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(edge("node", "m2").0, "current", "node edge to a carried target");
+        assert_eq!(edge("github", "o/r#7"), ("current".to_string(), "global-repo".to_string()));
+        assert_eq!(
+            edge("node", "external-node").0,
+            "unresolved",
+            "target not carried stays unresolved"
+        );
     }
 
     /// The CRASH-CREATED divergence window (Codex batch 8, finding 4): the import txn commits,

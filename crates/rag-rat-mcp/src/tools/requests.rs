@@ -788,6 +788,120 @@ impl MemoryUpdateArgs {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpEdgeRelation {
+    DependsOn,
+    RelatesTo,
+    Supersedes,
+    DerivedFrom,
+    Tracks,
+}
+
+impl McpEdgeRelation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DependsOn => "depends_on",
+            Self::RelatesTo => "relates_to",
+            Self::Supersedes => "supersedes",
+            Self::DerivedFrom => "derived_from",
+            Self::Tracks => "tracks",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpEdgeDirection {
+    /// Edges OUT of the node (its dependencies / mind-map links / tracks).
+    From,
+    /// Edges INTO the node — the reverse traversal (e.g. tasks that track an issue).
+    Into,
+}
+
+/// Add a typed graph edge (#464). Give EXACTLY ONE target: another node (`target_node_id`, with an
+/// optional `target_repo_id` for a cross-repo edge) OR a GitHub issue (all three `github_*`).
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryEdgeAddArgs {
+    pub source_node_id: String,
+    pub relation: McpEdgeRelation,
+    pub target_node_id: Option<String>,
+    pub target_repo_id: Option<String>,
+    pub github_owner: Option<String>,
+    pub github_repo: Option<String>,
+    pub github_number: Option<i64>,
+}
+
+/// Build an `EdgeTarget` from the flat wire fields shared by the edge tools: EXACTLY ONE of a node
+/// (`node_id`, with optional `node_repo_id`) or a full github ref. `node_field` names the node arg
+/// in the error so each tool reports its own field name.
+fn edge_target_from_parts(
+    node_id: Option<&str>,
+    node_repo_id: Option<&str>,
+    github: (Option<&str>, Option<&str>, Option<i64>),
+    node_field: &str,
+) -> anyhow::Result<rag_rat_core::query::memory::EdgeTarget> {
+    use rag_rat_core::query::memory::EdgeTarget;
+    match (node_id, github) {
+        (Some(node_id), (None, None, None)) => Ok(EdgeTarget::Node {
+            repo_id: node_repo_id.map(str::to_string),
+            node_id: node_id.to_string(),
+        }),
+        (None, (Some(owner), Some(repo), Some(number))) =>
+            Ok(EdgeTarget::Github { owner: owner.to_string(), repo: repo.to_string(), number }),
+        _ => anyhow::bail!(
+            "needs exactly one target: a {node_field}, OR a full github ref (github_owner + \
+             github_repo + github_number)"
+        ),
+    }
+}
+
+impl MemoryEdgeAddArgs {
+    pub(super) fn relation_str(&self) -> &'static str {
+        self.relation.as_str()
+    }
+
+    pub(super) fn target(&self) -> anyhow::Result<rag_rat_core::query::memory::EdgeTarget> {
+        edge_target_from_parts(
+            self.target_node_id.as_deref(),
+            self.target_repo_id.as_deref(),
+            (self.github_owner.as_deref(), self.github_repo.as_deref(), self.github_number),
+            "target_node_id",
+        )
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryEdgeRemoveArgs {
+    pub edge_key: String,
+}
+
+/// List a node's typed edges. `direction=from` lists a SOURCE node's outgoing edges (`node_id`
+/// required — a github issue has no outgoing edges). `direction=into` is the reverse traversal INTO
+/// a target: give EITHER `node_id` (nodes that edge into it) OR a full github ref (e.g. the tasks
+/// that `tracks` an issue).
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryEdgesArgs {
+    pub direction: McpEdgeDirection,
+    pub node_id: Option<String>,
+    pub github_owner: Option<String>,
+    pub github_repo: Option<String>,
+    pub github_number: Option<i64>,
+}
+
+impl MemoryEdgesArgs {
+    /// The reverse-traversal target for `direction=into` — a node id ignores its repo (the match is
+    /// on the globally-unique anchor), or a full github ref.
+    pub(super) fn reverse_target(&self) -> anyhow::Result<rag_rat_core::query::memory::EdgeTarget> {
+        edge_target_from_parts(
+            self.node_id.as_deref(),
+            None,
+            (self.github_owner.as_deref(), self.github_repo.as_deref(), self.github_number),
+            "node_id",
+        )
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FindClonesArgs {
     /// Minimum pairwise overlap/max_len similarity. Must be in the range [0.5, 1.0]; defaults to
@@ -885,6 +999,69 @@ mod tests {
     use rag_rat_core::index::CloneSymbolSelector;
 
     use super::ClonesForSymbolArgs;
+
+    #[test]
+    fn memory_edges_into_target_routes_node_and_github() {
+        use rag_rat_core::query::memory::EdgeTarget;
+
+        use super::{McpEdgeDirection, MemoryEdgesArgs};
+        let into = |node_id, gh: Option<(&str, &str, i64)>| MemoryEdgesArgs {
+            direction: McpEdgeDirection::Into,
+            node_id,
+            github_owner: gh.map(|g| g.0.to_string()),
+            github_repo: gh.map(|g| g.1.to_string()),
+            github_number: gh.map(|g| g.2),
+        };
+        // #464 review fix: `direction=into` must reach a GITHUB target, not always build a node.
+        assert!(matches!(
+            into(None, Some(("o", "r", 7))).reverse_target().unwrap(),
+            EdgeTarget::Github { number: 7, .. }
+        ));
+        assert!(matches!(
+            into(Some("mem_x".to_string()), None).reverse_target().unwrap(),
+            EdgeTarget::Node { .. }
+        ));
+        // Exactly one target: neither (or both) is an error.
+        assert!(into(None, None).reverse_target().is_err());
+        assert!(into(Some("mem_x".to_string()), Some(("o", "r", 7))).reverse_target().is_err());
+    }
+
+    #[test]
+    fn memory_edge_add_relation_and_target_mappings() {
+        use rag_rat_core::query::memory::EdgeTarget;
+
+        use super::{McpEdgeRelation, MemoryEdgeAddArgs};
+        let add = |relation, node: Option<&str>, gh: Option<(&str, &str, i64)>| MemoryEdgeAddArgs {
+            source_node_id: "s".to_string(),
+            relation,
+            target_node_id: node.map(str::to_string),
+            target_repo_id: None,
+            github_owner: gh.map(|g| g.0.to_string()),
+            github_repo: gh.map(|g| g.1.to_string()),
+            github_number: gh.map(|g| g.2),
+        };
+        // Every relation maps to its db token.
+        for (relation, token) in [
+            (McpEdgeRelation::DependsOn, "depends_on"),
+            (McpEdgeRelation::RelatesTo, "relates_to"),
+            (McpEdgeRelation::Supersedes, "supersedes"),
+            (McpEdgeRelation::DerivedFrom, "derived_from"),
+            (McpEdgeRelation::Tracks, "tracks"),
+        ] {
+            assert_eq!(add(relation, Some("t"), None).relation_str(), token);
+        }
+        // Target: exactly one of a node or a github ref.
+        assert!(matches!(
+            add(McpEdgeRelation::RelatesTo, Some("t"), None).target().unwrap(),
+            EdgeTarget::Node { .. }
+        ));
+        assert!(matches!(
+            add(McpEdgeRelation::Tracks, None, Some(("o", "r", 1))).target().unwrap(),
+            EdgeTarget::Github { .. }
+        ));
+        assert!(add(McpEdgeRelation::Tracks, None, None).target().is_err());
+        assert!(add(McpEdgeRelation::Tracks, Some("t"), Some(("o", "r", 1))).target().is_err());
+    }
 
     fn args(
         id: Option<i64>,

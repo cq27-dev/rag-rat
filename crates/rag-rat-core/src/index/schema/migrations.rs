@@ -1183,6 +1183,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_046_ID => Some(46),
             MIGRATION_047_ID => Some(47),
             MIGRATION_048_ID => Some(48),
+            MIGRATION_049_ID => Some(49),
             _ => None,
         })
         .max()
@@ -1240,6 +1241,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_046_ID
             | MIGRATION_047_ID
             | MIGRATION_048_ID
+            | MIGRATION_049_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1294,6 +1296,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_046_ID => migration.checksum != MIGRATION_046_CHECKSUM,
         MIGRATION_047_ID => migration.checksum != MIGRATION_047_CHECKSUM,
         MIGRATION_048_ID => migration.checksum != MIGRATION_048_CHECKSUM,
+        MIGRATION_049_ID => migration.checksum != MIGRATION_049_CHECKSUM,
         _ => false,
     }
 }
@@ -3383,6 +3386,51 @@ fn rebuild_repo_memory_fts_with_repo_id(conn: &Connection) -> rusqlite::Result<(
 pub(crate) fn apply_memory_payload_json(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "repo_memories", "payload_json", "TEXT")?;
     Ok(())
+}
+
+/// V049 (#464): `repo_node_edges` — the typed, content-addressed, cross-repo edge set. One row per
+/// edge from a source memory NODE to a target that is either another node or a code/github anchor.
+///
+/// Design invariants baked into the shape:
+///   - `edge_key` (PK) is the stable content-addressed identity: a `rebind` re-resolves the local
+///     rowids WITHOUT changing the key, so a sync fold keeps presence/tombstones keyed by it.
+///   - `repo_id` is the OWNER repo (the source node's repo — the periphery scope + adoption key);
+///     `target_repo_id` is the target's repo, which MAY differ (a cross-repo edge into a sibling).
+///   - Portable `target_kind` + `target_anchor` carry the durable target identity; the resolved
+///     local rowids (`target_node_id` / `target_logical_symbol_id`) are re-derivable and carry NO
+///     FK to volatile graph rows (the #248 rule — a reindex must never cascade-delete a durable
+///     edge). The ONLY FK is `source_node_id` -> `repo_memories(id)` (a durable node), cascading so
+///     an edge dies with its source.
+///   - `anchor_status` is `current` | `gone` | `unresolved` (the last for a cross-repo target whose
+///     repo is not present locally yet — re-resolved when it is indexed, never a hard failure).
+pub(crate) fn apply_repo_node_edges(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS repo_node_edges(
+            edge_key TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+            source_node_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            target_repo_id TEXT NOT NULL,
+            target_kind TEXT NOT NULL,
+            target_anchor TEXT NOT NULL,
+            target_node_id TEXT,
+            target_logical_symbol_id INTEGER,
+            symbol_kind TEXT,
+            signature_hash TEXT,
+            anchor_status TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY(source_node_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_repo_node_edges_source
+            ON repo_node_edges(source_node_id, relation);
+        -- Reverse traversal (edges_into) matches on the globally-unique
+        -- (target_kind, target_anchor) only, not target_repo_id (the anchor
+        -- determines its repo), so the index leads with exactly those two columns.
+        CREATE INDEX IF NOT EXISTS idx_repo_node_edges_target
+            ON repo_node_edges(target_kind, target_anchor);
+        ",
+    )
 }
 
 pub(crate) fn apply_symbols_is_test(conn: &Connection) -> rusqlite::Result<()> {
