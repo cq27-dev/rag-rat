@@ -17,9 +17,12 @@ pub(crate) fn create_memory(
     validate_len("body", &request.body, MAX_MEMORY_BODY_LEN)?;
     let source = request.source.clone().unwrap_or_else(|| "agent".to_string());
     validate_source(&source)?;
+    // `None` = an UNANCHORED node (#463): a `Concept` / standalone `Task` with no code anchor.
     let binding = resolve_binding(conn, &request.bind)?;
     let input_hash = memory_input_hash(&request.kind, &request.title, &request.body, &request.tags);
-    if let Some(existing_id) = duplicate_memory_id(conn, &request.title, &request.body, &binding)? {
+    if let Some(existing_id) =
+        duplicate_memory_id(conn, &request.title, &request.body, binding.as_ref())?
+    {
         let memory = memory_by_id(conn, &existing_id)?
             .ok_or_else(|| anyhow::anyhow!("duplicate memory `{existing_id}` disappeared"))?;
         return Ok(RepoMemoryCreateResult { memory, duplicate: true });
@@ -49,14 +52,17 @@ pub(crate) fn create_memory(
             request.created_by,
             now,
             source,
-            binding.source_text_hash,
+            binding.as_ref().and_then(|b| b.source_text_hash.clone()),
             input_hash
         ],
     )?;
-    insert_binding(conn, &id, &binding, now)?;
-    // A symbol-bound memory whose logical symbol has a known SCIP moniker gets the moniker anchor
-    // automatically (#70) — the relocation fallback the hash anchors can't provide.
-    insert_auto_moniker_binding(conn, &id, &binding, now)?;
+    // Unanchored nodes (#463) skip binding writes entirely — nothing to insert or auto-moniker.
+    if let Some(binding) = &binding {
+        insert_binding(conn, &id, binding, now)?;
+        // A symbol-bound memory whose logical symbol has a known SCIP moniker gets the moniker
+        // anchor automatically (#70) — the relocation fallback the hash anchors can't provide.
+        insert_auto_moniker_binding(conn, &id, binding, now)?;
+    }
     // Stamp the active repo on the new memory, then stamp its bindings FROM the (now-stamped)
     // parent memory (spec §4.5: a binding defaults to its memory's repo). Gated on the
     // periphery scope — a no-op on the pre-A5 schema (no `repo_id` column). MUST run before
@@ -510,7 +516,14 @@ pub(crate) fn rebind_memory(
     // Resolve inside the transaction so the stamped source_text_hash is consistent with the
     // bindings written in the same atomic unit.
     let tx = conn.unchecked_transaction()?;
-    let binding = resolve_binding(conn, &bind)?;
+    // Rebind MUST name an anchor — moving a memory to "no binding" is meaningless (delete/recreate
+    // it unanchored instead). Only `create_memory` accepts the unanchored (`None`) case (#463).
+    let binding = resolve_binding(conn, &bind)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "memory_rebind requires a binding target: logical_symbol_id, symbol_id, chunk_id, \
+             edge_id, call path, path/span, commit_hash, or github ref"
+        )
+    })?;
     conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = ?1", [memory_id])?;
     conn.execute("DELETE FROM repo_memory_call_paths WHERE memory_id = ?1", [memory_id])?;
     let now = now_ms();
@@ -577,19 +590,25 @@ pub(crate) fn list_memories(
         ))?;
         stmt.query_map([binding_kind], memory_summary_row)?.collect::<Result<_, _>>()?
     } else {
+        // LEFT JOIN (not INNER): an UNANCHORED node (#463) has no bindings and must still list —
+        // its binding columns come back NULL (rendered blank). The "first binding"
+        // correlation moves into the ON clause so a zero-binding memory keeps its row. (The
+        // kind-filtered branch above stays an inner join — filtering BY a binding kind
+        // correctly excludes bindingless nodes.)
         let mut stmt = conn.prepare(&format!(
             "
             SELECT m.id AS memory_id, m.kind, m.title, m.status,
                    b.binding_kind, b.binding_id
             FROM repo_memories AS m
-            JOIN repo_memory_bindings AS b ON b.memory_id = m.id
-            WHERE m.status IN ('active', 'stale'){repo_clause}
+            LEFT JOIN repo_memory_bindings AS b
+              ON b.memory_id = m.id
               AND b.rowid = (
                   SELECT b2.rowid FROM repo_memory_bindings AS b2
                   WHERE b2.memory_id = m.id
                   ORDER BY b2.binding_kind, b2.binding_id
                   LIMIT 1
               )
+            WHERE m.status IN ('active', 'stale'){repo_clause}
             ORDER BY m.updated_at_ms DESC
             "
         ))?;
@@ -604,8 +623,9 @@ fn memory_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySummary
         kind: row.get(1)?,
         title: row.get(2)?,
         status: row.get(3)?,
-        binding_kind: row.get(4)?,
-        binding_id: row.get(5)?,
+        // NULL for an unanchored node (#463, LEFT JOIN) → blank.
+        binding_kind: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        binding_id: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
     })
 }
 

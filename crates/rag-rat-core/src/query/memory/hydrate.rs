@@ -4,16 +4,19 @@ pub(crate) fn duplicate_memory_id(
     conn: &Connection,
     title: &str,
     body: &str,
-    binding: &ResolvedBinding,
+    binding: Option<&ResolvedBinding>,
 ) -> anyhow::Result<Option<String>> {
     // Dedupe NEVER crosses repos (spec §4.4): a duplicate is a same-repo title+body+binding match.
     // The `{repo_clause}` is empty on the pre-A5 schema (memory still repo-global), so this stays
-    // the original global dedupe until the periphery-scoping migration lands.
+    // the original global dedupe until the periphery-scoping migration lands. An UNANCHORED node
+    // (#463) has no binding, so its dupe is a same-repo title+body match with NO bindings — never a
+    // false collision with an anchored memory that happens to share text.
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
-    conn.query_row(
-        &format!(
-            "
+    match binding {
+        Some(binding) => conn.query_row(
+            &format!(
+                "
         SELECT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
@@ -24,10 +27,29 @@ pub(crate) fn duplicate_memory_id(
           AND repo_memories.status != 'obsolete'{repo_clause}
         LIMIT 1
         "
+            ),
+            params![title.trim(), body.trim(), binding.binding_kind, binding.binding_id],
+            |row| row.get("memory_id"),
         ),
-        params![title.trim(), body.trim(), binding.binding_kind, binding.binding_id],
-        |row| row.get("memory_id"),
-    )
+        None => conn.query_row(
+            &format!(
+                "
+        SELECT repo_memories.id AS memory_id
+        FROM repo_memories
+        WHERE lower(repo_memories.title) = lower(?1)
+          AND lower(repo_memories.body) = lower(?2)
+          AND repo_memories.status != 'obsolete'{repo_clause}
+          AND NOT EXISTS (
+              SELECT 1 FROM repo_memory_bindings WHERE repo_memory_bindings.memory_id = \
+                 repo_memories.id
+          )
+        LIMIT 1
+        "
+            ),
+            params![title.trim(), body.trim()],
+            |row| row.get("memory_id"),
+        ),
+    }
     .optional()
     .map_err(Into::into)
 }

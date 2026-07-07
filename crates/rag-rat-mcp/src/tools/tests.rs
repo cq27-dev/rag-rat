@@ -278,7 +278,8 @@ fn list_tools_exposes_complete_typed_schemas() {
     ]);
     assert_schema_has_property(tools, "heal_index", "limit");
     assert_schema_requires(tools, "memory_create", "kind");
-    assert_schema_requires(tools, "memory_create", "bind");
+    // `bind` is OPTIONAL (#463): omitting it creates an unanchored Concept/Task node.
+    assert_schema_has_property(tools, "memory_create", "bind");
     assert_schema_has_property(tools, "memory_create", "confidence");
     assert_schema_nested_property(tools, "memory_create", "bind", "edge_id");
     assert_schema_nested_property(tools, "memory_create", "bind", "edge_sequence_hash");

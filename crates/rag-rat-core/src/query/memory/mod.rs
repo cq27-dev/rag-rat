@@ -160,7 +160,7 @@ pub struct RepoMemoryCreate {
     pub bind: RepoMemoryBindTarget,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct RepoMemoryBindTarget {
     // Accept the opaque `sym_<hex>` handle (#149); `default` keeps it optional under the custom
     // deserializer.
@@ -204,6 +204,17 @@ pub struct RepoMemoryBindTarget {
     /// Directory anchor: a repo-root-relative directory path, or `""` for the repo root.
     /// Normalized on resolve (trim, drop leading `./`, strip trailing `/`).
     pub dir: Option<String>,
+}
+
+impl RepoMemoryBindTarget {
+    /// True iff NO field is set — a truly empty target, i.e. an UNANCHORED node (#463). Derived
+    /// structurally (`== default`) so it is drift-proof: any field added to this struct is covered
+    /// automatically. A PARTIALLY populated target (some field set, but not a complete binding —
+    /// e.g. github owner+repo without a number, or a span without a path) is NOT empty; it is a
+    /// malformed anchor that `resolve_binding` rejects rather than silently treating as unanchored.
+    pub(crate) fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

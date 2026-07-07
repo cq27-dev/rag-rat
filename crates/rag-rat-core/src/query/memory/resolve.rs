@@ -1,36 +1,41 @@
 use super::*;
 
+/// Resolve the ONE binding target a bind request names, or `Ok(None)` when the request names none
+/// — an UNANCHORED node (#463): a `Concept` or standalone `Task` lives only as a graph node, with
+/// no code anchor. This is the single source of truth for "is a binding present"; each caller
+/// decides what to do with `None` (`create_memory` allows it; `rebind_memory` rejects it — a rebind
+/// with nothing to bind to is meaningless). `Err` is reserved for a NAMED-but-unresolvable target.
 pub(crate) fn resolve_binding(
     conn: &Connection,
     bind: &RepoMemoryBindTarget,
-) -> anyhow::Result<ResolvedBinding> {
+) -> anyhow::Result<Option<ResolvedBinding>> {
     if let Some(logical_symbol_id) = bind.logical_symbol_id {
-        return resolve_logical_symbol_binding(conn, logical_symbol_id);
+        return resolve_logical_symbol_binding(conn, logical_symbol_id).map(Some);
     }
     if let Some(symbol_id) = bind.symbol_id {
-        return resolve_symbol_binding(conn, symbol_id);
+        return resolve_symbol_binding(conn, symbol_id).map(Some);
     }
     if let Some(chunk_id) = bind.chunk_id {
-        return resolve_chunk_binding(conn, chunk_id);
+        return resolve_chunk_binding(conn, chunk_id).map(Some);
     }
     if let Some(edge_id) = bind.edge_id {
-        return resolve_edge_binding(conn, edge_id);
+        return resolve_edge_binding(conn, edge_id).map(Some);
     }
     // Server-derived call path (preferred): compute the authoritative hash from the edges.
     if let Some(edge_path) = bind.edge_path.as_deref() {
-        return resolve_call_path_from_edges(conn, bind, edge_path);
+        return resolve_call_path_from_edges(conn, bind, edge_path).map(Some);
     }
     if let Some(edge_sequence_hash) = bind.edge_sequence_hash.as_deref() {
-        return resolve_call_path_binding(conn, bind, edge_sequence_hash);
+        return resolve_call_path_binding(conn, bind, edge_sequence_hash).map(Some);
     }
     if let Some(dir) = bind.dir.as_deref() {
-        return resolve_dir_binding(conn, dir);
+        return resolve_dir_binding(conn, dir).map(Some);
     }
     if let Some(path) = bind.path.as_deref() {
-        return resolve_path_binding(conn, path, bind.start_line, bind.end_line);
+        return resolve_path_binding(conn, path, bind.start_line, bind.end_line).map(Some);
     }
     if let Some(commit_hash) = bind.commit_hash.as_deref() {
-        return Ok(ResolvedBinding {
+        return Ok(Some(ResolvedBinding {
             binding_kind: "commit".to_string(),
             binding_id: commit_hash.to_string(),
             path: None,
@@ -49,12 +54,12 @@ pub(crate) fn resolve_binding(
             call_path: None,
             source_text_hash: None,
             anchor_status: "unverified".to_string(),
-        });
+        }));
     }
     if let (Some(owner), Some(repo), Some(number)) =
         (bind.github_owner.as_deref(), bind.github_repo.as_deref(), bind.github_number)
     {
-        return Ok(ResolvedBinding {
+        return Ok(Some(ResolvedBinding {
             binding_kind: "github".to_string(),
             binding_id: format!("{owner}/{repo}#{number}"),
             path: None,
@@ -73,11 +78,20 @@ pub(crate) fn resolve_binding(
             call_path: None,
             source_text_hash: None,
             anchor_status: "unverified".to_string(),
-        });
+        }));
+    }
+    // Fell through every binding branch. A TRULY EMPTY target is an unanchored node (#463); a
+    // PARTIALLY populated one (e.g. github owner+repo without a number, a span without a path, or
+    // call-path metadata without an `edge_sequence_hash`/`edge_path`) is a malformed anchor —
+    // reject it rather than silently dropping the intended binding into an invisible unanchored
+    // memory.
+    if bind.is_empty() {
+        return Ok(None);
     }
     anyhow::bail!(
-        "memory_create requires logical_symbol_id, symbol_id, chunk_id, edge_id, call path, \
-         path/span, commit_hash, or github ref binding"
+        "memory_create binding is incomplete: give a full logical_symbol_id, symbol_id, chunk_id, \
+         edge_id, call path, path/span, commit_hash, or github (owner+repo+number) ref — or omit \
+         `bind` entirely to create an unanchored node"
     )
 }
 

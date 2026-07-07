@@ -2443,3 +2443,136 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// #463: a node created with NO binding target is UNANCHORED — a graph node (a `Concept` /
+/// standalone `Task`) with no code anchor. It surfaces in the general `memory list` with blank
+/// binding columns, dedupes against another unanchored node of the same text, is excluded by a
+/// binding-kind filter, and is never flagged by `memory_validate` (no anchor to go stale/gone).
+#[test]
+fn unanchored_node_is_created_listed_and_deduped() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let make = || crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(), /* Task/Concept kinds land in #465; any kind may be
+                                       * unanchored. */
+        title: "Prefer the event log over polling".to_string(),
+        body: "A cross-cutting decision not anchored to any one symbol.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test-agent".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        bind: crate::query::memory::RepoMemoryBindTarget::default(), // empty → unanchored
+    };
+
+    let created = db.memory_create(make()).unwrap();
+    assert!(!created.duplicate);
+    assert!(created.memory.bindings.is_empty(), "an unanchored node has zero bindings");
+
+    let conn = db.storage.connection();
+
+    // Surfaces in the general list with blank binding columns (LEFT JOIN).
+    let all = crate::query::memory::list_memories(conn, None).unwrap();
+    let summary = all
+        .iter()
+        .find(|s| s.memory_id == created.memory.memory_id)
+        .expect("unanchored node must appear in `memory list`");
+    assert_eq!(summary.kind, "Decision");
+    assert_eq!(summary.binding_kind, "");
+    assert_eq!(summary.binding_id, "");
+
+    // A binding-kind filter excludes it (it has no binding kind).
+    assert!(
+        crate::query::memory::list_memories(conn, Some("path")).unwrap().is_empty(),
+        "an unanchored node must not surface under a binding-kind filter"
+    );
+
+    // A second unanchored node with identical text dedupes to the same id.
+    let again = db.memory_create(make()).unwrap();
+    assert!(again.duplicate, "a second unanchored node with the same text dedupes");
+    assert_eq!(again.memory.memory_id, created.memory.memory_id);
+
+    // Validation never flags an unanchored node (no anchor to go stale/gone).
+    assert_eq!(db.memory_validate().unwrap().stale, 0);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #463: `memory_rebind` still REQUIRES an anchor — moving a memory to "no binding" is meaningless.
+/// Only `memory_create` accepts the unanchored case.
+#[test]
+fn rebind_still_requires_a_binding_target() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Decision".to_string(),
+            title: "an unanchored node".to_string(),
+            body: "created without a binding".to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec![],
+            bind: crate::query::memory::RepoMemoryBindTarget::default(),
+        })
+        .unwrap();
+
+    let err = db
+        .memory_rebind(
+            &created.memory.memory_id,
+            crate::query::memory::RepoMemoryBindTarget::default(),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires a binding target"),
+        "rebind must reject an empty bind target: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #463 guard: a PARTIALLY populated bind (an intended anchor missing a field) must ERROR, not
+/// silently become an unanchored node — otherwise a typo'd anchor yields an invisible memory that
+/// no `memory_for_*` lookup surfaces and validation never checks.
+#[test]
+fn a_partial_binding_is_rejected_not_silently_unanchored() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // github owner+repo but NO number — an incomplete anchor, not an unanchored node.
+    let err = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Decision".to_string(),
+            title: "partial github anchor".to_string(),
+            body: "owner+repo without a number".to_string(),
+            confidence: "low".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec![],
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                github_owner: Some("o".to_string()),
+                github_repo: Some("r".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("binding is incomplete"),
+        "a partial binding must be rejected, got: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
