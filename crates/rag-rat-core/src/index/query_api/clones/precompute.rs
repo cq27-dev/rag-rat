@@ -34,6 +34,11 @@ pub(crate) const CLONE_PRECOMPUTE_THETA: f64 = THETA;
 
 const DEFAULT_BATCH_SIZE: usize = 512;
 
+/// Per-repo meta keys for the #472 quiet-window gate: the stale content revision under
+/// observation and when it was first observed (epoch ms).
+const CLONE_GRAPH_QUIET_REVISION_META: &str = "clone_graph_quiet_candidate_revision";
+const CLONE_GRAPH_QUIET_SINCE_META: &str = "clone_graph_quiet_candidate_since_ms";
+
 /// Soft per-pass budget + checkpoint granularity for one
 /// [`IndexDatabase::reconcile_clone_edges_pass`].
 #[derive(Debug, Clone)]
@@ -139,19 +144,109 @@ impl IndexDatabase {
         })
     }
 
-    /// True when the precomputed graph is ABSENT or STALE vs the current content — the gate the
-    /// watcher / maintenance pass uses to decide whether to spend budget on a recompute.
+    /// True when the precomputed graph is ABSENT or STALE vs the current content. The background
+    /// watcher / maintenance tails wrap this in [`Self::clone_graph_rebuild_due`] (the #472
+    /// quiet-window gate); explicit callers (`clones --precompute`) read the staleness directly.
     pub fn pending_clone_graph(&self) -> anyhow::Result<bool> {
+        let revision = self.content_revision()?;
+        self.clone_graph_stale_against(&revision)
+    }
+
+    /// The staleness core of [`Self::pending_clone_graph`], against an already-computed
+    /// `content_revision()` so the quiet gate pays the digest once per probe.
+    fn clone_graph_stale_against(&self, content_revision: &str) -> anyhow::Result<bool> {
         let conn = self.storage.connection();
         let Some(live) = live_generation_row(conn)? else {
             return Ok(true); // no completed generation yet
         };
-        Ok(live.source_revision != self.content_revision()?
+        Ok(live.source_revision != content_revision
             || live.normalizer_version != NORM_VERSION
             // A live generation built before postings existed (`postings_written = 0`) is pending
             // so one rebuild pass fills `clone_subblock_postings` — else an upgraded DB with an
             // already-Complete clone graph would keep an empty postings table forever (review R2).
             || !live.postings_written)
+    }
+
+    /// The background quiet-window gate for the clone-graph tail (#472): true when the graph is
+    /// pending AND the content revision has been stable for `quiet_ms`. Under sustained editing
+    /// `content_revision()` moves every pass, so an ungated tail discards the in-flight Building
+    /// generation and rebuilds the whole graph from symbol 0 each time (measured ~1 GB of DB
+    /// writes per pass); the gate defers the rebuild until the churn pauses. Bookkeeping lives in
+    /// per-repo meta (`clone_graph_quiet_*`), so the watcher and the hook-driven CLI `maintenance`
+    /// share one window across processes:
+    /// - graph current → drop any armed candidate, not due;
+    /// - stale revision != armed candidate (or nothing armed) → (re-)arm the window, not due;
+    /// - stale revision == armed candidate for ≥ `quiet_ms` → due.
+    ///
+    /// `probe_without_candidate = false` lets an idle pass skip the probe — and its
+    /// content-revision digest — entirely when no deferred rebuild is owed (nothing armed).
+    /// `quiet_ms = 0` disables the gate (a pending graph is immediately due). Explicit rebuild
+    /// paths (`clones --precompute`, full `index`) bypass the gate entirely.
+    pub fn clone_graph_rebuild_due(
+        &self,
+        quiet_ms: i64,
+        probe_without_candidate: bool,
+    ) -> anyhow::Result<bool> {
+        self.clone_graph_rebuild_due_at(now_ms(), quiet_ms, probe_without_candidate)
+    }
+
+    /// [`Self::clone_graph_rebuild_due`] with the clock injected (tests).
+    pub(crate) fn clone_graph_rebuild_due_at(
+        &self,
+        now_ms: i64,
+        quiet_ms: i64,
+        probe_without_candidate: bool,
+    ) -> anyhow::Result<bool> {
+        let candidate = self.clone_graph_quiet_candidate()?;
+        if candidate.is_none() && !probe_without_candidate {
+            return Ok(false);
+        }
+        let revision = self.content_revision()?;
+        if !self.clone_graph_stale_against(&revision)? {
+            if candidate.is_some() {
+                self.clear_clone_graph_quiet_candidate()?;
+            }
+            return Ok(false);
+        }
+        if quiet_ms == 0 {
+            return Ok(true);
+        }
+        match candidate {
+            Some((armed_revision, since_ms)) if armed_revision == revision =>
+                Ok(now_ms.saturating_sub(since_ms) >= quiet_ms),
+            _ => {
+                self.set_repo_meta(CLONE_GRAPH_QUIET_REVISION_META, &revision)?;
+                self.set_repo_meta(CLONE_GRAPH_QUIET_SINCE_META, &now_ms.to_string())?;
+                Ok(false)
+            },
+        }
+    }
+
+    /// The armed quiet-window candidate, if any: the stale revision under observation and when it
+    /// was first seen. A torn/corrupt pair reads as absent (the next probe re-arms it).
+    fn clone_graph_quiet_candidate(&self) -> anyhow::Result<Option<(String, i64)>> {
+        let Some(revision) = self.repo_meta(CLONE_GRAPH_QUIET_REVISION_META)? else {
+            return Ok(None);
+        };
+        let since_ms = self
+            .repo_meta(CLONE_GRAPH_QUIET_SINCE_META)?
+            .and_then(|since| since.parse::<i64>().ok());
+        Ok(since_ms.map(|since_ms| (revision, since_ms)))
+    }
+
+    fn clear_clone_graph_quiet_candidate(&self) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        crate::index::meta::delete_repo_meta(
+            conn,
+            &self.active_repo_id,
+            CLONE_GRAPH_QUIET_REVISION_META,
+        )?;
+        crate::index::meta::delete_repo_meta(
+            conn,
+            &self.active_repo_id,
+            CLONE_GRAPH_QUIET_SINCE_META,
+        )?;
+        Ok(())
     }
 
     /// Invalidate the persisted clone-graph postings — mark EVERY generation postings-stale
@@ -1154,6 +1249,160 @@ mod tests {
             .unwrap();
         assert!(postings > 0, "the upgrade rebuild fills clone_subblock_postings");
         assert!(!db.pending_clone_graph().unwrap(), "no longer pending after the rebuild");
+    }
+
+    /// The background quiet-window gate (#472): a pending clone graph does NOT fire a rebuild on
+    /// first observation — the probe ARMS the window by recording the stale revision — and fires
+    /// only once that revision has stayed stable past the window. This is what stops sustained
+    /// editing from treadmilling full-generation rebuilds on every watcher/maintenance pass.
+    #[test]
+    fn clone_graph_quiet_gate_arms_then_fires_after_the_window() {
+        let db = build_clone_fixture("quiet-gate-arms");
+        assert!(db.pending_clone_graph().unwrap(), "fresh fixture has no generation yet");
+        assert!(
+            !db.clone_graph_rebuild_due_at(1_000, 300_000, true).unwrap(),
+            "first observation arms the window instead of firing"
+        );
+        assert!(
+            !db.clone_graph_rebuild_due_at(1_000 + 299_999, 300_000, true).unwrap(),
+            "still inside the window"
+        );
+        assert!(
+            db.clone_graph_rebuild_due_at(1_000 + 300_000, 300_000, true).unwrap(),
+            "a stable revision past the window fires"
+        );
+    }
+
+    /// Content moving while armed re-arms the window for the NEW revision: sustained editing keeps
+    /// deferring (the treadmill fix), and only a revision that stays put for the full window fires.
+    #[test]
+    fn clone_graph_quiet_gate_rearms_when_the_revision_moves() {
+        let config = clone_fixture_config("quiet-gate-rearm");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert!(!db.clone_graph_rebuild_due_at(1_000, 300_000, true).unwrap(), "arm");
+        drop(db);
+
+        // Edit a fixture file and re-index so `content_revision()` moves past the armed candidate
+        // (the armed `clone_graph_quiet_*` repo_meta survives the rebuild, like the live-generation
+        // pointer does).
+        let a = config.root.join("src/a.rs");
+        let mut text = std::fs::read_to_string(&a).unwrap();
+        text.push_str("pub fn freshly_added(x: i32) -> i32 { x + 41 }\n");
+        std::fs::write(&a, text).unwrap();
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+
+        assert!(
+            !db.clone_graph_rebuild_due_at(10_000_000, 300_000, true).unwrap(),
+            "a moved revision re-arms instead of firing, however long the old candidate sat"
+        );
+        assert!(
+            db.clone_graph_rebuild_due_at(10_000_000 + 300_000, 300_000, true).unwrap(),
+            "the new revision fires once it has been stable for the window"
+        );
+    }
+
+    /// `probe_without_candidate = false` (an idle watcher pass with no deferred rebuild owed)
+    /// skips the probe entirely — nothing is armed, so an idle server never pays the
+    /// content-revision digest for the gate.
+    #[test]
+    fn clone_graph_quiet_gate_skips_the_probe_without_a_candidate() {
+        let db = build_clone_fixture("quiet-gate-cold");
+        assert!(
+            !db.clone_graph_rebuild_due_at(1_000, 300_000, false).unwrap(),
+            "no candidate + no probe permission means not due"
+        );
+        // The cold call did no bookkeeping: a later probing call still only ARMS.
+        assert!(
+            !db.clone_graph_rebuild_due_at(50_000_000, 300_000, true).unwrap(),
+            "the probing call after a cold one arms fresh"
+        );
+        assert!(db.clone_graph_rebuild_due_at(50_000_000 + 300_000, 300_000, true).unwrap());
+    }
+
+    /// Once the graph is current the gate reports not-due and drops the armed candidate, so idle
+    /// passes go back to the cheap no-candidate path.
+    #[test]
+    fn clone_graph_quiet_gate_clears_once_current() {
+        let db = build_clone_fixture("quiet-gate-clear");
+        assert!(!db.clone_graph_rebuild_due_at(1_000, 300_000, true).unwrap(), "arm");
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert!(
+            !db.clone_graph_rebuild_due_at(90_000_000, 300_000, true).unwrap(),
+            "a current graph is never due, regardless of the armed candidate's age"
+        );
+        let leftover: i64 = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM repo_meta WHERE key LIKE 'clone_graph_quiet_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "the armed candidate is dropped once the graph is current");
+    }
+
+    /// `quiet_ms = 0` disables the gate — a pending graph is immediately due (the pre-#472
+    /// immediate-rebuild behavior).
+    #[test]
+    fn clone_graph_quiet_gate_zero_window_fires_immediately() {
+        let db = build_clone_fixture("quiet-gate-zero");
+        assert!(db.clone_graph_rebuild_due_at(1_000, 0, true).unwrap());
+    }
+
+    /// End-to-end through the watcher pass (#472): a content-changing maintenance pass ARMS the
+    /// gate and DEFERS the clone rebuild; once the armed candidate has sat past the quiet window,
+    /// an otherwise-idle pass picks the owed rebuild up (the gate is also a tail trigger) and
+    /// completes it.
+    #[test]
+    fn maintenance_pass_defers_the_clone_rebuild_until_the_quiet_window() {
+        // Asserts whole-DB `clone_graph_generations` counts; opt out of the poison harness whose
+        // sibling seeds another repo's generation.
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("quiet-gate-pass");
+        drop(crate::IndexDatabase::rebuild(&config).unwrap());
+
+        // A content change lands, then a maintenance pass runs while the window is still open: it
+        // must arm and defer (no generation built), not discard-and-rebuild.
+        let a = config.root.join("src/a.rs");
+        let mut text = std::fs::read_to_string(&a).unwrap();
+        text.push_str("pub fn freshly_edited(x: i32) -> i32 { x * 3 }\n");
+        std::fs::write(&a, text).unwrap();
+        crate::watch::maintenance_pass(&config, false).unwrap();
+
+        let db = crate::IndexDatabase::open_config(&config).unwrap();
+        let generations: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM clone_graph_generations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(generations, 0, "a pass inside the quiet window defers the clone rebuild");
+
+        // Backdate the armed candidate past the window, then run an IDLE pass: the owed rebuild
+        // is now due, forces the otherwise-skipped tail, and completes.
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE repo_meta SET value = '1' WHERE key = \
+                 'clone_graph_quiet_candidate_since_ms'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        crate::watch::maintenance_pass(&config, false).unwrap();
+
+        let db = crate::IndexDatabase::open_config(&config).unwrap();
+        let complete: i64 = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM clone_graph_generations WHERE status = 'Complete'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete, 1, "the quiet-elapsed pass builds the graph to completion");
+        assert!(!edge_keys(&db).is_empty(), "and the fixture's clone edges are persisted");
     }
 
     /// A full rebuild recomputes `clone_token_df` authoritatively (correcting incremental drift)

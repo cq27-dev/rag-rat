@@ -34,6 +34,19 @@ use crate::locks::{self, FileLock};
 const GC_EVERY_PASSES: u64 = 20;
 /// Bound a single reconcile so a pass never holds the write lock indefinitely.
 const PASS_RECONCILE_MAX_SECONDS: u64 = 60;
+/// Quiet window before the background clone-graph rebuild fires (#472): the pass tail only spends
+/// budget on the clone graph once `content_revision()` has been STABLE this long. Every content
+/// change invalidates the whole precomputed graph (its freshness key is the global revision), so
+/// an ungated tail under sustained editing discards the in-flight generation and rebuilds from
+/// symbol 0 every pass — measured at ~1 GB of DB writes per pass. Shared by the watcher and the
+/// hook-driven CLI `maintenance`; explicit `clones --precompute` / full `index` stay immediate.
+///
+/// Convergence: the watcher's periodic sweeps pick a deferred rebuild up within one sweep of the
+/// window elapsing. On a HOOK-ONLY install (no watcher) a deferral waits for the next git action —
+/// the same cadence as an embedding backlog left by a time-capped hook pass, and bounded in
+/// impact: reads keep serving the last Complete generation, and the write-time clone check falls
+/// back to the RAM path until the rebuild lands.
+pub const CLONE_GRAPH_QUIET_MS: i64 = 5 * 60 * 1000;
 const STARTUP_CATCHUP_RUN_GC: bool = false;
 /// Shutdown / interactive lock acquisition: skip rather than block forever.
 const SKIP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -164,6 +177,22 @@ fn run_pass(
                 .is_ok_and(|pending| pending > 0)
         },
     );
+    // Clone-graph quiet gate (#472): one probe serves two roles. Inside the tail it REPLACES the
+    // bare `pending_clone_graph` check — a pass during active editing arms/re-arms the quiet
+    // window instead of discarding the in-flight generation and rebuilding the whole graph — and
+    // on an otherwise-idle pass a quiet-elapsed backlog FORCES the tail (like the embedding
+    // backlog above) so the owed rebuild lands right after the churn pauses rather than waiting
+    // for a gc pass. Unlike the embedding probe it must also run whenever the tail will run —
+    // including a startup embedding-backlog tail, which doesn't flip `tail_already_forced` — so
+    // every tail pass can at least ARM an unarmed pending graph (else it rides until a content
+    // change or gc pass). When nothing runs the tail the probe stays cheap: without an armed
+    // candidate it skips the content-revision digest entirely.
+    let clone_graph_due = db
+        .clone_graph_rebuild_due(
+            CLONE_GRAPH_QUIET_MS,
+            tail_already_forced || base_embedding_backlog,
+        )
+        .unwrap_or(false);
     // Idle backstop (issue #63, facet 2): when the sweep changed no content, skip the reconcile /
     // gc / memory-validate tail — an idle server should do no work past discovery. `run_gc` (every
     // GC_EVERY_PASSES) still forces a full tail, so the cases that DON'T flip content_changed are
@@ -178,6 +207,7 @@ fn run_pass(
         run_gc,
         shutdown_reconcile_pending,
         base_embedding_backlog,
+        clone_graph_due,
     ) {
         return Ok(());
     }
@@ -188,15 +218,14 @@ fn run_pass(
         let report = db.reconcile_with_options_progress(options, |_| {})?;
         base_reconcile_status = Some(report.status);
     }
-    // Clone-edge graph (#286): refresh the persisted graph when it's ABSENT or STALE, with whatever
-    // budget the embedding reconcile left — sharing the same PASS_RECONCILE_MAX_SECONDS so a pass
-    // can't overrun. Best-effort + resumable: a bounded pass makes partial progress and the next
-    // pass continues, so a large/dense repo's graph converges over several passes, entirely off
-    // the query path. `None` budget → skip (rides the next pass), exactly like the base
-    // reconcile.
-    if db.pending_clone_graph().unwrap_or(false)
-        && let Some(options) = budget.next_options()
-    {
+    // Clone-edge graph (#286): refresh the persisted graph when it's ABSENT or STALE — gated on
+    // the #472 quiet window (`clone_graph_due` above) so sustained editing defers the rebuild
+    // instead of treadmilling it — with whatever budget the embedding reconcile left, sharing the
+    // same PASS_RECONCILE_MAX_SECONDS so a pass can't overrun. Best-effort + resumable: a bounded
+    // pass makes partial progress and the next pass continues (the revision is quiet-stable, so
+    // the Building generation resumes), entirely off the query path. `None` budget → skip (rides
+    // the next pass), exactly like the base reconcile.
+    if clone_graph_due && let Some(options) = budget.next_options() {
         let _ = db.reconcile_clone_edges_with_budget(options.max_seconds);
     }
     if run_gc {
@@ -215,12 +244,14 @@ fn should_run_pass_tail(
     run_gc: bool,
     shutdown_reconcile_pending: bool,
     base_embedding_backlog: bool,
+    clone_graph_due: bool,
 ) -> bool {
     content_changed
         || overlays_changed
         || run_gc
         || shutdown_reconcile_pending
         || base_embedding_backlog
+        || clone_graph_due
 }
 
 fn pass_tail_forced_by_state(
@@ -1379,28 +1410,32 @@ mod tests {
     #[test]
     fn startup_catchup_does_not_force_the_expensive_tail() {
         assert!(
-            !should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, false),
+            !should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, false, false),
             "an unchanged startup catch-up must not run reconcile/gc/memory validation",
         );
         assert!(
-            should_run_pass_tail(true, false, STARTUP_CATCHUP_RUN_GC, false, false),
+            should_run_pass_tail(true, false, STARTUP_CATCHUP_RUN_GC, false, false, false),
             "real base content changes still run the maintenance tail",
         );
         assert!(
-            should_run_pass_tail(false, true, STARTUP_CATCHUP_RUN_GC, false, false),
+            should_run_pass_tail(false, true, STARTUP_CATCHUP_RUN_GC, false, false, false),
             "linked-worktree overlay changes still run the maintenance tail",
         );
         assert!(
-            should_run_pass_tail(false, false, true, false, false),
+            should_run_pass_tail(false, false, true, false, false, false),
             "scheduled GC passes still force the maintenance tail",
         );
         assert!(
-            should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, true, false),
+            should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, true, false, false),
             "a bounded shutdown discover marks base reconcile owed for the next startup pass",
         );
         assert!(
-            should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, true),
+            should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, true, false),
             "startup catch-up retries an already-indexed base embedding backlog",
+        );
+        assert!(
+            should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, false, true),
+            "a quiet-elapsed clone-graph backlog forces the otherwise-idle tail (#472)",
         );
     }
 

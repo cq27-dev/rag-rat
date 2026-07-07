@@ -444,9 +444,14 @@ fn run_maintenance_pass(
     let gc_report = db.garbage_collect().ok();
     // Clone-edge graph (#286): refresh the persisted graph when absent/stale with whatever budget
     // the embedding reconcile left (shared so the pass can't overrun), so the git-hook
-    // maintenance keeps the graph warm too — not just the foreground watcher. Best-effort +
-    // resumable across passes.
-    let clone_graph_report = if db.pending_clone_graph().unwrap_or(false) {
+    // maintenance keeps the graph warm too — not just the foreground watcher. Gated on the #472
+    // quiet window (shared with the watcher via per-repo meta): a pass observing a fresh content
+    // revision arms/defers instead of discarding and rebuilding the whole generation, so a stream
+    // of commits can't treadmill full rebuilds. Best-effort + resumable across passes.
+    let clone_graph_report = if db
+        .clone_graph_rebuild_due(rag_rat_core::watch::CLONE_GRAPH_QUIET_MS, true)
+        .unwrap_or(false)
+    {
         match budget.as_ref().and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
             Some(options) => db.reconcile_clone_edges_with_budget(options.max_seconds).ok(),
             None => None,
@@ -833,6 +838,95 @@ mod tests {
         // change the coalesced trigger requested).
         super::maintenance(&config, &args).unwrap();
         assert!(!pending.exists(), "the runner clears the rerun marker after its pass");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The hook-driven maintenance tail shares the #472 quiet-window gate with the watcher: a
+    /// pass observing a fresh content revision ARMS the window and DEFERS the clone-graph
+    /// rebuild; once the armed candidate has sat past the window, the next pass completes it.
+    #[test]
+    fn maintenance_defers_the_clone_graph_rebuild_inside_the_quiet_window() {
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-clone-quiet-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/a.rs"),
+            "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/b.rs"),
+            "pub fn load_order(store: Db) -> i32 { let o = store.get(20); validate(o); o + 1 }\n",
+        )
+        .unwrap();
+        let config = Config {
+            repo_id_override: None,
+            database_key_pinned: true,
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            llm: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+            search: Default::default(),
+            memory: Default::default(),
+            log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        // A content change lands, then the hook pass runs inside the window: it must arm the
+        // gate and defer the rebuild, not discard-and-rebuild the generation.
+        std::fs::write(root.join("src/c.rs"), "pub fn freshly_edited(x: i32) -> i32 { x * 3 }\n")
+            .unwrap();
+        let args = super::MaintenanceArgs {
+            trigger: Some("post-commit".to_string()),
+            max_seconds: None,
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+        super::maintenance(&config, &args).unwrap();
+
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        let generations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM clone_graph_generations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(generations, 0, "a hook pass inside the quiet window defers the clone rebuild");
+
+        // Backdate the armed candidate past the window; the next hook pass completes the owed
+        // rebuild.
+        conn.execute(
+            "UPDATE repo_meta SET value = '1' WHERE key = 'clone_graph_quiet_candidate_since_ms'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        super::maintenance(&config, &args).unwrap();
+
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        let complete: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM clone_graph_generations WHERE status = 'Complete'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete, 1, "the quiet-elapsed hook pass builds the graph to completion");
 
         let _ = std::fs::remove_dir_all(&root);
     }
