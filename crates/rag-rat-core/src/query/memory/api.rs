@@ -17,9 +17,19 @@ pub(crate) fn create_memory(
     validate_len("body", &request.body, MAX_MEMORY_BODY_LEN)?;
     let source = request.source.clone().unwrap_or_else(|| "agent".to_string());
     validate_source(&source)?;
-    validate_payload(request.payload_json.as_deref())?;
-    // `None` = an UNANCHORED node (#463): a `Concept` / standalone `Task` with no code anchor.
+    validate_payload(&request.kind, request.payload_json.as_deref())?;
+    // `None` = an UNANCHORED node: only the polymorphic graph-node kinds (`Task` / `Concept`) may
+    // be anchorless (#463/#465). Every OTHER kind must anchor to code — a zero-binding one is
+    // an orphan the dream verifier flags, so allowing its create would generate self-inflicted
+    // `memory_unverifiable` noise. This gate stays in lock-step with `dream::unverifiable_findings`
+    // via the shared `is_polymorphic_node_kind`.
     let binding = resolve_binding(conn, &request.bind)?;
+    if binding.is_none() && !is_polymorphic_node_kind(&request.kind) {
+        anyhow::bail!(
+            "a `{}` memory must anchor to code (only Task/Concept may be unanchored)",
+            request.kind
+        );
+    }
     let input_hash = memory_input_hash(
         &request.kind,
         &request.title,
@@ -29,6 +39,7 @@ pub(crate) fn create_memory(
     );
     if let Some(existing_id) = duplicate_memory_id(
         conn,
+        &request.kind,
         &request.title,
         &request.body,
         request.payload_json.as_deref(),
@@ -112,7 +123,27 @@ pub(crate) fn update_memory(
     if let Some(body) = update.body.as_deref() {
         validate_len("body", body, MAX_MEMORY_BODY_LEN)?;
     }
-    validate_payload(update.payload_json.as_deref())?;
+    // The resulting kind drives payload validation, the unanchored gate, and payload-clearing.
+    let new_kind = update.kind.clone().unwrap_or_else(|| current.kind.clone());
+    validate_payload(&new_kind, update.payload_json.as_deref())?;
+    // The unanchored-kind invariant holds on UPDATE too — but only to PREVENT INTRODUCING it, not
+    // to trap rows already in that state (a legacy pre-#465 unanchored `Decision`, or the
+    // same-kind no-op of a status-only update / `mark_obsolete`, stays editable so it can be
+    // CLEANED UP). Fire ONLY on a kind CHANGE to a non-polymorphic kind on a zero-binding node.
+    let changing_kind = update.kind.as_deref().is_some_and(|kind| kind != current.kind);
+    if changing_kind && !is_polymorphic_node_kind(&new_kind) && current.bindings.is_empty() {
+        anyhow::bail!(
+            "cannot retype an unanchored memory to `{new_kind}` (only Task/Concept may be \
+             unanchored); bind it to code first"
+        );
+    }
+    // A non-polymorphic kind carries NO payload — retyping AWAY from Task/Concept CLEARS a stranded
+    // payload rather than preserving it. Otherwise keep the update's payload, else the current one.
+    let stored_payload = if is_polymorphic_node_kind(&new_kind) {
+        update.payload_json.clone().or_else(|| current.payload_json.clone())
+    } else {
+        None
+    };
     let now = now_ms();
     conn.execute(
         "
@@ -128,14 +159,13 @@ pub(crate) fn update_memory(
         ",
         params![
             update.memory_id,
-            update.kind.unwrap_or(current.kind),
+            new_kind,
             update.title.unwrap_or(current.title),
             update.body.unwrap_or(current.body),
             update.confidence.unwrap_or(current.confidence),
             update.status.unwrap_or(current.status),
             now,
-            // `None` leaves the stored payload unchanged (like the other fields above).
-            update.payload_json.or(current.payload_json)
+            stored_payload
         ],
     )?;
     if let Some(tags) = update.tags {

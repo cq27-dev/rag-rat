@@ -2481,10 +2481,10 @@ fn unanchored_node_is_created_listed_and_deduped() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     let make = || crate::query::memory::RepoMemoryCreate {
-        kind: "Decision".to_string(), /* Task/Concept kinds land in #465; any kind may be
-                                       * unanchored. */
+        // Only Task/Concept may be created UNANCHORED (#465); other kinds must anchor to code.
+        kind: "Concept".to_string(),
         title: "Prefer the event log over polling".to_string(),
-        body: "A cross-cutting decision not anchored to any one symbol.".to_string(),
+        body: "A cross-cutting concept not anchored to any one symbol.".to_string(),
         confidence: "high".to_string(),
         created_by: Some("test-agent".to_string()),
         source: Some("agent".to_string()),
@@ -2505,7 +2505,7 @@ fn unanchored_node_is_created_listed_and_deduped() {
         .iter()
         .find(|s| s.memory_id == created.memory.memory_id)
         .expect("unanchored node must appear in `memory list`");
-    assert_eq!(summary.kind, "Decision");
+    assert_eq!(summary.kind, "Concept");
     assert_eq!(summary.binding_kind, "");
     assert_eq!(summary.binding_id, "");
 
@@ -2539,7 +2539,7 @@ fn rebind_still_requires_a_binding_target() {
 
     let created = db
         .memory_create(crate::query::memory::RepoMemoryCreate {
-            kind: "Decision".to_string(),
+            kind: "Concept".to_string(),
             title: "an unanchored node".to_string(),
             body: "created without a binding".to_string(),
             confidence: "medium".to_string(),
@@ -2713,6 +2713,162 @@ fn payload_bearing_nodes_dedupe_on_payload_not_just_text() {
     let c = db.memory_create(make(r#"{"priority":1}"#)).unwrap();
     assert!(c.duplicate, "identical text and payload dedups");
     assert_eq!(c.memory.memory_id, a.memory.memory_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #465 (PR #471 review): dedup folds KIND, and the unanchored-create gate is kind-aware. Two
+/// distinct graph-node kinds sharing text+payload are NOT duplicates; and only Task/Concept may be
+/// created unanchored — an unanchored Decision is rejected (which keeps `create` in lock-step with
+/// the dream verifier's kind exemption).
+#[test]
+fn dedup_and_unanchored_create_are_kind_aware() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let unanchored = |kind: &str| crate::query::memory::RepoMemoryCreate {
+        kind: kind.to_string(),
+        title: "same text".to_string(),
+        body: "same body".to_string(),
+        confidence: "medium".to_string(),
+        created_by: Some("test-agent".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        payload_json: Some(r#"{"p":1}"#.to_string()),
+        bind: crate::query::memory::RepoMemoryBindTarget::default(),
+    };
+
+    // A Concept and a Task with identical text+payload are DISTINCT (dedup folds kind).
+    let concept = db.memory_create(unanchored("Concept")).unwrap();
+    assert!(!concept.duplicate);
+    let task = db.memory_create(unanchored("Task")).unwrap();
+    assert!(!task.duplicate, "a different kind is not a duplicate");
+    assert_ne!(concept.memory.memory_id, task.memory.memory_id);
+    // Re-creating the same kind+text+payload dedups.
+    let again = db.memory_create(unanchored("Concept")).unwrap();
+    assert!(again.duplicate, "identical kind+text+payload dedups");
+    assert_eq!(again.memory.memory_id, concept.memory.memory_id);
+
+    // A non-Task/Concept kind cannot be created UNANCHORED (no payload here, so the anchor gate is
+    // what fires).
+    let err = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Decision".to_string(),
+            title: "unanchored decision".to_string(),
+            body: "b".to_string(),
+            confidence: "low".to_string(),
+            created_by: None,
+            source: Some("agent".to_string()),
+            tags: vec![],
+            payload_json: None,
+            bind: crate::query::memory::RepoMemoryBindTarget::default(),
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("must anchor to code"),
+        "an unanchored Decision must be rejected, got: {err}"
+    );
+    // A payload is rejected on a non-polymorphic kind, even when ANCHORED to code.
+    let perr = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "invariant with payload".to_string(),
+            body: "b".to_string(),
+            confidence: "low".to_string(),
+            created_by: None,
+            source: Some("agent".to_string()),
+            tags: vec![],
+            payload_json: Some(r#"{"p":1}"#.to_string()),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                path: Some("src/lib.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap_err();
+    assert!(
+        perr.to_string().contains("only Task/Concept may have a payload"),
+        "a payload on a non-polymorphic kind must be rejected, got: {perr}"
+    );
+
+    // The invariant holds on UPDATE too: a zero-binding node cannot be retyped to a non-graph kind,
+    // but retyping between graph-node kinds (Task -> Concept) is fine.
+    let retype = |kind: &str| crate::query::memory::RepoMemoryUpdate {
+        memory_id: task.memory.memory_id.clone(),
+        kind: Some(kind.to_string()),
+        title: None,
+        body: None,
+        confidence: None,
+        status: None,
+        tags: None,
+        payload_json: None,
+    };
+    let bad = db.memory_update(retype("Decision")).unwrap_err();
+    assert!(
+        bad.to_string().contains("only Task/Concept may be unanchored"),
+        "retyping an unanchored node to Decision must be rejected, got: {bad}"
+    );
+    assert_eq!(
+        db.memory_update(retype("Concept")).unwrap().kind,
+        "Concept",
+        "retyping between graph-node kinds is allowed"
+    );
+
+    // Retyping an ANCHORED Task (carrying a payload) to a non-polymorphic kind is allowed (it has a
+    // binding) and CLEARS the stranded payload rather than preserving it.
+    let anchored = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Task".to_string(),
+            title: "anchored task".to_string(),
+            body: "b".to_string(),
+            confidence: "medium".to_string(),
+            created_by: None,
+            source: Some("agent".to_string()),
+            tags: vec![],
+            payload_json: Some(r#"{"p":9}"#.to_string()),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                path: Some("src/lib.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    assert_eq!(anchored.memory.payload_json.as_deref(), Some(r#"{"p":9}"#));
+    let retyped = db
+        .memory_update(crate::query::memory::RepoMemoryUpdate {
+            memory_id: anchored.memory.memory_id.clone(),
+            kind: Some("Decision".to_string()),
+            title: None,
+            body: None,
+            confidence: None,
+            status: None,
+            tags: None,
+            payload_json: None,
+        })
+        .unwrap();
+    assert_eq!(retyped.kind, "Decision");
+    assert!(retyped.payload_json.is_none(), "retyping away from Task/Concept clears the payload");
+
+    // A LEGACY zero-binding non-graph memory (a pre-gate Decision, seeded directly under the active
+    // repo) stays CLEANABLE: a status-only update (mark_obsolete) does not change the kind, so the
+    // gate does not trap it.
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id)
+             SELECT 'mem_legacy', 'Decision', 'legacy orphan', 'b', 'low', 'active', 'agent', 0, \
+             0, 'agent', 'v1', repo_id FROM repo_memories WHERE id = ?1",
+            [&concept.memory.memory_id],
+        )
+        .unwrap();
+    assert_eq!(
+        db.memory_mark_obsolete("mem_legacy").unwrap().status,
+        "obsolete",
+        "a legacy unanchored non-graph memory can still be cleaned up"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

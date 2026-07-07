@@ -501,15 +501,31 @@ pub(crate) fn validate_kind(kind: &str) -> anyhow::Result<()> {
         _ => anyhow::bail!("invalid memory kind `{kind}`"),
     }
 }
-/// A polymorphic node's payload (#465) must be a JSON OBJECT — so it round-trips, and so it can be
-/// folded into `content_hash` in phase B. An array/scalar/malformed value is rejected; `None` (no
-/// payload) is fine. Payload-closure (a payload carries no node/edge references) is enforced once
-/// the edge model (#464) defines what a reference IS — a payload cannot "reference a node" before
-/// nodes are referenceable, so there is nothing to reject here yet.
-pub(crate) fn validate_payload(payload_json: Option<&str>) -> anyhow::Result<()> {
+/// The polymorphic graph-node kinds — `Task` and `Concept` (#463/#465). They ALONE may be created
+/// UNANCHORED (no code binding) AND may carry a structured `payload_json`; every other kind is a
+/// plain note (anchors to code, no payload). The SINGLE source of truth for the unanchored-create
+/// gate (`create`/`update_memory`), the payload-kind gate (`validate_payload`), and the dream
+/// verifier's `memory_unverifiable` exemption — they must never drift, or a create the gate allows
+/// becomes self-inflicted dream noise, or an off-contract payload/anchor slips through.
+pub(crate) fn is_polymorphic_node_kind(kind: &str) -> bool {
+    matches!(kind, "Task" | "Concept")
+}
+
+/// Validate a memory's `payload_json` for its `kind`. Only the polymorphic graph-node kinds
+/// (`is_polymorphic_node_kind`) may carry a payload, and it must be a JSON OBJECT (so it
+/// round-trips and can be folded into the identity hash). A payload on a plain-note kind, or a
+/// non-object payload, is rejected; `None` (no payload) is always fine. Payload-closure (a payload
+/// carries no node/edge references) is enforced once the edge model (#464) defines what a reference
+/// IS.
+pub(crate) fn validate_payload(kind: &str, payload_json: Option<&str>) -> anyhow::Result<()> {
     let Some(payload) = payload_json else {
         return Ok(());
     };
+    if !is_polymorphic_node_kind(kind) {
+        anyhow::bail!(
+            "a `{kind}` memory carries no payload (only Task/Concept may have a payload_json)"
+        );
+    }
     let value: serde_json::Value = serde_json::from_str(payload)
         .map_err(|e| anyhow::anyhow!("payload_json is not valid JSON: {e}"))?;
     if !value.is_object() {

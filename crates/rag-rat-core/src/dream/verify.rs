@@ -412,7 +412,7 @@ pub(super) fn unverifiable_findings(conn: &Connection) -> rusqlite::Result<Vec<D
         // anchor, so a zero-binding one is NOT "unverifiable". A zero-binding memory of any OTHER
         // kind is an orphan (all should-be-anchored) and is still flagged below, as is any memory
         // whose bindings all went `gone` (≥1 row, none live).
-        if matches!(kind.as_str(), "Task" | "Concept")
+        if crate::query::memory::is_polymorphic_node_kind(&kind)
             && !memory_has_any_binding(conn, &memory_id, &scope)?
         {
             continue;
