@@ -218,14 +218,24 @@ fn run_pass(
         let report = db.reconcile_with_options_progress(options, |_| {})?;
         base_reconcile_status = Some(report.status);
     }
-    // Clone-edge graph (#286): refresh the persisted graph when it's ABSENT or STALE — gated on
-    // the #472 quiet window (`clone_graph_due` above) so sustained editing defers the rebuild
-    // instead of treadmilling it — with whatever budget the embedding reconcile left, sharing the
-    // same PASS_RECONCILE_MAX_SECONDS so a pass can't overrun. Best-effort + resumable: a bounded
-    // pass makes partial progress and the next pass continues (the revision is quiet-stable, so
-    // the Building generation resumes), entirely off the query path. `None` budget → skip (rides
-    // the next pass), exactly like the base reconcile.
-    if clone_graph_due && let Some(options) = budget.next_options() {
+    // Clone-edge graph (#286/#473): try the cheap IN-PLACE delta first — it settles an ordinary
+    // edit on this very pass (freshness is the point; no quiet window) and reports whether a FULL
+    // rebuild is still owed (accumulated df drift). The full rebuild runs only when the delta
+    // could not settle freshness (absent generation, normalizer bump, cap crossing, huge delta,
+    // error) or a drift refresh is owed — and it stays behind the #472 quiet window
+    // (`clone_graph_due`) so sustained editing defers it instead of treadmilling. Best-effort +
+    // resumable, with whatever budget the embedding reconcile left (shared
+    // PASS_RECONCILE_MAX_SECONDS so a pass can't overrun); `None` budget → rides the next pass.
+    let clone_full_rebuild_owed = match db
+        .apply_clone_graph_delta(crate::index::CLONE_DELTA_MAX_FILES)
+    {
+        Ok(delta) if delta.status == "Applied" || delta.status == "Noop" => delta.full_rebuild_owed,
+        _ => true,
+    };
+    if clone_full_rebuild_owed
+        && clone_graph_due
+        && let Some(options) = budget.next_options()
+    {
         let _ = db.reconcile_clone_edges_with_budget(options.max_seconds);
     }
     if run_gc {

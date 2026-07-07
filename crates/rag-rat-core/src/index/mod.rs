@@ -59,10 +59,11 @@ pub(crate) use meta::{delete_repo_meta, repo_meta, set_repo_meta};
 pub use parser_failures::ParserFailure;
 pub(crate) use prep::*;
 pub use query_api::{
-    CandidateCloneClass, CloneCheckInput, CloneCompleteness, CloneEdgeReport, CloneEligibility,
-    CloneFingerprintHealth, CloneIneligibilityReason, CloneMember, CloneSymbolSelector,
-    ClonesForSymbolResult, FindClonesOptions, FindClonesResult, GcReport, ImportantSymbolsRequest,
-    OracleShaSnapshots, RoiFactors, SearchRequest, TextCloneMatch,
+    CLONE_DELTA_MAX_FILES, CandidateCloneClass, CloneCheckInput, CloneCompleteness,
+    CloneDeltaReport, CloneEdgeReport, CloneEligibility, CloneFingerprintHealth,
+    CloneIneligibilityReason, CloneMember, CloneSymbolSelector, ClonesForSymbolResult,
+    FindClonesOptions, FindClonesResult, GcReport, ImportantSymbolsRequest, OracleShaSnapshots,
+    RoiFactors, SearchRequest, TextCloneMatch,
 };
 pub(crate) use util::*;
 

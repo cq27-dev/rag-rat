@@ -52,6 +52,11 @@ pub(crate) mod precompute;
 /// module so it can reuse this module's private candidate-gen primitives.
 pub(crate) mod of_text;
 
+/// Incremental delta maintenance of the persisted clone graph (#473): patch the live generation
+/// in place for a small set of changed files instead of a full `precompute` rebuild — a child
+/// module so it shares the exact candidate-gen primitives and `precompute`'s write discipline.
+pub(crate) mod delta;
+
 #[cfg(test)]
 mod tests;
 

@@ -21,6 +21,7 @@ mod search;
 // the capped-class semantics by name (instead of hardcoding 50). Keeps the `clones` module
 // private so `build_class`'s reachability stays narrow (no `private_interfaces` widening of
 // `SymbolBag`).
+pub use clones::delta::{CLONE_DELTA_MAX_FILES, CloneDeltaReport};
 pub use clones::of_text::{CloneCheckInput, CloneFingerprintHealth, TextCloneMatch};
 pub use clones::precompute::CloneEdgeReport;
 pub use clones::{

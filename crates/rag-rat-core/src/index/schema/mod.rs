@@ -18,7 +18,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 49;
+pub const LATEST_SCHEMA_VERSION: u32 = 50;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -335,6 +335,13 @@ const MIGRATION_049_DESCRIPTION: &str =
      edges from a memory node to another node or a code/github target, with explicit owner + \
      target repo ids and a stable edge_key, no FK to volatile graph rows (only the durable source \
      memory)";
+const MIGRATION_050_ID: &str = "050_clone_delta_maintenance";
+const MIGRATION_050_CHECKSUM: &str = "sha256:rag-rat-clone-delta-maintenance-v50";
+const MIGRATION_050_DESCRIPTION: &str =
+    "Add the clone_subblock_postings (build_generation, path) index and the \
+     clone_graph_generations.delta_files_applied counter, so the incremental clone-graph delta \
+     pass can delete a changed file's postings without a table scan and track df drift toward the \
+     next full rebuild";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -728,6 +735,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_049_CHECKSUM,
         description: MIGRATION_049_DESCRIPTION,
         apply: apply_repo_node_edges,
+    },
+    Migration {
+        id: MIGRATION_050_ID,
+        checksum: MIGRATION_050_CHECKSUM,
+        description: MIGRATION_050_DESCRIPTION,
+        apply: apply_clone_delta_maintenance,
     },
 ];
 

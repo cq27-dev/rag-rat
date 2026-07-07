@@ -442,15 +442,22 @@ fn run_maintenance_pass(
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
     let gc_report = db.garbage_collect().ok();
-    // Clone-edge graph (#286): refresh the persisted graph when absent/stale with whatever budget
-    // the embedding reconcile left (shared so the pass can't overrun), so the git-hook
-    // maintenance keeps the graph warm too — not just the foreground watcher. Gated on the #472
-    // quiet window (shared with the watcher via per-repo meta): a pass observing a fresh content
-    // revision arms/defers instead of discarding and rebuilding the whole generation, so a stream
-    // of commits can't treadmill full rebuilds. Best-effort + resumable across passes.
-    let clone_graph_report = if db
-        .clone_graph_rebuild_due(rag_rat_core::watch::CLONE_GRAPH_QUIET_MS, true)
-        .unwrap_or(false)
+    // Clone-edge graph (#286/#473): try the cheap IN-PLACE delta first — it settles an ordinary
+    // commit's changes on this very hook pass. The FULL rebuild runs only when the delta could
+    // not settle freshness (absent generation, normalizer bump, cap crossing, huge delta, error)
+    // or the generation's accumulated df drift owes a refresh — and it stays behind the #472
+    // quiet window (shared with the watcher via per-repo meta), so a stream of commits can't
+    // treadmill full rebuilds. Best-effort + resumable across passes.
+    let clone_delta = db.apply_clone_graph_delta(rag_rat_core::index::CLONE_DELTA_MAX_FILES).ok();
+    let clone_full_rebuild_owed = match &clone_delta {
+        Some(delta) if delta.status == "Applied" || delta.status == "Noop" =>
+            delta.full_rebuild_owed,
+        _ => true,
+    };
+    let clone_graph_report = if clone_full_rebuild_owed
+        && db
+            .clone_graph_rebuild_due(rag_rat_core::watch::CLONE_GRAPH_QUIET_MS, true)
+            .unwrap_or(false)
     {
         match budget.as_ref().and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
             Some(options) => db.reconcile_clone_edges_with_budget(options.max_seconds).ok(),
@@ -463,7 +470,7 @@ fn run_maintenance_pass(
     // rename, or change, so relocate symbol/chunk bindings (or flag them) here rather than
     // leaving stale anchors until a manual memory_validate.
     let memory_validation = db.memory_validate().ok();
-    tracing::debug!(target: "rag_rat_core::maintenance", phase = "gc_clone_memory", gc = gc_report.is_some(), clone_graph = clone_graph_report.is_some(), memory_validated = memory_validation.is_some(), "post-reconcile phases complete");
+    tracing::debug!(target: "rag_rat_core::maintenance", phase = "gc_clone_memory", gc = gc_report.is_some(), clone_delta = clone_delta.as_ref().map_or("error", |d| d.status.as_str()), clone_graph = clone_graph_report.is_some(), memory_validated = memory_validation.is_some(), "post-reconcile phases complete");
     // Remaining backlog for the ACTIVE embedding model from the CHEAP persisted counts
     // (`status.embedding` / `status.artifacts`, #285), NOT `reconcile_plan` — which rebuilds +
     // re-hashes EVERY chunk's embedding input (O(repo)) on every hook pass. #378 measured that plan

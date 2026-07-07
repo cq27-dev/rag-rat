@@ -820,8 +820,8 @@ fn migration_047_creates_the_model_failure_table_on_fresh_apply() {
 fn migration_048_adds_the_memory_payload_json_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // The absolute-tip pin moved to `migration_049_*` (V049 is the tip now); this keeps the
-    // symbolic "schema at LATEST after apply" check and its V048 column coverage.
+    // Symbolic freshness check — the absolute tip pin lives on the NEWEST migration's test
+    // (migration_050_*), per the ladder convention.
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -843,10 +843,13 @@ fn migration_048_adds_the_memory_payload_json_column() {
 fn migration_049_adds_the_repo_node_edges_table() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V049 is the schema tip — the absolute pin (migration_048_* dropped to symbolic when this
-    // landed).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 49, "V049 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 49, "schema at LATEST after apply");
+    // Symbolic freshness check — the absolute tip pin lives on the NEWEST migration's test
+    // (migration_050_*), per the ladder convention.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     let table_sql = conn
         .query_row("SELECT sql FROM sqlite_master WHERE name = 'repo_node_edges'", [], |r| {
@@ -884,6 +887,44 @@ fn migration_049_adds_the_repo_node_edges_table() {
     // Idempotent re-apply.
     schema::apply(&conn).unwrap();
     assert!(conn_table_exists(&conn, "repo_node_edges"), "edge table survives a re-apply");
+}
+
+#[test]
+fn migration_050_adds_the_postings_path_index_and_delta_counter() {
+    let index_exists = |conn: &rusqlite::Connection| -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = \
+             'idx_clone_subblock_postings_path'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    };
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V050 is the schema tip — the absolute pin (migration_049_* dropped to the symbolic
+    // `current_version == LATEST` check when this landed).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 50, "V050 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 50, "schema at LATEST after apply");
+    assert!(
+        index_exists(&conn),
+        "the delta pass deletes a changed file's postings by (build_generation, path); the PK \
+         leads with token_hash, so that delete needs this index (#473)"
+    );
+    assert!(
+        conn_table_columns(&conn, "clone_graph_generations")
+            .contains(&"delta_files_applied".to_string()),
+        "generations carry the delta-drift counter that schedules the next full rebuild (#473)"
+    );
+    // Additive + defaulted: a re-apply is idempotent and both survive.
+    schema::apply(&conn).unwrap();
+    assert!(index_exists(&conn), "the postings path index survives a re-apply");
+    assert!(
+        conn_table_columns(&conn, "clone_graph_generations")
+            .contains(&"delta_files_applied".to_string()),
+        "delta_files_applied survives a re-apply"
+    );
 }
 
 #[test]

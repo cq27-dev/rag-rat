@@ -71,9 +71,9 @@ pub struct CloneEdgeReport {
 }
 
 /// Reindex-stable identity of a symbol endpoint: `(path, start_byte, file_sha)`.
-type Anchor = (String, i64, String);
+pub(super) type Anchor = (String, i64, String);
 
-struct EdgeRow {
+pub(super) struct EdgeRow {
     a_path: String,
     a_start_byte: i64,
     a_file_sha: String,
@@ -91,15 +91,15 @@ struct EdgeRow {
 /// `sub_block_tokens` set. Each `PostingGroup` expands to one `clone_subblock_postings` row per
 /// token at flush time. Grouping is deliberate — it clones the `(path, file_sha)` strings ONCE per
 /// symbol instead of once per token (a large function has hundreds of sub-block tokens).
-struct PostingGroup {
-    anchor: Anchor,
-    tokens: Vec<i64>,
+pub(super) struct PostingGroup {
+    pub(super) anchor: Anchor,
+    pub(super) tokens: Vec<i64>,
 }
 
-struct GenerationRow {
-    generation: i64,
-    source_revision: String,
-    normalizer_version: i64,
+pub(super) struct GenerationRow {
+    pub(super) generation: i64,
+    pub(super) source_revision: String,
+    pub(super) normalizer_version: i64,
     cursor_symbol_id: i64,
     edges_written: u64,
     /// Whether this generation is POSTINGS-AWARE (#296 phase 2): its `clone_subblock_postings` are
@@ -109,8 +109,19 @@ struct GenerationRow {
     /// cursor, a *Complete* postings-aware generation is fully populated — so the live-generation
     /// completeness gate (`pending_clone_graph` / the Phase-0 skip) reads this as "postings
     /// complete", and a `Building` one reads it as "resumable without a postings gap" (review R2).
-    postings_written: bool,
+    pub(super) postings_written: bool,
+    /// Files absorbed by in-place deltas since this generation's full build (#473) — the df-drift
+    /// signal: past [`CLONE_GRAPH_DRIFT_REBUILD_FILES`] the quiet gate schedules a full rebuild to
+    /// restore sub-block selectivity (df is frozen at the build's epoch, so long-lived generations
+    /// slowly lose candidate-pruning efficiency — never correctness).
+    pub(super) delta_files_applied: i64,
 }
+
+/// How many delta-absorbed files a live generation tolerates before the background tail owes a
+/// FULL rebuild (df epoch refresh + fresh postings). Drift degrades candidate-generation
+/// efficiency only — edges stay exact — so this is a performance valve, sized generously: a
+/// typical editing session touches far fewer files between natural quiet windows.
+pub(super) const CLONE_GRAPH_DRIFT_REBUILD_FILES: i64 = 256;
 
 impl IndexDatabase {
     /// Precompute the clone-edge graph to completion under the caller's write lock (loops resumable
@@ -191,6 +202,12 @@ impl IndexDatabase {
     }
 
     /// [`Self::clone_graph_rebuild_due`] with the clock injected (tests).
+    ///
+    /// "Owed" here means a FULL rebuild: the graph is stale in a way the #473 delta can't settle
+    /// (absent / normalizer bump / postings gap), OR the live generation has absorbed enough
+    /// delta files ([`CLONE_GRAPH_DRIFT_REBUILD_FILES`]) that its frozen df epoch owes a refresh.
+    /// A merely revision-stale-but-delta-eligible graph also arms here — if the delta settles it
+    /// first, the next probe sees it current and disarms.
     pub(crate) fn clone_graph_rebuild_due_at(
         &self,
         now_ms: i64,
@@ -202,7 +219,12 @@ impl IndexDatabase {
             return Ok(false);
         }
         let revision = self.content_revision()?;
-        if !self.clone_graph_stale_against(&revision)? {
+        let drifted = {
+            let conn = self.storage.connection();
+            live_generation_row(conn)?
+                .is_some_and(|live| live.delta_files_applied >= CLONE_GRAPH_DRIFT_REBUILD_FILES)
+        };
+        if !self.clone_graph_stale_against(&revision)? && !drifted {
             if candidate.is_some() {
                 self.clear_clone_graph_quiet_candidate()?;
             }
@@ -331,6 +353,10 @@ impl IndexDatabase {
             // skip forever with an empty `clone_subblock_postings` (review R2). A postings-less
             // live generation falls through and rebuilds a postings-full one.
             && live.postings_written
+            // #473: a generation that has absorbed enough in-place delta files owes a df-epoch
+            // refresh — it is FRESH (deltas keep `source_revision` current) but must not
+            // skip-as-current, or the drift rebuild the quiet gate scheduled would no-op forever.
+            && live.delta_files_applied < CLONE_GRAPH_DRIFT_REBUILD_FILES
         {
             return Ok(CloneEdgeReport {
                 status: "Current".to_string(),
@@ -694,7 +720,7 @@ fn resolve_symbol_anchors(conn: &Connection) -> anyhow::Result<BTreeMap<i64, Anc
 /// Build a content-anchored edge with endpoints in canonical `(path, start_byte)` order (the PK
 /// order). `overlap`/`similarity` are symmetric; the per-endpoint `token_len`s follow the chosen
 /// orientation.
-fn make_edge(
+pub(super) fn make_edge(
     s_anchor: &Anchor,
     s_token_len: i64,
     t_anchor: &Anchor,
@@ -740,44 +766,8 @@ fn flush_batch(
 ) -> anyhow::Result<u64> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> anyhow::Result<u64> {
-        let mut inserted = 0u64;
-        {
-            let mut stmt = conn.prepare_cached(
-                "INSERT OR IGNORE INTO clone_edges
-                    (build_generation, a_path, a_start_byte, a_file_sha, b_path, b_start_byte,
-                     b_file_sha, overlap, a_token_len, b_token_len, similarity, edge_source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            )?;
-            for e in batch.iter() {
-                inserted += stmt.execute(params![
-                    generation,
-                    e.a_path,
-                    e.a_start_byte,
-                    e.a_file_sha,
-                    e.b_path,
-                    e.b_start_byte,
-                    e.b_file_sha,
-                    e.overlap,
-                    e.a_token_len,
-                    e.b_token_len,
-                    e.similarity,
-                    e.edge_source,
-                ])? as u64;
-            }
-        }
-        {
-            let mut stmt = conn.prepare_cached(
-                "INSERT OR IGNORE INTO clone_subblock_postings
-                    (build_generation, token_hash, path, start_byte, file_sha)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            for g in postings.iter() {
-                let (path, start_byte, file_sha) = &g.anchor;
-                for &token_hash in &g.tokens {
-                    stmt.execute(params![generation, token_hash, path, start_byte, file_sha])?;
-                }
-            }
-        }
+        let inserted = insert_edge_rows(conn, generation, batch)?;
+        insert_posting_groups(conn, generation, postings)?;
         conn.execute(
             "UPDATE clone_graph_generations SET cursor_symbol_id = ?1, edges_written = ?2
               WHERE generation = ?3",
@@ -799,19 +789,75 @@ fn flush_batch(
     }
 }
 
+/// Insert edge rows for `generation` with the shared idempotent write discipline (`INSERT OR
+/// IGNORE` on the content-key PK). Returns the rows actually inserted. Shared by `flush_batch`
+/// (the full build) and the delta pass so the write shape lives in exactly one place. Runs inside
+/// the CALLER's transaction.
+pub(super) fn insert_edge_rows(
+    conn: &Connection,
+    generation: i64,
+    batch: &[EdgeRow],
+) -> anyhow::Result<u64> {
+    let mut inserted = 0u64;
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO clone_edges
+            (build_generation, a_path, a_start_byte, a_file_sha, b_path, b_start_byte,
+             b_file_sha, overlap, a_token_len, b_token_len, similarity, edge_source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+    for e in batch {
+        inserted += stmt.execute(params![
+            generation,
+            e.a_path,
+            e.a_start_byte,
+            e.a_file_sha,
+            e.b_path,
+            e.b_start_byte,
+            e.b_file_sha,
+            e.overlap,
+            e.a_token_len,
+            e.b_token_len,
+            e.similarity,
+            e.edge_source,
+        ])? as u64;
+    }
+    Ok(inserted)
+}
+
+/// Insert every posting group's per-token rows for `generation` (idempotent, content-key PK).
+/// Shared by `flush_batch` and the delta pass; runs inside the CALLER's transaction.
+pub(super) fn insert_posting_groups(
+    conn: &Connection,
+    generation: i64,
+    postings: &[PostingGroup],
+) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO clone_subblock_postings
+            (build_generation, token_hash, path, start_byte, file_sha)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for g in postings {
+        let (path, start_byte, file_sha) = &g.anchor;
+        for &token_hash in &g.tokens {
+            stmt.execute(params![generation, token_hash, path, start_byte, file_sha])?;
+        }
+    }
+    Ok(())
+}
+
 /// The ` AND clone_graph_generations.repo_id = '…'` predicate for the per-repo generation SWEEPS,
 /// or `""` on the pre-A5 schema (the generations table is still repo-global). The generation
 /// INTEGER stays globally unique (allocated `MAX(generation)+1` over ALL repos), so the transitive
 /// `clone_edges` / `clone_subblock_postings` are scoped for free by `build_generation`; only the
 /// generation lifecycle sweeps (allocate/build/complete/invalidate) filter `repo_id` so a repo's
 /// precompute never touches a sibling's generations. See `schema::periphery_repo_scope`.
-fn clone_generation_scope_clause(conn: &Connection) -> anyhow::Result<String> {
+pub(super) fn clone_generation_scope_clause(conn: &Connection) -> anyhow::Result<String> {
     let scope = crate::index::schema::periphery_repo_scope(conn, "clone_graph_generations")?;
     Ok(crate::index::schema::periphery_repo_scope_clause(&scope, "clone_graph_generations"))
 }
 
 /// The live (Complete) generation row, if one is published.
-fn live_generation_row(conn: &Connection) -> anyhow::Result<Option<GenerationRow>> {
+pub(super) fn live_generation_row(conn: &Connection) -> anyhow::Result<Option<GenerationRow>> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let Some(live) = crate::index::repo_meta(conn, &repo_id, "clone_graph_live_generation")? else {
         return Ok(None);
@@ -841,7 +887,7 @@ fn open_building_generation(
         .query_row(
             &format!(
                 "SELECT generation, source_revision, normalizer_version, cursor_symbol_id, \
-                 edges_written, postings_written
+                 edges_written, postings_written, delta_files_applied
                    FROM clone_graph_generations WHERE status = 'Building'{repo_clause}
                   ORDER BY generation DESC LIMIT 1"
             ),
@@ -894,6 +940,7 @@ fn open_building_generation(
         cursor_symbol_id: 0,
         edges_written: 0,
         postings_written: true,
+        delta_files_applied: 0,
     })
 }
 
@@ -901,7 +948,7 @@ fn read_generation(conn: &Connection, generation: i64) -> anyhow::Result<Option<
     Ok(conn
         .query_row(
             "SELECT generation, source_revision, normalizer_version, cursor_symbol_id, \
-             edges_written, postings_written
+             edges_written, postings_written, delta_files_applied
                FROM clone_graph_generations WHERE generation = ?1",
             params![generation],
             map_generation_row,
@@ -917,11 +964,12 @@ fn map_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GenerationRow
         cursor_symbol_id: row.get(3)?,
         edges_written: row.get::<_, i64>(4)? as u64,
         postings_written: row.get::<_, i64>(5)? != 0,
+        delta_files_applied: row.get(6)?,
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// The config for a fixed two-file fixture with two renamed-clone groups
@@ -929,7 +977,7 @@ mod tests {
     /// → identical content-key edges, so two builds are directly comparable. Split out so a
     /// test can `rebuild` the SAME config twice (identical content) to exercise the
     /// full-rebuild df refresh.
-    fn clone_fixture_config(tag: &str) -> crate::Config {
+    pub(in super::super) fn clone_fixture_config(tag: &str) -> crate::Config {
         let root = std::env::temp_dir().join(format!(
             "rag-rat-precompute-{tag}-{}-{}",
             std::process::id(),
@@ -983,7 +1031,9 @@ mod tests {
 
     /// The content-key set of the live-or-only generation's edges, sorted — the build-stable
     /// identity of the persisted graph (symbol_id-independent).
-    fn edge_keys(db: &crate::IndexDatabase) -> Vec<(String, i64, String, i64)> {
+    pub(in super::super) fn edge_keys(
+        db: &crate::IndexDatabase,
+    ) -> Vec<(String, i64, String, i64)> {
         let conn = db.storage.connection();
         let mut stmt = conn
             .prepare(
@@ -1348,6 +1398,66 @@ mod tests {
     fn clone_graph_quiet_gate_zero_window_fires_immediately() {
         let db = build_clone_fixture("quiet-gate-zero");
         assert!(db.clone_graph_rebuild_due_at(1_000, 0, true).unwrap());
+    }
+
+    /// The df EPOCH FREEZE (#473): incremental passes must not move `clone_token_df` — the
+    /// persisted postings order sub-block tokens by df AS OF their build, so a moving df would
+    /// desync them from every later sub-block computation (which is why the old per-pass refresh
+    /// had to invalidate the postings each time). After the freeze, a content change through a
+    /// maintenance pass leaves the df table byte-identical AND the live generation's
+    /// `postings_written` intact; df moves only at a FULL rebuild.
+    #[test]
+    fn incremental_index_keeps_the_df_epoch_frozen() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("df-freeze-epoch");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        let df_rows = |db: &crate::IndexDatabase| -> Vec<(i64, i64)> {
+            let conn = db.storage.connection();
+            let mut stmt = conn
+                .prepare("SELECT token_hash, df FROM clone_token_df ORDER BY token_hash")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let postings_written = |db: &crate::IndexDatabase| -> i64 {
+            db.storage
+                .connection()
+                .query_row(
+                    "SELECT postings_written FROM clone_graph_generations WHERE status = \
+                     'Complete'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let epoch = df_rows(&db);
+        assert!(!epoch.is_empty(), "the full rebuild seeded the df epoch");
+        assert_eq!(postings_written(&db), 1, "the precompute published postings");
+        drop(db);
+
+        // A new file with brand-new tokens through the watcher/maintenance incremental path.
+        std::fs::write(
+            config.root.join("src/frozen_probe.rs"),
+            "pub fn frozen_epoch_probe(zx: u64) -> u64 { zx.rotate_left(9) ^ 0xfeed_beef }\n",
+        )
+        .unwrap();
+        crate::watch::maintenance_pass(&config, false).unwrap();
+
+        let db = crate::IndexDatabase::open_config(&config).unwrap();
+        assert_eq!(
+            df_rows(&db),
+            epoch,
+            "an incremental pass must not move the df epoch (new tokens ride DF_FALLBACK until \
+             the next full rebuild)"
+        );
+        assert_eq!(
+            postings_written(&db),
+            1,
+            "and must not invalidate the live generation's postings"
+        );
     }
 
     /// End-to-end through the watcher pass (#472): a content-changing maintenance pass ARMS the

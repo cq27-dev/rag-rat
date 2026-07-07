@@ -126,13 +126,34 @@ pub(crate) fn candidate_pairs(conn: &Connection) -> anyhow::Result<Vec<(i64, i64
 /// so only the ACTIVE version of each file participates (SCOPED-VIEW REQUIREMENT #89). df is read
 /// via LEFT JOIN + COALESCE so a missing-df token is never dropped (design rev-4 §2).
 pub(crate) fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>> {
+    load_scoped_baseline_bags_filtered(conn, None)
+}
+
+/// [`load_scoped_baseline_bags`] restricted to symbols whose file `path` is in `paths` — the #473
+/// delta pass's bag load. IDENTICAL corpus filters (this is the parity contract: the delta's bags
+/// must be exactly the subset of the full build's bags for those files), just with a chunked
+/// `files.path IN (…)` narrowing so a small delta never decodes the whole corpus.
+pub(crate) fn load_scoped_baseline_bags_for_paths(
+    conn: &Connection,
+    paths: &[String],
+) -> anyhow::Result<Vec<SymbolBag>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    load_scoped_baseline_bags_filtered(conn, Some(paths))
+}
+
+fn load_scoped_baseline_bags_filtered(
+    conn: &Connection,
+    paths: Option<&[String]>,
+) -> anyhow::Result<Vec<SymbolBag>> {
     // Load `clone_token_df` ONCE into a map (#231 R3): the token bag now lives in an opaque
     // `token_bag` BLOB, so df can no longer be a per-token SQL JOIN. Each decoded token's df is
     // looked up here in Rust and COALESCEd to the fallback sentinel — a missing-df token must NOT
     // be dropped (design rev-4 §2). Only the baseline normalizer feeds candidate recall.
     // Post-A5 df is per-repo (its PK carries `repo_id`), so scope the read to the active repo —
-    // `{df_repo_clause}` is empty pre-A5. The writer (`refresh_clone_token_df` / the incremental
-    // bump) stamps the same repo, so the two agree.
+    // `{df_repo_clause}` is empty pre-A5. The writer (`refresh_clone_token_df`, full-rebuild /
+    // first-index only under the #473 df epoch freeze) stamps the same repo, so the two agree.
     let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
     let df_repo_clause =
         crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
@@ -150,53 +171,75 @@ pub(crate) fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec
     // (`prep.rs` / `file_index.rs` gate the compute on `!file_is_generated`), so this filter is now
     // defense-in-depth: it still guards a file that flipped to `generated = 1` AFTER its
     // fingerprints were written (a target reclassification without a reindex of that file).
-    // `token_len` comes from the COLUMN (R3); the bag itself is decoded from the BLOB.
-    let mut fp_stmt = conn.prepare(
-        "SELECT sf.symbol_id, symbols.language, sf.struct_hash, sf.token_len, sf.token_bag
-         FROM symbol_fingerprints sf
-         JOIN symbols ON symbols.id = sf.symbol_id
-         JOIN files ON files.id = symbols.file_id
-         WHERE sf.normalizer_kind = 'baseline'
-           AND sf.normalizer_version = ?1
-           AND files.generated = 0",
-    )?;
+    // `token_len` comes from the COLUMN (R3); the bag itself is decoded from the BLOB. The
+    // optional `paths` narrowing is chunked under the bind-variable cap; `None` runs the single
+    // unfiltered pass.
+    const PATH_CHUNK: usize = 400;
+    let path_chunks: Vec<Option<&[String]>> = match paths {
+        None => vec![None],
+        Some(paths) => paths.chunks(PATH_CHUNK).map(Some).collect(),
+    };
     let mut bags: Vec<SymbolBag> = Vec::new();
-    let mut rows = fp_stmt.query([NORM_VERSION])?;
-    while let Some(row) = rows.next()? {
-        // R4: a NULL `token_bag` (un-reindexed after the V032 migration) is a NO-BAG row — SKIP it
-        // (not an empty bag, no panic). Byte-identical recall holds only for a FULLY (re)indexed
-        // DB; clone recall is undefined for NULL-bag symbols until the post-migration
-        // reindex.
-        let Some(blob) = row.get::<_, Option<Vec<u8>>>(4)? else {
-            continue;
+    for chunk in path_chunks {
+        let (filter_clause, chunk_paths) = match chunk {
+            None => (String::new(), &[][..]),
+            Some(chunk) => {
+                let placeholders: Vec<String> =
+                    (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
+                (format!(" AND files.path IN ({})", placeholders.join(", ")), chunk)
+            },
         };
-        let Some(bag_pairs) = crate::index::clones::bag_blob::decode_token_bag(&blob) else {
-            // A stale/corrupt blob (version mismatch / truncation) decodes to None — treat as
-            // no-bag, same as NULL. It is repopulated on the next reindex.
-            continue;
-        };
-        let tokens: Vec<TokenPosting> = bag_pairs
-            .into_iter()
-            .map(|(token_hash, freq)| TokenPosting {
-                token_hash,
-                freq,
-                coalesced_df: df_by_token.get(&token_hash).copied().unwrap_or(DF_FALLBACK),
-            })
-            .collect();
-        // The BLOB is stored token_hash-sorted (the producer's invariant), which is exactly the
-        // order `overlap`'s two-pointer merge and `sub_block_tokens` expect — so no re-sort is
-        // needed on read. Assert it in debug to catch a producer regression.
-        debug_assert!(
-            tokens.windows(2).all(|w| w[0].token_hash <= w[1].token_hash),
-            "decoded token_bag must be token_hash-sorted"
-        );
-        bags.push(SymbolBag {
-            symbol_id: row.get(0)?,
-            language: row.get(1)?,
-            struct_hash: row.get(2)?,
-            token_len: row.get(3)?,
-            tokens,
-        });
+        let mut fp_stmt = conn.prepare(&format!(
+            "SELECT sf.symbol_id, symbols.language, sf.struct_hash, sf.token_len, sf.token_bag
+             FROM symbol_fingerprints sf
+             JOIN symbols ON symbols.id = sf.symbol_id
+             JOIN files ON files.id = symbols.file_id
+             WHERE sf.normalizer_kind = 'baseline'
+               AND sf.normalizer_version = ?1
+               AND files.generated = 0{filter_clause}"
+        ))?;
+        let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(1 + chunk_paths.len());
+        values.push(rusqlite::types::Value::Integer(NORM_VERSION));
+        for path in chunk_paths {
+            values.push(rusqlite::types::Value::Text(path.clone()));
+        }
+        let mut rows = fp_stmt.query(rusqlite::params_from_iter(values))?;
+        while let Some(row) = rows.next()? {
+            // R4: a NULL `token_bag` (un-reindexed after the V032 migration) is a NO-BAG row —
+            // SKIP it (not an empty bag, no panic). Byte-identical recall holds only for a FULLY
+            // (re)indexed DB; clone recall is undefined for NULL-bag symbols until the
+            // post-migration reindex.
+            let Some(blob) = row.get::<_, Option<Vec<u8>>>(4)? else {
+                continue;
+            };
+            let Some(bag_pairs) = crate::index::clones::bag_blob::decode_token_bag(&blob) else {
+                // A stale/corrupt blob (version mismatch / truncation) decodes to None — treat as
+                // no-bag, same as NULL. It is repopulated on the next reindex.
+                continue;
+            };
+            let tokens: Vec<TokenPosting> = bag_pairs
+                .into_iter()
+                .map(|(token_hash, freq)| TokenPosting {
+                    token_hash,
+                    freq,
+                    coalesced_df: df_by_token.get(&token_hash).copied().unwrap_or(DF_FALLBACK),
+                })
+                .collect();
+            // The BLOB is stored token_hash-sorted (the producer's invariant), which is exactly
+            // the order `overlap`'s two-pointer merge and `sub_block_tokens` expect — so no
+            // re-sort is needed on read. Assert it in debug to catch a producer regression.
+            debug_assert!(
+                tokens.windows(2).all(|w| w[0].token_hash <= w[1].token_hash),
+                "decoded token_bag must be token_hash-sorted"
+            );
+            bags.push(SymbolBag {
+                symbol_id: row.get(0)?,
+                language: row.get(1)?,
+                struct_hash: row.get(2)?,
+                token_len: row.get(3)?,
+                tokens,
+            });
+        }
     }
 
     // Return bags in `symbol_id` order, matching the prior `BTreeMap<symbol_id, _>` keyset (the SQL
