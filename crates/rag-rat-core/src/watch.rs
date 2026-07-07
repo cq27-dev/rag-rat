@@ -3179,6 +3179,7 @@ mod tests {
 
     /// Drain real-watcher setup noise until the channel stays quiet for `quiet_ms`, capped by
     /// `max_ms`, so negative placement probes only observe events from the mutation under test.
+    #[cfg(target_os = "linux")]
     fn drain_until_quiet(
         rx: &std::sync::mpsc::Receiver<notify::Result<Event>>,
         quiet_ms: u64,
