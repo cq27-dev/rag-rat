@@ -726,8 +726,13 @@ fn find_upgradeable_local_incumbent(
 
 /// Whether `repo_id` has `root` recorded in `repo_roots` — the upgrade scan's working-tree match
 /// (both sides store the identical `to_string_lossy` rendering of a `Config::load`-canonicalized
-/// root, so equality is exact).
-fn repo_has_recorded_root(conn: &Connection, repo_id: &str, root: &str) -> rusqlite::Result<bool> {
+/// root, so equality is exact). Also the #427 same-identity-join hint's known-checkout test:
+/// telling a repo's own re-index from a NEW physical checkout adopting its scope.
+pub(crate) fn repo_has_recorded_root(
+    conn: &Connection,
+    repo_id: &str,
+    root: &str,
+) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM repo_roots WHERE repo_id = ?1 AND root = ?2)",
         params![repo_id, root],
@@ -998,7 +1003,7 @@ pub(crate) fn resolve_config_repo_id(
 
 /// Whether `repo_id` is a REGISTERED real repo (present in `repos`, and not the placeholder
 /// marker).
-fn repo_id_is_registered(conn: &Connection, repo_id: &str) -> rusqlite::Result<bool> {
+pub(crate) fn repo_id_is_registered(conn: &Connection, repo_id: &str) -> rusqlite::Result<bool> {
     if repo_id == LEGACY_REPO_ID {
         return Ok(false);
     }
@@ -1036,6 +1041,20 @@ fn real_repo_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
         conn.prepare("SELECT repo_id FROM repos WHERE repo_id != ?1 ORDER BY repo_id")?;
     let ids = stmt.query_map([LEGACY_REPO_ID], |row| row.get::<_, String>(0))?;
     ids.collect()
+}
+
+/// The earliest-registered recorded root for `repo_id` (a representative "home" checkout to name
+/// in the #427 join hint), or `None` when the repo has no recorded roots. Read-only.
+pub(crate) fn earliest_recorded_root(
+    conn: &Connection,
+    repo_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT root FROM repo_roots WHERE repo_id = ?1 ORDER BY registered_at_ms, root LIMIT 1",
+        params![repo_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
 }
 
 /// Append a working-tree root for `repo_id` (idempotent per `(repo_id, root)` — worktrees of one

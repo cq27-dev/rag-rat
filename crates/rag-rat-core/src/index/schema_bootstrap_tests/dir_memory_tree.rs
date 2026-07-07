@@ -320,6 +320,8 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -550,6 +552,8 @@ fn dir_tree_truncates_at_max_nodes() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -697,6 +701,8 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();

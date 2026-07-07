@@ -701,6 +701,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         crate::IndexDatabase::rebuild(&config).unwrap()
     }
@@ -814,6 +816,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
 
@@ -881,6 +885,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
 
@@ -975,6 +981,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");

@@ -51,7 +51,44 @@ impl IndexDatabase {
         // flock only for its brief sweep.
         let lock_repo = crate::locks::write_lock_repo_id(config);
         let _write_lock = crate::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+        // #427 — enforce the empty-index invariant on the FULL-rebuild entry. Split around
+        // `create_or_migrate` so it mirrors the incremental path (open+migrate, THEN check) while
+        // still leaving NO stray DB file behind on a fresh refusal:
+        //  * PHASE 1 — a FRESH database (the file does not exist yet) that would discover nothing
+        //    is refused BEFORE `create_or_migrate` materializes the file (the `maintenance`
+        //    `!db.exists()` contract). A fresh DB is trivially not-already-indexed, so the check is
+        //    just the discovery walk.
+        //  * PHASE 2 — an EXISTING database is refused only AFTER `create_or_migrate` has brought
+        //    its schema current, because a pre-registry / older index can't be read (no `repos`
+        //    table) until it migrates. Checking post-migration lets a legacy index whose files were
+        //    all deleted be RECOGNIZED (via the persisted `source_root`, incl. the sole-placeholder
+        //    fallback for a not-yet-adopted legacy DB) and PRUNED, instead of wrongly refused as
+        //    first-time-empty (#427 review — the read-before-migrate hole the incremental path
+        //    never had). A genuine first-time-empty registration into an existing shared DB is
+        //    still refused, before `adopt` records it. `is_first_time_empty_conn` short-circuits on
+        //    an already-indexed root, so an established repo pruning to empty never pays the walk.
+        // Read-only `open_config` opens deliberately do NOT enforce (a read must not error); they
+        // can't smuggle an empty scope in because recognition keys on `source_root`, which only
+        // these indexing passes write. Callers react to the error: the one-shot `index`
+        // surfaces it; the watcher / maintenance `let _ =`-discard it and wait for content.
+        // `--allow-empty` opts in.
+        let db_existed = config.database.exists();
+        if !config.allow_empty && !db_existed && !crate::index::would_discover_any_file(config)? {
+            return Err(crate::index::EmptyIndexRefused {
+                root: config.root.display().to_string(),
+            }
+            .into());
+        }
         let mut db = Self::create_or_migrate(&config.database)?;
+        if !config.allow_empty
+            && db_existed
+            && crate::index::is_first_time_empty_conn(db.storage.connection(), config)?
+        {
+            return Err(crate::index::EmptyIndexRefused {
+                root: config.root.display().to_string(),
+            }
+            .into());
+        }
         // Register/adopt the repo BEFORE the scope view is installed and BEFORE any repo-scoped
         // write, so `active_repo_id` is a real (registered) id — every direct-scoped insert stamps
         // it, and `repo_meta` writes below satisfy the `repo_meta → repos` FK (an

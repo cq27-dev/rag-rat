@@ -15,7 +15,20 @@ use crate::render::{
 use crate::{DEFAULT_MAINTENANCE_SECONDS, open_index};
 
 pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
+    // The empty-index refusal is enforced ONCE, in the core `rebuild_with_progress` (#427); the CLI
+    // only threads the `--allow-empty` opt-in via `Config::allow_empty`, so every mode below
+    // (full / discover / changed / watch) inherits the same policy with no per-mode guard.
+    let config = &Config { allow_empty: args.allow_empty, ..config.clone() };
     if args.watch {
+        // Surface the loud-adoption warnings (re-anchor / same-identity join) for watch mode too —
+        // the watcher's catch-up pass indexes this scope, so a worktree/clone starting `--watch`
+        // must still get the `--worktree` / `[index] repo_id` guidance (#427 review). `run_watch`
+        // refuses a NO-`[target_bindings]` config up front (it could never index anything); a
+        // config with targets that currently match zero files instead starts and defers via
+        // the watcher's own rebuild, which refuses the first-time-empty registration and
+        // `let _ =`-discards it (waiting for content). `--allow-empty` registers a
+        // deliberately empty index either way.
+        surface_adoption_warnings(config)?;
         return run_watch(config.clone());
     }
     // Serialize with the background watcher / other writers OF THIS REPO (busy_timeout backstops
@@ -47,6 +60,7 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    surface_adoption_warnings(config)?;
     let db = if args.full {
         IndexDatabase::rebuild_with_progress(config, render_index_progress)?
     } else if args.discover {
@@ -67,6 +81,42 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
         eprintln!("⚠ {doctor_count} repo memories need re-anchoring — run 'rag-rat memory doctor'");
     }
     print_output(&db.status(&config.database)?)
+}
+
+/// #427: emit the loud-adoption warnings for a one-shot or watch `index`. Non-fatal (stderr), and
+/// deliberately NOT run for `--worktree` overlays (that is an explicit, correct overlay op). The
+/// re-anchor message leads the more generic same-identity-join message (worktree is the more
+/// specific diagnosis).
+fn surface_adoption_warnings(config: &Config) -> anyhow::Result<()> {
+    // The configured `[index] root` named a LINKED worktree; `Config::load` re-anchored it to the
+    // main checkout (worktrees share one base index). Say so, and point at the two ways to get the
+    // branch's own content: the overlay, or a distinct pinned identity.
+    if let Some(worktree_root) = &config.source_root_reanchored_from {
+        eprintln!(
+            "warning: `[index] root` names a linked worktree ({}); indexing the MAIN checkout {} \
+             instead — worktrees share one base index.\n  Index this branch's delta with `rag-rat \
+             index --worktree {}`.\n  To index {} as its own repo, pin `[index] repo_id`.",
+            worktree_root.display(),
+            config.root.display(),
+            worktree_root.display(),
+            worktree_root.display(),
+        );
+    }
+    // Warn — don't block — when this root shares an already-registered repo's identity and would
+    // merge into that ONE scope (a fresh clone, or a worktree not yet anchored). The user may want
+    // that (re-index) or may have meant an independent index; name the remedy either way.
+    if let Some(join) = rag_rat_core::index::same_identity_join_note(config)? {
+        eprintln!(
+            "warning: this checkout ({}) shares the identity of already-indexed repo `{}` \
+             (recorded at {}); indexing merges it into that one scope.\n  To index {} as its own \
+             repo, add `[index] repo_id = \"...\"` to rag-rat.toml.",
+            config.root.display(),
+            join.repo_id,
+            join.existing_root.display(),
+            config.root.display(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {
@@ -128,6 +178,21 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
 }
 
 pub(crate) fn run_watch(config: Config) -> anyhow::Result<()> {
+    // #427 (review): a config with no watchable target DIRECTORIES can discover nothing, EVER. Its
+    // watcher would place zero source watches and then sit forever — a silent, unrecoverable state
+    // (it never re-reads config, so adding targets later doesn't help until restart). Keyed on
+    // `target_directories()`, NOT `targets.is_empty()`: a target with an empty directory list
+    // (`[target_bindings] rust = []`) leaves `targets` non-empty yet watches nothing, the same dead
+    // end. Unlike a config WITH target dirs that currently match zero files — that legitimately
+    // starts and DEFERS, because a file appearing under a watched dir wakes it — the
+    // no-watchable-dir case is a misconfiguration, so refuse it up front with the actionable
+    // message, the same policy as the one-shot `index`. `--allow-empty` opts in to an empty watch.
+    if !config.allow_empty && config.target_directories().is_empty() {
+        return Err(rag_rat_core::index::EmptyIndexRefused {
+            root: config.root.display().to_string(),
+        }
+        .into());
+    }
     let Some(_watcher) = rag_rat_core::watch::Watcher::spawn(config.clone()) else {
         anyhow::bail!("watcher is disabled ([watch] enabled = false or RAG_RAT_NO_WATCH set)");
     };
@@ -279,7 +344,23 @@ fn run_maintenance_pass(
     let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "lock_acquired", elapsed_ms = started.elapsed().as_millis() as u64, "write lock acquired");
 
-    let mut db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
+    // #427: the core refuses a first-time-empty registration (a post-commit/checkout hook on a repo
+    // with no `[target_bindings]` or no matching files). The hook-driven maintenance pass treats
+    // that as "nothing to index yet" and DEFERS — a later pass registers once content appears —
+    // rather than surfacing an error into the git hook. A recorded root going empty still prunes
+    // (it is not first-time, so the core does not refuse it).
+    let mut db = match IndexDatabase::index_discover_with_progress(config, render_index_progress) {
+        Ok(db) => db,
+        Err(err) if err.downcast_ref::<rag_rat_core::index::EmptyIndexRefused>().is_some() => {
+            tracing::info!(target: "rag_rat_core::maintenance", "deferred: no discoverable files (first-time empty index)");
+            return Ok(serde_json::json!({
+                "trigger": trigger,
+                "status": "deferred",
+                "reason": "no discoverable files (first-time empty index)",
+            }));
+        },
+        Err(err) => return Err(err),
+    };
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "index_discover", elapsed_ms = started.elapsed().as_millis() as u64, "phase complete");
     // One-time on upgrade: re-encode any legacy f32 vector blobs to the compact int8 format (#312).
     // Meta-gated, so this runs once and then skips the table scan cheaply on every later pass; run
@@ -489,6 +570,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -568,6 +651,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -645,6 +730,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -717,6 +804,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         IndexDatabase::rebuild(&config).unwrap();
 

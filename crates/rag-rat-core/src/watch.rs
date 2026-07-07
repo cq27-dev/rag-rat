@@ -116,7 +116,18 @@ fn run_pass(
     retry_base_embedding_backlog: bool,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
-    let (mut db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
+    // #427: the core refuses a first-time-empty registration (`rag-rat mcp` / a hook on a config
+    // with no `[target_bindings]` or no matching files). A maintenance/watch pass treats that as
+    // "nothing to index yet" and DEFERS silently — a later pass registers once real content
+    // appears. A recorded root going empty still prunes (not first-time → not refused). The
+    // one-shot `index` command instead surfaces the same error to the operator.
+    let (mut db, content_changed) = match IndexDatabase::index_discover_reporting(config) {
+        Ok(result) => result,
+        Err(err) if err.downcast_ref::<crate::index::EmptyIndexRefused>().is_some() => {
+            return Ok(());
+        },
+        Err(err) => return Err(err),
+    };
     let shutdown_reconcile_pending = db.watch_shutdown_reconcile_pending()?;
     let runtime = &config.llm.embedding.runtime;
     let options = ReconcileOptions {
@@ -1169,12 +1180,22 @@ fn shutdown_discover(config: &Config) -> anyhow::Result<bool> {
     let lock_repo = locks::write_lock_repo_id(config);
     match locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SKIP_TIMEOUT)? {
         Some(_lock) => {
-            let (db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
-            if content_changed {
-                db.mark_watch_shutdown_reconcile_pending()?;
-                return Ok(true);
+            // #427: the core refuses a first-time-empty registration; a shutdown refresh defers on
+            // it (same as `run_pass`) rather than creating an empty index on the way out. Otherwise
+            // it preserves #460's shutdown-reconcile debt: a content change on the way out marks
+            // the base reconcile owed so the next startup pays it down.
+            match IndexDatabase::index_discover_reporting(config) {
+                Ok((db, content_changed)) => {
+                    if content_changed {
+                        db.mark_watch_shutdown_reconcile_pending()?;
+                        return Ok(true);
+                    }
+                    Ok(false)
+                },
+                Err(err) if err.downcast_ref::<crate::index::EmptyIndexRefused>().is_some() =>
+                    Ok(false),
+                Err(err) => Err(err),
             }
-            Ok(false)
         },
         None => Ok(false),
     }
@@ -1221,7 +1242,24 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         }
+    }
+
+    /// #427: a maintenance/watch pass on a first-time-empty config DEFERS — the core refuses the
+    /// empty registration and `run_pass` swallows `EmptyIndexRefused`, returning `Ok(())` and
+    /// registering nothing, rather than erroring into the watcher loop. Covers the in-process defer
+    /// path the subprocess CLI guards exercise out-of-process (so it doesn't count toward
+    /// coverage).
+    #[test]
+    fn maintenance_pass_defers_on_a_first_time_empty_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A single rust target with NO directories → discovers nothing → first-time-empty.
+        let config = whole_root_config(tmp.path(), &[]);
+        let result = maintenance_pass(&config, false);
+        assert!(result.is_ok(), "an empty first-time config must defer, not error: {result:?}");
+        assert!(!config.database.exists(), "deferring must register no empty index");
     }
 
     fn ephemeral_remote(query_endpoint: Option<&str>) -> RemoteEmbeddingConfig {
@@ -1969,6 +2007,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         let worktree = PathBuf::from("/wt/feat");
         let registry = PathBuf::from("/main/.git/worktrees");
@@ -2604,6 +2644,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         // A linked checkout mirrors the layout: `<checkout>/crate/src/a.rs`.
         let checkout =
@@ -2651,6 +2693,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         let ignore = IgnoreMatcher::compile(&root, &[]);
 
@@ -2716,6 +2760,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
 
         let ignore = IgnoreMatcher::compile(&root, &[]);
@@ -2792,6 +2838,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
 
         // Before: a source file under the subdir fires.
@@ -2940,6 +2988,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
 
         let (roots, _registry) = worktree_watch_targets(&config);
@@ -3280,6 +3330,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from("src")]);
         let dir_create =

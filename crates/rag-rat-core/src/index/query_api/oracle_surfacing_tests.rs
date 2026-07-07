@@ -48,6 +48,8 @@ fn rust_config(root: PathBuf) -> Config {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     }
 }
 
@@ -1174,6 +1176,8 @@ fn deleted_and_generated_paths_counted_in_skipped() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     git(&root, &["init", "-q"]);
     git(&root, &["add", "-A"]);

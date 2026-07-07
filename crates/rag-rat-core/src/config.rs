@@ -36,6 +36,18 @@ pub struct Config {
     /// nor un-pin the repo's database. `rag-rat consolidate` keys its pinned-config refusal off
     /// this, so the refusal and `database` resolution can never disagree.
     pub database_key_pinned: bool,
+    /// When `Config::load` re-anchored `[index] root` from a LINKED worktree to the MAIN checkout
+    /// (so all worktrees share one base index), this holds the ORIGINAL linked-worktree root; else
+    /// `None`. The pre-anchor root is otherwise lost after `anchor_root_to_main_worktree`. Used by
+    /// the `index` command to warn that it is indexing the main checkout, not the named worktree
+    /// (#427). Not read from TOML — populated during load.
+    pub source_root_reanchored_from: Option<PathBuf>,
+    /// Opt in to registering an EMPTY index (zero discovered files). Default `false`: the core
+    /// registration path (`rebuild_with_progress`) refuses a first-time-empty registration with
+    /// [`crate::index::EmptyIndexRefused`], so no entry point silently creates one (#427). The CLI
+    /// `index --allow-empty` flag sets this `true`; every other caller (watcher, git-hook
+    /// `maintenance`, MCP, init) leaves it `false`. Not read from TOML — set per invocation.
+    pub allow_empty: bool,
 }
 
 /// Search-ranking knobs (`[search]`). Default OFF so the shipped fuse is byte-identical to today;
@@ -889,6 +901,19 @@ impl Config {
         let local_checkout =
             if local_config_dir.as_os_str().is_empty() { Path::new(".") } else { local_config_dir };
 
+        // Best-effort resolution of what the LOCAL checkout's own `[index] root` names, taken
+        // BEFORE the governing seam below picks a winner — used only to detect + report a re-anchor
+        // to the caller (#427), never to decide anything (the seam is the sole source of truth for
+        // governance). `None` on any parse/resolution failure; that is not a second error path,
+        // just a diagnostic that stays silent when it cannot be computed.
+        let local_root_named: Option<PathBuf> = local_parse.as_ref().ok().and_then(|local_raw| {
+            normalize_existing_dir(
+                &local_config_dir
+                    .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
+            )
+            .ok()
+        });
+
         // THE GOVERNING SEAM (see the doc comment). Linked-ness comes from git TOPOLOGY — the
         // checkout holding the config file vs the repo's designated main worktree
         // ([`linked_worktree_main_root`]) — and governance is UNCONDITIONAL on that predicate.
@@ -959,6 +984,13 @@ impl Config {
                     (local_raw, local_config_dir.to_path_buf(), anchored_root, local_root)
                 },
             };
+
+        // #427: `root` may have ended up different from what the LOCAL checkout's own `[index]
+        // root` names — either because a linked worktree's config was overridden wholesale by
+        // MAIN's (the common case, above), or because `anchor_root_to_main_worktree` rebased an
+        // exotic branch-only root (#218/#219). Either way, report the pre-anchor value so `index`
+        // can warn the operator they're indexing the main checkout, not the worktree they named.
+        let source_root_reanchored_from = local_root_named.filter(|named| *named != root);
 
         // The database path (A7 default flip): an explicit `database` key is honored as-is — the
         // deprecated per-repo deployment, that repo stays un-consolidated and never syncs. ABSENT,
@@ -1048,6 +1080,8 @@ impl Config {
             log,
             repo_id_override,
             database_key_pinned,
+            source_root_reanchored_from,
+            allow_empty: false,
         })
     }
 }
@@ -2955,6 +2989,75 @@ mod tests {
         assert_eq!(
             from_linked.repo_id_override, None,
             "main omits the override, so the anchored identity derives — the branch pin is ignored",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #427: a linked worktree's `[index] root` resolves to itself locally, but `Config::load`
+    /// re-anchors it to MAIN so every worktree of a repo shares one base index. The PRE-anchor
+    /// value (the worktree the operator actually named) would otherwise be lost after anchoring —
+    /// capture it so the `index` command can warn instead of silently indexing a different
+    /// checkout than the one named.
+    #[test]
+    fn load_records_the_pre_anchor_root_for_a_linked_worktree() {
+        let git = |dir: &Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-reanchor-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+        std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+
+        let main_c = main.canonicalize().unwrap();
+        let linked_c = linked.canonicalize().unwrap();
+        let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
+        assert_eq!(from_linked.root, main_c, "root anchors to main (existing behavior)");
+        assert_eq!(
+            from_linked.source_root_reanchored_from.as_deref(),
+            Some(linked_c.as_path()),
+            "the pre-anchor (named) linked-worktree root is captured",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The counterpart to the above: loading from a plain (non-worktree) repo redirects nothing,
+    /// so the field stays `None`.
+    #[test]
+    fn load_leaves_reanchor_none_for_the_main_worktree() {
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp =
+            std::env::temp_dir().join(format!("ragrat-reanchor-none-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            tmp.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        git_commit_all(&tmp);
+
+        let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
+        assert!(
+            config.source_root_reanchored_from.is_none(),
+            "no worktree redirection happened, so the field stays None",
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

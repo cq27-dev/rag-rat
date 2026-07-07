@@ -13,6 +13,7 @@ pub mod walker;
 
 pub mod consolidate;
 
+mod adoption_hints;
 pub(crate) mod chunk_text_store;
 pub(crate) mod clones;
 mod discovery;
@@ -37,6 +38,11 @@ mod staleness;
 pub(crate) mod text_compression;
 mod util;
 mod worktree_overlay;
+pub use adoption_hints::{
+    EmptyIndexRefused, SameIdentityJoin, is_first_time_empty, is_first_time_empty_conn,
+    is_root_already_indexed, is_root_already_indexed_conn, same_identity_join_note,
+    would_discover_any_file,
+};
 pub use discovery::DiscoveryStatus;
 pub(crate) use discovery::*;
 pub use git_context::resolve_git_context;

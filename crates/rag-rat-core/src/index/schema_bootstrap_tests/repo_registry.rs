@@ -585,6 +585,40 @@ fn register_repo_adoption_relocates_repo_meta_rows() {
     );
 }
 
+/// The #427 same-identity-join hint's two read-only lookups: whether a given root is already one
+/// of `repo_id`'s recorded checkouts, and which recorded root is the earliest-registered (the
+/// "home" checkout the hint names).
+#[test]
+fn recorded_root_helpers_report_membership_and_earliest() {
+    use crate::index::schema::{earliest_recorded_root, repo_has_recorded_root};
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    schema::apply(&conn).expect("apply");
+    let id = identity("repo-x", "repo-x");
+    // First root A (registered_at 100), then a second checkout B (registered_at 200).
+    register_repo(&conn, &id, Path::new("/checkout-a"), 100).unwrap();
+    register_repo(&conn, &id, Path::new("/checkout-b"), 200).unwrap();
+
+    assert!(repo_has_recorded_root(&conn, &id.repo_id, "/checkout-a").unwrap());
+    assert!(repo_has_recorded_root(&conn, &id.repo_id, "/checkout-b").unwrap());
+    assert!(!repo_has_recorded_root(&conn, &id.repo_id, "/checkout-c").unwrap());
+    assert_eq!(
+        earliest_recorded_root(&conn, &id.repo_id).unwrap().as_deref(),
+        Some("/checkout-a"),
+        "earliest by registered_at_ms wins",
+    );
+
+    // Tiebreak: two roots registered at the SAME instant → the lexicographically-smaller root wins
+    // deterministically (the `ORDER BY registered_at_ms, root` secondary key).
+    let tied = identity("repo-tied", "repo-tied");
+    register_repo(&conn, &tied, Path::new("/z-checkout"), 500).unwrap();
+    register_repo(&conn, &tied, Path::new("/a-checkout"), 500).unwrap();
+    assert_eq!(
+        earliest_recorded_root(&conn, &tied.repo_id).unwrap().as_deref(),
+        Some("/a-checkout"),
+        "equal registered_at_ms → lexicographically-smaller root breaks the tie",
+    );
+}
+
 /// `single_repo_id` returns the sole `repos` row — the placeholder before adoption, the real id
 /// after — the connection-level stand-in the per-repo accessors resolve until A3.
 #[test]

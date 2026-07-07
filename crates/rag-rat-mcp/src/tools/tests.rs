@@ -892,6 +892,8 @@ fn mixed_config() -> (PathBuf, Config) {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     })
 }
 
@@ -919,6 +921,8 @@ fn markdown_config(text: &str) -> (PathBuf, Config) {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     })
 }
 
@@ -943,6 +947,8 @@ fn rust_config(root: PathBuf) -> Config {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     }
 }
 

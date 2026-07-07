@@ -507,6 +507,33 @@ fn watch_maintenance_pass_indexes_new_files() {
 }
 
 #[test]
+fn watch_maintenance_pass_defers_a_first_time_empty_config() {
+    // #427 review: a maintenance/watch pass on a brand-new config with NO discoverable files (an
+    // empty target tree — the `rag-rat mcp` / misconfigured-repo case) must NOT first-time-register
+    // an empty repo. It creates no database at all; a later pass registers once real content
+    // appears. (The one-shot `index` command surfaces this as an error; the watcher just waits.)
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap(); // configured target `src/`, but it is empty
+    let config = source_config(root.clone(), Language::Rust);
+
+    crate::watch::maintenance_pass(&config, false).unwrap();
+    assert!(
+        !config.database.exists(),
+        "an empty first-time config must not create/register an index"
+    );
+
+    // Content appears → the next pass registers + indexes it.
+    fs::write(root.join("src/one.rs"), "pub fn appeared() {}\n").unwrap();
+    crate::watch::maintenance_pass(&config, false).unwrap();
+    let db = IndexDatabase::open_config(&config).unwrap();
+    let hits = db.symbols("appeared", Some(Language::Rust), 10).unwrap();
+    assert!(!hits.is_empty(), "a pass after content appears must register + index it");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn discover_deletion_is_worktree_scoped() {
     // Invariant (watcher spec, review item 1): a discover pass run from worktree A must remove
     // only A's own rows for files missing from A's disk — never another worktree's overlay
@@ -846,6 +873,8 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let status = db.status(&config.database).unwrap();

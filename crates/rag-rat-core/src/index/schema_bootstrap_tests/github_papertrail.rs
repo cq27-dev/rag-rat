@@ -314,6 +314,8 @@ fn parser_failures_report_paths() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();

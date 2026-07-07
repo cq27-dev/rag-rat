@@ -27,6 +27,11 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        // This test deliberately rebuilds an EMPTY target root (no `.md` files) to verify schema
+        // bootstrap; that is the sanctioned `--allow-empty` path now that the core refuses a
+        // first-time-empty registration by default (#427).
+        allow_empty: true,
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();

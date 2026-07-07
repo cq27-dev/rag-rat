@@ -212,6 +212,8 @@ fn find_clones_rejects_nan_and_non_finite_min_similarity() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     crate::IndexDatabase::rebuild(&config).unwrap();
     let db = crate::IndexDatabase::open_config(&config).unwrap();
@@ -796,6 +798,8 @@ fn recall_candidates_identical_blob_vs_postings_grouping() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     let db = crate::IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();

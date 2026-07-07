@@ -540,6 +540,8 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -1325,6 +1327,8 @@ where
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let symbol = db.symbols("spawn_blocking", Some(Language::Rust), 10).unwrap().remove(0);

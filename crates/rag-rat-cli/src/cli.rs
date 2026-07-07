@@ -151,6 +151,10 @@ pub(crate) struct IndexArgs {
     /// Run the background file watcher in the foreground until interrupted.
     #[arg(long)]
     pub watch: bool,
+    /// Allow `index` to complete when zero files are discovered (e.g. no `[target_bindings]`),
+    /// registering the repo with empty content instead of erroring. Default: refuse (#427).
+    #[arg(long)]
+    pub allow_empty: bool,
 }
 
 #[derive(Debug, Args)]

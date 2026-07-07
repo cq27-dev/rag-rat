@@ -876,6 +876,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         }
     }
 

@@ -141,6 +141,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: LogConfig { enabled, dir: dir.join("logs"), ..LogConfig::default() },
+            source_root_reanchored_from: None,
+            allow_empty: false,
         }
     }
 

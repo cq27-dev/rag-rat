@@ -86,6 +86,8 @@ fn rag_rat_config(root: &Path) -> Config {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     }
 }
 
@@ -216,6 +218,8 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     }
 }
 
@@ -353,6 +357,8 @@ fn source_config(root: PathBuf, language: Language) -> Config {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     }
 }
 
@@ -717,6 +723,8 @@ fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     (root, config)
 }
@@ -839,6 +847,8 @@ fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     IndexDatabase::rebuild(&config).unwrap()
 }

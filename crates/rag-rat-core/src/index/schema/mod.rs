@@ -8,10 +8,17 @@ pub(crate) use migrations::*;
 // `IndexDatabase::open` refuses a multi-repo DB rather than silently scoping to the
 // lexicographically-first repo.
 pub(crate) use registry::multiple_real_repos;
+// `register_repo` uses `repo_has_recorded_root` intra-module; the only consumer of the
+// re-export is now a `schema_bootstrap_tests` case (#427 moved the same-identity-join check
+// off it onto the `source_root` marker). Gate the re-export to test builds so the non-test lib
+// doesn't carry a dead import.
+#[cfg(test)]
+pub(crate) use registry::repo_has_recorded_root;
 pub(crate) use registry::{
     CONNECTION_CONTEXT_GENERATION_KEY, CONNECTION_CONTEXT_REPO_KEY, LIVE_FILES_GENERATION_META_KEY,
-    active_generation, active_repo_id, live_files_generation, periphery_repo_scope,
-    periphery_repo_scope_clause, resolve_config_repo_id, scope_context_repo_id, sole_repo_id,
+    active_generation, active_repo_id, earliest_recorded_root, live_files_generation,
+    periphery_repo_scope, periphery_repo_scope_clause, repo_id_is_registered,
+    resolve_config_repo_id, scope_context_repo_id, sole_repo_id,
 };
 pub use registry::{LEGACY_REPO_ID, register_repo};
 use rusqlite::{Connection, OptionalExtension, params};

@@ -2133,6 +2133,8 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -2218,6 +2220,8 @@ fn repo_clusters_groups_cotouched_files() {
         search: Default::default(),
         memory: Default::default(),
         log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 

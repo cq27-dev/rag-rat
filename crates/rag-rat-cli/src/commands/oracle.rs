@@ -484,6 +484,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         (root, config)
     }
@@ -533,6 +535,8 @@ mod tests {
             search: Default::default(),
             memory: Default::default(),
             log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
         };
         let config = config_with(vec!["**/*.rs".to_string()], Vec::new());
         let profile = |dirs: &[&str]| {
