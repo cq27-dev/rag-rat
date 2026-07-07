@@ -246,6 +246,8 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
 
     // Register (or adopt/extend) this repo in the global DB. The returned id is what every imported
     // row is stamped with — the legacy DB's own `repo_id` (placeholder or otherwise) is discarded.
+    // Consolidation IMPORTS an indexed repo, so `register_repo` records the working-tree root
+    // (#427).
     let repo_id = schema::register_repo(target_conn, &identity, &config.root, schema::now_ms())?;
 
     // Bring the SOURCE to current schema too (read-write, under the source-side locks held above,

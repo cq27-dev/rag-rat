@@ -82,8 +82,9 @@ impl IndexDatabase {
         // pass could delete/stamp rows under the WRONG repo. Adopting here — the same step
         // `open_config` and `rebuild` run — resolves the config's own identity and points
         // every repo-scoped write below at it. Idempotent on an already-adopted single-repo
-        // DB (the common case).
-        db.adopt_repo_from_config(config)?;
+        // DB (the common case). INDEXING intent: an incremental/discover pass records this
+        // checkout's root (#427).
+        db.adopt_repo_from_config(config, super::lifecycle::AdoptIntent::Indexing)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
         // ADOPTION RESETS ALL CONNECTION-CARRIED REPO-DERIVED STATE BEFORE ANY DEFERRED HEAL (the

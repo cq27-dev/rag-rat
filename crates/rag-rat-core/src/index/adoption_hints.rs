@@ -90,11 +90,9 @@ pub fn same_identity_join_note(config: &Config) -> anyhow::Result<Option<SameIde
         return Ok(None);
     }
     // This exact checkout was already INDEXED as this repo → an ordinary re-index, not a join.
-    // Keyed on the `source_root` marker (via the shared helper), NOT `repo_roots` membership: a
-    // read-only `open_config` (doctor / MCP) records the root WITHOUT indexing, and suppressing the
-    // warning on that mere recording would let the first real index from a fresh same-identity
-    // clone silently join the shared scope with none of the `[index] repo_id` guidance (#427
-    // review).
+    // Via the shared indexing-only helper: recording is indexing-only, so a read-only `open_config`
+    // (doctor / MCP) of a fresh same-identity clone does NOT suppress the warning — the first real
+    // index from that clone still gets the `[index] repo_id` guidance (#427 review).
     if repo_indexed_at_this_root(conn, &identity.repo_id, config)? {
         return Ok(None);
     }
@@ -111,17 +109,15 @@ pub fn same_identity_join_note(config: &Config) -> anyhow::Result<Option<SameIde
 /// the now-empty set (applies the deletion plan) instead of stranding the old rows live; only a
 /// brand-new checkout landing empty is the footgun worth refusing.
 ///
-/// Judged by the persisted `source_root` of the repo this config resolves to — NOT by a
-/// `repo_roots` recording. That distinction is load-bearing: a read-only `open_config` (a `doctor`
-/// / MCP / query open) also calls `adopt_repo_from_config`, which `register_repo`s the checkout and
-/// RECORDS its root, but it NEVER writes `repo_meta[source_root]` — only a real indexing pass
-/// (rebuild / incremental) does. Keying on the recorded root would therefore let a mere read
-/// masquerade as an indexed checkout: a `doctor` on a no-`[target_bindings]` repo (or on a
-/// same-identity CLONE) would record the root, flip this to `true`, and let a later empty
-/// `--discover` / `--full` prune the scope (#427 review). Keying on `source_root` closes that: only
-/// an indexing pass sets it, and a clone's resolved repo carries the PRIMARY's `source_root`
-/// (≠ the clone's root), so the clone correctly stays not-indexed. `Ok(false)` on a
-/// fresh / never-written / garbage / unreadable database.
+/// Judged by an INDEXING-ONLY signal — a `repo_roots` recording (git repos) or the persisted
+/// `source_root` (non-git fallback) — see [`repo_indexed_at_this_root`]. Both are written only by a
+/// real indexing pass, never by a read-only `open_config` (a `doctor` / MCP / query open now
+/// registers identity via `register_repo_read_only`, which records NO root), so a mere read can't
+/// make an un-indexed checkout — or a fresh same-identity CLONE — look indexed and let a later
+/// empty `--discover` / `--full` prune the shared scope (#427 review). The per-checkout
+/// `repo_roots` row (not the single-valued `source_root`) is also what keeps a same-identity
+/// SIBLING clone's index from stealing this checkout's recognition. `Ok(false)` on a fresh /
+/// never-written / garbage / unreadable database.
 pub fn is_root_already_indexed(config: &Config) -> anyhow::Result<bool> {
     let Some(storage) = open_ro_compatible(config) else {
         return Ok(false);
@@ -130,16 +126,28 @@ pub fn is_root_already_indexed(config: &Config) -> anyhow::Result<bool> {
 }
 
 /// The single "this checkout is `repo_id`'s already-INDEXED home" signal, shared by every #427
-/// consumer (the empty-index guard AND the same-identity-join warning): `repo_id`'s persisted
-/// `source_root` equals this checkout's root. `source_root` is written ONLY by an indexing pass
-/// (rebuild / incremental), never by a read-only `open_config` adoption — so this is immune to a
-/// `doctor` / MCP read having merely recorded the root. Keep both consumers on THIS helper so a fix
-/// (or a footgun) can never apply to one and not the other.
+/// consumer (the empty-index guard AND the same-identity-join warning). Keep both consumers on THIS
+/// helper so a fix (or a footgun) can never apply to one and not the other.
+///
+/// Two indexing-only signals, either of which proves an indexing pass ran at this exact checkout:
+/// 1. Its working-tree root is recorded in `repo_roots` for `repo_id`. Recording is now
+///    INDEXING-ONLY (`register_repo` records; the read-only `register_repo_read_only` does not), so
+///    a recorded root is trustworthy — immune BOTH to a read-only `open_config` merely registering
+///    (the earlier fix's concern) AND to a same-identity sibling clone stealing recognition: each
+///    checkout records its OWN `repo_roots` row, so B indexing the shared repo leaves A's row
+///    intact (whereas the single-valued `source_root` is last-writer-wins — B's index overwrote it
+///    to B, wrongly making A look un-indexed, #427 review).
+/// 2. `repo_id`'s persisted `source_root` equals this root — the FALLBACK for an identity-less
+///    (non-git / unborn) root, which never gets a `repo_roots` entry (`adopt_repo_from_config`
+///    sole-picks WITHOUT `register_repo`). Also written only by an indexing pass.
 fn repo_indexed_at_this_root(
     conn: &rusqlite::Connection,
     repo_id: &str,
     config: &Config,
 ) -> anyhow::Result<bool> {
+    if schema::repo_has_recorded_root(conn, repo_id, &config.root.to_string_lossy())? {
+        return Ok(true);
+    }
     Ok(super::repo_meta(conn, repo_id, "source_root")? == Some(config.root.display().to_string()))
 }
 
@@ -358,13 +366,13 @@ mod tests {
     }
 
     /// `is_root_already_indexed` is `false` before indexing (no DB / fresh) and `true` after a
-    /// rebuild has persisted this checkout's `source_root` — the signal that scopes the #427
-    /// empty-index refusal to FIRST-TIME registrations, so a later delete-to-empty is allowed to
-    /// prune rather than refused. It keys off the persisted `source_root`: a fresh clone sharing
-    /// A's identity resolves to A's repo, whose `source_root` is A's root (≠ the clone), so the
-    /// clone stays `false` and an empty clone can't prune A's shared scope.
+    /// rebuild has recorded this checkout — the signal that scopes the #427 empty-index refusal to
+    /// FIRST-TIME registrations, so a later delete-to-empty is allowed to prune rather than
+    /// refused. It keys off an INDEXING-ONLY signal (the recorded root / source_root), NOT the
+    /// shared identity: a fresh clone sharing A's identity is never indexed, so it stays
+    /// `false` and an empty clone can't prune A's shared scope.
     #[test]
-    fn is_root_already_indexed_tracks_the_source_root_not_the_shared_identity() {
+    fn is_root_already_indexed_tracks_indexing_not_the_shared_identity() {
         if std::process::Command::new("git").arg("--version").output().is_err() {
             return; // no git on PATH — skip rather than fail.
         }
@@ -430,15 +438,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// #427 review (comment 4): a READ-ONLY open (`doctor` / MCP / query via `open_config`) also
-    /// adopts — it `register_repo`s the checkout and RECORDS its root — but it NEVER writes
-    /// `repo_meta[source_root]`. So a mere read must NOT flip `is_root_already_indexed` to `true`,
-    /// or a later empty `--discover` / `--full` on that no-target repo would be waved through as
-    /// "already indexed" and prune the scope. Recognition keys on `source_root` precisely to close
-    /// this: B is read-registered into A's shared DB but never indexed, so it stays
-    /// first-time-empty.
+    /// #427 review (comment 4): a READ-ONLY open (`doctor` / MCP / query via `open_config`) adopts
+    /// identity but must NOT record the checkout's root (it goes through `register_repo_read_only`)
+    /// nor write `repo_meta[source_root]` — both are indexing-only. So a mere read must NOT flip
+    /// `is_root_already_indexed` to `true`, or a later empty `--discover` / `--full` on that
+    /// no-target repo would be waved through as "already indexed" and prune the scope. B is
+    /// read-registered into A's shared DB but never indexed, so it stays first-time-empty.
     #[test]
-    fn a_read_registered_root_without_source_root_is_not_already_indexed() {
+    fn a_read_only_open_does_not_make_an_unindexed_repo_look_indexed() {
         if std::process::Command::new("git").arg("--version").output().is_err() {
             return; // identity resolution needs git; skip rather than fail.
         }
@@ -454,8 +461,8 @@ mod tests {
         crate::index::IndexDatabase::rebuild(&config_a).unwrap();
 
         // Repo B: a DISTINCT git repo (own init → own root commit → own identity), pointed at A's
-        // SAME database but with NO discoverable target files. A read-only `open_config` adopts it
-        // — registering B and recording its root — WITHOUT indexing anything.
+        // SAME database but with NO discoverable target files. A read-only `open_config` registers
+        // B's identity WITHOUT indexing anything and WITHOUT recording its root.
         let root_b = unique_temp_root();
         std::fs::create_dir_all(root_b.join("src")).unwrap();
         std::fs::write(root_b.join("keep.txt"), "not a rust file\n").unwrap();
@@ -467,8 +474,19 @@ mod tests {
 
         let _ = crate::index::IndexDatabase::open_config(&config_b).unwrap();
 
-        // B's root is now recorded, but no indexing pass ever ran for B, so its `source_root` is
-        // unset → it is NOT already-indexed, and a zero-file index on B is still first-time-empty.
+        // The read recorded NO root for B (register_repo_read_only) and ran no indexing pass, so B
+        // is NOT already-indexed and a zero-file index on B is still first-time-empty.
+        {
+            let conn = rusqlite::Connection::open(&config_b.database).unwrap();
+            let recorded: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM repo_roots WHERE root = ?1",
+                    [root_b.to_string_lossy()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded, 0, "a read-only open must not record the checkout's root");
+        }
         assert!(
             !is_root_already_indexed(&config_b).unwrap(),
             "a read-only open must not make an unindexed repo look already-indexed"
@@ -545,14 +563,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// #427 review ("Warn even when a read open recorded the checkout"): a read-only `open_config`
-    /// (doctor / MCP) on a fresh same-identity clone records the clone's root under the shared repo
-    /// WITHOUT indexing it. The same-identity-join warning must STILL fire on the first real index
-    /// — suppressing it on a mere recording would let the clone silently switch the shared
-    /// scope with none of the `[index] repo_id` guidance. Keyed on `source_root`, not
-    /// `repo_roots` membership.
+    /// #427 review ("Warn even when a read open touched the checkout"): a read-only `open_config`
+    /// (doctor / MCP) on a fresh same-identity clone registers its identity but neither indexes it
+    /// nor records its root. The same-identity-join warning must STILL fire on the first real index
+    /// — suppressing it on a mere read would let the clone silently switch the shared scope with
+    /// none of the `[index] repo_id` guidance.
     #[test]
-    fn same_identity_join_warns_even_after_a_read_recorded_the_clone_root() {
+    fn same_identity_join_warns_even_after_a_read_only_open_of_the_clone() {
         if std::process::Command::new("git").arg("--version").output().is_err() {
             return;
         }
@@ -572,14 +589,63 @@ mod tests {
         let mut config_b = config_a.clone();
         config_b.root = root_b.clone();
 
-        // A read-only open records B's root under the shared id, but indexes nothing (no
-        // source_root).
+        // A read-only open registers B's identity but records no root and indexes nothing.
         let _ = crate::index::IndexDatabase::open_config(&config_b).unwrap();
 
         // The join warning must still fire — the read must not suppress it.
         let note = same_identity_join_note(&config_b).unwrap();
-        assert!(note.is_some(), "a read-recorded clone must still warn it joins the shared scope");
+        assert!(
+            note.is_some(),
+            "a read-only-opened clone must still warn it joins the shared scope"
+        );
         assert_eq!(note.unwrap().existing_root, root_a);
+
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    /// #427 review ("Preserve pruning for earlier same-identity checkouts"): when checkout A has
+    /// indexed the shared repo and a same-identity checkout B then indexes it too, B's pass does
+    /// NOT steal A's already-indexed status — each checkout records its OWN `repo_roots` row
+    /// (the single-valued `source_root` would be last-writer-wins, flipped to B). So A deleting
+    /// its last file and re-indexing to empty is still ALLOWED to prune, not refused as
+    /// first-time-empty.
+    #[test]
+    fn a_sibling_index_does_not_steal_an_earlier_checkouts_prune_right() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        // A: committed git repo, indexed into a shared DB.
+        let root_a = unique_temp_root();
+        std::fs::create_dir_all(root_a.join("src")).unwrap();
+        std::fs::write(root_a.join("src/a.rs"), "fn a() {}\n").unwrap();
+        git(&root_a, &["init", "-q"]);
+        git(&root_a, &["add", "-A"]);
+        git(&root_a, &["commit", "-q", "-m", "init"]);
+        let config_a = source_config(root_a.clone(), Language::Rust);
+        crate::index::IndexDatabase::rebuild(&config_a).unwrap();
+        assert!(is_root_already_indexed(&config_a).unwrap(), "A is indexed after its rebuild");
+
+        // B: a same-identity clone of A, pointed at the SAME DB, INDEXED too (has its own file).
+        let root_b = PathBuf::from(format!("{}-clone", root_a.display()));
+        let _ = std::fs::remove_dir_all(&root_b);
+        git(&root_a, &["clone", "-q", ".", root_b.to_str().unwrap()]);
+        let mut config_b = config_a.clone();
+        config_b.root = root_b.clone();
+        crate::index::IndexDatabase::index_discover(&config_b).unwrap();
+
+        // B's index overwrote the shared `source_root` to B — but A's `repo_roots` row survives, so
+        // A is STILL recognized as already-indexed and its delete-to-empty prunes instead
+        // of refusing.
+        assert!(
+            is_root_already_indexed(&config_a).unwrap(),
+            "A must stay already-indexed after a sibling checkout indexes the shared repo"
+        );
+        std::fs::remove_file(root_a.join("src/a.rs")).unwrap();
+        assert!(
+            !is_first_time_empty(&config_a).unwrap(),
+            "A going empty must be allowed to prune, not refused as first-time-empty"
+        );
 
         let _ = std::fs::remove_dir_all(root_a);
         let _ = std::fs::remove_dir_all(root_b);

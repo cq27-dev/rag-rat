@@ -94,8 +94,8 @@ impl IndexDatabase {
         // it, and `repo_meta` writes below satisfy the `repo_meta → repos` FK (an
         // empty/unregistered id would violate it). `create_or_migrate` no longer resolves
         // the repo or heals the model manifest, so both move here, ordered after
-        // registration.
-        db.adopt_repo_from_config(config)?;
+        // registration. INDEXING intent: a full rebuild records this checkout's root (#427).
+        db.adopt_repo_from_config(config, super::lifecycle::AdoptIntent::Indexing)?;
         // A6: stage a FRESH file generation instead of clearing-then-reinserting in one long
         // write-locked transaction. `old_live` is the generation readers currently see; `target` is
         // higher than any the repo holds, so it never collides with a torn prior rebuild's

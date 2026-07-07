@@ -20,6 +20,20 @@ pub(super) enum BareOpenMode {
     AdoptionPending,
 }
 
+/// Why a config-bearing open is adopting its repo — decides whether the checkout's working-tree
+/// root is RECORDED in `repo_roots` (#427). A recorded root is the "this checkout was INDEXED here"
+/// signal `is_root_already_indexed` / `same_identity_join_note` key on, so only an indexing pass
+/// may create one. A read-only open registers identity (needed to scope its reads) but must NOT
+/// record the root: otherwise a `doctor` / MCP read of a fresh same-identity clone would make it
+/// look indexed and let a later empty index prune the shared scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdoptIntent {
+    /// A rebuild / incremental / discover pass that indexes content — records the root.
+    Indexing,
+    /// A read-only `open_config` (doctor / MCP / query) — registers identity, records NO root.
+    ReadOnly,
+}
+
 impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_bare(path, BareOpenMode::ConfigLess)
@@ -152,8 +166,10 @@ impl IndexDatabase {
         // Register/adopt BEFORE anything repo-scoped runs, then install the scope context so the
         // model-manifest heal + seed below resolve the correct repo (in a consolidated DB the sole-
         // repo fallback would be ambiguous — the ordering, not the fallback, is load-bearing
-        // there).
-        db.adopt_repo_from_config(config)?;
+        // there). READ-ONLY intent: `open_config` backs doctor / MCP / query reads, so it registers
+        // identity but records NO working-tree root (#427) — a read must not mark this checkout
+        // "indexed here".
+        db.adopt_repo_from_config(config, AdoptIntent::ReadOnly)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
         ai::ensure_model_manifest(db.storage.connection())?;
@@ -182,13 +198,30 @@ impl IndexDatabase {
     ///
     /// A genuine registration refusal (a different repo already owns a consolidated DB) also
     /// propagates, via `register_repo` itself.
-    pub(super) fn adopt_repo_from_config(&mut self, config: &Config) -> anyhow::Result<()> {
+    pub(super) fn adopt_repo_from_config(
+        &mut self,
+        config: &Config,
+        intent: AdoptIntent,
+    ) -> anyhow::Result<()> {
         let conn = self.storage.connection();
         let repo_id = match crate::repo_identity::resolve_repo_identity(
             &config.root,
             config.repo_id_override.as_deref(),
         ) {
-            Ok(identity) => schema::register_repo(conn, &identity, &config.root, schema::now_ms())?,
+            // #427: an INDEXING adoption records this checkout's working-tree root in `repo_roots`
+            // (the "this checkout was indexed here" signal); a READ-ONLY adoption (`open_config`
+            // from doctor / MCP / query) registers identity but does NOT record the root, so a mere
+            // read can't make an unindexed checkout look indexed (which would let a later empty
+            // index prune the shared scope).
+            Ok(identity) => {
+                let now = schema::now_ms();
+                match intent {
+                    AdoptIntent::Indexing =>
+                        schema::register_repo(conn, &identity, &config.root, now)?,
+                    AdoptIntent::ReadOnly =>
+                        schema::register_repo_read_only(conn, &identity, &config.root, now)?,
+                }
+            },
             Err(err) if err.is_absent() => {
                 // STRUCTURAL BACKSTOP (Codex batch 8, finding 5): an identity-less root may
                 // sole-pick only on a SINGLE-repo database. On a multi-repo store (an explicit

@@ -1530,7 +1530,7 @@ fn standalone_index_targets_publishes_staged_parser_failures_immediately() {
 
     // The standalone driver: create/adopt/scope, then index_targets — NO rebuild anywhere.
     let mut db = IndexDatabase::create_or_migrate(&config.database).unwrap();
-    db.adopt_repo_from_config(&config).unwrap();
+    db.adopt_repo_from_config(&config, crate::index::lifecycle::AdoptIntent::Indexing).unwrap();
     let (sha, wt) = crate::index::resolve_git_context(&root);
     db.set_context(&sha, &wt).unwrap();
     db.index_targets(&config).unwrap();
