@@ -10,6 +10,11 @@ use sha2::{Digest, Sha256};
 use crate::index::{delete_repo_meta, repo_meta, schema, scoped_table_row_count, set_repo_meta};
 use crate::search::lexical::SearchHit;
 
+const GIT_HISTORY_INDEXED_HEAD_META: &str = "git_history_indexed_head";
+const GIT_HISTORY_INDEXED_ROOT_META: &str = "git_history_indexed_root";
+const GIT_HISTORY_INDEXED_SHALLOW_META: &str = "git_history_indexed_shallow";
+const GIT_HISTORY_INDEXED_COMPLETE_META: &str = "git_history_indexed_complete";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GitHistoryIndexStatus {
     pub available: bool,
@@ -118,36 +123,136 @@ struct FileChange {
 }
 
 #[derive(Debug)]
+struct ReadGitHistory {
+    commits: Vec<CommitRecord>,
+    changes: Vec<FileChange>,
+    complete: bool,
+}
+
+#[derive(Debug)]
 pub(crate) struct PreparedGitHistory {
     repo: Option<GitRepo>,
     commits: Vec<CommitRecord>,
     changes: Vec<FileChange>,
+    complete: bool,
+    mode: PreparedGitHistoryMode,
+}
+
+#[derive(Debug)]
+enum PreparedGitHistoryMode {
+    Full,
+    Append { expected: HistoryCursors },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum GitHistoryPreparePlan {
+    Full,
+    Append { expected: HistoryCursors },
 }
 
 pub(crate) fn prepare(root: &Path) -> anyhow::Result<PreparedGitHistory> {
     let Some(repo) = git_repo(root) else {
-        return Ok(PreparedGitHistory { repo: None, commits: Vec::new(), changes: Vec::new() });
+        return Ok(PreparedGitHistory {
+            repo: None,
+            commits: Vec::new(),
+            changes: Vec::new(),
+            complete: true,
+            mode: PreparedGitHistoryMode::Full,
+        });
     };
     // One streaming gix revwalk pinned to the captured HEAD produces both the commit records and
     // their file changes — no `git log` subprocess and no full-history stdout buffer, so memory
     // stays bounded on deep-history repos (#212). Pinning to the captured sha (not implicit HEAD)
     // keeps `prepare` atomic w.r.t. a concurrent commit, so the stored `git_history_indexed_head`
     // stays honest for the reload gate.
-    let (commits, changes) = read_history(root, &repo.worktree_root, &repo.head);
-    Ok(PreparedGitHistory { repo: Some(repo), commits, changes })
+    let history = read_history(root, &repo.worktree_root, &repo.head);
+    Ok(PreparedGitHistory {
+        repo: Some(repo),
+        commits: history.commits,
+        changes: history.changes,
+        complete: history.complete,
+        mode: PreparedGitHistoryMode::Full,
+    })
 }
 
-/// The history reload-gate CURSOR values (`git_history_indexed_head`/`_root`/`_shallow`) a row
-/// apply produces, held back for a deferred write (A6, batch-4 P2). The git rows themselves are
-/// keyed, INERT data — `is_history_current` and `status` treat the CURSORS as the authority, never
-/// bare row presence — so a generation-staged rebuild lands the bulky rows early (Phase 2) and
-/// writes these cursors inside the terminal flip transaction, keeping "what commit is this index
-/// at" consistent with the file generation the pointer publishes. `None` cursors = a non-git root
-/// (the apply cleared the tables; nothing to record).
+pub(crate) fn prepare_with_plan(
+    root: &Path,
+    plan: GitHistoryPreparePlan,
+) -> anyhow::Result<PreparedGitHistory> {
+    match plan {
+        GitHistoryPreparePlan::Full => prepare(root),
+        GitHistoryPreparePlan::Append { expected } => prepare_append(root, expected),
+    }
+}
+
+fn prepare_append(root: &Path, expected: HistoryCursors) -> anyhow::Result<PreparedGitHistory> {
+    let Some(repo) = git_repo(root) else {
+        return Ok(PreparedGitHistory {
+            repo: None,
+            commits: Vec::new(),
+            changes: Vec::new(),
+            complete: true,
+            mode: PreparedGitHistoryMode::Full,
+        });
+    };
+    if expected.complete
+        && !repo.shallow
+        && root_key(root) == expected.root_key
+        && is_fast_forward(root, &expected.head, &repo.head)
+        && let Ok(history) =
+            read_history_excluding(root, &repo.worktree_root, &repo.head, &expected.head)
+        && history.complete
+    {
+        return Ok(PreparedGitHistory {
+            repo: Some(repo),
+            commits: history.commits,
+            changes: history.changes,
+            complete: true,
+            mode: PreparedGitHistoryMode::Append { expected },
+        });
+    }
+    prepare(root)
+}
+
+pub(crate) fn prepare_plan(conn: &Connection, root: &Path) -> GitHistoryPreparePlan {
+    let Some(repo) = git_repo(root) else {
+        return GitHistoryPreparePlan::Full;
+    };
+    if repo.shallow {
+        return GitHistoryPreparePlan::Full;
+    }
+    let probe = || -> anyhow::Result<GitHistoryPreparePlan> {
+        let repo_id = schema::active_repo_id(conn)?;
+        let expected = history_cursors(conn, &repo_id)?
+            .ok_or_else(|| anyhow::anyhow!("missing git history cursor"))?;
+        let has_rows = scoped_table_row_count(conn, "git_commits", &repo_id)? > 0;
+        if !has_rows
+            || expected.head == repo.head
+            || expected.root_key != root_key(root)
+            || expected.shallow
+            || !is_fast_forward(root, &expected.head, &repo.head)
+        {
+            return Ok(GitHistoryPreparePlan::Full);
+        }
+        Ok(GitHistoryPreparePlan::Append { expected })
+    };
+    probe().unwrap_or(GitHistoryPreparePlan::Full)
+}
+
+/// The history reload-gate CURSOR values (`git_history_indexed_head`/`_root`/`_shallow` plus
+/// `_complete`) a row apply produces, held back for a deferred write (A6, batch-4 P2). The git rows
+/// themselves are keyed, INERT data — `is_history_current` and `status` treat the CURSORS as the
+/// authority, never bare row presence — so a generation-staged rebuild lands the bulky rows early
+/// (Phase 2) and writes these cursors inside the terminal flip transaction, keeping "what commit is
+/// this index at" consistent with the file generation the pointer publishes. `complete=false`
+/// records a best-effort partial read that may be useful to inspect but must not be used as an
+/// append base. `None` cursors = a non-git root (the apply cleared the tables; nothing to record).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HistoryCursors {
     head: String,
     root_key: String,
     shallow: bool,
+    complete: bool,
 }
 
 /// Write the reload-gate cursors — the LAST step of a history apply, split out so the full
@@ -158,14 +263,16 @@ pub(crate) fn record_history_cursors(
     cursors: &HistoryCursors,
 ) -> anyhow::Result<()> {
     let repo_id = schema::active_repo_id(conn)?;
-    set_repo_meta(conn, &repo_id, "git_history_indexed_head", &cursors.head)?;
-    set_repo_meta(conn, &repo_id, "git_history_indexed_root", &cursors.root_key)?;
+    set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_HEAD_META, &cursors.head)?;
+    set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_ROOT_META, &cursors.root_key)?;
     set_repo_meta(
         conn,
         &repo_id,
-        "git_history_indexed_shallow",
+        GIT_HISTORY_INDEXED_SHALLOW_META,
         if cursors.shallow { "1" } else { "0" },
     )?;
+    let complete = if cursors.complete { "1" } else { "0" };
+    set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_COMPLETE_META, complete)?;
     Ok(())
 }
 
@@ -194,18 +301,128 @@ pub(crate) fn apply_prepared_deferring_cursors(
         return Ok((status(conn, root)?, None));
     };
 
+    let repo_id = schema::active_repo_id(conn)?;
+    let mut applied_cursors = HistoryCursors {
+        head: repo.head.clone(),
+        root_key: root_key(root),
+        shallow: repo.shallow,
+        complete: prepared.complete,
+    };
+
+    match prepared.mode {
+        PreparedGitHistoryMode::Append { ref expected }
+            if prepared.complete
+                && expected_history_cursors_match(conn, &repo_id, expected)?
+                && append_commit_hashes_absent(conn, &repo_id, &prepared.commits)? =>
+        {
+            append_history_rows(conn, &repo_id, &prepared.commits, prepared.changes)?;
+        },
+        PreparedGitHistoryMode::Append { .. } => {
+            if let Some(cursors) =
+                current_history_cursors_at_or_after_prepared(conn, &repo_id, root, &repo)?
+            {
+                return Ok((status(conn, root)?, Some(cursors)));
+            }
+            let Some(current_repo) = git_repo(root) else {
+                clear(conn)?;
+                return Ok((status(conn, root)?, None));
+            };
+            applied_cursors = HistoryCursors {
+                head: current_repo.head.clone(),
+                root_key: root_key(root),
+                shallow: current_repo.shallow,
+                complete: true,
+            };
+            let history = read_history(root, &current_repo.worktree_root, &current_repo.head);
+            applied_cursors.complete = history.complete;
+            replace_history_rows(conn, &repo_id, &history.commits, history.changes)?;
+        },
+        PreparedGitHistoryMode::Full => {
+            replace_history_rows(conn, &repo_id, &prepared.commits, prepared.changes)?;
+        },
+    }
+
+    // Reload-gate key: head + root + shallow flag + completeness. `is_history_current` skips the
+    // next reload only when the complete cursor matches and git_commits is non-empty. Returned for
+    // the caller to record — immediately (`apply_prepared`) or deferred into the rebuild's terminal
+    // txn.
+    Ok((status(conn, root)?, Some(applied_cursors)))
+}
+
+fn replace_history_rows(
+    conn: &Connection,
+    repo_id: &str,
+    commits: &[CommitRecord],
+    changes: Vec<FileChange>,
+) -> anyhow::Result<()> {
     // `git_commits` / `git_file_changes` are direct-scoped since V040, so a history reindex of ONE
     // repo must delete and re-insert only THAT repo's rows — a wholesale wipe would drop a sibling
     // repo's commits in a consolidated DB. `git_chunk_blame` is transitive via `chunks`/`files`, so
     // it is cleared through the active repo's chunks (A4): a history reindex invalidates blame for
     // this whole repo (new commits change attribution), but must not touch a sibling repo's cache.
     // `commit_fts` is external-content over `git_commits` and is resynced below.
-    let repo_id = schema::active_repo_id(conn)?;
     conn.execute("DELETE FROM git_file_changes WHERE repo_id = ?1", params![repo_id])?;
     conn.execute("DELETE FROM git_commits WHERE repo_id = ?1", params![repo_id])?;
-    delete_repo_chunk_blame(conn, &repo_id)?;
+    delete_repo_chunk_blame(conn, repo_id)?;
+    insert_history_rows(conn, repo_id, commits, changes)?;
 
-    for commit in &prepared.commits {
+    // Resync the external-content FTS from `git_commits` with the desync-safe `'rebuild'` (#51),
+    // never a `DELETE FROM commit_fts` + manual repopulate — the reinserted commit rows took new
+    // rowids, so the stored mapping is stale. `'rebuild'` re-indexes all repos' commits, keeping
+    // every repo searchable.
+    crate::index::schema::rebuild_commit_fts(conn)?;
+    Ok(())
+}
+
+fn append_history_rows(
+    conn: &Connection,
+    repo_id: &str,
+    commits: &[CommitRecord],
+    changes: Vec<FileChange>,
+) -> anyhow::Result<()> {
+    if commits.is_empty() {
+        debug_assert!(changes.is_empty(), "append changes must belong to appended commits");
+        // The history cursor may still advance for an out-of-scope fast-forward. Since existing
+        // `git_commits` rows are preserved, rebuild the external-content FTS so any prior desync
+        // is not carried past the new cursor.
+        crate::index::schema::rebuild_commit_fts(conn)?;
+        return Ok(());
+    }
+    // V1 keeps blame invalidation whole-repo even on append. Scoping by touched paths is a
+    // follow-up because merge commits' first-parent diff paths are used for scope but are not
+    // stored as `git_file_changes` rows.
+    delete_repo_chunk_blame(conn, repo_id)?;
+    insert_history_rows(conn, repo_id, commits, changes)?;
+    // External-content FTS can be missing or stale independently of `git_commits`. A fast-forward
+    // append preserves existing rows, but still has to run the desync-safe rebuild so older
+    // commits do not stay unsearchable until a later full history reload.
+    crate::index::schema::rebuild_commit_fts(conn)?;
+    Ok(())
+}
+
+fn append_commit_hashes_absent(
+    conn: &Connection,
+    repo_id: &str,
+    commits: &[CommitRecord],
+) -> anyhow::Result<bool> {
+    let mut stmt =
+        conn.prepare("SELECT EXISTS(SELECT 1 FROM git_commits WHERE repo_id = ?1 AND hash = ?2)")?;
+    for commit in commits {
+        let exists: bool = stmt.query_row(params![repo_id, commit.hash], |row| row.get(0))?;
+        if exists {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn insert_history_rows(
+    conn: &Connection,
+    repo_id: &str,
+    commits: &[CommitRecord],
+    changes: Vec<FileChange>,
+) -> anyhow::Result<()> {
+    for commit in commits {
         conn.execute(
             "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s, \
              committed_at_s, subject, body, changed_file_count, repo_id)
@@ -224,7 +441,7 @@ pub(crate) fn apply_prepared_deferring_cursors(
     }
 
     let mut changed_counts = BTreeMap::<String, i64>::new();
-    for change in prepared.changes {
+    for change in changes {
         *changed_counts.entry(change.commit_hash.clone()).or_default() += 1;
         conn.execute(
             "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind, \
@@ -246,18 +463,67 @@ pub(crate) fn apply_prepared_deferring_cursors(
             params![hash, count, repo_id],
         )?;
     }
+    Ok(())
+}
 
-    // Resync the external-content FTS from `git_commits` with the desync-safe `'rebuild'` (#51),
-    // never a `DELETE FROM commit_fts` + manual repopulate — the reinserted commit rows took new
-    // rowids, so the stored mapping is stale. `'rebuild'` re-indexes all repos' commits, keeping
-    // every repo searchable.
-    crate::index::schema::rebuild_commit_fts(conn)?;
-    // Reload-gate key: head + root + shallow flag. `is_history_current` skips the next reload
-    // only when all three still match and git_commits is non-empty. Returned for the caller to
-    // record — immediately (`apply_prepared`) or deferred into the rebuild's terminal txn.
-    let cursors =
-        HistoryCursors { head: repo.head.clone(), root_key: root_key(root), shallow: repo.shallow };
-    Ok((status(conn, root)?, Some(cursors)))
+fn raw_history_cursors(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<HistoryCursors>> {
+    let Some(head) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_HEAD_META)? else {
+        return Ok(None);
+    };
+    let Some(root_key) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_ROOT_META)? else {
+        return Ok(None);
+    };
+    let Some(shallow) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_SHALLOW_META)? else {
+        return Ok(None);
+    };
+    let shallow = match shallow.as_str() {
+        "0" => false,
+        "1" => true,
+        _ => return Ok(None),
+    };
+    let Some(complete) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_COMPLETE_META)? else {
+        return Ok(None);
+    };
+    let complete = match complete.as_str() {
+        "0" => false,
+        "1" => true,
+        _ => return Ok(None),
+    };
+    Ok(Some(HistoryCursors { head, root_key, shallow, complete }))
+}
+
+fn history_cursors(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<HistoryCursors>> {
+    Ok(raw_history_cursors(conn, repo_id)?.filter(|cursor| cursor.complete))
+}
+
+fn expected_history_cursors_match(
+    conn: &Connection,
+    repo_id: &str,
+    expected: &HistoryCursors,
+) -> anyhow::Result<bool> {
+    let has_rows = scoped_table_row_count(conn, "git_commits", repo_id)? > 0;
+    Ok(has_rows && history_cursors(conn, repo_id)?.as_ref() == Some(expected))
+}
+
+fn current_history_cursors_at_or_after_prepared(
+    conn: &Connection,
+    repo_id: &str,
+    root: &Path,
+    repo: &GitRepo,
+) -> anyhow::Result<Option<HistoryCursors>> {
+    if scoped_table_row_count(conn, "git_commits", repo_id)? == 0 {
+        return Ok(None);
+    }
+    let Some(current) = history_cursors(conn, repo_id)? else {
+        return Ok(None);
+    };
+    if current.root_key != root_key(root) || current.shallow != repo.shallow {
+        return Ok(None);
+    }
+    if current.head == repo.head || is_fast_forward(root, &repo.head, &current.head) {
+        return Ok(Some(current));
+    }
+    Ok(None)
 }
 
 pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {
@@ -276,7 +542,7 @@ pub fn status(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexS
     Ok(GitHistoryIndexStatus {
         available: repo.is_some(),
         head: repo.map(|repo| repo.head),
-        indexed_head: repo_meta(conn, &repo_id, "git_history_indexed_head")?,
+        indexed_head: repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_HEAD_META)?,
         commit_count,
         file_change_count,
     })
@@ -679,9 +945,12 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
     delete_repo_chunk_blame(conn, &repo_id)?;
     crate::index::schema::rebuild_commit_fts(conn)?;
     // The reload-gate keys moved to `repo_meta` (V039); clear them for the active repo.
-    for key in
-        ["git_history_indexed_head", "git_history_indexed_root", "git_history_indexed_shallow"]
-    {
+    for key in [
+        GIT_HISTORY_INDEXED_HEAD_META,
+        GIT_HISTORY_INDEXED_ROOT_META,
+        GIT_HISTORY_INDEXED_SHALLOW_META,
+        GIT_HISTORY_INDEXED_COMPLETE_META,
+    ] {
         delete_repo_meta(conn, &repo_id, key)?;
     }
     Ok(())
@@ -691,25 +960,42 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
 /// and their per-file changes in a SINGLE streaming pass — no `git log` subprocess and no
 /// full-history stdout buffer, so memory stays bounded on deep-history repos (#212). Best-effort: a
 /// repo gix can't open, or a commit it can't read, yields fewer rows rather than failing the whole
-/// index (matching the previous subprocess path's graceful degradation).
-fn read_history(
+/// index, but marks the result incomplete so it cannot become an append base.
+fn read_history(root: &Path, worktree_root: &Path, head: &str) -> ReadGitHistory {
+    let mut commits = Vec::new();
+    let mut changes = Vec::new();
+    let complete = read_history_inner(root, worktree_root, head, None, &mut commits, &mut changes)
+        .unwrap_or(false);
+    ReadGitHistory { commits, changes, complete }
+}
+
+fn read_history_excluding(
     root: &Path,
     worktree_root: &Path,
     head: &str,
-) -> (Vec<CommitRecord>, Vec<FileChange>) {
+    hidden_head: &str,
+) -> anyhow::Result<ReadGitHistory> {
     let mut commits = Vec::new();
     let mut changes = Vec::new();
-    let _ = read_history_inner(root, worktree_root, head, &mut commits, &mut changes);
-    (commits, changes)
+    let complete = read_history_inner(
+        root,
+        worktree_root,
+        head,
+        Some(hidden_head),
+        &mut commits,
+        &mut changes,
+    )?;
+    Ok(ReadGitHistory { commits, changes, complete })
 }
 
 fn read_history_inner(
     root: &Path,
     worktree_root: &Path,
     head: &str,
+    hidden_head: Option<&str>,
     commits: &mut Vec<CommitRecord>,
     changes: &mut Vec<FileChange>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mut repo = crate::index::git_context::discover_repo(root)?;
     // The by-commit-time walk + per-commit tree diffs look up each commit/tree more than once; an
     // object cache avoids repeated zlib inflation (gitoxide's own recommendation for these passes).
@@ -725,13 +1011,20 @@ fn read_history_inner(
     let walk = repo
         .rev_walk([head_id])
         // Newest-first, matching `git log`'s default reverse-chronological order.
-        .sorting(Sorting::ByCommitTime(gix::traverse::commit::simple::CommitTimeOrder::NewestFirst))
-        .all()?;
+        .sorting(Sorting::ByCommitTime(gix::traverse::commit::simple::CommitTimeOrder::NewestFirst));
+    let walk = match hidden_head {
+        Some(hidden_head) => {
+            let hidden_id = gix::ObjectId::from_hex(hidden_head.as_bytes())?;
+            walk.with_hidden([hidden_id])
+        },
+        None => walk,
+    }
+    .all()?;
     for info in walk {
         // A walk error (e.g. traversing past a shallow clone's boundary into absent objects) ends
         // the walk with what we have, rather than discarding the whole history (#213 review).
-        let Ok(info) = info else { break };
-        let Ok(commit) = repo.find_commit(info.id) else { break };
+        let Ok(info) = info else { return Ok(false) };
+        let Ok(commit) = repo.find_commit(info.id) else { return Ok(false) };
         let author = commit.author()?;
         let committer = commit.committer()?;
         let body = commit.message_raw_sloppy().to_string();
@@ -796,7 +1089,7 @@ fn read_history_inner(
             changes.append(&mut commit_changes);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Record one tree-diff change as a `FileChange` — any leaf path change (regular blob, symlink,
@@ -976,6 +1269,18 @@ fn git_repo(root: &Path) -> Option<GitRepo> {
     Some(GitRepo { worktree_root, head, shallow })
 }
 
+fn is_fast_forward(root: &Path, old_head: &str, new_head: &str) -> bool {
+    let probe = || -> anyhow::Result<bool> {
+        let mut repo = crate::index::git_context::discover_repo(root)?;
+        repo.object_cache_size_if_unset(16 * 1024 * 1024);
+        let old_id = gix::ObjectId::from_hex(old_head.as_bytes())?;
+        let new_id = gix::ObjectId::from_hex(new_head.as_bytes())?;
+        let merge_base = repo.merge_base(old_id, new_id)?;
+        Ok(merge_base.detach() == old_id)
+    };
+    probe().unwrap_or(false)
+}
+
 /// Canonical serialization of the indexed root for the reload gate. The git-history row set is
 /// a function of (HEAD, root) because the `-- .` pathspec runs in `current_dir(root)`, so the
 /// gate stores and compares the root alongside the head sha.
@@ -1002,18 +1307,16 @@ pub(crate) fn is_history_current(conn: &Connection, root: &Path) -> bool {
     }
     let probe = || -> anyhow::Result<bool> {
         let repo_id = schema::active_repo_id(conn)?;
-        let head_matches = repo_meta(conn, &repo_id, "git_history_indexed_head")?.as_deref()
-            == Some(repo.head.as_str());
-        let root_matches = repo_meta(conn, &repo_id, "git_history_indexed_root")?.as_deref()
-            == Some(root_key(root).as_str());
-        // A prior reload done while shallow only saw truncated history; redo it now that we are
-        // not shallow even if HEAD is unchanged.
-        let prior_was_full =
-            repo_meta(conn, &repo_id, "git_history_indexed_shallow")?.as_deref() == Some("0");
+        let Some(cursors) = history_cursors(conn, &repo_id)? else {
+            return Ok(false);
+        };
         // Guard against a torn/empty prior reload writing the meta without rows — counted per-repo
         // (V040), so a sibling repo's commits can't mask THIS repo's empty history.
         let has_rows = scoped_table_row_count(conn, "git_commits", &repo_id)? > 0;
-        Ok(head_matches && root_matches && prior_was_full && has_rows)
+        Ok(cursors.head == repo.head
+            && cursors.root_key == root_key(root)
+            && !cursors.shallow
+            && has_rows)
     };
     probe().unwrap_or(false)
 }
@@ -1039,4 +1342,109 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_root(label: &str) -> PathBuf {
+        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ragrat-git-history-{label}-{}-{id}", std::process::id()))
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let status = Command::new("git").current_dir(root).args(args).status().unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn git_output(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git").current_dir(root).args(args).output().unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn insert_commit_row(conn: &Connection, repo_id: &str, hash: &str) {
+        conn.execute(
+            "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s,
+             committed_at_s, subject, body, changed_file_count, repo_id)
+             VALUES (?1, 'Test', 'test@example.com', 0, 0, 'subject', '', 0, ?2)",
+            params![hash, repo_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn current_history_cursor_guard_rejects_empty_incomplete_or_wrong_scope() {
+        let root = temp_root("cursor-guard");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        let repo_id = "repo";
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, 'repo', 0)",
+            params![repo_id],
+        )
+        .unwrap();
+        let repo = GitRepo {
+            worktree_root: root.clone(),
+            head: "prepared-head".to_string(),
+            shallow: false,
+        };
+
+        assert!(
+            current_history_cursors_at_or_after_prepared(&conn, repo_id, &root, &repo)
+                .unwrap()
+                .is_none(),
+            "empty history rows are never current"
+        );
+
+        insert_commit_row(&conn, repo_id, "existing-head");
+        assert!(
+            current_history_cursors_at_or_after_prepared(&conn, repo_id, &root, &repo)
+                .unwrap()
+                .is_none(),
+            "rows without a complete cursor are never current"
+        );
+
+        set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_HEAD_META, "existing-head").unwrap();
+        set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_ROOT_META, "other-root").unwrap();
+        set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_SHALLOW_META, "0").unwrap();
+        set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_COMPLETE_META, "1").unwrap();
+        assert!(
+            current_history_cursors_at_or_after_prepared(&conn, repo_id, &root, &repo)
+                .unwrap()
+                .is_none(),
+            "a cursor from another root cannot satisfy a stale prepared append"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_history_excluding_reports_invalid_hidden_head() {
+        let root = temp_root("invalid-hidden-head");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init"]);
+        run_git(&root, &["config", "user.name", "Rag Rat"]);
+        run_git(&root, &["config", "user.email", "rag@example.com"]);
+        fs::write(root.join("README.md"), "tracked\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "Initial"]);
+        let head = git_output(&root, &["rev-parse", "HEAD"]);
+
+        let err = read_history_excluding(&root, &root, &head, "not-a-git-object")
+            .expect_err("invalid hidden head must be reported");
+        assert!(!err.to_string().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
 }

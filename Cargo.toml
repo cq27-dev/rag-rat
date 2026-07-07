@@ -32,7 +32,7 @@ rag-rat-core = { version = "0.13.0", path = "crates/rag-rat-core", default-featu
 rag-rat-mcp = { version = "0.13.0", path = "crates/rag-rat-mcp", default-features = false }
 anyhow = "1.0"
 fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
-gix = { version = "0.84.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
+gix = { version = "0.85.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
 libc = "0.2"
 # Separator-aware path→forward-slash conversion. Unlike a raw `\`→`/` replace, it only rewrites the
 # actual path SEPARATOR — so a literal backslash in a Unix filename is preserved. Used where a path

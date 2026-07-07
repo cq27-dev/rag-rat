@@ -92,21 +92,39 @@ impl IndexDatabase {
         // fallback).
         db.ensure_graph_index_current()?;
         db.ensure_generated_flags_current()?;
-        if db.indexed_file_count()? == 0 {
+        let scoped_file_count = db.indexed_file_count()?;
+        let active_base_scope_discovered = db.active_base_scope_discovered(&config.targets)?;
+        let repo_generation_file_count =
+            db.repo_generation_file_count(!active_base_scope_discovered)?;
+        if repo_generation_file_count == 0 && !active_base_scope_discovered {
             return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
-        progress(IndexProgress::Started { database: config.database.clone(), mode });
-        // Gate the git-history reload: `apply_prepared` is a full `git log` re-read (O(total
-        // history) — the `--numstat` pass diffs every commit) + 4-table wipe, and it runs on EVERY
-        // incremental/watcher pass. Skip it when HEAD/root/shallow are unchanged (the common case:
-        // a file edit or idle sweep leaves history untouched). Reloading only on a real change
-        // still catches every rewrite, since HEAD's sha is content-addressed. Decide BEFORE
-        // spawning `prepare` so an unchanged HEAD never pays the `git log` cost at all.
+        // A commit advances HEAD before committed-scope rows have been stamped for it. Likewise, a
+        // target-set change can make the active scope marker stale even when the old rows still
+        // make the counts match. Neither is a complete changed-file pass: discover the tree
+        // and restamp the generation for the active HEAD/target fingerprint (#459 review).
+        let active_scope_incomplete =
+            !active_base_scope_discovered || scoped_file_count < repo_generation_file_count;
+        let effective_mode = if active_scope_incomplete && mode == IndexMode::Changed {
+            IndexMode::Discover
+        } else {
+            mode
+        };
+        progress(IndexProgress::Started {
+            database: config.database.clone(),
+            mode: effective_mode,
+        });
+        // Gate the git-history reload. Unchanged HEAD/root/shallow skips it entirely; a
+        // fast-forward HEAD prepares only the new range (`old..new`) and appends rows; uncertainty,
+        // shallow history, root drift, and non-fast-forward rewrites prepare the full history. The
+        // append plan is revalidated after BEGIN IMMEDIATE because preparation happens before this
+        // writer owns the lock.
         let mut git_history = if db.git_history_is_current(&config.root) {
             None
         } else {
             progress(IndexProgress::IndexingGitHistory);
-            Some(spawn_git_history_prepare(&config.root))
+            let plan = git_history::prepare_plan(db.storage.connection(), &config.root);
+            Some(spawn_git_history_prepare_with_plan(&config.root, plan))
         };
         let result = (|| -> anyhow::Result<bool> {
             // BEGIN IMMEDIATE: acquire the write lock up front so a racing writer waits out
@@ -140,10 +158,15 @@ impl IndexDatabase {
                     config.llm.embedding.backend.model_id(),
                 )?;
             }
-            let (indexed, manifest_in_change_set) = match mode {
+            let (indexed, manifest_in_change_set) = match effective_mode {
                 IndexMode::Changed => db.index_changed_files_with_progress(config, progress)?,
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
+            };
+            let base_scope_discovery_marked = if effective_mode == IndexMode::Discover {
+                db.mark_active_base_scope_discovered(&config.targets)?
+            } else {
+                false
             };
             // Self-heal stale worktree-overlay rows (#87): a dirty-then-committed file's overlay
             // row otherwise lingers forever, shadowing its (correct) committed row in every
@@ -159,7 +182,8 @@ impl IndexDatabase {
                 || healed > 0
                 || source_root_changed
                 || git_meta_changed
-                || embedding_model_seeded;
+                || embedding_model_seeded
+                || base_scope_discovery_marked;
             // None when the gate above found git history already current — skip the reload.
             if let Some(handle) = git_history.take() {
                 db.apply_prepared_git_history(&config.root, handle)?;
@@ -622,5 +646,9 @@ impl IndexDatabase {
 /// incremental pass (#61, salvaging #95). Checked against both changed and deleted paths so a crate
 /// removal also triggers the refresh.
 fn paths_include_cargo_toml<'a>(mut paths: impl Iterator<Item = &'a Path>) -> bool {
-    paths.any(|path| path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml"))
+    paths.any(is_cargo_toml)
+}
+
+fn is_cargo_toml(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
 }

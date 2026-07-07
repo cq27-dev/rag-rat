@@ -66,6 +66,16 @@ impl IndexDatabase {
         ai::pending_embedding_jobs(self.storage.connection())
     }
 
+    pub(crate) fn pending_embedding_jobs_with_available_incremental_embedder(
+        &self,
+        options: &ai::ReconcileOptions,
+    ) -> anyhow::Result<u64> {
+        ai::pending_embedding_jobs_with_available_incremental_embedder(
+            self.storage.connection(),
+            options,
+        )
+    }
+
     /// One-time upgrade: re-encode any `chunk_embeddings` row still stored in the legacy f32 format
     /// to the compact int8 format (#312), gated by a meta key so later maintenance passes skip the
     /// table scan. A format-only conversion (decode f32 → encode int8), no model inference. Returns

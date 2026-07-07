@@ -1,6 +1,5 @@
 [index]
 root = "."
-database = ".rag-rat/index.sqlite"
 
 [llm.embedding]
 # DOGFOOD: jina-embeddings-v2-base-code (768-dim, 8192-token ALiBi context) — a CODE-specialized

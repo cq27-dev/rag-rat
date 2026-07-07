@@ -233,6 +233,7 @@ impl IndexDatabase {
             // reload stays owed), and the retry publishes files + git authority together.
             db.set_repo_meta("source_root", &config.root.display().to_string())?;
             db.write_git_meta(&config.root)?;
+            db.mark_active_base_scope_discovered(&config.targets)?;
             if let Some(cursors) = &history_cursors {
                 db.record_git_history_cursors(cursors)?;
             }

@@ -137,6 +137,14 @@ pub(crate) fn spawn_git_history_prepare(
     thread::spawn(move || git_history::prepare(&root))
 }
 
+pub(crate) fn spawn_git_history_prepare_with_plan(
+    root: &Path,
+    plan: git_history::GitHistoryPreparePlan,
+) -> JoinHandle<anyhow::Result<git_history::PreparedGitHistory>> {
+    let root = root.to_path_buf();
+    thread::spawn(move || git_history::prepare_with_plan(&root, plan))
+}
+
 pub(crate) fn join_git_history_prepare(
     handle: JoinHandle<anyhow::Result<git_history::PreparedGitHistory>>,
 ) -> anyhow::Result<git_history::PreparedGitHistory> {

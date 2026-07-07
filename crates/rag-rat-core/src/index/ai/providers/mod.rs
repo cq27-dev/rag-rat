@@ -168,11 +168,13 @@ fn light_embedder(
 pub(crate) enum ChunkEmbedder {
     /// An embedder is ready. `provisioned` is `Some` only for an ephemeral box; `None` for
     /// connect/local. `remote` is the already-read active remote config, if any, so reconcile does
-    /// not need to re-read potentially malformed meta outside the NotReady path.
+    /// not need to re-read potentially malformed meta outside the NotReady path. `estimated_jobs`
+    /// carries a paid candidate scan from a preflight path so reconcile can reuse it.
     Ready {
         embedder: Box<dyn Embedder>,
         provisioned: Option<ProvisionedBox>,
         remote: Option<Box<RemoteEmbeddingConfig>>,
+        estimated_jobs: Option<u64>,
     },
     /// Ephemeral active model on a non-provisioning pass whose local `query_endpoint` is absent or
     /// fails a probe embed (down, a wrong service on the port, the model not pulled, a dim
@@ -274,6 +276,7 @@ pub(crate) fn acquire_chunk_embedder(
                 embedder,
                 provisioned: None,
                 remote: Some(Box::new(transport)),
+                estimated_jobs: None,
             };
         }
         // BEFORE provisioning a paid box, confirm there's actually work to do. An explicit
@@ -338,6 +341,7 @@ pub(crate) fn acquire_chunk_embedder(
                     embedder: Box::new(embedder),
                     provisioned: Some(provisioned),
                     remote: Some(Box::new(window_remote)),
+                    estimated_jobs,
                 }
             },
             Err(err) => ChunkEmbedder::NotReady(err),
@@ -345,8 +349,12 @@ pub(crate) fn acquire_chunk_embedder(
     }
     // Connect / local: the usual single construction site.
     match active_embedder(conn, intra_threads) {
-        Ok(embedder) =>
-            ChunkEmbedder::Ready { embedder, provisioned: None, remote: remote.map(Box::new) },
+        Ok(embedder) => ChunkEmbedder::Ready {
+            embedder,
+            provisioned: None,
+            remote: remote.map(Box::new),
+            estimated_jobs: None,
+        },
         Err(err) => ChunkEmbedder::NotReady(err),
     }
 }

@@ -13,11 +13,12 @@ use crate::embedding_models::{
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A recognizable bogus row that only a git-history *reload* (full table wipe) would remove.
-/// Surviving the next incremental pass ⇒ the reload was skipped; gone ⇒ it ran. It lives in
-/// `git_file_changes` (a plain table the reload also wipes) rather than `git_commits`, because a
-/// stray `git_commits` row with no matching `commit_fts` entry desyncs the external-content FTS5
-/// and the reload's `DELETE FROM commit_fts` then corrupts it — a test artifact, not a real state.
+/// A recognizable bogus row that only a git-history full replacement would remove. Surviving the
+/// next incremental pass means the reload was skipped or appended; gone means the full path ran. It
+/// lives in `git_file_changes` (a plain table the full path wipes) rather than `git_commits`,
+/// because a stray `git_commits` row with no matching `commit_fts` entry desyncs the
+/// external-content FTS5 and the reload's `commit_fts` rebuild then has to repair it — a test
+/// artifact, not a real state.
 const SENTINEL_PATH: &str = "__rag_rat_reload_sentinel__";
 
 fn insert_sentinel_commit(db: &IndexDatabase) {
@@ -520,6 +521,22 @@ fn run_git(root: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn run_git_with_env(root: &Path, args: &[&str], env: &[(&str, &str)]) {
+    let output = Command::new("git")
+        .args(args)
+        .envs(env.iter().copied())
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {:?} failed", args);
+}
+
+fn git_output(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git").args(args).current_dir(root).output().unwrap();
+    assert!(output.status.success(), "git {:?} failed", args);
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 struct MockGitHubClient;

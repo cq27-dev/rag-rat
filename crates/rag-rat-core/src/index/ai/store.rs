@@ -1,6 +1,22 @@
 use super::*;
 use crate::index::text_compression::{ChunkTextDecoder, ChunkTextRow};
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ESTIMATED_RECONCILE_JOBS_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_estimated_reconcile_job_calls() {
+    ESTIMATED_RECONCILE_JOBS_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn estimated_reconcile_job_calls() -> usize {
+    ESTIMATED_RECONCILE_JOBS_CALLS.with(std::cell::Cell::get)
+}
+
 /// Map one candidate row to its `CurrentChunk` (with a placeholder `text`) plus the
 /// [`ChunkTextRow`] carrying the chunk's stored text (the compressed `chunk_text` blob + `raw_len`;
 /// the `chunks.text` column is gone, so the SELECT INNER JOINs `chunk_text`). The real `text` is
@@ -222,6 +238,9 @@ pub(crate) fn estimated_reconcile_jobs(
     scan: &EmbeddingScan<'_>,
     options: &ReconcileOptions,
 ) -> anyhow::Result<u64> {
+    #[cfg(test)]
+    ESTIMATED_RECONCILE_JOBS_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+
     // STREAM the candidates and count — never materialize EVERY candidate's decompressed text into
     // a `Vec` just to size the backlog (#64 audit; mirrors the streamed
     // `embedding_reconcile_plan`, #379). This runs on the watcher/maintenance gate

@@ -48,6 +48,32 @@ pub(crate) fn reconcile_with_options_progress(
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_BATCH_SIZE);
     let max_embedding_chars = options.max_embedding_chars.max(MIN_EMBEDDING_CHARS);
+    // The reconcile scan identity (model id/version/dim + char cap), built ONCE up front so the
+    // ephemeral pending-work check inside `acquire_chunk_embedder` sizes candidates exactly like
+    // the embed loop below (which reuses this same `scan`).
+    let scan = EmbeddingScan {
+        model_id: &active_model_id,
+        model_version: &model_version,
+        dim: embedding_dim,
+        max_embedding_chars,
+    };
+    let preflight_estimated_jobs = if automatic_reconcile_can_skip_noop(conn, &options) {
+        match estimated_reconcile_jobs(conn, &scan, &options) {
+            Ok(0) =>
+                return Ok(empty_current_reconcile_report(
+                    active_model_id,
+                    model_version,
+                    embedding_dim,
+                    batch_size,
+                    max_embedding_chars,
+                    &options,
+                )),
+            Ok(jobs) => Some(jobs),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     let started = now_ms();
     set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_STARTED_META, &started.to_string())?;
     // Stamp the active repo (V042): `reconcile_attempts` carries `repo_id`, so the attempt is
@@ -74,16 +100,6 @@ pub(crate) fn reconcile_with_options_progress(
     )?;
     let attempt_id = conn.last_insert_rowid();
     let timer = Instant::now();
-
-    // The reconcile scan identity (model id/version/dim + char cap), built ONCE up front so the
-    // ephemeral pending-work check inside `acquire_chunk_embedder` sizes candidates exactly like
-    // the embed loop below (which reuses this same `scan`).
-    let scan = EmbeddingScan {
-        model_id: &active_model_id,
-        model_version: &model_version,
-        dim: embedding_dim,
-        max_embedding_chars,
-    };
     // The chunk-embed embedder. For an EPHEMERAL active model on a provisioning reconcile, this
     // PROVISIONS a cookbook box (held by `_provisioned` for the whole loop — its `Drop` tears the
     // box down on success/error/panic) — but only AFTER confirming there's pending work, so a no-op
@@ -203,8 +219,9 @@ pub(crate) fn reconcile_with_options_progress(
 
     // `_provisioned` MUST outlive the embed loop: its `Drop` is the box teardown. Bound at function
     // scope here (not inside the match) so it lives until the function returns.
-    let (embedder, _provisioned, remote_config) = match acquired {
-        ChunkEmbedder::Ready { embedder, provisioned, remote } => (embedder, provisioned, remote),
+    let (embedder, _provisioned, remote_config, acquired_estimated_jobs) = match acquired {
+        ChunkEmbedder::Ready { embedder, provisioned, remote, estimated_jobs } =>
+            (embedder, provisioned, remote, estimated_jobs),
         ChunkEmbedder::NotReady(err) => {
             // Surface the cause (e.g. a cookbook provisioning failure with its captured stderr) so
             // a remote outage isn't swallowed; the report keeps the actionable "install" hint AND
@@ -238,7 +255,10 @@ pub(crate) fn reconcile_with_options_progress(
         .as_deref()
         .map(|remote| remote_reconcile_batch_size(remote, batch_size, options.max_seconds))
         .unwrap_or(batch_size);
-    let mut progress_total_chunks = estimated_reconcile_jobs(conn, &scan, &options)?;
+    let mut progress_total_chunks = match preflight_estimated_jobs.or(acquired_estimated_jobs) {
+        Some(jobs) => jobs,
+        None => estimated_reconcile_jobs(conn, &scan, &options)?,
+    };
     progress(ReconcileProgress::Started {
         model_id: active_model_id.clone(),
         total_chunks: progress_total_chunks,
@@ -411,6 +431,53 @@ pub(crate) fn reconcile_with_options_progress(
         "reconcile complete"
     );
     Ok(report)
+}
+
+fn automatic_reconcile_can_skip_noop(conn: &Connection, options: &ReconcileOptions) -> bool {
+    if options.provision_remote || options.force || options.max_seconds.is_none() {
+        return false;
+    }
+    match active_remote_config(conn) {
+        Ok(Some(remote)) if remote.is_ephemeral() => false,
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+fn empty_current_reconcile_report(
+    active_model_id: String,
+    model_version: String,
+    embedding_dim: usize,
+    batch_size: usize,
+    max_embedding_chars: usize,
+    options: &ReconcileOptions,
+) -> ReconcileReport {
+    ReconcileReport {
+        processed_chunks: 0,
+        embeddings_written: 0,
+        skipped_chunks: 0,
+        failed_chunks: 0,
+        blocked_chunks: 0,
+        model_id: active_model_id,
+        model_version,
+        embedding_dim,
+        batch_size,
+        max_embedding_chars,
+        forced: options.force,
+        changed_first: options.changed_first,
+        until_clean: options.until_clean,
+        max_seconds: options.max_seconds,
+        work_reasons: BTreeMap::new(),
+        skipped_by_policy: BTreeMap::new(),
+        input_chars: 0,
+        truncated_inputs: 0,
+        elapsed_ms: 0,
+        chunks_per_sec: 0.0,
+        chars_per_sec: 0.0,
+        avg_chars_per_chunk: 0.0,
+        status: "Current".to_string(),
+        message: None,
+    }
 }
 
 fn remote_reconcile_batch_size(
@@ -821,6 +888,14 @@ mod freshness_version_tests {
         conn
     }
 
+    fn reset_estimated_reconcile_job_calls() {
+        crate::index::ai::store::ESTIMATED_RECONCILE_JOBS_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn estimated_reconcile_job_calls() -> usize {
+        crate::index::ai::store::ESTIMATED_RECONCILE_JOBS_CALLS.with(std::cell::Cell::get)
+    }
+
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
@@ -836,6 +911,36 @@ mod freshness_version_tests {
             max_batch_chars: 384_000,
             request_timeout_s: 5,
         }
+    }
+
+    fn activate_remote_fastembed(conn: &Connection, remote: &RemoteEmbeddingConfig) {
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        set_active_remote_config(conn, remote).unwrap();
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2, runtime = \
+             'ollama'
+             WHERE model_id = ?1",
+            params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
+        )
+        .unwrap();
+        set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        set_repo_meta(
+            conn,
+            ACTIVE_EMBEDDING_MODEL_VERSION_META,
+            &remote_freshness_version(spec, remote),
+        )
+        .unwrap();
+    }
+
+    fn reconcile_attempt_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM reconcile_attempts", [], |row| row.get(0)).unwrap()
+    }
+
+    fn reconcile_meta_value(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row("SELECT value FROM reconcile_meta WHERE key = ?1", [key], |row| row.get(0))
+            .optional()
+            .unwrap()
     }
 
     struct TimeoutsThenOkEmbedder {
@@ -1219,6 +1324,70 @@ mod freshness_version_tests {
     }
 
     #[test]
+    fn automatic_noop_reconcile_does_not_write_attempt() {
+        let conn = schema_conn();
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        seed_embedding_chunk(&conn, 1);
+        let (url, handle, _) = spawn_reconcile_embed_stub(spec.dim, 1, Duration::ZERO);
+        let remote = remote_at(&url);
+        activate_remote_fastembed(&conn, &remote);
+
+        reset_estimated_reconcile_job_calls();
+        let report = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions {
+                max_seconds: Some(30),
+                provision_remote: false,
+                ..ReconcileOptions::default()
+            },
+            std::mem::drop,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(report.embeddings_written, 1);
+        assert_eq!(
+            estimated_reconcile_job_calls(),
+            1,
+            "non-empty automatic reconcile must reuse the no-op preflight estimate"
+        );
+        let attempts_after_work = reconcile_attempt_count(&conn);
+        let started_meta_after_work =
+            reconcile_meta_value(&conn, LAST_EMBEDDING_RECONCILE_STARTED_META)
+                .expect("working reconcile writes started meta");
+
+        reset_estimated_reconcile_job_calls();
+        let report = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions {
+                max_seconds: Some(30),
+                provision_remote: false,
+                ..ReconcileOptions::default()
+            },
+            std::mem::drop,
+        )
+        .unwrap();
+
+        assert_eq!(report.status, "Current");
+        assert_eq!(report.processed_chunks, 0);
+        assert_eq!(report.embeddings_written, 0);
+        assert_eq!(
+            estimated_reconcile_job_calls(),
+            1,
+            "automatic no-op reconcile needs only the preflight estimate"
+        );
+        assert_eq!(
+            reconcile_attempt_count(&conn),
+            attempts_after_work,
+            "automatic no-op reconcile must not append write-heavy attempt rows"
+        );
+        assert_eq!(
+            reconcile_meta_value(&conn, LAST_EMBEDDING_RECONCILE_STARTED_META),
+            Some(started_meta_after_work),
+            "automatic no-op reconcile must not dirty reconcile meta"
+        );
+    }
+
+    #[test]
     fn remote_reconcile_scopes_request_failure_to_remote_request_batch() {
         let conn = schema_conn();
         let spec = spec(FASTEMBED_MODEL_ID).unwrap();
@@ -1526,6 +1695,13 @@ mod freshness_version_tests {
         set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
         set_repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, spec.version).unwrap();
         set_repo_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META, "{not valid json").unwrap();
+        assert!(
+            !automatic_reconcile_can_skip_noop(&conn, &ReconcileOptions {
+                max_seconds: Some(1),
+                ..ReconcileOptions::default()
+            },),
+            "malformed remote meta fails the automatic no-op preflight closed"
+        );
 
         let report =
             reconcile_with_options_progress(&conn, ReconcileOptions::default(), |_| {}).unwrap();
@@ -1539,6 +1715,21 @@ mod freshness_version_tests {
             )
             .unwrap();
         assert_eq!(attempt_status, "Blocked");
+    }
+
+    #[test]
+    fn automatic_reconcile_continues_when_preflight_estimate_errors() {
+        let conn = schema_conn();
+        install_model(&conn, HASH_MODEL_ID, None).expect("hash installs");
+        conn.execute("DROP TABLE chunks", []).unwrap();
+
+        let err = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions { max_seconds: Some(1), ..ReconcileOptions::default() },
+            std::mem::drop,
+        )
+        .expect_err("the later reconcile estimate should report the broken schema");
+        assert!(err.to_string().contains("chunks"));
     }
 
     #[test]
@@ -1885,6 +2076,21 @@ mod freshness_version_tests {
         activate_ephemeral_with_query_endpoint(&conn, Some(&closed));
         seed_embedding_chunk(&conn, 1);
         assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::SkipEphemeral));
+    }
+
+    #[test]
+    fn automatic_noop_scan_is_not_used_for_ephemeral_query_endpoint() {
+        let conn = schema_conn();
+        activate_ephemeral_with_query_endpoint(&conn, Some("http://127.0.0.1:9"));
+
+        assert!(
+            !automatic_reconcile_can_skip_noop(&conn, &ReconcileOptions {
+                max_seconds: Some(1),
+                provision_remote: false,
+                ..ReconcileOptions::default()
+            }),
+            "ephemeral light passes must probe query_endpoint before any O(repo) no-op scan"
+        );
     }
 
     #[test]

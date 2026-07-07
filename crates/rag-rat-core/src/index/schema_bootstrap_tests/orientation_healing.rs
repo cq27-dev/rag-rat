@@ -291,6 +291,135 @@ fn incremental_pass_heals_stale_overlay_rows() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// #459 review: if the watcher indexes a dirty file and that file is then committed, a changed-mode
+/// follow-up at the new HEAD sees the lingering overlay row but not the unchanged committed files.
+/// It must promote to discover mode and restamp the whole clean tree, not preserve a partial scope.
+#[test]
+fn changed_pass_after_dirty_commit_restamps_unchanged_files() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2,
+        "fixture starts with both files visible"
+    );
+    drop(db);
+
+    fs::write(root.join("src/lib.rs"), "pub fn stable() -> i32 { 3 }\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    let dirty_scope_count: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(dirty_scope_count, 2, "the dirty overlay still shadows a complete active view");
+    drop(db);
+
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "commit dirty overlay"]);
+    let new_head = git_output(&root, &["rev-parse", "HEAD"]);
+
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = db
+            .storage
+            .connection()
+            .prepare("SELECT path, commit_sha, worktree_id FROM files ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            ("src/extra.rs".to_string(), new_head.clone(), String::new()),
+            ("src/lib.rs".to_string(), new_head, String::new()),
+        ],
+        "the clean post-commit scope must contain every file at the new HEAD"
+    );
+    let overlays: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM main.files WHERE worktree_id != '' AND kind != 'deleted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(overlays, 0, "the stale dirty overlay row is healed after the commit");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// The dirty-commit fallback must still discover/restamp the clean tree when another target file
+/// remains dirty; the dirty overlay should coexist with committed rows for unchanged files at the
+/// new HEAD.
+#[test]
+fn changed_pass_after_dirty_commit_restamps_with_another_dirty_target() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    fs::write(root.join("src/kept.rs"), "pub fn kept() -> i32 { 4 }\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "add kept file"]);
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        3,
+        "fixture starts with three files visible"
+    );
+    drop(db);
+
+    fs::write(root.join("src/lib.rs"), "pub fn stable() -> i32 { 3 }\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        3,
+        "dirty overlay still shadows a complete active view"
+    );
+    drop(db);
+
+    run_git(&root, &["add", "src/lib.rs"]);
+    run_git(&root, &["commit", "-m", "commit dirty overlay"]);
+    let new_head = git_output(&root, &["rev-parse", "HEAD"]);
+    fs::write(root.join("src/extra.rs"), "pub fn extra() -> i32 { 5 }\n").unwrap();
+
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    let rows: Vec<(String, String, bool)> = {
+        let mut stmt = db
+            .storage
+            .connection()
+            .prepare("SELECT path, commit_sha, worktree_id != '' FROM files ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            ("src/extra.rs".to_string(), String::new(), true),
+            ("src/kept.rs".to_string(), new_head.clone(), false),
+            ("src/lib.rs".to_string(), new_head, false),
+        ],
+        "discover fallback must restamp committed files while preserving the remaining dirty \
+         overlay"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Phase 3: the LOCAL structural-load enrichment (`scoped weighted fan-in`) rides along on BOTH the
 /// `impact_surface` neighbors AND `symbol_lookup` / `search` hits — labeled, never as PageRank. A
 /// hub called by several functions outranks a leaf nothing depends on.

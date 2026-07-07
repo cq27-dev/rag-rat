@@ -242,4 +242,45 @@ impl IndexDatabase {
                 .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))?;
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
+
+    pub(super) fn repo_generation_file_count(
+        &self,
+        include_retained_commit_fallback: bool,
+    ) -> anyhow::Result<usize> {
+        let count = self.storage.connection().query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT path FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2
+                   AND worktree_id = ?3 AND worktree_id != '' AND kind != 'deleted'
+                 UNION
+                 SELECT path FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2
+                   AND worktree_id = '' AND kind != 'deleted'
+                   AND (
+                       commit_sha = ?4
+                       OR (
+                           ?5 AND ?4 != '' AND commit_sha != '' AND NOT EXISTS (
+                               SELECT 1 FROM main.files
+                               WHERE repo_id = ?1 AND generation = ?2
+                                 AND worktree_id = '' AND commit_sha = ?4 AND kind != 'deleted'
+                           )
+                       )
+                   )
+                   AND path NOT IN (
+                       SELECT path FROM main.files
+                       WHERE repo_id = ?1 AND generation = ?2
+                         AND worktree_id = ?3 AND worktree_id != ''
+                   )
+             )",
+            params![
+                self.active_repo_id,
+                self.active_generation,
+                self.active_worktree_id,
+                self.active_commit_sha,
+                include_retained_commit_fallback,
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
 }

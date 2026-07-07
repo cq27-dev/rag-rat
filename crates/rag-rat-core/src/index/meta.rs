@@ -1,6 +1,10 @@
 //! Index key-value meta (the `index_meta` table) and the content-revision digest.
 
 use super::*;
+use crate::config::ResolvedTarget;
+
+const WATCH_SHUTDOWN_RECONCILE_PENDING_META: &str = "watch_shutdown_reconcile_pending";
+const BASE_SCOPE_DISCOVERED_META: &str = "files_base_scope_discovered";
 
 impl IndexDatabase {
     pub(super) fn record_content_revision(&self) -> anyhow::Result<String> {
@@ -35,6 +39,60 @@ impl IndexDatabase {
     /// no-change incremental/sweep pass avoids dirtying a WAL page (issue #63).
     pub(super) fn set_repo_meta_if_changed(&self, key: &str, value: &str) -> anyhow::Result<bool> {
         Ok(set_repo_meta_if_changed(self.storage.connection(), &self.active_repo_id, key, value)?)
+    }
+
+    pub(crate) fn mark_watch_shutdown_reconcile_pending(&self) -> anyhow::Result<bool> {
+        self.set_repo_meta_if_changed(WATCH_SHUTDOWN_RECONCILE_PENDING_META, "1")
+    }
+
+    pub(crate) fn watch_shutdown_reconcile_pending(&self) -> anyhow::Result<bool> {
+        Ok(self.repo_meta(WATCH_SHUTDOWN_RECONCILE_PENDING_META)?.as_deref() == Some("1"))
+    }
+
+    pub(crate) fn clear_watch_shutdown_reconcile_pending(&self) -> anyhow::Result<bool> {
+        if !self.watch_shutdown_reconcile_pending()? {
+            return Ok(false);
+        }
+        let conn = self.storage.connection();
+        delete_repo_meta(conn, &self.active_repo_id, WATCH_SHUTDOWN_RECONCILE_PENDING_META)?;
+        Ok(true)
+    }
+
+    pub(super) fn active_base_scope_discovered(
+        &self,
+        targets: &[ResolvedTarget],
+    ) -> anyhow::Result<bool> {
+        let Some(marker) = self.base_scope_discovery_marker(targets) else {
+            return Ok(false);
+        };
+        Ok(self.repo_meta(BASE_SCOPE_DISCOVERED_META)?.as_deref() == Some(marker.as_str()))
+    }
+
+    pub(super) fn mark_active_base_scope_discovered(
+        &self,
+        targets: &[ResolvedTarget],
+    ) -> anyhow::Result<bool> {
+        let Some(marker) = self.base_scope_discovery_marker(targets) else {
+            return Ok(false);
+        };
+        self.set_repo_meta_if_changed(BASE_SCOPE_DISCOVERED_META, &marker)
+    }
+
+    fn base_scope_discovery_marker(&self, targets: &[ResolvedTarget]) -> Option<String> {
+        let scope = if self.active_commit_sha.is_empty() {
+            if self.active_worktree_id.is_empty() {
+                return None;
+            }
+            format!("worktree={}", hex_sha256(self.active_worktree_id.as_bytes()))
+        } else {
+            format!("commit={}", self.active_commit_sha)
+        };
+        Some(format!(
+            "generation={};{};targets={}",
+            self.active_generation,
+            scope,
+            target_scope_fingerprint(targets)
+        ))
     }
 
     pub(super) fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
@@ -75,6 +133,35 @@ impl IndexDatabase {
         )?;
         Ok(hex_sha256(value.as_bytes()))
     }
+}
+
+fn target_scope_fingerprint(targets: &[ResolvedTarget]) -> String {
+    let mut input = String::new();
+    for target in targets {
+        input.push_str("target\0");
+        input.push_str(&target.name);
+        input.push('\0');
+        input.push_str(target.language.as_str());
+        input.push('\0');
+        input.push_str(target.kind.as_str());
+        input.push('\0');
+        for dir in &target.directories {
+            input.push_str("dir\0");
+            input.push_str(&path_string(dir));
+            input.push('\0');
+        }
+        for include in &target.include {
+            input.push_str("include\0");
+            input.push_str(include);
+            input.push('\0');
+        }
+        for exclude in &target.exclude {
+            input.push_str("exclude\0");
+            input.push_str(exclude);
+            input.push('\0');
+        }
+    }
+    hex_sha256(input.as_bytes())
 }
 
 /// Read a per-repo meta value from the `repo_meta` table — the repo-scoped twin of

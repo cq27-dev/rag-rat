@@ -40,21 +40,75 @@ pub(crate) fn status(conn: &Connection) -> anyhow::Result<LlmStatus> {
 /// is ready (nothing to retry) rather than erroring — the watcher must not abort a pass over a
 /// missing embedder.
 pub(crate) fn pending_embedding_jobs(conn: &Connection) -> anyhow::Result<u64> {
-    ensure_model_manifest(conn)?;
-    let model_id = active_embedding_model_id(conn)?;
-    let model = model(conn, &model_id)?;
-    if validate_ready_model(&model).is_err() {
+    pending_embedding_jobs_with_options(conn, &ReconcileOptions::default())
+}
+
+pub(crate) fn pending_embedding_jobs_with_options(
+    conn: &Connection,
+    options: &ReconcileOptions,
+) -> anyhow::Result<u64> {
+    let Some((model_id, model_version, dim, max_embedding_chars)) =
+        ready_embedding_scan_parts(conn, options)?
+    else {
         return Ok(0);
-    }
-    let model_version = active_embedding_model_version(conn, &model_id)?;
-    let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
+    };
     let scan = EmbeddingScan {
         model_id: &model_id,
         model_version: &model_version,
         dim,
-        max_embedding_chars: DEFAULT_MAX_EMBEDDING_CHARS,
+        max_embedding_chars,
     };
-    estimated_reconcile_jobs(conn, &scan, &ReconcileOptions::default())
+    estimated_reconcile_jobs(conn, &scan, options)
+}
+
+/// Count pending work for watcher backlog retries, but first prove an ephemeral incremental pass
+/// can actually embed. Without this guard, an absent/down local `query_endpoint` pays the O(repo)
+/// candidate scan on every startup only to have reconcile immediately return `SkipEphemeral`.
+pub(crate) fn pending_embedding_jobs_with_available_incremental_embedder(
+    conn: &Connection,
+    options: &ReconcileOptions,
+) -> anyhow::Result<u64> {
+    let Some(remote) = active_remote_config(conn)? else {
+        return pending_embedding_jobs_with_options(conn, options);
+    };
+    if !remote.is_ephemeral() {
+        return pending_embedding_jobs_with_options(conn, options);
+    }
+    let Some((model_id, model_version, dim, max_embedding_chars)) =
+        ready_embedding_scan_parts(conn, options)?
+    else {
+        return Ok(0);
+    };
+    let scan = EmbeddingScan {
+        model_id: &model_id,
+        model_version: &model_version,
+        dim,
+        max_embedding_chars,
+    };
+    let mut light_options = options.clone();
+    light_options.provision_remote = false;
+    match acquire_chunk_embedder(conn, light_options.intra_threads, &scan, &light_options) {
+        ChunkEmbedder::Ready { .. } => estimated_reconcile_jobs(conn, &scan, &light_options),
+        ChunkEmbedder::SkipEphemeral
+        | ChunkEmbedder::NoEphemeralWork
+        | ChunkEmbedder::NotReady(_) => Ok(0),
+    }
+}
+
+fn ready_embedding_scan_parts(
+    conn: &Connection,
+    options: &ReconcileOptions,
+) -> anyhow::Result<Option<(String, String, usize, usize)>> {
+    ensure_model_manifest(conn)?;
+    let model_id = active_embedding_model_id(conn)?;
+    let model = model(conn, &model_id)?;
+    if validate_ready_model(&model).is_err() {
+        return Ok(None);
+    }
+    let model_version = active_embedding_model_version(conn, &model_id)?;
+    let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
+    let max_embedding_chars = options.max_embedding_chars.max(MIN_EMBEDDING_CHARS);
+    Ok(Some((model_id, model_version, dim, max_embedding_chars)))
 }
 
 pub(crate) fn reconcile_plan(conn: &Connection) -> anyhow::Result<ReconcilePlan> {

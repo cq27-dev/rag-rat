@@ -34,6 +34,7 @@ use crate::locks::{self, FileLock};
 const GC_EVERY_PASSES: u64 = 20;
 /// Bound a single reconcile so a pass never holds the write lock indefinitely.
 const PASS_RECONCILE_MAX_SECONDS: u64 = 60;
+const STARTUP_CATCHUP_RUN_GC: bool = false;
 /// Shutdown / interactive lock acquisition: skip rather than block forever.
 const SKIP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Quiet window after a change to the installed binary before signaling the fleet to hot-upgrade.
@@ -87,7 +88,7 @@ impl Debounce {
 pub fn maintenance_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
-    run_pass(config, run_gc)
+    run_pass(config, run_gc, false)
 }
 
 /// Run one maintenance pass only if the write lock is free within `SKIP_TIMEOUT`; returns whether
@@ -96,16 +97,27 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
     let lock_repo = locks::write_lock_repo_id(config);
     match locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SKIP_TIMEOUT)? {
         Some(_lock) => {
-            run_pass(config, run_gc)?;
+            run_pass(config, run_gc, false)?;
             Ok(true)
         },
         None => Ok(false),
     }
 }
 
-fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
+fn startup_catchup_pass(config: &Config) -> anyhow::Result<()> {
+    let lock_repo = locks::write_lock_repo_id(config);
+    let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    run_pass(config, STARTUP_CATCHUP_RUN_GC, true)
+}
+
+fn run_pass(
+    config: &Config,
+    run_gc: bool,
+    retry_base_embedding_backlog: bool,
+) -> anyhow::Result<()> {
     let started = Instant::now();
     let (mut db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
+    let shutdown_reconcile_pending = db.watch_shutdown_reconcile_pending()?;
     let runtime = &config.llm.embedding.runtime;
     let options = ReconcileOptions {
         batch_size: Some(runtime.batch_size),
@@ -126,19 +138,44 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
     // change. Reconcile a CHANGED overlay's embeddings INLINE (while scoped to it) so a worktree
     // query isn't BM25-only for branch content — the base reconcile below can't see overlay chunks.
     let overlays_changed = refresh_worktree_overlays(&mut db, config, Some(&budget));
+    let tail_already_forced = pass_tail_forced_by_state(
+        content_changed,
+        overlays_changed,
+        run_gc,
+        shutdown_reconcile_pending,
+    );
+    let base_embedding_backlog = base_embedding_backlog_needs_tail(
+        tail_already_forced,
+        retry_base_embedding_backlog,
+        &budget,
+        |options| {
+            db.pending_embedding_jobs_with_available_incremental_embedder(options)
+                .is_ok_and(|pending| pending > 0)
+        },
+    );
     // Idle backstop (issue #63, facet 2): when the sweep changed no content, skip the reconcile /
     // gc / memory-validate tail — an idle server should do no work past discovery. `run_gc` (every
     // GC_EVERY_PASSES) still forces a full tail, so the cases that DON'T flip content_changed are
     // still caught within that bound: a freshly-installed embedder, an embedding backlog left by a
     // time-capped reconcile (PASS_RECONCILE_MAX_SECONDS), and drifted memory anchors. Any real
-    // content change runs the full tail immediately.
-    if !content_changed && !overlays_changed && !run_gc {
+    // content change runs the full tail immediately. Startup has two discover-only exceptions:
+    // a prior bounded shutdown discover that marked base reconcile owed, and an already-indexed
+    // base embedding backlog left by a time-capped or blocked prior pass.
+    if !should_run_pass_tail(
+        content_changed,
+        overlays_changed,
+        run_gc,
+        shutdown_reconcile_pending,
+        base_embedding_backlog,
+    ) {
         return Ok(());
     }
     // The base reconcile gets only the budget the overlays left behind; `None` → already exhausted,
     // so skip it (the embedding backlog rides the next pass) rather than spend a fresh full budget.
+    let mut base_reconcile_status = None;
     if let Some(options) = budget.next_options() {
-        db.reconcile_with_options_progress(options, |_| {})?;
+        let report = db.reconcile_with_options_progress(options, |_| {})?;
+        base_reconcile_status = Some(report.status);
     }
     // Clone-edge graph (#286): refresh the persisted graph when it's ABSENT or STALE, with whatever
     // budget the embedding reconcile left — sharing the same PASS_RECONCILE_MAX_SECONDS so a pass
@@ -155,7 +192,45 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
         let _ = db.garbage_collect();
     }
     let _ = db.memory_validate();
+    if shutdown_reconcile_pending && base_reconcile_status.as_deref() == Some("Current") {
+        db.clear_watch_shutdown_reconcile_pending()?;
+    }
     Ok(())
+}
+
+fn should_run_pass_tail(
+    content_changed: bool,
+    overlays_changed: bool,
+    run_gc: bool,
+    shutdown_reconcile_pending: bool,
+    base_embedding_backlog: bool,
+) -> bool {
+    content_changed
+        || overlays_changed
+        || run_gc
+        || shutdown_reconcile_pending
+        || base_embedding_backlog
+}
+
+fn pass_tail_forced_by_state(
+    content_changed: bool,
+    overlays_changed: bool,
+    run_gc: bool,
+    shutdown_reconcile_pending: bool,
+) -> bool {
+    content_changed || overlays_changed || run_gc || shutdown_reconcile_pending
+}
+
+fn base_embedding_backlog_needs_tail(
+    tail_already_forced: bool,
+    retry_base_embedding_backlog: bool,
+    budget: &ReconcileBudget,
+    pending_embedding_jobs: impl FnOnce(&ReconcileOptions) -> bool,
+) -> bool {
+    if tail_already_forced || !retry_base_embedding_backlog {
+        return false;
+    }
+    budget.next_options().is_some_and(|options| pending_embedding_jobs(&options))
 }
 
 /// Refresh the branch overlay of every live LINKED worktree of `config.root`'s repo (#219), so a
@@ -218,9 +293,10 @@ pub fn refresh_worktree_overlays(
                 // from the time left in the SHARED budget so overlays + base can't each spend the
                 // full `--max-seconds`; `None` → budget exhausted, skip and let the NEXT pass
                 // retry.
-                let needs_embed = this_changed
-                    || reconcile.is_some()
-                        && db.pending_embedding_jobs().is_ok_and(|pending| pending > 0);
+                let needs_embed = overlay_needs_embed(this_changed, reconcile, |options| {
+                    db.pending_embedding_jobs_with_available_incremental_embedder(options)
+                        .is_ok_and(|pending| pending > 0)
+                });
                 if needs_embed
                     && let Some(budget) = reconcile
                     && let Some(options) = budget.next_options()
@@ -236,6 +312,19 @@ pub fn refresh_worktree_overlays(
     // scoped to the last worktree it touched).
     let _ = db.use_worktree_scope(&config.root, None);
     changed
+}
+
+fn overlay_needs_embed(
+    this_changed: bool,
+    reconcile: Option<&ReconcileBudget>,
+    pending_embedding_jobs: impl FnOnce(&ReconcileOptions) -> bool,
+) -> bool {
+    if this_changed {
+        return true;
+    }
+    reconcile
+        .and_then(ReconcileBudget::next_options)
+        .is_some_and(|options| pending_embedding_jobs(&options))
 }
 
 /// A time budget shared across the per-overlay embedding reconciles AND the trailing base reconcile
@@ -912,7 +1001,9 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     };
 
     // Catch-up pass: covers edits made while no watcher was running (startup / election gap).
-    let _ = maintenance_pass(&config, true);
+    // Do not force the reconcile/gc/memory tail on every process start; on an unchanged checkout,
+    // startup must stay discover-only and write nothing past any cheap freshness repairs.
+    let _ = startup_catchup_pass(&config);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let Ok(mut notify_watcher) = recommended_watcher(move |res| {
@@ -1066,7 +1157,8 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
 
     // Final pass for edits in the last debounce window — discover only (no embedding), timeout-and-
     // skip. The host may SIGKILL shortly after stdin EOF, so shutdown must be bounded; discover is
-    // fast and keeps structure fresh, and the next session's startup catch-up does the embedding.
+    // fast and keeps structure fresh, and the next content-changing or periodic pass does the
+    // embedding.
     if debounce.fire_at().is_some() {
         let _ = shutdown_discover(&config);
     }
@@ -1077,8 +1169,12 @@ fn shutdown_discover(config: &Config) -> anyhow::Result<bool> {
     let lock_repo = locks::write_lock_repo_id(config);
     match locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SKIP_TIMEOUT)? {
         Some(_lock) => {
-            IndexDatabase::index_discover(config)?;
-            Ok(true)
+            let (db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
+            if content_changed {
+                db.mark_watch_shutdown_reconcile_pending()?;
+                return Ok(true);
+            }
+            Ok(false)
         },
         None => Ok(false),
     }
@@ -1090,7 +1186,11 @@ mod tests {
     use notify::event::{CreateKind, Flag, ModifyKind};
 
     use super::*;
-    use crate::config::{Config, LlmConfig, ResolvedTarget, TargetKind, WatchConfig};
+    use crate::config::{
+        Config, LlmConfig, RemoteBackend, RemoteEmbeddingConfig, ResolvedTarget, TargetKind,
+        WatchConfig,
+    };
+    use crate::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
     use crate::language::Language;
 
     fn mutation_event(path: PathBuf) -> Event {
@@ -1122,6 +1222,53 @@ mod tests {
             memory: Default::default(),
             log: Default::default(),
         }
+    }
+
+    fn ephemeral_remote(query_endpoint: Option<&str>) -> RemoteEmbeddingConfig {
+        RemoteEmbeddingConfig {
+            model: "all-minilm".to_string(),
+            backend: RemoteBackend::Ollama,
+            endpoint: None,
+            cookbook: Some("@rag-rat/cookbook/modal".to_string()),
+            query_endpoint: query_endpoint.map(str::to_string),
+            auth_env: None,
+            gpu: None,
+            num_ctx: None,
+            batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
+            request_timeout_s: 5,
+        }
+    }
+
+    fn activate_ephemeral_model(config: &Config, repo_id: &str, query_endpoint: Option<&str>) {
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        let remote = ephemeral_remote(query_endpoint);
+        let model_spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2, runtime = \
+             'ollama', last_error = NULL
+             WHERE model_id = ?1",
+            rusqlite::params![FASTEMBED_MODEL_ID, i64::try_from(model_spec.dim).unwrap()],
+        )
+        .unwrap();
+        crate::index::set_repo_meta(&conn, repo_id, "active_embedding_model", FASTEMBED_MODEL_ID)
+            .unwrap();
+        crate::index::set_repo_meta(
+            &conn,
+            repo_id,
+            "active_embedding_remote_config",
+            &serde_json::to_string(&remote).unwrap(),
+        )
+        .unwrap();
+        crate::index::set_repo_meta(
+            &conn,
+            repo_id,
+            "embedding_active_model_version",
+            &crate::index::ai::remote_freshness_version(model_spec, &remote),
+        )
+        .unwrap();
     }
 
     #[derive(Debug, Default)]
@@ -1189,6 +1336,292 @@ mod tests {
         watcher.unwatch(Path::new("repo/src")).unwrap();
         assert_eq!(<RecordingWatcher as notify::Watcher>::kind(), notify::WatcherKind::NullWatcher,);
         assert_eq!(watcher.watched.len(), 1);
+    }
+
+    #[test]
+    fn startup_catchup_does_not_force_the_expensive_tail() {
+        assert!(
+            !should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, false),
+            "an unchanged startup catch-up must not run reconcile/gc/memory validation",
+        );
+        assert!(
+            should_run_pass_tail(true, false, STARTUP_CATCHUP_RUN_GC, false, false),
+            "real base content changes still run the maintenance tail",
+        );
+        assert!(
+            should_run_pass_tail(false, true, STARTUP_CATCHUP_RUN_GC, false, false),
+            "linked-worktree overlay changes still run the maintenance tail",
+        );
+        assert!(
+            should_run_pass_tail(false, false, true, false, false),
+            "scheduled GC passes still force the maintenance tail",
+        );
+        assert!(
+            should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, true, false),
+            "a bounded shutdown discover marks base reconcile owed for the next startup pass",
+        );
+        assert!(
+            should_run_pass_tail(false, false, STARTUP_CATCHUP_RUN_GC, false, true),
+            "startup catch-up retries an already-indexed base embedding backlog",
+        );
+    }
+
+    #[test]
+    fn changed_overlay_skips_backlog_probe() {
+        let budget = ReconcileBudget::new(
+            ReconcileOptions::default(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        let needs_embed = overlay_needs_embed(true, Some(&budget), |_| false);
+
+        assert!(needs_embed, "a changed overlay still embeds inline");
+    }
+
+    #[test]
+    fn forced_tail_skips_base_backlog_probe() {
+        let budget = ReconcileBudget::new(
+            ReconcileOptions::default(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        let needs_tail = base_embedding_backlog_needs_tail(true, true, &budget, |_| true);
+
+        assert!(!needs_tail, "another tail trigger already guarantees reconcile");
+    }
+
+    #[test]
+    fn maintenance_pass_or_skip_runs_when_lock_is_available() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("ragrat-watch-maintenance-skip-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn maintenance_target() {}\n").unwrap();
+        let root = root.canonicalize().unwrap();
+        let config = whole_root_config(&root, &[PathBuf::from("src")]);
+
+        assert!(
+            maintenance_pass_or_skip(&config, false).unwrap(),
+            "an available writer lock should run the maintenance pass"
+        );
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert!(
+            db.status(&config.database).unwrap().file_count_by_language.values().sum::<u64>() > 0
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_catchup_retries_existing_base_embedding_backlog() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("ragrat-watch-startup-backlog-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn pending_startup_embedding(input: i32) -> i32 {
+    let doubled = input * 2;
+    let shifted = doubled + 13;
+    shifted + 7
+}
+",
+        )
+        .unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let mut config = whole_root_config(&root, &[PathBuf::from("src")]);
+        config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(HASH_MODEL_ID, None).unwrap();
+        assert!(
+            db.pending_embedding_jobs().unwrap() > 0,
+            "fixture starts with indexed chunks but no embeddings"
+        );
+        drop(db);
+
+        startup_catchup_pass(&config).unwrap();
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert_eq!(
+            db.pending_embedding_jobs().unwrap(),
+            0,
+            "unchanged startup catch-up retried and embedded the existing base backlog"
+        );
+        assert!(
+            db.current_embedding_count(HASH_MODEL_ID).unwrap() > 0,
+            "startup retry wrote hash embeddings"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_catchup_skips_ephemeral_backlog_scan_without_query_endpoint() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("ragrat-watch-ephemeral-backlog-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn pending_ephemeral_startup(input: i32) -> i32 {
+    let doubled = input * 2;
+    let shifted = doubled + 13;
+    shifted + 7
+}
+",
+        )
+        .unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let mut config = whole_root_config(&root, &[PathBuf::from("src")]);
+        config.llm.embedding.backend = FASTEMBED_MODEL_ID.parse().unwrap();
+
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let repo_id = db.active_repo_id.clone();
+        drop(db);
+        activate_ephemeral_model(&config, &repo_id, None);
+
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert!(
+            db.pending_embedding_jobs().unwrap() > 0,
+            "fixture has indexed chunks missing embeddings for the active ephemeral model"
+        );
+        drop(db);
+
+        crate::index::ai::reset_estimated_reconcile_job_calls();
+        startup_catchup_pass(&config).unwrap();
+        assert_eq!(
+            crate::index::ai::estimated_reconcile_job_calls(),
+            0,
+            "startup must not scan chunks before the ephemeral light endpoint is known usable"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_catchup_reconciles_shutdown_discovered_content() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("ragrat-watch-shutdown-reconcile-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn initial_value(input: i32) -> i32 {
+    let doubled = input * 2;
+    let shifted = doubled + 13;
+    shifted + 7
+}
+",
+        )
+        .unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let mut config = whole_root_config(&root, &[PathBuf::from("src")]);
+        config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(HASH_MODEL_ID, None).unwrap();
+        db.reconcile_with_options_progress(ReconcileOptions::default(), |_| {}).unwrap();
+        assert!(
+            db.current_embedding_count(HASH_MODEL_ID).unwrap() > 0,
+            "fixture must produce at least one embeddable chunk"
+        );
+        assert_eq!(db.pending_embedding_jobs().unwrap(), 0, "fixture starts fully reconciled");
+        assert!(
+            !shutdown_discover(&config).unwrap(),
+            "shutdown discover without source edits has no reconcile marker to set"
+        );
+        drop(db);
+
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn changed_value(input: i32) -> i32 {
+    let tripled = input * 3;
+    let shifted = tripled + 21;
+    shifted - 4
+}
+",
+        )
+        .unwrap();
+        assert!(shutdown_discover(&config).unwrap(), "shutdown discover indexed the edit");
+
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert!(
+            db.watch_shutdown_reconcile_pending().unwrap(),
+            "shutdown-discovered content leaves a startup reconcile marker"
+        );
+        assert!(
+            db.pending_embedding_jobs().unwrap() > 0,
+            "the discover-only shutdown pass leaves changed chunks without embeddings"
+        );
+        drop(db);
+
+        maintenance_pass(&config, STARTUP_CATCHUP_RUN_GC).unwrap();
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert!(
+            !db.watch_shutdown_reconcile_pending().unwrap(),
+            "successful startup reconcile clears the shutdown marker"
+        );
+        assert_eq!(
+            db.pending_embedding_jobs().unwrap(),
+            0,
+            "startup catch-up embedded the backlog"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_catchup_keeps_shutdown_marker_when_reconcile_is_blocked() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("ragrat-watch-shutdown-blocked-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn pending_embedding(input: i32) -> i32 {
+    let doubled = input * 2;
+    let shifted = doubled + 13;
+    shifted + 7
+}
+",
+        )
+        .unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let config = whole_root_config(&root, &[PathBuf::from("src")]);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.mark_watch_shutdown_reconcile_pending().unwrap();
+        drop(db);
+
+        maintenance_pass(&config, STARTUP_CATCHUP_RUN_GC).unwrap();
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert!(
+            db.watch_shutdown_reconcile_pending().unwrap(),
+            "a blocked startup reconcile must keep the shutdown marker for a later retry"
+        );
+        assert_eq!(
+            db.pending_embedding_jobs().unwrap(),
+            0,
+            "not-ready models report no pending jobs, so marker clearing must key off status"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2694,6 +3127,24 @@ mod tests {
         false
     }
 
+    /// Drain real-watcher setup noise until the channel stays quiet for `quiet_ms`, capped by
+    /// `max_ms`, so negative placement probes only observe events from the mutation under test.
+    fn drain_until_quiet(
+        rx: &std::sync::mpsc::Receiver<notify::Result<Event>>,
+        quiet_ms: u64,
+        max_ms: u64,
+    ) {
+        let quiet = Duration::from_millis(quiet_ms);
+        let deadline = Instant::now() + Duration::from_millis(max_ms);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(quiet.min(remaining)) {
+                Ok(_) => {},
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
     // Linux/inotify only: this asserts the watch-PLACEMENT optimization (an ignored subtree gets no
     // watch, so its edits are never delivered) — the mitigation for inotify `max_user_watches`
     // exhaustion that motivated #331/#332. inotify places one NON-recursive watch per directory, so
@@ -2715,13 +3166,13 @@ mod tests {
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("ragrat-331ign-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ignored_dir")).unwrap();
-        std::fs::create_dir_all(root.join("kept_dir")).unwrap();
+        std::fs::create_dir_all(root.join("ignored_dir/nested")).unwrap();
+        std::fs::create_dir_all(root.join("kept_dir/nested")).unwrap();
         let root = root.canonicalize().unwrap();
         std::fs::write(root.join(".gitignore"), "ignored_dir/\n").unwrap();
         // Seed a file in each so the dirs exist before the watch is placed.
-        std::fs::write(root.join("ignored_dir/a.rs"), "// a\n").unwrap();
-        std::fs::write(root.join("kept_dir/b.rs"), "// b\n").unwrap();
+        std::fs::write(root.join("ignored_dir/nested/a.rs"), "// a\n").unwrap();
+        std::fs::write(root.join("kept_dir/nested/b.rs"), "// b\n").unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
         let Ok(mut w) = recommended_watcher(move |res| {
@@ -2733,14 +3184,17 @@ mod tests {
         // Place watches exactly as watcher_main does: the gitignore-pruned target subtree.
         let ignore = IgnoreMatcher::compile(&root, &[PathBuf::from(".")]);
         watch_tree_pruned(&mut w, &root, &ignore);
+        drain_until_quiet(&rx, 100, 1000);
 
         // A write inside the gitignored subtree must NOT be delivered (the dir was never watched).
-        std::fs::write(root.join("ignored_dir/a.rs"), "// a edited\n").unwrap();
-        let ignored_seen = drain_until_path_under(&rx, &root.join("ignored_dir"), 2);
+        let ignored_probe = root.join("ignored_dir/nested");
+        std::fs::write(ignored_probe.join("a.rs"), "// a edited\n").unwrap();
+        let ignored_seen = drain_until_path_under(&rx, &ignored_probe, 2);
 
         // A write to a non-ignored sibling under the same target MUST be delivered.
-        std::fs::write(root.join("kept_dir/b.rs"), "// b edited\n").unwrap();
-        let kept_seen = drain_until_path_under(&rx, &root.join("kept_dir"), 3);
+        let kept_probe = root.join("kept_dir/nested");
+        std::fs::write(kept_probe.join("b.rs"), "// b edited\n").unwrap();
+        let kept_seen = drain_until_path_under(&rx, &kept_probe, 3);
 
         drop(w);
         std::fs::remove_dir_all(&root).ok();
@@ -3065,24 +3519,28 @@ mod tests {
         let config = whole_root_config(&root, &target_dirs);
         let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
         watch_tree_pruned(&mut w, &root, &ignore);
+        drain_until_quiet(&rx, 100, 1000);
 
         // Build the moved-in dir with a NESTED `.gitignore` ignoring `ignored_sub/`, plus a kept
         // sibling — all created BEFORE feeding the rename event (so the matcher was stale to them).
         let pkg = root.join("pkg");
-        std::fs::create_dir_all(pkg.join("ignored_sub")).unwrap();
-        std::fs::create_dir_all(pkg.join("kept_sub")).unwrap();
+        std::fs::create_dir_all(pkg.join("ignored_sub/deep")).unwrap();
+        std::fs::create_dir_all(pkg.join("kept_sub/deep")).unwrap();
         std::fs::write(pkg.join(".gitignore"), "ignored_sub/\n").unwrap();
-        std::fs::write(pkg.join("ignored_sub/x.rs"), "// x\n").unwrap();
-        std::fs::write(pkg.join("kept_sub/y.rs"), "// y\n").unwrap();
+        std::fs::write(pkg.join("ignored_sub/deep/x.rs"), "// x\n").unwrap();
+        std::fs::write(pkg.join("kept_sub/deep/y.rs"), "// y\n").unwrap();
         let rename =
             Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(pkg.clone());
         watch_created_dirs(&mut w, &rename, &config, &target_dirs, &mut ignore, None);
+        drain_until_quiet(&rx, 100, 1000);
 
         // The nested-ignored subdir must NOT be watched; the kept sibling MUST be.
-        std::fs::write(pkg.join("ignored_sub/x.rs"), "// x edited\n").unwrap();
-        let ignored_seen = drain_until_path_under(&rx, &pkg.join("ignored_sub"), 2);
-        std::fs::write(pkg.join("kept_sub/y.rs"), "// y edited\n").unwrap();
-        let kept_seen = drain_until_path_under(&rx, &pkg.join("kept_sub"), 3);
+        let ignored_probe = pkg.join("ignored_sub/deep");
+        std::fs::write(ignored_probe.join("x.rs"), "// x edited\n").unwrap();
+        let ignored_seen = drain_until_path_under(&rx, &ignored_probe, 2);
+        let kept_probe = pkg.join("kept_sub/deep");
+        std::fs::write(kept_probe.join("y.rs"), "// y edited\n").unwrap();
+        let kept_seen = drain_until_path_under(&rx, &kept_probe, 3);
 
         drop(w);
         std::fs::remove_dir_all(&root).ok();

@@ -80,9 +80,9 @@ use crate::{data_dir, locks};
 ///  (b) DB-LOCAL STATE — never copied; each entry states why:
 ///      * freshness/progress cursors that would make a fresh 0-row index falsely report itself
 ///        current: `content_revision`, `git_commit`, `git_dirty`, `git_history_indexed_head` /
-///        `_root` / `_shallow`, `github_last_sync_ms`, `graph_index_version`, `indexed_at_ms`,
-///        `vector_int8_reencode_done` / `_cursor`, `last_embedding_reconcile_started_at_ms` /
-///        `_finished_at_ms`;
+///        `_root` / `_shallow` / `_complete`, `github_last_sync_ms`, `graph_index_version`,
+///        `indexed_at_ms`, `vector_int8_reencode_done` / `_cursor`,
+///        `last_embedding_reconcile_started_at_ms` / `_finished_at_ms`;
 ///      * pointers/state owned by THIS database file's lifecycle: `live_files_generation` (absent ⇒
 ///        0 is load-bearing — A6), `clone_graph_live_generation`, `shallow_boundary` (adoption
 ///        proof for the legacy file's own registry), `source_root` (re-recorded by registration);
