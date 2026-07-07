@@ -18,14 +18,22 @@ use common::{git, git_commit, unique_dir};
 
 /// A git fixture repo with one rust file and an EXPLICIT `database` key — the pre-flip `init`
 /// shape — so the initial index builds the LEGACY per-repo `.rag-rat/index.sqlite`.
+///
+/// `model = "none"` (the hash embedder) is DELIBERATE and must stay: it pins the active-model id to
+/// a resolution-independent constant, so no test in this file depends on whether the default
+/// fastembed model resolves to its legacy id or the post-#317 canonical name (network/cache
+/// dependent). Without it `consolidating_a_second_repo_leaves_the_first_repos_heal_owed_meta` was
+/// environment-flaky. The seeded heal-owed witness (a legacy model id set directly in the DB) still
+/// mismatches this `none` config, so the "consolidate must not heal a sibling's meta" assertion is
+/// unchanged — just deterministic offline.
 fn fixture_repo() -> PathBuf {
     let root = unique_dir("repo");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn consolidate_anchor() {}\n").unwrap();
     fs::write(
         root.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
-         [\"src\"]\n",
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[llm.embedding]\nmodel = \
+         \"none\"\n\n[target_bindings]\nrust = [\"src\"]\n",
     )
     .unwrap();
     git(&root, &["init", "-q", "-b", "main"]);
@@ -88,7 +96,8 @@ fn consolidate_refuses_a_pinned_config_then_completes_after_key_removal() {
     // imports and renames atomically — no window in which legacy-side edits can be lost.
     fs::write(
         root.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+        "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \"none\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
     )
     .unwrap();
     let out = run(&root, &data_dir, &model_cache, &["consolidate"]);
@@ -139,8 +148,8 @@ fn consolidate_custom_pin_remedy_moves_then_imports() {
     fs::write(root.join("src/lib.rs"), "pub fn custom_pin_anchor() {}\n").unwrap();
     fs::write(
         root.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \"custom/my-index.sqlite\"\n\n[target_bindings]\nrust \
-         = [\"src\"]\n",
+        "[index]\nroot = \".\"\ndatabase = \"custom/my-index.sqlite\"\n\n[llm.embedding]\nmodel = \
+         \"none\"\n\n[target_bindings]\nrust = [\"src\"]\n",
     )
     .unwrap();
     git(&root, &["init", "-q", "-b", "main"]);
@@ -177,7 +186,8 @@ fn consolidate_custom_pin_remedy_moves_then_imports() {
     fs::rename(&custom, &default_legacy).unwrap();
     fs::write(
         root.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+        "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \"none\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
     )
     .unwrap();
     let out = run(&root, &data_dir, &model_cache, &["consolidate"]);
@@ -214,7 +224,8 @@ fn consolidating_a_second_repo_leaves_the_first_repos_heal_owed_meta() {
     assert!(out.status.success(), "repo1 index: {}", String::from_utf8_lossy(&out.stderr));
     fs::write(
         repo1.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+        "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \"none\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
     )
     .unwrap();
     let out = run(&repo1, &data_dir, &model_cache, &["consolidate"]);
@@ -245,7 +256,8 @@ fn consolidating_a_second_repo_leaves_the_first_repos_heal_owed_meta() {
     assert!(out.status.success(), "repo2 index: {}", String::from_utf8_lossy(&out.stderr));
     fs::write(
         repo2.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+        "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \"none\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
     )
     .unwrap();
     let out = run(&repo2, &data_dir, &model_cache, &["consolidate"]);
@@ -295,7 +307,8 @@ fn consolidate_refuses_a_pin_at_a_missing_path_and_accepts_a_pin_at_global() {
     fs::write(
         root.join("rag-rat.toml"),
         format!(
-            "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+            "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[llm.embedding]\nmodel = \
+             \"none\"\n\n[target_bindings]\nrust = [\"src\"]\n",
             common::toml_path(&global)
         ),
     )
@@ -328,7 +341,8 @@ fn consolidate_drains_a_pre_deepen_writers_legacy_lock() {
     assert!(out.status.success(), "index --full failed: {}", String::from_utf8_lossy(&out.stderr));
     fs::write(
         root.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+        "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \"none\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
     )
     .unwrap();
 
@@ -416,7 +430,8 @@ fn consolidate_migrates_an_old_vintage_source_so_model_meta_arrives() {
 
     fs::write(
         root.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+        "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \"none\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
     )
     .unwrap();
     let out = run(&root, &data_dir, &model_cache, &["consolidate"]);
@@ -468,7 +483,8 @@ fn consolidate_imports_a_lingering_legacy_under_a_pin_at_global() {
     fs::write(
         root.join("rag-rat.toml"),
         format!(
-            "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+            "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[llm.embedding]\nmodel = \
+             \"none\"\n\n[target_bindings]\nrust = [\"src\"]\n",
             common::toml_path(&global)
         ),
     )
@@ -520,7 +536,8 @@ fn consolidate_from_a_linked_worktree_uses_the_main_config_and_legacy() {
     git(&root, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
     fs::write(
         root.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+        "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \"none\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
     )
     .unwrap();
 
