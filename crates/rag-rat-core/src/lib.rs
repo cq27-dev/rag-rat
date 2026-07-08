@@ -1,3 +1,4 @@
+pub(crate) mod canonical;
 pub mod config;
 pub mod data_dir;
 pub mod dream;

@@ -258,21 +258,20 @@ fn queue_reason(
 }
 
 /// The dream freshness key for a memory's NOTE content — the single `content_hash` stamped into
-/// `memory_reality` / `memory_summaries`. Hashes the TRIMMED title AND body, newline-delimited (the
-/// house `memory_input_hash` style — deliberately NOT a bare `title ‖ body` concat, which would let
-/// `"ab"+"c"` and `"a"+"bc"` collide), because BOTH the verdict prompt and the compaction prompt
-/// audit the whole note (TITLE + body). So a title-only edit re-verifies / re-summarizes and drops
-/// the stale verdict / summary / marker exactly as a body edit does. (Kept dream-local rather than
-/// reusing `memory_input_hash`, which also folds kind + tags — dimensions the prompts don't audit —
-/// and reads the frozen-at-creation stored `input_hash`.)
+/// `memory_reality` / `memory_summaries`. It is `sha256(trim(title) + "\n" + trim(body))`, covering
+/// EXACTLY what the verdict and compaction prompts render: the title and body, and nothing else. So
+/// a title / body edit re-verifies / re-summarizes and drops the stale verdict / summary / marker,
+/// while a change to a dimension the prompts don't render (kind, tags, payload) does NOT churn the
+/// derived overlays. It becomes the §5.5 canonical [`content_hash`] (which folds the payload) only
+/// when the prompts start rendering the payload — bundled with a [`PROMPT_VERSION`] bump so that
+/// rollout is backfill-free (a bump re-queues every memory anyway). Distinct from the raw
+/// create-time `memory_input_hash`, which also folds kind + tags (dimensions the prompts don't
+/// audit) and reads the frozen-at-creation stored `input_hash`.
 ///
-/// `pub(crate)` so the surfacing hydrator recomputes it identically to the queue / verdict-pass
+/// [`PROMPT_VERSION`]: super::verdict::PROMPT_VERSION
+///
+/// `pub(crate)` so the surfacing hydrator recomputes it IDENTICALLY to the queue / verdict-pass
 /// stamp.
-/// The dream content-identity key over a memory's CURRENT note (title + body). NOTE (#465): the
-/// polymorphic `payload_json` is NOT folded here yet — the canonical payload fold is deferred to
-/// phase B (#404) with the rest of the §5.5 canonicalization. This is not a live staleness bug: the
-/// derived summary/verdict rows are over title+body, which a payload-only edit does not change, so
-/// they stay correct. (Create-time dedup DOES fold the payload — see `memory_input_hash`.)
 pub(crate) fn note_content_hash(title: &str, body: &str) -> String {
     crate::index::hex_sha256(format!("{}\n{}", title.trim(), body.trim()).as_bytes())
 }

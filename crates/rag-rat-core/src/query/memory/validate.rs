@@ -531,10 +531,21 @@ pub(crate) fn validate_payload(kind: &str, payload_json: Option<&str>) -> anyhow
             "a `{kind}` memory carries no payload (only Task/Concept may have a payload_json)"
         );
     }
-    let value: serde_json::Value = serde_json::from_str(payload)
-        .map_err(|e| anyhow::anyhow!("payload_json is not valid JSON: {e}"))?;
+    // Strict parse: reject a LITERAL duplicate object key (serde_json's default silently keeps the
+    // last, but parsers disagree on which wins → a cross-device hash divergence). Complete for a
+    // caller that passes the RAW payload string (CLI, direct core); the MCP JSON-RPC transport
+    // parses tool args into a `Value` upstream, collapsing dups deterministically before this runs
+    // (harmless among serde_json writers today) — hardening that boundary is #488.
+    let value = crate::canonical::parse_rejecting_duplicate_keys(payload)
+        .map_err(|e| anyhow::anyhow!("payload_json invalid: {e}"))?;
     if !value.is_object() {
         anyhow::bail!("payload_json must be a JSON object");
+    }
+    // Reject on WRITE anything the canonical encoder can't hash (two keys that NFC-normalize to the
+    // same key → an ambiguous dup-key map), so a STORED payload always encodes cleanly and
+    // `content_hash` can treat the canonical encoding as effectively infallible.
+    if let Some(err) = crate::canonical::payload_encoding_error(&value) {
+        anyhow::bail!("payload_json is not canonically encodable: {err}");
     }
     Ok(())
 }
@@ -609,6 +620,73 @@ pub(crate) fn memory_input_hash(
         .as_bytes(),
     )
 }
+/// The canonical, content-addressed identity of a memory's CONTENT (phase B §5.5) — hex SHA-256
+/// over a canonical CBOR array `[domain, payload_schema_version, nfc(trim title), nfc(trim body),
+/// payload]`. `kind` and `tags` are EXCLUDED (a pure reclassification / re-tag must not churn the
+/// content-addressed derived overlays); the payload IS folded, and its self-described
+/// `schema_version` is folded separately, so a payload-schema migration is a deliberate identity
+/// change. Distinct from `memory_input_hash` (the raw create-time dedup/id seed) and NEVER raw
+/// concatenation. A `None` payload folds as CBOR null with `schema_version = 0`.
+// Frozen §5.5 primitive, golden-vector-pinned; first production consumer is the op-log increment
+// (#404).
+#[allow(dead_code)]
+pub(crate) fn content_hash(title: &str, body: &str, payload_json: Option<&str>) -> String {
+    use crate::canonical::nfc;
+    let (schema_version, payload_element) = payload_cbor_element(payload_json);
+    let mut buf = Vec::new();
+    {
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        // §5.5: array([domain, schema_version, trimmed_title_nfc, trimmed_body_nfc, payload]).
+        // These fixed ops write to a `Vec`, so they are infallible.
+        enc.array(5).expect("cbor to a Vec is infallible");
+        enc.str("rag-rat/content-hash/1").expect("cbor to a Vec is infallible");
+        enc.u64(schema_version).expect("cbor to a Vec is infallible");
+        enc.str(&nfc(title.trim())).expect("cbor to a Vec is infallible");
+        enc.str(&nfc(body.trim())).expect("cbor to a Vec is infallible");
+    }
+    // Append the pre-encoded payload as the 5th array element (one CBOR item either way).
+    buf.extend_from_slice(&payload_element);
+    hex_sha256(&buf)
+}
+
+/// The `(schema_version, pre-encoded payload CBOR)` for `content_hash`. A payload folds as
+/// CANONICAL CBOR only when it parses with NO duplicate key (`serde_json` silently keeps the last
+/// of a LITERAL dup — parser-dependent — so we parse strictly) AND encodes with no NFC-duplicate
+/// key; otherwise — invalid JSON, a literal-dup, or an NFC-dup, all of which `validate_payload`
+/// rejects on write, so only a legacy / out-of-band payload reaches here — its RAW bytes fold as a
+/// CBOR byte string (a distinct major type, so it can't collide with a structured payload). This
+/// keeps `content_hash` TOTAL, DETERMINISTIC, and PARSER-INDEPENDENT: it runs on every memory in
+/// the dream pass and must never panic, and both duplicate-key kinds must hash identically across
+/// devices.
+fn payload_cbor_element(payload_json: Option<&str>) -> (u64, Vec<u8>) {
+    use crate::canonical::{encode_canonical_json, parse_rejecting_duplicate_keys};
+    let Some(raw) = payload_json else {
+        let mut buf = Vec::new();
+        minicbor::Encoder::new(&mut buf).null().expect("cbor to a Vec is infallible");
+        return (0, buf);
+    };
+    // A payload folds structurally ONLY when it is a JSON OBJECT (what `validate_payload` accepts)
+    // AND encodes canonically. A non-object (`null`, a scalar, an array) is rejected on write just
+    // like a dup-key / invalid one, so — crucially — it must NOT fold as structured CBOR: a text
+    // payload of `"null"` would encode to the SAME CBOR-null element as `None`, colliding a
+    // no-payload memory with a `null`-payload one and never invalidating overlays.
+    if let Ok(value) = parse_rejecting_duplicate_keys(raw)
+        && value.is_object()
+    {
+        let mut buf = Vec::new();
+        if encode_canonical_json(&value, &mut minicbor::Encoder::new(&mut buf)).is_ok() {
+            let version =
+                value.get("schema_version").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            return (version, buf);
+        }
+    }
+    // Legacy / out-of-band non-canonical payload (non-object, literal-dup, NFC-dup, or invalid
+    // JSON).
+    let mut buf = Vec::new();
+    minicbor::Encoder::new(&mut buf).bytes(raw.as_bytes()).expect("cbor to a Vec is infallible");
+    (0, buf)
+}
+
 pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let hash = Sha256::digest(bytes);
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -626,4 +704,111 @@ pub(crate) fn fts_query(query: &str) -> String {
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>();
     terms.join(" OR ")
+}
+
+#[cfg(test)]
+mod content_hash_tests {
+    use super::content_hash;
+
+    #[test]
+    fn folds_payload_and_schema_version() {
+        let base = content_hash("t", "b", None);
+        assert_ne!(base, content_hash("t", "b", Some(r#"{"schema_version":1,"x":1}"#)));
+        // A payload VALUE change changes the hash.
+        assert_ne!(
+            content_hash("t", "b", Some(r#"{"schema_version":1,"x":1}"#)),
+            content_hash("t", "b", Some(r#"{"schema_version":1,"x":2}"#)),
+        );
+        // A schema_version bump is a DELIBERATE identity change (§5.5), even with identical fields.
+        assert_ne!(
+            content_hash("t", "b", Some(r#"{"schema_version":1,"x":1}"#)),
+            content_hash("t", "b", Some(r#"{"schema_version":2,"x":1}"#)),
+        );
+    }
+
+    #[test]
+    fn payload_is_canonicalized_key_order_and_whitespace_dont_matter() {
+        assert_eq!(
+            content_hash("t", "b", Some(r#"{"a":1,"b":2}"#)),
+            content_hash("t", "b", Some(r#"{ "b": 2, "a": 1 }"#)),
+        );
+    }
+
+    #[test]
+    fn title_body_are_trimmed_and_nfc_normalized() {
+        assert_eq!(content_hash("t", "b", None), content_hash("  t  ", "\nb\t", None));
+        // é precomposed (U+00E9) vs e + combining acute (U+0065 U+0301).
+        assert_eq!(content_hash("caf\u{00e9}", "b", None), content_hash("cafe\u{0301}", "b", None),);
+    }
+
+    #[test]
+    fn no_payload_differs_from_empty_object() {
+        // `None` (CBOR null) is a distinct identity from an empty-object payload `{}`.
+        assert_ne!(content_hash("t", "b", None), content_hash("t", "b", Some("{}")));
+    }
+
+    #[test]
+    fn non_object_legacy_payload_does_not_collide_with_none() {
+        // A non-object text payload (`"null"`, a scalar) folds as raw BYTES, not structured CBOR —
+        // else `"null"` would encode to the same CBOR-null element as `None` and collide.
+        assert_ne!(content_hash("t", "b", Some("null")), content_hash("t", "b", None));
+        assert_ne!(content_hash("t", "b", Some("42")), content_hash("t", "b", None));
+    }
+
+    #[test]
+    fn validate_rejects_non_integer_number_payloads() {
+        // A float can't be a reliable content-hash input (binary64 collapse) — rejected on write.
+        let err = super::validate_payload("Task", Some(r#"{"score":0.85}"#)).unwrap_err();
+        assert!(err.to_string().contains("canonically encodable"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_nfc_duplicate_payload_keys() {
+        // A payload with "café" precomposed AND decomposed collapses to one NFC key on write —
+        // rejected so `content_hash` never sees an ambiguous dup-key map.
+        let dup = "{\"caf\u{00e9}\":1,\"cafe\u{0301}\":2}";
+        let err = super::validate_payload("Task", Some(dup)).unwrap_err();
+        assert!(err.to_string().contains("canonically encodable"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_literal_duplicate_payload_keys() {
+        // serde_json would silently keep the last; reject so the cross-device hash is well-defined.
+        let err = super::validate_payload("Task", Some(r#"{"a":1,"a":2}"#)).unwrap_err();
+        assert!(err.to_string().contains("duplicate object key"), "{err}");
+        // Nested duplicates are caught at any depth.
+        let nested = super::validate_payload("Task", Some(r#"{"x":{"a":1,"a":2}}"#)).unwrap_err();
+        assert!(nested.to_string().contains("duplicate object key"), "{nested}");
+    }
+
+    #[test]
+    fn legacy_dup_key_payloads_hash_as_raw_bytes() {
+        // A dup-key payload can't be created (validate rejects it), but a legacy / out-of-band one
+        // must NOT crash the dream pass. BOTH dup kinds — NFC-normalized and LITERAL — fold the raw
+        // bytes: total, deterministic, and PARSER-INDEPENDENT.
+        let nfc_dup = "{\"caf\u{00e9}\":1,\"cafe\u{0301}\":2}";
+        let literal_dup = r#"{"a":1,"a":2}"#;
+        for dup in [nfc_dup, literal_dup] {
+            let h = content_hash("t", "b", Some(dup));
+            assert_eq!(h, content_hash("t", "b", Some(dup)), "deterministic fallback");
+            assert_eq!(h.len(), 64, "still a sha-256 hex digest");
+        }
+        // A literal-dup must NOT collapse to serde's silent last-wins interpretation.
+        assert_ne!(
+            content_hash("t", "b", Some(literal_dup)),
+            content_hash("t", "b", Some(r#"{"a":2}"#)),
+            "raw-bytes fold is distinct from serde last-wins",
+        );
+    }
+
+    #[test]
+    fn golden_vector_pins_the_canonical_rule() {
+        // A stored dream freshness hash is content-addressed on this exact encoding — pin it so any
+        // change to the §5.5 canonical rule (which would silently re-derive every dream overlay) is
+        // caught and the domain tag `rag-rat/content-hash/1` bumped deliberately.
+        assert_eq!(
+            content_hash("title", "body", Some(r#"{"schema_version":1,"status":"todo"}"#)),
+            "5a07a01d8bc81c1dc9a80a2ea8707fc9d3f3bcfac5a6c31761deb3d2be2107b2"
+        );
+    }
 }

@@ -48,6 +48,8 @@ tree-sitter-kotlin.workspace = true
 tree-sitter-python.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
+minicbor = { version = "2.2.2", features = ["alloc"] }
+unicode-normalization = "0.1.25"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
