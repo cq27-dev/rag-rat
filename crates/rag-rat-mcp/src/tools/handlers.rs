@@ -7,6 +7,13 @@ pub(crate) fn call_tool_with_db(
     graded_history: bool,
     memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
+    // A JSON-RPC `tools/call` with the `arguments` object OMITTED reaches here as `Value::Null`
+    // (server.rs maps `None` → Null). `serde_json::from_value` of Null into an all-optional arg
+    // struct (e.g. `DreamArgs`) fails ("invalid type: null") BEFORE serde field defaults apply, so
+    // a bare no-arg call like `dream` would error. Normalize an absent/null argument object to
+    // an empty object so every tool's field defaults apply; a tool with REQUIRED fields still
+    // errors with a precise "missing field" message rather than a confusing type error (#514).
+    let arguments = if arguments.is_null() { json!({}) } else { arguments };
     let result = match name {
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;

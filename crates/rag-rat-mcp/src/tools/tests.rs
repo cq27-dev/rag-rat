@@ -632,6 +632,27 @@ fn mcp_dream_surfaces_a_finding_and_review_applies_a_verdict() {
 }
 
 #[test]
+fn mcp_dream_defaults_when_arguments_are_omitted() {
+    // #514: a JSON-RPC tools/call with the `arguments` object OMITTED reaches the dispatcher as
+    // Value::Null (server maps None -> Null). A bare `dream` call — all schema fields optional —
+    // must still apply its `limit`/`all` defaults, not error deserializing Null into DreamArgs.
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = rust_config(root.clone());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    drop(db);
+
+    let report = call_tool(&config.database, "dream", json!(null)).unwrap();
+    assert!(
+        report["findings"].is_array(),
+        "a bare `dream` call (omitted arguments) returns a worklist: {report}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn mcp_read_chunk_and_heal_index_do_not_return_stale_text() {
     let (root, config) = markdown_config("# Title\nalpha token\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
