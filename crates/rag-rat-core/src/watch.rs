@@ -201,6 +201,9 @@ fn run_pass(
     // content change runs the full tail immediately. Startup has two discover-only exceptions:
     // a prior bounded shutdown discover that marked base reconcile owed, and an already-indexed
     // base embedding backlog left by a time-capped or blocked prior pass.
+    // A pass with no content/overlay change is the quiet moment WAL hygiene waits for (#482) —
+    // whether or not something else (gc, a backlog, the clone gate) still forces the tail below.
+    let quiet_pass = !content_changed && !overlays_changed;
     if !should_run_pass_tail(
         content_changed,
         overlays_changed,
@@ -209,6 +212,7 @@ fn run_pass(
         base_embedding_backlog,
         clone_graph_due,
     ) {
+        maybe_checkpoint_wal(&db, quiet_pass, crate::index::WAL_CHECKPOINT_MIN_BYTES);
         return Ok(());
     }
     // The base reconcile gets only the budget the overlays left behind; `None` → already exhausted,
@@ -245,7 +249,34 @@ fn run_pass(
     if shutdown_reconcile_pending && base_reconcile_status.as_deref() == Some("Current") {
         db.clear_watch_shutdown_reconcile_pending()?;
     }
+    maybe_checkpoint_wal(&db, quiet_pass, crate::index::WAL_CHECKPOINT_MIN_BYTES);
     Ok(())
+}
+
+/// Opportunistic WAL hygiene (#482), on QUIET passes only: nothing else truncates the shared
+/// database's `-wal`, so it keeps its high-water mark forever without this. During sustained
+/// editing every pass has content changes, so the truncate — which waits on concurrent readers up
+/// to the busy timeout — defers exactly like the clone-graph rebuild and lands once churn pauses.
+/// Under `min_bytes` the probe is a bare stat of the sidecar, free on idle passes. Best-effort: a
+/// busy or failed checkpoint just rides the next quiet pass, and never fails the pass itself.
+fn maybe_checkpoint_wal(db: &IndexDatabase, quiet_pass: bool, min_bytes: u64) {
+    if !quiet_pass {
+        return;
+    }
+    match db.checkpoint_wal_if_oversized(min_bytes) {
+        Ok(report) if report.attempted => {
+            tracing::debug!(
+                target: "rag_rat_core::watch",
+                wal_bytes_before = report.wal_bytes_before,
+                truncated = report.truncated,
+                "wal checkpoint attempted"
+            );
+        },
+        Ok(_) => {},
+        Err(err) => {
+            tracing::debug!(target: "rag_rat_core::watch", error = %err, "wal checkpoint failed");
+        },
+    }
 }
 
 fn should_run_pass_tail(
@@ -1705,6 +1736,43 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wal_checkpoint_runs_on_quiet_passes_only() {
+        // #482: the TRUNCATE checkpoint waits on concurrent readers up to the busy timeout, so a
+        // churn pass (content changed) must never attempt it; it lands on the first quiet pass
+        // after editing pauses — the same deferral posture as the clone-graph rebuild.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("ragrat-watch-wal-checkpoint-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn wal_probe() -> i32 { 1 }\n").unwrap();
+        let config = whole_root_config(&root, &[PathBuf::from("src")]);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // Put frames in the WAL so there is something to truncate (any meta write serves).
+        db.mark_watch_shutdown_reconcile_pending().unwrap();
+        db.clear_watch_shutdown_reconcile_pending().unwrap();
+        assert!(db.database_file_health().unwrap().wal_bytes > 0);
+
+        maybe_checkpoint_wal(&db, false, 1);
+        assert!(
+            db.database_file_health().unwrap().wal_bytes > 0,
+            "a churn pass must leave the WAL alone"
+        );
+
+        maybe_checkpoint_wal(&db, true, 1);
+        assert_eq!(
+            db.database_file_health().unwrap().wal_bytes,
+            0,
+            "a quiet pass truncates the oversized WAL"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

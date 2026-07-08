@@ -206,7 +206,7 @@ pub(crate) fn run_watch(config: Config) -> anyhow::Result<()> {
 
 pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
     let schema = IndexDatabase::migration_check(&config.database)?;
-    let (index, discovery, storage, clone_fingerprints) =
+    let (index, discovery, storage, clone_fingerprints, file_health) =
         if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
             let db = IndexDatabase::open_config(config)?;
             let mut index_status = serde_json::to_value(db.status(&config.database)?)?;
@@ -221,15 +221,17 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
                 Some(serde_json::to_value(db.discovery_status(config)?)?),
                 Some(serde_json::to_value(db.storage_status()?)?),
                 Some(serde_json::to_value(db.clone_fingerprint_health()?)?),
+                Some(serde_json::to_value(db.database_file_health()?)?),
             )
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
     print_output(&serde_json::json!({
         "config_root": config.root,
         "database": config.database,
         "schema": schema,
         "storage": storage,
+        "file_health": file_health,
         "discovery": discovery,
         "clone_fingerprints": clone_fingerprints,
         "targets": config.targets.iter().map(|target| serde_json::json!({

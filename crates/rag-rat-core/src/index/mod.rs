@@ -62,8 +62,9 @@ pub use query_api::{
     CLONE_DELTA_MAX_FILES, CandidateCloneClass, CloneCheckInput, CloneCompleteness,
     CloneDeltaReport, CloneEdgeReport, CloneEligibility, CloneFingerprintHealth,
     CloneIneligibilityReason, CloneMember, CloneSymbolSelector, ClonesForSymbolResult,
-    FindClonesOptions, FindClonesResult, GcReport, ImportantSymbolsRequest, OracleShaSnapshots,
-    RoiFactors, SearchRequest, TextCloneMatch,
+    DatabaseFileHealth, FindClonesOptions, FindClonesResult, GcReport, ImportantSymbolsRequest,
+    OracleShaSnapshots, RoiFactors, SearchRequest, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES,
+    WalCheckpointReport,
 };
 pub(crate) use util::*;
 

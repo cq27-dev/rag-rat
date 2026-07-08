@@ -8,6 +8,7 @@ use crate::search::lexical::SearchOptions;
 
 mod ai_lifecycle;
 mod clones;
+mod db_file_health;
 mod dream;
 mod gc;
 mod graph;
@@ -31,6 +32,7 @@ pub use clones::{
 };
 #[cfg(test)]
 pub(crate) use clones::{MAX_MEMBERS, MEMBER_VALUE_CAP};
+pub use db_file_health::{DatabaseFileHealth, WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport};
 pub use gc::GcReport;
 pub use importance::ImportantSymbolsRequest;
 pub use oracle_runs::OracleShaSnapshots;
