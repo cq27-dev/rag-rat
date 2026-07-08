@@ -29,17 +29,22 @@ pub(crate) struct LocalDevice {
 }
 
 impl LocalDevice {
-    /// The signing capability — the authoring seam signs entry bodies with this.
-    pub(crate) fn secret(&self) -> &DeviceSecret {
+    /// The signing capability — the authoring seam signs entry bodies with this. `pub(super)`: the
+    /// secret (and `DeviceSecret` itself) stay oplog-internal; the store's authoring path is the
+    /// only caller. Cross-module callers author under a whole `&LocalDevice`, never the raw secret.
+    pub(super) fn secret(&self) -> &DeviceSecret {
         &self.secret
     }
 
-    /// The verifying key (for a local self-verify or to hand a peer).
-    pub(crate) fn public(&self) -> DevicePublic {
+    /// The verifying key (for a local self-verify). `pub(super)` to match `DevicePublic`'s
+    /// oplog-internal visibility.
+    pub(super) fn public(&self) -> DevicePublic {
         self.public
     }
 
-    /// The opaque device fingerprint the op model + signed entry body carry.
+    /// The opaque device fingerprint the op model + signed entry body carry. `pub(crate)` — the
+    /// authoring seam in `query::memory` passes it to `chain_tail`; `DeviceFingerprint` is likewise
+    /// crate-visible.
     pub(crate) fn fingerprint(&self) -> DeviceFingerprint {
         self.fingerprint
     }

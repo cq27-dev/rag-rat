@@ -23,9 +23,10 @@ use serde::{Deserialize, Serialize};
 
 use super::device::DevicePublic;
 use super::entry::{self, VerifiedEntry};
+use super::identity::LocalDevice;
 use super::op::{
-    self, DecodedOp, DeviceFingerprint, EdgeKey, EdgeSpec, Entry, NodeContent, NodeId, NodeStatus,
-    OpMeta, ResolvedAnchor,
+    self, DecodedOp, DeviceFingerprint, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId,
+    NodeStatus, OpMeta, ResolvedAnchor,
 };
 use super::project::{self, ProjectedEdge, ProjectedNode, ProjectedState};
 use super::stream::StreamId;
@@ -150,17 +151,128 @@ pub(crate) fn append(
     }
 
     insert_entry(&tx, &verified, lamport, signed_bytes, now_ms)?;
-    match stored_projector_version(&tx)? {
-        // The projection is already current: only the appended stream's fold moved.
-        Some(version) if version == PROJECTOR_VERSION => reproject(&tx, stream)?,
-        // An older (or missing) stamp means every OTHER stream's fold is stale too, and the
-        // store-global stamp written below would mark them all current — so this append must
-        // sweep every stream, not just its own, or a quiet stream keeps its stale rows forever.
-        _ => reproject_all_streams(&tx)?,
-    }
+    reproject_after_write(&tx, stream)?;
     stamp_projector_version(&tx)?;
     tx.commit()?;
     Ok(AppendOutcome::Appended { entry_hash: verified.entry_hash })
+}
+
+/// Re-fold after a write, then the caller stamps: only the touched `stream` when the projector
+/// stamp is already current, else EVERY stream. An older (or missing) stamp means every OTHER
+/// stream's fold is stale too, and the store-global stamp written next would mark them all current
+/// — so the write must sweep every stream, not just its own, or a quiet stream keeps its stale rows
+/// forever. Shared by [`append`] and the authoring path.
+fn reproject_after_write(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<()> {
+    match stored_projector_version(tx)? {
+        Some(version) if version == PROJECTOR_VERSION => reproject(tx, stream)?,
+        _ => reproject_all_streams(tx)?,
+    }
+    Ok(())
+}
+
+/// Author one NEW entry on `stream` WITHIN a caller-provided transaction: allocate the next Lamport
+/// from the local chain tail, sign, insert, and re-fold the projection — but neither open nor
+/// commit the txn. This is the seam a live memory mutation uses to make its row write and this
+/// op-append ONE atomic unit: it cannot call the self-transacting [`author_op`] from inside its own
+/// `IMMEDIATE` txn (SQLite has no nested transactions), and splitting them across two txns leaves a
+/// crash window where only one side commits. Genesis when the chain is empty. Unlike [`append`]
+/// (which accepts a foreign, pre-signed entry and may Fork), this MINTS a valid continuation from
+/// the tail it just read, so under the single local writer it is always continuous. Returns the new
+/// `entry_hash`.
+pub(crate) fn author_in_tx(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device: &LocalDevice,
+    op: &MemoryOp,
+    now_ms: i64,
+) -> anyhow::Result<[u8; 32]> {
+    assert_projector_not_newer(tx)?;
+    let entry_hash = author_one(tx, stream, device, op, now_ms)?;
+    reproject_after_write(tx, stream)?;
+    stamp_projector_version(tx)?;
+    Ok(entry_hash)
+}
+
+/// Author one entry in its OWN `IMMEDIATE` txn — the standalone wrapper over [`author_in_tx`] for a
+/// caller that is NOT already inside a transaction (the op-append is the whole unit of work).
+pub(crate) fn author_op(
+    conn: &Connection,
+    stream: StreamId,
+    device: &LocalDevice,
+    op: &MemoryOp,
+    now_ms: i64,
+) -> anyhow::Result<[u8; 32]> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let entry_hash = author_in_tx(&tx, stream, device, op, now_ms)?;
+    tx.commit()?;
+    Ok(entry_hash)
+}
+
+/// Author `ops` as the GENESIS batch of `stream` WITHIN a caller-provided txn — gate on an empty
+/// chain, then chain every entry from genesis with a SINGLE projection re-fold at the end, but
+/// NEITHER open NOR commit. The empty-chain gate lives INSIDE the txn (the caller's), so two
+/// concurrent first-authoring callers converge: the winner authors genesis→N, and the loser —
+/// serialized behind the winner's write — sees a non-empty chain and no-ops. Returns whether it
+/// authored (`false` = a chain already existed). The backfill opens its OWN `IMMEDIATE` txn, reads
+/// the memory snapshot UNDER that write lock, and calls this so the snapshot read + gate + write
+/// are one atomic unit (no memory created between the read and the batch is lost from the history).
+pub(crate) fn author_genesis_in_tx(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device: &LocalDevice,
+    ops: &[MemoryOp],
+    now_ms: i64,
+) -> anyhow::Result<bool> {
+    assert_projector_not_newer(tx)?;
+    if chain_tail(tx, stream, device.fingerprint())?.is_some() {
+        return Ok(false);
+    }
+    for op in ops {
+        // The tail read sees prior in-txn inserts, so each op chains off the one before it.
+        author_one(tx, stream, device, op, now_ms)?;
+    }
+    reproject_after_write(tx, stream)?;
+    stamp_projector_version(tx)?;
+    Ok(true)
+}
+
+/// [`author_genesis_in_tx`] in its OWN `IMMEDIATE` txn — the standalone wrapper for a caller that
+/// does not need to read a snapshot under the same write lock. Empty `ops` is a no-op.
+pub(crate) fn author_batch(
+    conn: &Connection,
+    stream: StreamId,
+    device: &LocalDevice,
+    ops: &[MemoryOp],
+    now_ms: i64,
+) -> anyhow::Result<bool> {
+    if ops.is_empty() {
+        return Ok(false);
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let authored = author_genesis_in_tx(&tx, stream, device, ops, now_ms)?;
+    tx.commit()?;
+    Ok(authored)
+}
+
+/// Read the `(stream, device)` tail, mint the next entry for `op` (genesis when the chain is
+/// empty), and INSERT it — no projection (the caller re-folds once). MUST run inside a txn so the
+/// tail read sees prior in-txn inserts, which is what lets [`author_batch`] chain a whole sequence.
+fn author_one(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device: &LocalDevice,
+    op: &MemoryOp,
+    now_ms: i64,
+) -> anyhow::Result<[u8; 32]> {
+    let (lamport, prev_hash) = match chain_tail(tx, stream, device.fingerprint())? {
+        Some(tail) => (tail.lamport + 1, Some(tail.entry_hash)),
+        None => (0, None),
+    };
+    let signed = entry::sign_entry(device.secret(), stream, prev_hash, lamport, op);
+    let lamport = i64::try_from(lamport)
+        .map_err(|_| anyhow::anyhow!("op-log lamport {lamport} exceeds i64"))?;
+    insert_entry(tx, &signed.entry, lamport, &signed.signed_bytes, now_ms)?;
+    Ok(signed.entry.entry_hash)
 }
 
 /// Where an incoming entry sits relative to a device's stored chain.
@@ -820,6 +932,82 @@ mod tests {
         let projected = load_projection(&conn, stream_a()).unwrap();
         assert_eq!(projected.nodes.len(), 3);
         assert!(projected.nodes.contains_key(&NodeId::from("mem_a")));
+    }
+
+    #[test]
+    fn author_op_mints_a_genesis_chain_and_projects() {
+        let conn = db();
+        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        // The FIRST authored op is genesis (lamport 0), each next advances by one — the allocator
+        // reads the tail, unlike `append` which is fed a caller-chosen lamport.
+        let h0 = author_op(&conn, stream_a(), &device, &create("mem_a", "first"), 1_000).unwrap();
+        let h1 = author_op(&conn, stream_a(), &device, &create("mem_b", "second"), 1_001).unwrap();
+        let h2 = author_op(&conn, stream_a(), &device, &create("mem_c", "third"), 1_002).unwrap();
+        assert_ne!(h0, h1, "each authored entry is distinct");
+        let tail = chain_tail(&conn, stream_a(), device.fingerprint()).unwrap().unwrap();
+        assert_eq!(tail.lamport, 2, "three authored ops occupy lamports 0,1,2");
+        assert_eq!(tail.entry_hash, h2);
+        assert_eq!(entry_count(&conn), 3);
+        let projected = load_projection(&conn, stream_a()).unwrap();
+        assert_eq!(projected.nodes.len(), 3);
+        assert!(projected.nodes.contains_key(&NodeId::from("mem_a")));
+    }
+
+    #[test]
+    fn author_in_tx_commits_atomically_with_a_caller_write() {
+        let conn = db();
+        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        // A live mutation: a table write and the op-append share ONE caller-owned txn.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        tx.execute("CREATE TABLE probe(x INTEGER)", []).unwrap();
+        tx.execute("INSERT INTO probe(x) VALUES (1)", []).unwrap();
+        author_in_tx(&tx, stream_a(), &device, &create("mem_a", "first"), 1_000).unwrap();
+        tx.commit().unwrap();
+        // Both sides landed under the one commit.
+        assert_eq!(entry_count(&conn), 1);
+        assert_eq!(load_projection(&conn, stream_a()).unwrap().nodes.len(), 1);
+    }
+
+    #[test]
+    fn author_in_tx_rolls_back_with_the_caller_transaction() {
+        let conn = db();
+        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_in_tx(&tx, stream_a(), &device, &create("mem_a", "first"), 1_000).unwrap();
+        drop(tx); // roll back the caller's txn
+        assert_eq!(entry_count(&conn), 0, "the authored entry rolls back with the caller's txn");
+    }
+
+    #[test]
+    fn author_batch_writes_one_atomic_chain_and_an_empty_batch_is_a_noop() {
+        let conn = db();
+        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        let authored = author_batch(&conn, stream_a(), &device, &[], 1_000).unwrap();
+        assert!(!authored, "an empty batch authors nothing");
+        assert_eq!(entry_count(&conn), 0);
+
+        let ops = [create("mem_a", "a"), create("mem_b", "b"), create("mem_c", "c")];
+        assert!(
+            author_batch(&conn, stream_a(), &device, &ops, 2_000).unwrap(),
+            "the genesis batch authored"
+        );
+        let tail = chain_tail(&conn, stream_a(), device.fingerprint()).unwrap().unwrap();
+        assert_eq!(tail.lamport, 2, "the batch chained lamports 0,1,2 in one txn");
+        assert_eq!(entry_count(&conn), 3);
+        assert_eq!(load_projection(&conn, stream_a()).unwrap().nodes.len(), 3);
+    }
+
+    #[test]
+    fn author_batch_no_ops_on_a_nonempty_chain() {
+        let conn = db();
+        let device = crate::oplog::local_device(&conn, 0).unwrap();
+        author_op(&conn, stream_a(), &device, &create("mem_a", "genesis"), 1_000).unwrap();
+        // author_batch is a GENESIS gate: on an already-non-empty chain it no-ops (returns false)
+        // rather than appending — that atomic gate is the backfill's idempotency guarantee.
+        let authored =
+            author_batch(&conn, stream_a(), &device, &[create("mem_b", "b")], 2_000).unwrap();
+        assert!(!authored, "a genesis batch no-ops on a non-empty chain");
+        assert_eq!(entry_count(&conn), 1, "the non-empty chain is left untouched");
     }
 
     #[test]

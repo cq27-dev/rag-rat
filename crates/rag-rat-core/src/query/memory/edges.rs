@@ -226,11 +226,47 @@ pub(crate) fn remove_edge(conn: &Connection, edge_key: &str) -> anyhow::Result<b
 
 /// Every edge OUT of `source_node_id` (its outgoing graph — deps, mind-map links, tracks).
 pub(crate) fn edges_from(conn: &Connection, source_node_id: &str) -> anyhow::Result<Vec<NodeEdge>> {
+    edges_from_source(conn, source_node_id, SourceScope::LiveOnly)
+}
+
+/// Every edge FROM `source_node_id`, INCLUDING those whose source memory is `obsolete`/`rejected` —
+/// the complete-history read the op-log backfill needs. It is exactly [`edges_from`] MINUS the
+/// `LIVE_SOURCE_PREDICATE` (a non-live source's edges stay visible); it KEEPS `reresolve_on_read`,
+/// so a node target's `target_repo_id` is repaired to CURRENT before it is signed into the op-log
+/// `EdgeSpec` (the stored column is only an add-time snapshot — stale after a repo-id re-point or
+/// if the target was `unresolved` at add time, and a signed op cannot be corrected later).
+/// `edge_key` itself folds node ids, not repo ids, so it is stable regardless.
+pub(crate) fn all_edges_from(
+    conn: &Connection,
+    source_node_id: &str,
+) -> anyhow::Result<Vec<NodeEdge>> {
+    edges_from_source(conn, source_node_id, SourceScope::All)
+}
+
+/// Whether an outgoing-edge read is filtered to a LIVE source (the recall surface) or spans EVERY
+/// source regardless of its memory's status (the complete-history backfill).
+enum SourceScope {
+    LiveOnly,
+    All,
+}
+
+/// Shared body of [`edges_from`] / [`all_edges_from`]: the only difference is whether the
+/// `LIVE_SOURCE_PREDICATE` is applied. Both are owner-scoped and both re-resolve node targets on
+/// read.
+fn edges_from_source(
+    conn: &Connection,
+    source_node_id: &str,
+    scope_kind: SourceScope,
+) -> anyhow::Result<Vec<NodeEdge>> {
     let scope = memory_repo_scope(conn)?;
     let repo_clause = periphery_edge_scope_clause(&scope);
+    let live_clause = match scope_kind {
+        SourceScope::LiveOnly => LIVE_SOURCE_PREDICATE,
+        SourceScope::All => "",
+    };
     let mut stmt = conn.prepare(&format!(
-        "{EDGE_SELECT} WHERE source_node_id = ?1{repo_clause}{LIVE_SOURCE_PREDICATE} ORDER BY \
-         relation, target_anchor"
+        "{EDGE_SELECT} WHERE source_node_id = ?1{repo_clause}{live_clause} ORDER BY relation, \
+         target_anchor"
     ))?;
     let rows = stmt.query_map([source_node_id], edge_row)?.collect::<rusqlite::Result<_>>()?;
     reresolve_on_read(conn, rows)

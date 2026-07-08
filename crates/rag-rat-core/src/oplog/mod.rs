@@ -40,3 +40,19 @@ mod op;
 mod project;
 mod store;
 mod stream;
+
+// The op-log's first crate-internal API surface (#524): the MINTING primitives + the op vocabulary
+// the memory subsystem needs to author + backfill entries. Every submodule above is otherwise
+// private, so this curated re-export is the ONE seam `query::memory` reaches through — and the only
+// direction of the dependency (`oplog` never depends back on `query::memory`).
+pub(crate) use identity::local_device;
+pub(crate) use op::{EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
+// The rest of the minting API completes the frozen surface but is unconsumed until the
+// live-wiring increment: `author_in_tx` / `author_op` mint ONE op (composed into a mutation
+// txn, or standalone), and `author_batch` is the standalone genesis-batch wrapper (the
+// backfill instead drives `author_genesis_in_tx` inside the txn it opens to snapshot memories
+// atomically).
+#[allow(unused_imports)]
+pub(crate) use store::{author_batch, author_in_tx, author_op};
+pub(crate) use store::{author_genesis_in_tx, chain_tail};
+pub(crate) use stream::owner_stream;
