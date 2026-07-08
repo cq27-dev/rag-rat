@@ -21,8 +21,12 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use super::THETA;
+// The current-df bag load stays test-only here: production build passes read the pinned epoch.
+#[cfg(test)]
+use super::substrate::load_scoped_baseline_bags;
 use super::substrate::{
-    SymbolBag, load_scoped_baseline_bags, overlap, sub_block_tokens, verified_clone,
+    SymbolBag, load_clone_df_epoch, load_scoped_baseline_bags_with_df, overlap, sub_block_tokens,
+    verified_clone,
 };
 use crate::index::IndexDatabase;
 use crate::index::clones::NORM_VERSION;
@@ -175,7 +179,12 @@ impl IndexDatabase {
             // A live generation built before postings existed (`postings_written = 0`) is pending
             // so one rebuild pass fills `clone_subblock_postings` — else an upgraded DB with an
             // already-Complete clone graph would keep an empty postings table forever (review R2).
-            || !live.postings_written)
+            || !live.postings_written
+            // Same self-heal contract for the df epoch (#479, the R2 shape): a Complete
+            // generation without its `clone_df_epoch` rows (the V051 backfill's empty-df edge, a
+            // torn epoch) is unservable by the fast path and the delta — it must read as pending
+            // so one rebuild re-pins it, not skip as current forever.
+            || !clone_df_epoch_serves(conn, live.generation)?)
     }
 
     /// The background quiet-window gate for the clone-graph tail (#472): true when the graph is
@@ -271,44 +280,18 @@ impl IndexDatabase {
         Ok(())
     }
 
-    /// Invalidate the persisted clone-graph postings — mark EVERY generation postings-stale
-    /// (`postings_written = 0`) so `pending_clone_graph` reports pending and the next maintenance
-    /// pass rebuilds the graph. Called when `clone_token_df` is recomputed (a full rebuild): the
-    /// postings freeze `sub_block_tokens`' ordering by the df table AS OF their build, but a full
-    /// rebuild corrects df drift WITHOUT changing file content, so `content_revision()` (the
-    /// clone-graph freshness key) stays equal and nothing else would catch the drift. Serving those
-    /// postings would rank a new function with the current df while reading postings ordered by the
-    /// old df, silently missing near-clones whose selected sub-block token shifted. Until the
-    /// rebuild, the write-time fast path falls back to the RAM build; `find_clones`' edges are
-    /// df-INDEPENDENT (they store the verified overlap) and are unaffected. Incremental indexing
-    /// bumps df alongside file-content changes, so `content_revision()` already gates that path —
-    /// only this content-invariant refresh needs the explicit nudge.
-    pub(crate) fn invalidate_clone_graph_postings(&self) -> anyhow::Result<()> {
-        let conn = self.storage.connection();
-        // Per-repo (A5): only the active repo's generations are invalidated — a full rebuild of one
-        // repo must not force a sibling repo's postings stale. `{repo_clause}` is empty pre-A5.
-        let repo_clause = clone_generation_scope_clause(conn)?;
-        conn.execute(
-            &format!(
-                "UPDATE clone_graph_generations SET postings_written = 0 WHERE 1=1{repo_clause}"
-            ),
-            [],
-        )?;
-        Ok(())
-    }
-
     /// The live clone-graph generation the write-time postings fast path may read from —
     /// `Some(gen)` ONLY when the persisted postings are safe to serve, `None` otherwise (→ the
     /// caller uses the RAM fallback). Eligibility is EXACT-freshness, deliberately STRICTER
-    /// than the `find_clones` edge fast path's "mildly-stale-OK" (review R1): the persisted
-    /// sub-block token set for a symbol depends on `sub_block_tokens`' ordering by the CURRENT
-    /// `clone_token_df`, so a generation whose `source_revision` has drifted from
+    /// than the `find_clones` edge fast path's "mildly-stale-OK" (review R1): the postings cover
+    /// exactly the file set of `source_revision`, so a generation drifted from
     /// `content_revision()` could disagree with what the live index would compute — a silent
     /// missed near-clone. So require:
     /// - a `Complete` live generation (the meta live-pointer only ever names a Complete one),
     /// - `normalizer_version == NORM_VERSION`,
-    /// - `postings_written` (a postings-complete, postings-aware generation — review R2), AND
-    /// - `source_revision == content_revision()` EXACTLY (not merely present).
+    /// - `postings_written` (a postings-complete, postings-aware generation — review R2),
+    /// - `source_revision == content_revision()` EXACTLY (not merely present), AND
+    /// - the generation's `clone_df_epoch` rows exist (#479 — the order to read the postings by).
     pub fn clone_check_indexed_generation(&self) -> anyhow::Result<Option<i64>> {
         // BASE-SCOPE ONLY. The clone graph (edges + postings) is built in the BASE scope —
         // maintenance restores it before the clone-graph pass, and `content_revision()` is GLOBAL
@@ -326,7 +309,11 @@ impl IndexDatabase {
         };
         let eligible = live.normalizer_version == NORM_VERSION
             && live.postings_written
-            && live.source_revision == self.content_revision()?;
+            && live.source_revision == self.content_revision()?
+            // #479: the postings are ordered by the generation's pinned epoch; without the epoch
+            // rows (a pre-V051 build the backfill could not cover) the reader cannot reproduce
+            // that order — fall back rather than silently miss near-clones.
+            && clone_df_epoch_serves(conn, live.generation)?;
         Ok(eligible.then_some(live.generation))
     }
 
@@ -353,6 +340,10 @@ impl IndexDatabase {
             // skip forever with an empty `clone_subblock_postings` (review R2). A postings-less
             // live generation falls through and rebuilds a postings-full one.
             && live.postings_written
+            // And the pinned df epoch (#479, same R2 shape): an epoch-less Complete generation is
+            // unservable by the fast path and the delta, so skipping-as-current would strand them
+            // on the fallback forever — fall through and rebuild one that pins its epoch.
+            && clone_df_epoch_serves(conn, live.generation)?
             // #473: a generation that has absorbed enough in-place delta files owes a df-epoch
             // refresh — it is FRESH (deltas keep `source_revision` current) but must not
             // skip-as-current, or the drift rebuild the quiet gate scheduled would no-op forever.
@@ -374,26 +365,29 @@ impl IndexDatabase {
         // discarded — its symbol-id cursor is meaningless against the new symbol rows.
         let building = open_building_generation(conn, &source_revision)?;
         // A FRESH build (cursor 0 ⇒ no symbol walked ⇒ zero postings staged for this generation)
-        // moves the df EPOCH to now (#477 review): the #473 drift rebuild exists to restore
-        // sub-block selectivity, so a full build that kept the old frozen df would reset the
-        // drift counter without delivering the refresh it promises — and more generally, every
-        // fresh generation's postings must be ordered by the df of ITS OWN build. The refresh
-        // invalidates every generation's postings flag (df moved), including the row just opened,
-        // whose (empty) postings set trivially matches the new epoch — re-mark it postings-aware.
-        // A RESUMED partial (cursor > 0) must NOT refresh: its persisted postings are ordered by
-        // the epoch its build started under.
+        // moves the df epoch to now (#477 review): the #473 drift rebuild exists to restore
+        // sub-block selectivity, so a full build that kept the old df would reset the drift
+        // counter without delivering the refresh it promises — and more generally, every fresh
+        // generation's postings must be ordered by the df of ITS OWN build. The refreshed df is
+        // then pinned durably in `clone_df_epoch` (#479): that snapshot — not the live
+        // `clone_token_df`, which moves on incremental passes — is what the delta pass and the
+        // write-time fast path read back for this generation. A RESUMED partial (cursor > 0)
+        // must NOT refresh or re-snapshot: its persisted postings are ordered by the epoch its
+        // build opened under.
         if building.cursor_symbol_id == 0 {
             self.refresh_clone_token_df()?;
-            conn.execute(
-                "UPDATE clone_graph_generations SET postings_written = 1 WHERE generation = ?1",
-                params![building.generation],
-            )?;
+            snapshot_clone_df_epoch(conn, building.generation)?;
         }
 
         // Load the scoped baseline bags + the content anchors for every scoped symbol, and build
         // the struct-hash buckets + sub-block inverted index in RAM (rebuilt each pass —
-        // cheap relative to the pair emission this avoids persisting postings for).
-        let bags = load_scoped_baseline_bags(conn)?;
+        // cheap relative to the pair emission this avoids persisting postings for). Bags are
+        // ordered by the generation's PINNED epoch (#479): identical to the just-refreshed live
+        // df on a fresh build, and — the case that matters — the OPEN-time order on a resumed
+        // partial, whose remaining postings must match the ones already staged even if the live
+        // table moved between the paused passes (Codex review of this change).
+        let epoch_df = load_clone_df_epoch(conn, building.generation)?;
+        let bags = load_scoped_baseline_bags_with_df(conn, &epoch_df)?;
         let symbols_total = bags.len() as u64;
         let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
         let anchors = resolve_symbol_anchors(conn)?;
@@ -858,6 +852,58 @@ pub(super) fn insert_posting_groups(
             stmt.execute(params![generation, token_hash, path, start_byte, file_sha])?;
         }
     }
+    Ok(())
+}
+
+/// Whether `generation`'s postings can be ORDERED for serving (#479): its pinned df epoch
+/// exists, or there is nothing to order (a zero-postings generation — a docs-only or
+/// fingerprint-less repo — has no order to lose, and refusing it would make `pending_clone_graph`
+/// rebuild an already-current empty graph forever). Only "postings exist but the epoch is gone"
+/// (a pre-V051 build the backfill's empty-df edge could not cover, a torn epoch) is unservable —
+/// every eligibility gate treats that like `postings_written = 0` (fall back / refuse; one full
+/// rebuild self-heals).
+pub(super) fn clone_df_epoch_serves(conn: &Connection, generation: i64) -> anyhow::Result<bool> {
+    if clone_df_epoch_exists(conn, generation)? {
+        return Ok(true);
+    }
+    let has_postings = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM clone_subblock_postings WHERE build_generation = ?1)",
+        params![generation],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    Ok(!has_postings)
+}
+
+/// The STRICT probe: `generation` has pinned epoch rows. The delta pass requires this — not the
+/// [`clone_df_epoch_serves`] sentinel — because it may CREATE the generation's first postings,
+/// and emitting them under an empty epoch map would leave postings no reader can order (Codex
+/// review of this change). An epoch-less generation goes to the full-rebuild path, which pins one.
+pub(super) fn clone_df_epoch_exists(conn: &Connection, generation: i64) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM clone_df_epoch WHERE build_generation = ?1)",
+        params![generation],
+        |r| r.get::<_, i64>(0),
+    )? != 0)
+}
+
+/// Pin a FRESH generation's df order (#479): copy the active repo's just-refreshed
+/// `clone_token_df` (baseline — the only normalizer kind the graph builds) into `clone_df_epoch`
+/// for `generation`. Runs only when a Building generation opens fresh (cursor 0); a resumed
+/// partial keeps the epoch it opened under, and CASCADE sweeps the rows with the generation.
+/// DELETE-first: a torn pass that snapshotted, died before its first checkpoint, and re-entered
+/// the fresh branch re-pins against the re-refreshed df instead of tripping the PK.
+fn snapshot_clone_df_epoch(conn: &Connection, generation: i64) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM clone_df_epoch WHERE build_generation = ?1", params![generation])?;
+    let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
+    let df_clause = crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
+    conn.execute(
+        &format!(
+            "INSERT INTO clone_df_epoch(build_generation, token_hash, df)
+             SELECT ?1, token_hash, df FROM clone_token_df
+             WHERE normalizer_kind = 'baseline'{df_clause}"
+        ),
+        params![generation],
+    )?;
     Ok(())
 }
 
@@ -1408,6 +1454,212 @@ pub(super) mod tests {
         assert_eq!(leftover, 0, "the armed candidate is dropped once the graph is current");
     }
 
+    /// #479: a FRESH Building generation pins its build-time df order durably in
+    /// `clone_df_epoch`, so the persisted postings survive later movement of the live
+    /// `clone_token_df`. A RESUMED partial must not re-snapshot — its postings are ordered by the
+    /// epoch its build opened under, and a mid-build df movement must not leak in.
+    #[test]
+    fn a_fresh_build_snapshots_the_df_epoch_and_a_resume_preserves_it() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let epoch_rows = |db: &crate::IndexDatabase, generation: i64| -> Vec<(i64, i64)> {
+            let conn = db.storage.connection();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT token_hash, df FROM clone_df_epoch WHERE build_generation = ?1
+                     ORDER BY token_hash",
+                )
+                .unwrap();
+            stmt.query_map([generation], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let df_rows = |db: &crate::IndexDatabase| -> Vec<(i64, i64)> {
+            let conn = db.storage.connection();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = 'baseline'
+                     ORDER BY token_hash",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+
+        let db = build_clone_fixture("df-epoch-fresh");
+        let report = db.precompute_clone_graph(None).unwrap();
+        assert_eq!(report.status, "Complete");
+        let fresh_epoch = epoch_rows(&db, report.generation);
+        assert!(!fresh_epoch.is_empty(), "a fresh build snapshots its df epoch");
+        assert_eq!(fresh_epoch, df_rows(&db), "the snapshot equals the df the build ran under");
+
+        // Resume: trip the budget so a Building generation persists, move the live df between
+        // passes (what an interleaved incremental bump does), and finish the build.
+        let resumed = build_clone_fixture("df-epoch-resume");
+        let first = resumed
+            .reconcile_clone_edges_pass(&CloneEdgeOptions {
+                max_seconds: Some(0),
+                batch_size: 1,
+                force: false,
+            })
+            .unwrap();
+        assert_eq!(first.status, "Partial", "a zero-second budget trips after one batch");
+        let open_epoch = epoch_rows(&resumed, first.generation);
+        assert!(!open_epoch.is_empty(), "the epoch is pinned when the generation opens");
+        // Adversarial mid-build live-df movement: invert the whole table between the paused
+        // passes (an incremental bump storm's worst case).
+        resumed
+            .storage
+            .connection()
+            .execute("UPDATE clone_token_df SET df = 1000000 - df", [])
+            .unwrap();
+        let mut passes = 0;
+        let completed = loop {
+            let report = resumed
+                .reconcile_clone_edges_pass(&CloneEdgeOptions {
+                    max_seconds: Some(0),
+                    batch_size: 1,
+                    force: false,
+                })
+                .unwrap();
+            passes += 1;
+            assert!(passes < 10_000, "must converge");
+            if report.status != "Partial" {
+                assert_eq!(report.status, "Complete");
+                break report;
+            }
+        };
+        assert_eq!(
+            epoch_rows(&resumed, completed.generation),
+            open_epoch,
+            "a resume preserves the open-time epoch — the mid-build df movement must not leak in"
+        );
+        // And the resumed passes must EMIT under that epoch too (Codex review): every persisted
+        // posting — including the symbols walked after the inversion — matches the sub-block
+        // selection under the pinned epoch, not the moved live table.
+        let conn = resumed.storage.connection();
+        let epoch_df = load_clone_df_epoch(conn, completed.generation).unwrap();
+        let live_df = super::super::substrate::load_current_clone_df(conn).unwrap();
+        let union_under = |df: &std::collections::HashMap<i64, i64>| -> BTreeSet<i64> {
+            load_scoped_baseline_bags_with_df(conn, df)
+                .unwrap()
+                .iter()
+                .flat_map(|bag| sub_block_tokens(bag, CLONE_PRECOMPUTE_THETA))
+                .collect()
+        };
+        let under_epoch = union_under(&epoch_df);
+        assert_ne!(
+            under_epoch,
+            union_under(&live_df),
+            "precondition: the inversion must actually change the prefix selection"
+        );
+        let persisted: BTreeSet<i64> = conn
+            .prepare(
+                "SELECT DISTINCT token_hash FROM clone_subblock_postings
+                 WHERE build_generation = ?1",
+            )
+            .unwrap()
+            .query_map(params![completed.generation], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            persisted, under_epoch,
+            "resumed passes emit postings under the pinned epoch, not the moved live df"
+        );
+    }
+
+    /// #479 empty-graph sentinel (Codex review): a repo with no baseline fingerprints (docs-only,
+    /// data-only) builds a Complete generation with ZERO postings and therefore ZERO epoch rows —
+    /// a legitimately empty order, not a lost one. It must read as current, or
+    /// `pending_clone_graph` would schedule a rebuild of the already-current empty graph on every
+    /// maintenance pass, forever.
+    #[test]
+    fn an_empty_generation_without_epoch_rows_stays_current() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let mut config = clone_fixture_config("df-epoch-empty");
+        // Replace the clone fixture's sources with a data-only file: no functions, so nothing is
+        // fingerprinted and the built graph is empty.
+        std::fs::remove_file(config.root.join("src/a.rs")).unwrap();
+        std::fs::remove_file(config.root.join("src/b.rs")).unwrap();
+        std::fs::write(config.root.join("src/data.rs"), "pub struct OnlyData { pub x: i64 }\n")
+            .unwrap();
+        config.allow_empty = true;
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert!(
+            !db.pending_clone_graph().unwrap(),
+            "an empty generation with no epoch rows is current, not perpetually pending"
+        );
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            "Current",
+            "and the next pass skips instead of rebuilding the empty graph forever"
+        );
+        drop(db);
+
+        // The FIRST fingerprinted content arrives: the delta must REFUSE (it would otherwise
+        // write the generation's first postings under an empty epoch map — postings no reader
+        // could order; Codex review) and the full path builds a fresh, epoch-pinned generation.
+        std::fs::write(
+            config.root.join("src/first.rs"),
+            "pub fn first_function(q: i64) -> i64 { q * 13 + 1 }\n",
+        )
+        .unwrap();
+        let (db, _changed) = crate::IndexDatabase::index_discover_reporting(&config).unwrap();
+        let report = db.apply_clone_graph_delta(64).unwrap();
+        assert_eq!(
+            report.status, "NotEligible",
+            "the delta must not create first postings on an epoch-less generation: {report:?}"
+        );
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert!(
+            db.clone_check_indexed_generation().unwrap().is_some(),
+            "the full rebuild pins an epoch and the fast path serves"
+        );
+    }
+
+    /// #479 upgrade defense: postings without their generation's epoch rows cannot be ordered
+    /// correctly (the reader would fall to DF_FALLBACK for every token — a silently different
+    /// order than the postings were built under). A missing epoch must behave like
+    /// `postings_written = 0`: the fast path falls back and the delta refuses, so one full
+    /// rebuild self-heals instead of silently losing recall.
+    #[test]
+    fn a_generation_without_epoch_rows_is_not_servable() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let db = build_clone_fixture("df-epoch-eligibility");
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert!(
+            db.clone_check_indexed_generation().unwrap().is_some(),
+            "a fresh build with its epoch serves the fast path"
+        );
+        db.storage.connection().execute("DELETE FROM clone_df_epoch", []).unwrap();
+        assert!(
+            db.clone_check_indexed_generation().unwrap().is_none(),
+            "an epoch-less generation must not serve the postings fast path"
+        );
+        let report = db.apply_clone_graph_delta(64).unwrap();
+        assert_eq!(
+            report.status, "NotEligible",
+            "the delta must not patch postings whose build order is unknown: {report:?}"
+        );
+        // The self-heal loop must CLOSE (Codex review of this change): the unservable state has
+        // to read as pending and rebuild on the next pass — not skip as "Current" forever, which
+        // would strand the fast path and the delta on the fallback.
+        assert!(
+            db.pending_clone_graph().unwrap(),
+            "an epoch-less generation reads as pending, scheduling the healing rebuild"
+        );
+        let heal = db.precompute_clone_graph(None).unwrap();
+        assert_eq!(heal.status, "Complete", "the pass rebuilds instead of skipping as current");
+        assert!(
+            db.clone_check_indexed_generation().unwrap().is_some(),
+            "the rebuilt generation pins a fresh epoch and serves again"
+        );
+    }
+
     /// `quiet_ms = 0` disables the gate — a pending graph is immediately due (the pre-#472
     /// immediate-rebuild behavior).
     #[test]
@@ -1416,42 +1668,19 @@ pub(super) mod tests {
         assert!(db.clone_graph_rebuild_due_at(1_000, 0, true).unwrap());
     }
 
-    /// The freeze's bootstrap exception (`refresh_clone_token_df_if_unseeded`): an UNSEEDED repo
-    /// (no df rows) seeds the epoch; a seeded repo is left untouched — the frozen epoch must not
-    /// move on the incremental finalize that calls this.
+    /// #479: incremental passes bump the LIVE `clone_token_df` (a new file's tokens get real df
+    /// instead of riding `DF_FALLBACK` until the next full build — the live-fallback recall fix),
+    /// while the published generation's PINNED epoch stays byte-identical and its postings stay
+    /// servable. This inverts the #473 whole-table freeze: the freeze now lives per generation in
+    /// `clone_df_epoch`, not on the live table.
     #[test]
-    fn refresh_if_unseeded_seeds_once_then_preserves_the_epoch() {
+    fn incremental_index_bumps_live_df_and_keeps_the_generation_epoch_frozen() {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
-        let db = build_clone_fixture("df-freeze-bootstrap");
-        let df_count = |db: &crate::IndexDatabase| -> i64 {
-            db.storage
-                .connection()
-                .query_row("SELECT COUNT(*) FROM clone_token_df", [], |r| r.get(0))
-                .unwrap()
-        };
-        // Simulate the pre-epoch state (a DB whose df was never seeded for this repo).
-        db.storage.connection().execute("DELETE FROM clone_token_df", []).unwrap();
-        db.refresh_clone_token_df_if_unseeded().unwrap();
-        let seeded = df_count(&db);
-        assert!(seeded > 0, "an unseeded repo gets its epoch seeded");
-
-        // Seeded → the guard is a strict no-op (the frozen epoch must not move).
-        db.refresh_clone_token_df_if_unseeded().unwrap();
-        assert_eq!(df_count(&db), seeded, "a seeded repo's epoch is preserved");
-    }
-
-    /// The df EPOCH FREEZE (#473): incremental passes must not move `clone_token_df` — the
-    /// persisted postings order sub-block tokens by df AS OF their build, so a moving df would
-    /// desync them from every later sub-block computation (which is why the old per-pass refresh
-    /// had to invalidate the postings each time). After the freeze, a content change through a
-    /// maintenance pass leaves the df table byte-identical AND the live generation's
-    /// `postings_written` intact; df moves only at a FULL rebuild.
-    #[test]
-    fn incremental_index_keeps_the_df_epoch_frozen() {
-        let _poison = crate::index::poison_sibling::disable_poison_sibling();
-        let config = clone_fixture_config("df-freeze-epoch");
+        let config = clone_fixture_config("df-live-bump");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        let report = db.precompute_clone_graph(None).unwrap();
+        assert_eq!(report.status, "Complete");
+        let generation = report.generation;
         let df_rows = |db: &crate::IndexDatabase| -> Vec<(i64, i64)> {
             let conn = db.storage.connection();
             let mut stmt = conn
@@ -1462,41 +1691,47 @@ pub(super) mod tests {
                 .map(Result::unwrap)
                 .collect()
         };
-        let postings_written = |db: &crate::IndexDatabase| -> i64 {
-            db.storage
-                .connection()
-                .query_row(
-                    "SELECT postings_written FROM clone_graph_generations WHERE status = \
-                     'Complete'",
-                    [],
-                    |r| r.get(0),
+        let epoch_rows = |db: &crate::IndexDatabase| -> Vec<(i64, i64)> {
+            let conn = db.storage.connection();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT token_hash, df FROM clone_df_epoch WHERE build_generation = ?1
+                     ORDER BY token_hash",
                 )
+                .unwrap();
+            stmt.query_map([generation], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
                 .unwrap()
+                .map(Result::unwrap)
+                .collect()
         };
-        let epoch = df_rows(&db);
-        assert!(!epoch.is_empty(), "the full rebuild seeded the df epoch");
-        assert_eq!(postings_written(&db), 1, "the precompute published postings");
+        let live_df = df_rows(&db);
+        let pinned_epoch = epoch_rows(&db);
+        assert!(!live_df.is_empty(), "the full rebuild computed the df");
+        assert_eq!(live_df, pinned_epoch, "at build time the live df IS the epoch");
         drop(db);
 
         // A new file with brand-new tokens through the watcher/maintenance incremental path.
         std::fs::write(
-            config.root.join("src/frozen_probe.rs"),
-            "pub fn frozen_epoch_probe(zx: u64) -> u64 { zx.rotate_left(9) ^ 0xfeed_beef }\n",
+            config.root.join("src/live_probe.rs"),
+            "pub fn live_bump_probe(zx: u64) -> u64 { zx.rotate_left(9) ^ 0xfeed_beef }\n",
         )
         .unwrap();
         crate::watch::maintenance_pass(&config, false).unwrap();
 
         let db = crate::IndexDatabase::open_config(&config).unwrap();
-        assert_eq!(
-            df_rows(&db),
-            epoch,
-            "an incremental pass must not move the df epoch (new tokens ride DF_FALLBACK until \
-             the next full rebuild)"
+        assert!(
+            df_rows(&db).len() > live_df.len(),
+            "the incremental pass bumps the live df with the new file's tokens"
         );
         assert_eq!(
-            postings_written(&db),
-            1,
-            "and must not invalidate the live generation's postings"
+            epoch_rows(&db),
+            pinned_epoch,
+            "the generation's pinned epoch never moves after its build"
+        );
+        assert!(
+            db.clone_check_indexed_generation().unwrap().is_some(),
+            "the live df movement must not invalidate the generation's postings (they are \
+             epoch-pinned; the maintenance pass's delta keeps them fresh)"
         );
     }
 
@@ -1555,14 +1790,14 @@ pub(super) mod tests {
         assert!(!edge_keys(&db).is_empty(), "and the fixture's clone edges are persisted");
     }
 
-    /// A full rebuild recomputes `clone_token_df` authoritatively (correcting incremental drift)
-    /// WITHOUT changing file content, so `content_revision()` — the clone-graph freshness key —
-    /// stays equal. The persisted postings freeze the OLD df ordering, so serving them under
-    /// the fresh df could silently miss near-clones; the rebuild must therefore INVALIDATE the
-    /// postings (mark the generation stale) so they rebuild against the fresh df. The
-    /// write-time fast path falls back to RAM until then. Self-heals on the next precompute.
+    /// A second FULL index rebuild over identical content leaves the clone graph transiently
+    /// pending — `content_revision()` digests raw `main.files`, and the freshly staged file
+    /// generation coexists with the superseded one until gc, so the digest moves — and one
+    /// precompute settles it. #479 note: the df refresh the rebuild runs no longer invalidates
+    /// anything (`invalidate_clone_graph_postings` is gone — postings are pinned to their own
+    /// `clone_df_epoch`); the pending window here is purely the revision-key movement.
     #[test]
-    fn full_rebuild_invalidates_postings_for_df_freshness() {
+    fn a_second_full_rebuild_leaves_the_graph_pending_until_one_precompute() {
         let config = clone_fixture_config("df-refresh");
         let db1 = crate::IndexDatabase::rebuild(&config).unwrap();
         db1.precompute_clone_graph(None).unwrap();
@@ -1574,18 +1809,18 @@ pub(super) mod tests {
         drop(db1); // release the DB file before the second rebuild takes the write lock
 
         // Second FULL rebuild over IDENTICAL content: the clone graph survives (it is content-
-        // anchored), but `refresh_clone_token_df` runs, so the postings must be invalidated.
+        // anchored), but the staged file generation moves the revision key until gc.
         let db2 = crate::IndexDatabase::rebuild(&config).unwrap();
         assert!(
             db2.pending_clone_graph().unwrap(),
-            "the full-rebuild df refresh invalidates the postings, so the graph is pending"
+            "the staged-generation revision drift leaves the graph pending"
         );
         assert!(
             db2.clone_check_indexed_generation().unwrap().is_none(),
-            "and the write-time fast path falls back to RAM until the postings are rebuilt"
+            "and the write-time fast path falls back to RAM until the graph settles"
         );
 
-        // Self-heals: re-precompute rebuilds the postings against the fresh df.
+        // Settles on the next precompute (a maintenance pass's delta would re-pin it likewise).
         assert_eq!(db2.precompute_clone_graph(None).unwrap().status, "Complete");
         assert!(!db2.pending_clone_graph().unwrap(), "current again after the rebuild");
         assert!(db2.clone_check_indexed_generation().unwrap().is_some(), "eligible again");

@@ -11,6 +11,13 @@ struct ChunkInsertFile<'a> {
     source_revision: &'a str,
 }
 
+/// Whether `write_symbol_fingerprints` should bump the LIVE `clone_token_df` per token (#215,
+/// restored by #479). Named so the call site reads its intent: `BumpDf(false)` on the
+/// full-rebuild path (df is recomputed authoritatively at finalize, so the per-token bump is
+/// wasted work), `BumpDf(true)` on the incremental/heal path (no finalize runs there, so the
+/// bump keeps the live df current).
+struct BumpDf(bool);
+
 impl IndexDatabase {
     pub fn heal_file(&self, path: &Path) -> anyhow::Result<()> {
         // A heal reads bytes from `source_root` (the MAIN checkout). Under a linked-worktree
@@ -230,13 +237,18 @@ impl IndexDatabase {
         )?;
         let symbol_db_ids = self.insert_symbols(file_id, file.language, &prepared.symbols)?;
         // Clone fingerprints were computed in the parallel prepare phase from the same parse used
-        // for symbols/edges (#230) — no second read, no second parse here, just the DB write. No
-        // path bumps `clone_token_df` anymore (#473 df EPOCH FREEZE): the persisted clone-graph
-        // postings order sub-block tokens by df AS OF their build, so moving df on incremental
-        // writes would desync them; df is refreshed authoritatively only at a FULL rebuild's
-        // finalize (refresh_clone_token_df, rebuild.rs). A new token simply rides `DF_FALLBACK`
-        // (selectivity-only) until the next full rebuild.
-        self.write_symbol_fingerprints(&symbol_db_ids, &prepared.symbol_fingerprints)?;
+        // for symbols/edges (#230) — no second read, no second parse here, just the DB write.
+        // bump_df = graph.is_none(): the full-rebuild path (graph: Some) recomputes clone_token_df
+        // authoritatively from the token-bag BLOBs in refresh_clone_token_df at finalize
+        // (rebuild.rs), so per-token upserts here would be recomputed-and-discarded — pure waste
+        // plus hot-row contention on common tokens. The incremental path (graph: None) runs no
+        // such finalize, so the bump is how the LIVE df stays current (#479 — the persisted
+        // postings' order is safe regardless: it is pinned per generation in `clone_df_epoch`).
+        self.write_symbol_fingerprints(
+            &symbol_db_ids,
+            &prepared.symbol_fingerprints,
+            BumpDf(graph.is_none()),
+        )?;
         // Edge candidates were computed in the parallel prepare phase with LOCAL symbol indices;
         // remap them to the real DB ids just assigned.
         match graph {
@@ -291,9 +303,9 @@ impl IndexDatabase {
             return Ok(());
         };
         let fingerprints = clones::fingerprint_symbols(parsed.root(), text, language, symbols);
-        // The heal path does not touch `clone_token_df` either — the #473 df epoch freeze (see
-        // `index_file`'s fingerprint write): df moves only at a full rebuild.
-        self.write_symbol_fingerprints(symbol_ids, &fingerprints)
+        // Heal/inline path runs no full-rebuild finalize, so the LIVE df is kept current here via
+        // the per-token bump (drift-tolerated; see write_symbol_fingerprints).
+        self.write_symbol_fingerprints(symbol_ids, &fingerprints, BumpDf(true))
     }
 
     /// Write precomputed baseline clone fingerprints (#215). `fingerprints` carries
@@ -305,19 +317,41 @@ impl IndexDatabase {
     /// The token bag is serialized into the `symbol_fingerprints.token_bag` BLOB column (#231),
     /// one BLOB per symbol — there is no longer a `symbol_token_postings` row-per-token write.
     ///
-    /// This write never touches `clone_token_df` (#473 df EPOCH FREEZE): df is recomputed
-    /// authoritatively only at a full rebuild's finalize (`refresh_clone_token_df`, rebuild.rs) —
-    /// or seeded once by `refresh_clone_token_df_if_unseeded` on a first standalone index — so the
-    /// persisted clone-graph postings and every later sub-block computation share one total order.
-    /// df is a selectivity hint only (the candidate read COALESCEs a missing row to
-    /// `DF_FALLBACK`), so epoch drift never changes a result — see query_api/clones.
+    /// `bump_df` gates the per-token LIVE `clone_token_df` upsert (#479 restored the #215
+    /// mechanism the #473 freeze removed). On the full-rebuild path it is `BumpDf(false)`:
+    /// `refresh_clone_token_df` (rebuild.rs) recomputes df exactly from the token-bag BLOBs at
+    /// finalize, so bumping per token here is recomputed-and-discarded work plus hot-row B-tree
+    /// contention on common tokens. On the incremental/heal paths it is `BumpDf(true)` — no
+    /// finalize runs there, so the drift-tolerated bump is how the LIVE df stays current for the
+    /// live candidate paths (a new token gets real selectivity instead of riding `DF_FALLBACK`
+    /// until the next full build). The PERSISTED graph is unaffected either way: each
+    /// generation's order is pinned in `clone_df_epoch` at its build.
     fn write_symbol_fingerprints(
         &self,
         symbol_db_ids: &[i64],
         fingerprints: &[(usize, clones::SymbolFingerprint)],
+        bump_df: BumpDf,
     ) -> anyhow::Result<()> {
         let conn = self.storage.connection();
         let normalizer_kind = clones::NormalizerKind::Baseline.as_db_str();
+        // Resolve the periphery scope ONCE (not per token). Post-A5 `clone_token_df`'s PK is
+        // `(repo_id, normalizer_kind, token_hash)`, so the upsert must stamp `repo_id` AND target
+        // it in the ON CONFLICT — the repo id is embedded as a per-call literal so the bound
+        // params (`?1` kind, `?2` token) stay unchanged. Pre-A5 (no `repo_id` column) uses the
+        // original SQL.
+        let clone_df_bump_sql =
+            match crate::index::schema::periphery_repo_scope(conn, "clone_token_df")? {
+                Some(repo_id) => format!(
+                    "INSERT INTO clone_token_df(repo_id, normalizer_kind, token_hash, df)
+                 VALUES ('{}', ?1, ?2, 1)
+                 ON CONFLICT(repo_id, normalizer_kind, token_hash) DO UPDATE SET df = df + 1",
+                    repo_id.replace('\'', "''")
+                ),
+                None => "INSERT INTO clone_token_df(normalizer_kind, token_hash, df)
+                 VALUES (?1, ?2, 1)
+                 ON CONFLICT(normalizer_kind, token_hash) DO UPDATE SET df = df + 1"
+                    .to_string(),
+            };
         for (local_index, fp) in fingerprints {
             let symbol_id = symbol_db_ids[*local_index];
             // The token bag rides the fingerprint row as ONE serialized BLOB (#231), replacing the
@@ -339,6 +373,17 @@ impl IndexDatabase {
                 token_bag_blob,
                 now_ms(),
             ])?;
+            // Bump the LIVE document frequency per distinct token ONLY when `bump_df`
+            // (incremental/heal): df is a selectivity hint for the live candidate paths (the read
+            // COALESCEs a missing row to DF_FALLBACK), so the increment-only drift is tolerated;
+            // full builds recompute exactly. R7: iterate the IN-MEMORY `fp.token_bag` — no decode
+            // round-trip.
+            if bump_df.0 {
+                for &(token_hash, _freq) in &fp.token_bag {
+                    conn.prepare_cached(&clone_df_bump_sql)?
+                        .execute(params![normalizer_kind, token_hash])?;
+                }
+            }
         }
         Ok(())
     }

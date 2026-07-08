@@ -18,7 +18,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 50;
+pub const LATEST_SCHEMA_VERSION: u32 = 51;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -342,6 +342,14 @@ const MIGRATION_050_DESCRIPTION: &str =
      clone_graph_generations.delta_files_applied counter, so the incremental clone-graph delta \
      pass can delete a changed file's postings without a table scan and track df drift toward the \
      next full rebuild";
+const MIGRATION_051_ID: &str = "051_clone_df_epoch";
+const MIGRATION_051_CHECKSUM: &str = "sha256:rag-rat-clone-df-epoch-v51";
+const MIGRATION_051_DESCRIPTION: &str =
+    "Add clone_df_epoch, the per-generation snapshot of clone_token_df taken at each fresh \
+     clone-graph build (#479), so the persisted postings and the delta pass read their own \
+     build's frozen token order while the live candidate paths read a clone_token_df that moves \
+     again on incremental passes; backfilled from the current (freeze-pinned) df for existing \
+     generations";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -741,6 +749,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_050_CHECKSUM,
         description: MIGRATION_050_DESCRIPTION,
         apply: apply_clone_delta_maintenance,
+    },
+    Migration {
+        id: MIGRATION_051_ID,
+        checksum: MIGRATION_051_CHECKSUM,
+        description: MIGRATION_051_DESCRIPTION,
+        apply: apply_clone_df_epoch,
     },
 ];
 

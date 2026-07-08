@@ -457,31 +457,11 @@ impl IndexDatabase {
     /// for recall either way.) df feeds candidate GENERATION (the `sub_block_tokens` ordering), not
     /// just ranking. Each symbol's decoded bag has no duplicate `token_hash` (the codec invariant),
     /// so counting one increment per (symbol, token) pair equals `COUNT(DISTINCT symbol_id)`.
-    /// Seed the df epoch ONLY when this repo has no `clone_token_df` rows yet — the #473 df EPOCH
-    /// FREEZE's one exception. Incremental finalizes call this instead of the unconditional
-    /// refresh: the persisted clone-graph postings order sub-block tokens by df AS OF their build,
-    /// so a per-pass refresh would desync them (which is why `refresh_clone_token_df` must
-    /// invalidate the postings every time it runs). A FIRST standalone index has no epoch to
-    /// preserve — and no postings to invalidate — so seeding here is safe and keeps the
-    /// selectivity ordering useful from the start; afterwards df moves only at a full rebuild.
-    pub(crate) fn refresh_clone_token_df_if_unseeded(&self) -> anyhow::Result<()> {
-        let seeded = {
-            let conn = self.storage.connection();
-            let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
-            let df_clause =
-                crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
-            conn.query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM clone_token_df WHERE 1=1{df_clause})"),
-                [],
-                |r| r.get::<_, i64>(0),
-            )? != 0
-        };
-        if seeded {
-            return Ok(());
-        }
-        self.refresh_clone_token_df()
-    }
-
+    /// Recompute the LIVE `clone_token_df` exactly from the active repo's token-bag BLOBs — the
+    /// authoritative refresh the full-rebuild / standalone-index finalizes run (the waves skip
+    /// per-token bumps via `BumpDf(false)` and settle here instead). #479: this refreshes the
+    /// LIVE selectivity table only; the persisted clone-graph postings are ordered by their own
+    /// generation's `clone_df_epoch` snapshot, so a refresh no longer invalidates them.
     pub(crate) fn refresh_clone_token_df(&self) -> anyhow::Result<()> {
         // Resolve the active-repo scope ONCE: it gates BOTH the fingerprint READ below and the df
         // wipe/reinsert (Phase 2). `symbol_fingerprints` is deliberately `repo_id`-free (keyed by
@@ -575,12 +555,6 @@ impl IndexDatabase {
                 ])?;
             }
         }
-        // The recomputed df may reorder `sub_block_tokens`, so the persisted clone-graph postings
-        // (frozen at their build-time df) can no longer be served against the current df without
-        // silently missing near-clones. Invalidate them so the next maintenance pass rebuilds the
-        // graph; this refresh keeps file content (and `content_revision()`) unchanged, so nothing
-        // else would catch it. See `invalidate_clone_graph_postings`.
-        self.invalidate_clone_graph_postings()?;
         Ok(())
     }
 

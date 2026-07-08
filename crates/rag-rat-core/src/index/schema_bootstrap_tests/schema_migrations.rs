@@ -914,10 +914,13 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
     };
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V050 is the schema tip — the absolute pin (migration_049_* dropped to the symbolic
-    // `current_version == LATEST` check when this landed).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 50, "V050 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 50, "schema at LATEST after apply");
+    // Symbolic freshness check (the absolute tip pin lives on the NEWEST migration's test —
+    // migration_051 — per the ladder convention).
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
     assert!(
         index_exists(&conn),
         "the delta pass deletes a changed file's postings by (build_generation, path); the PK \
@@ -971,6 +974,89 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
         )
         .unwrap();
     assert_eq!(postings_written, 0, "a pre-freeze generation is forced through a full rebuild");
+}
+
+#[test]
+fn migration_051_adds_clone_df_epoch_and_backfills_existing_generations() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V051 is the schema tip — the absolute pin (migration_050's drops to the symbolic
+    // `current_version == LATEST` check when this lands).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 51, "V051 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 51, "schema at LATEST after apply");
+    assert!(
+        conn_table_exists(&conn, "clone_df_epoch"),
+        "the per-generation df snapshot table exists (#479)"
+    );
+
+    // BACKFILL (the V050→V051 upgrade bridge): a pre-epoch-table DB holds generations whose
+    // postings are ordered by the CURRENT clone_token_df (the #473 freeze guarantees df has not
+    // moved since any servable generation's build), so snapshotting current df per generation is
+    // exact. Seed a V050-shaped state, re-run the applier in isolation (deferred-absence
+    // pattern), and assert the snapshot: matching (repo_id, normalizer_kind) rows only.
+    conn.execute(
+        "INSERT INTO clone_graph_generations
+            (generation, status, theta_floor, normalizer_kind, normalizer_version,
+             source_revision, started_at_ms, postings_written, repo_id)
+         VALUES (7, 'Complete', 0.7, 'baseline', 3, 'rev', 0, 1, 'r1')",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO clone_token_df(repo_id, normalizer_kind, token_hash, df)
+         VALUES ('r1', 'baseline', 101, 3), ('r1', 'baseline', 102, 9);
+         -- Different repo / different normalizer kind: must NOT enter generation 7's epoch.
+         INSERT INTO clone_token_df(repo_id, normalizer_kind, token_hash, df)
+         VALUES ('r2', 'baseline', 103, 5), ('r1', 'other', 104, 2);",
+    )
+    .unwrap();
+    conn.execute_batch("DROP TABLE clone_df_epoch;").unwrap();
+    schema::apply_clone_df_epoch(&conn).unwrap();
+    let epoch_rows = |conn: &rusqlite::Connection| -> Vec<(i64, i64, i64)> {
+        conn.prepare(
+            "SELECT build_generation, token_hash, df FROM clone_df_epoch
+             ORDER BY build_generation, token_hash",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    assert_eq!(
+        epoch_rows(&conn),
+        vec![(7, 101, 3), (7, 102, 9)],
+        "backfill snapshots exactly the generation's own (repo_id, normalizer_kind) df rows"
+    );
+
+    // Idempotence: a re-apply must not re-snapshot a generation that already has epoch rows —
+    // post-V051, current df moves on incremental passes, so a re-run folding NEW df rows into an
+    // existing epoch would corrupt the frozen order.
+    conn.execute(
+        "INSERT INTO clone_token_df(repo_id, normalizer_kind, token_hash, df)
+         VALUES ('r1', 'baseline', 105, 1)",
+        [],
+    )
+    .unwrap();
+    schema::apply_clone_df_epoch(&conn).unwrap();
+    assert_eq!(
+        epoch_rows(&conn),
+        vec![(7, 101, 3), (7, 102, 9)],
+        "a generation with epoch rows is never re-backfilled"
+    );
+
+    // FK CASCADE: the epoch rows die with their generation row (same lifecycle as
+    // clone_edges / clone_subblock_postings).
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         DELETE FROM clone_graph_generations WHERE generation = 7;",
+    )
+    .unwrap();
+    assert_eq!(
+        epoch_rows(&conn),
+        Vec::<(i64, i64, i64)>::new(),
+        "epoch rows CASCADE with the generation"
+    );
 }
 
 #[test]

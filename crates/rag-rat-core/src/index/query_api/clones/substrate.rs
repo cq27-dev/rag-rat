@@ -126,44 +126,83 @@ pub(crate) fn candidate_pairs(conn: &Connection) -> anyhow::Result<Vec<(i64, i64
 /// so only the ACTIVE version of each file participates (SCOPED-VIEW REQUIREMENT #89). df is read
 /// via LEFT JOIN + COALESCE so a missing-df token is never dropped (design rev-4 §2).
 pub(crate) fn load_scoped_baseline_bags(conn: &Connection) -> anyhow::Result<Vec<SymbolBag>> {
-    load_scoped_baseline_bags_filtered(conn, None)
+    // Live callers (the RAM fallback, `find_clones`) order by the CURRENT df.
+    let df_by_token = load_current_clone_df(conn)?;
+    load_scoped_baseline_bags_filtered(conn, None, &df_by_token)
+}
+
+/// [`load_scoped_baseline_bags`] with the df source injected (#479) — the persisted-graph BUILD's
+/// bag load: a fresh build passes its just-snapshotted epoch (identical to current df at that
+/// moment), and a RESUMED partial passes the epoch it opened under, so postings emitted across
+/// paused passes stay ordered consistently even when the live table moved in between.
+pub(crate) fn load_scoped_baseline_bags_with_df(
+    conn: &Connection,
+    df_by_token: &std::collections::HashMap<i64, i64>,
+) -> anyhow::Result<Vec<SymbolBag>> {
+    load_scoped_baseline_bags_filtered(conn, None, df_by_token)
 }
 
 /// [`load_scoped_baseline_bags`] restricted to symbols whose file `path` is in `paths` — the #473
 /// delta pass's bag load. IDENTICAL corpus filters (this is the parity contract: the delta's bags
 /// must be exactly the subset of the full build's bags for those files), just with a chunked
-/// `files.path IN (…)` narrowing so a small delta never decodes the whole corpus.
+/// `files.path IN (…)` narrowing so a small delta never decodes the whole corpus. `df_by_token`
+/// is injected (#479): the delta orders by its generation's FROZEN epoch
+/// ([`load_clone_df_epoch`]), never the moving live table.
 pub(crate) fn load_scoped_baseline_bags_for_paths(
     conn: &Connection,
     paths: &[String],
+    df_by_token: &std::collections::HashMap<i64, i64>,
 ) -> anyhow::Result<Vec<SymbolBag>> {
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    load_scoped_baseline_bags_filtered(conn, Some(paths))
+    load_scoped_baseline_bags_filtered(conn, Some(paths), df_by_token)
+}
+
+/// `token_hash -> df` from the LIVE `clone_token_df` (baseline normalizer — the only kind that
+/// feeds candidate recall), scoped to the active repo (A5). The CURRENT-order source for the live
+/// candidate paths; the persisted graph's consumers read [`load_clone_df_epoch`] instead (#479).
+/// A token absent from the map is maximally selective (`DF_FALLBACK`) — never dropped
+/// (design rev-4 §2).
+pub(crate) fn load_current_clone_df(
+    conn: &Connection,
+) -> anyhow::Result<std::collections::HashMap<i64, i64>> {
+    let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
+    let df_repo_clause =
+        crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = \
+         'baseline'{df_repo_clause}"
+    ))?;
+    let df_by_token = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(df_by_token)
+}
+
+/// `token_hash -> df` as pinned at `generation`'s build (#479) — the order every persisted
+/// posting of that generation was emitted under. Generation-keyed, so no repo scoping is needed
+/// (the generation integer is globally unique and CASCADEs with its repo's rows).
+pub(crate) fn load_clone_df_epoch(
+    conn: &Connection,
+    generation: i64,
+) -> anyhow::Result<std::collections::HashMap<i64, i64>> {
+    let mut stmt =
+        conn.prepare("SELECT token_hash, df FROM clone_df_epoch WHERE build_generation = ?1")?;
+    let df_by_token = stmt
+        .query_map([generation], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(df_by_token)
 }
 
 fn load_scoped_baseline_bags_filtered(
     conn: &Connection,
     paths: Option<&[String]>,
+    df_by_token: &std::collections::HashMap<i64, i64>,
 ) -> anyhow::Result<Vec<SymbolBag>> {
-    // Load `clone_token_df` ONCE into a map (#231 R3): the token bag now lives in an opaque
-    // `token_bag` BLOB, so df can no longer be a per-token SQL JOIN. Each decoded token's df is
-    // looked up here in Rust and COALESCEd to the fallback sentinel — a missing-df token must NOT
-    // be dropped (design rev-4 §2). Only the baseline normalizer feeds candidate recall.
-    // Post-A5 df is per-repo (its PK carries `repo_id`), so scope the read to the active repo —
-    // `{df_repo_clause}` is empty pre-A5. The writer (`refresh_clone_token_df`, full-rebuild /
-    // first-index only under the #473 df epoch freeze) stamps the same repo, so the two agree.
-    let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
-    let df_repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
-    let mut df_stmt = conn.prepare(&format!(
-        "SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = \
-         'baseline'{df_repo_clause}"
-    ))?;
-    let df_by_token: std::collections::HashMap<i64, i64> = df_stmt
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
-        .collect::<Result<_, _>>()?;
+    // Each decoded token's df is looked up in the injected map (#231 R3: the token bag lives in
+    // an opaque `token_bag` BLOB, so df cannot be a per-token SQL JOIN) and COALESCEd to the
+    // fallback sentinel — a missing-df token must NOT be dropped (design rev-4 §2).
 
     // Scoped baseline fingerprints + their token-bag BLOB, in one read (no per-token join).
     // `files.generated = 0` excludes generated files (e.g. `src/generated/…`, `.d.ts`) from the

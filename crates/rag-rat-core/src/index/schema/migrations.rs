@@ -1185,6 +1185,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_048_ID => Some(48),
             MIGRATION_049_ID => Some(49),
             MIGRATION_050_ID => Some(50),
+            MIGRATION_051_ID => Some(51),
             _ => None,
         })
         .max()
@@ -1244,6 +1245,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_048_ID
             | MIGRATION_049_ID
             | MIGRATION_050_ID
+            | MIGRATION_051_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1300,6 +1302,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_048_ID => migration.checksum != MIGRATION_048_CHECKSUM,
         MIGRATION_049_ID => migration.checksum != MIGRATION_049_CHECKSUM,
         MIGRATION_050_ID => migration.checksum != MIGRATION_050_CHECKSUM,
+        MIGRATION_051_ID => migration.checksum != MIGRATION_051_CHECKSUM,
         _ => false,
     }
 }
@@ -3469,6 +3472,60 @@ pub(crate) fn apply_clone_delta_maintenance(conn: &Connection) -> rusqlite::Resu
         "delta_files_applied",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    Ok(())
+}
+
+/// V051 (#479): per-generation df snapshot. The #473 freeze made `clone_token_df` itself the
+/// postings' frozen order, which left the LIVE candidate paths reading stale df — a newly indexed
+/// token rides `DF_FALLBACK` (sorted last) until the next full build, so a new clone family's
+/// sub-block prefixes prefer old tokens, and at the hot-token-cap margin its candidates drop
+/// entirely. `clone_df_epoch` pins each generation's build-time df durably (CASCADE-swept with the
+/// generation row, like edges/postings), so the persisted-graph consumers read their own build's
+/// order while `clone_token_df` is free to move again on incremental passes.
+///
+/// BACKFILL (the V050→V051 bridge): a pre-epoch DB's servable generations were built under the
+/// CURRENT `clone_token_df` — under the #473 freeze df cannot have moved since (any refresh
+/// invalidated `postings_written`, and a postings-invalid Building generation is discarded, never
+/// resumed) — so snapshotting current df per generation is exact and no forced rebuild is needed.
+/// Backfill targets only generations with ZERO epoch rows (each per-generation INSERT is one
+/// atomic statement, so a torn retry resumes cleanly), which also keeps a re-apply from folding
+/// post-V051 (moving) df rows into an already-pinned epoch. Known degenerate edge: a generation
+/// built while its repo's df table was empty backfills nothing; the runtime treats a missing
+/// epoch like `postings_written = 0` (one self-healing rebuild).
+pub(crate) fn apply_clone_df_epoch(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS clone_df_epoch(
+             build_generation INTEGER NOT NULL REFERENCES clone_graph_generations(generation)
+                                               ON DELETE CASCADE,
+             token_hash       INTEGER NOT NULL,
+             df               INTEGER NOT NULL,
+             PRIMARY KEY (build_generation, token_hash)
+         ) STRICT;",
+    )?;
+    // Enumerate the epoch-less generations FIRST, then snapshot each with its own atomic INSERT.
+    // A single self-referencing `INSERT … WHERE NOT EXISTS(SELECT … FROM clone_df_epoch)` is not
+    // used deliberately: SQLite may interleave the SELECT with the insertion, so rows landed for a
+    // generation earlier in the same statement could suppress its remaining rows.
+    let epoch_less: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT g.generation FROM clone_graph_generations g
+             LEFT JOIN clone_df_epoch e ON e.build_generation = g.generation
+             WHERE e.build_generation IS NULL
+             GROUP BY g.generation",
+        )?;
+        stmt.query_map([], |row| row.get::<_, i64>(0))?.collect::<Result<Vec<_>, _>>()?
+    };
+    for generation in epoch_less {
+        conn.execute(
+            "INSERT INTO clone_df_epoch(build_generation, token_hash, df)
+             SELECT g.generation, d.token_hash, d.df
+             FROM clone_graph_generations g
+             JOIN clone_token_df d
+               ON d.repo_id = g.repo_id AND d.normalizer_kind = g.normalizer_kind
+             WHERE g.generation = ?1",
+            params![generation],
+        )?;
+    }
     Ok(())
 }
 

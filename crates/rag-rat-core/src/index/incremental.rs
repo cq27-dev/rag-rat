@@ -290,11 +290,11 @@ impl IndexDatabase {
         // - apply_staged_parser_failures: THE batch-7 finding — the wave loop stages failures
         //   (`graph.is_some()` routing), so the finalize must publish them; at this connection's
         //   own (live) generation, atomic with its edges (no flip exists to defer to).
-        // - refresh_clone_token_df_if_unseeded: SEED the df epoch on a first standalone index
-        //   (pre-#473 this was an unconditional refresh). The #473 df EPOCH FREEZE keeps df fixed
-        //   between FULL rebuilds so the persisted clone-graph postings and every later sub-block
-        //   computation share one total order — an unconditional refresh here would both desync
-        //   them and re-invalidate the postings every incremental pass.
+        // - refresh_clone_token_df: recompute the LIVE df exactly (the wave ran with
+        //   `BumpDf(false)` — this pass, like the full rebuild, recomputes at finalize instead of
+        //   paying per-token upserts). Restored to the pre-#473 unconditional refresh by #479: the
+        //   persisted clone-graph postings are ordered by their own generation's `clone_df_epoch`,
+        //   so a live refresh no longer desyncs (or invalidates) anything.
         // - sync_fts + the graph/flags marks: chunk_fts was written inline and the edges/flags were
         //   just derived in full, so record freshness like the rebuild does — otherwise the very
         //   next open pays a full (safe but wasted) edge re-derive heal and an FTS rebuild.
@@ -308,7 +308,7 @@ impl IndexDatabase {
             self.finalize_base_edges(config, graph)?;
             self.rebuild_logical_symbols()?;
             self.apply_staged_parser_failures(self.active_generation)?;
-            self.refresh_clone_token_df_if_unseeded()?;
+            self.refresh_clone_token_df()?;
             self.sync_fts()?;
             self.mark_graph_index_current()?;
             self.mark_generated_flags_current()

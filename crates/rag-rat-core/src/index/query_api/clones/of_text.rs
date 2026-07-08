@@ -24,8 +24,8 @@ use rusqlite::{Connection, params, params_from_iter};
 use serde::Serialize;
 
 use super::substrate::{
-    DF_FALLBACK, SymbolBag, TokenPosting, load_scoped_baseline_bags, overlap, sub_block_tokens,
-    verified_clone,
+    DF_FALLBACK, SymbolBag, TokenPosting, load_clone_df_epoch, load_current_clone_df,
+    load_scoped_baseline_bags, overlap, sub_block_tokens, verified_clone,
 };
 use super::{HYDRATION_CHUNK, THETA};
 use crate::index::clones::bag_blob::decode_token_bag;
@@ -217,7 +217,7 @@ impl CheckIndex {
         if indexed.is_empty() {
             return Ok(None);
         }
-        let df_by_token = load_clone_token_df(conn)?;
+        let df_by_token = load_current_clone_df(conn)?;
         let mut id_to_idx = HashMap::with_capacity(indexed.len());
         let mut by_struct: HashMap<(String, String), Vec<i64>> = HashMap::new();
         let mut inverted: HashMap<i64, Vec<i64>> = HashMap::new();
@@ -309,8 +309,9 @@ impl CloneCorpus for CheckIndex {
 /// The BOUNDED postings fast path (#296 phase 3): resolve EXACT + NEAR candidates for each new
 /// function with index-covered SQL against the live clone-graph generation's persisted
 /// `clone_subblock_postings`, instead of preloading every scoped bag into a RAM inverted index.
-/// Held per batch; the only up-front load is `clone_token_df` (a small selectivity table, NOT
-/// O(functions)) for the new bags' token ordering.
+/// Held per batch; the only up-front load is the generation's `clone_df_epoch` (a small
+/// selectivity table, NOT O(functions)) for the new bags' token ordering (#479 — the pinned
+/// order the postings were built under, not the moving live `clone_token_df`).
 struct IndexedCorpus {
     generation: i64,
     df_by_token: HashMap<i64, i64>,
@@ -318,7 +319,10 @@ struct IndexedCorpus {
 
 impl IndexedCorpus {
     fn load(conn: &Connection, generation: i64) -> anyhow::Result<Self> {
-        Ok(Self { generation, df_by_token: load_clone_token_df(conn)? })
+        // #479: a NEW bag checked against this generation's postings must order its sub-block by
+        // the generation's FROZEN epoch — the live `clone_token_df` moves on incremental passes
+        // and would silently pick different prefix tokens than the postings were built under.
+        Ok(Self { generation, df_by_token: load_clone_df_epoch(conn, generation)? })
     }
 }
 
@@ -590,27 +594,6 @@ fn load_test_symbol_ids(conn: &Connection) -> anyhow::Result<HashSet<i64>> {
     let ids =
         stmt.query_map([], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<HashSet<i64>>>()?;
     Ok(ids)
-}
-
-/// `token_hash -> df` over the baseline normalizer — the selectivity source for a NEW bag's
-/// sub-block ordering. A token absent from the index is maximally selective (`DF_FALLBACK`),
-/// matching `load_scoped_baseline_bags`.
-fn load_clone_token_df(conn: &Connection) -> anyhow::Result<HashMap<i64, i64>> {
-    // Per-repo df (A5): scope to the active repo; `{df_repo_clause}` is empty pre-A5.
-    let df_scope = crate::index::schema::periphery_repo_scope(conn, "clone_token_df")?;
-    let df_repo_clause =
-        crate::index::schema::periphery_repo_scope_clause(&df_scope, "clone_token_df");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT token_hash, df FROM clone_token_df WHERE normalizer_kind = \
-         'baseline'{df_repo_clause}"
-    ))?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
-    let mut map = HashMap::new();
-    for row in rows {
-        let (token_hash, df) = row?;
-        map.insert(token_hash, df);
-    }
-    Ok(map)
 }
 
 /// A candidate-gen [`SymbolBag`] for a fresh, not-yet-indexed fingerprint (`symbol_id = -1`).

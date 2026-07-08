@@ -8,9 +8,11 @@
 //! - Edges are VERIFICATION RESULTS: `clone_edges.overlap` depends only on the two endpoint bags,
 //!   so an edit to file X cannot change any edge not touching X — edges between unchanged files
 //!   stay valid verbatim.
-//! - Prefix filtering is recall-lossless under ANY single consistent token order, and the #473 df
-//!   EPOCH FREEZE (see `refresh_clone_token_df_if_unseeded`) pins that order between FULL rebuilds,
-//!   so delta sub-blocks and the persisted postings always agree.
+//! - Prefix filtering is recall-lossless under ANY single consistent token order, and the
+//!   generation's `clone_df_epoch` snapshot (#479, superseding the #473 whole-table freeze) pins
+//!   the order its postings were built under — the delta reads THAT, so its sub-blocks and the
+//!   persisted postings always agree even while the live `clone_token_df` moves on incremental
+//!   passes.
 //!
 //! PARITY DISCIPLINE (pinned by `clone_graph_delta_matches_a_full_rebuild_over_an_edit_sequence`):
 //! the delta-maintained edge set must equal a from-scratch rebuild's at the same content. Two
@@ -113,6 +115,19 @@ impl IndexDatabase {
                 started,
             ));
         }
+        if !super::precompute::clone_df_epoch_exists(conn, live.generation)? {
+            // #479: the delta computes sub-blocks under the generation's pinned epoch; without
+            // the epoch rows the build order is unrecoverable, and patching under a different
+            // order would silently drop edges. One full rebuild re-pins it.
+            return Ok(report(
+                "NotEligible",
+                Some("live generation has no df epoch (pre-epoch build)"),
+                0,
+                0,
+                0,
+                started,
+            ));
+        }
         let revision = self.content_revision()?;
         if live.source_revision == revision {
             return Ok(CloneDeltaReport {
@@ -151,7 +166,12 @@ impl IndexDatabase {
             });
         }
 
-        let delta_bags = load_scoped_baseline_bags_for_paths(conn, &paths)?;
+        // #479: the delta's bags — and therefore every sub-block computed below — are ordered by
+        // the generation's FROZEN epoch, not the live `clone_token_df` (which moves on
+        // incremental passes). This is what keeps delta-emitted postings byte-compatible with the
+        // build's.
+        let epoch_df = super::substrate::load_clone_df_epoch(conn, generation)?;
+        let delta_bags = load_scoped_baseline_bags_for_paths(conn, &paths, &epoch_df)?;
         let anchors = anchors_for_paths(conn, &paths)?;
         let sub_blocks: BTreeMap<i64, Vec<i64>> = delta_bags
             .iter()
@@ -596,6 +616,10 @@ fn hydrate_posting_candidates(
 #[cfg(test)]
 mod tests {
     use super::super::precompute::tests::{clone_fixture_config, edge_keys};
+    use super::{
+        BTreeSet, CLONE_PRECOMPUTE_THETA, load_scoped_baseline_bags_for_paths, params,
+        sub_block_tokens,
+    };
     use crate::index::query_api::clones::precompute::CloneEdgeOptions;
 
     /// One incremental index over the fixture root (the watcher's discover path — works without
@@ -684,6 +708,97 @@ mod tests {
         let delta_edges = edge_keys(&db);
         let rebuilt_edges = force_rebuild_edges(&db);
         assert_eq!(delta_edges, rebuilt_edges, "compound deltas stay parity-equal");
+        drop(db);
+
+        // INTERLEAVED LIVE-INDEX STEP (#479): every reindex above already bumps the LIVE df; here
+        // an adversarial whole-table inversion (the most live drift could ever diverge from the
+        // pinned epoch) precedes one more edit + delta. Parity with a from-scratch rebuild must
+        // still hold — the delta orders by the generation's epoch, not the live table. (The
+        // byte-level discriminator lives in
+        // `delta_postings_are_ordered_by_the_epoch_not_the_live_df`; this step pins the
+        // end-to-end soundness claim on the edge set.)
+        {
+            let db = crate::IndexDatabase::open_config(&config).unwrap();
+            db.storage
+                .connection()
+                .execute("UPDATE clone_token_df SET df = 1000000 - df", [])
+                .unwrap();
+        }
+        std::fs::write(
+            config.root.join("src/e.rs"),
+            "pub fn load_shipment(db: Db) -> i32 { let s = db.get(50); validate(s); s + 1 }\n",
+        )
+        .unwrap();
+        let db = reindex(&config);
+        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, "Applied");
+        let delta_edges = edge_keys(&db);
+        let rebuilt_edges = force_rebuild_edges(&db);
+        assert_eq!(
+            delta_edges, rebuilt_edges,
+            "parity holds through an adversarial live-table inversion between deltas"
+        );
+    }
+
+    /// The byte-level pin for the #479 df split: the delta's persisted postings are ordered by
+    /// the generation's PINNED epoch, not the live `clone_token_df`. The live table is inverted
+    /// before the delta, so the two orders provably select DIFFERENT sub-block prefixes for the
+    /// touched file — and the postings must match the EPOCH's selection.
+    #[test]
+    fn delta_postings_are_ordered_by_the_epoch_not_the_live_df() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-epoch-postings");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        let built = db.precompute_clone_graph(None).unwrap();
+        assert_eq!(built.status, "Complete");
+        // Adversarial live drift: invert the whole live table.
+        db.storage.connection().execute("UPDATE clone_token_df SET df = 1000000 - df", []).unwrap();
+        drop(db);
+
+        // A near-clone family member: enough shared (mid-df) and unique (df=1) tokens that the
+        // epoch and inverted-live orders pick different prefixes.
+        let touched = "src/shipment.rs".to_string();
+        std::fs::write(
+            config.root.join(&touched),
+            "pub fn load_shipment(db: Db) -> i32 { let s = db.get(50); validate(s); s + 1 }\n",
+        )
+        .unwrap();
+        let db = reindex(&config);
+        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, "Applied");
+
+        let conn = db.storage.connection();
+        let paths = vec![touched.clone()];
+        let sub_block_union = |df: &std::collections::HashMap<i64, i64>| -> BTreeSet<i64> {
+            load_scoped_baseline_bags_for_paths(conn, &paths, df)
+                .unwrap()
+                .iter()
+                .flat_map(|bag| sub_block_tokens(bag, CLONE_PRECOMPUTE_THETA))
+                .collect()
+        };
+        let epoch_df =
+            super::super::substrate::load_clone_df_epoch(conn, built.generation).unwrap();
+        let live_df = super::super::substrate::load_current_clone_df(conn).unwrap();
+        let under_epoch = sub_block_union(&epoch_df);
+        let under_live = sub_block_union(&live_df);
+        assert_ne!(
+            under_epoch, under_live,
+            "precondition: the inversion must actually change the prefix selection — if this \
+             fails the fixture has degenerated and the test is vacuous"
+        );
+
+        let persisted: BTreeSet<i64> = conn
+            .prepare(
+                "SELECT DISTINCT token_hash FROM clone_subblock_postings
+                 WHERE build_generation = ?1 AND path = ?2",
+            )
+            .unwrap()
+            .query_map(params![built.generation, touched], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            persisted, under_epoch,
+            "delta-emitted postings are selected under the generation's pinned epoch"
+        );
     }
 
     /// A current generation is a cheap no-op — and a SECOND delta right after an applied one must
@@ -947,8 +1062,10 @@ mod tests {
         drop(db);
 
         // A content pass inside the quiet window: the delta settles freshness in place; the
-        // drift-owed FULL rebuild stays deferred. The new file's tokens do NOT enter the frozen
-        // df epoch (that is exactly the drift the counter measures).
+        // drift-owed FULL rebuild stays deferred. #479: the new file's tokens DO enter the LIVE
+        // df immediately (the incremental bump), but the generation's PINNED epoch — what its
+        // postings are ordered by — still predates them; that gap is exactly the drift the
+        // counter measures.
         std::fs::write(
             config.root.join("src/i.rs"),
             "pub fn drift_probe(q: i64) -> i64 { q * 11 - 6 }\n",
@@ -956,13 +1073,17 @@ mod tests {
         .unwrap();
         crate::watch::maintenance_pass(&config, false).unwrap();
         let db = crate::IndexDatabase::open_config(&config).unwrap();
-        let df_count = |db: &crate::IndexDatabase| -> i64 {
+        let epoch_count = |db: &crate::IndexDatabase, generation: i64| -> i64 {
             db.storage
                 .connection()
-                .query_row("SELECT COUNT(*) FROM clone_token_df", [], |r| r.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM clone_df_epoch WHERE build_generation = ?1",
+                    [generation],
+                    |r| r.get(0),
+                )
                 .unwrap()
         };
-        let frozen_df = df_count(&db);
+        let pinned_epoch = epoch_count(&db, built.generation);
         let live: i64 = db
             .storage
             .connection()
@@ -999,11 +1120,13 @@ mod tests {
             .unwrap();
         assert!(live > built.generation, "the quiet-elapsed pass ran the drift full rebuild");
         assert_eq!(absorbed, 0, "the fresh generation starts with zero absorbed deltas");
-        // The whole POINT of the drift rebuild (PR #477 review): it must refresh the df epoch,
-        // not just reset the counter — the delta-added file's tokens enter df with the rebuild.
+        // The whole POINT of the drift rebuild (PR #477 review): it must move the PINNED epoch,
+        // not just reset the counter — the fresh generation's postings are ordered by a df that
+        // includes the delta-added file's tokens (#479: the live table already had them from the
+        // incremental bump; the rebuild is what folds them into the served order).
         assert!(
-            df_count(&db) > frozen_df,
-            "the drift full rebuild refreshes the df epoch (absorbs the delta-added tokens)"
+            epoch_count(&db, live) > pinned_epoch,
+            "the drift full rebuild re-pins the epoch with the delta-added tokens"
         );
     }
 
