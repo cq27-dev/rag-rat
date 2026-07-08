@@ -46,14 +46,13 @@ pub(crate) fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> 
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("git repository has no worktree"))?
         .to_path_buf();
-    let pathspec = config_root_pathspec(&worktree_root, root);
     let mut paths = GitChangedPaths::default();
 
     for item in repo
         .status(gix::progress::Discard)?
         .untracked_files(UntrackedFiles::Files)
         .tree_index_track_renames(tree_index::TrackRenames::Disabled)
-        .into_iter([pathspec])?
+        .into_iter(config_root_status_pathspec(&worktree_root, root))?
     {
         let item = item?;
         let Some(path) = repo_relative_path_to_config_path(&worktree_root, root, item.location())
@@ -73,6 +72,33 @@ pub(crate) fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> 
     Ok(paths)
 }
 
+/// The status pathspec for a SUBDIR config root (`<subdir>/**`), or `None` when the config root
+/// IS the worktree root.
+///
+/// #474: a pathspec disables gix's ignored-DIRECTORY pruning wherever the spec could still match —
+/// the former whole-root wildcard `"*"` could match anywhere, so the dirwalk descended into every
+/// gitignored subtree (probing `.gitignore`/`.gitattributes` per directory), ~47k opens per
+/// maintenance pass under a vendored benchmark corpus in `target/` where `git status` prunes the
+/// same tree with zero. The whole-root case therefore passes NO pathspec (the choice
+/// `is_worktree_dirty` documents), pinned by
+/// `git_changed_paths_does_not_descend_into_ignored_directories`.
+///
+/// A SUBDIR root KEEPS its `<subdir>/**` spec (#474 review): gix still prunes everything the spec
+/// cannot match — including sibling ignored trees, pinned by
+/// `git_changed_paths_prunes_ignored_directories_outside_a_subdir_root` — and the bounded walk
+/// keeps an I/O failure in an out-of-scope sibling path from aborting a healthy subdir's changed
+/// indexing. The unpruned descent inside the subdir's OWN ignored dirs is the pre-existing,
+/// far smaller cost.
+fn config_root_status_pathspec(worktree_root: &Path, config_root: &Path) -> Option<BString> {
+    let relative = config_root.strip_prefix(worktree_root).unwrap_or_else(|_| Path::new(""));
+    let relative = path_string(relative);
+    if relative.is_empty() || relative == "." {
+        None
+    } else {
+        Some(BString::from(format!("{relative}/**")))
+    }
+}
+
 pub(crate) fn repo_relative_path_to_config_path(
     worktree_root: &Path,
     config_root: &Path,
@@ -80,16 +106,6 @@ pub(crate) fn repo_relative_path_to_config_path(
 ) -> Option<PathBuf> {
     let path = PathBuf::from(repo_relative_path.to_str_lossy().as_ref());
     worktree_root.join(path).strip_prefix(config_root).ok().map(Path::to_path_buf)
-}
-
-pub(crate) fn config_root_pathspec(worktree_root: &Path, config_root: &Path) -> BString {
-    let relative = config_root.strip_prefix(worktree_root).unwrap_or_else(|_| Path::new(""));
-    let relative = path_string(relative);
-    if relative.is_empty() || relative == "." {
-        BString::from("*")
-    } else {
-        BString::from(format!("{relative}/**"))
-    }
 }
 
 pub(crate) fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
@@ -306,6 +322,98 @@ mod worktree_scope_tests {
     fn none_is_the_base_scope() {
         let main = init_repo("none");
         assert_eq!(resolve_worktree_scope(&main, None), resolve_git_context(&main));
+    }
+
+    /// #474: the status walk must PRUNE gitignored directories, not descend into them — on a repo
+    /// with a large ignored build tree (a vendored benchmark corpus under `target/`), descending
+    /// costs tens of thousands of directory opens on EVERY maintenance pass. `git status` prunes;
+    /// the gix walk must too. Observability: an inotify watch on a directory fires `Access(Open)`
+    /// when that directory itself is opened (readdir), so a pruned walk delivers no events inside
+    /// the ignored subtree. Linux-only (inotify), like the watch-placement tests.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_changed_paths_does_not_descend_into_ignored_directories() {
+        use notify::Watcher as _;
+        let dir = init_repo("ignored-prune");
+        std::fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
+        git(&dir, &["add", ".gitignore"]);
+        git(&dir, &["commit", "-q", "-m", "ignore vendor"]);
+        std::fs::create_dir_all(dir.join("vendor/nested")).unwrap();
+        std::fs::write(dir.join("vendor/nested/blob.txt"), "ignored").unwrap();
+        // A real change outside the ignored tree, so the walk has work to report.
+        std::fs::write(dir.join("b.txt"), "fresh").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
+        .unwrap();
+        watcher.watch(&dir.join("vendor/nested"), notify::RecursiveMode::NonRecursive).unwrap();
+        // Drain any setup noise until quiet (the watch-test discipline), so only the status
+        // walk's own accesses can land in the assertion window.
+        while rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok() {}
+
+        let paths = git_changed_paths(&dir).unwrap();
+        assert!(
+            paths.changed.contains(&PathBuf::from("b.txt")),
+            "the real change is still reported: {paths:?}"
+        );
+
+        let mut intrusions = Vec::new();
+        while let Ok(event) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            if let Ok(event) = event {
+                intrusions.extend(event.paths);
+            }
+        }
+        assert!(
+            intrusions.is_empty(),
+            "the status walk descended into the gitignored subtree: {intrusions:?}"
+        );
+    }
+
+    /// The subdir-root complement (#474 review): a `<subdir>/**` pathspec keeps the status walk
+    /// BOUNDED — gix prunes everything the spec cannot match, so a sibling gitignored tree is
+    /// never entered even though a pathspec is present. This is the load-bearing assumption
+    /// behind keeping the spec for subdir roots (isolation from out-of-scope failures) while the
+    /// whole-root case drops it entirely.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_changed_paths_prunes_ignored_directories_outside_a_subdir_root() {
+        use notify::Watcher as _;
+        let dir = init_repo("subdir-prune");
+        std::fs::write(dir.join(".gitignore"), "vendor/\n").unwrap();
+        std::fs::create_dir_all(dir.join("crates")).unwrap();
+        std::fs::write(dir.join("crates/lib.rs"), "pub fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "subdir root"]);
+        std::fs::create_dir_all(dir.join("vendor/nested")).unwrap();
+        std::fs::write(dir.join("vendor/nested/blob.txt"), "ignored").unwrap();
+        std::fs::write(dir.join("crates/lib.rs"), "pub fn a() {}\npub fn b() {}\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
+        .unwrap();
+        watcher.watch(&dir.join("vendor/nested"), notify::RecursiveMode::NonRecursive).unwrap();
+        while rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok() {}
+
+        let paths = git_changed_paths(&dir.join("crates")).unwrap();
+        assert!(
+            paths.changed.contains(&PathBuf::from("lib.rs")),
+            "the subdir change is reported config-root-relative: {paths:?}"
+        );
+
+        let mut intrusions = Vec::new();
+        while let Ok(event) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            if let Ok(event) = event {
+                intrusions.extend(event.paths);
+            }
+        }
+        assert!(
+            intrusions.is_empty(),
+            "a subdir pathspec must not open sibling ignored trees: {intrusions:?}"
+        );
     }
 
     #[test]
