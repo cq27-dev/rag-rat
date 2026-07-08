@@ -152,6 +152,51 @@ impl IndexDatabase {
         Ok(())
     }
 
+    /// Adopt retained committed rows into the ACTIVE commit scope by re-stamping
+    /// `files.commit_sha` in place (#502): the row id — and every chunk, symbol, edge,
+    /// embedding, fingerprint, FTS entry, and memory binding hanging off it — survives, so a
+    /// HEAD move (pull, branch checkout) costs roughly its diff instead of a full re-derive.
+    /// The overlay→commit re-stamp in [`Self::heal_stale_overlay_rows`] is the precedent.
+    ///
+    /// The candidates come from [`discovery_plan`](super::discovery::discovery_plan), which
+    /// selects only paths ABSENT from the active scope, and the caller's pass transaction
+    /// isolates selection from application — so the V043 UNIQUE
+    /// `(repo_id, path, commit_sha, worktree_id, generation)` cannot collide. The WHERE still
+    /// pins the row to this writer's repo + generation + base scope (belt to the plan's
+    /// selection), so a stale candidate updates nothing rather than the wrong row.
+    pub(super) fn carry_retained_files_into_active_scope(
+        &self,
+        carried: &[i64],
+    ) -> anyhow::Result<usize> {
+        if carried.is_empty() || self.active_commit_sha.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.storage.connection();
+        let mut stmt = conn.prepare(
+            "UPDATE main.files SET commit_sha = ?2
+             WHERE id = ?1 AND repo_id = ?3 AND generation = ?4 AND worktree_id = ''
+               AND commit_sha != ?2",
+        )?;
+        let mut restamped = 0usize;
+        for file_id in carried {
+            restamped += stmt.execute(params![
+                file_id,
+                self.active_commit_sha,
+                self.active_repo_id,
+                self.active_generation,
+            ])?;
+        }
+        if restamped > 0 {
+            tracing::info!(
+                target: "rag_rat_core::maintenance",
+                carried = restamped,
+                commit = %self.active_commit_sha,
+                "carried retained committed rows into the active scope (HEAD move)"
+            );
+        }
+        Ok(restamped)
+    }
+
     pub(super) fn file_row(&self, path: &Path) -> anyhow::Result<FileRow> {
         self.storage
             .connection()

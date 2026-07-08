@@ -129,12 +129,14 @@ fn run_pass(
     retry_base_embedding_backlog: bool,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
+    let mut timings = PassTimings::new(started);
     // #427: the core refuses a first-time-empty registration (`rag-rat mcp` / a hook on a config
     // with no `[target_bindings]` or no matching files). A maintenance/watch pass treats that as
     // "nothing to index yet" and DEFERS silently — a later pass registers once real content
     // appears. A recorded root going empty still prunes (not first-time → not refused). The
     // one-shot `index` command instead surfaces the same error to the operator.
-    let (mut db, content_changed) = match IndexDatabase::index_discover_reporting(config) {
+    let discover = timings.stage("discover", || IndexDatabase::index_discover_reporting(config));
+    let (mut db, content_changed) = match discover {
         Ok(result) => result,
         Err(err) if err.downcast_ref::<crate::index::EmptyIndexRefused>().is_some() => {
             return Ok(());
@@ -161,7 +163,8 @@ fn run_pass(
     // worktree change counts toward running the tail below even when config.root itself didn't
     // change. Reconcile a CHANGED overlay's embeddings INLINE (while scoped to it) so a worktree
     // query isn't BM25-only for branch content — the base reconcile below can't see overlay chunks.
-    let overlays_changed = refresh_worktree_overlays(&mut db, config, Some(&budget));
+    let overlays_changed =
+        timings.stage("overlays", || refresh_worktree_overlays(&mut db, config, Some(&budget)));
     let tail_already_forced = pass_tail_forced_by_state(
         content_changed,
         overlays_changed,
@@ -212,14 +215,18 @@ fn run_pass(
         base_embedding_backlog,
         clone_graph_due,
     ) {
-        maybe_checkpoint_wal(&db, quiet_pass, crate::index::WAL_CHECKPOINT_MIN_BYTES);
+        timings.stage("wal", || {
+            maybe_checkpoint_wal(&db, quiet_pass, crate::index::WAL_CHECKPOINT_MIN_BYTES)
+        });
+        timings.emit(false, content_changed, overlays_changed);
         return Ok(());
     }
     // The base reconcile gets only the budget the overlays left behind; `None` → already exhausted,
     // so skip it (the embedding backlog rides the next pass) rather than spend a fresh full budget.
     let mut base_reconcile_status = None;
     if let Some(options) = budget.next_options() {
-        let report = db.reconcile_with_options_progress(options, |_| {})?;
+        let report =
+            timings.stage("reconcile", || db.reconcile_with_options_progress(options, |_| {}))?;
         base_reconcile_status = Some(report.status);
     }
     // Clone-edge graph (#286/#473): try the cheap IN-PLACE delta first — it settles an ordinary
@@ -230,8 +237,8 @@ fn run_pass(
     // (`clone_graph_due`) so sustained editing defers it instead of treadmilling. Best-effort +
     // resumable, with whatever budget the embedding reconcile left (shared
     // PASS_RECONCILE_MAX_SECONDS so a pass can't overrun); `None` budget → rides the next pass.
-    let clone_full_rebuild_owed = match db
-        .apply_clone_graph_delta(crate::index::CLONE_DELTA_MAX_FILES)
+    let clone_full_rebuild_owed = match timings
+        .stage("clone_delta", || db.apply_clone_graph_delta(crate::index::CLONE_DELTA_MAX_FILES))
     {
         Ok(delta) if delta.status == "Applied" || delta.status == "Noop" => delta.full_rebuild_owed,
         _ => true,
@@ -240,17 +247,73 @@ fn run_pass(
         && clone_graph_due
         && let Some(options) = budget.next_options()
     {
-        let _ = db.reconcile_clone_edges_with_budget(options.max_seconds);
+        let _ = timings
+            .stage("clone_rebuild", || db.reconcile_clone_edges_with_budget(options.max_seconds));
     }
     if run_gc {
-        let _ = db.garbage_collect();
+        let _ = timings.stage("gc", || db.garbage_collect());
     }
-    let _ = db.memory_validate();
+    let _ = timings.stage("memory_validate", || db.memory_validate());
     if shutdown_reconcile_pending && base_reconcile_status.as_deref() == Some("Current") {
         db.clear_watch_shutdown_reconcile_pending()?;
     }
-    maybe_checkpoint_wal(&db, quiet_pass, crate::index::WAL_CHECKPOINT_MIN_BYTES);
+    timings.stage("wal", || {
+        maybe_checkpoint_wal(&db, quiet_pass, crate::index::WAL_CHECKPOINT_MIN_BYTES)
+    });
+    timings.emit(true, content_changed, overlays_changed);
     Ok(())
+}
+
+/// Per-stage wall-clock for one maintenance pass, emitted as a single summary event (#502): the
+/// dogfood investigation had to reconstruct where a long pass went from `reconcile_attempts`
+/// timestamps because the pass logged no stage timings. One greppable line per pass fixes that.
+/// Tail passes log at `info`; an idle discover-only sweep logs at `debug` so a quiet server does
+/// not fill the log.
+struct PassTimings {
+    started: Instant,
+    stages: Vec<(&'static str, Duration)>,
+}
+
+impl PassTimings {
+    fn new(started: Instant) -> Self {
+        Self { started, stages: Vec::new() }
+    }
+
+    fn stage<T>(&mut self, name: &'static str, work: impl FnOnce() -> T) -> T {
+        let stage_started = Instant::now();
+        let result = work();
+        self.stages.push((name, stage_started.elapsed()));
+        result
+    }
+
+    fn emit(&self, tail_ran: bool, content_changed: bool, overlays_changed: bool) {
+        let stages = self
+            .stages
+            .iter()
+            .map(|(name, elapsed)| format!("{name}={}ms", elapsed.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let total_ms = self.started.elapsed().as_millis() as u64;
+        if tail_ran {
+            tracing::info!(
+                target: "rag_rat_core::maintenance",
+                total_ms,
+                content_changed,
+                overlays_changed,
+                %stages,
+                "maintenance pass"
+            );
+        } else {
+            tracing::debug!(
+                target: "rag_rat_core::maintenance",
+                total_ms,
+                content_changed,
+                overlays_changed,
+                %stages,
+                "maintenance pass (tail skipped)"
+            );
+        }
+    }
 }
 
 /// Opportunistic WAL hygiene (#482), on QUIET passes only: nothing else truncates the shared

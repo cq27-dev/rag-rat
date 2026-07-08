@@ -1,5 +1,16 @@
 use super::*;
 
+/// What an incremental file pass did, split by what each count gates downstream: `indexed`
+/// (derived or deleted rows — real content change), `manifest_in_change_set` (a `Cargo.toml`
+/// moved — refresh the package map), and `carried` (#502 — retained rows re-stamped into the
+/// active scope; mutates the DB and re-keys the package scope, but is NOT a content change:
+/// chunks, embeddings, and FTS entries all survive the re-stamp untouched).
+struct IncrementalFilesOutcome {
+    indexed: usize,
+    manifest_in_change_set: bool,
+    carried: usize,
+}
+
 impl IndexDatabase {
     pub fn index_changed(config: &Config) -> anyhow::Result<Self> {
         Self::index_changed_with_progress(config, |_| {})
@@ -179,11 +190,12 @@ impl IndexDatabase {
                     config.llm.embedding.backend.model_id(),
                 )?;
             }
-            let (indexed, manifest_in_change_set) = match effective_mode {
+            let outcome = match effective_mode {
                 IndexMode::Changed => db.index_changed_files_with_progress(config, progress)?,
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
             };
+            let IncrementalFilesOutcome { indexed, manifest_in_change_set, carried } = outcome;
             let base_scope_discovery_marked = if effective_mode == IndexMode::Discover {
                 db.mark_active_base_scope_discovered(&config.targets)?
             } else {
@@ -201,6 +213,7 @@ impl IndexDatabase {
             };
             let mut mutated = indexed > 0
                 || healed > 0
+                || carried > 0
                 || source_root_changed
                 || git_meta_changed
                 || embedding_model_seeded
@@ -221,19 +234,28 @@ impl IndexDatabase {
             // inside that gate and was skipped, leaving the crate set stale until the
             // next full rebuild). `refresh_packages` returns whether the package map
             // changed, which forces a re-resolve even when no file was indexed.
-            let roots_changed = if indexed > 0 || healed > 0 || manifest_in_change_set {
-                db.refresh_packages(&config.root)?
-            } else {
-                false
-            };
+            // `carried > 0` also refreshes (#502): the package map is keyed by
+            // `(commit_sha, worktree_id)`, so a carried scope needs its rows re-derived at the
+            // new commit even when nothing was (re)indexed — otherwise import resolution falls
+            // open until the next real edit (the incremental twin of the rebuild's
+            // `carry_forward_overlay_packages`).
+            let roots_changed =
+                if indexed > 0 || healed > 0 || carried > 0 || manifest_in_change_set {
+                    db.refresh_packages(&config.root)?
+                } else {
+                    false
+                };
             if roots_changed {
                 mutated = true;
             }
             // Healing can delete overlay symbols (NULLing their in-edges via
             // `remove_file_in_scope`), so it needs the same re-derive tail as real file changes.
             // Also re-resolve when the crate set changed but no file was indexed (a manifest-only
-            // change) so `use new_crate::X` resolves correctly (#95).
-            if indexed > 0 || healed > 0 || roots_changed {
+            // change) so `use new_crate::X` resolves correctly (#95). A carried scope (#502)
+            // re-resolves too: a carried caller's edge may point at a symbol of a file that
+            // changed (or vanished) across the HEAD move and was re-derived with fresh rowids —
+            // the full-scope resolve every ordinary edit pass runs is what re-points it.
+            if indexed > 0 || healed > 0 || carried > 0 || roots_changed {
                 progress(IndexProgress::RebuildingLogicalSymbols);
                 db.rebuild_logical_symbols()?;
                 progress(IndexProgress::ResolvingGraph);
@@ -470,14 +492,16 @@ impl IndexDatabase {
         Ok((total, graph))
     }
 
-    /// Returns `(file_count, manifest_in_change_set)`. The manifest flag is true when any changed
-    /// or deleted path is a `Cargo.toml`, signalling the workspace crate set may have changed
-    /// and the `packages` map should be refreshed before the resolve pass (#61, salvaging #95).
+    /// The manifest flag is true when any changed or deleted path is a `Cargo.toml`, signalling
+    /// the workspace crate set may have changed and the `packages` map should be refreshed
+    /// before the resolve pass (#61, salvaging #95). Changed mode never carries: it only sees
+    /// working-tree dirt, and the stale base-scope marker promotes a HEAD move to Discover
+    /// (#459), where the carry lives.
     fn index_changed_files_with_progress<F>(
         &self,
         config: &Config,
         progress: &mut F,
-    ) -> anyhow::Result<(usize, bool)>
+    ) -> anyhow::Result<IncrementalFilesOutcome>
     where
         F: FnMut(IndexProgress),
     {
@@ -488,24 +512,29 @@ impl IndexDatabase {
                 || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path));
         let files = collect_changed_index_files(config, &changes)?;
         let files = self.assign_file_scopes(files, &changes);
-        let count = self.apply_incremental_file_plan(files, changes.deleted, progress)?;
-        Ok((count, manifest_in_change_set))
+        let indexed = self.apply_incremental_file_plan(files, changes.deleted, progress)?;
+        Ok(IncrementalFilesOutcome { indexed, manifest_in_change_set, carried: 0 })
     }
 
-    /// Returns `(file_count, manifest_in_change_set)`. The manifest flag also consults the
-    /// discovery plan's file list, so a NEW (untracked, not-yet-committed) `Cargo.toml` is
-    /// caught even though git status would not list it as changed (#61, salvaging #95).
+    /// The manifest flag also consults the discovery plan's file list, so a NEW (untracked,
+    /// not-yet-committed) `Cargo.toml` is caught even though git status would not list it as
+    /// changed (#61, salvaging #95). Applies the plan's carry candidates (#502) — retained
+    /// committed rows re-stamped into the active commit scope — before deriving the (diff-sized)
+    /// remainder, all inside the caller's pass transaction.
     fn index_discovered_files_with_progress<F>(
         &self,
         config: &Config,
         progress: &mut F,
-    ) -> anyhow::Result<(usize, bool)>
+    ) -> anyhow::Result<IncrementalFilesOutcome>
     where
         F: FnMut(IndexProgress),
     {
         progress(IndexProgress::Discovering);
-        let plan = discovery_plan(self.storage.connection(), config)?;
+        // The status walk feeds BOTH the plan's carry filter (a dirty/untracked path must never
+        // be carried into the committed scope) and the scope assignment below — one walk, shared.
         let changes = git_changed_paths(&config.root).unwrap_or_default();
+        let plan = discovery_plan(self.storage.connection(), config, &changes)?;
+        let carried = self.carry_retained_files_into_active_scope(&plan.carried)?;
         let manifest_in_change_set =
             paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
                 || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path))
@@ -513,8 +542,8 @@ impl IndexDatabase {
                     plan.files.iter().map(|file| file.relative_path.as_path()),
                 );
         let files = self.assign_file_scopes(plan.files, &changes);
-        let count = self.apply_incremental_file_plan(files, plan.deleted, progress)?;
-        Ok((count, manifest_in_change_set))
+        let indexed = self.apply_incremental_file_plan(files, plan.deleted, progress)?;
+        Ok(IncrementalFilesOutcome { indexed, manifest_in_change_set, carried })
     }
 
     pub(super) fn assign_file_scopes(

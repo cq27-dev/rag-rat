@@ -884,6 +884,7 @@ mod generation_rebuild;
 mod git_history_reload;
 mod github_papertrail;
 mod graph_edges;
+mod head_move_carry;
 mod multi_repo_scope;
 mod orientation_healing;
 mod reconcile_embeddings;

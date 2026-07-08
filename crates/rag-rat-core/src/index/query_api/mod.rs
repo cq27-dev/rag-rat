@@ -98,22 +98,40 @@ impl IndexDatabase {
     }
 
     pub fn discovery_status(&self, config: &Config) -> anyhow::Result<DiscoveryStatus> {
-        let plan = discovery_plan(self.storage.connection(), config)?;
+        // The plan's carry filter needs the working tree's status (dirty/untracked paths are
+        // never carried), so status computes it exactly like the discover pass does — keeping
+        // the reported counts identical to what that pass would do.
+        let changes = git_changed_paths(&config.root).unwrap_or_default();
+        let plan = discovery_plan(self.storage.connection(), config, &changes)?;
         let unindexed_source_files =
             plan.unindexed.iter().filter(|file| file.kind == TargetKind::Source).count();
         let unindexed_sample =
             plan.unindexed.iter().take(10).map(|file| path_string(&file.relative_path)).collect();
-        let warning = (unindexed_source_files > 0).then(|| {
-            format!(
+        // A pending carry (#502) is pending work too: the retained rows are not in the active
+        // scope until a discover pass re-stamps them, so a carry-only HEAD move must not read as
+        // a clean index (a watcher-less install would otherwise report clean while queries at
+        // the new HEAD miss those files). The unindexed warning wins when both apply — its
+        // remedy covers the carry as well.
+        let warning = if unindexed_source_files > 0 {
+            Some(format!(
                 "{unindexed_source_files} unindexed source files detected. Run `rag-rat index \
                  --full` or `rag-rat index --discover`."
-            )
-        });
+            ))
+        } else if !plan.carried.is_empty() {
+            Some(format!(
+                "{} indexed files await adoption onto the current HEAD (it moved since the last \
+                 pass). Run `rag-rat index --discover`.",
+                plan.carried.len()
+            ))
+        } else {
+            None
+        };
         Ok(DiscoveryStatus {
             discovered_files: plan.discovered_files,
             indexed_files: plan.indexed_files,
             unindexed_files: plan.unindexed.len(),
             unindexed_source_files,
+            carryable_files: plan.carried.len(),
             changed_indexed_files: plan.changed.len(),
             removed_indexed_files: plan.deleted.len(),
             unindexed_sample,
