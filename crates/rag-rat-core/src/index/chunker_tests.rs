@@ -91,10 +91,11 @@ fn crlf_markdown_intermediate_boundary_is_on_disk_exact() {
 
 #[test]
 fn crlf_code_path_chunk_offsets_match_disk() {
-    // The tree-sitter code path (code_chunks_for_symbols -> line_span -> split_symbol) is the path
-    // whose offsets graph_meta joins against tree-sitter symbol byte offsets. line_span returns the
-    // on-disk span so split_symbol's end_byte stays byte-aligned with the raw file on CRLF input
-    // (the pre-#241-completion code computed end_byte in LF-normalized space and drifted short).
+    // The tree-sitter code path (code_chunks_for_symbols -> LineOffsets -> split_symbol) is the
+    // path whose offsets graph_meta joins against tree-sitter symbol byte offsets. The line-offset
+    // table yields the raw on-disk span so split_symbol's end_byte stays byte-aligned with the raw
+    // file on CRLF input (the pre-#241-completion code computed end_byte in LF-normalized space
+    // and drifted short).
     let crlf = "fn alpha() {\r\n    let x = 1;\r\n    let y = 2;\r\n}\r\n\r\nfn beta() {\r\n    \
                 alpha();\r\n}\r\n";
     let chunks = chunker::chunks_for_file(Path::new("x.rs"), Language::Rust, crlf);
@@ -131,4 +132,73 @@ fn lf_offsets_unchanged_regression() {
     let chunks = chunker::generated_chunks_for_file(Path::new("x.txt"), lf);
     assert_chunk_bytes_match_disk(&chunks, lf);
     assert_contiguous(&chunks, lf);
+}
+
+/// The per-file line-offset table replacing `line_span`'s from-byte-0 rescan (#517). These pin the
+/// exact contract the old scan had, so the O(1) lookups stay byte-identical: raw on-disk bytes
+/// (CRLF included), 1-based whole-line ranges, `None` on empty/invalid ranges, EOF clamping.
+mod line_offsets {
+    use crate::index::chunker::LineOffsets;
+
+    #[test]
+    fn middle_range_slices_whole_lines_including_terminators() {
+        let text = "one\ntwo\nthree\nfour\n";
+        let lines = LineOffsets::new(text);
+        let range = lines.byte_range(2, 3).expect("valid range");
+        assert_eq!(&text[range], "two\nthree\n");
+    }
+
+    #[test]
+    fn crlf_bytes_are_preserved_in_the_span() {
+        // The span must be the raw on-disk bytes — chunk offsets join against tree-sitter symbol
+        // offsets, which count CR bytes.
+        let text = "a\r\nb\r\nc\r\n";
+        let lines = LineOffsets::new(text);
+        let range = lines.byte_range(2, 2).expect("valid range");
+        assert_eq!(&text[range], "b\r\n");
+    }
+
+    #[test]
+    fn zero_start_line_and_inverted_range_are_none() {
+        let lines = LineOffsets::new("a\nb\n");
+        assert!(lines.byte_range(0, 1).is_none(), "lines are 1-based");
+        assert!(lines.byte_range(2, 1).is_none(), "end before start");
+    }
+
+    #[test]
+    fn start_line_past_eof_is_none() {
+        let lines = LineOffsets::new("a\nb");
+        assert!(lines.byte_range(3, 5).is_none());
+    }
+
+    #[test]
+    fn end_line_past_eof_clamps_to_text_end() {
+        let text = "a\nb\nc";
+        let lines = LineOffsets::new(text);
+        let range = lines.byte_range(2, 99).expect("valid range");
+        assert_eq!(&text[range], "b\nc");
+    }
+
+    #[test]
+    fn unterminated_last_line_ends_exactly_at_eof() {
+        let text = "a\nb\nc";
+        let lines = LineOffsets::new(text);
+        let range = lines.byte_range(3, 3).expect("valid range");
+        assert_eq!(&text[range], "c");
+        assert_eq!(lines.line_count(), 3);
+    }
+
+    #[test]
+    fn trailing_newline_does_not_create_a_phantom_line() {
+        let lines = LineOffsets::new("a\nb\n");
+        assert_eq!(lines.line_count(), 2, "split_inclusive semantics: no trailing empty line");
+        assert!(lines.byte_range(3, 3).is_none());
+    }
+
+    #[test]
+    fn empty_text_has_no_lines() {
+        let lines = LineOffsets::new("");
+        assert_eq!(lines.line_count(), 0);
+        assert!(lines.byte_range(1, 1).is_none());
+    }
 }

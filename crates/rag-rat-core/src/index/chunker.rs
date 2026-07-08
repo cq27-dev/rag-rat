@@ -86,18 +86,21 @@ pub fn code_chunks_for_symbols(
     text: &str,
     symbols: &[parser::ParsedSymbol],
 ) -> Vec<Chunk> {
+    // One line-offset table per file: every symbol's line range becomes an O(1) byte-range lookup
+    // instead of a from-byte-0 rescan per symbol (#517).
+    let lines = LineOffsets::new(text);
     let mut chunks = Vec::new();
     for symbol in symbols {
-        let Some(symbol_span) = line_span(text, symbol.start_line, symbol.end_line) else {
+        let Some(range) = lines.byte_range(symbol.start_line, symbol.end_line) else {
             continue;
         };
-        if symbol_span.text.trim().is_empty() {
+        let span_start = range.start;
+        let span_text = &text[range];
+        if span_text.trim().is_empty() {
             continue;
         }
         for (part_idx, part) in
-            split_symbol(&symbol_span.text, symbol_span.start_byte, symbol.start_line, 120)
-                .into_iter()
-                .enumerate()
+            split_symbol(span_text, span_start, symbol.start_line, 120).into_iter().enumerate()
         {
             chunks.push(make_chunk(
                 "code",
@@ -114,13 +117,18 @@ pub fn code_chunks_for_symbols(
             ));
         }
     }
-    chunks.extend(uncovered_code_chunks(path, text, symbols));
+    chunks.extend(uncovered_code_chunks(path, text, symbols, &lines));
     chunks.sort_by_key(|chunk| (chunk.start_byte, chunk.end_byte));
     if chunks.is_empty() { whole_file_chunk(path, text) } else { chunks }
 }
 
-fn uncovered_code_chunks(path: &Path, text: &str, symbols: &[parser::ParsedSymbol]) -> Vec<Chunk> {
-    let line_count = text.lines().count().max(1);
+fn uncovered_code_chunks(
+    path: &Path,
+    text: &str,
+    symbols: &[parser::ParsedSymbol],
+    lines: &LineOffsets,
+) -> Vec<Chunk> {
+    let line_count = lines.line_count().max(1);
     let mut covered = vec![false; line_count + 1];
     for symbol in symbols {
         let start = symbol.start_line.max(1);
@@ -141,6 +149,7 @@ fn uncovered_code_chunks(path: &Path, text: &str, symbols: &[parser::ParsedSymbo
             push_uncovered_chunk(
                 path,
                 text,
+                lines,
                 start,
                 line.saturating_sub(1),
                 chunks.len(),
@@ -149,27 +158,31 @@ fn uncovered_code_chunks(path: &Path, text: &str, symbols: &[parser::ParsedSymbo
         }
     }
     if let Some(start) = start_line {
-        push_uncovered_chunk(path, text, start, line_count, chunks.len(), &mut chunks);
+        push_uncovered_chunk(path, text, lines, start, line_count, chunks.len(), &mut chunks);
     }
     chunks
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_uncovered_chunk(
     path: &Path,
     text: &str,
+    lines: &LineOffsets,
     start_line: usize,
     end_line: usize,
     context_index: usize,
     chunks: &mut Vec<Chunk>,
 ) {
-    let Some(span) = line_span(text, start_line, end_line) else {
+    let Some(range) = lines.byte_range(start_line, end_line) else {
         return;
     };
-    if span.text.trim().is_empty() {
+    let span_start = range.start;
+    let span_text = &text[range];
+    if span_text.trim().is_empty() {
         return;
     }
     for (part_idx, part) in
-        split_symbol(&span.text, span.start_byte, start_line, 80).into_iter().enumerate()
+        split_symbol(span_text, span_start, start_line, 80).into_iter().enumerate()
     {
         chunks.push(make_chunk(
             "code",
@@ -188,37 +201,51 @@ fn push_uncovered_chunk(
     }
 }
 
-struct LineSpan {
-    start_byte: usize,
-    text: String,
+/// Byte offsets of each line start, computed once per file so a line range becomes an O(1)
+/// byte-range lookup — replacing the per-symbol from-byte-0 rescan that made chunking
+/// O(symbols × file bytes) (#517). The range slices the raw on-disk bytes (incl. any CRLF), so a
+/// span's length equals its real byte length; `split_symbol` re-normalizes each line when it
+/// builds chunk text, and advances its byte cursor over these raw lengths so code-chunk offsets
+/// stay aligned with the tree-sitter symbol offsets `query::graph_meta` joins against.
+pub(crate) struct LineOffsets {
+    /// `starts[i]` is the byte offset where 1-based line `i + 1` begins. A trailing `\n` closes
+    /// the last line rather than opening a phantom one (`split_inclusive` line semantics).
+    starts: Vec<usize>,
+    text_len: usize,
 }
 
-fn line_span(text: &str, start_line: usize, end_line: usize) -> Option<LineSpan> {
-    if start_line == 0 || end_line < start_line {
-        return None;
+impl LineOffsets {
+    pub(crate) fn new(text: &str) -> Self {
+        let mut starts = Vec::new();
+        if !text.is_empty() {
+            starts.push(0);
+        }
+        for (idx, byte) in text.bytes().enumerate() {
+            if byte == b'\n' && idx + 1 < text.len() {
+                starts.push(idx + 1);
+            }
+        }
+        Self { starts, text_len: text.len() }
     }
-    let mut byte = 0;
-    let mut start_byte = None;
-    let mut out = String::new();
-    for (idx, raw) in text.split_inclusive('\n').enumerate() {
-        let line_no = idx + 1;
-        if line_no == start_line {
-            start_byte = Some(byte);
-        }
-        if line_no >= start_line && line_no <= end_line {
-            // Keep the raw on-disk bytes (incl. any CRLF) so the returned span's length equals its
-            // real byte length; `split_symbol` re-normalizes each line when it builds chunk text,
-            // and advances its byte cursor over these raw lengths so code-chunk offsets stay
-            // aligned with the tree-sitter symbol offsets `query::graph_meta` joins against.
-            out.push_str(raw);
-        }
-        byte += raw.len();
-        if line_no >= end_line {
-            break;
-        }
+
+    pub(crate) fn line_count(&self) -> usize {
+        self.starts.len()
     }
-    let start_byte = start_byte?;
-    (!out.trim().is_empty()).then_some(LineSpan { start_byte, text: out })
+
+    /// The byte range covering whole lines `start_line..=end_line` (1-based; `end_line` clamps to
+    /// EOF), or `None` when the range is empty or starts past the last line.
+    pub(crate) fn byte_range(
+        &self,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        if start_line == 0 || end_line < start_line || start_line > self.starts.len() {
+            return None;
+        }
+        let start = self.starts[start_line - 1];
+        let end = self.starts.get(end_line).copied().unwrap_or(self.text_len);
+        Some(start..end)
+    }
 }
 
 fn whole_file_chunk(path: &Path, text: &str) -> Vec<Chunk> {
