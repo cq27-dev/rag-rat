@@ -676,6 +676,226 @@ fn compatible_open_refuses_dirty_and_newer_schema() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// #498: the forward-migrate REPLAY path (an existing versioned ledger — every open-time
+/// auto-migrate) must never touch the `__dirty__` marker. The marker choreography ran in
+/// autocommit around a baseline replay that is a pure idempotent no-op on a versioned DB, so any
+/// failure between the stamp and the clear — the live incident was a `SQLITE_BUSY` from an
+/// ordinary writer, which the GLOBAL schema lock deliberately does not serialize against —
+/// stranded a durable marker on a healthy DB, and every subsequent open refused with "dirty or
+/// partial schema migration detected" until a manual `index --full`.
+#[test]
+fn forward_migrate_replay_never_touches_the_dirty_marker() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    truncate_schema_to(&conn, 50);
+
+    // Audit every write that targets the marker: the stamp (the INSERT half of `INSERT OR
+    // REPLACE` fires the insert trigger) and the clear (DELETE).
+    conn.execute_batch(
+        "
+        CREATE TABLE dirty_marker_audit(op TEXT NOT NULL);
+        CREATE TRIGGER audit_dirty_stamp AFTER INSERT ON schema_version
+        WHEN NEW.id = '__dirty__'
+        BEGIN INSERT INTO dirty_marker_audit(op) VALUES ('stamp'); END;
+        CREATE TRIGGER audit_dirty_clear BEFORE DELETE ON schema_version
+        WHEN OLD.id = '__dirty__'
+        BEGIN INSERT INTO dirty_marker_audit(op) VALUES ('clear'); END;
+        ",
+    )
+    .unwrap();
+
+    schema::migrate_forward(&conn).unwrap();
+
+    let marker_writes: i64 =
+        conn.query_row("SELECT COUNT(*) FROM dirty_marker_audit", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        marker_writes, 0,
+        "a forward migrate over an existing ledger must not stamp or clear the dirty marker — the \
+         stamp..clear window is what a concurrent writer's SQLITE_BUSY strands (#498)"
+    );
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(status.state, schema::SchemaState::Compatible);
+    assert_eq!(status.current_version, schema::LATEST_SCHEMA_VERSION);
+}
+
+/// #498: a failure while REPLAYING a pending step must leave the schema `Older` — retryable on
+/// the next open — never `Dirty` (which refuses every open until a manual rebuild). The injected
+/// abort at the step's ledger record stands in for any mid-replay failure; the live one was a
+/// `SQLITE_BUSY` during the V050→V051 step.
+#[test]
+fn forward_migrate_step_failure_leaves_a_retryable_older_schema_not_dirty() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    truncate_schema_to(&conn, 50);
+
+    conn.execute_batch(
+        "
+        CREATE TRIGGER fail_051_record BEFORE INSERT ON schema_version
+        WHEN NEW.id = '051_clone_df_epoch'
+        BEGIN SELECT RAISE(ABORT, 'injected mid-replay failure'); END;
+        ",
+    )
+    .unwrap();
+    assert!(schema::migrate_forward(&conn).is_err(), "the injected failure fails the migrate");
+
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(
+        status.state,
+        schema::SchemaState::Older,
+        "a mid-replay failure must leave the schema Older (retryable), not Dirty: {}",
+        status.message
+    );
+
+    // With the failure gone, the next migrate completes the pending step exactly once.
+    conn.execute_batch("DROP TRIGGER fail_051_record;").unwrap();
+    schema::migrate_forward(&conn).unwrap();
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(status.state, schema::SchemaState::Compatible);
+    assert_eq!(status.current_version, schema::LATEST_SCHEMA_VERSION);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '051_clone_df_epoch'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the retried step is recorded exactly once");
+}
+
+/// #498 loser discipline: a forward migrate that finds NOTHING owed (001 and every additive step
+/// already recorded — the loser of a migration race re-entering after the winner finished) must
+/// leave the ledger completely untouched: no dirty stamp, no 001 re-record, no writes at all.
+/// Every avoided write is one fewer `SQLITE_BUSY` hazard against concurrent ordinary writers.
+#[test]
+fn forward_migrate_when_nothing_is_owed_leaves_the_ledger_untouched() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    conn.execute_batch(
+        "
+        CREATE TABLE ledger_write_audit(op TEXT NOT NULL, id TEXT NOT NULL);
+        CREATE TRIGGER audit_ledger_insert AFTER INSERT ON schema_version
+        BEGIN INSERT INTO ledger_write_audit(op, id) VALUES ('insert', NEW.id); END;
+        CREATE TRIGGER audit_ledger_update AFTER UPDATE ON schema_version
+        BEGIN INSERT INTO ledger_write_audit(op, id) VALUES ('update', NEW.id); END;
+        CREATE TRIGGER audit_ledger_delete AFTER DELETE ON schema_version
+        BEGIN INSERT INTO ledger_write_audit(op, id) VALUES ('delete', OLD.id); END;
+        ",
+    )
+    .unwrap();
+
+    schema::migrate_forward(&conn).unwrap();
+
+    let mut stmt = conn.prepare("SELECT op, id FROM ledger_write_audit").unwrap();
+    let writes: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        writes.is_empty(),
+        "a forward migrate with nothing owed must not write the ledger, got: {writes:?}"
+    );
+    assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Compatible);
+}
+
+/// #498: `rag-rat index --full` ([`schema::apply`]) is the sanctioned recovery the Dirty refusal
+/// names, so a successful apply must CLEAR a stranded `__dirty__` marker: apply re-runs every
+/// idempotent step, so a marker that survives it is provably stale. Without the clear, the
+/// remedy would leave the DB refusing every open forever. (The marker can be stranded by an
+/// older binary's failed mid-replay migrate; new binaries no longer stamp it on replay.)
+#[test]
+fn apply_clears_a_stranded_dirty_marker() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
+         VALUES ('__dirty__', 1, '', 'partial migration in progress')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Dirty);
+
+    schema::apply(&conn).unwrap();
+
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(
+        status.state,
+        schema::SchemaState::Compatible,
+        "a full apply must clear a stranded dirty marker: {}",
+        status.message
+    );
+}
+
+/// #498 review: a Dirty state can also come from a CHECKSUM-MISMATCHED baseline row (not just a
+/// stranded marker), and `index --full` must recover that too — apply re-records every additive
+/// step's checksum unconditionally, and the baseline provision must treat a stale 001 checksum
+/// as "provision owed" so the 001 row is refreshed as well.
+#[test]
+fn apply_recovers_a_baseline_checksum_mismatch() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    conn.execute(
+        "UPDATE schema_version SET checksum = 'sha256:corrupted'
+         WHERE id = '001_sqlite_storage_baseline'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Dirty);
+
+    schema::apply(&conn).unwrap();
+
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(
+        status.state,
+        schema::SchemaState::Compatible,
+        "a full apply must refresh a checksum-mismatched baseline row: {}",
+        status.message
+    );
+}
+
+/// #498: the forward-migrate variant of the double-checked schema race
+/// ([`concurrent_create_or_migrate_applies_the_schema_exactly_once`] covers the fresh-CREATE
+/// side): two upgraded processes racing one pending step over a shared V(N-1) DB. Both opens must
+/// succeed — the winner migrates under the GLOBAL schema lock, the loser re-checks under it and
+/// no-ops — and the ledger must hold exactly one row per migration with no stranded dirty marker.
+/// Before #498 the loser's UNLOCKED status probe could catch the winner's transient `__dirty__`
+/// stamp and refuse the open outright instead of waiting on the lock.
+#[test]
+fn concurrent_forward_migrate_applies_the_pending_step_exactly_once() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let db_path = root.join("index.sqlite");
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        schema::apply(&conn).unwrap();
+        truncate_schema_to(&conn, 50);
+        // Make the pending step real work again, as on a live V050 DB.
+        conn.execute_batch("DROP TABLE IF EXISTS clone_df_epoch;").unwrap();
+    }
+
+    let a = db_path.clone();
+    let b = db_path.clone();
+    let t1 = std::thread::spawn(move || IndexDatabase::open(&a).map(|_| ()));
+    let t2 = std::thread::spawn(move || IndexDatabase::open(&b).map(|_| ()));
+    t1.join().unwrap().expect("one concurrent opener migrates forward");
+    t2.join().unwrap().expect("the other re-checks under the schema lock and no-ops");
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(status.state, schema::SchemaState::Compatible);
+    assert_eq!(status.current_version, schema::LATEST_SCHEMA_VERSION);
+    assert_eq!(
+        status.migrations.len(),
+        schema::LATEST_SCHEMA_VERSION as usize,
+        "exactly one schema_version row per migration and no stranded dirty marker"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn discover_mode_indexes_new_files_and_removes_deleted_files() {
     let root = unique_temp_root();

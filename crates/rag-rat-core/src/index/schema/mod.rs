@@ -380,11 +380,24 @@ pub struct SchemaStatus {
 }
 
 /// Provision the baseline (001) idempotently: the schema_version ledger, then `apply_baseline`
-/// (all `CREATE … IF NOT EXISTS`) wrapped in the dirty marker so a crash mid-baseline is
-/// detectable, then record 001. Shared by [`apply`] (fresh DB) and [`migrate_forward`] (existing DB
-/// behind by N). LOAD-BEARING for forward-only: a pre-interning (≤v19) DB lacks shared tables like
-/// `name_strings`/`edges_data` that later migrations INSERT into, so the baseline must run BEFORE
-/// any forward step replays — exactly what the old full `apply` did before the ladder.
+/// (all `CREATE … IF NOT EXISTS`), then record 001. Shared by [`apply`] (fresh DB) and
+/// [`migrate_forward`] (existing DB behind by N). LOAD-BEARING for forward-only: a pre-interning
+/// (≤v19) DB lacks shared tables like `name_strings`/`edges_data` that later migrations INSERT
+/// into, so the baseline must run BEFORE any forward step replays — exactly what the old full
+/// `apply` did before the ladder.
+///
+/// The `__dirty__` marker wraps ONLY a provision that OWES the baseline record — 001 not yet
+/// recorded (first-ever provision), or recorded with a stale checksum (a mismatch reads as Dirty,
+/// and `index --full` recovery must refresh the row like it refreshes every step's) — where it
+/// makes a crash mid-baseline detectable. A REPLAY over a current 001 (every open-time forward
+/// migrate) must not touch the marker (#498): the marker choreography runs in autocommit, so the
+/// stamp is durable and globally visible the moment it lands, and the GLOBAL schema lock
+/// deliberately does not serialize against ordinary per-repo writers — a `SQLITE_BUSY` between
+/// the stamp and the clear stranded a marker on a healthy DB and every subsequent open refused
+/// until a manual `index --full` (observed live on V050→V051). The replay needs no marker: with
+/// 001 recorded the baseline ran to completion once, and every replayed statement is an
+/// individually atomic, idempotent no-op (`IF NOT EXISTS` DDL; the legacy conversions self-wrap
+/// in their own transaction), so a torn replay just resumes as `Older` on the next open.
 fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -396,11 +409,20 @@ fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
         );
         ",
     )?;
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![DIRTY_MIGRATION_ID, now_ms(), "", "partial migration in progress"],
-    )?;
+    let baseline_owed = conn
+        .query_row("SELECT checksum FROM schema_version WHERE id = ?1", [MIGRATION_001_ID], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .as_deref()
+        != Some(MIGRATION_001_CHECKSUM);
+    if baseline_owed {
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![DIRTY_MIGRATION_ID, now_ms(), "", "partial migration in progress"],
+        )?;
+    }
     // The string pool was `edge_strings` before the name-pool merge (#224, the V028 bump); it now
     // also holds symbol qualified-names, so the current schema names it `name_strings`. On a
     // pre-merge DB the POPULATED table is still `edge_strings` — rename it into place HERE, before
@@ -425,14 +447,25 @@ fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
     }
     let result = apply_baseline(conn);
     if let Err(err) = result {
-        let _ = conn.execute("UPDATE schema_version SET description = ?2 WHERE id = ?1", params![
-            DIRTY_MIGRATION_ID,
-            format!("partial migration failed: {err}")
-        ]);
+        if baseline_owed {
+            let _ =
+                conn.execute("UPDATE schema_version SET description = ?2 WHERE id = ?1", params![
+                    DIRTY_MIGRATION_ID,
+                    format!("partial migration failed: {err}")
+                ]);
+        }
         return Err(err);
     }
-    conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
-    record_migration(conn, MIGRATION_001_ID, MIGRATION_001_CHECKSUM, MIGRATION_001_DESCRIPTION)
+    if baseline_owed {
+        conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
+        record_migration(
+            conn,
+            MIGRATION_001_ID,
+            MIGRATION_001_CHECKSUM,
+            MIGRATION_001_DESCRIPTION,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
@@ -443,6 +476,12 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         (step.apply)(conn)?;
         record_migration(conn, step.id, step.checksum, step.description)?;
     }
+    // `index --full` is the sanctioned recovery the Dirty refusal names, and apply is its schema
+    // step: every migration just re-ran to completion, so a `__dirty__` marker that still
+    // survives (stranded by an older binary's failed mid-replay migrate) is provably stale —
+    // clear it, or the remedy would leave the DB refusing every open forever (#498). A crash
+    // before this point keeps the marker, so a genuinely torn apply still reads as Dirty.
+    conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
     Ok(())
 }
 
@@ -766,10 +805,22 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
 /// re-runs an already-applied migration, so a data backfill like 005's resolution rewrite (an
 /// unconditional UPDATE) cannot clobber current values on a routine open. The caller guarantees a
 /// versioned ledger exists; a ledger-less legacy DB is refused upstream, not force-migrated.
+///
+/// LOSER DISCIPLINE (#498): the ledger is read FIRST, and a migrate that finds nothing owed
+/// returns without writing anything at all — no dirty stamp, no 001 re-record, no baseline
+/// replay. The loser of a migration race normally never reaches here (the callers re-check state
+/// under the GLOBAL schema lock), but a direct call must be equally write-free: every avoided
+/// autocommit write is one fewer `SQLITE_BUSY` hazard against ordinary per-repo writers, which
+/// the schema lock deliberately does not serialize against.
 pub fn migrate_forward(conn: &Connection) -> anyhow::Result<()> {
-    provision_baseline(conn)?;
     let applied: std::collections::HashSet<String> =
         applied_migrations(conn)?.into_iter().map(|migration| migration.id).collect();
+    if applied.contains(MIGRATION_001_ID)
+        && ADDITIVE_MIGRATIONS.iter().all(|step| applied.contains(step.id))
+    {
+        return Ok(());
+    }
+    provision_baseline(conn)?;
     for step in ADDITIVE_MIGRATIONS {
         if !applied.contains(step.id) {
             (step.apply)(conn)?;
