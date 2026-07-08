@@ -1933,3 +1933,34 @@ fn incremental_open_resets_source_root_from_the_config_before_heals() {
 
     let _ = fs::remove_dir_all(fx.root_a);
 }
+
+/// #275: `current_callee_monikers` — the clone-refine collapse's `edge_oracle` read — must scope
+/// to the active repo. Both repos hold a row for the SAME `(source_path, file_sha, span)` with
+/// DIFFERENT monikers; an unscoped read would see both, treat the span as a multi-tool conflict,
+/// and drop it (or worse, serve the sibling's identity). The active repo must see exactly its own.
+#[test]
+fn current_callee_monikers_ignores_a_sibling_repos_rows() {
+    let conn = a5_scoped_two_repo_conn();
+
+    for (repo, symbol) in [(A5_REPO_A, "rust cr 1.0 a()."), (A5_REPO_B, "rust cr 1.0 b().")] {
+        conn.execute(
+            "INSERT INTO edge_oracle(repo_id, source_path, source_start_byte, source_end_byte, \
+             callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+             scip_symbol, kind, computed_at)
+             VALUES (?1, 'src/x.rs', 0, 20, 5, 8, 'calls_name', 'sha-x', 'scip-rust', 'v1', ?2, \
+             'resolved', 0)",
+            rusqlite::params![repo, symbol],
+        )
+        .unwrap();
+    }
+
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let monikers =
+        crate::index::oracle::current_callee_monikers(&conn, "src/x.rs", "sha-x").unwrap();
+    assert_eq!(
+        monikers,
+        std::collections::HashMap::from([((5, 8), "rust cr 1.0 a().".to_string())]),
+        "the collapse read must serve the ACTIVE repo's moniker, never conflict against (or leak) \
+         the sibling's row"
+    );
+}

@@ -206,7 +206,7 @@ pub(crate) fn apply_refinement(
     class.lcs_ratio = Some(refinement.lcs_ratio);
     class.confidence = Some(refinement.confidence.as_db_str().to_string());
     class.refactorability = Some(refinement.refactorability);
-    class.refine_mode = Some(refinement.refine_mode);
+    class.refine_mode = Some(refinement.refine_mode.as_db_str());
 
     // Plan 4b anti-unification payload — surfaced on BOTH the warm (cache-hit) and cold
     // (compute+store) paths because both flow through this helper. The two JSON columns are parsed

@@ -706,7 +706,7 @@ fn unsampled_refinement() -> crate::index::clones::refine::cache::CachedRefineme
         lcs_ratio: 1.0,
         confidence: crate::index::clones::refine::score::Confidence::High,
         refactorability: 1.0,
-        refine_mode: "baseline",
+        refine_mode: crate::index::clones::refine::cache::RefineMode::Baseline,
         template: String::new(),
         variation_points_json: "[]".to_string(),
         proposed_signature_json: "{}".to_string(),

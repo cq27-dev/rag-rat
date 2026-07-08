@@ -676,7 +676,15 @@ mod tests {
             parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
         let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::Rust);
         let struct_hash = tokens::struct_hash(&seq);
-        RefineMember { symbol_id, lang: Language::Rust, struct_hash, seq, node_spans, text }
+        RefineMember {
+            callee_monikers: Default::default(),
+            symbol_id,
+            lang: Language::Rust,
+            struct_hash,
+            seq,
+            node_spans,
+            text,
+        }
     }
 
     /// Canonical-order sort — matches the loader guarantee. Production keys on the REINDEX-STABLE
@@ -818,6 +826,7 @@ mod tests {
         // Synthetic anchor: `fn ...` header reduced to a single literal leaf at column 0 (all that
         // `anchor_leaf_is_literal` / `recover_param_type` inspect). seq[0] = a LIT_* token.
         let anchor = RefineMember {
+            callee_monikers: Default::default(),
             symbol_id: 1,
             lang: Language::Rust,
             struct_hash: "synthetic".to_string(),

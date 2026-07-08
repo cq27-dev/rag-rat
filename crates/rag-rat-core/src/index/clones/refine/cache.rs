@@ -23,8 +23,38 @@ use super::signature::propose_signature;
 use crate::index::clones::refine::RefineMember;
 use crate::index::clones::{ALIGNMENT_VERSION, NORM_VERSION};
 
-/// The 4a refine mode. Baseline token space only; the SCIP-aware mode is Plan 3/4b.
-const REFINE_MODE: &str = "baseline";
+/// The refine mode: which evidence the anti-unification classifier was allowed to consult.
+///
+/// `Baseline` is the 4a token-space-only mode. `Scip` (#275, Plan 3) additionally consults the
+/// SCIP-oracle callee monikers attached to each [`RefineMember`] — a same-named-different-spelling
+/// callee whose members all resolve to ONE moniker collapses back into the fixed spine instead of
+/// reopening as a `closure_param`/`differing_callee` variation. The mode is folded into
+/// [`refinement_key`], so the two modes address DISJOINT cache rows: an oracle run can invalidate
+/// every scip-mode row ([`invalidate_scip_refinements`]) without touching baseline rows, and a
+/// baseline row can never serve a scip-mode read.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum RefineMode {
+    Baseline,
+    Scip,
+}
+
+impl RefineMode {
+    pub(crate) fn as_db_str(&self) -> &'static str {
+        (*self).into()
+    }
+}
 
 /// A computed (or cache-hit) refinement for one clone class.
 ///
@@ -38,7 +68,7 @@ pub(crate) struct CachedRefinement {
     pub(crate) lcs_ratio: f64,
     pub(crate) confidence: Confidence,
     pub(crate) refactorability: f64,
-    pub(crate) refine_mode: &'static str,
+    pub(crate) refine_mode: RefineMode,
     /// The rendered anti-unification template (`clone_refinements.template`): fixed runs verbatim,
     /// variation runs as `⟨m0⟩`, gapped runs as `⟨m2?⟩`.
     pub(crate) template: String,
@@ -89,6 +119,7 @@ pub(crate) struct CachedRefinement {
 /// duplicates is preserved; structurally-identical-but-source-different classes get distinct keys.
 pub(crate) fn refinement_key(
     language: &str,
+    mode: RefineMode,
     struct_hashes: &[String],
     source_discriminators: &[String],
 ) -> String {
@@ -100,7 +131,7 @@ pub(crate) fn refinement_key(
     let mut material = String::new();
     material.push_str(language);
     material.push('\0');
-    material.push_str(REFINE_MODE);
+    material.push_str(mode.as_db_str());
     material.push('\0');
     material.push_str(&NORM_VERSION.to_string());
     material.push('\0');
@@ -129,6 +160,7 @@ pub(crate) fn refinement_key(
 pub(crate) fn refine_lookup(
     conn: &Connection,
     refinement_key: &str,
+    mode: RefineMode,
 ) -> anyhow::Result<Option<CachedRefinement>> {
     // The full content payload (4b): the rendered template + the serialized variation_points /
     // proposed_signature + the REAL anti_unify_coverage round-trip alongside the scoring outputs,
@@ -147,9 +179,10 @@ pub(crate) fn refine_lookup(
                 "SELECT lcs_ratio, confidence, refactorability, lcs_sampled,
                     template, variation_points_json, proposed_signature_json, anti_unify_coverage
              FROM clone_refinements
-             WHERE class_key = ?1 AND norm_version = ?2 AND alignment_version = ?3{repo_clause}"
+             WHERE class_key = ?1 AND norm_version = ?2 AND alignment_version = ?3
+               AND refine_mode = ?4{repo_clause}"
             ),
-            rusqlite::params![refinement_key, NORM_VERSION, ALIGNMENT_VERSION],
+            rusqlite::params![refinement_key, NORM_VERSION, ALIGNMENT_VERSION, mode.as_db_str()],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -178,7 +211,9 @@ pub(crate) fn refine_lookup(
             lcs_ratio,
             confidence: Confidence::from_db_str(&confidence),
             refactorability,
-            refine_mode: REFINE_MODE,
+            // The key folds the mode and the WHERE filters on it, so the row's mode IS the
+            // requested one — no re-parse needed.
+            refine_mode: mode,
             template,
             variation_points_json,
             proposed_signature_json,
@@ -211,6 +246,7 @@ pub(crate) fn refine_compute_and_store(
     conn: &Connection,
     refinement_key: &str,
     language: &str,
+    mode: RefineMode,
     members: &[RefineMember],
     similarity_min: f64,
     medoid_symbol_id: Option<i64>,
@@ -219,6 +255,7 @@ pub(crate) fn refine_compute_and_store(
         conn,
         refinement_key,
         language,
+        mode,
         members,
         similarity_min,
         medoid_symbol_id,
@@ -242,11 +279,20 @@ pub(crate) fn refine_compute_and_store_budgeted(
     conn: &Connection,
     refinement_key: &str,
     language: &str,
+    mode: RefineMode,
     members: &[RefineMember],
     similarity_min: f64,
     medoid_symbol_id: Option<i64>,
     mut global_remaining: Option<&mut u64>,
 ) -> anyhow::Result<CachedRefinement> {
+    // MODE COHERENCE (#275): a Baseline row must be oracle-independent — it survives
+    // `invalidate_scip_refinements`, so its payload may never depend on attached monikers. The
+    // driver only attaches monikers when it probed Scip; this assert keeps a future caller from
+    // silently computing an oracle-dependent payload under a baseline key.
+    debug_assert!(
+        mode == RefineMode::Scip || members.iter().all(|m| m.callee_monikers.is_empty()),
+        "baseline refine must not receive members with attached callee monikers"
+    );
     // `lcs_ratio` stays the NiCad class fidelity (min pairwise 2·LCS/(|a|+|b|)) + its sampling bit.
     let seqs: Vec<Vec<String>> = members.iter().map(|m| m.seq.clone()).collect();
     let (lcs_ratio, lcs_sampled) = match global_remaining.as_deref_mut() {
@@ -314,7 +360,7 @@ pub(crate) fn refine_compute_and_store_budgeted(
         rusqlite::params![
             refinement_key,
             language,
-            REFINE_MODE,
+            mode.as_db_str(),
             template.text,
             variation_points_json,
             proposed_signature_json,
@@ -333,7 +379,7 @@ pub(crate) fn refine_compute_and_store_budgeted(
         lcs_ratio,
         confidence,
         refactorability,
-        refine_mode: REFINE_MODE,
+        refine_mode: mode,
         template: template.text,
         variation_points_json,
         proposed_signature_json,
@@ -352,21 +398,45 @@ pub(crate) fn refine_class(
     conn: &Connection,
     refinement_key: &str,
     language: &str,
+    mode: RefineMode,
     members: &[RefineMember],
     similarity_min: f64,
     medoid_symbol_id: Option<i64>,
 ) -> anyhow::Result<CachedRefinement> {
-    if let Some(cached) = refine_lookup(conn, refinement_key)? {
+    if let Some(cached) = refine_lookup(conn, refinement_key, mode)? {
         return Ok(cached);
     }
     refine_compute_and_store(
         conn,
         refinement_key,
         language,
+        mode,
         members,
         similarity_min,
         medoid_symbol_id,
     )
+}
+
+/// Drop every NON-baseline refinement row (#275, finding 3): an `oracle run` rewrites the
+/// `edge_oracle` moniker evidence a scip-mode refinement consulted, and NOTHING in
+/// [`refinement_key`] changes when a moniker changes (the key folds struct_hashes + source
+/// discriminators, both oracle-blind) — so the rows must be invalidated wholesale. Baseline rows
+/// never consult oracle evidence (see the mode-coherence assert in
+/// [`refine_compute_and_store_budgeted`]) and are deliberately spared. Scoped to the active repo
+/// (`clone_refinements` is repo-scoped since A5); the dropped classes recompute lazily on the next
+/// `find_clones` refine pass.
+pub(crate) fn invalidate_scip_refinements(conn: &Connection) -> anyhow::Result<usize> {
+    let scope = crate::index::schema::periphery_repo_scope(conn, "clone_refinements")?;
+    let repo_clause =
+        crate::index::schema::periphery_repo_scope_clause(&scope, "clone_refinements");
+    let dropped = conn.execute(
+        &format!(
+            "DELETE FROM clone_refinements
+             WHERE refine_mode <> ?1{repo_clause}"
+        ),
+        rusqlite::params![RefineMode::Baseline.as_db_str()],
+    )?;
+    Ok(dropped)
 }
 
 #[cfg(test)]
@@ -393,7 +463,15 @@ mod tests {
             parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
         let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::Rust);
         let struct_hash = tokens::struct_hash(&seq);
-        RefineMember { symbol_id, lang: Language::Rust, struct_hash, seq, node_spans, text }
+        RefineMember {
+            callee_monikers: Default::default(),
+            symbol_id,
+            lang: Language::Rust,
+            struct_hash,
+            seq,
+            node_spans,
+            text,
+        }
     }
 
     /// Per-member source discriminator the way `load_source_discriminators` builds it in
@@ -413,28 +491,63 @@ mod tests {
 
     #[test]
     fn refinement_key_is_order_independent_over_struct_hashes() {
-        let k1 = refinement_key("rust", &["aaa".into(), "bbb".into(), "ccc".into()], &[]);
-        let k2 = refinement_key("rust", &["ccc".into(), "aaa".into(), "bbb".into()], &[]);
+        let k1 = refinement_key(
+            "rust",
+            RefineMode::Baseline,
+            &["aaa".into(), "bbb".into(), "ccc".into()],
+            &[],
+        );
+        let k2 = refinement_key(
+            "rust",
+            RefineMode::Baseline,
+            &["ccc".into(), "aaa".into(), "bbb".into()],
+            &[],
+        );
         assert_eq!(k1, k2, "the same struct_hash multiset must address the same refinement");
 
         // Source discriminators are ALSO order-independent (sorted before folding).
-        let d1 = refinement_key("rust", &["aaa".into()], &["s1".into(), "s2".into()]);
-        let d2 = refinement_key("rust", &["aaa".into()], &["s2".into(), "s1".into()]);
+        let d1 = refinement_key("rust", RefineMode::Baseline, &["aaa".into()], &[
+            "s1".into(),
+            "s2".into(),
+        ]);
+        let d2 = refinement_key("rust", RefineMode::Baseline, &["aaa".into()], &[
+            "s2".into(),
+            "s1".into(),
+        ]);
         assert_eq!(d1, d2, "source discriminators must be order-independent too");
     }
 
     #[test]
     fn refinement_key_distinguishes_language_and_multiset() {
-        let base = refinement_key("rust", &["aaa".into(), "bbb".into()], &[]);
+        let base = refinement_key("rust", RefineMode::Baseline, &["aaa".into(), "bbb".into()], &[]);
         // Different language → different key.
-        assert_ne!(base, refinement_key("typescript", &["aaa".into(), "bbb".into()], &[]));
+        assert_ne!(
+            base,
+            refinement_key("typescript", RefineMode::Baseline, &["aaa".into(), "bbb".into()], &[])
+        );
         // Different multiset → different key.
-        assert_ne!(base, refinement_key("rust", &["aaa".into(), "ccc".into()], &[]));
+        assert_ne!(
+            base,
+            refinement_key("rust", RefineMode::Baseline, &["aaa".into(), "ccc".into()], &[])
+        );
         // Duplicate-sensitive: a doubled hash is a different multiset.
-        assert_ne!(base, refinement_key("rust", &["aaa".into(), "aaa".into(), "bbb".into()], &[]));
+        assert_ne!(
+            base,
+            refinement_key(
+                "rust",
+                RefineMode::Baseline,
+                &["aaa".into(), "aaa".into(), "bbb".into()],
+                &[]
+            )
+        );
         // Same struct_hash multiset, DIFFERENT source discriminators → different key (the
         // cache-poisoning fix: structure-only is no longer sufficient).
-        assert_ne!(base, refinement_key("rust", &["aaa".into(), "bbb".into()], &["s1".into()]));
+        assert_ne!(
+            base,
+            refinement_key("rust", RefineMode::Baseline, &["aaa".into(), "bbb".into()], &[
+                "s1".into()
+            ])
+        );
     }
 
     /// Synthesize a long `RefineMember` with VALID parallel `node_spans` (one leaf span per token):
@@ -454,6 +567,7 @@ mod tests {
             })
             .collect();
         RefineMember {
+            callee_monikers: Default::default(),
             symbol_id,
             lang: Language::Rust,
             struct_hash: struct_hash.to_string(),
@@ -476,10 +590,18 @@ mod tests {
             long_member(1, "h1", LCS_MAX_SEQ_TOKENS + 1),
             long_member(2, "h2", LCS_MAX_SEQ_TOKENS + 1),
         ];
-        let key = refinement_key("rust", &["h1".into(), "h2".into()], &[]);
+        let key = refinement_key("rust", RefineMode::Baseline, &["h1".into(), "h2".into()], &[]);
 
-        let refinement =
-            refine_compute_and_store(&conn, &key, "rust", &members, 1.0, None).unwrap();
+        let refinement = refine_compute_and_store(
+            &conn,
+            &key,
+            "rust",
+            RefineMode::Baseline,
+            &members,
+            1.0,
+            None,
+        )
+        .unwrap();
         assert!(refinement.lcs_sampled, "long-member compute must set lcs_sampled (proxy path)");
         let rows: i64 =
             conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap();
@@ -503,10 +625,19 @@ mod tests {
             long_member(1, "h1", LCS_MAX_SEQ_TOKENS + 1),
             long_member(2, "h2", LCS_MAX_SEQ_TOKENS + 1),
         ];
-        let key = refinement_key("rust", &["h1".into(), "h2".into()], &[]);
+        let key = refinement_key("rust", RefineMode::Baseline, &["h1".into(), "h2".into()], &[]);
 
         // COLD compute: the length proxy engages → lcs_sampled = true, and it is PERSISTED.
-        let cold = refine_compute_and_store(&conn, &key, "rust", &members, 1.0, None).unwrap();
+        let cold = refine_compute_and_store(
+            &conn,
+            &key,
+            "rust",
+            RefineMode::Baseline,
+            &members,
+            1.0,
+            None,
+        )
+        .unwrap();
         assert!(cold.lcs_sampled, "cold compute on long seqs must set lcs_sampled");
 
         // Confirm the bit landed in the row (1, not the DEFAULT 0).
@@ -520,7 +651,7 @@ mod tests {
         assert_eq!(persisted, 1, "lcs_sampled must be persisted as 1");
 
         // WARM hit: refine_lookup reads the bit back — it must NOT degrade to false.
-        let warm = refine_lookup(&conn, &key).unwrap().expect("warm hit");
+        let warm = refine_lookup(&conn, &key, RefineMode::Baseline).unwrap().expect("warm hit");
         assert!(warm.lcs_sampled, "warm cache hit must read lcs_sampled=true back from the row");
     }
 
@@ -547,8 +678,8 @@ mod tests {
         };
         assert_eq!(count_rows(&conn), 0, "table starts empty");
 
-        let key = refinement_key("rust", &["h1".into(), "h2".into()], &[]);
-        let hit = refine_lookup(&conn, &key).unwrap();
+        let key = refinement_key("rust", RefineMode::Baseline, &["h1".into(), "h2".into()], &[]);
+        let hit = refine_lookup(&conn, &key, RefineMode::Baseline).unwrap();
 
         assert!(hit.is_none(), "a miss must return None");
         assert_eq!(count_rows(&conn), 0, "refine_lookup must NOT write a row on a miss");
@@ -573,15 +704,22 @@ mod tests {
             member(2, "fn g() { let y = 20; sink(y); }"),
         ];
         let struct_hashes: Vec<String> = members.iter().map(|m| m.struct_hash.clone()).collect();
-        let key = refinement_key("rust", &struct_hashes, &discriminators_for(&members));
+        let key = refinement_key(
+            "rust",
+            RefineMode::Baseline,
+            &struct_hashes,
+            &discriminators_for(&members),
+        );
 
         // Miss: compute + persist one row.
-        let first = refine_class(&conn, &key, "rust", &members, 1.0, None).unwrap();
+        let first =
+            refine_class(&conn, &key, "rust", RefineMode::Baseline, &members, 1.0, None).unwrap();
         assert_eq!(count_rows(&conn), 1, "the miss persists exactly one row");
         assert!(first.lcs_ratio > 0.99, "identical sequences ⇒ near-perfect lcs_ratio");
 
         // Hit: same key serves the cache, no new row.
-        let second = refine_class(&conn, &key, "rust", &members, 1.0, None).unwrap();
+        let second =
+            refine_class(&conn, &key, "rust", RefineMode::Baseline, &members, 1.0, None).unwrap();
         assert_eq!(count_rows(&conn), 1, "the hit must NOT grow the row count");
         assert_eq!(
             first.confidence, second.confidence,
@@ -645,9 +783,23 @@ mod tests {
             member(2, "fn g() { let y: f32 = 2.5; sink(y); }"),
         ];
         let struct_hashes: Vec<String> = members.iter().map(|m| m.struct_hash.clone()).collect();
-        let key = refinement_key("rust", &struct_hashes, &discriminators_for(&members));
+        let key = refinement_key(
+            "rust",
+            RefineMode::Baseline,
+            &struct_hashes,
+            &discriminators_for(&members),
+        );
 
-        let computed = refine_compute_and_store(&conn, &key, "rust", &members, 1.0, None).unwrap();
+        let computed = refine_compute_and_store(
+            &conn,
+            &key,
+            "rust",
+            RefineMode::Baseline,
+            &members,
+            1.0,
+            None,
+        )
+        .unwrap();
         // The payload is non-trivial: a real template + a non-empty VP array + a non-stub
         // signature.
         assert!(!computed.template.is_empty(), "computed template must be non-empty");
@@ -660,7 +812,7 @@ mod tests {
         );
 
         // Warm lookup returns byte-identical payload — no recompute, no proxy.
-        let cached = refine_lookup(&conn, &key).unwrap().expect("warm hit");
+        let cached = refine_lookup(&conn, &key, RefineMode::Baseline).unwrap().expect("warm hit");
         assert_eq!(cached.template, computed.template, "template must round-trip");
         assert_eq!(
             cached.variation_points_json, computed.variation_points_json,
@@ -702,7 +854,12 @@ mod tests {
             member(2, "fn g() { let y = 2.5; sink(y); }"),
         ];
         let struct_hashes: Vec<String> = members.iter().map(|m| m.struct_hash.clone()).collect();
-        let key = refinement_key("rust", &struct_hashes, &discriminators_for(&members));
+        let key = refinement_key(
+            "rust",
+            RefineMode::Baseline,
+            &struct_hashes,
+            &discriminators_for(&members),
+        );
 
         // Plant a stale 4a-style row at alignment_version = 1 (placeholder payload) directly.
         conn.execute(
@@ -719,14 +876,22 @@ mod tests {
 
         // The lookup at the CURRENT version (2) must MISS the v1 row.
         assert!(
-            refine_lookup(&conn, &key).unwrap().is_none(),
+            refine_lookup(&conn, &key, RefineMode::Baseline).unwrap().is_none(),
             "an alignment_version=1 row must not serve at the current version"
         );
 
         // Recompute: writes the row at the current version with the REAL payload (INSERT OR REPLACE
         // over the same class_key PRIMARY KEY).
-        let recomputed =
-            refine_compute_and_store(&conn, &key, "rust", &members, 1.0, None).unwrap();
+        let recomputed = refine_compute_and_store(
+            &conn,
+            &key,
+            "rust",
+            RefineMode::Baseline,
+            &members,
+            1.0,
+            None,
+        )
+        .unwrap();
         assert_ne!(recomputed.template, "STALE 4A SKELETON", "must recompute the real template");
         assert_ne!(recomputed.variation_points_json, "[]", "recompute fills the real VP array");
 
@@ -743,7 +908,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_version, ALIGNMENT_VERSION, "the recompute writes the current version");
-        let warm = refine_lookup(&conn, &key).unwrap().expect("warm hit after recompute");
+        let warm = refine_lookup(&conn, &key, RefineMode::Baseline)
+            .unwrap()
+            .expect("warm hit after recompute");
         assert_eq!(
             warm.template, recomputed.template,
             "the warm hit serves the recomputed payload"
@@ -764,15 +931,25 @@ mod tests {
         ];
         let hashes_a: Vec<String> = class_a.iter().map(|m| m.struct_hash.clone()).collect();
         let discs_a = discriminators_for(&class_a);
-        let key_a = refinement_key("rust", &hashes_a, &discs_a);
-        let computed_a =
-            refine_compute_and_store(&conn, &key_a, "rust", &class_a, 1.0, None).unwrap();
+        let key_a = refinement_key("rust", RefineMode::Baseline, &hashes_a, &discs_a);
+        let computed_a = refine_compute_and_store(
+            &conn,
+            &key_a,
+            "rust",
+            RefineMode::Baseline,
+            &class_a,
+            1.0,
+            None,
+        )
+        .unwrap();
 
         // Re-key the SAME content (same struct_hash multiset + same source bytes) → same key, same
         // template (cache hit).
-        let key_a2 = refinement_key("rust", &hashes_a, &discs_a);
+        let key_a2 = refinement_key("rust", RefineMode::Baseline, &hashes_a, &discs_a);
         assert_eq!(key_a, key_a2, "identical content must address the same refinement");
-        let cached = refine_lookup(&conn, &key_a2).unwrap().expect("hit for identical content");
+        let cached = refine_lookup(&conn, &key_a2, RefineMode::Baseline)
+            .unwrap()
+            .expect("hit for identical content");
         assert_eq!(cached.template, computed_a.template, "identical content → identical template");
 
         // A DIFFERENT class (a different body shape → a different struct_hash multiset) → a
@@ -782,10 +959,19 @@ mod tests {
             member(4, "fn q(c: i32, d: i32) -> i32 { let s = c + d + c; s * 2 }"),
         ];
         let hashes_b: Vec<String> = class_b.iter().map(|m| m.struct_hash.clone()).collect();
-        let key_b = refinement_key("rust", &hashes_b, &discriminators_for(&class_b));
+        let key_b =
+            refinement_key("rust", RefineMode::Baseline, &hashes_b, &discriminators_for(&class_b));
         assert_ne!(key_a, key_b, "different content must address a different refinement");
-        let computed_b =
-            refine_compute_and_store(&conn, &key_b, "rust", &class_b, 1.0, None).unwrap();
+        let computed_b = refine_compute_and_store(
+            &conn,
+            &key_b,
+            "rust",
+            RefineMode::Baseline,
+            &class_b,
+            1.0,
+            None,
+        )
+        .unwrap();
         assert_ne!(
             computed_a.template, computed_b.template,
             "structurally different classes must not share a template"
@@ -827,25 +1013,45 @@ mod tests {
         hb.sort();
         assert_eq!(ha, hb, "the two classes must share the struct_hash multiset (the bug premise)");
 
-        let key_a = refinement_key("rust", &hashes_a, &discriminators_for(&class_a));
-        let key_b = refinement_key("rust", &hashes_b, &discriminators_for(&class_b));
+        let key_a =
+            refinement_key("rust", RefineMode::Baseline, &hashes_a, &discriminators_for(&class_a));
+        let key_b =
+            refinement_key("rust", RefineMode::Baseline, &hashes_b, &discriminators_for(&class_b));
         assert_ne!(
             key_a, key_b,
             "same struct_hash multiset but different source MUST get distinct keys (no poisoning)"
         );
 
         // Compute A, then B. Two distinct keys → two distinct rows, each with its OWN payload.
-        let computed_a =
-            refine_compute_and_store(&conn, &key_a, "rust", &class_a, 1.0, None).unwrap();
-        let computed_b =
-            refine_compute_and_store(&conn, &key_b, "rust", &class_b, 1.0, None).unwrap();
+        let computed_a = refine_compute_and_store(
+            &conn,
+            &key_a,
+            "rust",
+            RefineMode::Baseline,
+            &class_a,
+            1.0,
+            None,
+        )
+        .unwrap();
+        let computed_b = refine_compute_and_store(
+            &conn,
+            &key_b,
+            "rust",
+            RefineMode::Baseline,
+            &class_b,
+            1.0,
+            None,
+        )
+        .unwrap();
         let rows: i64 =
             conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 2, "two source-distinct classes persist two distinct rows");
 
         // B's WARM lookup serves B's OWN payload — NOT A's. The per_member_values carry the real
         // literals, so a poisoned cache would surface A's `10`/`2.5` for class B.
-        let warm_b = refine_lookup(&conn, &key_b).unwrap().expect("class B has its own warm row");
+        let warm_b = refine_lookup(&conn, &key_b, RefineMode::Baseline)
+            .unwrap()
+            .expect("class B has its own warm row");
         assert_eq!(warm_b.template, computed_b.template, "B must serve B's template, not A's");
         assert_ne!(
             warm_b.variation_points_json, computed_a.variation_points_json,
@@ -863,6 +1069,61 @@ mod tests {
                 && !warm_b.variation_points_json.contains("2.5"),
             "class B payload carries ITS real literal 3.5 (not A's 2.5): {}",
             warm_b.variation_points_json
+        );
+    }
+
+    /// #275: the refine MODE is folded into the content key, so baseline and scip refinements
+    /// of the SAME class occupy disjoint cache rows — an oracle run can drop every scip row
+    /// without touching baseline rows, and neither mode can serve the other's payload.
+    #[test]
+    fn refinement_key_distinguishes_refine_mode() {
+        let hashes = vec!["aaa".to_string(), "bbb".to_string()];
+        let discs = vec!["s1".to_string()];
+        assert_ne!(
+            refinement_key("rust", RefineMode::Baseline, &hashes, &discs),
+            refinement_key("rust", RefineMode::Scip, &hashes, &discs),
+            "the two refine modes must address disjoint cache namespaces"
+        );
+    }
+
+    /// #275 finding 3: an oracle run rewrites the moniker evidence a scip refinement consulted,
+    /// and nothing in its key changes — `invalidate_scip_refinements` must drop every scip-mode
+    /// row (they recompute lazily) while sparing the oracle-independent baseline rows.
+    #[test]
+    fn invalidate_scip_refinements_drops_scip_rows_and_spares_baseline() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::schema::apply(&conn).unwrap();
+
+        let members = vec![
+            member(1, "fn f() { let x = 10; sink(x); }"),
+            member(2, "fn g() { let y = 20; sink(y); }"),
+        ];
+        let hashes: Vec<String> = members.iter().map(|m| m.struct_hash.clone()).collect();
+        let discs = discriminators_for(&members);
+        let base_key = refinement_key("rust", RefineMode::Baseline, &hashes, &discs);
+        let scip_key = refinement_key("rust", RefineMode::Scip, &hashes, &discs);
+        refine_compute_and_store(
+            &conn,
+            &base_key,
+            "rust",
+            RefineMode::Baseline,
+            &members,
+            1.0,
+            None,
+        )
+        .unwrap();
+        refine_compute_and_store(&conn, &scip_key, "rust", RefineMode::Scip, &members, 1.0, None)
+            .unwrap();
+
+        let dropped = invalidate_scip_refinements(&conn).unwrap();
+        assert_eq!(dropped, 1, "exactly the scip row is dropped");
+        assert!(
+            refine_lookup(&conn, &scip_key, RefineMode::Scip).unwrap().is_none(),
+            "the scip refinement must be gone after an oracle run"
+        );
+        assert!(
+            refine_lookup(&conn, &base_key, RefineMode::Baseline).unwrap().is_some(),
+            "the oracle-independent baseline refinement must survive"
         );
     }
 
@@ -889,19 +1150,32 @@ mod tests {
         ];
         let hashes1: Vec<String> = class1.iter().map(|m| m.struct_hash.clone()).collect();
         let hashes2: Vec<String> = class2.iter().map(|m| m.struct_hash.clone()).collect();
-        let key1 = refinement_key("rust", &hashes1, &discriminators_for(&class1));
-        let key2 = refinement_key("rust", &hashes2, &discriminators_for(&class2));
+        let key1 =
+            refinement_key("rust", RefineMode::Baseline, &hashes1, &discriminators_for(&class1));
+        let key2 =
+            refinement_key("rust", RefineMode::Baseline, &hashes2, &discriminators_for(&class2));
         assert_eq!(key1, key2, "byte-identical source → same content key (true dupe)");
 
         // Compute class 1 → persists one row.
-        let computed1 = refine_compute_and_store(&conn, &key1, "rust", &class1, 1.0, None).unwrap();
+        let computed1 = refine_compute_and_store(
+            &conn,
+            &key1,
+            "rust",
+            RefineMode::Baseline,
+            &class1,
+            1.0,
+            None,
+        )
+        .unwrap();
         let rows_after_1: i64 =
             conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap();
         assert_eq!(rows_after_1, 1, "class 1 persists one row");
 
         // Class 2 (distinct class, byte-identical content) LOOKS UP the same key → cache hit, same
         // template, no new row.
-        let cached2 = refine_lookup(&conn, &key2).unwrap().expect("class 2 hits class 1's cache");
+        let cached2 = refine_lookup(&conn, &key2, RefineMode::Baseline)
+            .unwrap()
+            .expect("class 2 hits class 1's cache");
         assert_eq!(
             cached2.template, computed1.template,
             "byte-identical source must serve the same cached template"

@@ -1939,7 +1939,7 @@ fn clones_for_symbol_returns_refined_class() {
 /// same key; the two key families never collide for the same class.
 #[test]
 fn refinement_key_is_content_addressed_and_distinct_from_read_key() {
-    use crate::index::clones::refine::cache::refinement_key;
+    use crate::index::clones::refine::cache::{RefineMode, refinement_key};
 
     let hashes = vec!["h1".to_string(), "h2".to_string(), "h3".to_string()];
     let shuffled = vec!["h3".to_string(), "h1".to_string(), "h2".to_string()];
@@ -1948,8 +1948,8 @@ fn refinement_key_is_content_addressed_and_distinct_from_read_key() {
     // Same multiset, different order (struct_hashes AND source discriminators) → same
     // refinement_key (content-addressed, order-independent).
     assert_eq!(
-        refinement_key("rust", &hashes, &discs),
-        refinement_key("rust", &shuffled, &discs_shuffled),
+        refinement_key("rust", RefineMode::Baseline, &hashes, &discs),
+        refinement_key("rust", RefineMode::Baseline, &shuffled, &discs_shuffled),
         "the same struct_hash + source-discriminator multiset must address the same refinement"
     );
 
@@ -2398,7 +2398,7 @@ fn load_refine_members_returns_up_to_value_cap() {
 
     // load_refine_members must cap the re-parse to MEMBER_VALUE_CAP members.
     let members = db
-        .load_refine_members(&big)
+        .load_refine_members(&big, false)
         .expect("load_refine_members ok")
         .expect("refine inputs available for an in-scope class");
     assert_eq!(
@@ -2450,8 +2450,10 @@ fn refine_member_carries_spans_len_eq_seq() {
     let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
     let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
 
-    let members =
-        db.load_refine_members(&[id_a, id_b]).expect("load ok").expect("refine inputs available");
+    let members = db
+        .load_refine_members(&[id_a, id_b], false)
+        .expect("load ok")
+        .expect("refine inputs available");
     assert_eq!(members.len(), 2, "both members must be returned");
 
     for m in &members {
@@ -2515,7 +2517,7 @@ fn faithfulness_pin_still_drops_drifted_member() {
 
     // Sanity: before drift, refine inputs are available.
     assert!(
-        db.load_refine_members(&[id_a, id_b]).unwrap().is_some(),
+        db.load_refine_members(&[id_a, id_b], false).unwrap().is_some(),
         "before drift: refine inputs must be available"
     );
 
@@ -2529,7 +2531,7 @@ fn faithfulness_pin_still_drops_drifted_member() {
 
     // After drift: the re-parse of b.rs produces a different struct_hash → faithfulness pin fires
     // → load_refine_members returns Ok(None).
-    let result = db.load_refine_members(&[id_a, id_b]).unwrap();
+    let result = db.load_refine_members(&[id_a, id_b], false).unwrap();
     assert!(
         result.is_none(),
         "a drifted member (struct_hash mismatch) must cause load_refine_members to return Ok(None)"
@@ -3729,7 +3731,7 @@ fn load_refine_members_reparse_is_faithful_to_persisted_struct_hash() {
     let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
 
     let members = db
-        .load_refine_members(&[id_a, id_b])
+        .load_refine_members(&[id_a, id_b], false)
         .unwrap()
         .expect("refine inputs available for an unchanged, in-scope clone pair");
     assert_eq!(members.len(), 2, "both members loaded");
@@ -3792,7 +3794,8 @@ fn load_refine_members_empty_input_returns_empty() {
     fs::write(root.join("src/a.rs"), "pub fn f() -> i32 { 0 }\n").unwrap();
     let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
 
-    let members = db.load_refine_members(&[]).unwrap().expect("empty input is a valid empty set");
+    let members =
+        db.load_refine_members(&[], false).unwrap().expect("empty input is a valid empty set");
     assert!(members.is_empty(), "empty member_ids → empty members");
 
     let _ = fs::remove_dir_all(root);
@@ -3824,7 +3827,7 @@ fn load_refine_members_returns_none_when_source_missing() {
     // Delete one member's source file on disk; the fingerprint rows are unchanged in the index.
     fs::remove_file(root.join("src/b.rs")).unwrap();
 
-    let result = db.load_refine_members(&[id_a, id_b]).unwrap();
+    let result = db.load_refine_members(&[id_a, id_b], false).unwrap();
     assert!(
         result.is_none(),
         "a member with a deleted source file must yield Ok(None) for the whole class"
@@ -3876,7 +3879,7 @@ fn load_refine_members_returns_none_under_linked_overlay_scope() {
     let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
 
     // Even with valid member ids, refine is unavailable under an overlay scope.
-    let result = db.load_refine_members(&[id_a, id_b]).unwrap();
+    let result = db.load_refine_members(&[id_a, id_b], false).unwrap();
     assert!(
         result.is_none(),
         "refine must be unavailable (Ok(None)) under a linked-worktree overlay scope"
@@ -3884,4 +3887,120 @@ fn load_refine_members_returns_none_under_linked_overlay_scope() {
 
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
+}
+
+/// #275 (Plan 3) end to end: a clone class whose ONLY difference is the callee SPELLING —
+/// baseline refines it with a `differing_callee` closure_param (it cannot prove `validate` /
+/// `check` / `verify` / `audit` are one function). Seeding CURRENT `edge_oracle` rows that
+/// resolve every member's callee to ONE moniker flips the next refine into scip mode: the callee
+/// column collapses back into the fixed spine (coverage 1.0, no variation point, no
+/// `differing_callee`) and the class carries `refine_mode = "scip"` provenance. The baseline and
+/// scip refinements coexist as separate cache rows (the mode is folded into the key).
+#[test]
+fn scip_moniker_collapse_lifts_a_same_symbol_callee_class() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    // The write_four_renamed_clones shape, but the CALLEE differs per member — the one variation
+    // baseline must flag as differing_callee and the oracle can collapse.
+    let fixtures = [
+        ("a", "load_user", "u", "validate"),
+        ("a", "load_order", "o", "check"),
+        ("b", "load_item", "i", "verify"),
+        ("b", "load_blob", "x", "audit"),
+    ];
+    for (dir, name, var, callee) in fixtures {
+        fs::write(
+            root.join(dir).join(format!("{name}.rs")),
+            format!(
+                "pub fn {name}(db: Db) -> i32 {{ let {var} = db.get(1); {callee}({var}); {var} + \
+                 1 }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let config = four_clone_config(&root);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Run 1 — NO oracle data: baseline mode, and the differing callee is a conservative
+    // closure_param/differing_callee variation point.
+    let r1 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    let class1 = &r1.classes[0];
+    assert!(class1.refined, "run 1 refines the class");
+    assert_eq!(class1.refine_mode, Some("baseline"), "no oracle coverage ⇒ baseline mode");
+    let vps1 = class1.variation_points.as_ref().expect("run 1 VPs").as_array().unwrap().clone();
+    assert!(
+        vps1.iter().any(|vp| vp["differing_callee"] == serde_json::Value::Bool(true)),
+        "baseline must flag the differing callee (non-vacuity guard), got {vps1:?}"
+    );
+
+    // Seed CURRENT oracle verdicts: each member file's callee identifier span resolves to the
+    // SAME moniker. `file_sha` must equal the indexed (= on-disk) content hash for the rows to
+    // count as current.
+    let conn = db.storage.connection();
+    for (dir, name, _var, callee) in fixtures {
+        let rel = format!("{dir}/{name}.rs");
+        let src = fs::read_to_string(root.join(&rel)).unwrap();
+        let sha = crate::index::hex_sha256(src.as_bytes());
+        let start = src.find(&format!("{callee}(")).unwrap();
+        conn.execute(
+            "INSERT INTO edge_oracle(repo_id, source_path, source_start_byte, source_end_byte, \
+             callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+             scip_symbol, kind, computed_at)
+             VALUES (?1, ?2, ?3, ?4, ?3, ?4, 'calls_name', ?5, 'scip-rust', 'v1', 'rust cr 1.0 \
+             validate().', 'resolved', 0)",
+            rusqlite::params![
+                db.active_repo_id,
+                rel,
+                start as i64,
+                (start + callee.len()) as i64,
+                sha,
+            ],
+        )
+        .unwrap();
+    }
+
+    // Run 2 — oracle coverage exists: scip mode, the callee collapses into the fixed spine.
+    let r2 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    let class2 = &r2.classes[0];
+    assert!(class2.refined, "run 2 refines the class (scip-mode cold compute)");
+    assert_eq!(
+        class2.refine_mode,
+        Some("scip"),
+        "oracle coverage ⇒ scip mode provenance on the class"
+    );
+    let vps2 = class2.variation_points.as_ref().expect("run 2 VPs").as_array().unwrap().clone();
+    assert!(
+        vps2.iter().all(|vp| vp["differing_callee"] != serde_json::Value::Bool(true)),
+        "a moniker-proven same-symbol callee must not be differing_callee, got {vps2:?}"
+    );
+    assert!(
+        vps2.is_empty(),
+        "the callee was the ONLY variation — the collapsed class has no variation points, got \
+         {vps2:?}"
+    );
+    assert_eq!(
+        class2.anti_unify_coverage,
+        Some(1.0),
+        "the collapsed callee column is fixed spine — coverage returns to 1.0"
+    );
+
+    // Both modes' refinements coexist as distinct cache rows (disjoint key namespaces). Scoped
+    // to the active repo — the poison-sibling harness seeds its own refinement row.
+    let modes: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT refine_mode FROM clone_refinements WHERE repo_id = ?1 ORDER BY refine_mode",
+            )
+            .unwrap();
+        stmt.query_map([&db.active_repo_id], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(modes, vec!["baseline".to_string(), "scip".to_string()]);
+
+    let _ = fs::remove_dir_all(root);
 }

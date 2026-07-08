@@ -437,6 +437,12 @@ pub(crate) fn run_in_tx(
         &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
     )?;
 
+    // The run rewrote the `edge_oracle` moniker evidence, and NOTHING in a scip-mode clone
+    // refinement's cache key changes when a moniker changes (#275 finding 3) — invalidate every
+    // scip-mode row so the next refine pass recomputes against the fresh verdicts. Baseline rows
+    // are oracle-independent and spared.
+    crate::index::clones::refine::cache::invalidate_scip_refinements(conn)?;
+
     Ok(report)
 }
 

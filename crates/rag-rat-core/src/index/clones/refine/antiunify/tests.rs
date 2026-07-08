@@ -17,7 +17,15 @@ fn member(symbol_id: i64, src: &str) -> RefineMember {
         parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
     let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::Rust);
     let struct_hash = tokens::struct_hash(&seq);
-    RefineMember { symbol_id, lang: Language::Rust, struct_hash, seq, node_spans, text }
+    RefineMember {
+        callee_monikers: Default::default(),
+        symbol_id,
+        lang: Language::Rust,
+        struct_hash,
+        seq,
+        node_spans,
+        text,
+    }
 }
 
 /// Build a `RefineMember` from a TypeScript snippet — the TS analogue of [`member`]. Picks the
@@ -39,7 +47,15 @@ fn member_ts(symbol_id: i64, src: &str) -> RefineMember {
         .expect("a body symbol");
     let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::TypeScript);
     let struct_hash = tokens::struct_hash(&seq);
-    RefineMember { symbol_id, lang: Language::TypeScript, struct_hash, seq, node_spans, text }
+    RefineMember {
+        callee_monikers: Default::default(),
+        symbol_id,
+        lang: Language::TypeScript,
+        struct_hash,
+        seq,
+        node_spans,
+        text,
+    }
 }
 
 /// Sort members into the canonical order the loader guarantees. Production keys on the
@@ -913,6 +929,145 @@ fn differing_free_callee_at_matched_column_is_closure_param() {
     );
 }
 
+/// Attach a SCIP callee moniker for the `nth` (0-based) occurrence of `name` in the member's
+/// source — the span-exact map `current_callee_monikers` would build in scip refine mode (#275).
+fn with_callee_moniker(
+    mut member: RefineMember,
+    name: &str,
+    nth: usize,
+    moniker: &str,
+) -> RefineMember {
+    let mut from = 0;
+    let mut start = None;
+    for _ in 0..=nth {
+        let at = member.text[from..].find(name).expect("callee occurrence present") + from;
+        start = Some(at);
+        from = at + name.len();
+    }
+    let start = start.expect("nth occurrence");
+    member.callee_monikers.insert((start, start + name.len()), moniker.to_string());
+    member
+}
+
+#[test]
+fn same_moniker_callee_at_matched_column_stays_fixed() {
+    // #275 (Plan 3): the SAME fixture as `differing_free_callee_at_matched_column_is_closure_param`
+    // — `foo()` vs `bar()` at an LCS-matched callee column — but the oracle proves both spellings
+    // resolve to ONE moniker (a moved / aliased / re-exported same function). The reopen must NOT
+    // fire: the column stays FIXED (the anchor's spelling renders as template text — finding 4's
+    // "a collapsed callee becomes fixed template text"), there is NO variation point, NO
+    // `differing_callee`, and coverage stays 1.0 — the Type-2 lift.
+    let a = with_callee_moniker(member(1, "fn a(){ foo(); }"), "foo", 0, "rust cr 1.0 m/foo().");
+    let b = with_callee_moniker(member(2, "fn b(){ bar(); }"), "bar", 0, "rust cr 1.0 m/foo().");
+    let (_members, template) = run(vec![a, b]);
+
+    assert!(
+        template.variation_points.is_empty(),
+        "a moniker-proven same-symbol callee must not open a variation point, got {:?}",
+        template.variation_points
+    );
+    assert!(
+        (template.anti_unify_coverage - 1.0).abs() < 1e-12,
+        "a collapsed callee keeps coverage 1.0, got {}",
+        template.anti_unify_coverage
+    );
+    assert!(
+        template.text.contains("foo"),
+        "the collapsed column renders the anchor's spelling as fixed text, got {:?}",
+        template.text
+    );
+}
+
+#[test]
+fn differing_moniker_callee_still_reopens_as_closure_param() {
+    // #275: monikers attached but DIFFERENT — genuinely different functions. The collapse must
+    // not fire; the reopen routes through the differing-callee guard exactly as with no oracle.
+    let a = with_callee_moniker(member(1, "fn a(){ foo(); }"), "foo", 0, "rust cr 1.0 m/foo().");
+    let b = with_callee_moniker(member(2, "fn b(){ bar(); }"), "bar", 0, "rust cr 1.0 m/bar().");
+    let (_members, template) = run(vec![a, b]);
+
+    assert_eq!(template.variation_points.len(), 1, "got {:?}", template.variation_points);
+    let vp = &template.variation_points[0];
+    assert_eq!(vp.kind, MetavarKind::ClosureParam);
+    assert!(vp.differing_callee, "different monikers keep the differing-callee verdict");
+}
+
+#[test]
+fn missing_moniker_on_one_member_vetoes_the_collapse() {
+    // #275: only ONE member carries oracle evidence (stale coverage for the other file, a drifted
+    // member, an unresolved callee). No proof ⇒ no collapse — the conservative reopen stands.
+    let a = with_callee_moniker(member(1, "fn a(){ foo(); }"), "foo", 0, "rust cr 1.0 m/foo().");
+    let b = member(2, "fn b(){ bar(); }");
+    let (_members, template) = run(vec![a, b]);
+
+    assert_eq!(template.variation_points.len(), 1, "got {:?}", template.variation_points);
+    let vp = &template.variation_points[0];
+    assert_eq!(vp.kind, MetavarKind::ClosureParam);
+    assert!(vp.differing_callee, "a member without a moniker must veto the collapse");
+}
+
+#[test]
+fn same_moniker_callee_in_matched_statement_redescent_is_not_differing() {
+    // #275, the VARIATION-RUN site (`run_callees_differ` guard): the
+    // `matched_statement_differing_callee_after_indel_is_closure_param` fixture — the matched
+    // second statement's callee genuinely differs in token space (reused `a` = ID0 vs fresh `b` =
+    // ID1, so LCS makes it a variation run, not a matched column) — but the oracle proves both
+    // resolve to ONE moniker. The guard is skipped: the run classifies through the normal ladder
+    // (a single `ID` leaf ⇒ value_param), NEVER `differing_callee`. This also pins that the
+    // moniker map survives the statement re-descent (the sub-members share the parent's absolute
+    // offsets).
+    let a = with_callee_moniker(
+        member(1, "fn f(){ a(); a(); let z = 0; }"),
+        "a",
+        // Occurrences of "a" in the source: the fn param list has none; `fn f(){ a(); a(); …` —
+        // occurrence 0 is the first callee, 1 the second (the compared statement's callee).
+        // Attach BOTH so whichever statement the alignment compares carries evidence.
+        0,
+        "rust cr 1.0 m/same().",
+    );
+    let a = with_callee_moniker(a, "a", 1, "rust cr 1.0 m/same().");
+    let b = with_callee_moniker(
+        member(2, "fn f(){ a(); b(); let z = 0; w(); }"),
+        "b",
+        0,
+        "rust cr 1.0 m/same().",
+    );
+    // Member b's FIRST callee `a` matches member a's — equal values never reopen, but attach the
+    // moniker anyway (the production map covers every resolved call site).
+    let b = with_callee_moniker(b, "a", 0, "rust cr 1.0 m/same().");
+    let (_members, template) = run(vec![a, b]);
+
+    // The a/b callee variation must NOT be a differing callee any more…
+    assert!(
+        template.variation_points.iter().all(|vp| !vp.differing_callee),
+        "a moniker-proven same-symbol callee must not be flagged differing_callee, got {:?}",
+        template.variation_points
+    );
+    // …it classifies through the ladder as a plain single-leaf value hole instead.
+    let collapsed_vp = template
+        .variation_points
+        .iter()
+        .find(|vp| {
+            let mut vals = vp.per_member_values.clone();
+            vals.retain(|v| !v.is_empty());
+            vals.sort();
+            vals == vec!["a".to_string(), "b".to_string()]
+        })
+        .expect("the a/b callee column still surfaces as a variation point");
+    assert_eq!(
+        collapsed_vp.kind,
+        MetavarKind::ValueParam,
+        "the guard-skipped single-leaf run falls through to value_param, got {:?}",
+        collapsed_vp
+    );
+    // The inserted `w();` stays gapped — the collapse never touches indel handling.
+    assert!(
+        template.variation_points.iter().any(|vp| vp.kind == MetavarKind::Gapped),
+        "the inserted w(); must stay a gapped metavar, got {:?}",
+        template.variation_points
+    );
+}
+
 #[test]
 fn differing_scoped_path_callee_tail_at_matched_column_is_closure_param() {
     // #235 item 18: `m::foo()` vs `m::bar()` differ only in the FINAL path segment. Both
@@ -1318,6 +1473,7 @@ fn synthetic_method_call() -> RefineMember {
         "ID2".to_string(),
     ];
     RefineMember {
+        callee_monikers: Default::default(),
         symbol_id: 1,
         lang: Language::Rust,
         struct_hash: "synthetic".to_string(),
@@ -1690,6 +1846,7 @@ fn synthetic_member(symbol_id: i64, struct_hash: &str, token_count: usize) -> Re
         })
         .collect();
     RefineMember {
+        callee_monikers: Default::default(),
         symbol_id,
         lang: Language::Rust,
         struct_hash: struct_hash.to_string(),
@@ -1980,6 +2137,7 @@ fn zero_width_insert_sharing_column_is_rendered() {
     // non-deterministic to force): a 3-leaf anchor, a consuming gapped VP over cols
     // [1..=2], and a zero-width gapped VP also attached at col 1.
     let anchor = RefineMember {
+        callee_monikers: Default::default(),
         symbol_id: 1,
         lang: Language::Rust,
         struct_hash: "synthetic".to_string(),
@@ -2753,6 +2911,7 @@ fn defensive_member_sample_cap_marks_tail_members_unaligned() {
 fn call_node_differing_callee_classifies_low_with_flag() {
     let members = vec![
         RefineMember {
+            callee_monikers: Default::default(),
             symbol_id: 1,
             lang: Language::Rust,
             struct_hash: "call".to_string(),
@@ -2766,6 +2925,7 @@ fn call_node_differing_callee_classifies_low_with_flag() {
             text: Arc::from("foo()"),
         },
         RefineMember {
+            callee_monikers: Default::default(),
             symbol_id: 2,
             lang: Language::Rust,
             struct_hash: "call".to_string(),
@@ -2831,6 +2991,7 @@ fn split_helper_defensive_paths_are_covered() {
     assert_eq!(classified.hi(), 8);
 
     let invalid_utf8_slice = RefineMember {
+        callee_monikers: Default::default(),
         symbol_id: 1,
         lang: Language::Rust,
         struct_hash: "utf8".to_string(),
@@ -2848,6 +3009,7 @@ fn split_helper_defensive_paths_are_covered() {
     ]);
 
     let empty_anchor = RefineMember {
+        callee_monikers: Default::default(),
         symbol_id: 2,
         lang: Language::Rust,
         struct_hash: "empty".to_string(),
@@ -2858,6 +3020,7 @@ fn split_helper_defensive_paths_are_covered() {
     assert_eq!(annotation_type_context(&empty_anchor, 0), None);
 
     let invalid_type_slice = RefineMember {
+        callee_monikers: Default::default(),
         symbol_id: 3,
         lang: Language::Rust,
         struct_hash: "bad-type".to_string(),
@@ -2871,6 +3034,7 @@ fn split_helper_defensive_paths_are_covered() {
     assert_eq!(annotation_type_context(&invalid_type_slice, 1), None);
 
     let colon_without_type = RefineMember {
+        callee_monikers: Default::default(),
         symbol_id: 4,
         lang: Language::Rust,
         struct_hash: "no-type".to_string(),
@@ -2884,6 +3048,7 @@ fn split_helper_defensive_paths_are_covered() {
     assert_eq!(annotation_type_context(&colon_without_type, 1), None);
 
     let interpolated_template = RefineMember {
+        callee_monikers: Default::default(),
         symbol_id: 5,
         lang: Language::TypeScript,
         struct_hash: "template".to_string(),
@@ -2906,6 +3071,7 @@ fn split_helper_defensive_paths_are_covered() {
     assert_eq!(widen_string_content_run(&interpolated_template, 2, 2), (2, 2));
 
     let duplicate_string_candidates = RefineMember {
+        callee_monikers: Default::default(),
         symbol_id: 6,
         lang: Language::Rust,
         struct_hash: "duplicate-strings".to_string(),

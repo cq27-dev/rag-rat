@@ -114,7 +114,9 @@ const _: () = assert!(
 pub(crate) const HYDRATION_CHUNK: usize = 900;
 
 use self::build::{build_class, count_stale_member_paths};
-use self::refine_load::{load_refine_rows, load_source_discriminators};
+use self::refine_load::{
+    load_refine_rows, load_source_discriminators, oracle_callee_coverage_exists,
+};
 use self::resolve::{classify_ineligibility_reason, resolve_selector_to_symbol_id};
 use self::scoring::{
     apply_refinement, build_completeness, canonical_member_order_key,
@@ -126,7 +128,7 @@ use self::substrate::{
 };
 use crate::index::IndexDatabase;
 use crate::index::clones::refine::cache::{
-    refine_compute_and_store_budgeted, refine_lookup, refinement_key,
+    RefineMode, refine_compute_and_store_budgeted, refine_lookup, refinement_key,
 };
 use crate::index::clones::refine::split::coherence_split;
 
@@ -491,6 +493,17 @@ impl IndexDatabase {
             return Ok(());
         };
 
+        // Refine mode (#275, Plan 3): scip when any member file has CURRENT oracle callee
+        // coverage, else baseline. Probed BEFORE the key because the mode is folded into it — the
+        // two modes address disjoint cache namespaces, so an oracle run can invalidate every
+        // scip-mode row (`invalidate_scip_refinements`) without touching baseline rows. Cheap
+        // (one EXISTS per hydration chunk), so the warm probe stays a probe.
+        let mode = if oracle_callee_coverage_exists(conn, class_ids)? {
+            RefineMode::Scip
+        } else {
+            RefineMode::Baseline
+        };
+
         // Content-addressed key over the member struct_hash multiset + the per-member source
         // discriminators — NOT the read-side `class.class_key` (location-derived). Two classes with
         // the same structural content AND the same exact source bodies share a refinement; the key
@@ -501,7 +514,7 @@ impl IndexDatabase {
         // `build_class`), while `key` spans the FULL struct_hash multiset. The gap is not a
         // determinism break — the sample is id-ASC stable — but Plan-4b should compute confidence
         // over the full set or fold the sample into the key.
-        let key = refinement_key(&class.language, &struct_hashes, &source_discriminators);
+        let key = refinement_key(&class.language, mode, &struct_hashes, &source_discriminators);
 
         // ── Phase 1 (PURE READ — warm path): probe the content-addressed cache. A SELECT is safe
         // on the MCP's read-only connection; a WARM cache hit never takes the write lock and never
@@ -515,7 +528,7 @@ impl IndexDatabase {
         // key → cache miss → cold path (re-parse + faithfulness check). Staleness is separately
         // surfaced to callers via `completeness.stale_members`. Skipping the re-validation on warm
         // hits is therefore not a regression; it is the designed behavior.
-        if let Some(refinement) = refine_lookup(conn, &key)? {
+        if let Some(refinement) = refine_lookup(conn, &key, mode)? {
             // WARM path: cache hit — apply the refinement without re-parsing any source files.
             apply_refinement(class, refinement);
             return Ok(());
@@ -546,7 +559,7 @@ impl IndexDatabase {
         // `load_refine_members` is the expensive step (file reads + tree-sitter parses).
         // `None` ⇒ refine unavailable (overlay scope, drifted source, parse failure, or a
         // vanished fingerprint row) — leave the class un-refined.
-        let Some(members) = self.load_refine_members(class_ids)? else {
+        let Some(members) = self.load_refine_members(class_ids, mode == RefineMode::Scip)? else {
             return Ok(());
         };
         // An empty or singleton member set (shouldn't happen for a ≥2 class) is not refinable.
@@ -560,6 +573,7 @@ impl IndexDatabase {
             conn,
             &key,
             &class.language,
+            mode,
             &members,
             class.similarity_min,
             class.medoid_symbol_id,
@@ -776,6 +790,11 @@ impl IndexDatabase {
     pub(crate) fn load_refine_members(
         &self,
         member_ids: &[i64],
+        // Attach per-member SCIP callee monikers (#275) — `true` ONLY when the driver probed
+        // `RefineMode::Scip`. A baseline refinement must stay oracle-independent (it survives the
+        // oracle-run invalidation), so the monikers that would let the classifier collapse a
+        // callee are simply never attached in baseline mode.
+        attach_callee_monikers: bool,
     ) -> anyhow::Result<Option<Vec<crate::index::clones::refine::RefineMember>>> {
         if member_ids.is_empty() {
             return Ok(Some(Vec::new()));
@@ -831,6 +850,14 @@ impl IndexDatabase {
         // whole-file buffer must be kept, not sliced to the symbol range.
         let mut file_cache: std::collections::HashMap<String, Arc<str>> =
             std::collections::HashMap::new();
+        // Per-path SCIP callee monikers (#275), fetched once per distinct file in scip mode.
+        // Keyed by the sha of the DISK bytes just read — `current_callee_monikers` only returns
+        // rows whose `file_sha` matches, so the spans are guaranteed to line up with the
+        // `node_spans` this very parse produces. A drifted file matches nothing (no collapse).
+        let mut moniker_cache: std::collections::HashMap<
+            String,
+            std::collections::HashMap<(usize, usize), String>,
+        > = std::collections::HashMap::new();
 
         let mut members: Vec<crate::index::clones::refine::RefineMember> =
             Vec::with_capacity(rows.len());
@@ -840,6 +867,13 @@ impl IndexDatabase {
                     // Source missing/unreadable on disk — can't reproduce the token sequence.
                     return Ok(None);
                 };
+                if attach_callee_monikers {
+                    let disk_sha = crate::index::hex_sha256(content.as_bytes());
+                    moniker_cache.insert(
+                        row.path.clone(),
+                        crate::index::oracle::current_callee_monikers(conn, &row.path, &disk_sha)?,
+                    );
+                }
                 file_cache.insert(row.path.clone(), Arc::from(content.as_str()));
             }
             let text: Arc<str> =
@@ -883,6 +917,7 @@ impl IndexDatabase {
                 struct_hash: row.struct_hash,
                 seq,
                 node_spans,
+                callee_monikers: moniker_cache.get(&row.path).cloned().unwrap_or_default(),
                 text,
             });
         }

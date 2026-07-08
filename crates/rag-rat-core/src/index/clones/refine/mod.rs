@@ -45,4 +45,13 @@ pub(crate) struct RefineMember {
     /// `text.get(span.start_byte..span.end_byte)` to recover real source for any `NodeSpan` in
     /// `node_spans`.
     pub(crate) text: std::sync::Arc<str>,
+    /// SCIP-oracle callee resolutions for this member's file (#275, Plan 3): the callee-identifier
+    /// byte range → the resolved SCIP moniker, from `edge_oracle` rows whose `file_sha` matches
+    /// the EXACT bytes `text` was read from (so the spans line up — see
+    /// `current_callee_monikers`). EMPTY unless the driver probed scip mode and current oracle
+    /// coverage exists; the anti-unify classifier consults it to collapse a
+    /// same-symbol-different-spelling callee back into the fixed spine instead of reopening it as
+    /// a `differing_callee` variation. Byte ranges use the same ABSOLUTE file offsets as
+    /// `node_spans`.
+    pub(crate) callee_monikers: std::collections::HashMap<(usize, usize), String>,
 }

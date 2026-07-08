@@ -98,7 +98,51 @@ pub(super) fn matched_column_reopen(
     };
     // The erasure only matters when the recovered source values actually differ (C1 up front): a
     // same-callee / same-type / same-literal column stays fixed.
-    matched_source_values_differ(members, alignment, col).then_some(role)
+    if !matched_source_values_differ(members, alignment, col) {
+        return None;
+    }
+    // SCIP moniker collapse (#275, Plan 3): a callee column whose members SPELL the callee
+    // differently but all RESOLVE to one oracle moniker is the same function (moved / aliased /
+    // re-exported) — the Type-2 equivalence the baseline can't prove. The column stays FIXED
+    // (anchor's spelling renders), exactly like a consistently-renamed value local; no variation
+    // point, no `differing_callee`. Only fires when EVERY contributing member carries a moniker
+    // for its span (attached only in scip refine mode) — one missing resolution vetoes the
+    // collapse, so oracle staleness degrades to today's conservative reopen, never a wrong fix.
+    if role == ReopenRole::Callee && matched_callee_monikers_agree(members, alignment, col) {
+        return None;
+    }
+    Some(role)
+}
+
+/// `true` when EVERY aligned member contributing a token at matched column `col` carries a SCIP
+/// callee moniker for that token's span, and all those monikers name ONE symbol (#275, Plan 3).
+/// A contributing member WITHOUT a moniker returns `false` (no oracle evidence → no collapse);
+/// members that gapped the column contribute no opinion, mirroring
+/// [`matched_source_values_differ`]. `local N` monikers never reach here
+/// (`current_callee_monikers` drops them — document-scoped identity must not equate across
+/// files).
+fn matched_callee_monikers_agree(
+    members: &[RefineMember],
+    alignment: &ClassAlignment,
+    col: usize,
+) -> bool {
+    let mut seen: Option<&str> = None;
+    for (m_idx, member) in members.iter().enumerate() {
+        if !alignment.aligned[m_idx] {
+            continue;
+        }
+        let Some(j) = alignment.col_map[m_idx][col] else { continue };
+        let span = &member.node_spans[j];
+        let Some(moniker) = member.callee_monikers.get(&(span.start_byte, span.end_byte)) else {
+            return false;
+        };
+        match seen {
+            None => seen = Some(moniker),
+            Some(prev) if prev == moniker => {},
+            Some(_) => return false,
+        }
+    }
+    seen.is_some()
 }
 
 /// `true` when the anchor's spine leaf at column `col` is a callee / method-name identifier in
@@ -212,7 +256,16 @@ pub(super) fn classify_run(
     // DIFFERS across members is closure_param Medium/Low, NEVER a high-confidence value_param.
     // Baseline cannot prove two differing callees resolve to the same symbol. `differing_callee` is
     // set true ONLY here, so downstream scoring keys off the real seam, not the band (Fix 5).
-    if run_callees_differ(per_member_values) {
+    //
+    // SCIP moniker collapse (#275, Plan 3): when the oracle CAN prove it — every member realises
+    // the run as one callee leaf whose attached moniker is the SAME symbol — the guard is skipped
+    // and the run classifies through the normal ladder (a single `ID` leaf lands at rule (2)
+    // value_param, like any consistently-equivalent rename), never `differing_callee`. Scope is
+    // deliberately same-call-syntax only (finding 2): a multi-token or cross-syntax run
+    // (`a::b::foo()` vs `foo()`) fails the single-leaf gate and keeps today's verdict.
+    if run_callees_differ(per_member_values)
+        && !run_callee_monikers_agree(members, alignment, lo, hi)
+    {
         if opens_call_head(anchor_kind) {
             // The run snapped to the call node itself — generic differing call subtree, Low.
             return RunClass {
@@ -557,6 +610,59 @@ fn uniform_literal_bucket(
         }
     }
     bucket.map(|b| b.to_string())
+}
+
+/// `true` when EVERY aligned member realises the run `[lo..=hi]` as exactly ONE leaf token whose
+/// span carries a SCIP callee moniker, and all those monikers name ONE symbol (#275, Plan 3) —
+/// the oracle-proven "same function, different spelling" case the differing-callee guard exists
+/// to be conservative about. Any member realising the run as a multi-token subtree, a non-leaf,
+/// or a leaf WITHOUT a moniker returns `false` (finding 2's same-call-syntax scope + the
+/// no-evidence veto); a member that gapped the run contributes no opinion, mirroring
+/// [`run_callees_differ`]'s empty-value skip. Token indices are gathered the same way as
+/// [`every_member_single_leaf`] (col_map slots + inserts keyed in the run).
+fn run_callee_monikers_agree(
+    members: &[RefineMember],
+    alignment: &ClassAlignment,
+    lo: usize,
+    hi: usize,
+) -> bool {
+    let mut seen: Option<&str> = None;
+    for (m_idx, member) in members.iter().enumerate() {
+        if !alignment.aligned[m_idx] {
+            continue;
+        }
+        let cm = &alignment.col_map[m_idx];
+        let inserts = &alignment.member_inserts[m_idx];
+        let mut idxs: Vec<usize> = Vec::new();
+        for &slot in &cm[lo..=hi] {
+            if let Some(j) = slot {
+                idxs.push(j);
+            }
+        }
+        for (_key, ins) in inserts.range(lo..=hi) {
+            idxs.extend(ins.iter().copied());
+        }
+        if idxs.is_empty() {
+            // A gap / cost-skipped member has no callee to compare — no opinion.
+            continue;
+        }
+        if idxs.len() != 1 {
+            return false;
+        }
+        let span = &member.node_spans[idxs[0]];
+        if !span.is_leaf {
+            return false;
+        }
+        let Some(moniker) = member.callee_monikers.get(&(span.start_byte, span.end_byte)) else {
+            return false;
+        };
+        match seen {
+            None => seen = Some(moniker),
+            Some(prev) if prev == moniker => {},
+            Some(_) => return false,
+        }
+    }
+    seen.is_some()
 }
 
 /// `true` when the run's per-member values (the call/method subtree source) differ across members —

@@ -5,6 +5,9 @@
 //! The heuristic resolution stays on the `edges` row untouched; the oracle's verdict lives only in
 //! `edge_oracle`. This is what lets eval diff heuristic-vs-oracle. See `apply_oracle_tables`.
 
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+
 use rusqlite::{Connection, params};
 
 use super::{OracleResolutionKind, OracleTool};
@@ -152,6 +155,60 @@ pub(crate) struct EdgeJoinCandidate {
 /// `constructs`) join against SCIP occurrences too, but a confirmation on them is not a covered
 /// *call* and must be excluded from the recall numerator (the population-mismatch finding, #81).
 pub(crate) const CALL_EDGE_KIND: &str = "calls_name";
+
+/// The CURRENT SCIP callee resolutions for one file, keyed by the callee-identifier byte range —
+/// the clone-refine moniker-collapse input (#275, Plan 3). `file_sha` must be the sha256 of the
+/// EXACT bytes the caller's byte offsets were derived from: `edge_oracle` spans were computed
+/// against the content hashed into each row's `file_sha`, so filtering on it is what makes the
+/// span join sound (a drifted file simply matches nothing — the conservative no-collapse
+/// fallback). Uses `idx_edge_oracle_anchor` (source_path prefix).
+///
+/// Two exclusions keep a false collapse impossible:
+/// - `local N` monikers are DOCUMENT-scoped (unique only within one file), so cross-file equality
+///   would identify two different functions — never returned.
+/// - a span where two rows (different tools / tool versions) disagree on the moniker has no
+///   trustworthy identity — dropped entirely.
+pub(crate) fn current_callee_monikers(
+    conn: &Connection,
+    source_path: &str,
+    file_sha: &str,
+) -> anyhow::Result<HashMap<(usize, usize), String>> {
+    let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT callee_start_byte, callee_end_byte, scip_symbol
+         FROM edge_oracle
+         WHERE source_path = ?1 AND file_sha = ?2 AND edge_kind = ?3{repo_clause}"
+    ))?;
+    let rows = stmt.query_map(params![source_path, file_sha, CALL_EDGE_KIND], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+    })?;
+    let mut monikers: HashMap<(usize, usize), String> = HashMap::new();
+    let mut conflicted: HashSet<(usize, usize)> = HashSet::new();
+    for row in rows {
+        let (start, end, symbol) = row?;
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            continue;
+        };
+        if super::scip::is_local_symbol(&symbol) {
+            continue;
+        }
+        let span = (start, end);
+        if conflicted.contains(&span) {
+            continue;
+        }
+        match monikers.entry(span) {
+            Entry::Vacant(slot) => {
+                slot.insert(symbol);
+            },
+            Entry::Occupied(existing) if *existing.get() == symbol => {},
+            Entry::Occupied(existing) => {
+                existing.remove();
+                conflicted.insert(span);
+            },
+        }
+    }
+    Ok(monikers)
+}
 
 /// One symbol's identity + byte span within a file, for mapping a SCIP definition range back to our
 /// symbol table by containment overlap.

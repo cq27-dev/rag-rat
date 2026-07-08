@@ -91,7 +91,8 @@ pub struct CandidateCloneClass {
     /// only on classes the two-phase driver refined (`refined == true`). `lcs_ratio` is the NiCad
     /// class fidelity (min pairwise `2·LCS/(|a|+|b|)`); `confidence` is the persisted band
     /// (`"high"`/`"medium"`/`"low"`); `refactorability` is the `(0,1]`-clamped ROI multiplier;
-    /// `refine_mode` is `Some("baseline")` when refined.
+    /// `refine_mode` is `Some("baseline")` or — when the SCIP-oracle moniker evidence was
+    /// consulted (#275, Plan 3) — `Some("scip")` when refined.
     pub lcs_ratio: Option<f64>,
     pub confidence: Option<String>,
     pub refactorability: Option<f64>,

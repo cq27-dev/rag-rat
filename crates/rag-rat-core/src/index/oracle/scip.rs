@@ -232,8 +232,9 @@ pub(crate) fn symbol_is_module(symbol: &str) -> bool {
 }
 
 /// A SCIP `local …` symbol is function-local. SCIP's own `is_local_symbol` checks the `local`
-/// scheme prefix; we mirror it so the dependency's exact rule applies.
-fn is_local_symbol(symbol: &str) -> bool {
+/// scheme prefix; we mirror it so the dependency's exact rule applies. `pub(crate)` since #275:
+/// the clone-refine moniker collapse must never treat two document-scoped locals as one identity.
+pub(crate) fn is_local_symbol(symbol: &str) -> bool {
     ::scip::symbol::is_local_symbol(symbol)
 }
 

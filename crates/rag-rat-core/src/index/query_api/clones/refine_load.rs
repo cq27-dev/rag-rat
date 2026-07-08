@@ -94,6 +94,52 @@ pub(crate) fn load_refine_rows(
     Ok(Some(rows))
 }
 
+/// Whether ANY member's file has CURRENT SCIP-oracle callee coverage (#275, Plan 3): an
+/// `edge_oracle` call row whose `file_sha` matches the file's indexed `sha256`. This is the
+/// refine-MODE probe — `true` selects [`RefineMode::Scip`], which keys (and caches) the refinement
+/// in the scip-mode namespace and lets the loader attach callee monikers. CHEAP (one EXISTS per
+/// hydration chunk over `idx_edge_oracle_anchor`), and deterministic for a given (index, oracle)
+/// state, so the warm cache probe stays a probe.
+///
+/// ANY (not ALL) member coverage selects scip mode: a class spanning a covered and an uncovered
+/// file still benefits when the compared callee spans all carry monikers, and the collapse itself
+/// stays span-exact (a member without a moniker vetoes its own comparison, never the whole
+/// class). A class with NO covered file computes byte-identically to baseline, so it keeps the
+/// baseline key rather than duplicating rows into the scip namespace.
+///
+/// [`RefineMode::Scip`]: crate::index::clones::refine::cache::RefineMode
+pub(crate) fn oracle_callee_coverage_exists(
+    conn: &Connection,
+    member_ids: &[i64],
+) -> anyhow::Result<bool> {
+    let repo_clause = crate::index::schema::periphery_repo_scope_clause(
+        &crate::index::schema::periphery_repo_scope(conn, "edge_oracle")?,
+        "edge_oracle",
+    );
+    for chunk in member_ids.chunks(HYDRATION_CHUNK) {
+        let id_placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM symbols
+                 JOIN files ON files.id = symbols.file_id
+                 JOIN edge_oracle
+                   ON edge_oracle.source_path = files.path
+                   AND edge_oracle.file_sha = files.sha256
+                   AND edge_oracle.edge_kind = 'calls_name'{repo_clause}
+                 WHERE symbols.id IN ({})
+             )",
+            id_placeholders.join(", ")
+        );
+        let covered: bool =
+            conn.query_row(&sql, rusqlite::params_from_iter(chunk.iter()), |row| row.get(0))?;
+        if covered {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Fetch a per-member SOURCE DISCRIMINATOR — `"{file_sha256}:{start_byte}-{end_byte}"` — for the
 /// refinement cache key (#215 Plan 4b, cache-poisoning fix). `file_sha256` is the indexed file
 /// content hash; the body byte span pins the member's source range. Together they uniquely

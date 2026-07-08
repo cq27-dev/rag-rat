@@ -481,6 +481,9 @@ fn emit_matched_statement_redescent(
             seq: member.seq[start..end].to_vec(),
             node_spans: member.node_spans[start..end].to_vec(),
             text: member.text.clone(),
+            // Same ABSOLUTE offsets as the parent, so the moniker map carries over verbatim —
+            // the #275 callee collapse works inside a re-descended statement too.
+            callee_monikers: member.callee_monikers.clone(),
         });
         sub_to_full.push(m_idx);
     }
@@ -624,6 +627,7 @@ mod coverage_tests {
         node_spans: Vec<NodeSpan>,
     ) -> RefineMember {
         RefineMember {
+            callee_monikers: Default::default(),
             symbol_id,
             lang: Language::Rust,
             struct_hash: seq.join("\u{1}"),

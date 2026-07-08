@@ -828,10 +828,17 @@ fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
         )
         .unwrap();
     }
-    let config = Config {
+    IndexDatabase::rebuild(&four_clone_config(root)).unwrap()
+}
+
+/// The `write_four_renamed_clones` fixture's config — a rust target over the `a/` + `b/` dirs —
+/// shared with tests that write their own four-member variant (e.g. the #275 differing-callee
+/// fixture) before rebuilding.
+fn four_clone_config(root: &Path) -> Config {
+    Config {
         repo_id_override: None,
         database_key_pinned: true,
-        root: root.clone(),
+        root: root.to_path_buf(),
         database: root.join(".rag-rat/index.sqlite"),
         targets: vec![ResolvedTarget {
             name: "rust".to_string(),
@@ -850,8 +857,7 @@ fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
         log: Default::default(),
         source_root_reanchored_from: None,
         allow_empty: false,
-    };
-    IndexDatabase::rebuild(&config).unwrap()
+    }
 }
 
 /// Resolve the `symbols.id` of a fingerprinted function by its qualified-name `ref` (the

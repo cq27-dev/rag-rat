@@ -234,3 +234,68 @@ fn record_oracle_run_and_count_by_kind() {
         0
     );
 }
+
+/// `current_callee_monikers` (#275, Plan 3) returns only span→moniker entries a clone-refine
+/// collapse may trust: rows whose `file_sha` matches the requested content hash (a drifted file
+/// matches nothing), never a document-scoped `local N` symbol, and never a span two rows disagree
+/// on (a multi-tool conflict has no trustworthy identity).
+#[test]
+fn current_callee_monikers_filters_sha_locals_and_conflicts() {
+    let h = Harness::new();
+    let src = "fn caller() { keep(); conflicted(); stale(); loc(); }\n";
+    let file = h.add_file("m.rs", src);
+    let sha = h.file_sha("m.rs");
+    let span = |name: &str| {
+        let start = src.find(name).unwrap();
+        (start, start + name.len())
+    };
+
+    let (keep_lo, keep_hi) = span("keep");
+    let keep_edge = h.add_edge(file, "keep", keep_lo, keep_hi, "NameOnly", None);
+    h.write_verdict(keep_edge, &sha, None, "rust cr 1.0 keep().", OracleResolutionKind::Upgrade);
+
+    // A span two tools disagree on: the second verdict is written under a DIFFERENT tool with a
+    // different symbol → the span is dropped entirely.
+    let (con_lo, con_hi) = span("conflicted");
+    let con_edge = h.add_edge(file, "conflicted", con_lo, con_hi, "NameOnly", None);
+    h.write_verdict(con_edge, &sha, None, "rust cr 1.0 one().", OracleResolutionKind::Upgrade);
+    let key = h.edge_content_key(con_edge);
+    store::write_edge_oracle(&h.conn, OracleTool::ScipClang, VERSION, &EdgeOracleRow {
+        source_path: &key.source_path,
+        source_start_byte: key.source_start_byte,
+        source_end_byte: key.source_end_byte,
+        callee_start_byte: key.callee_start_byte,
+        callee_end_byte: key.callee_end_byte,
+        edge_kind: &key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: None,
+        scip_symbol: "rust cr 1.0 two().",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+
+    // A verdict computed against DIFFERENT bytes (stale sha) — the spans can't be trusted to
+    // line up with the requested content, so it is excluded.
+    let (stale_lo, stale_hi) = span("stale");
+    let stale_edge = h.add_edge(file, "stale", stale_lo, stale_hi, "NameOnly", None);
+    h.write_verdict(
+        stale_edge,
+        "not-the-requested-sha",
+        None,
+        "rust cr 1.0 stale().",
+        OracleResolutionKind::Upgrade,
+    );
+
+    // A `local N` symbol is document-scoped — cross-file equality would identify two different
+    // functions, so it is never returned.
+    let (loc_lo, loc_hi) = span("loc");
+    let loc_edge = h.add_edge(file, "loc", loc_lo, loc_hi, "NameOnly", None);
+    h.write_verdict(loc_edge, &sha, None, "local 5", OracleResolutionKind::Upgrade);
+
+    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha).unwrap();
+    assert_eq!(
+        monikers,
+        std::collections::HashMap::from([((keep_lo, keep_hi), "rust cr 1.0 keep().".to_string())]),
+        "only the sha-current, non-local, conflict-free span may be returned"
+    );
+}
