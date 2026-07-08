@@ -299,3 +299,44 @@ fn wait_until_gone(path: &Path, timeout: Duration) {
     }
     panic!("listener at {} still accepting after {timeout:?}", path.display());
 }
+
+/// #484: when the index schema was created by a newer rag-rat (one upgraded agent migrated the
+/// shared DB; this hook binary — and therefore this session's MCP server — is older), the
+/// session-start digest must become an actionable version-skew notice instead of going silent.
+#[test]
+fn session_start_warns_when_the_index_schema_is_newer() {
+    let dir = std::env::temp_dir().join(format!("ragrat-hook-newer-schema-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn skew_probe() {}\n").unwrap();
+    std::fs::write(
+        dir.join("rag-rat.toml"),
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\n",
+    )
+    .unwrap();
+    let config = rag_rat_core::Config::load(dir.join("rag-rat.toml")).unwrap();
+    rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
+
+    // Make the schema read as created-by-a-future-rag-rat: an unrecognized migration id.
+    let conn = rusqlite::Connection::open(&config.database).unwrap();
+    conn.execute_batch(
+        "INSERT INTO schema_version(id, applied_at_ms, checksum, description)
+         VALUES ('999_future_schema', 1, 'sha256:future', 'future schema');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let input = serde_json::json!({
+        "session_id": "s-skew", "cwd": dir, "hook_event_name": "SessionStart",
+        "source": "startup"
+    });
+    let (stdout, status) = run_hook(&input.to_string(), &dir);
+    assert!(status.success(), "the hook must never block session start");
+    assert!(
+        stdout.contains("newer rag-rat") && stdout.contains("upgrade rag-rat"),
+        "expected an actionable version-skew notice, got: {stdout:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

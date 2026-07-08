@@ -764,6 +764,19 @@ pub fn migrate_forward(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Appended to the `Newer` refusal: on Linux the fleet hot-upgrade re-execs armed MCP servers
+/// when a new binary lands, so a stale server heals itself once rag-rat is reinstalled; on every
+/// other platform running servers keep the old binary until their sessions restart, and the
+/// message must say so (#484).
+fn hot_upgrade_caveat() -> &'static str {
+    if cfg!(target_os = "linux") {
+        ""
+    } else {
+        "; running MCP servers do not hot-upgrade on this platform — restart their sessions after \
+         upgrading"
+    }
+}
+
 pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
     if !table_exists(conn, "schema_version")? {
         let has_legacy_tables = table_exists(conn, "files")? || table_exists(conn, "chunks")?;
@@ -819,7 +832,14 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
             current_version: known_version(&migrations),
             latest_version: LATEST_SCHEMA_VERSION,
             migrations,
-            message: "index schema was created by a newer rag-rat; refusing to open".to_string(),
+            // #484: on a shared global DB one upgraded agent migrates the schema and every
+            // process still on an older binary lands here — the refusal must carry the remedy,
+            // because it surfaces as the error text of every CLI/MCP open.
+            message: format!(
+                "index schema was created by a newer rag-rat; refusing to open — upgrade rag-rat \
+                 or restart sessions/servers still running an older binary{}",
+                hot_upgrade_caveat()
+            ),
         });
     }
     let current_version = known_version(&migrations);

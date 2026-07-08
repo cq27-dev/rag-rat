@@ -315,6 +315,15 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
     // (`let _ = run_inner()`) — so the hook stays silent and never blocks session start. Do NOT
     // add error prints here: this branch's stdout is injected as model context.
     let conn = IndexConnection::open_read_only(&config.database)?;
+    // Version skew (#484): a schema created by a newer rag-rat means this binary — and the MCP
+    // server this session just started, which is at most as new — will refuse every open. Say so
+    // actionably instead of composing a digest that half-works today and errors tomorrow. The
+    // schema message already carries the remedy (and the non-Linux no-hot-upgrade caveat).
+    let schema = rag_rat_core::index::schema::status(conn.connection())?;
+    if schema.state == rag_rat_core::index::schema::SchemaState::Newer {
+        print!("{}", newer_schema_notice(&schema.message));
+        return Ok(());
+    }
     // Scope orientation to the session's worktree: `config.root` (anchored to the main worktree) is
     // the base index, `input.cwd` is where the session is — a linked worktree gets its branch
     // overlay (#219). find_config already anchored config.root to the main worktree, so the two
@@ -332,6 +341,16 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
         print!("{line}");
     }
     Ok(())
+}
+
+/// The session-start notice replacing the digest when the index schema is NEWER than this binary
+/// (#484). Pure so it's testable; `schema_message` is the core refusal text, which carries the
+/// remedy and the platform caveat.
+fn newer_schema_notice(schema_message: &str) -> String {
+    format!(
+        "⚠ rag-rat version skew: {schema_message}. Repo-intelligence MCP tools in this session \
+         will error until then.\n"
+    )
 }
 
 /// One digest line stating the running version vs the latest published on crates.io, with the

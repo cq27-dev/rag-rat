@@ -661,6 +661,17 @@ fn compatible_open_refuses_dirty_and_newer_schema() {
     assert_eq!(newer.state, schema::SchemaState::Newer);
     let err = IndexDatabase::open(&database).unwrap_err().to_string();
     assert!(err.contains("newer rag-rat"), "{err}");
+    // #484: the refusal must carry the remedy — on a shared global DB one upgraded agent migrates
+    // the schema and every older-binary process hits this, so a bare refusal reads as breakage.
+    assert!(err.contains("upgrade rag-rat"), "{err}");
+    assert!(err.contains("restart"), "{err}");
+    // The fleet hot-upgrade re-execs armed MCP servers only on Linux; elsewhere the message must
+    // say running servers stay stale until their sessions restart.
+    if cfg!(target_os = "linux") {
+        assert!(!err.contains("hot-upgrade"), "{err}");
+    } else {
+        assert!(err.contains("do not hot-upgrade"), "{err}");
+    }
 
     let _ = fs::remove_dir_all(root);
 }
