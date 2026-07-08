@@ -1,28 +1,34 @@
-//! The signed, hash-chained op-log entry envelope (phase B op-log, §C4 layer-1).
+//! The signed, hash-chained op-log entry envelope (phase B op-log, layer 1).
 //!
-//! Wraps an opaque op ([`super::op`]) in a per-device, append-only signed log. Two domain-tagged
-//! canonical CBOR objects, both DEFINITE-length + minimal-header (the same discipline `super::op`
-//! and `super::cbor` enforce):
+//! Wraps an opaque op ([`super::op`]) in a per-`(stream, device)`, append-only signed log. Two
+//! domain-tagged canonical CBOR objects, both DEFINITE-length + minimal-header (the same
+//! discipline `super::op` and `super::cbor` enforce):
 //!
 //! ```text
-//! body_bytes   = cbor([ "rag-rat/entry/1", prev_hash, lamport, device_fingerprint, op_bytes ])
+//! body_bytes   = cbor([ "rag-rat/entry/2", stream_id, prev_hash, lamport, device_fingerprint,
+//!                       op_bytes ])
 //! signed_bytes = cbor([ "rag-rat/signed-entry/1", body_bytes (bstr), signature (64-byte bstr) ])
 //! ```
 //!
+//! - `stream_id` is the immutable identity of the stream this entry belongs to (32-byte bstr,
+//!   [`super::stream`], #509). It lives INSIDE the signed body so stream membership is
+//!   signature-protected: a signed entry cannot be replayed from one stream into another (which
+//!   would let a peer/relay contaminate a filtered view with another view's chains).
 //! - `prev_hash` is the previous entry's `entry_hash` (32-byte bstr), or CBOR `null` for the
-//!   genesis (first) entry — the hash-chain link.
+//!   genesis (first) entry — the hash-chain link. Chains are per `(stream_id, device)`.
 //! - `op_bytes` = `op::encode(op)`, carried as an opaque bstr. Layer-1 forwards op bytes verbatim:
-//!   an UNKNOWN op still signs, verifies, and chains (§5.4) — verification NEVER requires
-//!   `op::decode` to succeed.
-//! - `entry_hash = sha256(body_bytes)` — the chain link + content address (§5.6 watermark `(seq,
-//!   entry_hash)`).
+//!   an UNKNOWN op still signs, verifies, and chains — verification NEVER requires `op::decode` to
+//!   succeed.
+//! - `entry_hash = sha256(body_bytes)` — the chain link + content address (the `(seq, entry_hash)`
+//!   watermark primitive). Because the body folds `stream_id`, entry hashes are globally unique
+//!   across streams.
 //!
 //! **The signature covers exactly `body_bytes`** — the canonical CBOR of
-//! `[domain, prev_hash, lamport, device_fingerprint, op_bytes]`, and nothing else. `signed_bytes`
-//! (the outer envelope) is NOT signed; it is the transport form bundling the signed body with its
-//! signature. This is the security boundary: a byte that is not inside `body_bytes` is not
-//! protected by the signature, and the canonical rule guarantees the SAME logical body has exactly
-//! one signed encoding.
+//! `[domain, stream_id, prev_hash, lamport, device_fingerprint, op_bytes]`, and nothing else.
+//! `signed_bytes` (the outer envelope) is NOT signed; it is the transport form bundling the signed
+//! body with its signature. This is the security boundary: a byte that is not inside `body_bytes`
+//! is not protected by the signature, and the canonical rule guarantees the SAME logical body has
+//! exactly one signed encoding.
 
 use anyhow::Context;
 use minicbor::Encoder;
@@ -33,11 +39,12 @@ use sha2::{Digest, Sha256};
 use super::cbor;
 use super::device::{DevicePublic, DeviceSecret};
 use super::op::{self, DeviceFingerprint, MemoryOp};
+use super::stream::StreamId;
 
 /// Domain tag + version for the signed BODY (the bytes the signature covers). Bump the version to
 /// evolve the entry wire deliberately — an old binary then rejects the new domain rather than
-/// misreading it.
-const ENTRY_DOMAIN: &str = "rag-rat/entry/1";
+/// misreading it. (`/2` added the in-body `stream_id`; `/1` never shipped and has no decoder.)
+const ENTRY_DOMAIN: &str = "rag-rat/entry/2";
 
 /// Domain tag + version for the outer transport envelope (body + signature).
 const SIGNED_DOMAIN: &str = "rag-rat/signed-entry/1";
@@ -51,6 +58,8 @@ const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 /// projection actually needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct VerifiedEntry {
+    /// The stream this entry belongs to — signature-protected, so it cannot be re-homed.
+    pub(super) stream_id: StreamId,
     /// The previous entry's `entry_hash`, or `None` for the genesis entry.
     pub(super) prev_hash: Option<[u8; 32]>,
     pub(super) lamport: u64,
@@ -73,8 +82,9 @@ pub(super) struct SignedEntry {
 }
 
 /// The pieces of one entry body, grouped so the encoder takes a single named argument rather than a
-/// four-primitive train (two of which are 32-byte arrays that are easy to transpose).
+/// five-primitive train (three of which are 32-byte arrays that are easy to transpose).
 struct BodyParts<'a> {
+    stream_id: StreamId,
     prev_hash: Option<[u8; 32]>,
     lamport: u64,
     device_fingerprint: DeviceFingerprint,
@@ -86,19 +96,32 @@ struct BodyParts<'a> {
 /// deterministic).
 pub(super) fn sign_entry(
     secret: &DeviceSecret,
+    stream_id: StreamId,
     prev_hash: Option<[u8; 32]>,
     lamport: u64,
     op: &MemoryOp,
 ) -> SignedEntry {
     let device_fingerprint = secret.public().fingerprint();
     let op_bytes = op::encode(op);
-    let body_bytes =
-        encode_body(&BodyParts { prev_hash, lamport, device_fingerprint, op_bytes: &op_bytes });
+    let body_bytes = encode_body(&BodyParts {
+        stream_id,
+        prev_hash,
+        lamport,
+        device_fingerprint,
+        op_bytes: &op_bytes,
+    });
     let entry_hash = sha256(&body_bytes);
     let signature = secret.sign(&body_bytes);
     let signed_bytes = encode_signed(&body_bytes, &signature);
     SignedEntry {
-        entry: VerifiedEntry { prev_hash, lamport, device_fingerprint, op_bytes, entry_hash },
+        entry: VerifiedEntry {
+            stream_id,
+            prev_hash,
+            lamport,
+            device_fingerprint,
+            op_bytes,
+            entry_hash,
+        },
         signature,
         body_bytes,
         signed_bytes,
@@ -112,18 +135,31 @@ pub(super) fn sign_entry(
 #[cfg(test)]
 pub(super) fn sign_entry_from_op_bytes(
     secret: &DeviceSecret,
+    stream_id: StreamId,
     prev_hash: Option<[u8; 32]>,
     lamport: u64,
     op_bytes: Vec<u8>,
 ) -> SignedEntry {
     let device_fingerprint = secret.public().fingerprint();
-    let body_bytes =
-        encode_body(&BodyParts { prev_hash, lamport, device_fingerprint, op_bytes: &op_bytes });
+    let body_bytes = encode_body(&BodyParts {
+        stream_id,
+        prev_hash,
+        lamport,
+        device_fingerprint,
+        op_bytes: &op_bytes,
+    });
     let entry_hash = sha256(&body_bytes);
     let signature = secret.sign(&body_bytes);
     let signed_bytes = encode_signed(&body_bytes, &signature);
     SignedEntry {
-        entry: VerifiedEntry { prev_hash, lamport, device_fingerprint, op_bytes, entry_hash },
+        entry: VerifiedEntry {
+            stream_id,
+            prev_hash,
+            lamport,
+            device_fingerprint,
+            op_bytes,
+            entry_hash,
+        },
         signature,
         body_bytes,
         signed_bytes,
@@ -152,10 +188,11 @@ pub(super) fn verify_signed(bytes: &[u8], pubkey: &DevicePublic) -> anyhow::Resu
     Ok(signed.entry)
 }
 
-/// Verify a SINGLE device's append-only chain under `pubkey`: genesis `prev_hash == None`, each
-/// subsequent `prev_hash == previous.entry_hash`, STRICTLY increasing `lamport`, and every
-/// signature valid (re-checked from `signed_bytes`, not trusted from the struct's cached fields).
-/// Cross-device merge is the fold (`super::project`), never here.
+/// Verify a SINGLE device's append-only chain under `pubkey`: one `stream_id` throughout (a chain
+/// is per `(stream, device)` — a spliced-in foreign-stream entry must not read as continuity),
+/// genesis `prev_hash == None`, each subsequent `prev_hash == previous.entry_hash`, STRICTLY
+/// increasing `lamport`, and every signature valid (re-checked from `signed_bytes`, not trusted
+/// from the struct's cached fields). Cross-device merge is the fold (`super::project`), never here.
 pub(super) fn verify_chain(entries: &[SignedEntry], pubkey: &DevicePublic) -> anyhow::Result<()> {
     let mut prev: Option<VerifiedEntry> = None;
     for (idx, signed) in entries.iter().enumerate() {
@@ -169,6 +206,9 @@ pub(super) fn verify_chain(entries: &[SignedEntry], pubkey: &DevicePublic) -> an
                     anyhow::bail!("genesis entry {idx} must have prev_hash == None");
                 },
             Some(previous) => {
+                if verified.stream_id != previous.stream_id {
+                    anyhow::bail!("entry {idx} belongs to a different stream than the chain");
+                }
                 if verified.prev_hash != Some(previous.entry_hash) {
                     anyhow::bail!("entry {idx} prev_hash does not link to the previous entry_hash");
                 }
@@ -186,14 +226,16 @@ pub(super) fn verify_chain(entries: &[SignedEntry], pubkey: &DevicePublic) -> an
     Ok(())
 }
 
-/// Encode the signed body: `[domain, prev_hash | null, lamport, device_fingerprint, op_bytes]`,
-/// definite lengths + minimal headers. THESE are the bytes the signature and `entry_hash` cover.
+/// Encode the signed body: `[domain, stream_id, prev_hash | null, lamport, device_fingerprint,
+/// op_bytes]`, definite lengths + minimal headers. THESE are the bytes the signature and
+/// `entry_hash` cover.
 fn encode_body(parts: &BodyParts<'_>) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(96);
+    let mut buf = Vec::with_capacity(128);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(5).expect(INFALLIBLE);
+        enc.array(6).expect(INFALLIBLE);
         enc.str(ENTRY_DOMAIN).expect(INFALLIBLE);
+        enc.bytes(&parts.stream_id.to_bytes()).expect(INFALLIBLE);
         match parts.prev_hash {
             // A 32-byte bstr for a linked entry, CBOR null for the genesis — an unambiguous,
             // distinct "no predecessor" marker (not an all-zero hash).
@@ -239,15 +281,16 @@ fn decode_body(body_bytes: &[u8]) -> Result<VerifiedEntry, CborError> {
     // — layer-1 does NOT require the op to be a recognizable / canonical op here).
     cbor::require_canonical_cbor(body_bytes)?;
     let mut d = Decoder::new(body_bytes);
-    cbor::expect_array(&mut d, 5)?;
+    cbor::expect_array(&mut d, 6)?;
     expect_domain(&mut d, ENTRY_DOMAIN)?;
+    let stream_id = StreamId::from_bytes(fixed_bytes::<32>(d.bytes()?, "stream_id")?);
     let prev_hash = decode_prev_hash(&mut d)?;
     let lamport = d.u64()?;
     let device_fingerprint =
         DeviceFingerprint::from_bytes(fixed_bytes::<32>(d.bytes()?, "device fingerprint")?);
     let op_bytes = d.bytes()?.to_vec();
     let entry_hash = sha256(body_bytes);
-    Ok(VerifiedEntry { prev_hash, lamport, device_fingerprint, op_bytes, entry_hash })
+    Ok(VerifiedEntry { stream_id, prev_hash, lamport, device_fingerprint, op_bytes, entry_hash })
 }
 
 /// Read the leading domain string and assert it matches `want` — a wrong/absent tag is a foreign or
@@ -298,6 +341,11 @@ mod tests {
         DeviceSecret::from_seed(&[7u8; 32])
     }
 
+    /// A fixed stream identity for wire fixtures — deterministic and visually distinctive.
+    fn stream() -> StreamId {
+        StreamId::from_bytes([3u8; 32])
+    }
+
     /// A representative content op for round-trip / tamper tests.
     fn node_create() -> MemoryOp {
         MemoryOp::NodeCreate {
@@ -318,18 +366,18 @@ mod tests {
     fn golden_vectors_pin_the_entry_wire_format() {
         // The entry wire is a frozen primitive: the signature, `entry_hash`, and the chain all
         // build on these exact bytes. A canonical-rule change must break this test and
-        // force a deliberate `rag-rat/entry/1` / `rag-rat/signed-entry/1` domain bump.
-        // Fixture: genesis Snapshot, lamport 1, seed [7; 32] — fully deterministic (ed25519
-        // signing is deterministic).
-        let signed = sign_entry(&secret(), None, 1, &MemoryOp::Snapshot);
+        // force a deliberate domain bump (as adding `stream_id` bumped `/1` to `/2`).
+        // Fixture: genesis Snapshot on stream [3; 32], lamport 1, seed [7; 32] — fully
+        // deterministic (ed25519 signing is deterministic).
+        let signed = sign_entry(&secret(), stream(), None, 1, &MemoryOp::Snapshot);
         assert_eq!(
             hex(&signed.body_bytes),
-            "856f7261672d7261742f656e7472792f31f6015820fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff5522638895818836c7261672d7261742f6f702f3168736e617073686f74f6",
+            "866f7261672d7261742f656e7472792f3258200303030303030303030303030303030303030303030303030303030303030303f6015820fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff5522638895818836c7261672d7261742f6f702f3168736e617073686f74f6",
             "body_bytes golden",
         );
         assert_eq!(
             hex(&signed.signed_bytes),
-            "83767261672d7261742f7369676e65642d656e7472792f31584f856f7261672d7261742f656e7472792f31f6015820fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff5522638895818836c7261672d7261742f6f702f3168736e617073686f74f658402d6c805bb70968fdfb32ecf19fdbbbccdc2130dad9b067b25c9782824c1dceb0ec5c03c7090bc786bad56ad3e05f8b0ad0129ffb699cf2bcc4d56b63c5b24800",
+            "83767261672d7261742f7369676e65642d656e7472792f315871866f7261672d7261742f656e7472792f3258200303030303030303030303030303030303030303030303030303030303030303f6015820fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff5522638895818836c7261672d7261742f6f702f3168736e617073686f74f658400aab0cf060dd7eee539e0e84c48fdf5be81eaba1ece62324a513cd6adc5a29e508c275dd0b4a4d2030254375a62ee171527e562136102e702c40924d7488a504",
             "signed_bytes golden",
         );
     }
@@ -338,51 +386,54 @@ mod tests {
     fn body_bytes_has_the_expected_canonical_structure() {
         // Structure-level proof (independent of the opaque fingerprint / signature bytes) that the
         // encoder emits the frozen shape the golden vector pins.
-        let signed = sign_entry(&secret(), None, 1, &MemoryOp::Snapshot);
+        let signed = sign_entry(&secret(), stream(), None, 1, &MemoryOp::Snapshot);
         let body = &signed.body_bytes;
-        assert_eq!(body[0], 0x85, "5-element array header");
+        assert_eq!(body[0], 0x86, "6-element array header");
         assert_eq!(body[1], 0x6f, "text header, len 15");
-        assert_eq!(&body[2..17], b"rag-rat/entry/1");
-        assert_eq!(body[17], 0xf6, "genesis prev_hash is CBOR null");
-        assert_eq!(body[18], 0x01, "lamport 1, minimal uint");
-        assert_eq!(&body[19..21], &[0x58, 0x20], "device_fp bstr header, len 32");
+        assert_eq!(&body[2..17], b"rag-rat/entry/2");
+        assert_eq!(&body[17..19], &[0x58, 0x20], "stream_id bstr header, len 32");
+        assert_eq!(&body[19..51], &stream().to_bytes(), "stream_id bytes");
+        assert_eq!(body[51], 0xf6, "genesis prev_hash is CBOR null");
+        assert_eq!(body[52], 0x01, "lamport 1, minimal uint");
+        assert_eq!(&body[53..55], &[0x58, 0x20], "device_fp bstr header, len 32");
         assert_eq!(
-            &body[21..53],
+            &body[55..87],
             &secret().public().fingerprint().to_bytes(),
             "device_fp bytes == sha256(pubkey)",
         );
-        assert_eq!(&body[53..55], &[0x58, 0x18], "op_bytes bstr header, len 24");
-        assert_eq!(&body[55..], &op::encode(&MemoryOp::Snapshot), "op_bytes == op::encode");
-        assert_eq!(body.len(), 79);
+        assert_eq!(&body[87..89], &[0x58, 0x18], "op_bytes bstr header, len 24");
+        assert_eq!(&body[89..], &op::encode(&MemoryOp::Snapshot), "op_bytes == op::encode");
+        assert_eq!(body.len(), 113);
     }
 
     #[test]
     fn signed_bytes_has_the_expected_canonical_structure() {
-        let signed = sign_entry(&secret(), None, 1, &MemoryOp::Snapshot);
+        let signed = sign_entry(&secret(), stream(), None, 1, &MemoryOp::Snapshot);
         let wire = &signed.signed_bytes;
         assert_eq!(wire[0], 0x83, "3-element array header");
         assert_eq!(wire[1], 0x76, "text header, len 22");
         assert_eq!(&wire[2..24], b"rag-rat/signed-entry/1");
-        assert_eq!(&wire[24..26], &[0x58, 0x4f], "body bstr header, len 79");
-        assert_eq!(&wire[26..105], signed.body_bytes.as_slice());
-        assert_eq!(&wire[105..107], &[0x58, 0x40], "signature bstr header, len 64");
-        assert_eq!(&wire[107..171], &signed.signature);
-        assert_eq!(wire.len(), 171);
+        assert_eq!(&wire[24..26], &[0x58, 0x71], "body bstr header, len 113");
+        assert_eq!(&wire[26..139], signed.body_bytes.as_slice());
+        assert_eq!(&wire[139..141], &[0x58, 0x40], "signature bstr header, len 64");
+        assert_eq!(&wire[141..205], &signed.signature);
+        assert_eq!(wire.len(), 205);
     }
 
     #[test]
     fn entry_hash_is_sha256_of_the_body() {
-        let signed = sign_entry(&secret(), None, 1, &MemoryOp::Snapshot);
+        let signed = sign_entry(&secret(), stream(), None, 1, &MemoryOp::Snapshot);
         assert_eq!(signed.entry.entry_hash, sha256(&signed.body_bytes));
     }
 
     #[test]
     fn genesis_round_trips_through_verify() {
         let secret = secret();
-        let signed = sign_entry(&secret, None, 1, &node_create());
+        let signed = sign_entry(&secret, stream(), None, 1, &node_create());
         let verified = verify_signed(&signed.signed_bytes, &secret.public()).expect("verifies");
         assert_eq!(verified, signed.entry);
         assert_eq!(verified.prev_hash, None);
+        assert_eq!(verified.stream_id, stream());
         // decode_signed alone (no signature check) yields the same structure.
         assert_eq!(decode_signed(&signed.signed_bytes).unwrap().entry, signed.entry);
     }
@@ -390,8 +441,9 @@ mod tests {
     #[test]
     fn non_genesis_round_trips_through_verify() {
         let secret = secret();
-        let genesis = sign_entry(&secret, None, 1, &MemoryOp::Snapshot);
-        let second = sign_entry(&secret, Some(genesis.entry.entry_hash), 2, &node_create());
+        let genesis = sign_entry(&secret, stream(), None, 1, &MemoryOp::Snapshot);
+        let second =
+            sign_entry(&secret, stream(), Some(genesis.entry.entry_hash), 2, &node_create());
         let verified = verify_signed(&second.signed_bytes, &secret.public()).expect("verifies");
         assert_eq!(verified.prev_hash, Some(genesis.entry.entry_hash));
         assert_eq!(verified.lamport, 2);
@@ -399,7 +451,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_the_wrong_key() {
-        let signed = sign_entry(&secret(), None, 1, &MemoryOp::Snapshot);
+        let signed = sign_entry(&secret(), stream(), None, 1, &MemoryOp::Snapshot);
         let wrong = DeviceSecret::from_seed(&[9u8; 32]).public();
         assert!(
             verify_signed(&signed.signed_bytes, &wrong).is_err(),
@@ -417,6 +469,7 @@ mod tests {
         let public_b = DeviceSecret::from_seed(&[9u8; 32]).public();
         let op_bytes = op::encode(&MemoryOp::Snapshot);
         let forged_body = encode_body(&BodyParts {
+            stream_id: stream(),
             prev_hash: None,
             lamport: 1,
             device_fingerprint: public_b.fingerprint(),
@@ -433,7 +486,7 @@ mod tests {
     /// Flip one byte at `index` of an otherwise-valid signed entry and assert verification fails.
     fn assert_tamper_rejected(index: usize, label: &str) {
         let secret = secret();
-        let signed = sign_entry(&secret, Some([0x11; 32]), 5, &node_create());
+        let signed = sign_entry(&secret, stream(), Some([0x11; 32]), 5, &node_create());
         let mut wire = signed.signed_bytes.clone();
         wire[index] ^= 0x01;
         assert!(
@@ -445,24 +498,26 @@ mod tests {
     #[test]
     fn tampering_any_signed_field_is_rejected() {
         // Locate each field inside the fixture's wire and flip a byte within it. Layout (a
-        // non-genesis node_create entry): outer [0x83, 0x76, 22-byte domain, 0x58 0x4f, body(79+),
-        // 0x58 0x40, sig(64)]; body [0x85, 0x6f, 15-byte domain, 0x58 0x20 prev_hash(32), lamport,
-        // 0x58 0x20 device_fp(32), 0x58 .. op_bytes(..)].
+        // non-genesis node_create entry): outer [0x83, 0x76, 22-byte domain, 0x58 len, body,
+        // 0x58 0x40, sig(64)]; body [0x86, 0x6f, 15-byte domain, 0x58 0x20 stream_id(32),
+        // 0x58 0x20 prev_hash(32), lamport, 0x58 0x20 device_fp(32), 0x58 .. op_bytes(..)].
         let secret = secret();
-        let signed = sign_entry(&secret, Some([0x11; 32]), 5, &node_create());
+        let signed = sign_entry(&secret, stream(), Some([0x11; 32]), 5, &node_create());
         let wire = &signed.signed_bytes;
         // Body starts after outer header [0x83, 0x76, 22 domain bytes, 0x58, len] = 2 + 22 + 2 =
         // 26.
         let body_start = 26;
-        // Within the body: [0]=array, [1..17)=domain(0x6f+15), [17]=0x58,[18]=0x20 prev_hash
-        // header, prev_hash = [19..51), lamport at 51 (5 → 0x05), device_fp header [52,53],
-        // fp [54..86), op header at 86, op_bytes after.
-        let prev_hash_byte = body_start + 19; // inside the 32-byte prev_hash
-        let lamport_byte = body_start + 51; // the lamport uint
-        let device_fp_byte = body_start + 54; // inside the 32-byte device_fp
-        let op_byte = body_start + 88; // inside op_bytes
+        // Within the body: [0]=array, [1..17)=domain(0x6f+15), stream_id header [17,18],
+        // stream_id = [19..51), prev_hash header [51,52], prev_hash = [53..85), lamport at 85
+        // (5 → 0x05), device_fp header [86,87], fp [88..120), op header at 120, op_bytes after.
+        let stream_byte = body_start + 19; // inside the 32-byte stream_id
+        let prev_hash_byte = body_start + 53; // inside the 32-byte prev_hash
+        let lamport_byte = body_start + 85; // the lamport uint
+        let device_fp_byte = body_start + 88; // inside the 32-byte device_fp
+        let op_byte = body_start + 122; // inside op_bytes
         let signature_byte = wire.len() - 1; // last signature byte
         for (index, label) in [
+            (stream_byte, "stream_id"),
             (prev_hash_byte, "prev_hash"),
             (lamport_byte, "lamport"),
             (device_fp_byte, "device_fingerprint"),
@@ -475,7 +530,7 @@ mod tests {
 
     #[test]
     fn trailing_bytes_are_rejected() {
-        let signed = sign_entry(&secret(), None, 1, &MemoryOp::Snapshot);
+        let signed = sign_entry(&secret(), stream(), None, 1, &MemoryOp::Snapshot);
         let mut wire = signed.signed_bytes.clone();
         wire.push(0x00);
         assert!(decode_signed(&wire).is_err(), "trailing bytes after the wire are rejected");
@@ -488,16 +543,17 @@ mod tests {
         let secret = secret();
         let op_bytes = op::encode(&MemoryOp::Snapshot);
         let good = encode_body(&BodyParts {
+            stream_id: stream(),
             prev_hash: None,
             lamport: 1,
             device_fingerprint: secret.public().fingerprint(),
             op_bytes: &op_bytes,
         });
-        // good[18] is the minimal lamport uint (0x01). Splice a non-minimal 8-byte header for 1.
-        assert_eq!(good[18], 0x01);
-        let mut overlong = good[..18].to_vec();
+        // good[52] is the minimal lamport uint (0x01). Splice a non-minimal 8-byte header for 1.
+        assert_eq!(good[52], 0x01);
+        let mut overlong = good[..52].to_vec();
         overlong.extend_from_slice(&[0x1b, 0, 0, 0, 0, 0, 0, 0, 1]); // uint 1, non-minimal 8-byte
-        overlong.extend_from_slice(&good[19..]);
+        overlong.extend_from_slice(&good[53..]);
         let signature = secret.sign(&overlong);
         let wire = encode_signed(&overlong, &signature);
         assert!(verify_signed(&wire, &secret.public()).is_err(), "non-canonical lamport rejected");
@@ -535,6 +591,7 @@ mod tests {
         // Sanity: op::decode keeps it opaque (Unknown), never errors.
         assert!(op::decode(&unknown_op).is_ok());
         let body = encode_body(&BodyParts {
+            stream_id: stream(),
             prev_hash: None,
             lamport: 1,
             device_fingerprint: secret.public().fingerprint(),
@@ -550,11 +607,12 @@ mod tests {
         verify_chain(&[genesis], &secret.public()).expect("unknown op chains");
     }
 
-    /// A good three-entry chain from one device: genesis + two links, strictly increasing lamport.
+    /// A good three-entry chain from one device on one stream: genesis + two links, strictly
+    /// increasing lamport.
     fn good_chain(secret: &DeviceSecret) -> Vec<SignedEntry> {
-        let e0 = sign_entry(secret, None, 1, &MemoryOp::Snapshot);
-        let e1 = sign_entry(secret, Some(e0.entry.entry_hash), 2, &node_create());
-        let e2 = sign_entry(secret, Some(e1.entry.entry_hash), 5, &MemoryOp::Snapshot);
+        let e0 = sign_entry(secret, stream(), None, 1, &MemoryOp::Snapshot);
+        let e1 = sign_entry(secret, stream(), Some(e0.entry.entry_hash), 2, &node_create());
+        let e2 = sign_entry(secret, stream(), Some(e1.entry.entry_hash), 5, &MemoryOp::Snapshot);
         vec![e0, e1, e2]
     }
 
@@ -577,16 +635,16 @@ mod tests {
         let secret = secret();
         let mut chain = good_chain(&secret);
         // Re-author entry 2 pointing at the WRONG predecessor hash (still a valid signature).
-        chain[2] = sign_entry(&secret, Some([0xaa; 32]), 5, &MemoryOp::Snapshot);
+        chain[2] = sign_entry(&secret, stream(), Some([0xaa; 32]), 5, &MemoryOp::Snapshot);
         assert!(verify_chain(&chain, &secret.public()).is_err(), "a broken link must fail");
     }
 
     #[test]
     fn a_non_monotonic_lamport_fails() {
         let secret = secret();
-        let e0 = sign_entry(&secret, None, 5, &MemoryOp::Snapshot);
+        let e0 = sign_entry(&secret, stream(), None, 5, &MemoryOp::Snapshot);
         // entry 1 links correctly but does NOT advance the lamport (5 is not > 5).
-        let e1 = sign_entry(&secret, Some(e0.entry.entry_hash), 5, &node_create());
+        let e1 = sign_entry(&secret, stream(), Some(e0.entry.entry_hash), 5, &node_create());
         assert!(
             verify_chain(&[e0, e1], &secret.public()).is_err(),
             "lamport must strictly increase",
@@ -597,10 +655,24 @@ mod tests {
     fn a_non_none_genesis_prev_hash_fails() {
         let secret = secret();
         // A genesis entry that claims a predecessor is not a valid chain head.
-        let genesis = sign_entry(&secret, Some([0x22; 32]), 1, &MemoryOp::Snapshot);
+        let genesis = sign_entry(&secret, stream(), Some([0x22; 32]), 1, &MemoryOp::Snapshot);
         assert!(
             verify_chain(&[genesis], &secret.public()).is_err(),
             "genesis prev_hash must be None",
+        );
+    }
+
+    #[test]
+    fn a_foreign_stream_entry_cannot_continue_a_chain() {
+        // A validly-signed entry that links the predecessor hash and advances the lamport, but
+        // belongs to a DIFFERENT stream, is not continuity: chains are per (stream, device).
+        let secret = secret();
+        let e0 = sign_entry(&secret, stream(), None, 1, &MemoryOp::Snapshot);
+        let other = StreamId::from_bytes([4u8; 32]);
+        let e1 = sign_entry(&secret, other, Some(e0.entry.entry_hash), 2, &node_create());
+        assert!(
+            verify_chain(&[e0, e1], &secret.public()).is_err(),
+            "a chain must carry exactly one stream_id",
         );
     }
 

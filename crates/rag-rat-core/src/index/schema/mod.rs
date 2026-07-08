@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 52;
+pub const LATEST_SCHEMA_VERSION: u32 = 53;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -358,6 +358,14 @@ const MIGRATION_052_DESCRIPTION: &str =
      signed entry log, content-addressed on entry_hash, no FK; and the layer-2 shadow projection \
      (oplog_projected_nodes / oplog_projected_edges) plus oplog_meta, wholly rebuilt by the \
      full-replay fold. Fresh tables (no backfill); nothing is wired to the live write path yet";
+const MIGRATION_053_ID: &str = "053_oplog_stream_scoping";
+const MIGRATION_053_CHECKSUM: &str = "sha256:rag-rat-oplog-stream-scoping-v53";
+const MIGRATION_053_DESCRIPTION: &str =
+    "Scope the op-log by immutable stream identity (#509): rebuild the still-unwired (and \
+     therefore empty) V052 op-log tables with a stream_id dimension — one signed chain per \
+     (stream_id, device), UNIQUE(stream_id, device_fingerprint, lamport), projection keyed per \
+     stream — and add oplog_fork_evidence, the quarantine that durably preserves BOTH heads of a \
+     detected equivocation. Nothing is wired to the live write path yet";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -811,6 +819,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_052_CHECKSUM,
         description: MIGRATION_052_DESCRIPTION,
         apply: apply_oplog_storage,
+    },
+    Migration {
+        id: MIGRATION_053_ID,
+        checksum: MIGRATION_053_CHECKSUM,
+        description: MIGRATION_053_DESCRIPTION,
+        apply: apply_oplog_stream_scoping,
     },
 ];
 

@@ -1,20 +1,21 @@
-//! Durable SQLite storage for the memory op-log (phase B, §C4/§5.4).
+//! Durable SQLite storage for the memory op-log (phase B, layer 1 + shadow projection).
 //!
-//! Two layers, persisted by the V052 migration:
+//! Two layers, persisted by the V052/V053 migrations, both scoped by the immutable
+//! [`super::stream`] identity — one signed chain per `(stream_id, device)`:
 //! - **Layer 1** — `oplog_entries`, the opaque signed entry log. [`append`] verifies an entry
-//!   (signature + fingerprint binding), gates it on op-bytes decodability, checks per-device chain
-//!   continuity against the stored tail, and inserts — all in one `IMMEDIATE` transaction,
-//!   idempotent on `entry_hash`. `signed_bytes` is the sole source of truth; every header column
-//!   derives from it.
+//!   (signature + fingerprint binding + stream binding), gates it on op-bytes decodability, checks
+//!   per-`(stream, device)` chain continuity against the stored tail, and inserts — all in one
+//!   `IMMEDIATE` transaction, idempotent on `entry_hash`. `signed_bytes` is the sole source of
+//!   truth; every header column derives from it. A detected fork durably quarantines the rejected
+//!   head in `oplog_fork_evidence`, so BOTH heads of an equivocation survive.
 //! - **Layer 2** — the shadow projection (`oplog_projected_nodes` / `oplog_projected_edges`), a
-//!   pure full-replay fold of layer 1 via [`super::project::project`], rewritten wholesale inside
+//!   pure full-replay fold of layer 1 via [`super::project::project`], rewritten per stream inside
 //!   the same transaction so the materialized view never lags the log. Never a source of truth; a
-//!   `DELETE`-all
-//!   + reinsert is the whole update.
+//!   per-stream `DELETE` + reinsert is the whole update.
 //!
-//! Nothing here is wired to the live memory write path yet — roster/epochs, immutable stream
-//! identity, and transport are later increments; the module is exercised in isolation, mirroring
-//! the `content_hash` / op-model / entry-envelope freezes that preceded it.
+//! Nothing here is wired to the live memory write path yet — roster/epochs and transport are later
+//! increments; the module is exercised in isolation, mirroring the `content_hash` / op-model /
+//! entry-envelope / stream-identity freezes that preceded it.
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -27,11 +28,12 @@ use super::op::{
     OpMeta, ResolvedAnchor,
 };
 use super::project::{self, ProjectedEdge, ProjectedNode, ProjectedState};
+use super::stream::StreamId;
 use crate::query::memory::EdgeRelation;
 
 /// Bump when the fold's projectable set or LWW semantics change (a new op kind becomes `Known`, a
 /// register is added). A shadow projection stamped with an older version is re-folded on demand
-/// ([`reproject_if_projector_stale`], the §5.4 upgrade re-fold), never trusted incrementally.
+/// ([`reproject_if_projector_stale`], the upgrade re-fold), never trusted incrementally.
 const PROJECTOR_VERSION: i64 = 1;
 
 /// The `oplog_meta` key holding the projector version the shadow tables were last folded by.
@@ -39,9 +41,9 @@ const PROJECTOR_VERSION_KEY: &str = "projector_version";
 
 /// The result of an [`append`] attempt. `Appended` / `AlreadyPresent` mean the log now contains the
 /// entry; `MissingPredecessor` / `Fork` mean it was rejected WITHOUT mutating the log or
-/// projection, so a caller (phase D) can discriminate a retry-after-backfill from an equivocation
-/// to quarantine. A cryptographic failure, an undecodable op, or a lamport overflow is an `Err`,
-/// not an outcome.
+/// projection, so a caller (phase D) can discriminate a retry-after-backfill from an equivocation.
+/// A cryptographic failure, a stream mismatch, an undecodable op, or a lamport overflow is an
+/// `Err`, not an outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AppendOutcome {
     /// Verified, chain-continuous, newly inserted; the projection was re-folded in the same txn.
@@ -53,25 +55,28 @@ pub(crate) enum AppendOutcome {
     /// after backfill.
     MissingPredecessor { entry_hash: [u8; 32] },
     /// The entry conflicts with the stored chain (a second genesis, or a `lamport` at/behind the
-    /// tail) — an equivocation. `conflicting` is the stored entry it collides with, kept as
-    /// evidence (richer fork forensics — a quarantine table — is a later S2 increment).
+    /// tail) — an equivocation. `conflicting` is the stored entry it collides with. The rejected
+    /// entry is durably quarantined in `oplog_fork_evidence` (BOTH heads must survive a process
+    /// exit — a cloned/restored device is exactly the case where forensics happen later); the
+    /// log and projection stay untouched.
     Fork { entry_hash: [u8; 32], conflicting: Vec<u8> },
 }
 
-/// The head of one device's chain — its highest-`lamport` entry.
+/// The head of one `(stream, device)` chain — its highest-`lamport` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChainTail {
     pub(crate) lamport: u64,
     pub(crate) entry_hash: [u8; 32],
 }
 
-/// Verify and durably append one signed entry under `pubkey`, keeping the shadow projection in sync
-/// atomically. `now_ms` is the injected local receipt time (not protocol ordering). See
-/// [`AppendOutcome`] for the accept/reject cases; a tampered/wrong-keyed entry, an undecodable op,
-/// a lamport that overflows `i64`, or a store whose projection a NEWER rag-rat already owns is an
-/// `Err`.
+/// Verify and durably append one signed entry under `pubkey` onto `expected_stream`, keeping the
+/// shadow projection in sync atomically. `now_ms` is the injected local receipt time (not protocol
+/// ordering). See [`AppendOutcome`] for the accept/reject cases; a tampered/wrong-keyed entry, an
+/// entry whose signed body names a DIFFERENT stream, an undecodable op, a lamport that overflows
+/// `i64`, or a store whose projection a NEWER rag-rat already owns is an `Err`.
 pub(crate) fn append(
     conn: &Connection,
+    expected_stream: StreamId,
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
     now_ms: i64,
@@ -80,27 +85,36 @@ pub(crate) fn append(
     //    binding. A tampered body/header/signature or a wrong key is a hard error.
     let verified = entry::verify_signed(signed_bytes, pubkey)?;
 
-    // 2. Poison guard (§5.4): the op bytes must be DECODABLE before accepting an entry whose
-    //    projection will decode them. `Known` AND `Unknown` both pass — an unknown kind/relation/
-    //    status stays retained-but-unprojected. Only a HARD decode error (structural corruption, or
-    //    a deliberate `rag-rat/op/2` domain bump this binary can't read) is rejected here, so one
-    //    poison entry can never wedge every future reproject.
+    // 2. Stream binding: the signed body names the stream it belongs to; the caller names the
+    //    stream it is accepting for. A mismatch is the cross-stream replay the in-body stream_id
+    //    exists to stop (an entry re-homed onto another stream would contaminate that stream's
+    //    projection past any visibility filtering) — a hard error, never stored.
+    if verified.stream_id != expected_stream {
+        anyhow::bail!("op-log entry belongs to a different stream than it was offered for");
+    }
+
+    // 3. Poison guard: the op bytes must be DECODABLE before accepting an entry whose projection
+    //    will decode them. `Known` AND `Unknown` both pass — an unknown kind/relation/status stays
+    //    retained-but-unprojected. Only a HARD decode error (structural corruption, or a deliberate
+    //    `rag-rat/op/2` domain bump this binary can't read) is rejected here, so one poison entry
+    //    can never wedge every future reproject.
     op::decode(&verified.op_bytes)
         .context("op-log entry carries undecodable op bytes; refusing to append")?;
 
-    // 3. Lamport must fit SQLite's signed INTEGER; `as i64` would wrap a >= 2^63 value negative and
+    // 4. Lamport must fit SQLite's signed INTEGER; `as i64` would wrap a >= 2^63 value negative and
     //    silently corrupt the chain order. No realistic Lamport reaches this — reject, don't trust.
     let lamport = i64::try_from(verified.lamport)
         .map_err(|_| anyhow::anyhow!("op-log lamport {} exceeds i64", verified.lamport))?;
 
     let device = verified.device_fingerprint;
+    let stream = verified.stream_id;
     // IMMEDIATE so the tail read and the insert are one write transaction — no TOCTOU between the
     // continuity check and the append. Dropping the txn (an early return below) rolls back.
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
 
     // Refuse to touch a store whose projection a NEWER rag-rat already owns: reprojecting with this
-    // older decoder would drop ops the newer binary knows and stamp the version DOWN (§5.4
-    // projector monotonicity). Read inside the txn so the check and the write are atomic.
+    // older decoder would drop ops the newer binary knows and stamp the version DOWN (projector
+    // monotonicity). Read inside the txn so the check and the write are atomic.
     assert_projector_not_newer(&tx)?;
 
     // Idempotency BEFORE continuity (a re-delivered mid-chain entry must not read as a fork).
@@ -108,20 +122,42 @@ pub(crate) fn append(
         return Ok(AppendOutcome::AlreadyPresent { entry_hash: verified.entry_hash });
     }
 
-    let tail = chain_tail(&tx, device)?;
-    match classify_chain(&tx, device, &verified, tail.as_ref())? {
+    let tail = chain_tail(&tx, stream, device)?;
+    match classify_chain(&tx, stream, device, &verified, tail.as_ref())? {
         ChainVerdict::MissingPredecessor => {
             return Ok(AppendOutcome::MissingPredecessor { entry_hash: verified.entry_hash });
         },
         ChainVerdict::Fork => {
-            let conflicting = conflicting_entry(&tx, device, lamport)?;
-            return Ok(AppendOutcome::Fork { entry_hash: verified.entry_hash, conflicting });
+            let conflicting = conflicting_entry(&tx, stream, device, lamport)?;
+            // Quarantine the rejected head durably, then COMMIT only that: the log and projection
+            // stay unmutated, but the equivocation's second head survives a process exit for later
+            // forensics instead of living only in this return value.
+            record_fork_evidence(
+                &tx,
+                &verified,
+                lamport,
+                signed_bytes,
+                conflicting.as_ref().map(|c| c.entry_hash),
+                now_ms,
+            )?;
+            tx.commit()?;
+            return Ok(AppendOutcome::Fork {
+                entry_hash: verified.entry_hash,
+                conflicting: conflicting.map(|c| c.signed_bytes).unwrap_or_default(),
+            });
         },
         ChainVerdict::Continuous => {},
     }
 
     insert_entry(&tx, &verified, lamport, signed_bytes, now_ms)?;
-    reproject(&tx)?;
+    match stored_projector_version(&tx)? {
+        // The projection is already current: only the appended stream's fold moved.
+        Some(version) if version == PROJECTOR_VERSION => reproject(&tx, stream)?,
+        // An older (or missing) stamp means every OTHER stream's fold is stale too, and the
+        // store-global stamp written below would mark them all current — so this append must
+        // sweep every stream, not just its own, or a quiet stream keeps its stale rows forever.
+        _ => reproject_all_streams(&tx)?,
+    }
     stamp_projector_version(&tx)?;
     tx.commit()?;
     Ok(AppendOutcome::Appended { entry_hash: verified.entry_hash })
@@ -139,14 +175,15 @@ enum ChainVerdict {
     Fork,
 }
 
-/// Classify `verified` against the device's `tail`. The rule is [`super::entry::verify_chain`]'s
-/// per-device chain, applied one entry at a time: genesis has `prev_hash == None`; a follow-on
-/// points `prev_hash` at the head and strictly advances `lamport`. Only ONE rejection is a
-/// retryable gap — a `lamport` PAST the tail whose (absent) predecessor may still backfill;
-/// everything else that can never become a valid extension is a `Fork`. The present-vs-absent
-/// predecessor split needs a DB read.
+/// Classify `verified` against the `(stream, device)` chain's `tail`. The rule is
+/// [`super::entry::verify_chain`]'s per-`(stream, device)` chain, applied one entry at a time:
+/// genesis has `prev_hash == None`; a follow-on points `prev_hash` at the head and strictly
+/// advances `lamport`. Only ONE rejection is a retryable gap — a `lamport` PAST the tail whose
+/// (absent) predecessor may still backfill; everything else that can never become a valid
+/// extension is a `Fork`. The present-vs-absent predecessor split needs a DB read.
 fn classify_chain(
     conn: &Connection,
+    stream: StreamId,
     device: DeviceFingerprint,
     verified: &VerifiedEntry,
     tail: Option<&ChainTail>,
@@ -171,24 +208,27 @@ fn classify_chain(
     }
     Ok(if prev == tail.entry_hash {
         ChainVerdict::Continuous // extends the head
-    } else if predecessor_present(conn, device, &prev)? {
+    } else if predecessor_present(conn, stream, device, &prev)? {
         ChainVerdict::Fork // branches off a present non-head entry
     } else {
         ChainVerdict::MissingPredecessor // predecessor genuinely absent — a later entry may backfill
     })
 }
 
-/// Whether this device's log already holds the entry `prev_hash` points at.
+/// Whether this `(stream, device)` chain already holds the entry `prev_hash` points at.
 fn predecessor_present(
     conn: &Connection,
+    stream: StreamId,
     device: DeviceFingerprint,
     prev_hash: &[u8; 32],
 ) -> rusqlite::Result<bool> {
+    let stream_bytes = stream.to_bytes();
     let device_bytes = device.to_bytes();
     Ok(conn
         .query_row(
-            "SELECT 1 FROM oplog_entries WHERE device_fingerprint = ?1 AND entry_hash = ?2",
-            params![device_bytes.as_slice(), prev_hash.as_slice()],
+            "SELECT 1 FROM oplog_entries
+             WHERE stream_id = ?1 AND device_fingerprint = ?2 AND entry_hash = ?3",
+            params![stream_bytes.as_slice(), device_bytes.as_slice(), prev_hash.as_slice()],
             |_| Ok(()),
         )
         .optional()?
@@ -202,14 +242,17 @@ fn insert_entry(
     signed_bytes: &[u8],
     now_ms: i64,
 ) -> rusqlite::Result<()> {
+    let stream_bytes = verified.stream_id.to_bytes();
     let device_bytes = verified.device_fingerprint.to_bytes();
     let prev_hash: Option<Vec<u8>> = verified.prev_hash.map(|h| h.to_vec());
     tx.execute(
         "INSERT INTO oplog_entries(
-             entry_hash, device_fingerprint, lamport, prev_hash, signed_bytes, received_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
+             received_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             verified.entry_hash.as_slice(),
+            stream_bytes.as_slice(),
             device_bytes.as_slice(),
             lamport,
             prev_hash,
@@ -220,17 +263,19 @@ fn insert_entry(
     Ok(())
 }
 
-/// The device's highest-`lamport` entry, or `None` for an empty chain.
+/// The `(stream, device)` chain's highest-`lamport` entry, or `None` for an empty chain.
 pub(crate) fn chain_tail(
     conn: &Connection,
+    stream: StreamId,
     device: DeviceFingerprint,
 ) -> anyhow::Result<Option<ChainTail>> {
+    let stream_bytes = stream.to_bytes();
     let device_bytes = device.to_bytes();
     let row = conn
         .query_row(
             "SELECT lamport, entry_hash FROM oplog_entries
-             WHERE device_fingerprint = ?1 ORDER BY lamport DESC LIMIT 1",
-            params![device_bytes.as_slice()],
+             WHERE stream_id = ?1 AND device_fingerprint = ?2 ORDER BY lamport DESC LIMIT 1",
+            params![stream_bytes.as_slice(), device_bytes.as_slice()],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
@@ -254,53 +299,122 @@ fn entry_exists(conn: &Connection, entry_hash: &[u8; 32]) -> rusqlite::Result<bo
         .is_some())
 }
 
-/// The stored entry an incoming one collides with: prefer the entry in the same `(device, lamport)`
-/// slot (the direct equivocation), else the device's current head. Best-effort evidence.
-fn conflicting_entry(
-    conn: &Connection,
-    device: DeviceFingerprint,
-    lamport: i64,
-) -> anyhow::Result<Vec<u8>> {
-    let device_bytes = device.to_bytes();
-    let at_slot: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT signed_bytes FROM oplog_entries
-             WHERE device_fingerprint = ?1 AND lamport = ?2",
-            params![device_bytes.as_slice(), lamport],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(bytes) = at_slot {
-        return Ok(bytes);
-    }
-    let head: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT signed_bytes FROM oplog_entries
-             WHERE device_fingerprint = ?1 ORDER BY lamport DESC LIMIT 1",
-            params![device_bytes.as_slice()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(head.unwrap_or_default())
+/// The stored entry a rejected fork collides with — its wire bytes plus its `entry_hash` (the
+/// quarantine row points at it).
+struct ConflictingEntry {
+    signed_bytes: Vec<u8>,
+    entry_hash: [u8; 32],
 }
 
-/// Rebuild the shadow projection from the whole log in one `IMMEDIATE` txn, and stamp the projector
-/// version. The standalone entry point for the §5.4 upgrade re-fold and for a batch-append caller.
-/// Refuses (like [`append`]) if a NEWER projector already owns the projection.
+/// The stored entry an incoming one collides with: prefer the entry in the same `(stream, device,
+/// lamport)` slot (the direct equivocation), else the chain's current head. Best-effort evidence.
+fn conflicting_entry(
+    conn: &Connection,
+    stream: StreamId,
+    device: DeviceFingerprint,
+    lamport: i64,
+) -> anyhow::Result<Option<ConflictingEntry>> {
+    let stream_bytes = stream.to_bytes();
+    let device_bytes = device.to_bytes();
+    let at_slot: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT signed_bytes, entry_hash FROM oplog_entries
+             WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport = ?3",
+            params![stream_bytes.as_slice(), device_bytes.as_slice(), lamport],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let row = match at_slot {
+        Some(row) => Some(row),
+        None => conn
+            .query_row(
+                "SELECT signed_bytes, entry_hash FROM oplog_entries
+                 WHERE stream_id = ?1 AND device_fingerprint = ?2 ORDER BY lamport DESC LIMIT 1",
+                params![stream_bytes.as_slice(), device_bytes.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?,
+    };
+    row.map(|(signed_bytes, entry_hash)| {
+        Ok(ConflictingEntry { signed_bytes, entry_hash: hash_from_vec(entry_hash)? })
+    })
+    .transpose()
+}
+
+/// Durably quarantine the rejected head of a detected fork. Idempotent on `(stream, entry_hash)`
+/// (a redelivered fork re-reports, never duplicates); never touches the log or projection.
+fn record_fork_evidence(
+    tx: &Transaction<'_>,
+    verified: &VerifiedEntry,
+    lamport: i64,
+    signed_bytes: &[u8],
+    conflicting_entry_hash: Option<[u8; 32]>,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let stream_bytes = verified.stream_id.to_bytes();
+    let device_bytes = verified.device_fingerprint.to_bytes();
+    let conflicting: Option<Vec<u8>> = conflicting_entry_hash.map(|h| h.to_vec());
+    tx.execute(
+        "INSERT INTO oplog_fork_evidence(
+             stream_id, entry_hash, device_fingerprint, lamport, signed_bytes,
+             conflicting_entry_hash, observed_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(stream_id, entry_hash) DO NOTHING",
+        params![
+            stream_bytes.as_slice(),
+            verified.entry_hash.as_slice(),
+            device_bytes.as_slice(),
+            lamport,
+            signed_bytes,
+            conflicting,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Rebuild the whole shadow projection — every stream present in the log — in one `IMMEDIATE`
+/// txn, and stamp the projector version. The standalone entry point for the upgrade re-fold and
+/// for a batch-append caller; a re-fold must sweep EVERY stream, not just the one a write touched,
+/// or a quiet stream would serve a stale materialization after an upgrade. Refuses (like
+/// [`append`]) if a NEWER projector already owns the projection.
 pub(crate) fn rebuild_projection(conn: &Connection) -> anyhow::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     assert_projector_not_newer(&tx)?;
-    reproject(&tx)?;
+    reproject_all_streams(&tx)?;
     stamp_projector_version(&tx)?;
     tx.commit()?;
     Ok(())
 }
 
+/// Re-fold EVERY stream wholesale: clear BOTH tables first so a projection row whose stream no
+/// longer has entries cannot linger, then fold each present stream. The only projection write
+/// allowed to precede a projector-version stamp over a stale store.
+fn reproject_all_streams(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM oplog_projected_nodes", [])?;
+    tx.execute("DELETE FROM oplog_projected_edges", [])?;
+    for stream in streams_present(tx)? {
+        reproject(tx, stream)?;
+    }
+    Ok(())
+}
+
+/// Every distinct stream the log currently holds entries for.
+fn streams_present(conn: &Connection) -> anyhow::Result<Vec<StreamId>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT stream_id FROM oplog_entries")?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut streams = Vec::new();
+    for row in rows {
+        streams.push(StreamId::from_bytes(hash_from_vec(row?)?));
+    }
+    Ok(streams)
+}
+
 /// Re-fold the shadow projection iff it was last folded by a STRICTLY OLDER (or missing) projector
-/// version (§5.4: a binary that learns a new op kind must re-fold WITHOUT waiting for a write).
-/// Returns whether it re-folded. A projection stamped by the current or a NEWER projector is left
-/// intact — never downgraded. (The mechanism; wiring this into the index open path lands when the
-/// store meets the live read path.)
+/// version (a binary that learns a new op kind must re-fold WITHOUT waiting for a write). Returns
+/// whether it re-folded. A projection stamped by the current or a NEWER projector is left intact —
+/// never downgraded. (The mechanism; wiring this into the index open path lands when the store
+/// meets the live read path.)
 pub(crate) fn reproject_if_projector_stale(conn: &Connection) -> anyhow::Result<bool> {
     match stored_projector_version(conn)? {
         Some(version) if version >= PROJECTOR_VERSION => Ok(false),
@@ -314,7 +428,8 @@ pub(crate) fn reproject_if_projector_stale(conn: &Connection) -> anyhow::Result<
 /// Error if a NEWER projector already folded this store's projection — an older binary must not
 /// reproject (it would drop ops the newer binary knows) or stamp the version down. Mirrors the
 /// schema ladder's "newer rag-rat" refusal, at the projection layer (a projector bump need not
-/// carry a schema bump, so the schema guard does not cover it).
+/// carry a schema bump, so the schema guard does not cover it). The stamp is store-global, not
+/// per stream: one binary folds every stream it holds.
 fn assert_projector_not_newer(conn: &Connection) -> anyhow::Result<()> {
     if let Some(stored) = stored_projector_version(conn)?
         && stored > PROJECTOR_VERSION
@@ -327,20 +442,32 @@ fn assert_projector_not_newer(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The full-replay fold: decode the projectable entries, `project`, and rewrite BOTH shadow tables.
-/// Deterministic and side-effect-free beyond the two tables; the O(n) cost per call is bounded
-/// later by snapshot compaction (§5.6).
-fn reproject(tx: &Transaction<'_>) -> anyhow::Result<()> {
-    let entries = load_known_entries(tx)?;
+/// The full-replay fold for ONE stream: decode its projectable entries, `project`, and rewrite its
+/// rows in BOTH shadow tables — another stream's projection is never touched, so a busy stream's
+/// append cannot perturb a filtered view's materialization. Deterministic and side-effect-free
+/// beyond the two tables; the O(n) cost per call is bounded later by snapshot compaction.
+fn reproject(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<()> {
+    let entries = load_known_entries(tx, stream)?;
     let state = project::project(&entries);
-    tx.execute("DELETE FROM oplog_projected_nodes", [])?;
-    tx.execute("DELETE FROM oplog_projected_edges", [])?;
+    let stream_bytes = stream.to_bytes();
+    tx.execute("DELETE FROM oplog_projected_nodes WHERE stream_id = ?1", params![
+        stream_bytes.as_slice()
+    ])?;
+    tx.execute("DELETE FROM oplog_projected_edges WHERE stream_id = ?1", params![
+        stream_bytes.as_slice()
+    ])?;
     for (node_id, node) in &state.nodes {
         let content_json = serde_json::to_string(&NodeContentRow::from(&node.content))
             .context("serialize projected node content")?;
         tx.execute(
-            "INSERT INTO oplog_projected_nodes(node_id, content_json, status) VALUES (?1, ?2, ?3)",
-            params![node_id.as_str(), content_json, node.status.as_db_str()],
+            "INSERT INTO oplog_projected_nodes(stream_id, node_id, content_json, status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                stream_bytes.as_slice(),
+                node_id.as_str(),
+                content_json,
+                node.status.as_db_str()
+            ],
         )?;
     }
     for (edge_key, edge) in &state.edges {
@@ -353,22 +480,25 @@ fn reproject(tx: &Transaction<'_>) -> anyhow::Result<()> {
             .transpose()
             .context("serialize projected edge resolved anchor")?;
         tx.execute(
-            "INSERT INTO oplog_projected_edges(edge_key, spec_json, resolved_json)
-             VALUES (?1, ?2, ?3)",
-            params![edge_key.as_str(), spec_json, resolved_json],
+            "INSERT INTO oplog_projected_edges(stream_id, edge_key, spec_json, resolved_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![stream_bytes.as_slice(), edge_key.as_str(), spec_json, resolved_json],
         )?;
     }
     Ok(())
 }
 
-/// Load the PROJECTABLE entries — every stored op decoded to `Known`. An `Unknown` op is retained
-/// in the log but skipped here (§5.4), so this is a strict subset of the full log (hence
+/// Load ONE stream's PROJECTABLE entries — every stored op decoded to `Known`. An `Unknown` op is
+/// retained in the log but skipped here, so this is a strict subset of the stream's log (hence
 /// `_known_`). A hard decode failure is unreachable given [`append`]'s accept-gate and surfaces as
 /// a loud error (corruption at rest), never a silent skip.
-fn load_known_entries(tx: &Transaction<'_>) -> anyhow::Result<Vec<Entry>> {
-    let mut stmt =
-        tx.prepare("SELECT device_fingerprint, lamport, signed_bytes FROM oplog_entries")?;
-    let rows = stmt.query_map([], |row| {
+fn load_known_entries(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<Vec<Entry>> {
+    let stream_bytes = stream.to_bytes();
+    let mut stmt = tx.prepare(
+        "SELECT device_fingerprint, lamport, signed_bytes FROM oplog_entries
+         WHERE stream_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![stream_bytes.as_slice()], |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?))
     })?;
     let mut entries = Vec::new();
@@ -384,21 +514,27 @@ fn load_known_entries(tx: &Transaction<'_>) -> anyhow::Result<Vec<Entry>> {
             .op_bytes;
         match op::decode(&op_bytes).context("stored op bytes failed to decode")? {
             DecodedOp::Known(op) => entries.push(Entry { meta: OpMeta { lamport, device }, op }),
-            DecodedOp::Unknown { .. } => {}, // retained in the log, not projected (§5.4)
+            DecodedOp::Unknown { .. } => {}, // retained in the log, not projected
         }
     }
     Ok(entries)
 }
 
-/// Reconstruct the converged projection from the shadow tables — the read the eventual live path
-/// consumes, and the round-trip for idempotency tests (compare parsed `ProjectedState`, never JSON
-/// text, so serde_json key order is irrelevant).
-pub(crate) fn load_projection(conn: &Connection) -> anyhow::Result<ProjectedState> {
+/// Reconstruct ONE stream's converged projection from the shadow tables — the read the eventual
+/// live path consumes, and the round-trip for idempotency tests (compare parsed `ProjectedState`,
+/// never JSON text, so serde_json key order is irrelevant).
+pub(crate) fn load_projection(
+    conn: &Connection,
+    stream: StreamId,
+) -> anyhow::Result<ProjectedState> {
+    let stream_bytes = stream.to_bytes();
     let mut state = ProjectedState::default();
     {
-        let mut stmt =
-            conn.prepare("SELECT node_id, content_json, status FROM oplog_projected_nodes")?;
-        let rows = stmt.query_map([], |row| {
+        let mut stmt = conn.prepare(
+            "SELECT node_id, content_json, status FROM oplog_projected_nodes
+             WHERE stream_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![stream_bytes.as_slice()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })?;
         for row in rows {
@@ -414,9 +550,11 @@ pub(crate) fn load_projection(conn: &Connection) -> anyhow::Result<ProjectedStat
         }
     }
     {
-        let mut stmt =
-            conn.prepare("SELECT edge_key, spec_json, resolved_json FROM oplog_projected_edges")?;
-        let rows = stmt.query_map([], |row| {
+        let mut stmt = conn.prepare(
+            "SELECT edge_key, spec_json, resolved_json FROM oplog_projected_edges
+             WHERE stream_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![stream_bytes.as_slice()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -598,6 +736,15 @@ mod tests {
         DeviceSecret::from_seed(&[seed; 32])
     }
 
+    /// The stream the tests append onto, plus a second one for cross-stream isolation cases.
+    fn stream_a() -> StreamId {
+        StreamId::from_bytes([0xAA; 32])
+    }
+
+    fn stream_b() -> StreamId {
+        StreamId::from_bytes([0xBB; 32])
+    }
+
     fn content(title: &str) -> NodeContent {
         NodeContent {
             kind: "Invariant".to_string(),
@@ -623,25 +770,54 @@ mod tests {
         conn.query_row("SELECT COUNT(*) FROM oplog_entries", [], |row| row.get(0)).unwrap()
     }
 
+    /// Every quarantined fork head: `(entry_hash, signed_bytes, conflicting_entry_hash)`.
+    #[allow(clippy::type_complexity)]
+    fn fork_evidence(conn: &Connection) -> Vec<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT entry_hash, signed_bytes, conflicting_entry_hash FROM oplog_fork_evidence
+                 ORDER BY lamport",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     #[test]
     fn append_genesis_then_chain_roundtrips() {
         let conn = db();
         let s = secret(1);
-        let g = entry::sign_entry(&s, None, 1, &create("mem_a", "first"));
-        let out = append(&conn, &g.signed_bytes, &s.public(), 1_000).unwrap();
+        let g = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "first"));
+        let out = append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1_000).unwrap();
         assert!(matches!(out, AppendOutcome::Appended { .. }));
 
-        let e2 = entry::sign_entry(&s, Some(g.entry.entry_hash), 4, &create("mem_b", "second"));
-        append(&conn, &e2.signed_bytes, &s.public(), 1_001).unwrap();
-        let e3 = entry::sign_entry(&s, Some(e2.entry.entry_hash), 9, &create("mem_c", "third"));
-        append(&conn, &e3.signed_bytes, &s.public(), 1_002).unwrap();
+        let e2 = entry::sign_entry(
+            &s,
+            stream_a(),
+            Some(g.entry.entry_hash),
+            4,
+            &create("mem_b", "second"),
+        );
+        append(&conn, stream_a(), &e2.signed_bytes, &s.public(), 1_001).unwrap();
+        let e3 = entry::sign_entry(
+            &s,
+            stream_a(),
+            Some(e2.entry.entry_hash),
+            9,
+            &create("mem_c", "third"),
+        );
+        append(&conn, stream_a(), &e3.signed_bytes, &s.public(), 1_002).unwrap();
 
-        let tail = chain_tail(&conn, s.public().fingerprint()).unwrap().expect("chain has a head");
+        let tail = chain_tail(&conn, stream_a(), s.public().fingerprint())
+            .unwrap()
+            .expect("chain has a head");
         assert_eq!(tail.lamport, 9);
         assert_eq!(tail.entry_hash, e3.entry.entry_hash);
         assert_eq!(entry_count(&conn), 3);
 
-        let projected = load_projection(&conn).unwrap();
+        let projected = load_projection(&conn, stream_a()).unwrap();
         assert_eq!(projected.nodes.len(), 3);
         assert!(projected.nodes.contains_key(&NodeId::from("mem_a")));
     }
@@ -650,9 +826,9 @@ mod tests {
     fn reappend_is_idempotent() {
         let conn = db();
         let s = secret(2);
-        let g = entry::sign_entry(&s, None, 1, &create("mem_a", "first"));
-        append(&conn, &g.signed_bytes, &s.public(), 1_000).unwrap();
-        let again = append(&conn, &g.signed_bytes, &s.public(), 1_005).unwrap();
+        let g = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "first"));
+        append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1_000).unwrap();
+        let again = append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1_005).unwrap();
         assert_eq!(again, AppendOutcome::AlreadyPresent { entry_hash: g.entry.entry_hash });
         assert_eq!(entry_count(&conn), 1);
     }
@@ -662,20 +838,21 @@ mod tests {
         let conn = db();
         let s = secret(3);
         // A follow-on that references a predecessor we don't hold (no genesis appended yet).
-        let orphan = entry::sign_entry(&s, Some([7u8; 32]), 2, &create("mem_a", "orphan"));
+        let orphan =
+            entry::sign_entry(&s, stream_a(), Some([7u8; 32]), 2, &create("mem_a", "orphan"));
         assert!(matches!(
-            append(&conn, &orphan.signed_bytes, &s.public(), 1_000).unwrap(),
+            append(&conn, stream_a(), &orphan.signed_bytes, &s.public(), 1_000).unwrap(),
             AppendOutcome::MissingPredecessor { .. }
         ));
         assert_eq!(entry_count(&conn), 0);
 
         // Genesis, then a follow-on that advances lamport but points prev at the wrong hash (a
         // gap).
-        let g = entry::sign_entry(&s, None, 1, &create("mem_a", "first"));
-        append(&conn, &g.signed_bytes, &s.public(), 1_001).unwrap();
-        let gap = entry::sign_entry(&s, Some([9u8; 32]), 5, &create("mem_b", "gap"));
+        let g = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "first"));
+        append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1_001).unwrap();
+        let gap = entry::sign_entry(&s, stream_a(), Some([9u8; 32]), 5, &create("mem_b", "gap"));
         assert!(matches!(
-            append(&conn, &gap.signed_bytes, &s.public(), 1_002).unwrap(),
+            append(&conn, stream_a(), &gap.signed_bytes, &s.public(), 1_002).unwrap(),
             AppendOutcome::MissingPredecessor { .. }
         ));
         assert_eq!(entry_count(&conn), 1);
@@ -685,12 +862,14 @@ mod tests {
     fn fork_rejections_keep_evidence() {
         let conn = db();
         let s = secret(4);
-        let g = entry::sign_entry(&s, None, 5, &create("mem_a", "first"));
-        append(&conn, &g.signed_bytes, &s.public(), 1_000).unwrap();
+        let g = entry::sign_entry(&s, stream_a(), None, 5, &create("mem_a", "first"));
+        append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1_000).unwrap();
 
         // A second genesis for the same device is an equivocation.
-        let second_genesis = entry::sign_entry(&s, None, 6, &create("mem_b", "genesis-2"));
-        let out = append(&conn, &second_genesis.signed_bytes, &s.public(), 1_001).unwrap();
+        let second_genesis =
+            entry::sign_entry(&s, stream_a(), None, 6, &create("mem_b", "genesis-2"));
+        let out =
+            append(&conn, stream_a(), &second_genesis.signed_bytes, &s.public(), 1_001).unwrap();
         match out {
             AppendOutcome::Fork { conflicting, .. } => {
                 assert_eq!(conflicting, g.signed_bytes, "the stored genesis is the evidence");
@@ -699,22 +878,48 @@ mod tests {
         }
 
         // A follow-on that chains onto the head but does not advance lamport rewrites history.
-        let stale = entry::sign_entry(&s, Some(g.entry.entry_hash), 5, &create("mem_c", "stale"));
+        let stale = entry::sign_entry(
+            &s,
+            stream_a(),
+            Some(g.entry.entry_hash),
+            5,
+            &create("mem_c", "stale"),
+        );
         assert!(matches!(
-            append(&conn, &stale.signed_bytes, &s.public(), 1_002).unwrap(),
+            append(&conn, stream_a(), &stale.signed_bytes, &s.public(), 1_002).unwrap(),
             AppendOutcome::Fork { .. }
         ));
 
         // A stale entry (lamport at/below the tail) whose predecessor we don't even hold can never
         // become a valid extension either — it is a permanent equivocation, NOT a retryable gap.
         let stale_absent =
-            entry::sign_entry(&s, Some([3u8; 32]), 4, &create("mem_d", "stale-absent"));
+            entry::sign_entry(&s, stream_a(), Some([3u8; 32]), 4, &create("mem_d", "stale-absent"));
         assert!(matches!(
-            append(&conn, &stale_absent.signed_bytes, &s.public(), 1_003).unwrap(),
+            append(&conn, stream_a(), &stale_absent.signed_bytes, &s.public(), 1_003).unwrap(),
             AppendOutcome::Fork { .. }
         ));
 
-        assert_eq!(entry_count(&conn), 1, "no fork was stored");
+        assert_eq!(entry_count(&conn), 1, "no fork entered the log");
+
+        // Every rejected head was durably quarantined — BOTH heads of each equivocation survive a
+        // process exit — and each row points at the stored entry it collided with.
+        let quarantined = fork_evidence(&conn);
+        assert_eq!(quarantined.len(), 3, "each fork left one evidence row");
+        assert!(
+            quarantined.iter().any(|(hash, signed, conflicting)| {
+                hash.as_slice() == second_genesis.entry.entry_hash
+                    && signed == &second_genesis.signed_bytes
+                    && conflicting.as_deref() == Some(g.entry.entry_hash.as_slice())
+            }),
+            "the second genesis is quarantined verbatim, pointing at the stored genesis"
+        );
+
+        // Redelivering a quarantined fork re-reports without duplicating the evidence row.
+        assert!(matches!(
+            append(&conn, stream_a(), &second_genesis.signed_bytes, &s.public(), 1_004).unwrap(),
+            AppendOutcome::Fork { .. }
+        ));
+        assert_eq!(fork_evidence(&conn).len(), 3, "redelivery does not duplicate evidence");
     }
 
     #[test]
@@ -722,15 +927,17 @@ mod tests {
         let conn = db();
         let s = secret(13);
         // Build a chain A -> B.
-        let a = entry::sign_entry(&s, None, 1, &create("mem_a", "a"));
-        append(&conn, &a.signed_bytes, &s.public(), 1).unwrap();
-        let b = entry::sign_entry(&s, Some(a.entry.entry_hash), 2, &create("mem_b", "b"));
-        append(&conn, &b.signed_bytes, &s.public(), 2).unwrap();
+        let a = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "a"));
+        append(&conn, stream_a(), &a.signed_bytes, &s.public(), 1).unwrap();
+        let b =
+            entry::sign_entry(&s, stream_a(), Some(a.entry.entry_hash), 2, &create("mem_b", "b"));
+        append(&conn, stream_a(), &b.signed_bytes, &s.public(), 2).unwrap();
 
         // C forks off A — a PRESENT predecessor that is not the head B — at a higher lamport. The
         // predecessor exists, so backfill can never resolve it: this is an equivocation, not a gap.
-        let c = entry::sign_entry(&s, Some(a.entry.entry_hash), 3, &create("mem_c", "c"));
-        match append(&conn, &c.signed_bytes, &s.public(), 3).unwrap() {
+        let c =
+            entry::sign_entry(&s, stream_a(), Some(a.entry.entry_hash), 3, &create("mem_c", "c"));
+        match append(&conn, stream_a(), &c.signed_bytes, &s.public(), 3).unwrap() {
             AppendOutcome::Fork { conflicting, .. } => {
                 assert!(!conflicting.is_empty(), "the colliding head is kept as evidence");
             },
@@ -743,16 +950,16 @@ mod tests {
     fn tamper_and_wrong_key_are_hard_errors() {
         let conn = db();
         let s = secret(5);
-        let g = entry::sign_entry(&s, None, 1, &create("mem_a", "first"));
+        let g = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "first"));
 
         let mut tampered = g.signed_bytes.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
-        assert!(append(&conn, &tampered, &s.public(), 1_000).is_err());
+        assert!(append(&conn, stream_a(), &tampered, &s.public(), 1_000).is_err());
 
         // A valid entry verified under the wrong device key.
         let wrong = secret(6);
-        assert!(append(&conn, &g.signed_bytes, &wrong.public(), 1_000).is_err());
+        assert!(append(&conn, stream_a(), &g.signed_bytes, &wrong.public(), 1_000).is_err());
         assert_eq!(entry_count(&conn), 0);
     }
 
@@ -761,9 +968,9 @@ mod tests {
         let conn = db();
         let s = secret(7);
         // A validly-SIGNED entry whose op bytes are structurally undecodable.
-        let poison = entry::sign_entry_from_op_bytes(&s, None, 1, vec![0xFF]);
+        let poison = entry::sign_entry_from_op_bytes(&s, stream_a(), None, 1, vec![0xFF]);
         assert!(
-            append(&conn, &poison.signed_bytes, &s.public(), 1_000).is_err(),
+            append(&conn, stream_a(), &poison.signed_bytes, &s.public(), 1_000).is_err(),
             "an undecodable op must not enter the log (it would wedge every future reproject)"
         );
         assert_eq!(entry_count(&conn), 0);
@@ -774,7 +981,7 @@ mod tests {
         let conn = db();
         let s = secret(8);
         // A canonical `rag-rat/op/1` envelope with a kind tag this binary doesn't know → decodes to
-        // `Unknown`, so it passes the accept-gate, stores, and chains — but never projects (§5.4).
+        // `Unknown`, so it passes the accept-gate, stores, and chains — but never projects.
         let mut op_bytes = Vec::new();
         {
             let mut enc = Encoder::new(&mut op_bytes);
@@ -783,18 +990,23 @@ mod tests {
             enc.str("future_kind").unwrap();
             enc.null().unwrap();
         }
-        let unknown = entry::sign_entry_from_op_bytes(&s, None, 1, op_bytes);
+        let unknown = entry::sign_entry_from_op_bytes(&s, stream_a(), None, 1, op_bytes);
         assert!(matches!(
-            append(&conn, &unknown.signed_bytes, &s.public(), 1_000).unwrap(),
+            append(&conn, stream_a(), &unknown.signed_bytes, &s.public(), 1_000).unwrap(),
             AppendOutcome::Appended { .. }
         ));
         // It chains: a follow-on onto it is accepted.
-        let follow =
-            entry::sign_entry(&s, Some(unknown.entry.entry_hash), 2, &create("mem_a", "x"));
-        append(&conn, &follow.signed_bytes, &s.public(), 1_001).unwrap();
+        let follow = entry::sign_entry(
+            &s,
+            stream_a(),
+            Some(unknown.entry.entry_hash),
+            2,
+            &create("mem_a", "x"),
+        );
+        append(&conn, stream_a(), &follow.signed_bytes, &s.public(), 1_001).unwrap();
 
         assert_eq!(entry_count(&conn), 2, "both entries are in the log");
-        let projected = load_projection(&conn).unwrap();
+        let projected = load_projection(&conn, stream_a()).unwrap();
         assert_eq!(projected.nodes.len(), 1, "only the known op projected");
         assert!(projected.nodes.contains_key(&NodeId::from("mem_a")));
     }
@@ -807,30 +1019,31 @@ mod tests {
 
         // Two devices interleave; a non-null payload round-trips; a status flip is folded.
         let t = secret(10);
-        let g = entry::sign_entry(&s, None, 1, &{
+        let g = entry::sign_entry(&s, stream_a(), None, 1, &{
             let mut c = content("payload node");
             c.payload = Some(r#"{"schema_version":1,"n":42}"#.to_string());
             MemoryOp::NodeCreate { node_id: NodeId::from("mem_a"), content: c }
         });
-        let g_other = entry::sign_entry(&t, None, 2, &create("mem_b", "other-device"));
-        let status = entry::sign_entry(&s, Some(g.entry.entry_hash), 3, &MemoryOp::NodeStatus {
-            node_id: NodeId::from("mem_a"),
-            status: NodeStatus::Stale,
-        });
+        let g_other = entry::sign_entry(&t, stream_a(), None, 2, &create("mem_b", "other-device"));
+        let status =
+            entry::sign_entry(&s, stream_a(), Some(g.entry.entry_hash), 3, &MemoryOp::NodeStatus {
+                node_id: NodeId::from("mem_a"),
+                status: NodeStatus::Stale,
+            });
 
         let expected;
         {
             let conn = Connection::open(&path).unwrap();
             schema::apply(&conn).unwrap();
-            append(&conn, &g.signed_bytes, &s.public(), 1).unwrap();
-            append(&conn, &g_other.signed_bytes, &t.public(), 2).unwrap();
-            append(&conn, &status.signed_bytes, &s.public(), 3).unwrap();
-            expected = load_projection(&conn).unwrap();
+            append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1).unwrap();
+            append(&conn, stream_a(), &g_other.signed_bytes, &t.public(), 2).unwrap();
+            append(&conn, stream_a(), &status.signed_bytes, &s.public(), 3).unwrap();
+            expected = load_projection(&conn, stream_a()).unwrap();
         }
 
         // Reopen a fresh connection to the same file: the projection persisted verbatim.
         let reopened = Connection::open(&path).unwrap();
-        let loaded = load_projection(&reopened).unwrap();
+        let loaded = load_projection(&reopened, stream_a()).unwrap();
         assert_eq!(loaded, expected);
 
         // …and it equals a from-scratch in-memory fold of the same ops.
@@ -859,9 +1072,9 @@ mod tests {
     fn upgrade_refold_rebuilds_a_stale_projection() {
         let conn = db();
         let s = secret(11);
-        let g = entry::sign_entry(&s, None, 1, &create("mem_a", "first"));
-        append(&conn, &g.signed_bytes, &s.public(), 1_000).unwrap();
-        assert_eq!(load_projection(&conn).unwrap().nodes.len(), 1);
+        let g = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "first"));
+        append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1_000).unwrap();
+        assert_eq!(load_projection(&conn, stream_a()).unwrap().nodes.len(), 1);
 
         // Simulate an old binary that folded under an earlier projector version and left the shadow
         // tables stale (here: emptied).
@@ -872,7 +1085,7 @@ mod tests {
         .unwrap();
 
         assert!(reproject_if_projector_stale(&conn).unwrap(), "a stale stamp re-folds");
-        assert_eq!(load_projection(&conn).unwrap().nodes.len(), 1, "the node is back");
+        assert_eq!(load_projection(&conn, stream_a()).unwrap().nodes.len(), 1, "the node is back");
         assert!(!reproject_if_projector_stale(&conn).unwrap(), "current stamp is a no-op");
     }
 
@@ -880,8 +1093,8 @@ mod tests {
     fn append_refuses_to_downgrade_a_newer_projection() {
         let conn = db();
         let s = secret(14);
-        let g = entry::sign_entry(&s, None, 1, &create("mem_a", "first"));
-        append(&conn, &g.signed_bytes, &s.public(), 1).unwrap();
+        let g = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "first"));
+        append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1).unwrap();
 
         // Simulate a NEWER binary having folded + stamped a higher projector version.
         conn.execute("UPDATE oplog_meta SET value = ?1 WHERE key = ?2", params![
@@ -892,9 +1105,15 @@ mod tests {
 
         // This older projector must refuse to append (it would drop newer-known ops and stamp
         // down).
-        let e2 = entry::sign_entry(&s, Some(g.entry.entry_hash), 2, &create("mem_b", "second"));
+        let e2 = entry::sign_entry(
+            &s,
+            stream_a(),
+            Some(g.entry.entry_hash),
+            2,
+            &create("mem_b", "second"),
+        );
         assert!(
-            append(&conn, &e2.signed_bytes, &s.public(), 2).is_err(),
+            append(&conn, stream_a(), &e2.signed_bytes, &s.public(), 2).is_err(),
             "an older projector must not write a newer-projected store"
         );
         assert_eq!(entry_count(&conn), 1, "the refused append wrote nothing");
@@ -918,22 +1137,161 @@ mod tests {
             owner_repo_id: "repo".to_string(),
         };
         let key = edge.edge_key();
-        let g = entry::sign_entry(&s, None, 1, &create("mem_a", "first"));
-        append(&conn, &g.signed_bytes, &s.public(), 1).unwrap();
-        let add = entry::sign_entry(&s, Some(g.entry.entry_hash), 2, &MemoryOp::EdgeAdd {
-            edge: edge.clone(),
-        });
+        let g = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "first"));
+        append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1).unwrap();
+        let add =
+            entry::sign_entry(&s, stream_a(), Some(g.entry.entry_hash), 2, &MemoryOp::EdgeAdd {
+                edge: edge.clone(),
+            });
         let add_hash = add.entry.entry_hash;
-        append(&conn, &add.signed_bytes, &s.public(), 2).unwrap();
-        assert_eq!(load_projection(&conn).unwrap().edges.len(), 1);
+        append(&conn, stream_a(), &add.signed_bytes, &s.public(), 2).unwrap();
+        assert_eq!(load_projection(&conn, stream_a()).unwrap().edges.len(), 1);
 
-        let remove = entry::sign_entry(&s, Some(add_hash), 3, &MemoryOp::EdgeRemove {
+        let remove = entry::sign_entry(&s, stream_a(), Some(add_hash), 3, &MemoryOp::EdgeRemove {
             edge_key: key.clone(),
         });
-        append(&conn, &remove.signed_bytes, &s.public(), 3).unwrap();
+        append(&conn, stream_a(), &remove.signed_bytes, &s.public(), 3).unwrap();
         assert!(
-            load_projection(&conn).unwrap().edges.is_empty(),
-            "the DELETE-all reproject drops the tombstoned edge's row"
+            load_projection(&conn, stream_a()).unwrap().edges.is_empty(),
+            "the reproject drops the tombstoned edge's row"
+        );
+    }
+
+    #[test]
+    fn an_entry_offered_for_the_wrong_stream_is_refused() {
+        // The cross-stream replay case the in-body stream_id exists to stop: a validly-signed
+        // stream-B entry offered on stream A is a hard error — never stored, never quarantined
+        // (it is not an equivocation, it is mis-delivery).
+        let conn = db();
+        let s = secret(15);
+        let foreign = entry::sign_entry(&s, stream_b(), None, 1, &create("mem_a", "foreign"));
+        assert!(
+            append(&conn, stream_a(), &foreign.signed_bytes, &s.public(), 1).is_err(),
+            "a stream-B entry must not append onto stream A"
+        );
+        assert_eq!(entry_count(&conn), 0);
+        assert!(fork_evidence(&conn).is_empty(), "mis-delivery is not an equivocation");
+    }
+
+    #[test]
+    fn streams_are_isolated_chains_and_projections() {
+        let conn = db();
+        let s = secret(16);
+
+        // The SAME device opens a genesis at the SAME lamport on two streams: two independent
+        // chains, not a fork.
+        let on_a = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "on a"));
+        let on_b = entry::sign_entry(&s, stream_b(), None, 1, &create("mem_b", "on b"));
+        assert!(matches!(
+            append(&conn, stream_a(), &on_a.signed_bytes, &s.public(), 1).unwrap(),
+            AppendOutcome::Appended { .. }
+        ));
+        assert!(matches!(
+            append(&conn, stream_b(), &on_b.signed_bytes, &s.public(), 2).unwrap(),
+            AppendOutcome::Appended { .. }
+        ));
+
+        // Tails are per (stream, device).
+        let device = s.public().fingerprint();
+        assert_eq!(chain_tail(&conn, stream_a(), device).unwrap().unwrap().lamport, 1);
+        assert_eq!(
+            chain_tail(&conn, stream_a(), device).unwrap().unwrap().entry_hash,
+            on_a.entry.entry_hash
+        );
+        assert_eq!(
+            chain_tail(&conn, stream_b(), device).unwrap().unwrap().entry_hash,
+            on_b.entry.entry_hash
+        );
+
+        // Projections are per stream: each holds exactly its own node.
+        let projected_a = load_projection(&conn, stream_a()).unwrap();
+        let projected_b = load_projection(&conn, stream_b()).unwrap();
+        assert_eq!(projected_a.nodes.len(), 1);
+        assert!(projected_a.nodes.contains_key(&NodeId::from("mem_a")));
+        assert_eq!(projected_b.nodes.len(), 1);
+        assert!(projected_b.nodes.contains_key(&NodeId::from("mem_b")));
+
+        // A fork on stream B never perturbs stream A's chain or projection.
+        let fork_b = entry::sign_entry(&s, stream_b(), None, 2, &create("mem_c", "fork"));
+        assert!(matches!(
+            append(&conn, stream_b(), &fork_b.signed_bytes, &s.public(), 3).unwrap(),
+            AppendOutcome::Fork { .. }
+        ));
+        assert_eq!(load_projection(&conn, stream_a()).unwrap(), projected_a);
+        assert_eq!(load_projection(&conn, stream_b()).unwrap(), projected_b);
+
+        // A wholesale rebuild re-folds every stream and converges to the same state.
+        rebuild_projection(&conn).unwrap();
+        assert_eq!(load_projection(&conn, stream_a()).unwrap(), projected_a);
+        assert_eq!(load_projection(&conn, stream_b()).unwrap(), projected_b);
+    }
+
+    #[test]
+    fn upgrade_refold_rebuilds_every_stream() {
+        // The upgrade re-fold must sweep EVERY stream, not just the busiest: a stream nothing is
+        // writing to would otherwise serve a stale materialization forever after an upgrade.
+        let conn = db();
+        let s = secret(17);
+        let on_a = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "on a"));
+        let on_b = entry::sign_entry(&s, stream_b(), None, 1, &create("mem_b", "on b"));
+        append(&conn, stream_a(), &on_a.signed_bytes, &s.public(), 1).unwrap();
+        append(&conn, stream_b(), &on_b.signed_bytes, &s.public(), 2).unwrap();
+
+        conn.execute_batch(
+            "DELETE FROM oplog_projected_nodes;
+             DELETE FROM oplog_projected_edges;",
+        )
+        .unwrap();
+        conn.execute("UPDATE oplog_meta SET value = '0' WHERE key = ?1", params![
+            PROJECTOR_VERSION_KEY
+        ])
+        .unwrap();
+
+        assert!(reproject_if_projector_stale(&conn).unwrap(), "a stale stamp re-folds");
+        assert_eq!(load_projection(&conn, stream_a()).unwrap().nodes.len(), 1);
+        assert_eq!(load_projection(&conn, stream_b()).unwrap().nodes.len(), 1);
+    }
+
+    #[test]
+    fn append_over_a_stale_stamp_refolds_every_stream_before_stamping() {
+        // An append that finds an older/missing projector stamp writes the store-GLOBAL current
+        // stamp on commit — so it must re-fold every stream first, not just its own. If it swept
+        // only the appended stream, the now-current stamp would stop
+        // `reproject_if_projector_stale` from ever fixing the others' stale rows.
+        let conn = db();
+        let s = secret(18);
+        let on_a = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "on a"));
+        let on_b = entry::sign_entry(&s, stream_b(), None, 1, &create("mem_b", "on b"));
+        append(&conn, stream_a(), &on_a.signed_bytes, &s.public(), 1).unwrap();
+        append(&conn, stream_b(), &on_b.signed_bytes, &s.public(), 2).unwrap();
+
+        // Simulate an old binary's fold: stale shadow rows everywhere, an older stamp.
+        conn.execute_batch(
+            "DELETE FROM oplog_projected_nodes;
+             DELETE FROM oplog_projected_edges;",
+        )
+        .unwrap();
+        conn.execute("UPDATE oplog_meta SET value = '0' WHERE key = ?1", params![
+            PROJECTOR_VERSION_KEY
+        ])
+        .unwrap();
+
+        // Append lands on stream A only.
+        let second = entry::sign_entry(
+            &s,
+            stream_a(),
+            Some(on_a.entry.entry_hash),
+            2,
+            &create("mem_c", "second"),
+        );
+        append(&conn, stream_a(), &second.signed_bytes, &s.public(), 3).unwrap();
+
+        // Stream B's projection was rebuilt too, and the stamp is genuinely current.
+        assert_eq!(load_projection(&conn, stream_b()).unwrap().nodes.len(), 1);
+        assert_eq!(load_projection(&conn, stream_a()).unwrap().nodes.len(), 2);
+        assert!(
+            !reproject_if_projector_stale(&conn).unwrap(),
+            "nothing left for the upgrade re-fold to do"
         );
     }
 }

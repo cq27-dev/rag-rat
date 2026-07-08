@@ -1372,10 +1372,13 @@ fn migration_052_adds_oplog_storage_tables() {
         ["oplog_entries", "oplog_projected_nodes", "oplog_projected_edges", "oplog_meta"];
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V052 is the schema tip — the absolute pin (migration_051's drops to the symbolic
-    // `current_version == LATEST` check when a V053 lands).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 52, "V052 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 52, "schema at LATEST after apply");
+    // V053 now holds the absolute tip pin (migration_053's test); this drops to the symbolic
+    // `current_version == LATEST` freshness check.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
     for table in OPLOG_TABLES {
         assert!(conn_table_exists(&conn, table), "V052 creates {table}");
     }
@@ -1396,6 +1399,69 @@ fn migration_052_adds_oplog_storage_tables() {
     for table in OPLOG_TABLES {
         assert!(conn_table_exists(&conn, table), "the isolated applier recreates {table}");
     }
+}
+
+#[test]
+fn migration_053_scopes_the_oplog_by_stream_and_adds_fork_evidence() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V053 is the schema tip — the absolute pin (migration_052's drops to the symbolic
+    // `current_version == LATEST` check when a V054 lands).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 53, "V053 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 53, "schema at LATEST after apply");
+
+    // The rebuilt tables carry the stream dimension; the quarantine table exists.
+    for (table, column) in [
+        ("oplog_entries", "stream_id"),
+        ("oplog_projected_nodes", "stream_id"),
+        ("oplog_projected_edges", "stream_id"),
+        ("oplog_fork_evidence", "conflicting_entry_hash"),
+    ] {
+        assert!(
+            conn_table_columns(&conn, table).contains(&column.to_string()),
+            "V053 gives {table} its {column} column"
+        );
+    }
+
+    // One chain slot per (stream, device, lamport): the same (device, lamport) is legal on two
+    // DIFFERENT streams, and an equivocation within one stream trips the UNIQUE tripwire.
+    conn.execute_batch(
+        "INSERT INTO oplog_entries VALUES (x'01', x'aa', x'dd', 1, NULL, x'00', 0);
+         INSERT INTO oplog_entries VALUES (x'02', x'bb', x'dd', 1, NULL, x'00', 0);",
+    )
+    .expect("the same (device, lamport) slot on two streams is two distinct chains");
+    assert!(
+        conn.execute(
+            "INSERT INTO oplog_entries VALUES (x'03', x'aa', x'dd', 1, NULL, x'00', 0)",
+            [],
+        )
+        .is_err(),
+        "UNIQUE(stream_id, device_fingerprint, lamport) rejects a same-stream slot collision"
+    );
+
+    // Deferred-absence in ISOLATION: reduce the tables to the V052 shape (no stream_id, no
+    // quarantine) and re-run the applier alone — it rebuilds the stream-scoped shape, and a
+    // replay reconverges (the rebuild is safe precisely because the log is un-wired and empty;
+    // see the applier's invariant comment).
+    conn.execute_batch(
+        "DROP TABLE oplog_entries;
+         DROP TABLE oplog_projected_nodes;
+         DROP TABLE oplog_projected_edges;
+         DROP TABLE oplog_fork_evidence;
+         CREATE TABLE oplog_entries(entry_hash BLOB PRIMARY KEY) STRICT;",
+    )
+    .unwrap();
+    schema::apply_oplog_stream_scoping(&conn).unwrap();
+    schema::apply_oplog_stream_scoping(&conn).expect("replay reconverges");
+    for table in
+        ["oplog_entries", "oplog_projected_nodes", "oplog_projected_edges", "oplog_fork_evidence"]
+    {
+        assert!(
+            conn_table_columns(&conn, table).contains(&"stream_id".to_string()),
+            "the isolated applier rebuilds {table} stream-scoped"
+        );
+    }
+    assert!(conn_table_exists(&conn, "oplog_meta"), "oplog_meta is left untouched");
 }
 
 #[test]

@@ -1187,6 +1187,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_050_ID => Some(50),
             MIGRATION_051_ID => Some(51),
             MIGRATION_052_ID => Some(52),
+            MIGRATION_053_ID => Some(53),
             _ => None,
         })
         .max()
@@ -1248,6 +1249,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_050_ID
             | MIGRATION_051_ID
             | MIGRATION_052_ID
+            | MIGRATION_053_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1306,6 +1308,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_050_ID => migration.checksum != MIGRATION_050_CHECKSUM,
         MIGRATION_051_ID => migration.checksum != MIGRATION_051_CHECKSUM,
         MIGRATION_052_ID => migration.checksum != MIGRATION_052_CHECKSUM,
+        MIGRATION_053_ID => migration.checksum != MIGRATION_053_CHECKSUM,
         _ => false,
     }
 }
@@ -3579,6 +3582,71 @@ pub(crate) fn apply_oplog_storage(conn: &Connection) -> rusqlite::Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          ) STRICT;",
+    )?;
+    Ok(())
+}
+
+/// V053 (#509): scope the op-log by immutable stream identity. One signed chain, watermark, and
+/// projection exists per `(stream_id, device)`, so the V052 tables gain a `stream_id` dimension:
+/// `UNIQUE(stream_id, device_fingerprint, lamport)` pins each device's chain as strictly linear
+/// PER STREAM, and the shadow-projection tables key on `(stream_id, node_id / edge_key)` so a
+/// re-fold of one stream never touches another's rows. `oplog_fork_evidence` is new — the
+/// quarantine that durably preserves BOTH heads of a detected equivocation (the store previously
+/// only RETURNED the colliding entry to the caller); `signed_bytes` is the rejected head verbatim,
+/// `conflicting_entry_hash` points at the stored entry it collided with.
+///
+/// INVARIANT: this is a DROP + CREATE rebuild, which is safe ONLY because nothing writes the
+/// op-log tables yet (the module is un-wired until the write-path increment, so every database's
+/// copies are empty — there is no data to preserve). Once the log is wired, a re-shape must use a
+/// data-preserving recipe instead. `oplog_meta` is left untouched (its projector-version stamp is
+/// not stream-scoped). Idempotent (a replay rebuilds the same empty tables); the self-wrapped
+/// IMMEDIATE transaction makes an interrupted rebuild reconverge on the next run.
+pub(crate) fn apply_oplog_stream_scoping(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         DROP TABLE IF EXISTS oplog_entries;
+         CREATE TABLE oplog_entries(
+             entry_hash         BLOB PRIMARY KEY,
+             stream_id          BLOB NOT NULL,
+             device_fingerprint BLOB NOT NULL,
+             lamport            INTEGER NOT NULL,
+             prev_hash          BLOB,
+             signed_bytes       BLOB NOT NULL,
+             received_at_ms     INTEGER NOT NULL,
+             UNIQUE(stream_id, device_fingerprint, lamport)
+         ) STRICT;
+
+         DROP TABLE IF EXISTS oplog_projected_nodes;
+         CREATE TABLE oplog_projected_nodes(
+             stream_id    BLOB NOT NULL,
+             node_id      TEXT NOT NULL,
+             content_json TEXT NOT NULL,
+             status       TEXT NOT NULL,
+             PRIMARY KEY(stream_id, node_id)
+         ) STRICT;
+
+         DROP TABLE IF EXISTS oplog_projected_edges;
+         CREATE TABLE oplog_projected_edges(
+             stream_id     BLOB NOT NULL,
+             edge_key      TEXT NOT NULL,
+             spec_json     TEXT NOT NULL,
+             resolved_json TEXT,
+             PRIMARY KEY(stream_id, edge_key)
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS oplog_fork_evidence(
+             stream_id              BLOB NOT NULL,
+             entry_hash             BLOB NOT NULL,
+             device_fingerprint     BLOB NOT NULL,
+             lamport                INTEGER NOT NULL,
+             signed_bytes           BLOB NOT NULL,
+             conflicting_entry_hash BLOB,
+             observed_at_ms         INTEGER NOT NULL,
+             PRIMARY KEY(stream_id, entry_hash)
+         ) STRICT;
+
+         COMMIT;",
     )?;
     Ok(())
 }
