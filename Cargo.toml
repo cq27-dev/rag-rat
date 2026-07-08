@@ -31,6 +31,11 @@ categories = ["command-line-utilities", "development-tools"]
 rag-rat-core = { version = "0.14.0", path = "crates/rag-rat-core", default-features = false }
 rag-rat-mcp = { version = "0.14.0", path = "crates/rag-rat-mcp", default-features = false }
 anyhow = "1.0"
+# ed25519 device-identity signing for the op-log's signed entry envelope (§C4 layer-1). Default
+# features (incl. `zeroize`, which zeroizes a `SigningKey`'s seed on drop) are kept; the `rand_core`
+# CSPRNG-keygen feature stays OFF — device keys derive deterministically from a seed via
+# `SigningKey::from_bytes`. Verification uses `verify_strict` (rejects malleable / small-order sigs).
+ed25519-dalek = "2"
 fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 gix = { version = "0.85.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
 libc = "0.2"
@@ -72,6 +77,9 @@ tree-sitter-kotlin = { package = "tree-sitter-kotlin-ng", version = "1.1.0" }
 tree-sitter-python = "=0.25.0"
 tree-sitter-rust = "=0.24.2"
 tree-sitter-typescript = "=0.23.2"
+# Secret-material hygiene for the op-log device seed — `Zeroizing<[u8; 32]>` scrubs the seed copy on
+# drop (already in the tree transitively via ed25519-dalek; pinned here as a direct dep).
+zeroize = "1"
 
 # `cc` compiles the bundled SQLite amalgamation at the profile's opt-level, which is 0 for
 # `cargo build`/`cargo test` — an unoptimized SQLite is dramatically slower at the heavy INSERT

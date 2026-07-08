@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ed25519-dalek.workspace = true
 fastembed = { workspace = true, optional = true }
 gix.workspace = true
 ignore = "0.4.26"
@@ -50,6 +51,7 @@ tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 minicbor = { version = "2.2.2", features = ["alloc"] }
 unicode-normalization = "0.1.25"
+zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
