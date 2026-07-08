@@ -555,12 +555,25 @@ pub(crate) fn review_dream_finding(
         ReviewVerdict::Reset => None,
         _ => Some(now_ms),
     };
-    conn.execute(
+    // Status-CONDITIONAL update (#514): the reviewability check above ran against the SELECT
+    // snapshot, but the MCP `dream_review` tool runs on the lock-free write path where a concurrent
+    // `dream` sync can resolve/supersede this finding between that read and this write. Gate the
+    // UPDATE on the row STILL being reviewable so it can never flip a terminal
+    // (resolved/superseded/archived) row back to accepted/open; if the race lost, 0 rows change and
+    // we report it rather than silently corrupting the lifecycle. (The Rust check above stays: it
+    // gives the precise "is {status} — not reviewable" message for the common non-racing case.)
+    let changed = conn.execute(
         &format!(
-            "UPDATE dream_findings SET status = ?2, reviewed_at_ms = ?3 WHERE id = ?1{repo_clause}"
+            "UPDATE dream_findings SET status = ?2, reviewed_at_ms = ?3 WHERE id = ?1 AND status \
+             IN ('open', 'accepted', 'dismissed'){repo_clause}"
         ),
         rusqlite::params![id, new_status, reviewed_at],
     )?;
+    if changed == 0 {
+        anyhow::bail!(
+            "finding `{id}` is no longer reviewable — it was resolved or superseded concurrently"
+        );
+    }
     Ok(ReviewedFinding { id, kind, subject, status: new_status.to_string() })
 }
 
