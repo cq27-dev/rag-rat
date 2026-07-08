@@ -3442,11 +3442,27 @@ pub(crate) fn apply_repo_node_edges(conn: &Connection) -> rusqlite::Result<()> {
 /// (`delta_files_applied`, the df-drift signal that schedules the next full rebuild). Both
 /// additive + idempotent; the column type is STRICT-valid and defaulted so existing generation
 /// rows read back 0 (no deltas absorbed).
+///
+/// Pre-freeze postings are NOT delta-ready (#477 review): binaries before the df epoch freeze
+/// bumped `clone_token_df` on incremental passes WITHOUT invalidating the postings, so an
+/// upgraded index can hold a live generation whose postings are ordered by an older df than the
+/// current table — a delta patching it would compute sub-blocks under the moved df and silently
+/// miss edges. Clear `postings_written` so those generations take one full rebuild (which re-pins
+/// the epoch at its own build). Gated on the delta column being freshly ADDED, so only the first
+/// run (a genuinely pre-freeze index) invalidates — a re-apply on an already-frozen index must
+/// not throw away a valid graph.
 pub(crate) fn apply_clone_delta_maintenance(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_clone_subblock_postings_path
              ON clone_subblock_postings(build_generation, path);",
     )?;
+    // ORDER IS LOAD-BEARING (torn-retry safety): the invalidation runs BEFORE the gate column is
+    // added. A kill between the two leaves the column absent, so the retry re-runs the
+    // (idempotent) invalidation and then adds the column — the gate can never read "already
+    // frozen" while the clear is still owed.
+    if !column_exists(conn, "clone_graph_generations", "delta_files_applied")? {
+        conn.execute_batch("UPDATE clone_graph_generations SET postings_written = 0;")?;
+    }
     add_column_if_missing(
         conn,
         "clone_graph_generations",

@@ -917,7 +917,17 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
             .contains(&"delta_files_applied".to_string()),
         "generations carry the delta-drift counter that schedules the next full rebuild (#473)"
     );
-    // Additive + defaulted: a re-apply is idempotent and both survive.
+    // Additive + defaulted: a re-apply is idempotent and both survive — and a POST-freeze
+    // generation's postings are NOT invalidated by a re-apply (the pre-freeze invalidation below
+    // is gated on the delta column being freshly added).
+    conn.execute(
+        "INSERT INTO clone_graph_generations
+            (generation, status, theta_floor, normalizer_kind, normalizer_version,
+             source_revision, started_at_ms, postings_written)
+         VALUES (1, 'Complete', 0.7, 'baseline', 3, 'rev', 0, 1)",
+        [],
+    )
+    .unwrap();
     schema::apply(&conn).unwrap();
     assert!(index_exists(&conn), "the postings path index survives a re-apply");
     assert!(
@@ -925,6 +935,31 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
             .contains(&"delta_files_applied".to_string()),
         "delta_files_applied survives a re-apply"
     );
+    let postings_written: i64 = conn
+        .query_row(
+            "SELECT postings_written FROM clone_graph_generations WHERE generation = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(postings_written, 1, "a re-apply must not invalidate an already-frozen graph");
+
+    // PRE-freeze upgrade (#477 review): a generation from before the df epoch freeze may carry
+    // postings ordered by an older df than the current table (incremental bumps moved df without
+    // invalidating). The first V050 run — recognized by the delta column being absent — must
+    // clear `postings_written` so those generations take one full rebuild instead of being
+    // treated as delta-ready.
+    conn.execute_batch("ALTER TABLE clone_graph_generations DROP COLUMN delta_files_applied;")
+        .unwrap();
+    schema::apply_clone_delta_maintenance(&conn).unwrap();
+    let postings_written: i64 = conn
+        .query_row(
+            "SELECT postings_written FROM clone_graph_generations WHERE generation = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(postings_written, 0, "a pre-freeze generation is forced through a full rebuild");
 }
 
 #[test]
