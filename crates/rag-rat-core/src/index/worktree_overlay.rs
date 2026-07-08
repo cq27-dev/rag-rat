@@ -450,7 +450,10 @@ impl IndexDatabase {
         pruned: usize,
     ) -> anyhow::Result<()> {
         if indexed > 0 || tombstoned > 0 || pruned > 0 {
-            self.rebuild_logical_symbols()?;
+            // Defer: an overlay refresh re-parsed only the worktree's own files, so it must not
+            // stamp the logical-key version — the base scope's drift is still in the future
+            // (#493).
+            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
             self.refresh_packages(source_root)?;
             self.resolve_overlay_edges(worktree_id)?;
             self.sync_fts()?;

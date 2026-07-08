@@ -184,7 +184,7 @@ impl IndexDatabase {
             // Carry every live row OUTSIDE the base scope (linked-worktree overlays, other-commit
             // leftovers) forward onto `target` — the rebuild only re-emits the base scope, so
             // they must ride along to stay visible after the flip.
-            db.carry_forward_live_overlays(target, old_live)?;
+            let carried_rows = db.carry_forward_live_overlays(target, old_live)?;
             let carried_overlays = db.carried_overlay_worktrees(target)?;
             // Carry each carried overlay's PACKAGE ROOTS onto the new base scope (batch 6 #3): the
             // overlay FILE rows carried above are matched into the scope view by `worktree_id`
@@ -219,7 +219,23 @@ impl IndexDatabase {
             // already at `target` within this transaction, so the fold sees them (the A6 handoff
             // note, now satisfied PRE-flip inside the same atomic write).
             progress(IndexProgress::RebuildingLogicalSymbols);
-            db.rebuild_logical_symbols()?;
+            // FullRederive ONLY when the published set is EXACTLY what this rebuild re-parsed.
+            // Any row `carry_forward_live_overlays` moved forward — a linked-worktree overlay OR
+            // an other-commit committed leftover (`worktree_id = ''`, carried when this rebuild
+            // runs from a linked worktree) — rode along WITHOUT a reparse, so its symbols still
+            // carry the old derivation. Stamping over them would let a later heal of THOSE rows
+            // see a current key version, skip the drift snapshot, and strand their references.
+            // Gate on the carried-row COUNT, not `carried_overlays.is_empty()`:
+            // `carried_overlay_worktrees` returns only `worktree_id != ''` overlays, a NARROWER
+            // set than what was actually carried, so it would miss carried committed leftovers
+            // (#493 review). Carries are transient, so the stamp lands on the next carry-free
+            // rebuild while every pass keeps healing what it can see.
+            let stamp = if carried_rows == 0 {
+                graph_index::KeyVersionStamp::FullRederive
+            } else {
+                graph_index::KeyVersionStamp::Defer
+            };
+            db.rebuild_logical_symbols(stamp)?;
             // Publish the STAGED `parser_failures` state (upserts for paths that failed this
             // pass, clears for clean re-parses, an orphan sweep for paths removed from the tree)
             // atomically with the flip: the waves staged these mutations in a temp table instead
@@ -359,8 +375,12 @@ impl IndexDatabase {
     /// (base commit + base worktree both empty ⇒ every row IS in the base scope) and when there
     /// are no overlays. Runs INSIDE the terminal flip transaction so a reader sees overlays at
     /// exactly one generation.
-    fn carry_forward_live_overlays(&self, target: i64, old_live: i64) -> anyhow::Result<()> {
-        self.storage.connection().execute(
+    ///
+    /// Returns the number of `files` rows carried — the #493 logical-key-version stamp gate reads
+    /// it: any carried row was NOT re-parsed by this rebuild, so a non-zero count means the
+    /// published generation still holds old-derivation symbols and the stamp must defer.
+    fn carry_forward_live_overlays(&self, target: i64, old_live: i64) -> anyhow::Result<usize> {
+        let carried = self.storage.connection().execute(
             "UPDATE main.files SET generation = ?1
              WHERE repo_id = ?2 AND generation = ?3
                AND commit_sha != ?4 AND worktree_id != ?5",
@@ -372,7 +392,7 @@ impl IndexDatabase {
                 self.active_worktree_id
             ],
         )?;
-        Ok(())
+        Ok(carried)
     }
 
     /// Re-key each carried linked-worktree overlay's generation-less `packages` rows onto the

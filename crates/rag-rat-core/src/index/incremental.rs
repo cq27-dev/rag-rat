@@ -257,7 +257,9 @@ impl IndexDatabase {
             // the full-scope resolve every ordinary edit pass runs is what re-points it.
             if indexed > 0 || healed > 0 || carried > 0 || roots_changed {
                 progress(IndexProgress::RebuildingLogicalSymbols);
-                db.rebuild_logical_symbols()?;
+                // Defer: this pass re-parsed only the CHANGED files, so it must not stamp the
+                // logical-key version — untouched files' drift is still in the future (#493).
+                db.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
                 progress(IndexProgress::ResolvingGraph);
                 db.resolve_edges()?;
                 db.mark_graph_index_current()?;
@@ -328,7 +330,10 @@ impl IndexDatabase {
         let result = (|| -> anyhow::Result<()> {
             self.build_chunk_text_store()?;
             self.finalize_base_edges(config, graph)?;
-            self.rebuild_logical_symbols()?;
+            // FullRederive: the standalone pass indexed the whole corpus (a fresh index — no
+            // pre-existing rows, so the drift heal is empty), so it may stamp the logical-key
+            // version (#493).
+            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::FullRederive)?;
             self.apply_staged_parser_failures(self.active_generation)?;
             self.refresh_clone_token_df()?;
             self.sync_fts()?;

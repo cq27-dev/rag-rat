@@ -61,7 +61,9 @@ impl IndexDatabase {
             &text,
             &scope,
         )?;
-        self.rebuild_logical_symbols()?;
+        // Defer: a single-file heal must not stamp the logical-key version — every other file's
+        // drift is still in the future (#493).
+        self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
         self.resolve_edges()
     }
 

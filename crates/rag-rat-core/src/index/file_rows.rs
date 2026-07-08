@@ -45,6 +45,11 @@ impl IndexDatabase {
         commit_sha: &str,
         worktree_id: &str,
     ) -> anyhow::Result<()> {
+        // #493: every live-scope file replacement funnels through here, so this is the seam that
+        // memoizes the drift-heal snapshot BEFORE the symbol deletes below destroy its
+        // member-signature evidence. A no-op unless the key-version stamp is stale, and paid at
+        // most once per pass.
+        self.capture_drift_snapshot_before_removal()?;
         let path = path_string(path);
         // Direct edges_data writes (#79): these statements touch up to every in-edge of a file's
         // symbols, so they must not pay the view triggers' per-row dictionary probes.

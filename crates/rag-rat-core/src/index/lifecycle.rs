@@ -140,6 +140,7 @@ impl IndexDatabase {
             github: github::GitHubContext::default(),
             config: None,
             _identity_lock: None,
+            drift_snapshot: std::sync::Mutex::new(None),
         };
         if matches!(mode, BareOpenMode::ConfigLess) {
             db.ensure_graph_index_current()?;
@@ -161,6 +162,7 @@ impl IndexDatabase {
             github: github::GitHubContext::from_gh(),
             config: Some(config.clone()),
             _identity_lock: None,
+            drift_snapshot: std::sync::Mutex::new(None),
         };
         db.storage.set_source_root(config.root.clone());
         // Register/adopt BEFORE anything repo-scoped runs, then install the scope context so the
@@ -327,6 +329,7 @@ impl IndexDatabase {
             github: github::GitHubContext::from_gh(),
             config: Some(config.clone()),
             _identity_lock: None,
+            drift_snapshot: std::sync::Mutex::new(None),
         };
         // Install the scope context BEFORE the heal-owed gates: `set_context` mirrors the resolved
         // `repo_id` into `temp.connection_context` (writable even on a read-only main DB), so the
@@ -448,6 +451,7 @@ impl IndexDatabase {
             github: github::GitHubContext::default(),
             config: None,
             _identity_lock: None,
+            drift_snapshot: std::sync::Mutex::new(None),
         })
     }
 

@@ -359,7 +359,9 @@ impl IndexDatabase {
         let result = (|| -> anyhow::Result<()> {
             self.apply_incremental_file_plan(files, changes.deleted.clone(), &mut |_| {})?;
             self.refresh_packages(&config.root)?;
-            self.rebuild_logical_symbols()?;
+            // Defer: this heal re-parsed only the STALE files, so it must not stamp the
+            // logical-key version — untouched files' drift is still in the future (#493).
+            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
             self.resolve_edges()?;
             self.sync_fts()?;
             Ok(())

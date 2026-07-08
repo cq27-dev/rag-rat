@@ -143,6 +143,15 @@ pub struct IndexDatabase {
     /// lock must match the repo id it writes under. `None` on the lockless open paths (they stay
     /// lockless by design) and whenever the entry lock already covers the resolved id.
     _identity_lock: Option<crate::locks::WriteLock>,
+    /// The lazily captured #493 drift-heal snapshot, tagged with the repo it was captured for.
+    /// Populated by the FIRST [`Self::remove_file_in_scope`] of a pass while the key-version
+    /// stamp is stale — the symbol rows about to be deleted carry the snapshot's signature
+    /// evidence, so it must be memoized before the first deletion — and consumed by the next
+    /// [`Self::rebuild_logical_symbols`] (which captures fresh when nothing was removed: the
+    /// evidence is still intact then). Idle passes never remove a file, never populate this, and
+    /// never pay the snapshot scan. Interior mutability because the deleters take `&self`.
+    drift_snapshot:
+        std::sync::Mutex<Option<(String, Option<Vec<graph_index::LogicalKeyDriftRow>>)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +277,20 @@ const GRAPH_INDEX_VERSION: &str = "11";
 // `is_generated_path` codegen living under a source target.
 const GENERATED_FLAGS_VERSION: &str = "1";
 const GENERATED_FLAGS_VERSION_KEY: &str = "generated_flags_version";
+
+// Bumped when [`graph_index::LogicalSymbolKey`]'s DERIVATION changes semantics — a
+// signature-capture fix, a kind-classification change, a qualified-name derivation change, or a
+// grammar bump that shifts any of them. The stable logical id hashes those fields, so a semantic
+// change churns EVERY logical id in a repo at its next rebuild at once, stranding every
+// logical-symbol memory binding (and moniker / call-path reference) simultaneously (#493). On a
+// mismatch the rebuild snapshots the referenced old rows and realigns them onto the re-derived
+// ids (`heal_logical_key_drift`); matching is evidence-gated, so bump this LIBERALLY on any doubt
+// — a no-drift heal is a cheap no-op, an unbumped drift is a whole-repo stranding healed one
+// validate at a time. Per-repo (`repo_meta`, like `graph_index_version`): a shared DB holds repos
+// rebuilt by different binaries.
+// 1: initial version (#493).
+const LOGICAL_KEY_VERSION: &str = "1";
+const LOGICAL_KEY_VERSION_KEY: &str = "logical_key_version";
 
 #[derive(Debug, Error)]
 pub enum IndexError {
