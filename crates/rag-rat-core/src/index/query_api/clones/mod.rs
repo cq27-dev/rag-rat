@@ -498,7 +498,12 @@ impl IndexDatabase {
         // two modes address disjoint cache namespaces, so an oracle run can invalidate every
         // scip-mode row (`invalidate_scip_refinements`) without touching baseline rows. Cheap
         // (one EXISTS per hydration chunk), so the warm probe stays a probe.
-        let mode = if oracle_callee_coverage_exists(conn, class_ids)? {
+        let mode = if oracle_callee_coverage_exists(
+            conn,
+            class_ids,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )? {
             RefineMode::Scip
         } else {
             RefineMode::Baseline
@@ -871,7 +876,13 @@ impl IndexDatabase {
                     let disk_sha = crate::index::hex_sha256(content.as_bytes());
                     moniker_cache.insert(
                         row.path.clone(),
-                        crate::index::oracle::current_callee_monikers(conn, &row.path, &disk_sha)?,
+                        crate::index::oracle::current_callee_monikers(
+                            conn,
+                            &row.path,
+                            &disk_sha,
+                            &self.active_commit_sha,
+                            &self.active_worktree_id,
+                        )?,
                     );
                 }
                 file_cache.insert(row.path.clone(), Arc::from(content.as_str()));

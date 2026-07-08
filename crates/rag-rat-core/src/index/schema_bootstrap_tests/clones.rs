@@ -3938,27 +3938,43 @@ fn scip_moniker_collapse_lifts_a_same_symbol_callee_class() {
     );
 
     // Seed CURRENT oracle verdicts: each member file's callee identifier span resolves to the
-    // SAME moniker. `file_sha` must equal the indexed (= on-disk) content hash for the rows to
-    // count as current.
+    // SAME moniker. `file_sha` must equal the indexed (= on-disk) content hash, a COMPLETED
+    // `oracle_runs` row in this checkout must stand behind their `(tool, tool_version)`, and each
+    // verdict's content key must match a LIVE `calls_name` edge — the three currency gates the
+    // collapse read applies. Deriving the verdict's content key from the real indexed edge (rather
+    // than a synthetic callee-only span) is what the production oracle does, so the live-edge gate
+    // sees a match.
     let conn = db.storage.connection();
+    conn.execute(
+        "INSERT INTO oracle_runs(repo_id, tool, tool_version, commit_sha, worktree_id, \
+         started_at, status, stats_json)
+         VALUES (?1, 'scip-rust', 'v1', ?2, ?3, 0, 'Completed', '{}')",
+        rusqlite::params![db.active_repo_id, db.active_commit_sha, db.active_worktree_id],
+    )
+    .unwrap();
     for (dir, name, _var, callee) in fixtures {
         let rel = format!("{dir}/{name}.rs");
         let src = fs::read_to_string(root.join(&rel)).unwrap();
         let sha = crate::index::hex_sha256(src.as_bytes());
-        let start = src.find(&format!("{callee}(")).unwrap();
+        // The real edge the extractor emitted for `callee(...)` — its source span is the whole
+        // call expression, its callee span the identifier. The verdict is keyed by BOTH.
+        let (src_lo, src_hi, cal_lo, cal_hi): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT edges.source_start_byte, edges.source_end_byte, edges.callee_start_byte, \
+                 edges.callee_end_byte
+                 FROM edges JOIN files ON files.id = edges.source_file_id
+                 WHERE files.path = ?1 AND edges.edge_kind = 'calls_name' AND edges.to_name = ?2",
+                rusqlite::params![rel, callee],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
         conn.execute(
             "INSERT INTO edge_oracle(repo_id, source_path, source_start_byte, source_end_byte, \
              callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
              scip_symbol, kind, computed_at)
-             VALUES (?1, ?2, ?3, ?4, ?3, ?4, 'calls_name', ?5, 'scip-rust', 'v1', 'rust cr 1.0 \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'calls_name', ?7, 'scip-rust', 'v1', 'rust cr 1.0 \
              validate().', 'resolved', 0)",
-            rusqlite::params![
-                db.active_repo_id,
-                rel,
-                start as i64,
-                (start + callee.len()) as i64,
-                sha,
-            ],
+            rusqlite::params![db.active_repo_id, rel, src_lo, src_hi, cal_lo, cal_hi, sha],
         )
         .unwrap();
     }

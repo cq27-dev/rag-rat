@@ -48,7 +48,9 @@ pub use run::{OracleEvalMetrics, RecallCalls};
 use rusqlite::Connection;
 use serde::Serialize;
 pub use status::OracleStatus;
-pub(crate) use store::{EdgeOracleComparison, EdgeOracleVerdict, current_callee_monikers};
+pub(crate) use store::{
+    EdgeOracleComparison, EdgeOracleVerdict, callee_moniker_current_clause, current_callee_monikers,
+};
 
 /// Run one oracle pass over the current edge candidates from a pre-built `.scip` and return its
 /// [`OracleReport`]. Phase-1 public entry point (consumed by `eval`); no CLI/MCP surface yet (#69).

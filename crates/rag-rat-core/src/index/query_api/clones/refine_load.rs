@@ -95,11 +95,14 @@ pub(crate) fn load_refine_rows(
 }
 
 /// Whether ANY member's file has CURRENT SCIP-oracle callee coverage (#275, Plan 3): an
-/// `edge_oracle` call row whose `file_sha` matches the file's indexed `sha256`. This is the
-/// refine-MODE probe — `true` selects [`RefineMode::Scip`], which keys (and caches) the refinement
-/// in the scip-mode namespace and lets the loader attach callee monikers. CHEAP (one EXISTS per
-/// hydration chunk over `idx_edge_oracle_anchor`), and deterministic for a given (index, oracle)
-/// state, so the warm cache probe stays a probe.
+/// `edge_oracle` call-HEAD row whose `file_sha` matches the file's indexed `sha256` and that
+/// passes the shared currency gate (`callee_moniker_current_clause`: call-HEAD edge kinds, the
+/// LATEST completed run per tool in the active `(commit_sha, worktree_id)` checkout, a still-live
+/// resolved definition) — the SAME discipline the moniker fetch applies, so mode and attachment
+/// can't diverge. This is the refine-MODE probe — `true` selects [`RefineMode::Scip`], which keys
+/// (and caches) the refinement in the scip-mode namespace and lets the loader attach callee
+/// monikers. CHEAP (one EXISTS per hydration chunk over `idx_edge_oracle_anchor`), and
+/// deterministic for a given (index, oracle) state, so the warm cache probe stays a probe.
 ///
 /// ANY (not ALL) member coverage selects scip mode: a class spanning a covered and an uncovered
 /// file still benefits when the compared callee spans all carry monikers, and the collapse itself
@@ -111,6 +114,8 @@ pub(crate) fn load_refine_rows(
 pub(crate) fn oracle_callee_coverage_exists(
     conn: &Connection,
     member_ids: &[i64],
+    commit_sha: &str,
+    worktree_id: &str,
 ) -> anyhow::Result<bool> {
     let repo_clause = crate::index::schema::periphery_repo_scope_clause(
         &crate::index::schema::periphery_repo_scope(conn, "edge_oracle")?,
@@ -118,6 +123,13 @@ pub(crate) fn oracle_callee_coverage_exists(
     );
     for chunk in member_ids.chunks(HYDRATION_CHUNK) {
         let id_placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+        let commit_slot = format!("?{}", chunk.len() + 1);
+        let worktree_slot = format!("?{}", chunk.len() + 2);
+        let current_clause = crate::index::oracle::callee_moniker_current_clause(
+            conn,
+            &commit_slot,
+            &worktree_slot,
+        )?;
         let sql = format!(
             "SELECT EXISTS(
                  SELECT 1
@@ -125,14 +137,21 @@ pub(crate) fn oracle_callee_coverage_exists(
                  JOIN files ON files.id = symbols.file_id
                  JOIN edge_oracle
                    ON edge_oracle.source_path = files.path
-                   AND edge_oracle.file_sha = files.sha256
-                   AND edge_oracle.edge_kind = 'calls_name'{repo_clause}
+                   AND edge_oracle.file_sha = files.sha256{repo_clause}{current_clause}
                  WHERE symbols.id IN ({})
              )",
             id_placeholders.join(", ")
         );
+        let params: Vec<Box<dyn rusqlite::ToSql>> = chunk
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+            .chain([
+                Box::new(commit_sha.to_string()) as Box<dyn rusqlite::ToSql>,
+                Box::new(worktree_id.to_string()) as Box<dyn rusqlite::ToSql>,
+            ])
+            .collect();
         let covered: bool =
-            conn.query_row(&sql, rusqlite::params_from_iter(chunk.iter()), |row| row.get(0))?;
+            conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| row.get(0))?;
         if covered {
             return Ok(true);
         }

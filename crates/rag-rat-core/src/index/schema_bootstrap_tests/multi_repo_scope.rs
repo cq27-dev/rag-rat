@@ -1938,10 +1938,25 @@ fn incremental_open_resets_source_root_from_the_config_before_heals() {
 /// to the active repo. Both repos hold a row for the SAME `(source_path, file_sha, span)` with
 /// DIFFERENT monikers; an unscoped read would see both, treat the span as a multi-tool conflict,
 /// and drop it (or worse, serve the sibling's identity). The active repo must see exactly its own.
+/// The latest-run currency gate's `oracle_runs` subquery must be repo-scoped too: repo B holds a
+/// NEWER run under a DIFFERENT `tool_version` — unscoped, that run would be "latest" for the tool
+/// and filter repo A's current rows.
 #[test]
 fn current_callee_monikers_ignores_a_sibling_repos_rows() {
     let conn = a5_scoped_two_repo_conn();
 
+    // Repo A's latest run stands behind 'v1'; repo B's NEWER (higher-id) run is on 'v2'. Rows are
+    // only trusted when the LATEST run of their tool in the ACTIVE repo + checkout backs their
+    // version, so B's run must not supersede A's.
+    for (repo, version) in [(A5_REPO_A, "v1"), (A5_REPO_B, "v2")] {
+        conn.execute(
+            "INSERT INTO oracle_runs(repo_id, tool, tool_version, commit_sha, worktree_id, \
+             started_at, status, stats_json)
+             VALUES (?1, 'scip-rust', ?2, 'commit-x', '', 0, 'Completed', '{}')",
+            rusqlite::params![repo, version],
+        )
+        .unwrap();
+    }
     for (repo, symbol) in [(A5_REPO_A, "rust cr 1.0 a()."), (A5_REPO_B, "rust cr 1.0 b().")] {
         conn.execute(
             "INSERT INTO edge_oracle(repo_id, source_path, source_start_byte, source_end_byte, \
@@ -1954,13 +1969,48 @@ fn current_callee_monikers_ignores_a_sibling_repos_rows() {
         .unwrap();
     }
 
+    // A LIVE `calls_name` edge for the verdict's content key must exist in the active checkout —
+    // the collapse read gates on it. One file+edge in repo A's scope satisfies the (repo-agnostic,
+    // path+sha+commit-keyed) live-edge EXISTS; repo B's verdict is filtered by the repo predicate
+    // before that gate, so it needs none.
+    conn.execute(
+        "INSERT INTO files(repo_id, path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id)
+         VALUES (?1, 'src/x.rs', 'rust', 'source', 'sha-x', 0, 0, 'commit-x', '')",
+        [A5_REPO_A],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO name_strings(value)
+             VALUES ('x_callee'), ('calls_name'), ('NameOnly'), ('unresolved');",
+    )
+    .unwrap();
+    let id_of = |v: &str| -> i64 {
+        conn.query_row("SELECT id FROM name_strings WHERE value = ?1", [v], |r| r.get(0)).unwrap()
+    };
+    conn.execute(
+        "INSERT INTO edges_data(source_file_id, to_name_id, edge_kind_id, confidence_id, \
+         resolution_id, source_start_byte, source_end_byte, callee_start_byte, callee_end_byte)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 20, 5, 8)",
+        rusqlite::params![
+            file_id,
+            id_of("x_callee"),
+            id_of("calls_name"),
+            id_of("NameOnly"),
+            id_of("unresolved"),
+        ],
+    )
+    .unwrap();
+
     a5_set_active_repo(&conn, A5_REPO_A);
     let monikers =
-        crate::index::oracle::current_callee_monikers(&conn, "src/x.rs", "sha-x").unwrap();
+        crate::index::oracle::current_callee_monikers(&conn, "src/x.rs", "sha-x", "commit-x", "")
+            .unwrap();
     assert_eq!(
         monikers,
         std::collections::HashMap::from([((5, 8), "rust cr 1.0 a().".to_string())]),
         "the collapse read must serve the ACTIVE repo's moniker, never conflict against (or leak) \
-         the sibling's row"
+         the sibling's row — and the sibling's newer run must not supersede the active repo's"
     );
 }

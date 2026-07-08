@@ -156,14 +156,72 @@ pub(crate) struct EdgeJoinCandidate {
 /// *call* and must be excluded from the recall numerator (the population-mismatch finding, #81).
 pub(crate) const CALL_EDGE_KIND: &str = "calls_name";
 
+/// The edge kinds whose callee byte range covers a CALL-HEAD identifier the clone-refine
+/// anti-unify classifier can treat as a callee position (#275): free-fn/method calls
+/// (`calls_name`) and macro invocations (`uses_macro` — `opens_call_head` treats a macro head
+/// exactly like a call head, and the Rust extractor stamps the callee range on the macro-name
+/// identifier). Spelled as a SQL list fragment for the two moniker-collapse reads.
+/// `references_type` / `constructs` / `implements` rows also join SCIP occurrences (they carry a
+/// callee range) but are never callee positions in the classifier, so they stay excluded.
+pub(crate) const CALL_HEAD_EDGE_KINDS_SQL: &str = "('calls_name', 'uses_macro')";
+
+/// The gating tail every clone-refine moniker read appends after its `edge_oracle` anchor match
+/// (`source_path` + `file_sha`): rows a collapse may trust are exactly those that are
+///
+/// 1. **call-HEAD kinds** ([`CALL_HEAD_EDGE_KINDS_SQL`]) — the only positions the classifier can
+///    reopen as a callee;
+/// 2. **from the LATEST completed run of their tool in the active checkout** — superseded
+///    `tool_version` rows are intentionally left behind by [`clear_edge_oracle_for_tool`] (it
+///    clears only the current `(tool, tool_version)` scope), and a run in a sibling checkout says
+///    nothing about this one. The correlated subquery is the SQL spelling of
+///    [`latest_run_tool_version`] (`id DESC` = completion order — see that fn for why `started_at`
+///    ordering is wrong); a tool with no run in this checkout matches nothing (`= NULL` is never
+///    true), so its rows drop;
+/// 3. **backed by a still-live resolved definition** ([`edge_oracle_def_current_predicate`]) — the
+///    same def-drift gate the surfacing reads apply: a callsite file can be unchanged while the
+///    resolved def was deleted/reindexed, and a moniker for a target the current index no longer
+///    contains must not prove two callees identical.
+/// 4. **still decorating a LIVE edge** ([`edge_oracle_live_edge_predicate`]) — the content-key join
+///    the surfacing path makes an INNER JOIN. A verdict whose content key no longer maps to a live
+///    edge (a row surviving a reindex after the extractor stopped emitting that call edge) is a
+///    dangling verdict; the surfacing reads exclude it via [`edge_oracle_scope_join`], so the
+///    collapse must too. This loses no real collapse: the classifier only ever looks up callee
+///    spans that are call-head tokens, which is exactly where the extractor emits an edge.
+///
+/// `commit_slot`/`worktree_slot` are the caller's bind-parameter names for the active checkout
+/// (e.g. `"?3"`, `"?4"`); they feed the runs subquery, the def-drift EXISTS, and the live-edge
+/// EXISTS. Shared by [`current_callee_monikers`] and the refine-mode probe
+/// (`oracle_callee_coverage_exists`) so the probe and the fetch express ONE currency discipline —
+/// a probe looser than the fetch would key baseline-identical refinements into the scip cache
+/// namespace (needless oracle-run churn).
+pub(crate) fn callee_moniker_current_clause(
+    conn: &Connection,
+    commit_slot: &str,
+    worktree_slot: &str,
+) -> anyhow::Result<String> {
+    let runs_repo_clause = oracle_repo_scope_clause(conn, "oracle_runs")?;
+    Ok(format!(
+        " AND edge_oracle.edge_kind IN {CALL_HEAD_EDGE_KINDS_SQL} AND edge_oracle.tool_version = \
+         (SELECT oracle_runs.tool_version FROM oracle_runs WHERE oracle_runs.tool = \
+         edge_oracle.tool AND oracle_runs.commit_sha = {commit_slot} AND oracle_runs.worktree_id \
+         = {worktree_slot}{runs_repo_clause} ORDER BY oracle_runs.id DESC LIMIT \
+         1){def_current}{live_edge}",
+        def_current = edge_oracle_def_current_predicate(commit_slot, worktree_slot),
+        live_edge = edge_oracle_live_edge_predicate(commit_slot, worktree_slot),
+    ))
+}
+
 /// The CURRENT SCIP callee resolutions for one file, keyed by the callee-identifier byte range —
 /// the clone-refine moniker-collapse input (#275, Plan 3). `file_sha` must be the sha256 of the
 /// EXACT bytes the caller's byte offsets were derived from: `edge_oracle` spans were computed
 /// against the content hashed into each row's `file_sha`, so filtering on it is what makes the
 /// span join sound (a drifted file simply matches nothing — the conservative no-collapse
-/// fallback). Uses `idx_edge_oracle_anchor` (source_path prefix).
+/// fallback). `commit_sha`/`worktree_id` scope the currency gate
+/// ([`callee_moniker_current_clause`]): only call-HEAD rows the LATEST run of each tool in the
+/// active checkout stands behind, whose resolved definition still exists, are returned. Uses
+/// `idx_edge_oracle_anchor` (source_path prefix).
 ///
-/// Two exclusions keep a false collapse impossible:
+/// Two further exclusions keep a false collapse impossible:
 /// - `local N` monikers are DOCUMENT-scoped (unique only within one file), so cross-file equality
 ///   would identify two different functions — never returned.
 /// - a span where two rows (different tools / tool versions) disagree on the moniker has no
@@ -172,14 +230,17 @@ pub(crate) fn current_callee_monikers(
     conn: &Connection,
     source_path: &str,
     file_sha: &str,
+    commit_sha: &str,
+    worktree_id: &str,
 ) -> anyhow::Result<HashMap<(usize, usize), String>> {
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
+    let current_clause = callee_moniker_current_clause(conn, "?3", "?4")?;
     let mut stmt = conn.prepare(&format!(
         "SELECT callee_start_byte, callee_end_byte, scip_symbol
          FROM edge_oracle
-         WHERE source_path = ?1 AND file_sha = ?2 AND edge_kind = ?3{repo_clause}"
+         WHERE source_path = ?1 AND file_sha = ?2{repo_clause}{current_clause}"
     ))?;
-    let rows = stmt.query_map(params![source_path, file_sha, CALL_EDGE_KIND], |row| {
+    let rows = stmt.query_map(params![source_path, file_sha, commit_sha, worktree_id], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
     })?;
     let mut monikers: HashMap<(usize, usize), String> = HashMap::new();
@@ -871,10 +932,48 @@ pub(crate) fn count_edge_oracle_scoped(
 /// cleanly after [`edge_oracle_scope_join`]'s trailing `WHERE`.
 pub(crate) fn edge_oracle_current_predicate() -> String {
     format!(
-        " AND edge_oracle.file_sha = files.sha256 AND (edge_oracle.resolved_symbol_id IS NULL OR \
-         EXISTS (SELECT 1 FROM symbols JOIN files ON files.id = symbols.file_id WHERE symbols.id \
-         = edge_oracle.resolved_symbol_id AND {scope}))",
-        scope = active_checkout_file_predicate("?3", "?4"),
+        " AND edge_oracle.file_sha = files.sha256{def_current}",
+        def_current = edge_oracle_def_current_predicate("?3", "?4"),
+    )
+}
+
+/// Gate (2) of [`edge_oracle_current_predicate`] on its own — the def-drift EXISTS, parameterized
+/// on the caller's bind-slot names for `(commit_sha, worktree_id)` so reads that don't use the
+/// `?1..?4` scope-join slot convention ([`callee_moniker_current_clause`]) still apply the ONE
+/// spelling of the gate rather than re-deriving it. The inner `symbols`/`files` names shadow any
+/// outer join of the same tables (SQLite resolves the subquery scope first), exactly as when
+/// appended after [`edge_oracle_scope_join`].
+pub(crate) fn edge_oracle_def_current_predicate(commit_slot: &str, worktree_slot: &str) -> String {
+    format!(
+        " AND (edge_oracle.resolved_symbol_id IS NULL OR EXISTS (SELECT 1 FROM symbols JOIN files \
+         ON files.id = symbols.file_id WHERE symbols.id = edge_oracle.resolved_symbol_id AND \
+         {scope}))",
+        scope = active_checkout_file_predicate(commit_slot, worktree_slot),
+    )
+}
+
+/// The EXISTS-form mirror of [`edge_oracle_scope_join`]'s content-key INNER JOIN: whether the
+/// correlated `edge_oracle` row still decorates a LIVE `edges` row in the active
+/// `(commit_sha, worktree_id)` checkout — the SAME six content-key columns (`source_path` →
+/// `files.path`, `file_sha` → `files.sha256`, the source + callee byte spans, and `edge_kind`)
+/// plus the active-checkout file predicate. The surfacing reads express this as an INNER JOIN
+/// because they DECORATE edges (they need a live edge to attach the `Compiler` tier to); the
+/// clone-refine moniker reads are `FROM edge_oracle` with no join and span multiple tools (to
+/// detect cross-tool conflicts), so they can't take the single-tool JOIN form and append this
+/// ` AND EXISTS(...)` instead. Same isolation model as `edge_oracle_scope_join`: repo isolation
+/// comes from the outer `edge_oracle.repo_id` predicate, so this EXISTS is intentionally not
+/// repo-scoped (a cross-repo path+sha+commit collision is identical content, benign for an
+/// existence check). Uses the `edges` VIEW (like the JOIN) so `edge_kind` resolves as text. The
+/// inner `files`/`edges` names are a fresh scope, shadowing any outer join of the same tables.
+pub(crate) fn edge_oracle_live_edge_predicate(commit_slot: &str, worktree_slot: &str) -> String {
+    format!(
+        " AND EXISTS (SELECT 1 FROM files JOIN edges ON edges.source_file_id = files.id AND \
+         edges.source_start_byte = edge_oracle.source_start_byte AND edges.source_end_byte = \
+         edge_oracle.source_end_byte AND edges.callee_start_byte = edge_oracle.callee_start_byte \
+         AND edges.callee_end_byte = edge_oracle.callee_end_byte AND edges.edge_kind = \
+         edge_oracle.edge_kind WHERE files.path = edge_oracle.source_path AND files.sha256 = \
+         edge_oracle.file_sha AND {scope})",
+        scope = active_checkout_file_predicate(commit_slot, worktree_slot),
     )
 }
 

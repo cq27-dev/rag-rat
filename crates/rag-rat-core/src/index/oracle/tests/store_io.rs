@@ -249,6 +249,22 @@ fn current_callee_monikers_filters_sha_locals_and_conflicts() {
         let start = src.find(name).unwrap();
         (start, start + name.len())
     };
+    // The currency gate only trusts rows the LATEST run of their tool stands behind — record a
+    // completed run for BOTH tools so every row below is in play (the conflict drop must fire
+    // on trusted rows, not on rows the run gate already filtered).
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, 0, "Completed", "{}")
+        .unwrap();
+    store::record_oracle_run_at(
+        &h.conn,
+        OracleTool::ScipClang,
+        VERSION,
+        COMMIT,
+        WORKTREE,
+        0,
+        "Completed",
+        "{}",
+    )
+    .unwrap();
 
     let (keep_lo, keep_hi) = span("keep");
     let keep_edge = h.add_edge(file, "keep", keep_lo, keep_hi, "NameOnly", None);
@@ -292,10 +308,197 @@ fn current_callee_monikers_filters_sha_locals_and_conflicts() {
     let loc_edge = h.add_edge(file, "loc", loc_lo, loc_hi, "NameOnly", None);
     h.write_verdict(loc_edge, &sha, None, "local 5", OracleResolutionKind::Upgrade);
 
-    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha).unwrap();
+    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, COMMIT, WORKTREE).unwrap();
     assert_eq!(
         monikers,
         std::collections::HashMap::from([((keep_lo, keep_hi), "rust cr 1.0 keep().".to_string())]),
         "only the sha-current, non-local, conflict-free span may be returned"
+    );
+}
+
+/// The run/def currency gates on `current_callee_monikers` (#275 Codex round-2): a row is trusted
+/// ONLY when (a) the LATEST completed run of its tool in the active checkout stands behind its
+/// `tool_version` — superseded-version rows linger by design (`clear_edge_oracle_for_tool` clears
+/// only the current scope) and must not lend identity — and (b) its resolved definition, if
+/// in-corpus, still exists in the active checkout (the same def-drift gate the surfacing reads
+/// apply: an unchanged callsite can point at a deleted/reindexed target).
+#[test]
+fn current_callee_monikers_drops_superseded_runs_and_dead_defs() {
+    let h = Harness::new();
+    let src = "fn caller() { old_ver(); no_run(); dead_def(); live_def(); }\n";
+    let file = h.add_file("m.rs", src);
+    let sha = h.file_sha("m.rs");
+    let span = |name: &str| {
+        let start = src.find(name).unwrap();
+        (start, start + name.len())
+    };
+    // The latest completed run for TOOL carries VERSION — rows under any other version of TOOL,
+    // or under a tool with NO run in this checkout, are not backed by it.
+    store::record_oracle_run_at(
+        &h.conn,
+        TOOL,
+        "superseded",
+        COMMIT,
+        WORKTREE,
+        0,
+        "Completed",
+        "{}",
+    )
+    .unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, 1, "Completed", "{}")
+        .unwrap();
+
+    // (a) A row written under TOOL's SUPERSEDED version: the latest run no longer stands behind
+    // it, even though its file_sha is current.
+    let (old_lo, old_hi) = span("old_ver");
+    let old_edge = h.add_edge(file, "old_ver", old_lo, old_hi, "NameOnly", None);
+    let old_key = h.edge_content_key(old_edge);
+    store::write_edge_oracle(&h.conn, TOOL, "superseded", &EdgeOracleRow {
+        source_path: &old_key.source_path,
+        source_start_byte: old_key.source_start_byte,
+        source_end_byte: old_key.source_end_byte,
+        callee_start_byte: old_key.callee_start_byte,
+        callee_end_byte: old_key.callee_end_byte,
+        edge_kind: &old_key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: None,
+        scip_symbol: "rust cr 1.0 old().",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+
+    // (a') A row under a tool with NO run in this checkout — nothing stands behind it here (a
+    // sibling checkout's run must not lend identity to this one).
+    let (norun_lo, norun_hi) = span("no_run");
+    let norun_edge = h.add_edge(file, "no_run", norun_lo, norun_hi, "NameOnly", None);
+    let norun_key = h.edge_content_key(norun_edge);
+    store::write_edge_oracle(&h.conn, OracleTool::ScipClang, VERSION, &EdgeOracleRow {
+        source_path: &norun_key.source_path,
+        source_start_byte: norun_key.source_start_byte,
+        source_end_byte: norun_key.source_end_byte,
+        callee_start_byte: norun_key.callee_start_byte,
+        callee_end_byte: norun_key.callee_end_byte,
+        edge_kind: &norun_key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: None,
+        scip_symbol: "cpp . . norun().",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+
+    // (b) An in-corpus verdict whose resolved definition no longer exists — the callsite file is
+    // unchanged (sha matches) but the target is gone, so the moniker names nothing current.
+    let (dead_lo, dead_hi) = span("dead_def");
+    let dead_edge = h.add_edge(file, "dead_def", dead_lo, dead_hi, "NameOnly", None);
+    h.write_verdict(
+        dead_edge,
+        &sha,
+        Some(999_999),
+        "rust cr 1.0 dead().",
+        OracleResolutionKind::Upgrade,
+    );
+
+    // Control: a current-version verdict whose resolved definition IS live in the active
+    // checkout — the only row the collapse may trust.
+    let defs = h.add_file("defs.rs", "fn live_def() {}\n");
+    let live_sym = h.add_symbol(defs, "live_def", 3, 11);
+    let (live_lo, live_hi) = span("live_def");
+    let live_edge = h.add_edge(file, "live_def", live_lo, live_hi, "NameOnly", Some(live_sym));
+    h.write_verdict(
+        live_edge,
+        &sha,
+        Some(live_sym),
+        "rust cr 1.0 live().",
+        OracleResolutionKind::Upgrade,
+    );
+
+    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, COMMIT, WORKTREE).unwrap();
+    assert_eq!(
+        monikers,
+        std::collections::HashMap::from([((live_lo, live_hi), "rust cr 1.0 live().".to_string())]),
+        "superseded-version, run-less-tool, and dead-def rows must all be dropped"
+    );
+}
+
+/// The call-HEAD kind gate (#275 Codex round-2): `uses_macro` rows participate in the collapse —
+/// the classifier treats a macro head exactly like a call head, so a clone class differing only
+/// by macro name needs macro verdicts to reach scip mode — while `references_type` rows (which
+/// also carry a callee range and join SCIP occurrences) are never callee positions and stay out.
+#[test]
+fn current_callee_monikers_includes_macro_heads_and_excludes_non_call_kinds() {
+    let h = Harness::new();
+    let src = "fn caller() { emit!(1); let t: Widget = make(); }\n";
+    let file = h.add_file("m.rs", src);
+    let sha = h.file_sha("m.rs");
+    let span = |name: &str| {
+        let start = src.find(name).unwrap();
+        (start, start + name.len())
+    };
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, 0, "Completed", "{}")
+        .unwrap();
+
+    let (mac_lo, mac_hi) = span("emit");
+    let mac_edge =
+        h.add_edge_with_kind(file, "emit", mac_lo, mac_hi, "uses_macro", "NameOnly", None);
+    h.write_verdict(mac_edge, &sha, None, "rust cr 1.0 emit!.", OracleResolutionKind::Upgrade);
+
+    let (ty_lo, ty_hi) = span("Widget");
+    let ty_edge =
+        h.add_edge_with_kind(file, "Widget", ty_lo, ty_hi, "references_type", "NameOnly", None);
+    h.write_verdict(ty_edge, &sha, None, "rust cr 1.0 Widget#", OracleResolutionKind::Upgrade);
+
+    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, COMMIT, WORKTREE).unwrap();
+    assert_eq!(
+        monikers,
+        std::collections::HashMap::from([((mac_lo, mac_hi), "rust cr 1.0 emit!.".to_string())]),
+        "uses_macro is a call-HEAD kind (returned); references_type is not (excluded)"
+    );
+}
+
+/// The live-edge gate (#512 Codex round-3): a verdict whose content key no longer maps to a LIVE
+/// edge — a dangling row surviving a reindex after the extractor stopped emitting that call — is
+/// dropped, exactly as the surfacing reads drop it via `edge_oracle_scope_join`. A live-edge-backed
+/// verdict on the same file, current sha, and same run is still returned; only the missing edge
+/// distinguishes them.
+#[test]
+fn current_callee_monikers_drops_verdicts_without_a_live_edge() {
+    let h = Harness::new();
+    let src = "fn caller() { live(); dangling(); }\n";
+    let file = h.add_file("m.rs", src);
+    let sha = h.file_sha("m.rs");
+    let span = |name: &str| {
+        let start = src.find(name).unwrap();
+        (start, start + name.len())
+    };
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, 0, "Completed", "{}")
+        .unwrap();
+
+    // A live edge + its verdict, keyed off the real edge — returned.
+    let (live_lo, live_hi) = span("live");
+    let live_edge = h.add_edge(file, "live", live_lo, live_hi, "NameOnly", None);
+    h.write_verdict(live_edge, &sha, None, "rust cr 1.0 live().", OracleResolutionKind::Upgrade);
+
+    // A dangling verdict: a `calls_name` content key with NO backing edge (no `add_edge`), same
+    // file + current sha + same completed run — only the live-edge gate can exclude it.
+    let (dang_lo, dang_hi) = span("dangling");
+    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
+        source_path: "m.rs",
+        source_start_byte: 0,
+        source_end_byte: 0,
+        callee_start_byte: dang_lo as i64,
+        callee_end_byte: dang_hi as i64,
+        edge_kind: "calls_name",
+        file_sha: &sha,
+        resolved_symbol_id: None,
+        scip_symbol: "rust cr 1.0 dangling().",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+
+    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, COMMIT, WORKTREE).unwrap();
+    assert_eq!(
+        monikers,
+        std::collections::HashMap::from([((live_lo, live_hi), "rust cr 1.0 live().".to_string())]),
+        "a verdict with no live edge is dropped; the live-edge-backed one is returned"
     );
 }
