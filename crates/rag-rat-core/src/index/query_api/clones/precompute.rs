@@ -373,6 +373,22 @@ impl IndexDatabase {
         // generation toward a different revision (a reindex landed since it started) is
         // discarded — its symbol-id cursor is meaningless against the new symbol rows.
         let building = open_building_generation(conn, &source_revision)?;
+        // A FRESH build (cursor 0 ⇒ no symbol walked ⇒ zero postings staged for this generation)
+        // moves the df EPOCH to now (#477 review): the #473 drift rebuild exists to restore
+        // sub-block selectivity, so a full build that kept the old frozen df would reset the
+        // drift counter without delivering the refresh it promises — and more generally, every
+        // fresh generation's postings must be ordered by the df of ITS OWN build. The refresh
+        // invalidates every generation's postings flag (df moved), including the row just opened,
+        // whose (empty) postings set trivially matches the new epoch — re-mark it postings-aware.
+        // A RESUMED partial (cursor > 0) must NOT refresh: its persisted postings are ordered by
+        // the epoch its build started under.
+        if building.cursor_symbol_id == 0 {
+            self.refresh_clone_token_df()?;
+            conn.execute(
+                "UPDATE clone_graph_generations SET postings_written = 1 WHERE generation = ?1",
+                params![building.generation],
+            )?;
+        }
 
         // Load the scoped baseline bags + the content anchors for every scoped symbol, and build
         // the struct-hash buckets + sub-block inverted index in RAM (rebuilt each pass —
@@ -1398,6 +1414,30 @@ pub(super) mod tests {
     fn clone_graph_quiet_gate_zero_window_fires_immediately() {
         let db = build_clone_fixture("quiet-gate-zero");
         assert!(db.clone_graph_rebuild_due_at(1_000, 0, true).unwrap());
+    }
+
+    /// The freeze's bootstrap exception (`refresh_clone_token_df_if_unseeded`): an UNSEEDED repo
+    /// (no df rows) seeds the epoch; a seeded repo is left untouched — the frozen epoch must not
+    /// move on the incremental finalize that calls this.
+    #[test]
+    fn refresh_if_unseeded_seeds_once_then_preserves_the_epoch() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let db = build_clone_fixture("df-freeze-bootstrap");
+        let df_count = |db: &crate::IndexDatabase| -> i64 {
+            db.storage
+                .connection()
+                .query_row("SELECT COUNT(*) FROM clone_token_df", [], |r| r.get(0))
+                .unwrap()
+        };
+        // Simulate the pre-epoch state (a DB whose df was never seeded for this repo).
+        db.storage.connection().execute("DELETE FROM clone_token_df", []).unwrap();
+        db.refresh_clone_token_df_if_unseeded().unwrap();
+        let seeded = df_count(&db);
+        assert!(seeded > 0, "an unseeded repo gets its epoch seeded");
+
+        // Seeded → the guard is a strict no-op (the frozen epoch must not move).
+        db.refresh_clone_token_df_if_unseeded().unwrap();
+        assert_eq!(df_count(&db), seeded, "a seeded repo's epoch is preserved");
     }
 
     /// The df EPOCH FREEZE (#473): incremental passes must not move `clone_token_df` — the

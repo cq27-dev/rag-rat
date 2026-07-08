@@ -721,6 +721,59 @@ mod tests {
         assert_eq!(report.status, "NotEligible", "{report:?}");
     }
 
+    /// The remaining eligibility gates: a postings-stale live generation (pre-upgrade or
+    /// df-refresh-invalidated) and an in-flight Building generation both refuse the in-place
+    /// patch — the full-rebuild path owns those states.
+    #[test]
+    fn clone_graph_delta_is_not_eligible_for_stale_postings_or_inflight_builds() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-ineligible");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        let conn = db.storage.connection();
+
+        conn.execute("UPDATE clone_graph_generations SET postings_written = 0", []).unwrap();
+        let report = db.apply_clone_graph_delta(64).unwrap();
+        assert_eq!(report.status, "NotEligible", "postings-stale generation: {report:?}");
+        conn.execute("UPDATE clone_graph_generations SET postings_written = 1", []).unwrap();
+
+        // An in-flight (Building) generation means a full rebuild is owed — patching the live
+        // generation now would race its eventual publish.
+        conn.execute(
+            "INSERT INTO clone_graph_generations
+                (generation, status, theta_floor, normalizer_kind, normalizer_version,
+                 source_revision, started_at_ms, postings_written, repo_id)
+             VALUES (9999, 'Building', 0.7, 'baseline', ?1, 'inflight-rev', 0, 1, ?2)",
+            rusqlite::params![crate::index::clones::NORM_VERSION, db.active_repo_id],
+        )
+        .unwrap();
+        let report = db.apply_clone_graph_delta(64).unwrap();
+        assert_eq!(report.status, "NotEligible", "in-flight full rebuild: {report:?}");
+    }
+
+    /// A content-revision move with NO clone-relevant file change (a new file with no
+    /// fingerprintable functions) re-pins `source_revision` without touching the graph —
+    /// `Applied` with zero files, zero edge churn.
+    #[test]
+    fn clone_graph_delta_repins_freshness_for_clone_irrelevant_changes() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-irrelevant");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        let edges_before = edge_keys(&db);
+        drop(db);
+
+        // A type-only file: indexed (revision moves) but no function fingerprints.
+        std::fs::write(config.root.join("src/j.rs"), "pub struct MarkerOnly;\n").unwrap();
+        let db = reindex(&config);
+        let report = db.apply_clone_graph_delta(64).unwrap();
+        assert_eq!(report.status, "Applied", "{report:?}");
+        assert_eq!(report.files_changed, 0, "no clone-relevant file changed");
+        assert_eq!(report.edges_added + report.edges_removed, 0);
+        assert_eq!(edge_keys(&db), edges_before, "the graph itself is untouched");
+        assert!(!db.pending_clone_graph().unwrap(), "but the freshness key is re-pinned");
+    }
+
     /// A delta larger than `max_files` escalates without writing anything — a huge delta (branch
     /// switch) is cheaper to rebuild than to patch file-by-file.
     #[test]
@@ -894,7 +947,8 @@ mod tests {
         drop(db);
 
         // A content pass inside the quiet window: the delta settles freshness in place; the
-        // drift-owed FULL rebuild stays deferred.
+        // drift-owed FULL rebuild stays deferred. The new file's tokens do NOT enter the frozen
+        // df epoch (that is exactly the drift the counter measures).
         std::fs::write(
             config.root.join("src/i.rs"),
             "pub fn drift_probe(q: i64) -> i64 { q * 11 - 6 }\n",
@@ -902,6 +956,13 @@ mod tests {
         .unwrap();
         crate::watch::maintenance_pass(&config, false).unwrap();
         let db = crate::IndexDatabase::open_config(&config).unwrap();
+        let df_count = |db: &crate::IndexDatabase| -> i64 {
+            db.storage
+                .connection()
+                .query_row("SELECT COUNT(*) FROM clone_token_df", [], |r| r.get(0))
+                .unwrap()
+        };
+        let frozen_df = df_count(&db);
         let live: i64 = db
             .storage
             .connection()
@@ -938,6 +999,12 @@ mod tests {
             .unwrap();
         assert!(live > built.generation, "the quiet-elapsed pass ran the drift full rebuild");
         assert_eq!(absorbed, 0, "the fresh generation starts with zero absorbed deltas");
+        // The whole POINT of the drift rebuild (PR #477 review): it must refresh the df epoch,
+        // not just reset the counter — the delta-added file's tokens enter df with the rebuild.
+        assert!(
+            df_count(&db) > frozen_df,
+            "the drift full rebuild refreshes the df epoch (absorbs the delta-added tokens)"
+        );
     }
 
     /// The generation bookkeeping: an applied delta bumps `source_revision` to current (making
