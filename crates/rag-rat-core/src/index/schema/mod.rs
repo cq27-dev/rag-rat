@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 53;
+pub const LATEST_SCHEMA_VERSION: u32 = 54;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -366,6 +366,14 @@ const MIGRATION_053_DESCRIPTION: &str =
      (stream_id, device), UNIQUE(stream_id, device_fingerprint, lamport), projection keyed per \
      stream — and add oplog_fork_evidence, the quarantine that durably preserves BOTH heads of a \
      detected equivocation. Nothing is wired to the live write path yet";
+const MIGRATION_054_ID: &str = "054_oplog_device_identity";
+const MIGRATION_054_CHECKSUM: &str = "sha256:rag-rat-oplog-device-identity-v54";
+const MIGRATION_054_DESCRIPTION: &str =
+    "Add oplog_device_identity (#513, phase B): the ONE persisted ed25519 keypair per store that \
+     the op-log write path signs every entry with — a single-row (id = 0) STRICT table holding \
+     the 32-byte seed, its derived public_key, and the sha256(public_key) fingerprint. \
+     Store-global, not repo-scoped (a device is a machine identity). Purely additive; nothing is \
+     wired to the live write path yet";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -825,6 +833,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_053_CHECKSUM,
         description: MIGRATION_053_DESCRIPTION,
         apply: apply_oplog_stream_scoping,
+    },
+    Migration {
+        id: MIGRATION_054_ID,
+        checksum: MIGRATION_054_CHECKSUM,
+        description: MIGRATION_054_DESCRIPTION,
+        apply: apply_oplog_device_identity,
     },
 ];
 

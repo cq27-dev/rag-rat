@@ -1188,6 +1188,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_051_ID => Some(51),
             MIGRATION_052_ID => Some(52),
             MIGRATION_053_ID => Some(53),
+            MIGRATION_054_ID => Some(54),
             _ => None,
         })
         .max()
@@ -1250,6 +1251,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_051_ID
             | MIGRATION_052_ID
             | MIGRATION_053_ID
+            | MIGRATION_054_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1309,6 +1311,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_051_ID => migration.checksum != MIGRATION_051_CHECKSUM,
         MIGRATION_052_ID => migration.checksum != MIGRATION_052_CHECKSUM,
         MIGRATION_053_ID => migration.checksum != MIGRATION_053_CHECKSUM,
+        MIGRATION_054_ID => migration.checksum != MIGRATION_054_CHECKSUM,
         _ => false,
     }
 }
@@ -3644,6 +3647,35 @@ pub(crate) fn apply_oplog_stream_scoping(conn: &Connection) -> rusqlite::Result<
              conflicting_entry_hash BLOB,
              observed_at_ms         INTEGER NOT NULL,
              PRIMARY KEY(stream_id, entry_hash)
+         ) STRICT;
+
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// V054 (#513): the op-log's persisted local device identity. ONE ed25519 keypair per store, so
+/// every entry this install authors — live or backfilled — signs under a stable fingerprint
+/// instead of a fresh per-process key. Store-global, NOT repo-scoped: a device is a machine
+/// identity, orthogonal to the per-repo owner streams it signs (and, later, doubles as the
+/// transport node key — a machine singleton). `id INTEGER PRIMARY KEY CHECK (id = 0)` is the
+/// single-row guard: a second identity cannot be inserted. `seed` is the 32-byte secret scalar
+/// seed; `public_key` (32 bytes) and `fingerprint` (= sha256(public_key)) are derivable from it but
+/// stored too so the row is legible and a load can assert they still agree.
+///
+/// Purely ADDITIVE (`CREATE TABLE IF NOT EXISTS` — a brand-new table, nothing to drop or backfill),
+/// unlike the V053 rebuild. Idempotent; the self-wrapped IMMEDIATE transaction reconverges an
+/// interrupted create on the next run.
+pub(crate) fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         CREATE TABLE IF NOT EXISTS oplog_device_identity(
+             id            INTEGER PRIMARY KEY CHECK (id = 0),
+             seed          BLOB NOT NULL,
+             public_key    BLOB NOT NULL,
+             fingerprint   BLOB NOT NULL,
+             created_at_ms INTEGER NOT NULL
          ) STRICT;
 
          COMMIT;",

@@ -1405,10 +1405,13 @@ fn migration_052_adds_oplog_storage_tables() {
 fn migration_053_scopes_the_oplog_by_stream_and_adds_fork_evidence() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V053 is the schema tip — the absolute pin (migration_052's drops to the symbolic
-    // `current_version == LATEST` check when a V054 lands).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 53, "V053 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 53, "schema at LATEST after apply");
+    // V054 now holds the absolute tip pin (migration_054's test); this drops to the symbolic
+    // `current_version == LATEST` freshness check.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     // The rebuilt tables carry the stream dimension; the quarantine table exists.
     for (table, column) in [
@@ -1462,6 +1465,54 @@ fn migration_053_scopes_the_oplog_by_stream_and_adds_fork_evidence() {
         );
     }
     assert!(conn_table_exists(&conn, "oplog_meta"), "oplog_meta is left untouched");
+}
+
+#[test]
+fn migration_054_adds_the_single_row_device_identity_table() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V054 is the schema tip — this test carries the absolute pin (the older oplog tests dropped to
+    // the symbolic `current_version == LATEST` check).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 54, "V054 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 54, "schema at LATEST after apply");
+
+    // The identity table exists with its full column set.
+    for column in ["seed", "public_key", "fingerprint", "created_at_ms"] {
+        assert!(
+            conn_table_columns(&conn, "oplog_device_identity").contains(&column.to_string()),
+            "V054 gives oplog_device_identity its {column} column"
+        );
+    }
+
+    // `CHECK (id = 0)` + the primary key make it a strict single-row table: id 0 inserts once; a
+    // non-zero id is refused by the CHECK; a second id-0 insert is refused by the PK.
+    conn.execute("INSERT INTO oplog_device_identity VALUES (0, x'00', x'11', x'22', 0)", [])
+        .expect("the sole id=0 identity row inserts");
+    assert!(
+        conn.execute("INSERT INTO oplog_device_identity VALUES (1, x'00', x'11', x'22', 0)", [])
+            .is_err(),
+        "CHECK (id = 0) rejects a second, non-zero identity"
+    );
+    assert!(
+        conn.execute("INSERT INTO oplog_device_identity VALUES (0, x'99', x'88', x'77', 1)", [])
+            .is_err(),
+        "the id=0 primary key rejects a second identity"
+    );
+
+    // Deferred-absence in ISOLATION: drop the table and re-run the applier alone (never against the
+    // full ladder's end state). It recreates the table, and a replay is a no-op (CREATE … IF NOT
+    // EXISTS).
+    conn.execute_batch("DROP TABLE oplog_device_identity;").unwrap();
+    assert!(
+        !conn_table_exists(&conn, "oplog_device_identity"),
+        "dropped before the isolated apply"
+    );
+    schema::apply_oplog_device_identity(&conn).unwrap();
+    schema::apply_oplog_device_identity(&conn).expect("replay is a no-op");
+    assert!(
+        conn_table_columns(&conn, "oplog_device_identity").contains(&"seed".to_string()),
+        "the isolated applier recreates the table"
+    );
 }
 
 #[test]

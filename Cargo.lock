@@ -3447,6 +3447,7 @@ dependencies = [
  "criterion",
  "ed25519-dalek",
  "fastembed",
+ "getrandom 0.3.4",
  "gix",
  "iai-callgrind",
  "ignore",

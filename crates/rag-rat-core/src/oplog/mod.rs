@@ -24,6 +24,9 @@
 //! - [`stream`]: the immutable, content-derived stream identity (#509) — one signed chain,
 //!   watermark, and projection exists PER [`stream::StreamId`]; the entry body binds it, so stream
 //!   membership is signature-protected.
+//! - [`identity`]: the store's ONE persisted ed25519 device identity (#513) —
+//!   [`identity::local_device`] mints it from OS entropy on first use and returns it stably
+//!   thereafter, so every authored entry signs under one machine fingerprint.
 //!
 //! Nothing here is wired into the live write path yet (later increments add the append-on-mutation
 //! seam, roster/epochs, and transport) — this mirrors the `content_hash` freeze: pin the semantic
@@ -32,6 +35,7 @@
 mod cbor;
 mod device;
 mod entry;
+mod identity;
 mod op;
 mod project;
 mod store;

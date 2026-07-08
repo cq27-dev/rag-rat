@@ -15,6 +15,7 @@ categories.workspace = true
 anyhow.workspace = true
 ed25519-dalek.workspace = true
 fastembed = { workspace = true, optional = true }
+getrandom.workspace = true
 gix.workspace = true
 ignore = "0.4.26"
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }

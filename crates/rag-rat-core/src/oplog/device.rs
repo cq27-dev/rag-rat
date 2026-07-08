@@ -37,6 +37,26 @@ impl DeviceSecret {
         Self(SigningKey::from_bytes(&seed))
     }
 
+    /// Generate a FRESH random device key from OS entropy — the production keygen path. The 32-byte
+    /// seed is filled by the system CSPRNG (`getrandom`) and flows through [`from_seed`], so
+    /// seeding stays the one construction point (deterministic tests keep their fixed seeds).
+    /// Fails only if the OS entropy source is unavailable.
+    pub(super) fn generate() -> anyhow::Result<Self> {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        // `getrandom::Error` only implements `std::error::Error` behind getrandom's `std` feature
+        // (off under `--no-default-features`), so format it via `Display` rather than `.context`.
+        getrandom::fill(seed.as_mut_slice())
+            .map_err(|e| anyhow::anyhow!("OS CSPRNG failed to seed a device key: {e}"))?;
+        Ok(Self::from_seed(&seed))
+    }
+
+    /// The 32-byte secret seed, in a scrubbing buffer. The persistence layer stores this so a
+    /// reopened store re-derives the SAME key via [`from_seed`] — it is the only durable copy, so
+    /// the accessor deliberately exposes the secret (see the plaintext-at-rest decision).
+    pub(super) fn seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.0.to_bytes())
+    }
+
     /// The matching public identity (for verification + fingerprint derivation).
     pub(super) fn public(&self) -> DevicePublic {
         DevicePublic(self.0.verifying_key())
@@ -107,6 +127,31 @@ mod tests {
         // A different seed is a different device.
         let b = DeviceSecret::from_seed(&seed_b());
         assert_ne!(a1.public().to_bytes(), b.public().to_bytes());
+    }
+
+    #[test]
+    fn generate_is_nondeterministic() {
+        // Two independent generations must not collide — the CSPRNG, not a fixed seed, is the
+        // source. (A collision here would mean the entropy source is broken.)
+        let a = DeviceSecret::generate().expect("OS CSPRNG available");
+        let b = DeviceSecret::generate().expect("OS CSPRNG available");
+        assert_ne!(a.public().to_bytes(), b.public().to_bytes(), "generate must not repeat a key");
+    }
+
+    #[test]
+    fn generated_key_seed_round_trips() {
+        // The persisted seed must reconstruct the IDENTICAL key: `generate` → `seed` → `from_seed`
+        // yields the same pubkey, fingerprint, and signatures. This is what makes a reopened store
+        // keep one stable identity.
+        let generated = DeviceSecret::generate().expect("OS CSPRNG available");
+        let reloaded = DeviceSecret::from_seed(&generated.seed());
+        assert_eq!(generated.public().to_bytes(), reloaded.public().to_bytes());
+        assert_eq!(
+            generated.public().fingerprint().to_bytes(),
+            reloaded.public().fingerprint().to_bytes()
+        );
+        let msg = b"canonical entry body bytes";
+        assert_eq!(generated.sign(msg), reloaded.sign(msg), "the reloaded key signs identically");
     }
 
     #[test]
