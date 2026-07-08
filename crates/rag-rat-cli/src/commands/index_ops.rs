@@ -75,8 +75,14 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
         eprintln!("warning: repo-memory re-validation failed: {err}");
     }
     // After validate has refreshed anchor_status values, count non-current anchors with a
-    // read-only query (doctor reads persisted values; no re-validation).
-    let doctor_count = db.memory_doctor().map(|entries| entries.len()).unwrap_or(0);
+    // read-only query (doctor reads persisted values; no re-validation). `pending` entries are
+    // excluded — alive on an in-flight worktree branch (#492), they need no re-anchoring — but
+    // everything else doctor lists (gone/stale bindings AND placeholder-scoped memories) stays
+    // actionable and must keep tripping this warning.
+    let doctor_count = db
+        .memory_doctor()
+        .map(|entries| entries.iter().filter(|e| e.anchor_status != "pending").count())
+        .unwrap_or(0);
     if doctor_count > 0 {
         eprintln!("⚠ {doctor_count} repo memories need re-anchoring — run 'rag-rat memory doctor'");
     }

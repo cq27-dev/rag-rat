@@ -526,6 +526,180 @@ fn relocation_lands_on_the_kind_matching_twin_not_plan_order() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// #492: the path probe took the newest `files` row with no `kind != 'deleted'` filter, and a
+/// deleted-at-HEAD file's marker row (kind='deleted', sha256='') shadowed the absence — a bare
+/// path binding to a deleted file stayed `current` forever.
+#[test]
+fn a_deleted_at_head_file_makes_a_bare_path_binding_gone() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn keeper() {}\n").unwrap();
+    fs::write(root.join("src/doomed.rs"), "pub fn doomed() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Risk".to_string(),
+            title: "Area note on a file that will be deleted".to_string(),
+            body: "Must go gone with its file, not stay current behind the deleted marker."
+                .to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                path: Some("src/doomed.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+    let status = |db: &IndexDatabase| -> String {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT anchor_status FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    db.memory_validate().unwrap();
+    assert_eq!(status(&db), "current", "alive file → current");
+
+    // The file is deleted at HEAD: the index keeps a deleted-marker row (kind='deleted',
+    // sha256=''), exactly the shape the incremental delete path leaves behind.
+    fs::remove_file(root.join("src/doomed.rs")).unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.files SET kind = 'deleted', sha256 = '' WHERE path = 'src/doomed.rs'",
+            [],
+        )
+        .unwrap();
+    let report = db.memory_validate().unwrap();
+    assert_eq!(status(&db), "gone", "the deleted marker must not shadow the file's absence");
+    assert_eq!(report.gone, 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// #492: a path that is absent at THIS context's HEAD but alive in another indexed scope (a
+/// linked-worktree overlay — an in-flight branch) is `pending`, not `gone`. Verified live on the
+/// dogfood DB: a forward anchor to a branch-only file ping-ponged current/gone between contexts,
+/// and doctor advised mark-obsolete for valid in-flight work.
+#[test]
+fn a_path_alive_only_in_another_scope_validates_pending_not_gone() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn base() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let live_generation =
+        crate::index::schema::live_files_generation(db.storage.connection(), &db.active_repo_id)
+            .unwrap();
+    let insert_row = |generation: i64, sha: &str| {
+        db.storage
+            .connection()
+            .execute(
+                "INSERT INTO main.files (path, language, kind, sha256, modified_at_ms,
+                                    generated, indexed_at_ms, indexed_revision, commit_sha,
+                                    worktree_id, has_test_code, repo_id, generation)
+                 VALUES ('src/inflight.rs', 'rust', 'source', ?2, 0, 0, 0, '', '',
+                         'wt-elsewhere', 0, ?1, ?3)",
+                params![db.active_repo_id, sha, generation],
+            )
+            .unwrap();
+    };
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Decision".to_string(),
+            title: "Forward anchor to in-flight work".to_string(),
+            body: "Absent here, alive on a branch — pending, never mark-obsolete bait.".to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                path: Some("src/inflight.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+    let status = |db: &IndexDatabase| -> String {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT anchor_status FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    // A SUPERSEDED generation's not-yet-GC'd row is NOT alive-elsewhere evidence (the review
+    // case: a full rebuild deleted the file; pre-sweep the dead generation still holds a source
+    // row) — only live-generation rows (worktree overlays ride the live generation) count.
+    insert_row(live_generation + 7, "dead-gen-sha");
+    let report = db.memory_validate().unwrap();
+    assert_eq!(
+        status(&db),
+        "gone",
+        "a superseded generation's leftover row must not report pending"
+    );
+    assert_eq!(report.pending, 0);
+
+    // A retained old-commit BASE row (worktree_id = '') at the live generation is THIS context's
+    // history, not another checkout — a path deleted at HEAD must stay gone through the pre-gc
+    // window (review case 2).
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO main.files (path, language, kind, sha256, modified_at_ms, generated,
+                                indexed_at_ms, indexed_revision, commit_sha, worktree_id,
+                                has_test_code, repo_id, generation)
+             VALUES ('src/inflight.rs', 'rust', 'source', 'old-commit-sha', 0, 0, 0, '',
+                     'oldcommit', '', 0, ?1, ?2)",
+            params![db.active_repo_id, live_generation],
+        )
+        .unwrap();
+    let report = db.memory_validate().unwrap();
+    assert_eq!(status(&db), "gone", "a retained old-commit base row must not report pending");
+    assert_eq!(report.pending, 0);
+
+    // The in-flight branch's checkout indexed the file at the LIVE generation (the
+    // worktree-overlay shape) — now it is genuinely pending.
+    insert_row(live_generation, "wt-sha");
+    let report = db.memory_validate().unwrap();
+    assert_eq!(status(&db), "pending", "alive in another scope → pending, not gone");
+    assert_eq!(report.pending, 1);
+    assert_eq!(report.gone, 0);
+
+    // Doctor surfaces it (as pending — informational), never as gone.
+    let doctor = db.memory_doctor().unwrap();
+    let entry = doctor.iter().find(|e| e.memory_id == memory_id).expect("doctor lists pending");
+    assert_eq!(entry.anchor_status, "pending");
+
+    // Once no scope holds the path (the branch was abandoned), it is genuinely gone.
+    db.storage
+        .connection()
+        .execute("DELETE FROM main.files WHERE path = 'src/inflight.rs'", [])
+        .unwrap();
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.pending, 0);
+    assert_eq!(report.gone, 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
     let root = unique_temp_root();

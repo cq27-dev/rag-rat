@@ -334,7 +334,13 @@ pub(crate) fn split_active_stale(memories: Vec<RepoMemory>) -> (Vec<RepoMemory>,
         if memory.status == "stale"
             || memory.bindings.iter().any(|binding| {
                 binding.binding_kind != SCIP_MONIKER_BINDING_KIND
-                    && matches!(binding.anchor_status.as_str(), "stale" | "gone" | "unverified")
+                    && matches!(
+                        binding.anchor_status.as_str(),
+                        // `pending` (#492) joins the demoted bucket: the anchored code is not in
+                        // THIS context, so drive-by evidence must not present as confidently
+                        // current — but unlike `gone` it draws no remediation.
+                        "stale" | "gone" | "unverified" | "pending"
+                    )
             })
         {
             stale.push(memory);

@@ -254,6 +254,10 @@ pub struct RepoMemoryValidationReport {
     pub relocated: u64,
     pub stale: u64,
     pub gone: u64,
+    /// Absent at THIS context's HEAD but alive in another indexed scope (a linked-worktree
+    /// overlay — in-flight branch work, #492). Not broken: it re-anchors when the branch lands,
+    /// and it must never draw `gone`-style remediation (rebind / mark-obsolete).
+    pub pending: u64,
     pub unverified: u64,
 }
 

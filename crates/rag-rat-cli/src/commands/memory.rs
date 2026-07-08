@@ -178,6 +178,17 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
             for entry in &entries {
                 eprintln!("[{}] {} ({})", entry.anchor_status, entry.title, entry.memory_id);
                 eprintln!("  binding: {} {}", entry.binding_kind, entry.binding_id);
+                // `pending` (#492): the target is alive in another indexed scope (an in-flight
+                // worktree branch) — informational only. Never suggest rebind/mark-obsolete
+                // (that advice clobbered a valid forward anchor on the dogfood repo), and never
+                // fail the command over it.
+                if entry.anchor_status == "pending" {
+                    eprintln!(
+                        "  -> in flight on another checkout (worktree overlay); no action needed \
+                         — it re-anchors when that branch lands"
+                    );
+                    continue;
+                }
                 if entry.candidates.is_empty() {
                     if entry.anchor_status == "gone" {
                         eprintln!(

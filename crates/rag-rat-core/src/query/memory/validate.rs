@@ -442,9 +442,13 @@ pub(crate) fn validate_path_binding(
     let Some(path) = binding.path.as_deref() else {
         return Ok("unverified".to_string());
     };
+    // `kind != 'deleted'` (#492): a deleted-at-HEAD file leaves a marker row (kind='deleted',
+    // sha256='') that would otherwise be the newest row for the path and shadow the absence —
+    // the binding stayed `current` forever behind it.
     let current_hash = conn
         .query_row(
-            "SELECT sha256 FROM files WHERE path = ?1 ORDER BY id DESC LIMIT 1",
+            "SELECT sha256 FROM files WHERE path = ?1 AND kind != 'deleted'
+             ORDER BY id DESC LIMIT 1",
             [path],
             |row| row.get::<_, String>(0),
         )
@@ -460,10 +464,21 @@ pub(crate) fn validate_path_binding(
         // (alive but un-content-verifiable), never `gone`. The target must be a FILE: a
         // path binding names a file, so a directory now occupying that name leaves the file
         // genuinely `gone`.
-        let status = match path_is_file_on_disk(fs_root, path) {
-            true if binding.start_line.is_none() && binding.end_line.is_none() => "current",
-            true => "unverified",
-            false => "gone",
+        let status = if path_is_file_on_disk(fs_root, path) {
+            if binding.start_line.is_none() && binding.end_line.is_none() {
+                "current"
+            } else {
+                "unverified"
+            }
+        } else if path_is_live_in_another_scope(conn, path)? {
+            // Neither indexed here nor on disk — but ALIVE in another indexed scope (a
+            // linked-worktree overlay: an in-flight branch, #492): the anchor is `pending`,
+            // not gone. Verified live: forward anchors to branch-only files ping-ponged
+            // current/gone between checkout contexts, and doctor advised mark-obsolete for
+            // valid in-flight work. Only when NO scope holds the path is it genuinely gone.
+            "pending"
+        } else {
+            "gone"
         };
         return Ok(status.to_string());
     };
@@ -517,6 +532,36 @@ fn is_repo_relative(path: &str) -> bool {
 /// repo-relative.
 fn path_is_file_on_disk(root: Option<&Path>, path: &str) -> bool {
     root.is_some_and(|root| is_repo_relative(path) && root.join(path).is_file())
+}
+
+/// Whether ANOTHER CHECKOUT's overlay holds a live row for `path` — the `pending` probe (#492).
+/// The scoped `files` view already answered "not in THIS context"; a linked-worktree overlay row
+/// (an in-flight branch's checkout) means the anchor's target exists and will re-anchor when the
+/// branch lands, so it must not be treated (or remediated) as dead. Three predicates keep the
+/// probe honest (each closes a false-pending source found in review):
+/// - repo-scoped: a sibling repo's identical path cannot bless a dead anchor on a consolidated DB;
+/// - LIVE-generation only: a superseded full-rebuild generation's not-yet-GC'd rows are not
+///   alive-elsewhere evidence;
+/// - OTHER-worktree only (`worktree_id != ''` and != the active context's): retained old-commit
+///   base rows (worktree_id = '') and the active checkout's own dirty-scope rows are THIS context,
+///   not another one — a path deleted at HEAD must stay `gone` through the pre-gc window.
+fn path_is_live_in_another_scope(conn: &Connection, path: &str) -> anyhow::Result<bool> {
+    let active_repo_id = crate::index::schema::active_repo_id(conn)?;
+    let live_generation = crate::index::schema::live_files_generation(conn, &active_repo_id)?;
+    let active_worktree = context_worktree_id(conn);
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.files
+                       WHERE path = ?1 AND kind != 'deleted' AND repo_id = ?2
+                         AND generation = ?3
+                         AND worktree_id != '' AND worktree_id != ?4)",
+        params![path, active_repo_id, live_generation, active_worktree],
+        |r| r.get::<_, i64>(0),
+    )? != 0)
+}
+
+/// The active context's worktree id, `''` when no scope view is installed on this connection.
+fn context_worktree_id(conn: &Connection) -> String {
+    crate::index::schema::connection_context_value(conn, "worktree_id").unwrap_or_default()
 }
 
 /// Whether `dir` (repo-root-relative, `""` = repo root) resolves to an existing directory under

@@ -202,12 +202,14 @@ pub fn description(name: &str) -> &'static str {
              `memory_id` to get the complete original. Surface-independent: always the full body.",
         "memory_validate" =>
             "Re-anchor every repo memory against current source and mark each current / relocated \
-             / stale / gone. Runs automatically after indexing.",
+             / stale / gone / pending. Runs automatically after indexing.",
         "memory_doctor" =>
-            "List repo memories whose anchor is stale or gone, each with suggested re-anchor \
-             targets (qualified names) — the actionable companion to memory_validate. Read-only; \
+            "List repo memories whose anchor is stale, gone, or pending, each with suggested \
+             re-anchor targets (qualified names) — the actionable companion to memory_validate. A \
+             `pending` anchor is alive on an in-flight worktree branch: informational only — do \
+             NOT rebind or mark it obsolete; it re-anchors when that branch lands. Read-only; \
              reports the last-validated status, so run memory_validate first for a fresh check. \
-             Rebind the listed memories with memory_rebind.",
+             Rebind stale/gone entries with memory_rebind.",
         "memory_mark_obsolete" =>
             "Mark a repo memory obsolete — kept for audit, hidden from active recall.",
         "memory_edge_add" =>

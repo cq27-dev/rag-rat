@@ -938,11 +938,16 @@ pub(crate) fn scope_context_repo_id(conn: &Connection) -> Option<String> {
 /// the `temp.connection_context` table (a raw connection with no view installed) — `.ok()` swallows
 /// the "no such table" error into `None`, exactly like `edges::resolve`'s `scope_context_value`.
 fn context_repo_id(conn: &Connection) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM temp.connection_context WHERE key = ?1",
-        [CONNECTION_CONTEXT_REPO_KEY],
-        |row| row.get::<_, String>(0),
-    )
+    connection_context_value(conn, CONNECTION_CONTEXT_REPO_KEY)
+}
+
+/// Read one key from the per-connection scope context (`temp.connection_context`), tolerating the
+/// table's common absence (a raw connection with no scope view installed) as `None` — the shared
+/// tolerant-read for every context key (`repo_id`, `worktree_id`, `commit_sha`, …).
+pub(crate) fn connection_context_value(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row("SELECT value FROM temp.connection_context WHERE key = ?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
     .optional()
     .ok()
     .flatten()

@@ -695,9 +695,9 @@ pub struct MemoryDoctorEntry {
 ///
 /// Invariant: this function is purely READ — it never writes to the database.
 /// Count of active memories whose anchor is `gone`/`stale` — the EXACT population `doctor_report`
-/// lists (same WHERE), so a "N need re-anchoring" nudge matches what `memory_doctor` then shows.
-/// `scip_moniker` bindings are excluded (self-heal on the next oracle run, never
-/// rebind-actionable).
+/// lists as ACTIONABLE (`pending` entries are listed there informationally but need no
+/// re-anchoring, so they are deliberately not counted here — #492). `scip_moniker` bindings are
+/// excluded (self-heal on the next oracle run, never rebind-actionable).
 pub(crate) fn doctor_attention_count(conn: &Connection) -> anyhow::Result<u64> {
     let scope = memory_repo_scope(conn)?;
     let repo_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "m");
@@ -752,7 +752,10 @@ pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDocto
         FROM repo_memory_bindings AS b
         JOIN repo_memories AS m ON m.id = b.memory_id
         WHERE m.status = 'active'
-          AND b.anchor_status IN ('gone', 'stale')
+          -- `pending` is LISTED (informational: alive on an in-flight branch, #492) but is
+          -- deliberately absent from `doctor_attention_count` and the dream queue — it is not
+          -- rebind-actionable and must never draw gone-style remediation.
+          AND b.anchor_status IN ('gone', 'stale', 'pending')
           -- `scip_moniker` bindings are excluded: a lagging moniker self-heals on the next
           -- `oracle run` and is never rebind-actionable; a genuinely dead symbol surfaces via
           -- its symbol/logical_symbol binding anyway (#70).
@@ -979,6 +982,7 @@ pub(crate) fn validate_memories(
         relocated: 0,
         stale: 0,
         gone: 0,
+        pending: 0,
         unverified: 0,
     };
     for row in rows {
@@ -1029,6 +1033,7 @@ pub(crate) fn validate_memories(
             "relocated" => report.relocated += 1,
             "stale" => report.stale += 1,
             "gone" => report.gone += 1,
+            "pending" => report.pending += 1,
             _ => report.unverified += 1,
         }
     }
