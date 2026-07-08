@@ -10,6 +10,11 @@ pub mod index;
 pub mod language;
 pub mod locks;
 pub mod logging;
+// Phase B op-log primitive (#404/#489): a pure op model + deterministic projection fold, frozen in
+// isolation and NOT yet wired into the write path — so its surface is dead until a later increment
+// consumes it (the same posture as `content_hash`'s `#[allow(dead_code)]`).
+#[allow(dead_code)]
+pub(crate) mod oplog;
 pub mod output;
 pub mod query;
 pub mod repo_identity;

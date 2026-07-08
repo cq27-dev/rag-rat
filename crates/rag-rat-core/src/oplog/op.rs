@@ -1,0 +1,1194 @@
+//! The memory op model + its canonical CBOR wire form (phase B op-log, §5.4/§6.3).
+//!
+//! An [`Entry`] is one op (`op`) plus its ordering metadata (`meta`): a per-stream Lamport counter
+//! and a device fingerprint. The Lamport/device pair is DEFINED here as the op-log's total order —
+//! neither exists in the schema yet (it arrives with the signed envelope in a later increment). The
+//! op set itself is frozen from design §5.4 / contract §6.3.
+//!
+//! Every op serializes to CANONICAL, deterministic CBOR: a definite-length envelope
+//! `[domain, op-kind, payload]`, domain-tagged + versioned (`"rag-rat/op/1"`) so a future op format
+//! can never collide — the same discipline `crate::canonical` / `content_hash` use for
+//! `"rag-rat/content-hash/1"`. **Structural** canonicity only (definite lengths, minimal-length
+//! headers, deterministic field order): unlike `crate::canonical`, strings are serialized VERBATIM,
+//! NOT NFC-normalized. An op is a per-author record whose bytes are fixed at authoring and carried
+//! opaque thereafter — its determinism is byte-for-byte reproducibility of the SAME op, not
+//! cross-author convergence of the same content. Content normalization (NFC + `trim`) is the write
+//! path's job at author time (so the stored content and the separately-NFC-normalizing
+//! `content_hash` agree); the wire serializer does not re-normalize. [`decode`] returns a
+//! [`DecodedOp`]: a recognized op is `Known`; an
+//! op whose KIND — or whose relation/status TOKEN — this binary doesn't know decodes to `Unknown`,
+//! its raw bytes RETAINED (never projected) so a binary upgrade can re-fold it (the layer-1 opaque
+//! seam, §5.4). Structurally-corrupt bytes are a hard error, distinct from the forward-compat seam.
+//!
+//! Closed-token reuse: the edge relation is `crate::query::memory::EdgeRelation` (the persisted
+//! `repo_node_edges.relation` set) and [`NodeStatus`] mirrors the validated memory-status set
+//! (`active`/`stale`/`obsolete`/`rejected`) — this module invents NO new status/relation tokens.
+//! `edge_key` is derived through the same `query::memory::edge_key` helper the live edge table
+//! uses, and is treated as an opaque identity here (its canonical-CBOR form is a separate §5.5
+//! increment).
+
+use minicbor::Encoder;
+use minicbor::data::Type;
+use minicbor::decode::{Decoder, Error as CborError};
+
+use crate::query::memory::{self, EdgeRelation};
+
+/// Domain tag + version, the envelope's first element. Bump the version to evolve the wire format
+/// deliberately (an old binary then rejects the new domain rather than misreading it).
+const DOMAIN: &str = "rag-rat/op/1";
+
+/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible), so every encode step
+/// `.expect`s this — mirrors `content_hash`.
+const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
+
+/// A globally-unique memory/graph-node id (the `repo_memories.id` / `source_node_id` shape). Owned
+/// and `Ord` so it keys the projected `nodes` map.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct NodeId(String);
+
+impl NodeId {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for NodeId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+/// The stable, content-addressed edge identity (`repo_node_edges.edge_key`). Opaque here: derived
+/// via [`EdgeSpec::edge_key`] for an add, carried verbatim by a remove/rebind, and used only as a
+/// map key by the fold. `Ord` so it keys the projected `edges` map.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct EdgeKey(String);
+
+impl EdgeKey {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for EdgeKey {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for EdgeKey {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// A 32-byte opaque device identity — the total-order tie-break under equal Lamport counters. Kept
+/// opaque this increment (an ed25519 pubkey hash once the signed envelope lands); `Ord` compares
+/// the raw bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct DeviceFingerprint([u8; 32]);
+
+impl DeviceFingerprint {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// A memory-node lifecycle status — the validated `repo_memories.status` set, mirrored as a closed
+/// enum so the fold can carry it typed. The db tokens are pinned by test against
+/// `query::memory::validate_status`; do not add a token without that gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeStatus {
+    Active,
+    Stale,
+    Obsolete,
+    Rejected,
+}
+
+impl Default for NodeStatus {
+    /// A node with no status op projects as `active` (the create-time default).
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+impl NodeStatus {
+    pub(crate) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Stale => "stale",
+            Self::Obsolete => "obsolete",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    /// `None` for an unrecognized token — the caller treats that as a forward-compat status this
+    /// binary can't project (→ [`DecodedOp::Unknown`]), not a decode error.
+    pub(crate) fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "active" => Self::Active,
+            "stale" => Self::Stale,
+            "obsolete" => Self::Obsolete,
+            "rejected" => Self::Rejected,
+            _ => return None,
+        })
+    }
+}
+
+/// The content dimension of a node — the mapped `repo_memories` content columns (+ sibling
+/// `repo_memory_tags`). Identity/bookkeeping columns (`content_hash`/`input_hash`/`repo_id`/
+/// timestamps) are NOT op payload. `kind`/`confidence`/`source` are carried verbatim as strings
+/// (their closed-set validation is the write path's job, not the wire's).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NodeContent {
+    pub(crate) kind: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) confidence: String,
+    pub(crate) source: String,
+    /// A SET: canonically sorted + deduped (via [`NodeContent::canonicalize`] / at encode time),
+    /// so neither order nor duplicates perturb the wire bytes or the projected state.
+    pub(crate) tags: Vec<String>,
+    /// Opaque `schema_version`-tagged JSON payload for a polymorphic node; carried verbatim.
+    pub(crate) payload: Option<String>,
+}
+
+impl NodeContent {
+    /// Put `tags` in canonical (sorted + deduplicated) SET order. The wire encoder applies the same
+    /// rule, and the fold applies this before STORING content, so an in-memory op built with
+    /// unsorted/duplicate tags projects identically to the same op round-tripped through the wire.
+    pub(crate) fn canonicalize(&mut self) {
+        self.tags.sort_unstable();
+        self.tags.dedup();
+    }
+}
+
+/// The presence dimension of an edge — mirrors `repo_node_edges`: source, relation, target
+/// `(repo, kind, anchor)`, and the owner repo. `edge_key` is DERIVED from
+/// `(source, relation, target_kind, target_anchor)` (not the repo ids), matching the live table.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EdgeSpec {
+    pub(crate) source_node_id: NodeId,
+    pub(crate) relation: EdgeRelation,
+    pub(crate) target_repo_id: String,
+    pub(crate) target_kind: String,
+    pub(crate) target_anchor: String,
+    pub(crate) owner_repo_id: String,
+}
+
+impl EdgeSpec {
+    /// Derive the stable `edge_key` through the SAME helper the live edge table uses, so an op-log
+    /// add and a direct insert content-address identically.
+    pub(crate) fn edge_key(&self) -> EdgeKey {
+        EdgeKey::from(memory::edge_key(
+            self.source_node_id.as_str(),
+            self.relation.as_db_str(),
+            &self.target_kind,
+            &self.target_anchor,
+        ))
+    }
+}
+
+/// The re-resolved local anchor a [`MemoryOp::Rebind`] carries — mirrors the resolution triple the
+/// edge table recomputes on read (`target_repo_id`, resolved local `target_node_id`,
+/// `anchor_status`). `anchor_status` is carried verbatim (opaque resolution state, not a wire token
+/// this module owns).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedAnchor {
+    pub(crate) target_repo_id: String,
+    pub(crate) target_node_id: Option<String>,
+    pub(crate) anchor_status: String,
+}
+
+/// The frozen op set (§5.4 / §6.3). Each op mutates exactly one LWW register of one node/edge (see
+/// the fold), except `NodeCreate`, which also establishes existence.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MemoryOp {
+    /// Establish a node and set its content register.
+    NodeCreate { node_id: NodeId, content: NodeContent },
+    /// FULL content replacement for an existing node.
+    NodeUpdate { node_id: NodeId, content: NodeContent },
+    /// The status/lifecycle dimension.
+    NodeStatus { node_id: NodeId, status: NodeStatus },
+    /// Edge presence; the `edge_key` is derivable from the spec.
+    EdgeAdd { edge: EdgeSpec },
+    /// Tombstone an edge by its stable `edge_key`.
+    EdgeRemove { edge_key: EdgeKey },
+    /// Re-resolve an edge's local anchor; NEVER mutates the `edge_key` or presence.
+    Rebind { edge_key: EdgeKey, resolved: ResolvedAnchor },
+    /// A converged-state boundary marker; inert in the fold this increment (§5.4/C4).
+    Snapshot,
+}
+
+impl MemoryOp {
+    /// The envelope's op-kind tag (element 1). Stable wire tokens — a rename is a format change.
+    fn kind_tag(&self) -> &'static str {
+        match self {
+            Self::NodeCreate { .. } => "node_create",
+            Self::NodeUpdate { .. } => "node_update",
+            Self::NodeStatus { .. } => "node_status",
+            Self::EdgeAdd { .. } => "edge_add",
+            Self::EdgeRemove { .. } => "edge_remove",
+            Self::Rebind { .. } => "rebind",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+/// One op plus its total-order metadata — the unit the fold consumes.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Entry {
+    pub(crate) meta: OpMeta,
+    pub(crate) op: MemoryOp,
+}
+
+/// The op-log's ordering key: a per-stream Lamport counter + the authoring device. Total order is
+/// `(lamport, device)` ascending, device bytes breaking a Lamport tie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpMeta {
+    pub(crate) lamport: u64,
+    pub(crate) device: DeviceFingerprint,
+}
+
+/// The outcome of decoding one op envelope. `Unknown` is the forward-compat seam: an op kind — or a
+/// relation/status token — this binary doesn't recognize is kept opaque (raw bytes RETAINED) rather
+/// than dropped or projected, so a later binary can re-fold the stream (§5.4).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DecodedOp {
+    Known(MemoryOp),
+    Unknown { tag: String, raw: Vec<u8> },
+}
+
+/// A `minicbor` encoder writing into an owned `Vec` — the concrete, infallible target every encode
+/// helper shares.
+type VecEncoder<'a> = Encoder<&'a mut Vec<u8>>;
+
+/// Encode one op to canonical CBOR: `[domain, op-kind, payload]`, definite lengths throughout,
+/// deterministic. The op's METADATA (`OpMeta`) is NOT encoded here — it belongs to the signed
+/// envelope (a later increment); these bytes freeze the op wire format the golden vectors pin.
+pub(crate) fn encode(op: &MemoryOp) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    {
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(3).expect(INFALLIBLE);
+        enc.str(DOMAIN).expect(INFALLIBLE);
+        enc.str(op.kind_tag()).expect(INFALLIBLE);
+        encode_payload(&mut enc, op);
+    }
+    buf
+}
+
+/// Write the op-specific payload as exactly ONE CBOR item (the envelope's element 2).
+fn encode_payload(enc: &mut VecEncoder<'_>, op: &MemoryOp) {
+    match op {
+        MemoryOp::NodeCreate { node_id, content } | MemoryOp::NodeUpdate { node_id, content } => {
+            enc.array(2).expect(INFALLIBLE);
+            enc.str(node_id.as_str()).expect(INFALLIBLE);
+            encode_content(enc, content);
+        },
+        MemoryOp::NodeStatus { node_id, status } => {
+            enc.array(2).expect(INFALLIBLE);
+            enc.str(node_id.as_str()).expect(INFALLIBLE);
+            enc.str(status.as_db_str()).expect(INFALLIBLE);
+        },
+        MemoryOp::EdgeAdd { edge } => encode_edge_spec(enc, edge),
+        MemoryOp::EdgeRemove { edge_key } => {
+            enc.str(edge_key.as_str()).expect(INFALLIBLE);
+        },
+        MemoryOp::Rebind { edge_key, resolved } => {
+            enc.array(2).expect(INFALLIBLE);
+            enc.str(edge_key.as_str()).expect(INFALLIBLE);
+            encode_resolved(enc, resolved);
+        },
+        MemoryOp::Snapshot => {
+            // Inert boundary marker: a strictly-null payload. A future snapshot that carries a
+            // coverage manifest (§5.4/C4) is a NEW op kind — NOT a non-null payload under this kind
+            // — so an old binary retains it through the unknown-KIND seam (uniform forward-compat),
+            // while `snapshot` stays null-only and its decode rejects any non-null payload.
+            enc.null().expect(INFALLIBLE);
+        },
+    }
+}
+
+fn encode_content(enc: &mut VecEncoder<'_>, content: &NodeContent) {
+    enc.array(7).expect(INFALLIBLE);
+    enc.str(&content.kind).expect(INFALLIBLE);
+    enc.str(&content.title).expect(INFALLIBLE);
+    enc.str(&content.body).expect(INFALLIBLE);
+    enc.str(&content.confidence).expect(INFALLIBLE);
+    enc.str(&content.source).expect(INFALLIBLE);
+    // Tags are a SET: sort AND dedup before encoding so neither order nor duplicates perturb the
+    // canonical bytes. `NodeContent::canonicalize` applies the SAME rule to stored content, so the
+    // wire and the projected state agree.
+    let mut tags: Vec<&str> = content.tags.iter().map(String::as_str).collect();
+    tags.sort_unstable();
+    tags.dedup();
+    enc.array(tags.len() as u64).expect(INFALLIBLE);
+    for tag in tags {
+        enc.str(tag).expect(INFALLIBLE);
+    }
+    encode_opt_str(enc, content.payload.as_deref());
+}
+
+fn encode_edge_spec(enc: &mut VecEncoder<'_>, edge: &EdgeSpec) {
+    enc.array(6).expect(INFALLIBLE);
+    enc.str(edge.source_node_id.as_str()).expect(INFALLIBLE);
+    enc.str(edge.relation.as_db_str()).expect(INFALLIBLE);
+    enc.str(&edge.target_repo_id).expect(INFALLIBLE);
+    enc.str(&edge.target_kind).expect(INFALLIBLE);
+    enc.str(&edge.target_anchor).expect(INFALLIBLE);
+    enc.str(&edge.owner_repo_id).expect(INFALLIBLE);
+}
+
+fn encode_resolved(enc: &mut VecEncoder<'_>, resolved: &ResolvedAnchor) {
+    enc.array(3).expect(INFALLIBLE);
+    enc.str(&resolved.target_repo_id).expect(INFALLIBLE);
+    encode_opt_str(enc, resolved.target_node_id.as_deref());
+    enc.str(&resolved.anchor_status).expect(INFALLIBLE);
+}
+
+/// Encode an optional string as a text item or CBOR `null` — a distinct, unambiguous absent marker.
+fn encode_opt_str(enc: &mut VecEncoder<'_>, value: Option<&str>) {
+    match value {
+        Some(text) => enc.str(text).expect(INFALLIBLE),
+        None => enc.null().expect(INFALLIBLE),
+    };
+}
+
+/// Decode one op envelope. A recognized op → `Known`; a future op kind / relation / status token →
+/// `Unknown` (raw bytes retained); structurally-invalid CBOR or a wrong/absent domain tag → `Err`.
+pub(crate) fn decode(bytes: &[u8]) -> anyhow::Result<DecodedOp> {
+    decode_envelope(bytes).map_err(|err| anyhow::anyhow!("op decode failed: {err}"))
+}
+
+fn decode_envelope(bytes: &[u8]) -> Result<DecodedOp, CborError> {
+    let mut d = Decoder::new(bytes);
+    expect_array(&mut d, 3)?;
+    let domain = d.str()?;
+    if domain != DOMAIN {
+        // A wrong/absent domain tag is a foreign or corrupt object, NOT a forward-compat op — a
+        // future format bumps the version and an old binary must reject rather than misread it.
+        return Err(CborError::message(format!(
+            "unknown op domain tag `{domain}` (expected `{DOMAIN}`)"
+        )));
+    }
+    let kind = d.str()?.to_string();
+    // `None` from a decode helper means "a token this binary doesn't know" → the whole op is kept
+    // opaque as `Unknown`. A hard `Err` (propagated by `?`) means the bytes are structurally wrong.
+    let known = match kind.as_str() {
+        "node_create" => {
+            let (node_id, content) = decode_node_content(&mut d)?;
+            Some(MemoryOp::NodeCreate { node_id, content })
+        },
+        "node_update" => {
+            let (node_id, content) = decode_node_content(&mut d)?;
+            Some(MemoryOp::NodeUpdate { node_id, content })
+        },
+        "node_status" => decode_node_status(&mut d)?,
+        "edge_add" => decode_edge_spec(&mut d)?.map(|edge| MemoryOp::EdgeAdd { edge }),
+        "edge_remove" => Some(MemoryOp::EdgeRemove { edge_key: EdgeKey::from(d.str()?) }),
+        "rebind" => {
+            let (edge_key, resolved) = decode_rebind(&mut d)?;
+            Some(MemoryOp::Rebind { edge_key, resolved })
+        },
+        "snapshot" => {
+            d.null()?;
+            Some(MemoryOp::Snapshot)
+        },
+        // A future op KIND this binary doesn't know — its payload is not read here; the raw bytes
+        // are validated for canonical CBOR on the `None` arm below.
+        _ => None,
+    };
+    match known {
+        Some(op) => {
+            // Byte-CANONICAL identity: a known op has exactly ONE accepted encoding — the one
+            // `encode` produces (minimal headers, definite lengths, sorted+deduped tags, NO
+            // trailing bytes). `minicbor`'s decoder otherwise accepts
+            // structurally-valid but non-canonical input; re-encoding and demanding
+            // equality rejects every alternate representation, so a later signature /
+            // content-address over these bytes is unambiguous.
+            if encode(&op) != bytes {
+                return Err(CborError::message("non-canonical op encoding"));
+            }
+            Ok(DecodedOp::Known(op))
+        },
+        None => {
+            // An UNKNOWN op is retained opaque (we can't re-encode it), but it must STILL be
+            // exactly one canonical CBOR item with no trailing bytes — otherwise a
+            // future binary that learns the kind could see two wire forms of one
+            // logical op (and its `encode == bytes` check would then reject an entry an
+            // older peer accepted + forwarded). Validate the raw bytes.
+            require_canonical_cbor(bytes)?;
+            Ok(DecodedOp::Unknown { tag: kind, raw: bytes.to_vec() })
+        },
+    }
+}
+
+/// Validate that `bytes` is EXACTLY one canonical CBOR item (RFC 8949 §4.2 core-deterministic) with
+/// no trailing bytes: MINIMAL-length argument headers, DEFINITE lengths only, sorted + unique map
+/// keys, and no floats (this wire format is integer-only, §5.5). This is the encoding-level
+/// canonicity a retained [`DecodedOp::Unknown`] needs; a known op gets the same guarantee (plus
+/// value-level rules like sorted tags) from `encode(decode) == bytes`.
+fn require_canonical_cbor(bytes: &[u8]) -> Result<(), CborError> {
+    let mut pos = 0;
+    check_canonical_item(bytes, &mut pos, 0)?;
+    if pos != bytes.len() {
+        return Err(CborError::message("trailing bytes after canonical CBOR item"));
+    }
+    Ok(())
+}
+
+/// Max CBOR nesting depth. Real ops nest shallowly (envelope → payload array → content array → tags
+/// array ≈ depth 4); a deeper structure is malformed/hostile, and unbounded recursion in the
+/// validator would overflow the stack — so cap it well above any real op and reject beyond.
+const MAX_CBOR_DEPTH: usize = 32;
+
+/// Validate one canonical CBOR item at `*pos`, advancing past it; recurses into arrays/maps/tags
+/// with a bounded `depth` (a pathologically nested input errors instead of overflowing the stack).
+fn check_canonical_item(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<(), CborError> {
+    if depth > MAX_CBOR_DEPTH {
+        return Err(CborError::message("CBOR nesting too deep"));
+    }
+    let (major, arg) = read_canonical_header(bytes, pos)?;
+    match major {
+        0 | 1 => Ok(()), // uint / negative int — the header IS the value
+        2 => {
+            // byte string: `arg` opaque content bytes (no UTF-8 requirement).
+            advance_string(bytes, pos, arg)
+        },
+        3 => {
+            // text string: `arg` bytes that MUST be valid UTF-8. A future decoder reads this field
+            // with `d.str()`, which rejects invalid UTF-8 — so a non-UTF-8 text string is not a
+            // re-foldable canonical op even though its length header is well-formed.
+            let start = *pos;
+            advance_string(bytes, pos, arg)?;
+            str::from_utf8(&bytes[start..*pos])
+                .map_err(|_| CborError::message("invalid UTF-8 in CBOR text string"))?;
+            Ok(())
+        },
+        4 => {
+            for _ in 0..arg {
+                check_canonical_item(bytes, pos, depth + 1)?;
+            }
+            Ok(())
+        },
+        5 => {
+            // Map: keys must be strictly ascending by their encoded bytes (sorted + no duplicates).
+            let mut prev_key: Option<&[u8]> = None;
+            for _ in 0..arg {
+                let key_start = *pos;
+                check_canonical_item(bytes, pos, depth + 1)?;
+                let key = &bytes[key_start..*pos];
+                if prev_key.is_some_and(|prev| key <= prev) {
+                    return Err(CborError::message("map keys not sorted or duplicated"));
+                }
+                prev_key = Some(key);
+                check_canonical_item(bytes, pos, depth + 1)?;
+            }
+            Ok(())
+        },
+        6 => check_canonical_item(bytes, pos, depth + 1), // tag: one following item
+        7 => Ok(()),                                      /* simple value (null/bool/…); floats */
+        // already rejected by the header
+        // reader
+        _ => Err(CborError::message("invalid CBOR major type")),
+    }
+}
+
+/// Read one CBOR item header at `*pos`, returning `(major, argument)` and advancing past it.
+/// Rejects non-minimal argument encodings, indefinite/reserved lengths, and floats.
+fn read_canonical_header(bytes: &[u8], pos: &mut usize) -> Result<(u8, u64), CborError> {
+    let first = read_u8(bytes, pos)?;
+    let major = first >> 5;
+    let arg = match first & 0x1f {
+        info @ 0..=23 => u64::from(info),
+        24 => {
+            let v = u64::from(read_u8(bytes, pos)?);
+            require(v >= 24, "non-minimal 1-byte CBOR argument")?;
+            v
+        },
+        25 => {
+            require(major != 7, "float is non-canonical (integer-only wire format)")?;
+            let v = read_be(bytes, pos, 2)?;
+            require(v > u64::from(u8::MAX), "non-minimal 2-byte CBOR argument")?;
+            v
+        },
+        26 => {
+            require(major != 7, "float is non-canonical (integer-only wire format)")?;
+            let v = read_be(bytes, pos, 4)?;
+            require(v > u64::from(u16::MAX), "non-minimal 4-byte CBOR argument")?;
+            v
+        },
+        27 => {
+            require(major != 7, "float is non-canonical (integer-only wire format)")?;
+            let v = read_be(bytes, pos, 8)?;
+            require(v > u64::from(u32::MAX), "non-minimal 8-byte CBOR argument")?;
+            v
+        },
+        _ => return Err(CborError::message("reserved or indefinite CBOR length")), // 28..=31
+    };
+    Ok((major, arg))
+}
+
+/// Advance `*pos` past `arg` string content bytes, bounds-checking against `bytes`.
+fn advance_string(bytes: &[u8], pos: &mut usize, arg: u64) -> Result<(), CborError> {
+    let len = usize::try_from(arg).map_err(|_| CborError::message("CBOR length overflow"))?;
+    let end = pos
+        .checked_add(len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| CborError::message("CBOR string runs past end"))?;
+    *pos = end;
+    Ok(())
+}
+
+fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8, CborError> {
+    let byte = *bytes.get(*pos).ok_or_else(|| CborError::message("unexpected end of CBOR"))?;
+    *pos += 1;
+    Ok(byte)
+}
+
+/// Read `n` (≤ 8) big-endian bytes into a `u64`.
+fn read_be(bytes: &[u8], pos: &mut usize, n: usize) -> Result<u64, CborError> {
+    let end = pos
+        .checked_add(n)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| CborError::message("unexpected end of CBOR"))?;
+    let value = bytes[*pos..end].iter().fold(0u64, |acc, &byte| (acc << 8) | u64::from(byte));
+    *pos = end;
+    Ok(value)
+}
+
+fn require(condition: bool, message: &'static str) -> Result<(), CborError> {
+    if condition { Ok(()) } else { Err(CborError::message(message)) }
+}
+
+fn decode_node_content(d: &mut Decoder<'_>) -> Result<(NodeId, NodeContent), CborError> {
+    expect_array(d, 2)?;
+    let node_id = NodeId::from(d.str()?);
+    let content = decode_content(d)?;
+    Ok((node_id, content))
+}
+
+fn decode_content(d: &mut Decoder<'_>) -> Result<NodeContent, CborError> {
+    expect_array(d, 7)?;
+    let kind = d.str()?.to_string();
+    let title = d.str()?.to_string();
+    let body = d.str()?.to_string();
+    let confidence = d.str()?.to_string();
+    let source = d.str()?.to_string();
+    let tags = decode_str_array(d)?;
+    let payload = decode_opt_str(d)?;
+    Ok(NodeContent { kind, title, body, confidence, source, tags, payload })
+}
+
+/// Decode a node-status op, or `None` for a forward-compat status token this binary can't project.
+fn decode_node_status(d: &mut Decoder<'_>) -> Result<Option<MemoryOp>, CborError> {
+    expect_array(d, 2)?;
+    let node_id = NodeId::from(d.str()?);
+    let token = d.str()?;
+    Ok(NodeStatus::from_db_str(token).map(|status| MemoryOp::NodeStatus { node_id, status }))
+}
+
+/// Decode an edge spec, or `None` for a forward-compat relation token this binary can't project.
+fn decode_edge_spec(d: &mut Decoder<'_>) -> Result<Option<EdgeSpec>, CborError> {
+    expect_array(d, 6)?;
+    let source_node_id = NodeId::from(d.str()?);
+    let token = d.str()?.to_string();
+    // Read the WHOLE payload before judging the relation token, so a TRUNCATED `edge_add` is a hard
+    // (structural) error even when the relation is unknown — an unknown relation must still be a
+    // complete, well-formed op to be retained opaquely.
+    let target_repo_id = d.str()?.to_string();
+    let target_kind = d.str()?.to_string();
+    let target_anchor = d.str()?.to_string();
+    let owner_repo_id = d.str()?.to_string();
+    let Ok(relation) = EdgeRelation::from_db_str(&token) else {
+        // A relation this binary doesn't know → not projectable; kept opaque as `Unknown`.
+        return Ok(None);
+    };
+    Ok(Some(EdgeSpec {
+        source_node_id,
+        relation,
+        target_repo_id,
+        target_kind,
+        target_anchor,
+        owner_repo_id,
+    }))
+}
+
+fn decode_rebind(d: &mut Decoder<'_>) -> Result<(EdgeKey, ResolvedAnchor), CborError> {
+    expect_array(d, 2)?;
+    let edge_key = EdgeKey::from(d.str()?);
+    let resolved = decode_resolved(d)?;
+    Ok((edge_key, resolved))
+}
+
+fn decode_resolved(d: &mut Decoder<'_>) -> Result<ResolvedAnchor, CborError> {
+    expect_array(d, 3)?;
+    let target_repo_id = d.str()?.to_string();
+    let target_node_id = decode_opt_str(d)?;
+    let anchor_status = d.str()?.to_string();
+    Ok(ResolvedAnchor { target_repo_id, target_node_id, anchor_status })
+}
+
+fn decode_str_array(d: &mut Decoder<'_>) -> Result<Vec<String>, CborError> {
+    let len = expect_definite_len(d)?;
+    // Do NOT preallocate `len`: it is an attacker-controllable CBOR array header, so a bogus huge
+    // count would OOM before the (short) body is even read. Grow as elements are actually decoded —
+    // a truncated array errors at the first missing element, bounding work by real input size.
+    let mut out = Vec::new();
+    for _ in 0..len {
+        out.push(d.str()?.to_string());
+    }
+    Ok(out)
+}
+
+fn decode_opt_str(d: &mut Decoder<'_>) -> Result<Option<String>, CborError> {
+    if d.datatype()? == Type::Null {
+        d.null()?;
+        Ok(None)
+    } else {
+        Ok(Some(d.str()?.to_string()))
+    }
+}
+
+/// Read a definite-length array header and assert its element count — canonical CBOR is
+/// definite-length only, and a wrong count is a structural (hard) error.
+fn expect_array(d: &mut Decoder<'_>, want: u64) -> Result<(), CborError> {
+    let got = expect_definite_len(d)?;
+    if got == want {
+        Ok(())
+    } else {
+        Err(CborError::message(format!("expected a {want}-element array, got {got}")))
+    }
+}
+
+fn expect_definite_len(d: &mut Decoder<'_>) -> Result<u64, CborError> {
+    d.array()?.ok_or_else(|| CborError::message("expected a definite-length array"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Hand-roll a raw CBOR envelope, scoping the encoder so its borrow on the buffer ends before
+    /// the bytes are returned — the fixture builder for the forward-compat / corruption tests.
+    fn raw_envelope(write: impl FnOnce(&mut VecEncoder<'_>)) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            write(&mut enc);
+        }
+        buf
+    }
+
+    fn content() -> NodeContent {
+        NodeContent {
+            kind: "Invariant".to_string(),
+            title: "title".to_string(),
+            body: "body".to_string(),
+            confidence: "high".to_string(),
+            source: "agent".to_string(),
+            // Already sorted — encode canonicalizes, so a round-trip yields sorted tags.
+            tags: vec!["a".to_string(), "b".to_string()],
+            payload: Some(r#"{"schema_version":1}"#.to_string()),
+        }
+    }
+
+    fn edge_spec() -> EdgeSpec {
+        EdgeSpec {
+            source_node_id: NodeId::from("mem_src"),
+            relation: EdgeRelation::DependsOn,
+            target_repo_id: "repo_t".to_string(),
+            target_kind: "node".to_string(),
+            target_anchor: "mem_dst".to_string(),
+            owner_repo_id: "repo_o".to_string(),
+        }
+    }
+
+    fn resolved() -> ResolvedAnchor {
+        ResolvedAnchor {
+            target_repo_id: "repo_t".to_string(),
+            target_node_id: Some("mem_dst".to_string()),
+            anchor_status: "current".to_string(),
+        }
+    }
+
+    /// One representative op per variant — the golden + round-trip fixtures.
+    fn every_variant() -> Vec<(&'static str, MemoryOp)> {
+        vec![
+            ("node_create", MemoryOp::NodeCreate {
+                node_id: NodeId::from("mem_1"),
+                content: content(),
+            }),
+            ("node_update", MemoryOp::NodeUpdate {
+                node_id: NodeId::from("mem_1"),
+                content: content(),
+            }),
+            ("node_status", MemoryOp::NodeStatus {
+                node_id: NodeId::from("mem_1"),
+                status: NodeStatus::Obsolete,
+            }),
+            ("edge_add", MemoryOp::EdgeAdd { edge: edge_spec() }),
+            ("edge_remove", MemoryOp::EdgeRemove { edge_key: EdgeKey::from("edgekey_1") }),
+            ("rebind", MemoryOp::Rebind {
+                edge_key: EdgeKey::from("edgekey_1"),
+                resolved: resolved(),
+            }),
+            ("snapshot", MemoryOp::Snapshot),
+        ]
+    }
+
+    #[test]
+    fn golden_vectors_pin_the_op_wire_format() {
+        // The op wire format is a frozen primitive: a signed envelope, the fold, and (later) the
+        // content-addressed identity all build on these exact bytes. Any change to the canonical
+        // rule must break this test and force a deliberate `rag-rat/op/1` version bump.
+        let got: Vec<(&str, String)> =
+            every_variant().iter().map(|(name, op)| (*name, hex(&encode(op)))).collect();
+        let want: Vec<(&str, &str)> = vec![
+            (
+                "node_create",
+                "836c7261672d7261742f6f702f316b6e6f64655f63726561746582656d656d5f318769496e76617269616e74657469746c6564626f64796468696768656167656e748261616162747b22736368656d615f76657273696f6e223a317d",
+            ),
+            (
+                "node_update",
+                "836c7261672d7261742f6f702f316b6e6f64655f75706461746582656d656d5f318769496e76617269616e74657469746c6564626f64796468696768656167656e748261616162747b22736368656d615f76657273696f6e223a317d",
+            ),
+            ("node_status", "836c7261672d7261742f6f702f316b6e6f64655f73746174757382656d656d5f31686f62736f6c657465"),
+            (
+                "edge_add",
+                "836c7261672d7261742f6f702f3168656467655f61646486676d656d5f7372636a646570656e64735f6f6e667265706f5f74646e6f6465676d656d5f647374667265706f5f6f",
+            ),
+            ("edge_remove", "836c7261672d7261742f6f702f316b656467655f72656d6f766569656467656b65795f31"),
+            (
+                "rebind",
+                "836c7261672d7261742f6f702f3166726562696e648269656467656b65795f3183667265706f5f74676d656d5f6473746763757272656e74",
+            ),
+            ("snapshot", "836c7261672d7261742f6f702f3168736e617073686f74f6"),
+        ];
+        let got_refs: Vec<(&str, &str)> =
+            got.iter().map(|(name, bytes)| (*name, bytes.as_str())).collect();
+        assert_eq!(got_refs, want);
+    }
+
+    #[test]
+    fn every_variant_round_trips() {
+        for (name, op) in every_variant() {
+            let bytes = encode(&op);
+            match decode(&bytes).unwrap() {
+                DecodedOp::Known(decoded) => {
+                    assert_eq!(decoded, op, "{name} must round-trip through encode/decode");
+                },
+                DecodedOp::Unknown { tag, .. } => {
+                    panic!("{name} decoded as Unknown(tag={tag}), expected Known");
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_op_kind_is_retained_not_projected() {
+        // A future op kind: a well-formed `[domain, "future_op", payload]` envelope. It must decode
+        // to `Unknown` with the tag + the ORIGINAL bytes retained (re-foldable after an upgrade),
+        // never an error and never a silent drop.
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("future_op").unwrap();
+            enc.u64(42).unwrap();
+        });
+
+        match decode(&buf).unwrap() {
+            DecodedOp::Unknown { tag, raw } => {
+                assert_eq!(tag, "future_op");
+                assert_eq!(raw, buf, "the raw bytes are retained verbatim for re-fold");
+            },
+            DecodedOp::Known(op) => panic!("expected Unknown, got Known({op:?})"),
+        }
+    }
+
+    #[test]
+    fn unknown_relation_token_decodes_to_unknown() {
+        // A future edge relation inside an otherwise-valid `edge_add` → the whole op is kept
+        // opaque.
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("edge_add").unwrap();
+            enc.array(6).unwrap();
+            enc.str("mem_src").unwrap();
+            enc.str("mentors").unwrap(); // not a known EdgeRelation token
+            enc.str("repo_t").unwrap();
+            enc.str("node").unwrap();
+            enc.str("mem_dst").unwrap();
+            enc.str("repo_o").unwrap();
+        });
+
+        match decode(&buf).unwrap() {
+            DecodedOp::Unknown { tag, raw } => {
+                assert_eq!(tag, "edge_add");
+                assert_eq!(raw, buf);
+            },
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_status_token_decodes_to_unknown() {
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("node_status").unwrap();
+            enc.array(2).unwrap();
+            enc.str("mem_1").unwrap();
+            enc.str("archived").unwrap(); // not a known NodeStatus token
+        });
+
+        match decode(&buf).unwrap() {
+            DecodedOp::Unknown { tag, .. } => assert_eq!(tag, "node_status"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_domain_tag_is_a_hard_error() {
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str("rag-rat/op/2").unwrap();
+            enc.str("snapshot").unwrap();
+            enc.null().unwrap();
+        });
+        assert!(decode(&buf).is_err(), "a bumped domain version must not silently decode");
+    }
+
+    #[test]
+    fn structurally_malformed_bytes_are_a_hard_error() {
+        // A known kind whose payload array has the wrong arity is corruption, not forward-compat.
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("node_status").unwrap();
+            enc.array(1).unwrap(); // node_status wants a 2-element payload
+            enc.str("mem_1").unwrap();
+        });
+        assert!(decode(&buf).is_err());
+        // Not even a CBOR array.
+        assert!(decode(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn trailing_bytes_after_an_op_are_rejected() {
+        // A complete, valid op followed by extra CBOR is not a canonical envelope — accepting it
+        // would make the retained bytes differ from what `encode` produces (wire-identity drift).
+        let mut buf = encode(&MemoryOp::Snapshot);
+        buf.push(0x00); // a stray trailing CBOR unsigned 0
+        assert!(decode(&buf).is_err(), "trailing bytes must be rejected");
+    }
+
+    #[test]
+    fn truncated_unknown_kind_payload_is_rejected() {
+        // A future op kind whose declared payload array is short is corruption, not a retainable
+        // opaque op — the skip-and-verify path rejects it.
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("future_op").unwrap();
+            enc.array(3).unwrap(); // claims three elements...
+            enc.str("only_one").unwrap(); // ...supplies one
+        });
+        assert!(decode(&buf).is_err());
+    }
+
+    #[test]
+    fn truncated_edge_add_is_rejected_even_with_an_unknown_relation() {
+        // The full payload is read before the relation is judged, so a short `edge_add` hard-errors
+        // rather than being silently accepted as Unknown.
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("edge_add").unwrap();
+            enc.array(6).unwrap(); // claims six...
+            enc.str("mem_src").unwrap();
+            enc.str("mentors").unwrap(); // unknown relation
+            enc.str("repo_t").unwrap(); // ...supplies three
+        });
+        assert!(decode(&buf).is_err());
+    }
+
+    #[test]
+    fn non_canonical_tag_order_is_rejected() {
+        // Tags out of canonical (sorted) order re-encode differently → rejected. Otherwise the same
+        // logical op would have two accepted wire representations under one signature.
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("node_create").unwrap();
+            enc.array(2).unwrap();
+            enc.str("mem_1").unwrap();
+            enc.array(7).unwrap();
+            enc.str("Invariant").unwrap();
+            enc.str("title").unwrap();
+            enc.str("body").unwrap();
+            enc.str("high").unwrap();
+            enc.str("agent").unwrap();
+            enc.array(2).unwrap();
+            enc.str("b").unwrap(); // out of sorted order
+            enc.str("a").unwrap();
+            enc.null().unwrap(); // payload
+        });
+        assert!(decode(&buf).is_err(), "unsorted tags are non-canonical");
+    }
+
+    #[test]
+    fn duplicate_tags_are_deduped_and_rejected_on_the_wire() {
+        // Tags are a SET: encode drops duplicates, so a dup and its deduped form encode
+        // identically.
+        let mut dup = content();
+        dup.tags = vec!["a".to_string(), "a".to_string(), "b".to_string()];
+        let mut deduped = content();
+        deduped.tags = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(encode(&node_create(dup)), encode(&node_create(deduped)));
+        // And a hand-built dup-tag envelope is non-canonical (re-encode differs) → rejected.
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("node_create").unwrap();
+            enc.array(2).unwrap();
+            enc.str("mem_1").unwrap();
+            enc.array(7).unwrap();
+            enc.str("Invariant").unwrap();
+            enc.str("title").unwrap();
+            enc.str("body").unwrap();
+            enc.str("high").unwrap();
+            enc.str("agent").unwrap();
+            enc.array(2).unwrap();
+            enc.str("a").unwrap();
+            enc.str("a").unwrap(); // duplicate
+            enc.null().unwrap();
+        });
+        assert!(decode(&buf).is_err(), "duplicate tags are non-canonical on the wire");
+    }
+
+    #[test]
+    fn overlong_length_header_is_rejected() {
+        // Splice the canonical snapshot's inline domain-length header (`0x6c`, len 12) into the
+        // non-minimal 1-byte-length form (`0x78 0x0c`) — same string, non-canonical CBOR. `encode`
+        // only ever emits the minimal header, so `decode` must reject the overlong input.
+        let canonical = encode(&MemoryOp::Snapshot);
+        assert_eq!(canonical[1], 0x6c, "domain length header is the inline minimal form");
+        let mut overlong = vec![canonical[0], 0x78, 0x0c];
+        overlong.extend_from_slice(&canonical[2..]);
+        assert!(decode(&overlong).is_err(), "an overlong length header is non-canonical");
+    }
+
+    #[test]
+    fn a_huge_declared_tag_count_does_not_preallocate() {
+        // A tiny payload declaring an enormous tag-array length must return a decode error, never
+        // OOM or panic — the decoder grows with real bytes, so it errors at the first missing tag.
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("node_create").unwrap();
+            enc.array(2).unwrap();
+            enc.str("mem_1").unwrap();
+            enc.array(7).unwrap();
+            enc.str("Invariant").unwrap();
+            enc.str("title").unwrap();
+            enc.str("body").unwrap();
+            enc.str("high").unwrap();
+            enc.str("agent").unwrap();
+            enc.array(u64::MAX).unwrap(); // absurd declared tag count, with no elements following
+        });
+        assert!(decode(&buf).is_err(), "a bogus tag count must error, not allocate");
+    }
+
+    #[test]
+    fn non_canonical_unknown_op_bytes_are_rejected() {
+        // A future op KIND whose payload uses a non-minimal length header is non-canonical and must
+        // be rejected even though the kind is unknown — every RETAINED op is one canonical wire
+        // form.
+        let mut overlong = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("future_op").unwrap();
+        });
+        // Payload = text "x" with a non-minimal 1-byte length header (`0x78 0x01`) not inline
+        // `0x61`.
+        overlong.extend_from_slice(&[0x78, 0x01, b'x']);
+        assert!(decode(&overlong).is_err(), "a non-canonical unknown payload is rejected");
+
+        // The canonical (inline) form of the same unknown op IS retained.
+        let mut canonical = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("future_op").unwrap();
+        });
+        canonical.extend_from_slice(&[0x61, b'x']);
+        assert!(matches!(decode(&canonical).unwrap(), DecodedOp::Unknown { .. }));
+    }
+
+    #[test]
+    fn deeply_nested_unknown_op_is_rejected() {
+        // Unbounded recursion in the canonical validator would overflow the stack; a pathologically
+        // nested payload must return a decode error instead.
+        let mut buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("future_op").unwrap();
+        });
+        // Payload = MAX_CBOR_DEPTH+2 nested single-element arrays (0x81) around a uint-0 leaf.
+        buf.extend(std::iter::repeat_n(0x81u8, MAX_CBOR_DEPTH + 2));
+        buf.push(0x00);
+        assert!(decode(&buf).is_err(), "excessive CBOR nesting is rejected, not overflowed");
+    }
+
+    #[test]
+    fn invalid_utf8_text_in_unknown_op_is_rejected() {
+        // A future op whose payload TEXT string is not valid UTF-8 (`0x61 0xff`) must be rejected:
+        // a later decoder reads it with `d.str()` (UTF-8 required), so it is not
+        // re-foldable and can't be retained as "canonical".
+        let mut buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("future_op").unwrap();
+        });
+        buf.extend_from_slice(&[0x61, 0xff]); // text, length 1, content byte 0xff (invalid UTF-8)
+        assert!(decode(&buf).is_err(), "invalid UTF-8 text in an unknown op is rejected");
+    }
+
+    #[test]
+    fn indefinite_length_unknown_op_is_rejected() {
+        // An indefinite-length payload (`0x9f … 0xff`) is never canonical CBOR.
+        let mut buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("future_op").unwrap();
+        });
+        buf.extend_from_slice(&[0x9f, 0xff]); // indefinite-length array, immediately closed
+        assert!(decode(&buf).is_err());
+    }
+
+    /// Wrap raw `payload` CBOR bytes as the 3rd element of an unknown-KIND op envelope, so the
+    /// retention path's canonical-CBOR validator is what judges `payload`.
+    fn unknown_op_with_payload(payload: &[u8]) -> Vec<u8> {
+        let mut buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("future_op").unwrap();
+        });
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn canonical_validator_accepts_every_canonical_cbor_shape() {
+        // One canonical item per CBOR major type / integer width → each retained as Unknown.
+        let shapes: &[&[u8]] = &[
+            &[0x41, 0x00],                                           // byte string, len 1
+            &[0xa1, 0x61, b'a', 0x00],                               // map {"a": 0} (single key)
+            &[0xc0, 0x00],                                           // tag(0) wrapping uint 0
+            &[0xf5],                                                 // simple value: true
+            &[0x19, 0x01, 0x00],                                     // uint 256 (minimal 2-byte)
+            &[0x1a, 0x00, 0x01, 0x00, 0x00],                         // uint 65536 (minimal 4-byte)
+            &[0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00], // uint 2^32 (minimal 8-byte)
+        ];
+        for payload in shapes {
+            let bytes = unknown_op_with_payload(payload);
+            assert!(
+                matches!(decode(&bytes).unwrap(), DecodedOp::Unknown { .. }),
+                "canonical payload {payload:02x?} should be retained as Unknown",
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_validator_rejects_every_non_canonical_cbor_shape() {
+        let shapes: &[&[u8]] = &[
+            &[0xa2, 0x61, b'b', 0x00, 0x61, b'a', 0x00], // map keys OUT of order ("b" then "a")
+            &[0xa2, 0x61, b'a', 0x00, 0x61, b'a', 0x01], // DUPLICATE map key "a"
+            &[0x19, 0x00, 0xff],                         // uint 255 in a non-minimal 2-byte header
+            &[0x1a, 0x00, 0x00, 0x00, 0xff],             // uint 255 in a non-minimal 4-byte header
+            &[0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff], // …non-minimal 8-byte header
+            &[0x62, b'a'],                               /* text claims length 2, only 1 byte
+                                                          * present */
+        ];
+        for payload in shapes {
+            let bytes = unknown_op_with_payload(payload);
+            assert!(
+                decode(&bytes).is_err(),
+                "non-canonical payload {payload:02x?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_after_an_unknown_op_are_rejected() {
+        // The Known path rejects trailing bytes via `encode == bytes`; the Unknown path must reject
+        // them via the canonical validator's own no-trailing-bytes check.
+        let mut buf = unknown_op_with_payload(&[0x00]); // canonical unknown op (payload = uint 0)
+        buf.push(0x00); // a stray trailing CBOR byte
+        assert!(decode(&buf).is_err(), "trailing bytes after an unknown op are rejected");
+    }
+
+    #[test]
+    fn a_non_null_snapshot_payload_is_rejected() {
+        // `snapshot` is strictly null; a future manifest-carrying snapshot is a NEW kind, not a
+        // non-null payload here — an old binary must reject, never misread.
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("snapshot").unwrap();
+            enc.u64(1).unwrap(); // non-null payload
+        });
+        assert!(decode(&buf).is_err());
+    }
+
+    #[test]
+    fn node_status_tokens_match_the_validated_memory_status_set() {
+        // The op-log status tokens ARE the persisted `repo_memories.status` set — pin them against
+        // the write-path validator so the two can never drift, and pin the exact db strings.
+        for (status, token) in [
+            (NodeStatus::Active, "active"),
+            (NodeStatus::Stale, "stale"),
+            (NodeStatus::Obsolete, "obsolete"),
+            (NodeStatus::Rejected, "rejected"),
+        ] {
+            assert_eq!(status.as_db_str(), token);
+            assert_eq!(NodeStatus::from_db_str(token), Some(status));
+            memory::validate_status(token)
+                .unwrap_or_else(|_| panic!("`{token}` must be a valid memory status"));
+        }
+        assert_eq!(NodeStatus::from_db_str("archived"), None);
+        assert_eq!(NodeStatus::default(), NodeStatus::Active);
+    }
+
+    #[test]
+    fn edge_key_matches_the_live_edge_table_derivation() {
+        // The op-log derives `edge_key` through the same helper the live table uses, so an add via
+        // the op-log and a direct insert content-address to the SAME key.
+        let spec = edge_spec();
+        let expected = memory::edge_key(
+            spec.source_node_id.as_str(),
+            spec.relation.as_db_str(),
+            &spec.target_kind,
+            &spec.target_anchor,
+        );
+        assert_eq!(spec.edge_key().as_str(), expected);
+    }
+
+    #[test]
+    fn payload_absent_differs_from_payload_present() {
+        // The `null` vs text encoding keeps a no-payload node distinct from one with a payload.
+        let mut without = content();
+        without.payload = None;
+        assert_ne!(encode(&node_create(without)), encode(&node_create(content())));
+    }
+
+    fn node_create(content: NodeContent) -> MemoryOp {
+        MemoryOp::NodeCreate { node_id: NodeId::from("mem_1"), content }
+    }
+}
