@@ -819,10 +819,76 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
             },
         })
         .unwrap();
-    let call_path = db.memory_for_call_path_hash("edge-sequence-test-hash", 10).unwrap();
+    let call_path = db
+        .memory_for_call_path_hash(
+            "edge-sequence-test-hash",
+            10,
+            crate::config::MemorySurface::Full,
+        )
+        .unwrap();
     assert_eq!(call_path.len(), 1);
     assert_eq!(call_path[0].memory_id, call_path_memory.memory.memory_id);
     assert_eq!(call_path[0].call_paths[0].path_summary, "caller_edge -> target_edge");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn memory_search_defers_the_body_under_the_summary_surface() {
+    // #5: `memory_search` now honors `[memory] surface` (summary by default). Under `Summary` the
+    // full body is deferred to `memory show` (title-only when no dream summary row exists yet);
+    // under `Full` the whole body is returned.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "surfaceprobe invariant".to_string(),
+        body: "The surfaceprobe body is load-bearing and worth compacting.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        payload_json: None,
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            logical_symbol_id: None,
+            symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            path: Some("src/lib.rs".to_string()),
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+            edge_path: None,
+            dir: None,
+        },
+    })
+    .unwrap();
+
+    let full = db.memory_search("surfaceprobe", 10, crate::config::MemorySurface::Full).unwrap();
+    assert_eq!(full.len(), 1, "the memory is found");
+    assert!(!full[0].body.is_empty(), "the `full` surface returns the whole body");
+
+    let summary =
+        db.memory_search("surfaceprobe", 10, crate::config::MemorySurface::Summary).unwrap();
+    assert_eq!(summary.len(), 1, "the same hit under the default surface");
+    assert_eq!(summary[0].memory_id, full[0].memory_id);
+    assert!(
+        summary[0].body.is_empty(),
+        "the `summary` surface defers the body to `memory show` (title-only with no summary row \
+         yet)"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -913,7 +979,8 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
         .unwrap();
     assert_eq!(call_path_status(&db), "current");
     // memory_for_call_path resolves the server hash.
-    let found = db.memory_for_call_path_hash(&hash, 10).unwrap();
+    let found =
+        db.memory_for_call_path_hash(&hash, 10, crate::config::MemorySurface::Full).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].memory_id, created.memory.memory_id);
 
@@ -927,7 +994,10 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
     );
     db.memory_validate().unwrap();
     assert_eq!(call_path_status(&db), "current", "server hash survives edge row-id churn");
-    assert_eq!(db.memory_for_call_path_hash(&hash, 10).unwrap().len(), 1);
+    assert_eq!(
+        db.memory_for_call_path_hash(&hash, 10, crate::config::MemorySurface::Full).unwrap().len(),
+        1
+    );
 
     // Move the call site down a line: the source line (and thus the exact fingerprint) changes,
     // but the edge's loose identity (caller -> callee) still matches → relocated, not gone.

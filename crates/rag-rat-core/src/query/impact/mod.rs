@@ -54,9 +54,9 @@ pub struct ImpactSurfaceOptions {
     /// bindings + call paths (#37). The agent-facing MCP default is compact; full detail stays one
     /// lookup away (`memory_for_symbol` / `memory_for_path` / `memory_for_call_path`).
     pub compact_memories: bool,
-    /// How the compact `repo_memories` headers render (`[memory] surface`). `Full` (the default)
-    /// keeps the mechanical header; `Summary` hydrates each header with the dream-compacted
-    /// summary and verdict marker for the memory's current body (dream v2 pass 2). Only
+    /// How the compact `repo_memories` headers render (`[memory] surface`). `Summary` (the
+    /// default) hydrates each header with the dream-compacted summary and verdict marker for
+    /// the memory's current body (dream v2 pass 2); `Full` keeps the mechanical header. Only
     /// consulted when `compact_memories` is set; the full-body view is unaffected.
     pub surface: crate::config::MemorySurface,
 }

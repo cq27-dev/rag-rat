@@ -471,20 +471,26 @@ fn memories_are_isolated_across_repos() {
     assert_eq!(live, 2, "both same-titled memories survive under their own repo_id");
 
     // memory_search (library, FTS): each scope returns its OWN memory id, never the sibling's.
-    let a_found = open_scoped(&repo_a, &data_dir).memory_search("quokkamarker", 10).unwrap();
+    let a_found = open_scoped(&repo_a, &data_dir)
+        .memory_search("quokkamarker", 10, rag_rat_core::config::MemorySurface::Full)
+        .unwrap();
     assert!(
         a_found.iter().any(|m| m.memory_id == a_mem)
             && a_found.iter().all(|m| m.memory_id != b_mem),
         "A's memory_search returns A's memory id only: {a_found:?}"
     );
-    let b_found = open_scoped(&repo_b, &data_dir).memory_search("lorikeetmarker", 10).unwrap();
+    let b_found = open_scoped(&repo_b, &data_dir)
+        .memory_search("lorikeetmarker", 10, rag_rat_core::config::MemorySurface::Full)
+        .unwrap();
     assert!(
         b_found.iter().any(|m| m.memory_id == b_mem)
             && b_found.iter().all(|m| m.memory_id != a_mem),
         "B's memory_search returns B's memory id only: {b_found:?}"
     );
     // B's distinctive token — present in no A memory — is unreachable from A's scope.
-    let a_cross = open_scoped(&repo_a, &data_dir).memory_search("lorikeetmarker", 10).unwrap();
+    let a_cross = open_scoped(&repo_a, &data_dir)
+        .memory_search("lorikeetmarker", 10, rag_rat_core::config::MemorySurface::Full)
+        .unwrap();
     assert!(a_cross.is_empty(), "A's FTS scope never matches B's body: {a_cross:?}");
 
     // memory list (CLI): each repo lists exactly its OWN memory id (not just "some one memory").
@@ -739,18 +745,26 @@ fn consolidate_lands_a_third_legacy_repos_memories_fts_searchable() {
         .query_row("SELECT COUNT(*) FROM repo_memories WHERE id = ?1", [&legacy_mem], |r| r.get(0))
         .unwrap();
     assert_eq!(global_hit, 1, "the legacy memory landed in the global store");
-    let found = open_scoped(&repo_c, &data_dir).memory_search(unique_token, 10).unwrap();
+    let found = open_scoped(&repo_c, &data_dir)
+        .memory_search(unique_token, 10, rag_rat_core::config::MemorySurface::Full)
+        .unwrap();
     assert!(
         found.iter().any(|m| m.memory_id == legacy_mem),
         "the imported memory is FTS-searchable immediately from C's scope"
     );
     // The import stayed scoped: NEITHER pre-existing repo can reach C's token.
     assert!(
-        open_scoped(&repo_a, &data_dir).memory_search(unique_token, 10).unwrap().is_empty(),
+        open_scoped(&repo_a, &data_dir)
+            .memory_search(unique_token, 10, rag_rat_core::config::MemorySurface::Full)
+            .unwrap()
+            .is_empty(),
         "repo A cannot see C's imported memory"
     );
     assert!(
-        open_scoped(&repo_b, &data_dir).memory_search(unique_token, 10).unwrap().is_empty(),
+        open_scoped(&repo_b, &data_dir)
+            .memory_search(unique_token, 10, rag_rat_core::config::MemorySurface::Full)
+            .unwrap()
+            .is_empty(),
         "repo B cannot see C's imported memory"
     );
 

@@ -62,8 +62,12 @@ impl IndexDatabase {
         &self,
         query: &str,
         limit: u32,
+        surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
-        crate::query::memory::memory_search(self.storage.connection(), query, limit)
+        let conn = self.storage.connection();
+        let mut memories = crate::query::memory::memory_search(conn, query, limit)?;
+        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+        Ok(memories)
     }
 
     pub fn memory_for_symbol(
@@ -94,8 +98,12 @@ impl IndexDatabase {
         &self,
         edge_ids: &[i64],
         limit: u32,
+        surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
-        crate::query::memory::memories_for_edges(self.storage.connection(), edge_ids, limit)
+        let conn = self.storage.connection();
+        let mut memories = crate::query::memory::memories_for_edges(conn, edge_ids, limit)?;
+        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+        Ok(memories)
     }
 
     pub fn memory_evidence_for_symbol_and_edges(
@@ -127,12 +135,13 @@ impl IndexDatabase {
         &self,
         edge_sequence_hash: &str,
         limit: u32,
+        surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
-        crate::query::memory::memories_for_call_path_hash(
-            self.storage.connection(),
-            edge_sequence_hash,
-            limit,
-        )
+        let conn = self.storage.connection();
+        let mut memories =
+            crate::query::memory::memories_for_call_path_hash(conn, edge_sequence_hash, limit)?;
+        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+        Ok(memories)
     }
 
     pub fn memory_rebind(

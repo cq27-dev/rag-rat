@@ -204,7 +204,7 @@ pub(crate) fn call_tool_with_db(
         },
         "memory_search" => {
             let args: MemorySearchArgs = serde_json::from_value(arguments)?;
-            json!(db.memory_search(&args.query, args.limit)?)
+            json!(db.memory_search(&args.query, args.limit, memory_surface)?)
         },
         "memory_for_symbol" => {
             let args: MemoryForSymbolArgs = serde_json::from_value(arguments)?;
@@ -216,7 +216,11 @@ pub(crate) fn call_tool_with_db(
         },
         "memory_for_call_path" => {
             let args: MemoryForCallPathArgs = serde_json::from_value(arguments)?;
-            json!(db.memory_for_call_path_hash(&args.edge_sequence_hash, args.limit)?)
+            json!(db.memory_for_call_path_hash(
+                &args.edge_sequence_hash,
+                args.limit,
+                memory_surface
+            )?)
         },
         "memory_show" => {
             let args: MemoryIdArgs = serde_json::from_value(arguments)?;

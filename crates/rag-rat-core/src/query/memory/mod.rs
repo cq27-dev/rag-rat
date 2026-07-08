@@ -419,9 +419,9 @@ pub struct CompactRepoMemory {
     pub logical_symbol_id: Option<i64>,
     /// The dream-compacted summary of the memory's CURRENT body, populated ONLY under `[memory]
     /// surface = "summary"` when a `memory_summaries` row exists for the current content_hash
-    /// (dream v2 pass 2). `None` under the default `full` surface, or when no summary has been
-    /// generated — the title then stands alone (the title-only fallback). The full body is
-    /// always one lookup away via `memory show` / `memory_show`.
+    /// (dream v2 pass 2). `None` under the `full` surface, or when no summary has been generated —
+    /// the title then stands alone (the title-only fallback). The full body is always one lookup
+    /// away via `memory show` / `memory_show`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     /// A plain-text verdict marker from the memory's `memory_reality` row (dream v2 pass 1), e.g.
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn full_surface_projection_carries_no_summary_or_verdict() {
-        // The default (`full`) compact projection is purely mechanical — no summary/verdict, even
+        // The `full` compact projection is purely mechanical — no summary/verdict, even
         // when sibling rows exist (they are only read by `compact_summary_first`).
         let compact = CompactRepoMemory::from(&memory_with_body("m1", "body"));
         assert_eq!(compact.summary, None);

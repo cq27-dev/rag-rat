@@ -456,14 +456,17 @@ moved on, so there is nothing to act on). Reviewing is repo-scoped and never run
 
 ## Memory surfacing (`[memory] surface`)
 
-`[memory] surface` controls how drive-by memory attachments render. The default is `full`
-(byte-identical to today's mechanical view). Set it to `summary` to have memory attachments show the
-dream-compacted summary plus a plain-text verdict marker (`[verdict: diverged]` /
-`[verdict: current @<short-commit>]`) in place of the full body, for each memory that has one:
+`[memory] surface` controls how memory attachments and memory-query results render. The default is
+`summary`: memory attachments (and `memory_search` / `memory_for_call_path` / `memory_for_edges`
+hits) show the dream-compacted summary plus a plain-text verdict marker (`[verdict: diverged]` /
+`[verdict: current @<short-commit>]`) in place of the full body, for each memory that has one, and
+fall back to the title alone until one is generated. Set it to `full` to restore whole bodies
+everywhere. Either way, `memory show` / `memory_show` always returns the full body — that is the
+deliberate "expand on request" path.
 
 ```toml
 [memory]
-surface = "full"   # or "summary" — render title + compacted summary + verdict marker
+surface = "summary"   # default; or "full" — return whole bodies everywhere
 ```
 
 `summary` applies across every drive-by renderer: `impact_surface`'s compact `repo_memories`, the
