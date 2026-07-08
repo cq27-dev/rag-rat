@@ -191,6 +191,20 @@ pub fn registry_lock_path(database: &Path) -> PathBuf {
     lock_dir(database).join("rag-rat-registry.lock")
 }
 
+/// The GLOBAL sync-session lock path, beside the DB (#483): ONE per database file, held around
+/// each device-side p2p sync session (phase D, #406). The per-device ed25519 key doubles as the
+/// iroh NODE key — a machine-level identity — so two concurrent sessions would announce the same
+/// node id from two live endpoints; this lock is what makes the device key never live twice.
+/// Machine scope (per data-dir), NOT per repo or per worktree: two repos' maintenance passes both
+/// wanting to sync contend here, and the loser warn-skips (sync defers to its next pass — the
+/// op-log fold makes late convergence harmless). GLOBAL-LOCK ORDERING RULE (shared with
+/// [`schema_lock_path`] / [`registry_lock_path`]): acquired while per-repo entry locks may already
+/// be held (per-repo → global); any per-repo lock taken while it is held must be BOUNDED. The
+/// shared/remote-review transport (#217) reuses this same seam for its endpoint.
+pub fn sync_session_lock_path(database: &Path) -> PathBuf {
+    lock_dir(database).join("rag-rat-sync.lock")
+}
+
 /// Per-DB, PER-REPO maintenance coordination lock, held by the running `rag-rat maintenance`
 /// command for its whole pass so the multiple git hooks a single amend/merge/rebase fires coalesce
 /// into one pass instead of each running a full discover (#267). Keyed by `repo_id` (A6) like
@@ -348,6 +362,19 @@ impl WriteLock {
         timeout: Duration,
     ) -> anyhow::Result<Option<WriteLock>> {
         Self::acquire_path_timeout(registry_lock_path(database), timeout)
+    }
+
+    /// Polls until the GLOBAL sync-session lock ([`sync_session_lock_path`]) is acquired or
+    /// `timeout` elapses; `Ok(None)` on timeout — the caller warn-skips the session (sync defers
+    /// to its next maintenance pass). Deliberately timeout-only, with no blocking variant: sync
+    /// piggybacks hook/maintenance passes and must never hang one behind another device-wide
+    /// session. Reentrant on the holding thread like the other write locks (a session flow that
+    /// re-enters does not self-deadlock).
+    pub fn acquire_sync_session_timeout(
+        database: &Path,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<WriteLock>> {
+        Self::acquire_path_timeout(sync_session_lock_path(database), timeout)
     }
 
     fn acquire_path_blocking(lock_path: PathBuf) -> anyhow::Result<WriteLock> {
@@ -685,6 +712,73 @@ mod tests {
 
         let _ = fs::remove_file(&link);
         let _ = fs::remove_dir_all(&real);
+    }
+
+    #[test]
+    fn sync_session_lock_path_is_one_per_database_and_distinct_from_sibling_locks() {
+        // #483: the sync-session lock is MACHINE-scope (one per database file, like the schema and
+        // registry locks) — the per-device key it guards is per data-dir, not per repo or worktree.
+        let db = Path::new("/repo/.rag-rat/index.sqlite");
+        assert_eq!(sync_session_lock_path(db), sync_session_lock_path(db));
+        assert!(sync_session_lock_path(db).to_string_lossy().ends_with("rag-rat-sync.lock"));
+        // Never collides with the other lock files beside the same DB.
+        assert_ne!(sync_session_lock_path(db), schema_lock_path(db));
+        assert_ne!(sync_session_lock_path(db), registry_lock_path(db));
+        assert_ne!(sync_session_lock_path(db), write_lock_path(db, "aaaa11112222"));
+        assert_ne!(sync_session_lock_path(db), maintenance_lock_path(db, "aaaa11112222"));
+    }
+
+    #[test]
+    fn sync_session_lock_is_reentrant_within_a_thread_but_not_across_threads() {
+        // #483: two concurrent sync sessions would put the device key (the iroh node key) live on
+        // two endpoints at once — a second PROCESS/THREAD must contend on the real OS lock, while
+        // a nested same-thread acquire (a session flow re-entering) must not self-deadlock.
+        let dir = temp_dir();
+        let db = dir.join("index.sqlite");
+
+        let outer =
+            WriteLock::acquire_sync_session_timeout(&db, Duration::from_millis(100)).unwrap();
+        assert!(outer.is_some(), "first sync-session acquire should succeed");
+        let inner =
+            WriteLock::acquire_sync_session_timeout(&db, Duration::from_millis(50)).unwrap();
+        assert!(inner.is_some(), "nested same-thread acquire must re-enter, not block");
+        drop(inner);
+
+        let db_other = db.clone();
+        let got = std::thread::spawn(move || {
+            WriteLock::acquire_sync_session_timeout(&db_other, Duration::from_millis(100))
+                .unwrap()
+                .is_some()
+        })
+        .join()
+        .unwrap();
+        assert!(!got, "a second thread must contend on the real OS lock while a session runs");
+
+        // GLOBAL-LOCK ORDERING RULE sanity: a per-repo write lock is an INDEPENDENT file, so a
+        // repo's ordinary write is not blocked by a running sync session (only the bounded
+        // per-repo-under-global edge ever waits, and on its own flock).
+        let db_sibling = db.clone();
+        let repo_got = std::thread::spawn(move || {
+            WriteLock::acquire_timeout(&db_sibling, "aaaa11112222", Duration::from_millis(100))
+                .unwrap()
+                .is_some()
+        })
+        .join()
+        .unwrap();
+        assert!(repo_got, "a per-repo write lock must not be blocked by the sync-session lock");
+
+        drop(outer);
+        let db_after = db.clone();
+        let reacquired = std::thread::spawn(move || {
+            WriteLock::acquire_sync_session_timeout(&db_after, Duration::from_millis(100))
+                .unwrap()
+                .is_some()
+        })
+        .join()
+        .unwrap();
+        assert!(reacquired, "the lock is free after the outermost session guard drops");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
