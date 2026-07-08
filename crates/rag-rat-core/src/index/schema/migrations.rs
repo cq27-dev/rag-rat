@@ -1186,6 +1186,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_049_ID => Some(49),
             MIGRATION_050_ID => Some(50),
             MIGRATION_051_ID => Some(51),
+            MIGRATION_052_ID => Some(52),
             _ => None,
         })
         .max()
@@ -1246,6 +1247,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_049_ID
             | MIGRATION_050_ID
             | MIGRATION_051_ID
+            | MIGRATION_052_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1303,6 +1305,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_049_ID => migration.checksum != MIGRATION_049_CHECKSUM,
         MIGRATION_050_ID => migration.checksum != MIGRATION_050_CHECKSUM,
         MIGRATION_051_ID => migration.checksum != MIGRATION_051_CHECKSUM,
+        MIGRATION_052_ID => migration.checksum != MIGRATION_052_CHECKSUM,
         _ => false,
     }
 }
@@ -3526,6 +3529,57 @@ pub(crate) fn apply_clone_df_epoch(conn: &Connection) -> rusqlite::Result<()> {
             params![generation],
         )?;
     }
+    Ok(())
+}
+
+/// V052 (#503, phase B C4): the memory op-log storage tables — a durable home for the pure `oplog`
+/// primitives (op model, signed hash-chained entry, deterministic fold). Two layers (§5.4):
+///
+/// - **`oplog_entries`** is layer 1: the opaque signed entry log. `signed_bytes` is the sole source
+///   of truth; `entry_hash` (its content address + chain link + idempotency key),
+///   `device_fingerprint`, `lamport`, and `prev_hash` are denormalized from the SAME verified entry
+///   for indexed access and cannot drift. NO FK — the log is authored data that must OUTLIVE a
+///   reindex (the #248 content- addressed discipline); a reindex rewrites the code graph, never
+///   this table. `UNIQUE(device_ fingerprint, lamport)` pins each device's chain as strictly linear
+///   (a tripwire against a same-slot equivocation; per-`stream_id` fork DETECTION is a later S2
+///   increment).
+/// - **`oplog_projected_nodes` / `oplog_projected_edges`** are layer 2: a DERIVED shadow
+///   projection, wholly rebuilt by the full-replay fold (`store::reproject`) — never a source of
+///   truth, so a `DELETE`-all + reinsert is the whole update. `oplog_meta` stamps the projector
+///   version so a binary that learns a new op kind re-folds on demand (§5.4 upgrade re-fold) rather
+///   than trusting a stale materialization.
+///
+/// Idempotent (`CREATE TABLE IF NOT EXISTS`), self-transaction-free, replay-write-free (#498); the
+/// tables are fresh with no backfill.
+pub(crate) fn apply_oplog_storage(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS oplog_entries(
+             entry_hash         BLOB PRIMARY KEY,
+             device_fingerprint BLOB NOT NULL,
+             lamport            INTEGER NOT NULL,
+             prev_hash          BLOB,
+             signed_bytes       BLOB NOT NULL,
+             received_at_ms     INTEGER NOT NULL,
+             UNIQUE(device_fingerprint, lamport)
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS oplog_projected_nodes(
+             node_id      TEXT PRIMARY KEY,
+             content_json TEXT NOT NULL,
+             status       TEXT NOT NULL
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS oplog_projected_edges(
+             edge_key      TEXT PRIMARY KEY,
+             spec_json     TEXT NOT NULL,
+             resolved_json TEXT
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS oplog_meta(
+             key   TEXT PRIMARY KEY,
+             value TEXT NOT NULL
+         ) STRICT;",
+    )?;
     Ok(())
 }
 

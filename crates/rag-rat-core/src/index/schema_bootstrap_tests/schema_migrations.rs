@@ -1284,10 +1284,13 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
 fn migration_051_adds_clone_df_epoch_and_backfills_existing_generations() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V051 is the schema tip — the absolute pin (migration_050's drops to the symbolic
-    // `current_version == LATEST` check when this lands).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 51, "V051 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 51, "schema at LATEST after apply");
+    // V052 now holds the absolute tip pin (migration_052's test); this drops to the symbolic
+    // `current_version == LATEST` freshness check.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
     assert!(
         conn_table_exists(&conn, "clone_df_epoch"),
         "the per-generation df snapshot table exists (#479)"
@@ -1361,6 +1364,38 @@ fn migration_051_adds_clone_df_epoch_and_backfills_existing_generations() {
         Vec::<(i64, i64, i64)>::new(),
         "epoch rows CASCADE with the generation"
     );
+}
+
+#[test]
+fn migration_052_adds_oplog_storage_tables() {
+    const OPLOG_TABLES: [&str; 4] =
+        ["oplog_entries", "oplog_projected_nodes", "oplog_projected_edges", "oplog_meta"];
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V052 is the schema tip — the absolute pin (migration_051's drops to the symbolic
+    // `current_version == LATEST` check when a V053 lands).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 52, "V052 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 52, "schema at LATEST after apply");
+    for table in OPLOG_TABLES {
+        assert!(conn_table_exists(&conn, table), "V052 creates {table}");
+    }
+
+    // Deferred-absence in ISOLATION: drop the tables and re-run the applier alone (never against
+    // the full ladder's prior state). It recreates them, and a second run is a no-op (CREATE …
+    // IF NOT EXISTS), matching the replay-write-free discipline.
+    conn.execute_batch(
+        "DROP TABLE oplog_entries;
+         DROP TABLE oplog_projected_nodes;
+         DROP TABLE oplog_projected_edges;
+         DROP TABLE oplog_meta;",
+    )
+    .unwrap();
+    assert!(!conn_table_exists(&conn, "oplog_entries"), "dropped before the isolated apply");
+    schema::apply_oplog_storage(&conn).unwrap();
+    schema::apply_oplog_storage(&conn).expect("replay is a no-op");
+    for table in OPLOG_TABLES {
+        assert!(conn_table_exists(&conn, table), "the isolated applier recreates {table}");
+    }
 }
 
 #[test]

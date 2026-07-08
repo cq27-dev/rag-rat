@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 51;
+pub const LATEST_SCHEMA_VERSION: u32 = 52;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -351,6 +351,13 @@ const MIGRATION_051_DESCRIPTION: &str =
      build's frozen token order while the live candidate paths read a clone_token_df that moves \
      again on incremental passes; backfilled from the current (freeze-pinned) df for existing \
      generations";
+const MIGRATION_052_ID: &str = "052_oplog_storage";
+const MIGRATION_052_CHECKSUM: &str = "sha256:rag-rat-oplog-storage-v52";
+const MIGRATION_052_DESCRIPTION: &str =
+    "Add the memory op-log storage tables (#503, phase B C4): oplog_entries — the layer-1 opaque \
+     signed entry log, content-addressed on entry_hash, no FK; and the layer-2 shadow projection \
+     (oplog_projected_nodes / oplog_projected_edges) plus oplog_meta, wholly rebuilt by the \
+     full-replay fold. Fresh tables (no backfill); nothing is wired to the live write path yet";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -798,6 +805,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_051_CHECKSUM,
         description: MIGRATION_051_DESCRIPTION,
         apply: apply_clone_df_epoch,
+    },
+    Migration {
+        id: MIGRATION_052_ID,
+        checksum: MIGRATION_052_CHECKSUM,
+        description: MIGRATION_052_DESCRIPTION,
+        apply: apply_oplog_storage,
     },
 ];
 

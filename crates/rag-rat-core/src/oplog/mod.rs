@@ -18,13 +18,18 @@
 //! - [`cbor`]: the shared canonical-CBOR discipline (definite lengths, minimal headers, sorted map
 //!   keys, no trailing) both wire layers enforce.
 //!
-//! Nothing here is wired into the live write path yet (later increments add SQLite storage, the
-//! append-on-mutation seam, roster/epochs, and transport) — this mirrors the `content_hash` freeze:
-//! pin the semantic primitive first, in isolation-testable form. See `issue-489-plan.md` /
-//! `issue-497-plan.md`.
+//! - [`store`]: the durable SQLite seam — the layer-1 opaque signed entry log (verified,
+//!   chain-continuous, idempotent [`store::append`]) plus the layer-2 full-replay projection into
+//!   oplog-owned shadow tables, kept in sync atomically (§C4/§5.4).
+//!
+//! Nothing here is wired into the live write path yet (later increments add the append-on-mutation
+//! seam, roster/epochs, immutable stream identity, and transport) — this mirrors the `content_hash`
+//! freeze: pin the semantic primitive first, in isolation-testable form. See `issue-489-plan.md` /
+//! `issue-497-plan.md` / `issue-503-plan.md`.
 
 mod cbor;
 mod device;
 mod entry;
 mod op;
 mod project;
+mod store;

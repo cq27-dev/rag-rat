@@ -105,6 +105,31 @@ pub(super) fn sign_entry(
     }
 }
 
+/// Sign a body over ARBITRARY op bytes (not `op::encode` of a known op) — the storage layer's
+/// poison guard and its unknown-op retention path need entries whose `op_bytes` are undecodable or
+/// decode to `Unknown`, which the typed [`sign_entry`] can't produce. Test-only; the production
+/// wire is untouched.
+#[cfg(test)]
+pub(super) fn sign_entry_from_op_bytes(
+    secret: &DeviceSecret,
+    prev_hash: Option<[u8; 32]>,
+    lamport: u64,
+    op_bytes: Vec<u8>,
+) -> SignedEntry {
+    let device_fingerprint = secret.public().fingerprint();
+    let body_bytes =
+        encode_body(&BodyParts { prev_hash, lamport, device_fingerprint, op_bytes: &op_bytes });
+    let entry_hash = sha256(&body_bytes);
+    let signature = secret.sign(&body_bytes);
+    let signed_bytes = encode_signed(&body_bytes, &signature);
+    SignedEntry {
+        entry: VerifiedEntry { prev_hash, lamport, device_fingerprint, op_bytes, entry_hash },
+        signature,
+        body_bytes,
+        signed_bytes,
+    }
+}
+
 /// Decode a signed entry envelope, STRUCTURE only — canonical (no trailing) outer + body, extract
 /// the fields. Does NOT verify the signature (that is [`verify_signed`]).
 pub(super) fn decode_signed(bytes: &[u8]) -> anyhow::Result<SignedEntry> {
