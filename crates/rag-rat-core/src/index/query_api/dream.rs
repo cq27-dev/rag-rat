@@ -8,7 +8,7 @@ use crate::dream::{CompactPass, DreamOptions, DreamReport, VerdictPass};
 
 impl IndexDatabase {
     pub fn dream_run(&self, opts: DreamOptions) -> anyhow::Result<DreamReport> {
-        Ok(crate::dream::dream_run(self.storage.connection(), opts)?)
+        crate::dream::dream_run(self.storage.connection(), opts)
     }
 
     /// [`Self::dream_run`] plus the phase-B model verdict pass and the phase-C model compaction

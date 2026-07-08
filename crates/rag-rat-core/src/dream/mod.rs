@@ -130,7 +130,7 @@ fn effective_rank(base_rank: f64, first_seen_at_ms: i64, now_ms: i64) -> f64 {
 /// model); the model verdict pass runs in [`dream_run_with_passes`] and writes `memory_reality`
 /// BEFORE this reads it. With no model ever run, the `memory_reality` verdict rows are absent, so
 /// the divergence set is empty — a harmless no-op.
-pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<DreamReport> {
+pub fn dream_run(conn: &Connection, opts: DreamOptions) -> anyhow::Result<DreamReport> {
     let mut findings = findings::coverage_gap(conn, opts.limit)?;
     findings.extend(findings::stale_reference(conn)?);
     // The verification finding kinds emit over ALL active memories / ALL stored verdict rows
@@ -225,7 +225,7 @@ pub fn dream_run_with_passes(
     if let Some(pass) = compact_pass {
         compact::run_compact_pass(conn, pass, opts.now_ms)?;
     }
-    Ok(dream_run(conn, opts)?)
+    dream_run(conn, opts)
 }
 
 /// Whether the model passes would call the model AT ALL this run — the zero-work guard for

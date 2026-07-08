@@ -3,7 +3,7 @@
 //! revive) with repo-folded ids. Split out of the former monolithic `dream.rs` so the module index
 //! (`mod.rs`) curates the surface and the v2 verification pass lives in its own sibling (`verify`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use regex::Regex;
 use rusqlite::Connection;
@@ -11,6 +11,14 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::DreamFinding;
+use crate::query::pagerank::{self, ImportanceOptions};
+
+/// Ranking pool `coverage_gap` pulls from [`pagerank::important_symbols`] before filtering out
+/// memory-covered / test-infra rows. Sized like the ranker's own `MAX_RESULTS` cap so a repo whose
+/// most-load-bearing symbols are already well-memoried still leaves enough uncovered candidates to
+/// fill the finding `limit`; a symbol ranked below this pool is, by definition, not load-bearing
+/// enough to be worth a coverage-gap finding.
+const COVERAGE_RANK_POOL: usize = 500;
 
 /// The finding kinds a plain `dream` run always computes (no `--verify`) — the resolve pass may
 /// close a stale one even when this run produced zero of them.
@@ -96,51 +104,136 @@ fn hex16(bytes: &[u8]) -> String {
     bytes.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-/// `coverage_gap`: top call-graph in-degree symbols with no memory binding (load-bearing code with
-/// no institutional memory). Importance = DISTINCT caller count (`edges_data` carries several rows
-/// per caller pair, so `COUNT(*)` would over-count). COVERAGE mirrors the canonical memory query
-/// (query/memory/api.rs): a callee is covered if a binding matches its `symbol_id`, its logical
-/// symbol (mapped through `logical_symbol_members` — a logical_symbol binding covers ALL its member
-/// variants, not just the one stored `symbol_id`), or its file path. Test infra is filtered by
-/// `has_test_code`, NOT an unanchored `path LIKE '%test%'` (which would drop real files like
-/// `attestation.rs`/`latest.rs`). All filters run IN SQL *before* the LIMIT so the budget is spent
-/// on ELIGIBLE rows. The `files` join resolves to the active-checkout `temp.files` view so callees
-/// are checkout-scoped; the caller in-degree is not yet scoped (follow-up: reuse the scoped
-/// `important_symbols` PageRank instead of this raw in-degree proxy).
-pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<DreamFinding>> {
-    // The COVERAGE exclusion subqueries read `repo_memory_bindings` and must be scoped to the
-    // ACTIVE repo (V042): a SIBLING repo's binding — a colliding `symbol_id` rowid, or a path
-    // binding at a path this repo also has (the same-path case) — would otherwise mark this repo's
-    // load-bearing symbol as covered and SUPPRESS its coverage-gap finding (a false negative).
-    // `{binding_clause}`/`{b_clause}` empty pre-A5.
+/// `coverage_gap`: the most load-bearing symbols with no memory binding (load-bearing code with no
+/// institutional memory). Importance is the CANONICAL scoped weighted PageRank
+/// ([`pagerank::important_symbols`], query/pagerank.rs), NOT a raw caller in-degree — the #261 fix.
+/// The old proxy `COUNT(DISTINCT e.from_symbol_id)` counted callers from `edges_data` unscoped, so
+/// on a consolidated DB it summed callers from OTHER worktrees/overlays (latent on a single
+/// checkout, wrong across worktrees); the PageRank facility reads `edges_data` joined to the
+/// per-connection `files` scope view (active checkout only) and hydrates winners through it, so
+/// both the flow and the endpoints are checkout-scoped — and it is a strictly better "load-bearing"
+/// signal (edge-weighted + confidence-scaled) than raw in-degree.
+///
+/// We rank a generous pool ([`COVERAGE_RANK_POOL`]) and then, IN RUST, drop the memory-covered and
+/// test-infra rows and take the top `limit` — the ranker has no coverage/test notion, so the filter
+/// can't live in its SQL. COVERAGE mirrors the canonical memory query (query/memory/api.rs): a
+/// symbol is covered if a binding matches its `symbol_id`, its logical symbol (mapped through
+/// `logical_symbol_members` — a logical binding covers ALL its member variants), or its file path.
+/// Test infra is filtered by `has_test_code`, NOT `path LIKE '%test%'` (which would drop real files
+/// like `attestation.rs`). Every coverage read is ACTIVE-repo scoped (V042): a SIBLING repo's
+/// binding — a colliding `symbol_id` rowid, or a path binding at a path this repo also has — must
+/// not mark this repo's load-bearing symbol covered and suppress its finding (a false negative).
+///
+/// `oracle_effects: None` — `dream_run` holds only a `&Connection`, not the `IndexDatabase` state
+/// (active commit / worktree id) the SCIP-oracle upgrade map is built from, so `coverage_gap` ranks
+/// the heuristic confidence-weighted graph. That is the same scoped substrate `important_symbols`
+/// uses, minus the optional compiler upgrade — acceptable for a heuristic worklist signal.
+pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> anyhow::Result<Vec<DreamFinding>> {
+    // A zero budget wants zero findings — skip the coverage-set reads and the whole-graph PageRank
+    // (the old `LIMIT 0` SQL was free; keep this path free too).
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    // `{binding_clause}`/`{b_clause}` are ` AND <table>.repo_id = '<id>'` under scope, empty
+    // pre-A5.
     let scope = crate::index::schema::periphery_repo_scope(conn, "repo_memories")?;
     let binding_clause =
         crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memory_bindings");
     let b_clause = crate::index::schema::periphery_repo_scope_clause(&scope, "b");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT s.name, f.path, COUNT(DISTINCT e.from_symbol_id) AS d FROM edges_data e JOIN \
-         symbols s ON s.id = e.to_symbol_id JOIN files f ON f.id = s.file_id WHERE e.to_symbol_id \
-         IS NOT NULL AND e.from_symbol_id IS NOT NULL AND f.has_test_code = 0 AND e.to_symbol_id \
-         NOT IN (SELECT symbol_id FROM repo_memory_bindings WHERE symbol_id IS NOT \
-         NULL{binding_clause}) AND e.to_symbol_id NOT IN (SELECT lsm.symbol_id FROM \
-         logical_symbol_members lsm JOIN repo_memory_bindings b ON b.logical_symbol_id = \
-         lsm.logical_symbol_id WHERE b.logical_symbol_id IS NOT NULL{b_clause}) AND f.path NOT IN \
-         (SELECT path FROM repo_memory_bindings WHERE path IS NOT NULL{binding_clause}) GROUP BY \
-         e.to_symbol_id ORDER BY d DESC LIMIT ?1"
-    ))?;
-    let rows: Vec<(String, String, i64)> = stmt
-        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+
+    // Covered symbol ids: a direct `symbol_id` binding OR any member of a bound logical symbol.
+    let mut covered_symbols: HashSet<i64> = conn
+        .prepare(&format!(
+            "SELECT symbol_id FROM repo_memory_bindings WHERE symbol_id IS NOT \
+             NULL{binding_clause}"
+        ))?
+        .query_map([], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let top_d = rows.first().map(|(_, _, d)| *d).unwrap_or(1).max(1) as f64;
-    Ok(rows
-        .into_iter()
-        .map(|(name, path, d)| DreamFinding {
+    let logical_members = conn
+        .prepare(&format!(
+            "SELECT lsm.symbol_id FROM logical_symbol_members lsm JOIN repo_memory_bindings b ON \
+             b.logical_symbol_id = lsm.logical_symbol_id WHERE b.logical_symbol_id IS NOT \
+             NULL{b_clause}"
+        ))?
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    covered_symbols.extend(logical_members);
+
+    let covered_paths: HashSet<String> = conn
+        .prepare(&format!(
+            "SELECT path FROM repo_memory_bindings WHERE path IS NOT NULL{binding_clause}"
+        ))?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    // Test-infra files (mirrors the old `f.has_test_code = 0`). Read through the SAME `files` scope
+    // view `important_symbols` hydrates paths through, so the path comparison below is consistent.
+    let test_paths: HashSet<String> = conn
+        .prepare("SELECT path FROM files WHERE has_test_code = 1")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    // Symbols that are DEPENDED UPON in the active checkout: the target of an in-scope edge with a
+    // resolved caller. `important_symbols` ranks EVERY graph node, so a source-only leaf caller
+    // (only outgoing edges) still gets non-zero PageRank from teleport mass and would otherwise
+    // surface as a bogus coverage gap — but a coverage gap is load-bearing = depended-upon
+    // code. This restores the old builder's `e.to_symbol_id` gate: only inbound symbols
+    // qualify. Scoped by `source_file_id` through the same `files` view the ranker uses, so a
+    // purely cross-worktree caller never counts.
+    let inbound: HashSet<i64> = conn
+        .prepare(
+            "SELECT DISTINCT d.to_symbol_id FROM edges_data d JOIN files ON files.id = \
+             d.source_file_id WHERE d.to_symbol_id IS NOT NULL AND d.from_symbol_id IS NOT NULL",
+        )?
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let ranked = pagerank::important_symbols(conn, ImportanceOptions {
+        limit: limit.max(COVERAGE_RANK_POOL),
+        personalize_to: &[],
+        oracle_effects: None,
+    })?;
+
+    let mut seen_subjects: HashSet<String> = HashSet::new();
+    let mut out: Vec<DreamFinding> = Vec::new();
+    let mut top_score = f64::MIN_POSITIVE;
+    for sym in ranked.symbols {
+        if out.len() >= limit {
+            break;
+        }
+        if !inbound.contains(&sym.symbol_id)
+            || covered_symbols.contains(&sym.symbol_id)
+            || covered_paths.contains(&sym.path)
+            || test_paths.contains(&sym.path)
+        {
+            continue;
+        }
+        // `path::<bare name>` (the last `::` segment of the qualified name) — the readable identity
+        // the old `s.name`-based subject used, not the redundant `path::<fully-qualified>`. cfg
+        // twins / overloads hydrate to the SAME subject from different symbol ids: emit ONE finding
+        // (keep the highest-ranked), so a run never yields two findings sharing a (kind, subject).
+        let bare = sym.qualified_name.rsplit("::").next().unwrap_or(sym.qualified_name.as_str());
+        let subject = format!("{}::{}", sym.path, bare);
+        if !seen_subjects.insert(subject.clone()) {
+            continue;
+        }
+        // Normalize by the top uncovered score so the highest-priority gap ranks 1.0 (the old
+        // `d / top_d` semantics), decaying with importance. The evidence carries NO volatile score
+        // — a stable claim keeps a reviewer's accept/dismiss alive across graph churn (only
+        // becoming covered, or dropping out of the load-bearing pool, resolves the
+        // finding).
+        if out.is_empty() {
+            top_score = sym.score.max(f64::MIN_POSITIVE);
+        }
+        out.push(DreamFinding {
             kind: "coverage_gap".into(),
-            subject: format!("{path}::{name}"),
-            evidence: format!("{d} distinct callers, no memory binding [E0 importance proxy]"),
-            rank: d as f64 / top_d,
-        })
-        .collect())
+            subject,
+            evidence: "load-bearing symbol (scoped weighted PageRank), no memory binding [E0]"
+                .into(),
+            rank: sym.score / top_score,
+        });
+    }
+    Ok(out)
 }
 
 /// `stale_reference`: a memory body references a `.rs` path that no longer resolves against the
@@ -236,6 +329,31 @@ pub(super) fn sync(
     Ok(counts)
 }
 
+/// Collapse findings that share a `(kind, subject)` to ONE — the highest-ranked (ties keep the
+/// first seen) — preserving the survivors' first-seen order. The dream lifecycle keys on
+/// `(kind, subject)`, so two inputs sharing it can't both live as distinct current rows; deduping
+/// here (rather than letting the loop's supersede race silently drop one) makes the survivor
+/// deterministic. See the call site for the failure it guards (#261).
+fn dedup_by_kind_subject(findings: &[DreamFinding]) -> Vec<&DreamFinding> {
+    let mut position: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut order: Vec<&DreamFinding> = Vec::new();
+    for f in findings {
+        let key = (f.kind.as_str(), f.subject.as_str());
+        match position.get(&key) {
+            // Keep the winner's SLOT (first-seen order) but swap in the higher-ranked claim.
+            Some(&idx) =>
+                if f.rank > order[idx].rank {
+                    order[idx] = f;
+                },
+            None => {
+                position.insert(key, order.len());
+                order.push(f);
+            },
+        }
+    }
+    order
+}
+
 fn sync_in_tx(
     conn: &Connection,
     findings: &[DreamFinding],
@@ -243,6 +361,14 @@ fn sync_in_tx(
     resolve_kinds: &[&str],
 ) -> rusqlite::Result<(usize, usize, usize, usize)> {
     let (mut opened, mut refreshed, mut superseded, mut resolved) = (0, 0, 0, 0);
+    // Dedup the INPUT by (kind, subject) first (#261). Two findings sharing a (kind, subject) but
+    // carrying different evidence (→ different claim_hash → different id) would otherwise race in
+    // the loop below: the second's `supersede_others` supersedes the first WITHIN the same run, so
+    // a real finding is silently dropped (last-writer wins). Keep the highest-ranked claim
+    // deterministically (ties keep the first seen) so the survivor is stable across re-runs. The
+    // finding builders already avoid this (coverage_gap dedups subjects; the memory-* kinds key on
+    // a unique memory id), so this is the belt-and-braces guard at the shared sync seam.
+    let findings = dedup_by_kind_subject(findings);
     let mut seen: HashSet<(String, String)> = HashSet::new();
     // Resolve the active-repo scope once for the whole sync (all statements below share it): the
     // read predicate `{repo_clause}` and the INSERT's `{repo_col}`/`{repo_val}` stamp prefix.
@@ -721,5 +847,159 @@ mod tests {
         assert!(count(&c, "resolved") >= 1, "absent finding resolves");
         sync(&c, &cg("10 callers", 0.1), 5000, BASE_FINDING_KINDS).unwrap();
         assert_eq!(count(&c, "open"), 1, "reappearing resolved finding is revived to open");
+    }
+
+    // --- coverage_gap over the PageRank ranker (#261) -------------------------------------------
+
+    fn intern(c: &Connection, value: &str) -> i64 {
+        c.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", [value]).unwrap();
+        c.query_row("SELECT id FROM name_strings WHERE value = ?1", [value], |r| r.get(0)).unwrap()
+    }
+
+    fn add_file(c: &Connection, path: &str, has_test_code: i64) -> i64 {
+        c.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, has_test_code, repo_id) VALUES (?1, 'rust', 'source', 'h', \
+             0, 0, '', '', ?2, 'r')",
+            rusqlite::params![path, has_test_code],
+        )
+        .unwrap();
+        c.last_insert_rowid()
+    }
+
+    fn add_symbol(c: &Connection, file_id: i64, name: &str) -> i64 {
+        let qn = intern(c, name);
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+             end_byte, start_line, end_line, is_test) VALUES (?1, 'rust', ?2, ?3, 'function', 0, \
+             0, 0, 0, 0)",
+            rusqlite::params![file_id, name, qn],
+        )
+        .unwrap();
+        c.last_insert_rowid()
+    }
+
+    fn add_call(c: &Connection, file_id: i64, from: (i64, &str), to: (i64, &str)) {
+        c.execute(
+            "INSERT INTO edges_data(source_file_id, from_symbol_id, to_symbol_id, from_name_id, \
+             to_name_id, edge_kind_id, confidence_id, resolution_id) VALUES (?1, ?2, ?3, ?4, ?5, \
+             ?6, ?7, ?7)",
+            rusqlite::params![
+                file_id,
+                from.0,
+                to.0,
+                intern(c, from.1),
+                intern(c, to.1),
+                intern(c, "calls_name"),
+                intern(c, "Exact"),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn coverage_gap_ranks_by_pagerank_and_excludes_covered_and_test_symbols() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        // `hub`, `covered_hub`, and `test_hub` are each called by `a` and `b` (equal in-degree), so
+        // the raw-in-degree proxy could not separate them — but `covered_hub` has a memory and
+        // `test_hub` lives in test infra, so only `hub` is a real gap. The PageRank ranker supplies
+        // the importance; the Rust-side filter drops the covered / test rows.
+        let src = add_file(&c, "src/lib.rs", 0);
+        let test = add_file(&c, "src/lib_test.rs", 1);
+        let hub = add_symbol(&c, src, "hub");
+        let covered = add_symbol(&c, src, "covered_hub");
+        let test_hub = add_symbol(&c, test, "test_hub");
+        let a = add_symbol(&c, src, "a");
+        let b = add_symbol(&c, src, "b");
+        for (caller, cname) in [(a, "a"), (b, "b")] {
+            add_call(&c, src, (caller, cname), (hub, "hub"));
+            add_call(&c, src, (caller, cname), (covered, "covered_hub"));
+            add_call(&c, test, (caller, cname), (test_hub, "test_hub"));
+        }
+        // A symbol-id binding covers `covered_hub` (repo-scoped). The binding's `memory_id` FKs to
+        // `repo_memories`, so the memory row must exist first.
+        c.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms, \
+             updated_at_ms, source, memory_version, repo_id) VALUES ('m', 'Invariant', 't', 'b', \
+             'high', 'active', 0, 0, 'agent', 'v1', 'r')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, symbol_id, \
+             anchor_status, created_at_ms, repo_id) VALUES ('m', 'symbol', 'bnd', ?1, 'current', \
+             0, 'r')",
+            [covered],
+        )
+        .unwrap();
+
+        let findings = coverage_gap(&c, 10).unwrap();
+        let subjects: Vec<&str> = findings.iter().map(|f| f.subject.as_str()).collect();
+        assert!(
+            subjects.contains(&"src/lib.rs::hub"),
+            "the uncovered, non-test load-bearing hub is a coverage gap: {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s.contains("covered_hub")),
+            "a memory-covered symbol is excluded: {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s.contains("test_hub")),
+            "a test-infra symbol is excluded: {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| *s == "src/lib.rs::a" || *s == "src/lib.rs::b"),
+            "source-only callers (no inbound edge) are NOT load-bearing and must be excluded: \
+             {subjects:?}"
+        );
+        let hub_finding = findings.iter().find(|f| f.subject == "src/lib.rs::hub").unwrap();
+        assert!(
+            (hub_finding.rank - 1.0).abs() < 1e-9,
+            "the top gap normalizes to rank 1.0: {}",
+            hub_finding.rank
+        );
+        assert!(
+            hub_finding.evidence.contains("PageRank"),
+            "evidence cites the importance signal: {}",
+            hub_finding.evidence
+        );
+    }
+
+    #[test]
+    fn sync_dedups_same_kind_subject_keeping_the_highest_ranked_claim() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        // Two findings, SAME (kind, subject), DIFFERENT evidence → different claim_hash → different
+        // id. Before #261 the second's supersede swept the first WITHIN the run (last-writer drop).
+        // Now the higher-ranked claim is the single open row and nothing is superseded.
+        let findings = vec![
+            DreamFinding {
+                kind: "coverage_gap".into(),
+                subject: "x::F".into(),
+                evidence: "lo".into(),
+                rank: 0.2,
+            },
+            DreamFinding {
+                kind: "coverage_gap".into(),
+                subject: "x::F".into(),
+                evidence: "hi".into(),
+                rank: 0.9,
+            },
+        ];
+        let (opened, _refreshed, superseded, _resolved) =
+            sync(&c, &findings, 100, BASE_FINDING_KINDS).unwrap();
+        assert_eq!(opened, 1, "exactly one finding opens for the (kind, subject)");
+        assert_eq!(superseded, 0, "no within-run supersede race");
+        let rows: Vec<(String, String)> = c
+            .prepare("SELECT status, evidence FROM dream_findings WHERE subject = 'x::F'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "only the winning claim is persisted: {rows:?}");
+        assert_eq!(rows[0].0, "open");
+        assert_eq!(rows[0].1, "hi", "the higher-ranked claim wins the collision");
     }
 }

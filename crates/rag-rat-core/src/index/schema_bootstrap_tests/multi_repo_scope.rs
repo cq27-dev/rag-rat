@@ -1378,17 +1378,10 @@ fn dream_candidate_builders_ignore_a_sibling_repos_memories() {
     )
     .unwrap();
     let file_id = conn.last_insert_rowid();
-    let mut symbol_ids = Vec::new();
-    for name in ["shared_fn", "caller_fn"] {
-        conn.execute(
-            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
-             end_byte, start_line, end_line, is_test)
-             VALUES (?1, 'rust', ?2, NULL, 'function', 0, 0, 0, 0, 0)",
-            rusqlite::params![file_id, name],
-        )
-        .unwrap();
-        symbol_ids.push(conn.last_insert_rowid());
-    }
+    // Intern the names first so each symbol carries a real `qualified_name_id`: the PageRank ranker
+    // `coverage_gap` now uses (#261) hydrates its winners through `qualified_name`, and production
+    // symbols always have one (file_index interns it unconditionally) — a NULL here is an
+    // unrealistic shortcut that would drop the symbol from the ranking.
     conn.execute_batch(
         "INSERT OR IGNORE INTO name_strings(value)
              VALUES ('caller_fn'), ('shared_fn'), ('calls_name'), ('Exact');",
@@ -1398,6 +1391,17 @@ fn dream_candidate_builders_ignore_a_sibling_repos_memories() {
         conn.query_row("SELECT id FROM name_strings WHERE value = ?1", [value], |r| r.get(0))
             .unwrap()
     };
+    let mut symbol_ids = Vec::new();
+    for name in ["shared_fn", "caller_fn"] {
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
+             end_byte, start_line, end_line, is_test)
+             VALUES (?1, 'rust', ?2, ?3, 'function', 0, 0, 0, 0, 0)",
+            rusqlite::params![file_id, name, name_id(name)],
+        )
+        .unwrap();
+        symbol_ids.push(conn.last_insert_rowid());
+    }
     conn.execute(
         "INSERT INTO edges_data(source_file_id, from_symbol_id, to_symbol_id, from_name_id, \
          to_name_id, edge_kind_id, confidence_id, resolution_id)
