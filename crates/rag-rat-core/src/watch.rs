@@ -10,12 +10,16 @@
 //!   with a max-latency cap so sustained writes can't starve a pass.
 //! - Each pass runs the existing pipeline: discover → reconcile → (rate-limited) gc →
 //!   memory_validate. Discover handles additions/edits/deletions; the pass is idempotent.
+//! - Passes execute on a dedicated worker thread, never on the event loop (#506): a long stage
+//!   (cold embedding backlog, clone-graph rebuild) or a blocked write-lock acquisition must not
+//!   stop events from classifying or the fleet hot-upgrade trigger from firing. One pass in flight
+//!   at a time; fire conditions that arrive mid-pass coalesce into the armed debounce.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -55,6 +59,9 @@ const SKIP_TIMEOUT: Duration = Duration::from_secs(3);
 const FLEET_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Max-latency cap for the fleet-trigger debounce (sustained binary churn still fires).
 const FLEET_MAX_LATENCY: Duration = Duration::from_millis(2000);
+/// Event-loop wait when no deadline is armed — also bounds the stop-flag check while a pass is in
+/// flight, since the loop must keep iterating for the fleet trigger during a long pass (#506).
+const IDLE_WAIT: Duration = Duration::from_millis(500);
 
 /// Debounce state with a hard max-latency cap. Pure (clock injected) so it is unit-testable without
 /// real filesystem events.
@@ -95,6 +102,93 @@ impl Debounce {
     fn should_fire(&self, now: Instant) -> bool {
         self.fire_at().is_some_and(|at| now >= at)
     }
+}
+
+/// What the event loop asks the pass worker to run (#506).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PassRequest {
+    /// Startup catch-up: covers edits made while no watcher was running, and retries a base
+    /// embedding backlog left by a bounded prior pass. Does not count toward the gc cadence.
+    StartupCatchup,
+    Maintenance {
+        run_gc: bool,
+    },
+}
+
+/// Everything that wakes the event loop: filesystem events from notify, pass completions from the
+/// worker thread, and the drop-time wake that makes `stop` observable immediately instead of at
+/// the next recv timeout (idle waits stretch to the periodic-sweep interval).
+#[derive(Debug)]
+enum LoopMsg {
+    Fs(notify::Result<Event>),
+    PassDone,
+    Wake,
+}
+
+/// At most one maintenance pass in flight per watcher (#506). A fire condition that arrives while
+/// a pass runs is NOT queued: the caller leaves the debounce armed (see [`EventLoop::run`]) so the
+/// follow-up dispatches as soon as the completion lands, coalescing any number of mid-pass fires
+/// into one.
+#[derive(Debug)]
+struct PassScheduler {
+    inflight: bool,
+    passes: u64,
+}
+
+impl PassScheduler {
+    fn new() -> Self {
+        Self { inflight: false, passes: 0 }
+    }
+
+    /// The startup catch-up request; in flight like any pass, but outside the gc cadence.
+    fn dispatch_startup(&mut self) -> PassRequest {
+        self.inflight = true;
+        PassRequest::StartupCatchup
+    }
+
+    /// The next maintenance request, or `None` while a pass is already in flight.
+    fn dispatch(&mut self) -> Option<PassRequest> {
+        if self.inflight {
+            return None;
+        }
+        self.inflight = true;
+        self.passes += 1;
+        Some(PassRequest::Maintenance { run_gc: self.passes.is_multiple_of(GC_EVERY_PASSES) })
+    }
+
+    fn on_done(&mut self) {
+        self.inflight = false;
+    }
+
+    fn in_flight(&self) -> bool {
+        self.inflight
+    }
+}
+
+/// Spawn the maintenance worker (#506): passes run here, OFF the event-loop thread, so debounced
+/// events keep classifying and the fleet hot-upgrade trigger keeps firing while a pass crunches
+/// (or sits blocked on the per-DB write lock). Cross-process collision discipline is unchanged —
+/// each pass still takes the write lock itself, so concurrent writers (git-hook `maintenance`,
+/// other servers' elected watchers, the CLI) serialize exactly as before; the single worker
+/// thread is what keeps THIS watcher to one pass at a time. Each request is answered with
+/// [`LoopMsg::PassDone`] so the loop can refresh worktree watch state and dispatch a coalesced
+/// follow-up; the worker exits when the request channel closes.
+fn spawn_pass_worker(
+    pass_rx: Receiver<PassRequest>,
+    done_tx: Sender<LoopMsg>,
+    mut run_pass_request: impl FnMut(&PassRequest) + Send + 'static,
+) -> Option<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("rag-rat-watch-pass".to_string())
+        .spawn(move || {
+            while let Ok(request) = pass_rx.recv() {
+                run_pass_request(&request);
+                if done_tx.send(LoopMsg::PassDone).is_err() {
+                    return;
+                }
+            }
+        })
+        .ok()
 }
 
 /// Run one maintenance pass, blocking on the per-DB write lock (watcher-to-watcher serializes).
@@ -868,6 +962,7 @@ fn event_targets_binary(fleet_bin: Option<&Path>, event: &Event) -> bool {
 #[derive(Debug)]
 pub struct Watcher {
     stop: Arc<AtomicBool>,
+    wake: Sender<LoopMsg>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -887,20 +982,27 @@ impl Watcher {
             return None;
         }
         let stop = Arc::new(AtomicBool::new(false));
+        // The loop channel is created here (not in `watcher_main`) so Drop holds a sender and can
+        // wake the loop out of its recv wait the moment `stop` is set.
+        let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("rag-rat-watch".to_string())
             .spawn({
                 let stop = Arc::clone(&stop);
-                move || watcher_main(config, fleet_bin, &stop)
+                let tx = tx.clone();
+                move || watcher_main(config, fleet_bin, &stop, tx, rx)
             })
             .ok()?;
-        Some(Watcher { stop, handle: Some(handle) })
+        Some(Watcher { stop, wake: tx, handle: Some(handle) })
     }
 }
 
 impl Drop for Watcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Without the wake, an idle loop observes `stop` only at its next recv timeout — up to
+        // the periodic-sweep interval — long past the host's post-EOF kill grace.
+        let _ = self.wake.send(LoopMsg::Wake);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1130,7 +1232,13 @@ fn sync_linked_worktrees_after_pass(
     linked_worktrees.sync(watcher, config, current);
 }
 
-fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
+fn watcher_main(
+    config: Config,
+    fleet_bin: Option<PathBuf>,
+    stop: &AtomicBool,
+    tx: Sender<LoopMsg>,
+    rx: Receiver<LoopMsg>,
+) {
     let base_dir =
         config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
     let election_path = locks::election_lock_path(&base_dir, &config.root);
@@ -1146,14 +1254,11 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
         }
     };
 
-    // Catch-up pass: covers edits made while no watcher was running (startup / election gap).
-    // Do not force the reconcile/gc/memory tail on every process start; on an unchanged checkout,
-    // startup must stay discover-only and write nothing past any cheap freshness repairs.
-    let _ = startup_catchup_pass(&config);
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let Ok(mut notify_watcher) = recommended_watcher(move |res| {
-        let _ = tx.send(res);
+    let Ok(mut notify_watcher) = recommended_watcher({
+        let tx = tx.clone();
+        move |res| {
+            let _ = tx.send(LoopMsg::Fs(res));
+        }
     }) else {
         return;
     };
@@ -1198,115 +1303,208 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
         fleet_bin.as_deref(),
     );
 
-    let mut debounce = Debounce::new(
-        Duration::from_millis(config.watch.debounce_ms),
-        Duration::from_millis(config.watch.max_latency_ms),
-    );
-    let mut fleet_debounce = Debounce::new(FLEET_DEBOUNCE, FLEET_MAX_LATENCY);
-    // Periodic backstop (covers event-blind filesystems + missed events). `None` disables it.
-    let periodic = (config.watch.periodic_sweep_secs > 0)
-        .then(|| Duration::from_secs(config.watch.periodic_sweep_secs));
-    let mut passes: u64 = 0;
-    let mut last_pass = Instant::now(); // the catch-up pass just ran
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
+    // Maintenance passes run on the worker thread (#506); see `spawn_pass_worker` for why.
+    let (pass_tx, pass_rx) = std::sync::mpsc::channel();
+    let Some(pass_worker) = spawn_pass_worker(pass_rx, tx, {
+        let config = config.clone();
+        move |request| {
+            let _ = match request {
+                PassRequest::StartupCatchup => startup_catchup_pass(&config),
+                PassRequest::Maintenance { run_gc } => maintenance_pass(&config, *run_gc),
+            };
         }
-        let now = Instant::now();
-        let periodic_wait = periodic.map(|p| (last_pass + p).saturating_duration_since(now));
-        let wait = [debounce.due_in(now), fleet_debounce.due_in(now), periodic_wait]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(Duration::from_millis(500));
-        match rx.recv_timeout(wait) {
-            Ok(Ok(event)) => {
-                let now = Instant::now();
-                // Place watches on newly-appeared, non-ignored directories REGARDLESS of relevance
-                // (#332). Target dirs are watched NON-recursively (#331), so notify won't
-                // auto-descend into a new subdir — and a bare `mkdir src/foo` is NOT
-                // `event_is_relevant` (a directory is extensionless → not a target FILE), so gating
-                // this on the relevance check below would leave the new dir unwatched and its files
-                // invisible until the periodic sweep (or forever, if it is disabled). A directory
-                // MOVED in (`mv pkg src/pkg`) arrives as a rename, not a Create —
-                // `watch_created_dirs` handles both. Its own cheap filter
-                // (Create/rename + is-dir + not-ignored) makes calling it on every
-                // event correct. When it places a watch, arm the debounce even if the directory
-                // event itself is extensionless and therefore not relevant: the newly-created dir
-                // can already contain files that need the pass to discover them. The watch keeps
-                // SUBSEQUENT edits firing. Gates each path on real-dir + target relation +
-                // not-ignored, and recompiles the matcher for a moved-in nested `.gitignore`
-                // (#332).
-                if event_requests_maintenance(
-                    &mut notify_watcher,
-                    &event,
-                    &config,
-                    &target_dirs,
-                    &mut ignore,
-                    &mut linked_worktrees,
-                    worktree_registry.as_deref(),
-                ) {
-                    debounce.on_event(now);
-                    // A `.gitignore` mutation changed the rules — recompile so subsequent events
-                    // are classified against current rules, not the matcher
-                    // this watcher booted with.
-                    if kind_is_mutation(&event.kind)
-                        && event.paths.iter().any(|path| is_gitignore_path(path))
-                    {
-                        // PLACEMENT, not just classification, must track the new rules (#332): a
-                        // removed ignore rule UN-ignores a subtree the startup walk skipped, so
-                        // re-walk and add watches for it now — otherwise edits inside it never
-                        // fire. notify's `watch()` is idempotent for an
-                        // already-watched path, so re-walking only ADDS the
-                        // newly-eligible dirs. (A newly-IGNORED subtree keeps its
-                        // now-stale watches — harmless wasted watches; full unwatch bookkeeping is
-                        // deferred.)
-                        recompile_ignore_and_place_watches(
-                            &mut notify_watcher,
-                            &config,
-                            &target_dirs,
-                            &mut ignore,
-                            &mut linked_worktrees,
-                        );
-                    }
-                }
-                if event_targets_binary(fleet_bin.as_deref(), &event) {
-                    fleet_debounce.on_event(now);
-                }
-            },
-            Ok(_) => {},
-            Err(RecvTimeoutError::Timeout) => {},
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        let now = Instant::now();
-        let periodic_due = periodic.is_some_and(|p| now >= last_pass + p);
-        if debounce.should_fire(now) || periodic_due {
-            passes += 1;
-            let _ = maintenance_pass(&config, passes.is_multiple_of(GC_EVERY_PASSES));
-            debounce.reset();
-            last_pass = Instant::now();
-            // Refresh the live linked-worktree set after every pass. Existing checkout paths can
-            // switch branches and therefore branch-local target sets; rebuilding the state keeps
-            // classification, ignore matchers, and watch placement in one place. Removed checkout
-            // paths can still have stale backend watches (harmless; their overlay is GC-pruned),
-            // but no stale `LinkedWorktreeWatch` state remains active.
-            sync_linked_worktrees_after_pass(&mut notify_watcher, &config, &mut linked_worktrees);
-        }
-        if fleet_debounce.should_fire(now)
-            && let Some(bin) = fleet_bin.as_deref()
-        {
-            // Signal the fleet (this process last) to hot-upgrade to the freshly installed binary.
-            fleet::trigger(bin);
-            fleet_debounce.reset();
-        }
+    }) else {
+        return;
+    };
+
+    // Catch-up pass: covers edits made while no watcher was running (startup / election gap).
+    // Dispatched to the worker AFTER watch placement, so a change landing mid-catch-up is caught
+    // by an event instead of falling into the old catch-up→placement blind window — including a
+    // `cargo install` into the just-watched binary dir (#506). Do not force the reconcile/gc/
+    // memory tail on every process start; on an unchanged checkout, startup must stay
+    // discover-only and write nothing past any cheap freshness repairs.
+    let mut scheduler = PassScheduler::new();
+    let _ = pass_tx.send(scheduler.dispatch_startup());
+
+    let mut fire_fleet_trigger = |bin: &Path| fleet::trigger(bin);
+    let final_refresh_owed = EventLoop {
+        config: &config,
+        target_dirs: &target_dirs,
+        fleet_bin: fleet_bin.as_deref(),
+        notify_watcher: &mut notify_watcher,
+        ignore: &mut ignore,
+        linked_worktrees: &mut linked_worktrees,
+        worktree_registry: worktree_registry.as_deref(),
+        rx,
+        pass_tx: &pass_tx,
+        scheduler: &mut scheduler,
+        stop,
+        fleet_trigger: &mut fire_fleet_trigger,
     }
+    .run();
+
+    // Let an in-flight pass finish (bounded by the pass itself, exactly as when passes ran
+    // inline), then release the worker.
+    drop(pass_tx);
+    let _ = pass_worker.join();
 
     // Final pass for edits in the last debounce window — discover only (no embedding), timeout-and-
     // skip. The host may SIGKILL shortly after stdin EOF, so shutdown must be bounded; discover is
     // fast and keeps structure fresh, and the next content-changing or periodic pass does the
     // embedding.
-    if debounce.fire_at().is_some() {
+    if final_refresh_owed {
         let _ = shutdown_discover(&config);
+    }
+}
+
+/// The watcher event loop, separated from [`watcher_main`] so tests can drive it with a recording
+/// notify watcher and play the pass worker themselves. The invariant it exists to enforce (#506):
+/// this thread NEVER runs a maintenance pass inline — it hands requests to the worker over
+/// `pass_tx` and keeps classifying events and serving the fleet trigger while the pass runs.
+struct EventLoop<'a, W: notify::Watcher> {
+    config: &'a Config,
+    target_dirs: &'a [PathBuf],
+    fleet_bin: Option<&'a Path>,
+    notify_watcher: &'a mut W,
+    ignore: &'a mut IgnoreMatcher,
+    linked_worktrees: &'a mut LinkedWorktreeWatches,
+    worktree_registry: Option<&'a Path>,
+    rx: Receiver<LoopMsg>,
+    pass_tx: &'a Sender<PassRequest>,
+    scheduler: &'a mut PassScheduler,
+    stop: &'a AtomicBool,
+    /// Injected so tests can observe the fleet firing; production wires [`fleet::trigger`].
+    fleet_trigger: &'a mut (dyn FnMut(&Path) + Send),
+}
+
+impl<W: notify::Watcher> EventLoop<'_, W> {
+    /// Run until `stop`; returns whether a final shutdown refresh is owed (the debounce is still
+    /// armed — events arrived after the last dispatched pass).
+    fn run(self) -> bool {
+        let mut debounce = Debounce::new(
+            Duration::from_millis(self.config.watch.debounce_ms),
+            Duration::from_millis(self.config.watch.max_latency_ms),
+        );
+        let mut fleet_debounce = Debounce::new(FLEET_DEBOUNCE, FLEET_MAX_LATENCY);
+        // Periodic backstop (covers event-blind filesystems + missed events). `None` disables it.
+        let periodic = (self.config.watch.periodic_sweep_secs > 0)
+            .then(|| Duration::from_secs(self.config.watch.periodic_sweep_secs));
+        let mut last_pass = Instant::now(); // the startup catch-up was just dispatched
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let now = Instant::now();
+            // While a pass is in flight its fire condition stays due (the debounce only resets on
+            // dispatch), so recomputing those deadlines would spin the loop — the `PassDone`
+            // message is what wakes it. The fleet debounce still shapes the wait: the trigger
+            // must fire DURING a long pass, not after it (#506).
+            let wait = if self.scheduler.in_flight() {
+                fleet_debounce.due_in(now).unwrap_or(IDLE_WAIT)
+            } else {
+                let periodic_wait =
+                    periodic.map(|p| (last_pass + p).saturating_duration_since(now));
+                [debounce.due_in(now), fleet_debounce.due_in(now), periodic_wait]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .unwrap_or(IDLE_WAIT)
+            };
+            match self.rx.recv_timeout(wait) {
+                Ok(LoopMsg::Fs(Ok(event))) => {
+                    let now = Instant::now();
+                    // Place watches on newly-appeared, non-ignored directories REGARDLESS of
+                    // relevance (#332). Target dirs are watched NON-recursively (#331), so notify
+                    // won't auto-descend into a new subdir — and a bare `mkdir src/foo` is NOT
+                    // `event_is_relevant` (a directory is extensionless → not a target FILE), so
+                    // gating this on the relevance check below would leave the new dir unwatched
+                    // and its files invisible until the periodic sweep (or forever, if it is
+                    // disabled). A directory MOVED in (`mv pkg src/pkg`) arrives as a rename, not
+                    // a Create — `watch_created_dirs` handles both. Its own cheap filter
+                    // (Create/rename + is-dir + not-ignored) makes calling it on every
+                    // event correct. When it places a watch, arm the debounce even if the
+                    // directory event itself is extensionless and therefore not relevant: the
+                    // newly-created dir can already contain files that need the pass to discover
+                    // them. The watch keeps SUBSEQUENT edits firing. Gates each path on real-dir +
+                    // target relation + not-ignored, and recompiles the matcher for a moved-in
+                    // nested `.gitignore` (#332).
+                    if event_requests_maintenance(
+                        self.notify_watcher,
+                        &event,
+                        self.config,
+                        self.target_dirs,
+                        self.ignore,
+                        self.linked_worktrees,
+                        self.worktree_registry,
+                    ) {
+                        debounce.on_event(now);
+                        // A `.gitignore` mutation changed the rules — recompile so subsequent
+                        // events are classified against current rules, not the matcher
+                        // this watcher booted with.
+                        if kind_is_mutation(&event.kind)
+                            && event.paths.iter().any(|path| is_gitignore_path(path))
+                        {
+                            // PLACEMENT, not just classification, must track the new rules (#332):
+                            // a removed ignore rule UN-ignores a subtree the startup walk skipped,
+                            // so re-walk and add watches for it now — otherwise edits inside it
+                            // never fire. notify's `watch()` is idempotent for an
+                            // already-watched path, so re-walking only ADDS the
+                            // newly-eligible dirs. (A newly-IGNORED subtree keeps its
+                            // now-stale watches — harmless wasted watches; full unwatch
+                            // bookkeeping is deferred.)
+                            recompile_ignore_and_place_watches(
+                                self.notify_watcher,
+                                self.config,
+                                self.target_dirs,
+                                self.ignore,
+                                self.linked_worktrees,
+                            );
+                        }
+                    }
+                    if event_targets_binary(self.fleet_bin, &event) {
+                        fleet_debounce.on_event(now);
+                    }
+                },
+                Ok(LoopMsg::Fs(Err(_))) => {},
+                Ok(LoopMsg::PassDone) => {
+                    self.scheduler.on_done();
+                    last_pass = Instant::now();
+                    // Refresh the live linked-worktree set after every pass. Existing checkout
+                    // paths can switch branches and therefore branch-local target sets; rebuilding
+                    // the state keeps classification, ignore matchers, and watch placement in one
+                    // place. Removed checkout paths can still have stale backend watches
+                    // (harmless; their overlay is GC-pruned), but no stale `LinkedWorktreeWatch`
+                    // state remains active.
+                    sync_linked_worktrees_after_pass(
+                        self.notify_watcher,
+                        self.config,
+                        self.linked_worktrees,
+                    );
+                },
+                Ok(LoopMsg::Wake) => {},
+                Err(RecvTimeoutError::Timeout) => {},
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            let now = Instant::now();
+            let periodic_due = periodic.is_some_and(|p| now >= last_pass + p);
+            if (debounce.should_fire(now) || periodic_due)
+                && let Some(request) = self.scheduler.dispatch()
+            {
+                let _ = self.pass_tx.send(request);
+                // Reset ONLY on dispatch: while a pass is in flight the armed debounce is the
+                // record that a follow-up is owed, and it fires as soon as `PassDone` lands.
+                debounce.reset();
+            }
+            if fleet_debounce.should_fire(now)
+                && let Some(bin) = self.fleet_bin
+            {
+                // Signal the fleet (this process last) to hot-upgrade to the freshly installed
+                // binary.
+                (self.fleet_trigger)(bin);
+                fleet_debounce.reset();
+            }
+        }
+        debounce.fire_at().is_some()
     }
 }
 
@@ -3090,6 +3288,151 @@ mod tests {
         let d = Debounce::new(Duration::from_millis(400), Duration::from_millis(2500));
         assert!(d.due_in(Instant::now()).is_none());
         assert!(!d.should_fire(Instant::now()));
+    }
+
+    #[test]
+    fn scheduler_coalesces_fire_requests_while_a_pass_is_in_flight() {
+        let mut scheduler = PassScheduler::new();
+        assert_eq!(scheduler.dispatch(), Some(PassRequest::Maintenance { run_gc: false }));
+        assert!(scheduler.in_flight());
+        assert_eq!(scheduler.dispatch(), None, "a fire while a pass runs must coalesce");
+        scheduler.on_done();
+        assert_eq!(
+            scheduler.dispatch(),
+            Some(PassRequest::Maintenance { run_gc: false }),
+            "the coalesced fire dispatches once the pass completes",
+        );
+    }
+
+    #[test]
+    fn scheduler_gc_cadence_counts_maintenance_passes_only() {
+        let mut scheduler = PassScheduler::new();
+        assert_eq!(scheduler.dispatch_startup(), PassRequest::StartupCatchup);
+        assert!(scheduler.in_flight(), "the startup catch-up occupies the in-flight slot");
+        scheduler.on_done();
+        for pass in 1..=GC_EVERY_PASSES {
+            let request = scheduler.dispatch().expect("no pass is in flight");
+            assert_eq!(
+                request,
+                PassRequest::Maintenance { run_gc: pass == GC_EVERY_PASSES },
+                "gc runs on pass {GC_EVERY_PASSES}, not on pass {pass}",
+            );
+            scheduler.on_done();
+        }
+    }
+
+    /// #506: the worker runs requests in order, answers each with `PassDone` on the loop channel,
+    /// and exits when the request channel closes.
+    #[test]
+    fn pass_worker_runs_requests_in_order_and_reports_completion() {
+        let (pass_tx, pass_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = spawn_pass_worker(pass_rx, done_tx, {
+            let ran = Arc::clone(&ran);
+            move |request: &PassRequest| ran.lock().unwrap().push(request.clone())
+        })
+        .expect("worker thread spawns");
+        pass_tx.send(PassRequest::StartupCatchup).unwrap();
+        pass_tx.send(PassRequest::Maintenance { run_gc: true }).unwrap();
+        for _ in 0..2 {
+            match done_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(LoopMsg::PassDone) => {},
+                other => panic!("expected PassDone, got {other:?}"),
+            }
+        }
+        drop(pass_tx);
+        worker.join().unwrap();
+        assert_eq!(*ran.lock().unwrap(), vec![
+            PassRequest::StartupCatchup,
+            PassRequest::Maintenance { run_gc: true },
+        ]);
+    }
+
+    /// The #506 regression: while a maintenance pass is in flight, the event loop must keep
+    /// classifying events and must fire the fleet hot-upgrade trigger — the exact window where a
+    /// `cargo install` used to land unseen. The test plays the pass worker itself and withholds
+    /// the completion until the end.
+    #[test]
+    fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let fleet_bin = root.join("rag-rat-506-test-bin");
+        std::fs::write(&fleet_bin, b"binary").unwrap();
+
+        let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+        config.watch.debounce_ms = 10;
+        config.watch.max_latency_ms = 50;
+        config.watch.periodic_sweep_secs = 0;
+        let target_dirs = config.target_directories();
+        let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
+        let mut linked_worktrees = LinkedWorktreeWatches::default();
+        let mut notify_watcher =
+            <RecordingWatcher as notify::Watcher>::new(|_| {}, notify::Config::default()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (pass_tx, pass_rx) = std::sync::mpsc::channel();
+        let (fleet_tx, fleet_rx) = std::sync::mpsc::channel();
+        let mut scheduler = PassScheduler::new();
+        let stop = AtomicBool::new(false);
+        let mut fleet_trigger = move |bin: &Path| {
+            let _ = fleet_tx.send(bin.to_path_buf());
+        };
+
+        let event_loop = EventLoop {
+            config: &config,
+            target_dirs: &target_dirs,
+            fleet_bin: Some(&fleet_bin),
+            notify_watcher: &mut notify_watcher,
+            ignore: &mut ignore,
+            linked_worktrees: &mut linked_worktrees,
+            worktree_registry: None,
+            rx,
+            pass_tx: &pass_tx,
+            scheduler: &mut scheduler,
+            stop: &stop,
+            fleet_trigger: &mut fleet_trigger,
+        };
+        std::thread::scope(|scope| {
+            let loop_thread = scope.spawn(move || event_loop.run());
+
+            // A relevant edit dispatches a pass to the worker (played by this test).
+            tx.send(LoopMsg::Fs(Ok(mutation_event(root.join("src/lib.rs"))))).unwrap();
+            assert_eq!(
+                pass_rx.recv_timeout(Duration::from_secs(5)),
+                Ok(PassRequest::Maintenance { run_gc: false }),
+            );
+
+            // While that pass is in flight (no PassDone), a new binary landing must still fire
+            // the fleet trigger...
+            tx.send(LoopMsg::Fs(Ok(mutation_event(fleet_bin.clone())))).unwrap();
+            assert_eq!(
+                fleet_rx.recv_timeout(Duration::from_secs(5)),
+                Ok(fleet_bin.clone()),
+                "the fleet trigger must fire during a pass, not after it",
+            );
+            // ...and a further edit is classified, coalescing into the armed debounce instead of
+            // dispatching a concurrent pass.
+            tx.send(LoopMsg::Fs(Ok(mutation_event(root.join("src/lib.rs"))))).unwrap();
+            assert_eq!(
+                pass_rx.recv_timeout(Duration::from_millis(300)),
+                Err(RecvTimeoutError::Timeout),
+                "no second pass may dispatch while one is in flight",
+            );
+
+            // Completing the pass dispatches the coalesced follow-up.
+            tx.send(LoopMsg::PassDone).unwrap();
+            assert_eq!(
+                pass_rx.recv_timeout(Duration::from_secs(5)),
+                Ok(PassRequest::Maintenance { run_gc: false }),
+            );
+
+            stop.store(true, Ordering::Relaxed);
+            tx.send(LoopMsg::Wake).unwrap();
+            let final_refresh_owed = loop_thread.join().unwrap();
+            assert!(!final_refresh_owed, "every observed edit was consumed by a dispatched pass",);
+        });
     }
 
     #[test]
