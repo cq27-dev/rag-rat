@@ -77,19 +77,40 @@ pub(crate) fn validate_logical_symbol_binding(
     // repo-scoped for free through the scope view; `logical_symbols` is a direct table, so it needs
     // the explicit filter.
     let active_repo_id = crate::index::schema::active_repo_id(conn)?;
-    let relocated = conn
-        .query_row(
+    // #491: one qualified name can hold several live twins (a struct and its impl block;
+    // overloads with distinct signatures), so a bare `LIMIT 1` is a plan-order coin flip that
+    // can land a struct-bound memory on the impl row. The binding stores the V014 relocation
+    // discriminators (`symbol_kind`, `signature_hash`) — fetch every twin (with a member
+    // signature: all members of a group share it, since the signature is part of the logical
+    // key) and prefer the one that agrees, tiebreaking deterministically by id.
+    let candidates: Vec<RelocationTwin> = {
+        let mut stmt = conn.prepare(
             "
-            SELECT id, path
-            FROM logical_symbols
-            WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
-              AND repo_id = ?2
-            LIMIT 1
+            SELECT ls.id, ls.path, ls.kind,
+                   (SELECT s.signature FROM logical_symbol_members m
+                      JOIN symbols s ON s.id = m.symbol_id
+                     WHERE m.logical_symbol_id = ls.id LIMIT 1)
+            FROM logical_symbols ls
+            WHERE ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
+              AND ls.repo_id = ?2
+            ORDER BY ls.id
             ",
-            params![&binding.binding_id, active_repo_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
+        )?;
+        let rows = stmt.query_map(params![&binding.binding_id, active_repo_id], |row| {
+            Ok(RelocationTwin {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                kind: row.get(2)?,
+                signature: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let relocated = pick_relocation_twin(
+        candidates,
+        binding.symbol_kind.as_deref(),
+        binding.signature_hash.as_deref(),
+    );
     if let Some((id, path)) = relocated {
         binding.logical_symbol_id = Some(id);
         binding.path = Some(path);
@@ -123,6 +144,42 @@ pub(crate) fn validate_logical_symbol_binding(
     }
     relocate_via_moniker_or_gone(conn, binding)
 }
+/// A live logical-symbol row sharing the dead binding's qualified name — a relocation candidate.
+struct RelocationTwin {
+    id: i64,
+    path: String,
+    kind: String,
+    signature: Option<String>,
+}
+
+/// Choose which same-qualified-name twin a gone binding relocates onto (#491): the stored
+/// discriminators win — kind agreement outranks signature-hash agreement (a rename usually keeps
+/// the kind but changes the signature text) — and equal evidence falls back to the lowest id, so
+/// the pick is deterministic instead of plan-order. `None` evidence on the binding degrades
+/// gracefully: every candidate scores equally and the id tiebreak decides, matching the old
+/// behavior for bindings that predate the V014 discriminators.
+fn pick_relocation_twin(
+    candidates: Vec<RelocationTwin>,
+    bound_kind: Option<&str>,
+    bound_signature_hash: Option<&str>,
+) -> Option<(i64, String)> {
+    candidates
+        .into_iter()
+        .map(|twin| {
+            let kind_agrees = bound_kind == Some(twin.kind.as_str());
+            let signature_agrees = match (bound_signature_hash, &twin.signature) {
+                (Some(bound), Some(sig)) => bound == hex_sha256(sig.trim().as_bytes()),
+                _ => false,
+            };
+            // Candidates arrive id-ascending; max_by_key keeps the LAST maximum, so compare on
+            // (score, negated id) to keep the lowest-id winner among evidence ties.
+            let score = (u8::from(kind_agrees) << 1) | u8::from(signature_agrees);
+            (score, -twin.id, twin)
+        })
+        .max_by_key(|(score, neg_id, _)| (*score, *neg_id))
+        .map(|(_, _, twin)| (twin.id, twin.path))
+}
+
 pub(crate) fn validate_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,

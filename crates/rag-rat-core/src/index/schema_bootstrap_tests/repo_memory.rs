@@ -427,6 +427,105 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// #491: one qualified name, two logical twins (a `struct` and its `impl` block). The impl's
+/// logical key sorts first ("impl" < "struct"), so it gets the lower rowid and an unordered
+/// `LIMIT 1` relocation deterministically lands a struct-bound memory on the impl row. The
+/// binding stores the V014 discriminators (`symbol_kind`, `signature_hash`) for exactly this —
+/// relocation must prefer the twin that agrees with them.
+#[test]
+fn relocation_lands_on_the_kind_matching_twin_not_plan_order() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/twin.rs"),
+        "pub struct TwinAnchor {\n    pub x: i64,\n}\n\nimpl TwinAnchor {\n    pub fn \
+         probe(&self) -> i64 {\n        self.x\n    }\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let twin_id = |kind: &str| -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT ls.id FROM logical_symbols ls
+                 JOIN name_strings qn ON qn.id = ls.qualified_name_id
+                 WHERE qn.value LIKE '%::TwinAnchor' AND ls.kind = ?1",
+                [kind],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let struct_id = twin_id("struct");
+    let impl_id = twin_id("impl");
+    assert_ne!(struct_id, impl_id, "the fixture must produce both twins");
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Bound to the struct twin".to_string(),
+            body: "Relocation must land back on the struct, not the impl block.".to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: Some(struct_id),
+                symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+                edge_path: None,
+                dir: None,
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+
+    // Simulate key-derivation drift: the stored id no longer resolves, while the qualified name
+    // and the stored discriminators (symbol_kind = struct + the struct's signature hash) survive.
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE repo_memory_bindings SET logical_symbol_id = 424242 WHERE memory_id = ?1",
+            params![memory_id],
+        )
+        .unwrap();
+
+    db.memory_validate().unwrap();
+    let (relocated_id, status): (i64, String) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT logical_symbol_id, anchor_status FROM repo_memory_bindings
+             WHERE memory_id = ?1",
+            params![memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "relocated", "the dead id must relocate by qualified name");
+    assert_eq!(
+        relocated_id, struct_id,
+        "relocation must prefer the kind-matching twin (struct), not the impl row plan order \
+         happens to return first"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
     let root = unique_temp_root();
