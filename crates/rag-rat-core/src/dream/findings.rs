@@ -323,7 +323,17 @@ pub(super) fn sync(
     now_ms: i64,
     resolve_kinds: &[&str],
 ) -> rusqlite::Result<(usize, usize, usize, usize)> {
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE, not the default DEFERRED: take the write lock at BEGIN so the per-finding
+    // SELECT-then-INSERT in `sync_in_tx` is atomic against a concurrent writer. A DEFERRED txn
+    // upgrades to a writer only on its first INSERT — AFTER the SELECT already read "no current
+    // row" — so two runs racing on the same (kind, subject) could both take the
+    // brand-new-insert branch and the loser hits a PK violation instead of refreshing. The CLI
+    // serializes `dream` with the repo WriteLock, but the MCP `dream`/`dream_review` tools run
+    // on the lock-free write path (up to `RAG_RAT_MCP_TOOL_WORKERS`, default 2, concurrent), so
+    // the atomicity must live here. IMMEDIATE makes a second writer block at BEGIN
+    // (busy_timeout, then the MCP call-level busy-retry) until the first commits, after which
+    // its SELECT sees the row and refreshes — no duplicate insert.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let counts = sync_in_tx(&tx, findings, now_ms, resolve_kinds)?;
     tx.commit()?;
     Ok(counts)
@@ -1001,5 +1011,33 @@ mod tests {
         assert_eq!(rows.len(), 1, "only the winning claim is persisted: {rows:?}");
         assert_eq!(rows[0].0, "open");
         assert_eq!(rows[0].1, "hi", "the higher-ranked claim wins the collision");
+    }
+
+    #[test]
+    fn sync_uses_an_immediate_transaction_so_concurrent_dream_workers_cannot_race() {
+        // #514: two MCP `dream` workers hit `sync` on separate connections with no cross-process
+        // lock. The txn is IMMEDIATE, so it takes the write lock at BEGIN and the per-finding
+        // SELECT-then-INSERT can't interleave into a duplicate-id insert. Proven deterministically:
+        // hold a writer on a second connection, then run an EMPTY sync. Under the old DEFERRED txn
+        // an empty sync does zero writes and would succeed even against a held writer;
+        // under IMMEDIATE it must fail busy at BEGIN. busy_timeout=0 makes the contention
+        // immediate, not a blocking wait.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dream.sqlite");
+        let a = Connection::open(&path).unwrap();
+        a.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        a.busy_timeout(std::time::Duration::ZERO).unwrap();
+        crate::index::schema::apply(&a).unwrap();
+
+        let b = Connection::open(&path).unwrap();
+        b.busy_timeout(std::time::Duration::ZERO).unwrap();
+        b.execute_batch("BEGIN IMMEDIATE").unwrap(); // hold the write lock
+
+        let err = sync(&a, &[], 1, BASE_FINDING_KINDS).unwrap_err();
+        assert!(
+            crate::storage::is_busy(&anyhow::Error::new(err)),
+            "an empty sync under a concurrently-held writer must fail busy — proving BEGIN \
+             IMMEDIATE, not DEFERRED (which would do no writes and silently succeed)"
+        );
     }
 }
