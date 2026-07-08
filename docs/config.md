@@ -454,6 +454,11 @@ A verdict is **preserved across future runs**: a re-run that still reports the f
 `open`/`accepted`/`dismissed` finding is reviewable — a `resolved`/`superseded` one is not (the code
 moved on, so there is nothing to act on). Reviewing is repo-scoped and never runs the model.
 
+The same worklist and review actions are available over MCP for a pull-based strong agent: the
+`dream` tool returns the ranked worklist (`{ limit?, all? }`; recomputes the deterministic findings
+like `rag-rat dream`, but never the opt-in model passes), and `dream_review` applies a verdict
+(`{ finding, verdict: "accept" | "dismiss" | "reset" }`).
+
 ## Memory surfacing (`[memory] surface`)
 
 `[memory] surface` controls how memory attachments and memory-query results render. The default is

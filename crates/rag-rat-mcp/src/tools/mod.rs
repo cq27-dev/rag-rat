@@ -59,6 +59,10 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
             | "memory_edge_remove"
             | "memory_mark_obsolete"
             | "memory_validate"
+            // `dream` recomputes the deterministic worklist and syncs `dream_findings`;
+            // `dream_review` writes a finding's human verdict — both mutate the index.
+            | "dream"
+            | "dream_review"
     )
 }
 

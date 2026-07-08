@@ -45,6 +45,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "memory_edge_add",
     "memory_edge_remove",
     "memory_edges",
+    "dream",
+    "dream_review",
 ];
 
 pub fn list_tools() -> Value {
@@ -223,6 +225,20 @@ pub fn description(name: &str) -> &'static str {
             "List a node's typed edges: direction=from returns its outgoing edges (deps / links / \
              tracks); direction=into is the reverse traversal (e.g. tasks that track an issue, or \
              nodes that depend on this one).",
+        "dream" =>
+            "Return the deterministic memory-maintenance worklist: coverage gaps (load-bearing \
+             symbols with no memory) + stale references (a memory citing a path that no longer \
+             resolves), ranked, each with a stable `id` to review. This is the pull surface for a \
+             strong agent to burn down the worklist. Recomputes the deterministic findings on each \
+             call (like `rag-rat dream`); it does NOT run the opt-in model verdict/compaction \
+             passes — those stay on the CLI/cron `rag-rat dream --verify|--compact`, and the \
+             findings they persist (e.g. memory_divergence) still surface here. Review a finding \
+             with dream_review.",
+        "dream_review" =>
+            "Apply a human verdict to ONE dream finding by id (a full id or unambiguous prefix): \
+             accept (a real gap to act on), dismiss (noise), or reset (clear a prior verdict, back \
+             to open). Dream only proposes; this is how the reviewer confirms. The verdict \
+             survives future dream runs. Mirrors `rag-rat dream <id> --accept|--dismiss|--reset`.",
         _ => "Unknown tool.",
     }
 }
@@ -267,6 +283,8 @@ pub fn schema(name: &str) -> Value {
         "memory_edge_add" => schema_for::<MemoryEdgeAddArgs>(),
         "memory_edge_remove" => schema_for::<MemoryEdgeRemoveArgs>(),
         "memory_edges" => schema_for::<MemoryEdgesArgs>(),
+        "dream" => schema_for::<DreamArgs>(),
+        "dream_review" => schema_for::<DreamReviewArgs>(),
         _ => json!({"type": "object"}),
     }
 }

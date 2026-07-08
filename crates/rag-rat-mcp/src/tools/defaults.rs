@@ -32,6 +32,11 @@ pub(crate) fn default_search_limit() -> u32 {
     10
 }
 
+/// `dream`'s `coverage_gap` budget — matches the CLI `rag-rat dream`'s `--limit` default (20).
+pub(crate) fn default_dream_limit() -> u32 {
+    20
+}
+
 pub(crate) fn default_search_graph_mode() -> McpGraphMode {
     McpGraphMode::Compact
 }

@@ -551,6 +551,87 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
 }
 
 #[test]
+fn mcp_dream_surfaces_a_finding_and_review_applies_a_verdict() {
+    // #263: the pull-based dream surface over MCP. `dream` recomputes the deterministic worklist
+    // (a WRITE tool — it syncs `dream_findings`, like `rag-rat dream`); `dream_review` applies a
+    // human verdict. Seed a `stale_reference` finding by binding a memory whose body cites a `.rs`
+    // path that does NOT resolve against the index — a deterministic, single-finding trigger that
+    // needs no model.
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = rust_config(root.clone());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    drop(db);
+
+    let memory = call_tool(
+        &config.database,
+        "memory_create",
+        json!({
+            "kind": "Risk",
+            "title": "Cites a path that has since moved",
+            "body": "The old logic lived in crates/ghost/src/vanished.rs before the refactor.",
+            "confidence": "medium",
+            "created_by": "dream-test",
+            "bind": {"path": "src/lib.rs"}
+        }),
+    )
+    .unwrap();
+    let memory_id = memory["memory"]["memory_id"].as_str().unwrap().to_string();
+
+    // The default worklist surfaces the OPEN stale_reference finding (its subject is the memory
+    // id).
+    let report = call_tool(&config.database, "dream", json!({})).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["kind"] == "stale_reference" && f["subject"] == memory_id.as_str())
+        .expect("dream should surface the stale_reference finding")
+        .clone();
+    assert_eq!(finding["status"], "open");
+    let finding_id = finding["id"].as_str().unwrap().to_string();
+
+    // Accept it: the verdict is echoed back, and the finding leaves the default (open) worklist.
+    let reviewed = call_tool(
+        &config.database,
+        "dream_review",
+        json!({"finding": finding_id, "verdict": "accept"}),
+    )
+    .unwrap();
+    assert_eq!(reviewed["status"], "accepted");
+    assert_eq!(reviewed["id"], finding_id.as_str());
+
+    // Re-running `dream` recomputes stale_reference (the bad path is still cited) — the refresh
+    // branch PRESERVES the accepted verdict, so the finding stays out of the open worklist.
+    let after = call_tool(&config.database, "dream", json!({})).unwrap();
+    assert!(
+        !after["findings"].as_array().unwrap().iter().any(|f| f["id"] == finding_id.as_str()),
+        "an accepted finding must drop out of the default (open) worklist"
+    );
+    // `all: true` brings the reviewed finding back, now marked accepted.
+    let all = call_tool(&config.database, "dream", json!({"all": true})).unwrap();
+    let seen = all["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == finding_id.as_str())
+        .expect("`all: true` lists the accepted finding");
+    assert_eq!(seen["status"], "accepted");
+
+    // reset clears the verdict, returning the finding to the open worklist.
+    let reset = call_tool(
+        &config.database,
+        "dream_review",
+        json!({"finding": finding_id, "verdict": "reset"}),
+    )
+    .unwrap();
+    assert_eq!(reset["status"], "open");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn mcp_read_chunk_and_heal_index_do_not_return_stale_text() {
     let (root, config) = markdown_config("# Title\nalpha token\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -1280,6 +1361,8 @@ fn read_only_classification_covers_every_tool_and_denies_writers() {
         "memory_edge_remove",
         "memory_mark_obsolete",
         "memory_validate",
+        "dream",
+        "dream_review",
     ];
     for writer in WRITERS {
         assert!(TOOL_NAMES.contains(writer), "writer {writer} is not a registered tool");

@@ -902,6 +902,56 @@ impl MemoryEdgesArgs {
     }
 }
 
+/// `dream`: recompute and return the deterministic memory-maintenance worklist (coverage gaps +
+/// stale references). Mirrors the SHAPE of the read tools (returns a ranked worklist) but is
+/// classified as a write tool — like the CLI `rag-rat dream`, it syncs `dream_findings`. It does
+/// NOT run the opt-in model verdict/compaction passes (those stay on the CLI/cron `--verify` /
+/// `--compact`); findings a prior model run persisted still surface here.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DreamArgs {
+    /// Max `coverage_gap` findings to compute (the load-bearing-symbol budget); defaults to 20.
+    #[serde(default = "default_dream_limit")]
+    pub limit: u32,
+    /// Also surface the human-reviewed (`accepted` / `dismissed`) findings, not just the open
+    /// worklist — the `rag-rat dream --all` listing, so a reviewer can see and `reset` them.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// The human verdict `dream_review` applies to a dream finding — mirrors the CLI
+/// `rag-rat dream <id> --accept|--dismiss|--reset`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpReviewVerdict {
+    /// Confirm the finding as a real gap to act on; the verdict survives future dream runs.
+    Accept,
+    /// Reject the finding as noise; the verdict survives future dream runs.
+    Dismiss,
+    /// Clear a prior accept/dismiss, returning the finding to the open worklist.
+    Reset,
+}
+
+impl McpReviewVerdict {
+    pub(super) fn core(self) -> rag_rat_core::dream::ReviewVerdict {
+        use rag_rat_core::dream::ReviewVerdict;
+        match self {
+            Self::Accept => ReviewVerdict::Accept,
+            Self::Dismiss => ReviewVerdict::Dismiss,
+            Self::Reset => ReviewVerdict::Reset,
+        }
+    }
+}
+
+/// `dream_review`: apply a human verdict to ONE dream finding by id or prefix — the pull-based
+/// counterpart to the CLI review surface, so a strong agent burns down the worklist over MCP.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DreamReviewArgs {
+    /// The finding id from the `dream` worklist — a full id or an unambiguous git-style PREFIX.
+    pub finding: String,
+    /// `accept` / `dismiss` / `reset`.
+    pub verdict: McpReviewVerdict,
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FindClonesArgs {
     /// Minimum pairwise overlap/max_len similarity. Must be in the range [0.5, 1.0]; defaults to
