@@ -827,6 +827,90 @@ fn apply_clears_a_stranded_dirty_marker() {
     );
 }
 
+/// #501 review: the baseline replay must be DATA-PRESERVING, not just convergent — the pre-ladder
+/// prototype conversion ran `DROP TABLE IF EXISTS chunk_summaries` unconditionally, so every
+/// forward migrate wiped the current summaries (re-derivable only at model cost) on its way to
+/// recreating the table empty. Destructive legacy conversions may fire only when the LEGACY shape
+/// is actually present.
+#[test]
+fn forward_migrate_replay_preserves_chunk_summaries() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // Seed a bare summary row (FK off — the parent chunk chain is irrelevant to what this test
+    // pins: the replay must not touch the rows).
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO chunk_summaries(chunk_id, model_id, prompt_version, input_hash, text_hash,
+                                     summary, status)
+         VALUES (1, 'model', 'v1', 'ih', 'th', 'a summary worth keeping', 'Current');",
+    )
+    .unwrap();
+    truncate_schema_to(&conn, 50);
+
+    schema::migrate_forward(&conn).unwrap();
+
+    let kept: i64 =
+        conn.query_row("SELECT COUNT(*) FROM chunk_summaries", [], |row| row.get(0)).unwrap();
+    assert_eq!(kept, 1, "a baseline replay must not wipe current-shape chunk summaries");
+}
+
+/// #501 review companion: the legacy-prototype conversion still fires where it should — a
+/// pre-ladder DB whose `chunk_summaries` is the ORIGINAL single-summary shape (chunk_id PK, no
+/// `prompt_version`) gets it replaced with the current shape, and the prototype `embeddings`
+/// table is removed.
+#[test]
+fn baseline_replay_still_converts_the_legacy_prototype_ai_tables() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE embeddings(chunk_id INTEGER PRIMARY KEY, vector BLOB);
+        CREATE TABLE chunk_summaries(
+            chunk_id INTEGER PRIMARY KEY,
+            model_id TEXT NOT NULL,
+            source_text_hash TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            last_error TEXT
+        );
+        ",
+    )
+    .unwrap();
+
+    schema::apply(&conn).unwrap();
+
+    assert!(!conn_table_exists(&conn, "embeddings"), "the prototype embeddings table is dropped");
+    assert!(
+        conn_table_columns(&conn, "chunk_summaries").contains(&"prompt_version".to_string()),
+        "the legacy chunk_summaries shape is replaced with the current one"
+    );
+}
+
+/// #498: a failed FIRST-EVER provision (001 never recorded) keeps the crash-detectability
+/// contract — the DB reads Dirty and the marker row records the failure, so a torn fresh
+/// bootstrap refuses to serve until `index --full` re-runs it.
+#[test]
+fn a_failed_first_provision_reads_dirty_with_the_failure_recorded() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    // Poison the bootstrap: a pre-existing wrong-shape `files` table no-ops the baseline's
+    // `CREATE TABLE IF NOT EXISTS files` and then fails its index build (`no such column`).
+    conn.execute_batch("CREATE TABLE files(id INTEGER PRIMARY KEY);").unwrap();
+
+    assert!(schema::apply(&conn).is_err(), "the poisoned baseline fails the first provision");
+
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(status.state, schema::SchemaState::Dirty);
+    let description: String = conn
+        .query_row("SELECT description FROM schema_version WHERE id = '__dirty__'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        description.contains("partial migration failed"),
+        "the marker records the failure: {description}"
+    );
+}
+
 /// #498 review: a Dirty state can also come from a CHECKSUM-MISMATCHED baseline row (not just a
 /// stranded marker), and `index --full` must recover that too — apply re-records every additive
 /// step's checksum unconditionally, and the baseline provision must treat a stale 001 checksum

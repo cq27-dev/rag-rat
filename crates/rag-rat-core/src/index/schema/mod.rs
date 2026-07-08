@@ -394,10 +394,13 @@ pub struct SchemaStatus {
 /// stamp is durable and globally visible the moment it lands, and the GLOBAL schema lock
 /// deliberately does not serialize against ordinary per-repo writers — a `SQLITE_BUSY` between
 /// the stamp and the clear stranded a marker on a healthy DB and every subsequent open refused
-/// until a manual `index --full` (observed live on V050→V051). The replay needs no marker: with
-/// 001 recorded the baseline ran to completion once, and every replayed statement is an
-/// individually atomic, idempotent no-op (`IF NOT EXISTS` DDL; the legacy conversions self-wrap
-/// in their own transaction), so a torn replay just resumes as `Older` on the next open.
+/// until a manual `index --full` (observed live on V050→V051). The replay needs no marker
+/// because it is CONVERGENT and DATA-PRESERVING, not because every statement is a no-op: creates
+/// are `IF NOT EXISTS`, the destructive legacy conversions are CONDITIONAL — they fire only when
+/// the legacy shape is present (`drop_legacy_ai_prototype_tables`, the `edge_strings` rename
+/// below, `ensure_edges_data`'s self-wrapped copy) — and a torn replay leaves the owed step rows
+/// unrecorded, so the DB still reads `Older` and the next open re-runs the baseline to
+/// completion before anything serves.
 fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "

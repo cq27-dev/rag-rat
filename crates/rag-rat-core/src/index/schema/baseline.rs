@@ -1,6 +1,7 @@
 use super::*;
 
 pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
+    drop_legacy_ai_prototype_tables(conn)?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS index_meta(
@@ -229,9 +230,6 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             language TEXT NOT NULL,
             message TEXT NOT NULL
         );
-
-        DROP TABLE IF EXISTS embeddings;
-        DROP TABLE IF EXISTS chunk_summaries;
 
         CREATE TABLE IF NOT EXISTS ai_models(
             model_id TEXT PRIMARY KEY,
@@ -608,6 +606,22 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     // baseline) cannot leave the postings table behind it. R5: V029's DDL is not edited; the
     // convergence lives here, not in the checksummed migration body.
     apply_token_bag_blob(conn)?;
+    Ok(())
+}
+
+/// Drop the pre-ladder AI prototype tables, CONDITIONALLY: `embeddings` (superseded by
+/// `chunk_embeddings`; nothing modern recreates it, so `IF EXISTS` alone makes it a no-op on a
+/// current DB) and the ORIGINAL single-summary `chunk_summaries` shape (chunk_id PK, no
+/// `prompt_version` — superseded by the (chunk_id, model_id, prompt_version)-keyed table the
+/// baseline batch creates). The `prompt_version` probe is load-bearing (#501 review): these DROPs
+/// used to run unconditionally inside the batch, so every baseline REPLAY (every forward migrate)
+/// wiped the current summaries on its way to recreating the table empty. A replay must be
+/// data-preserving — destructive conversions fire only when the legacy shape is actually present.
+fn drop_legacy_ai_prototype_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS embeddings;")?;
+    if !column_exists(conn, "chunk_summaries", "prompt_version")? {
+        conn.execute_batch("DROP TABLE IF EXISTS chunk_summaries;")?;
+    }
     Ok(())
 }
 
