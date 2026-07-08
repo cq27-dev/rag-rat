@@ -90,7 +90,9 @@ impl IndexDatabase {
         } else {
             chunker::chunks_for_file(path, language, text)
         };
-        let chunks = prepare_chunks(path, language.as_str(), kind.as_str(), chunks, text);
+        // No shared tree on the heal path yet (it re-parses per derivation, #518), so the
+        // low-signal gate keeps its text-based fallback here.
+        let chunks = prepare_chunks(path, language.as_str(), kind.as_str(), chunks, text, None);
         // has_test_code from the SAME chunk-text marker set as insert_prepared_file + the V024
         // backfill, so a file healed through this path matches a fully-indexed one (#77). The heal
         // path is a second files-insert site; chunks are prepared up here (they don't need file_id)

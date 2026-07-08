@@ -782,6 +782,7 @@ pub(crate) fn embedding_policy_skip_summary(
             symbol_path.as_deref(),
             &text,
             max_embedding_chars,
+            LowSignalCheck::FromText,
         );
         if !decision.eligible {
             *skipped_by_policy.entry(decision.policy).or_default() += 1;

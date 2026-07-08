@@ -23,14 +23,21 @@ pub(crate) struct PreparedChunk {
 /// Compute the per-chunk hashes / anchor / embedding policy for a file's chunks. Splits the file's
 /// lines once (anchors only read a few boundary/context lines). Shared by the parallel prepare
 /// phase and the inline incremental path, so both keep this CPU work off the serial insert stage.
+///
+/// `parsed_root` is the file's shared tree-sitter parse when the caller holds one: the low-signal
+/// embedding gate then classifies each chunk's byte span against it instead of re-parsing every
+/// chunk's text (#516 — the re-parse cost a worker-thread spawn per chunk). `None` (generated /
+/// oversized / markdown / parse-failure files, and the heal path) keeps the text-based fallback.
 pub(crate) fn prepare_chunks(
     path: &Path,
     language: &str,
     file_kind: &str,
     chunks: Vec<Chunk>,
     full_text: &str,
+    parsed_root: Option<tree_sitter::Node<'_>>,
 ) -> Vec<PreparedChunk> {
     let full_lines = full_text.lines().collect::<Vec<_>>();
+    let language_kind = language.parse::<Language>().ok();
     chunks
         .into_iter()
         .map(|chunk| {
@@ -41,6 +48,17 @@ pub(crate) fn prepare_chunks(
                 chunk.end_line,
                 &full_lines,
             );
+            // Build the check lazily — the policy's cheaper gates (SkipTooSmall etc.) must keep
+            // short-circuiting before any tree walk or re-parse happens.
+            let low_signal = match parsed_root.zip(language_kind) {
+                Some((root, language)) => ai::LowSignalCheck::FromSpan {
+                    language,
+                    root,
+                    start_byte: chunk.start_byte,
+                    end_byte: chunk.end_byte,
+                },
+                None => ai::LowSignalCheck::FromText,
+            };
             let embedding = ai::embedding_policy_for_chunk(
                 path,
                 language,
@@ -49,6 +67,7 @@ pub(crate) fn prepare_chunks(
                 chunk.symbol_path.as_deref(),
                 &chunk.text,
                 ai::DEFAULT_MAX_EMBEDDING_CHARS,
+                low_signal,
             );
             PreparedChunk { chunk, text_hash, anchor, embedding }
         })
@@ -271,13 +290,15 @@ pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<Prepared
         // Markdown, oversized, or a hard parse failure: line-based chunking, no shared tree.
         chunker::chunks_for_file(&file.relative_path, file.language, &text)
     };
-    // Precompute per-chunk hashes / anchor / embedding policy here, in parallel.
+    // Precompute per-chunk hashes / anchor / embedding policy here, in parallel. The low-signal
+    // gate classifies chunk spans against the shared tree (one parse per file, #516).
     let chunks = prepare_chunks(
         &file.relative_path,
         file.language.as_str(),
         file.kind.as_str(),
         chunks,
         &text,
+        parsed.as_ref().map(|p| p.root()),
     );
 
     // Edge candidates walk the shared tree (no re-parse). from_symbol_id holds a local symbol
@@ -324,4 +345,56 @@ pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<Prepared
         symbol_fingerprints,
         parser_failure,
     })
+}
+
+#[cfg(test)]
+mod low_signal_wiring_tests {
+    use super::*;
+
+    /// The span-based low-signal gate (#516) must reach the same per-chunk policy decisions as the
+    /// text-based fallback it replaces on the shared-parse path — same chunks, tree present vs
+    /// absent. The fixture is sized so both outcomes occur (every block clears the 80-char
+    /// `SkipTooSmall` gate): a use/doc-comment block that must be SkipLowSignal and function
+    /// bodies that must Embed. If the wiring ever regresses to `None`, this still passes — the
+    /// companion assertions that BOTH policies occur keep the parity check non-vacuous.
+    #[test]
+    fn span_and_text_low_signal_paths_agree_on_prepared_chunk_policies() {
+        let src = "//! Module documentation explaining what this file is for.\n\nuse \
+                   std::collections::BTreeMap;\nuse std::collections::HashSet;\nuse \
+                   std::path::PathBuf;\n\nfn real_work(input: usize) -> usize {\n    let doubled \
+                   = input * 2;\n    let shifted = doubled + 7;\n    shifted * shifted\n}\n\nfn \
+                   more_work(count: usize) -> usize {\n    let mut total = 0;\n    for step in \
+                   0..count {\n        total += step;\n    }\n    total\n}\n";
+        let path = Path::new("src/lib.rs");
+        let parsed = parser::parse_file(path, Language::Rust, src).expect("fixture parses");
+        let chunks = chunker::code_chunks_for_symbols(path, src, &parsed.symbols);
+
+        let decisions = |prepared: &[PreparedChunk]| {
+            prepared
+                .iter()
+                .map(|pc| {
+                    (
+                        pc.chunk.symbol_path.clone(),
+                        pc.embedding.policy.clone(),
+                        pc.embedding.eligible,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let with_tree =
+            prepare_chunks(path, "rust", "source", chunks.clone(), src, Some(parsed.root()));
+        let text_only = prepare_chunks(path, "rust", "source", chunks, src, None);
+
+        assert_eq!(decisions(&with_tree), decisions(&text_only), "span vs text policy parity");
+        assert!(
+            with_tree.iter().any(|pc| pc.embedding.policy == "SkipLowSignal"),
+            "fixture must exercise the low-signal outcome: {:?}",
+            decisions(&with_tree),
+        );
+        assert!(
+            with_tree.iter().any(|pc| pc.embedding.policy == "Embed"),
+            "fixture must exercise the embed outcome: {:?}",
+            decisions(&with_tree),
+        );
+    }
 }
