@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.14.0...rag-rat-core-v0.15.0) - 2026-07-09
+
+### Added
+
+- *(oplog)* wire authoring into the live memory write path (phase B) ([#538](https://github.com/cq27-dev/rag-rat/pull/538))
+- *(oplog)* op-authoring helper + full backfill of existing memories (phase B, unwired) ([#526](https://github.com/cq27-dev/rag-rat/pull/526))
+- *(oracle)* live LSP client substrate for the incremental resolution path ([#531](https://github.com/cq27-dev/rag-rat/pull/531))
+- *(index)* realign logical-symbol references on key-derivation drift ([#493](https://github.com/cq27-dev/rag-rat/pull/493)) ([#525](https://github.com/cq27-dev/rag-rat/pull/525))
+- *(memory)* two-observation downgrade hysteresis for anchor status ([#492](https://github.com/cq27-dev/rag-rat/pull/492)) ([#528](https://github.com/cq27-dev/rag-rat/pull/528))
+- *(clones)* scip refine mode — moniker-collapse same-symbol callees to Type-2 ([#512](https://github.com/cq27-dev/rag-rat/pull/512))
+- *(dream)* expose dream + dream_review MCP tools ([#263](https://github.com/cq27-dev/rag-rat/pull/263)) ([#514](https://github.com/cq27-dev/rag-rat/pull/514))
+- *(oplog)* persisted local device identity — CSPRNG keygen + single-row store (phase B) ([#523](https://github.com/cq27-dev/rag-rat/pull/523))
+- *(oplog)* immutable stream identity — signed stream binding, stream-scoped store, fork quarantine (phase B S2) ([#511](https://github.com/cq27-dev/rag-rat/pull/511))
+- *(memory)* default the memory surface to summary; extend it to the memory-query tools ([#508](https://github.com/cq27-dev/rag-rat/pull/508))
+- *(oplog)* durable storage — layer-1 signed log + full-replay shadow projection (phase B C4) ([#504](https://github.com/cq27-dev/rag-rat/pull/504))
+- *(oplog)* signed hash-chained entry envelope + ed25519 device keys (phase B C4 layer-1) ([#500](https://github.com/cq27-dev/rag-rat/pull/500))
+- *(memory)* pending anchor status for in-flight worktree branches ([#496](https://github.com/cq27-dev/rag-rat/pull/496))
+- *(oplog)* memory op model + deterministic projection fold (phase B §5.4) ([#495](https://github.com/cq27-dev/rag-rat/pull/495))
+- *(clones)* per-generation df snapshot (clone_df_epoch) frees the live df to move ([#490](https://github.com/cq27-dev/rag-rat/pull/490))
+- *(memory)* canonical content_hash primitive (phase B §5.5) ([#480](https://github.com/cq27-dev/rag-rat/pull/480))
+- *(schema)* actionable version-skew messaging for the newer-schema refusal ([#487](https://github.com/cq27-dev/rag-rat/pull/487))
+- *(index)* quiet-pass WAL checkpointing + doctor file-health warnings ([#486](https://github.com/cq27-dev/rag-rat/pull/486))
+- *(locks)* per-database sync-session lock for the device-wide iroh endpoint ([#485](https://github.com/cq27-dev/rag-rat/pull/485))
+- *(clones)* incremental delta maintenance of the persisted clone graph ([#477](https://github.com/cq27-dev/rag-rat/pull/477))
+- *(memory)* typed cross-repo node edges (repo_node_edges) ([#476](https://github.com/cq27-dev/rag-rat/pull/476))
+- *(memory)* polymorphic node payload + Task/Concept kinds ([#471](https://github.com/cq27-dev/rag-rat/pull/471))
+- *(memory)* allow unanchored nodes (Concept / standalone Task) ([#466](https://github.com/cq27-dev/rag-rat/pull/466))
+
+### Fixed
+
+- *(oracle)* surface real I/O errors from the tool-output read ([#556](https://github.com/cq27-dev/rag-rat/pull/556))
+- *(parser)* grow the stack for recursive tree-descent helpers + tripwire enforcing it ([#551](https://github.com/cq27-dev/rag-rat/pull/551))
+- *(dream)* rank coverage_gap by scoped PageRank, not unscoped caller in-degree ([#261](https://github.com/cq27-dev/rag-rat/pull/261)) ([#515](https://github.com/cq27-dev/rag-rat/pull/515))
+- *(watch)* run maintenance passes on a worker thread so events and the fleet trigger stay live ([#510](https://github.com/cq27-dev/rag-rat/pull/510))
+- *(index)* carry retained committed rows across a HEAD move instead of re-deriving the repo ([#505](https://github.com/cq27-dev/rag-rat/pull/505))
+- *(schema)* forward-migrate replay no longer stamps the dirty marker ([#501](https://github.com/cq27-dev/rag-rat/pull/501))
+- *(memory)* relocation prefers the discriminator-matching twin, not plan order ([#494](https://github.com/cq27-dev/rag-rat/pull/494))
+- *(index)* stop the gix status walk from descending into gitignored directories ([#481](https://github.com/cq27-dev/rag-rat/pull/481))
+- *(watch)* gate the background clone-graph rebuild on a content quiet window ([#475](https://github.com/cq27-dev/rag-rat/pull/475))
+- *(watch)* gate the linux-only drain_until_quiet test helper behind cfg ([#468](https://github.com/cq27-dev/rag-rat/pull/468))
+
+### Other
+
+- *(index)* route the heal path through the shared single-parse core ([#552](https://github.com/cq27-dev/rag-rat/pull/552))
+- *(parser)* iterative depth-safe tree walks for symbol and edge extraction ([#540](https://github.com/cq27-dev/rag-rat/pull/540))
+- *(init)* print the MCP connect command instead of auto-registering ([#542](https://github.com/cq27-dev/rag-rat/pull/542))
+- complete the MCP tool catalog, trim the README, make the skills MCP-native ([#539](https://github.com/cq27-dev/rag-rat/pull/539))
+- *(edges)* linearize contains_edges and containing_symbol; dedup the grammar match ([#533](https://github.com/cq27-dev/rag-rat/pull/533))
+- *(reconcile)* skip the policy re-parse for current chunks on the backlog gate ([#529](https://github.com/cq27-dev/rag-rat/pull/529))
+- *(index)* shared-parse low-signal classification + O(1) chunker line spans ([#527](https://github.com/cq27-dev/rag-rat/pull/527))
+
 ## [0.14.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.13.0...rag-rat-core-v0.14.0) - 2026-07-07
 
 ### Added
