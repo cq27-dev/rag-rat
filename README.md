@@ -348,7 +348,7 @@ of hoping. (`rag-rat eval` requires a `--features eval` build; it is absent from
 
 ## Benchmarks
 
-The headline workload is indexing the whole Linux kernel (v7.0, ~63k C/H files, 11.2M graph edges).
+The headline workload is indexing the whole Linux kernel (v7.0, ~63k C/H files, 9.14M graph edges).
 Full numbers — wall-clock, throughput, peak RSS, on-disk size, unresolved-edge taxonomy — are in
 [`docs/benchmarks.md`](docs/benchmarks.md). Performance is tracked per-push and gated per-PR; the live
 history is at [bencher.dev/perf/rag-rat/plots](https://bencher.dev/perf/rag-rat/plots) (wiring:
