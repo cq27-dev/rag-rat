@@ -1,0 +1,17 @@
+{
+  "name": "rag-rat",
+  "displayName": "rag-rat",
+  "description": "Local repo-intelligence index + MCP server: semantic search, symbol/graph navigation, impact-surface preflight, git + GitHub papertrail, and a source-anchored memory graph. 46 tools over MCP.",
+  "version": "0.15.0",
+  "author": { "name": "Kristaps Karlsons" },
+  "homepage": "https://github.com/cq27-dev/rag-rat",
+  "repository": "https://github.com/cq27-dev/rag-rat",
+  "license": "MIT",
+  "keywords": ["mcp", "code-intelligence", "semantic-search", "code-graph", "repo-memory"],
+  "mcpServers": {
+    "rag-rat": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp-launch.js", "mcp"]
+    }
+  }
+}

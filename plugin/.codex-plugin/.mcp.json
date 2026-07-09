@@ -1,0 +1,6 @@
+{
+  "rag-rat": {
+    "command": "node",
+    "args": ["${CODEX_PLUGIN_ROOT}/scripts/mcp-launch.js", "mcp"]
+  }
+}
