@@ -208,29 +208,30 @@ Prefer reusing the existing function(s) over duplicating — impact_surface / sy
 
 ## The tools
 
-The highest-leverage ones (full catalog + JSON schemas in [`docs/mcp-tools.md`](docs/mcp-tools.md)):
+rag-rat exposes **46 MCP tools** — the full catalog with JSON schemas lives in
+[`docs/mcp-tools.md`](docs/mcp-tools.md). The ones you'll reach for most:
 
 - **`impact_surface`** — the coding preflight from the loop above: callers, callees, tests, git
-  history, GitHub papertrail, and repo memories for a symbol in one call. `repo_memories` defaults to
-  a compact, scannable per-memory header (kind, title, confidence, anchor status, and where it's
-  bound); pass `full_memories: true` (or use `memory_for_symbol|path|call_path`) for full bodies +
-  bindings.
-- **`semantic_search`** — hybrid BM25 + vector recall over source/docs, validated against current
+  history, GitHub papertrail, and the repo memories crossing a symbol, in one call. Memories default
+  to compact, scannable headers; pass `full_memories: true` for full bodies + bindings.
+- **`semantic_search`** — hybrid BM25 + vector recall over source and docs, validated against current
   source. Every hit reports `retrieval_mode`; `explain=true` breaks down the score.
-- **`symbol_lookup`** — exact/fuzzy symbol resolution; cfg/overload duplicates grouped as one
-  logical symbol.
-- **`find_callers` / `trace_callees`** — reverse/forward graph traversal (low-signal std/macro noise
-  filtered by default).
-- **`important_symbols`** — load-bearing symbols by (SCIP-aware) PageRank; see
-  [`docs/oracle.md`](docs/oracle.md).
-- **`repo_brief` / `repo_clusters`** — orientation: spine / churn / god-modules / ownership clusters.
-- **`find_clones` / `clones_for_symbol`** — exact + near-miss duplicate functions ranked by refactor
-  ROI; the candidate graph is precomputed in the background so it scales to large repos.
-- **`read_chunk`** — current text for a chunk with anchor validation.
-- Git/GitHub: `commit_search`, `git_history_for_path|symbol`, `git_blame_chunk`,
-  `papertrail_for_*`, `rationale_search`.
-- Memories: `memory_create`, `memory_update`, `memory_search`, `memory_for_symbol|path|call_path`,
-  `memory_validate`, `memory_mark_obsolete`.
+- **`symbol_lookup`** — exact/fuzzy symbol resolution; cfg/overload variants grouped as one logical
+  symbol.
+- **`find_callers` / `trace_callees`** — reverse/forward call-graph traversal (low-signal std/macro
+  noise filtered by default).
+- **`important_symbols`** — the load-bearing symbols by (SCIP-aware) PageRank, seeded from your
+  current diff by default; see [`docs/oracle.md`](docs/oracle.md).
+- **`find_clones`** — exact + near-miss duplicate functions ranked by refactor ROI (the candidate
+  graph is precomputed in the background, so it scales to large repos).
+- **`memory_create`** — record a source-anchored repo memory; **`dream`** surfaces the maintenance
+  worklist that keeps them honest ([below](#self-maintaining-memories)).
+
+Beyond these: repo orientation (`repo_brief`, `repo_clusters`), git/GitHub rationale
+(`commit_search`, `git_history_for_*`, `papertrail_for_*`, `rationale_search`), the full memory
+graph (`memory_search`, `memory_edges`, `memory_rebind`, `memory_doctor`, …), graph-vs-compiler
+audit (`compare_graph_to_scip`), and index diagnostics (`index_status`, `llm_status`, `heal_index`)
+— all documented in [`docs/mcp-tools.md`](docs/mcp-tools.md).
 
 ## Repo memories
 
@@ -242,6 +243,32 @@ call-path, commit, or GitHub ref. rag-rat tracks each anchor as `current`, `relo
 `gone`, or `unverified`, and surfaces matching memories through the `memory_*` tools and inline in
 `read_chunk`, `symbol_lookup`, `find_callers`, `trace_callees`, and `impact_surface`. They're how
 hard-won context reaches the *next* agent in one call instead of evaporating.
+
+Memories are also a **typed graph**, not just a flat list: `memory_edge_add` / `memory_edges` connect
+them with relations (`depends_on`, `relates_to`, `supersedes`, `derived_from`, `tracks`) — a task DAG,
+a mind-map link between decisions, or a task that `tracks` a GitHub issue. Full tool list:
+[`docs/mcp-tools.md`](docs/mcp-tools.md#repo-memories).
+
+## Self-maintaining memories
+
+Memories rot: the code moves under them, an invariant gets superseded, a load-bearing function ships
+with no memory at all. **`dream`** is the maintenance loop that keeps the layer honest. It recomputes
+a ranked worklist of findings *about* the memories themselves — each with a stable id to review:
+
+- **coverage gaps** — load-bearing symbols (by the same PageRank as `important_symbols`) that carry no
+  memory, so the next agent editing them gets nothing.
+- **stale references** — a memory citing a path or anchor that no longer resolves.
+
+`dream` runs the deterministic findings on every call. Two opt-in **model passes** go deeper, running
+a small model on an ephemeral remote GPU (`[llm.dream.remote]`) only when work is pending:
+`rag-rat dream --verify` recomputes each memory's verdict against current source *reality* (has the
+code drifted from what the memory claims?), and `--compact` rewrites a verbose memory to a tighter
+summary. Findings those passes persist surface back through `dream`.
+
+Nothing is deleted automatically. A human — or a strong agent over MCP — burns the worklist down with
+**`dream_review`** (`accept` a real gap, `dismiss` noise, `reset` a prior verdict), and verdicts
+survive future runs so settled findings don't come back. It's the same surface as the CLI
+`rag-rat dream` / `rag-rat dream <id> --accept|--dismiss|--reset`.
 
 ## Compiler-grade resolution & ranking
 
@@ -380,6 +407,9 @@ rag-rat oracle run | status        # compiler-grade resolution (docs/oracle.md)
 rag-rat models list | install <model>
 rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64
 rag-rat github sync --from-refs
+rag-rat memory list | show <id> | doctor | rebind <id>    # inspect / re-anchor repo memories
+rag-rat dream [--verify|--compact] [<id> --accept|--dismiss|--reset]   # memory-maintenance worklist
+rag-rat consolidate                # import a legacy per-repo index into the global store
 rag-rat hooks install              # git maintenance hooks
 rag-rat gc                         # prune rows for dead git contexts
 rag-rat eval [--json|--update-baseline]   # CI search-quality gate; requires a `--features eval` build (absent from the released binary)

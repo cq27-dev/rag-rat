@@ -34,6 +34,32 @@ Prefer these over `grep`/`cat`/file sweeps when browsing or understanding code:
 - **`important_symbols`** — load-bearing symbols by (SCIP-aware) PageRank; pass `personalize` to bias
   toward what you're editing.
 
+That's the daily loop. The MCP exposes **46 tools** in all — reach past the core ones by the question
+you're actually asking (full schemas: `docs/mcp-tools.md`):
+
+| When you want to… | Reach for |
+|---|---|
+| Find where a concept/behavior lives | `semantic_search` |
+| Resolve a symbol by name (exact/fuzzy) | `symbol_lookup` |
+| See what calls X / what X calls | `find_callers` / `trace_callees` |
+| **Know the blast radius before editing** | **`impact_surface`** (callers, callees, tests, history, memories — the preflight) |
+| Read a chunk's exact current text | `read_chunk` |
+| Orient in an unfamiliar repo | `repo_brief` (spine / churn / god_modules / refactor_candidates), `repo_clusters` |
+| Find the load-bearing symbols | `important_symbols` |
+| Check if code duplicates what's already here | `find_clones`; the clone class of one symbol → `clones_for_symbol` |
+| Understand **why** code exists (rationale) | `papertrail_for_symbol` / `papertrail_for_chunk`, `rationale_search` |
+| Trace **when/why** something changed | `git_history_for_symbol` / `git_history_for_path`, `commit_search`, `commits_touching_query`, `git_blame_chunk` |
+| Pull a GitHub issue/PR or refs for a path | `github_issue_search`, `github_refs_for_path`, `papertrail_for_commit` |
+| Read docs / doc-comments for a symbol | `docs_for_symbol` |
+| Map the FFI / binding surface | `ffi_surface` |
+| Audit whether the graph is trustworthy here | `compare_graph_to_scip` (vs compiler), `compare_graph_to_text` (vs regex) |
+| Recall prior notes and their links | `memory_search`, `memory_for_symbol` / `memory_for_path` / `memory_for_call_path`, `memory_edges` |
+| Triage the memory-maintenance worklist | `dream` → `dream_review` (see the **dream-review** skill) |
+| Check index / embedding / GitHub-cache health | `index_status`, `llm_status`, `github_sync_status`; repair drift with `heal_index` |
+
+Reaching for the right tool is cheap and eager: prefer the specific one (`papertrail_for_symbol` for
+*why*, `find_clones` before writing a helper) over defaulting to `semantic_search` for everything.
+
 **Symbol handle:** symbol-returning tools emit `id`, an opaque `sym_<hex>` token — the stable handle
 to cache and pass back into graph/impact/memory tools as `id` (copy verbatim; never parse it as a
 number). Use `ref` (the `path::name` qualified name) for human-readable identity.
@@ -72,6 +98,11 @@ Do it well:
   `FFIBoundary`. Write a concrete title and a body with the **why** + **how to apply** — not just the
   what.
 - **`memory_update` / `memory_mark_obsolete`** when a memory is wrong or superseded — don't leave
-  stale guidance. After a large refactor, `rag-rat memory doctor` flags `gone` anchors to re-bind.
+  stale guidance. After a large refactor, **`memory_doctor`** flags `gone` anchors and
+  **`memory_rebind`** re-anchors them.
+
+The memory layer is kept honest by **`dream`** — a maintenance worklist of load-bearing code with no
+memory (coverage gaps) and memories that have drifted from the source. The **dream-review** skill is
+the loop for triaging it.
 
 The equivalents exist on the CLI too (`rag-rat memory …`) — use whichever your harness exposes.

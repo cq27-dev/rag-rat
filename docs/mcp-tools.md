@@ -53,15 +53,43 @@ To run from a checkout without installing, use a project-scoped server whose com
 
 ## Tools
 
+The MCP surface is **46 tools** in nine groups. The signatures are below; the prose sections that
+follow describe response shapes and per-tool behavior. Every symbol/search/read tool additionally
+accepts an optional `"worktree": string` — an absolute path to a linked git worktree, served as a
+branch overlay over the indexed checkout — omitted from the signatures below for brevity.
+
+**Search & symbols**
+
 - `semantic_search`: `{ "query": string, "limit"?: number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include"?: ("generated" | "git" | "papertrail" | "fallback")[], "explain"?: boolean }`
-- `symbol_lookup`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "lang"?: string, "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("memories")[] }`
+- `symbol_lookup`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "lang"?: string, "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("memories" | "generated")[] }`
+- `docs_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
+
+**Call graph & impact**
+
 - `find_callers`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("references" | "unresolved" | "macros" | "common_methods" | "coverage" | "memories")[], "edge_kinds"?: string[] }`
 - `trace_callees`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("references" | "unresolved" | "macros" | "common_methods" | "coverage" | "memories")[], "edge_kinds"?: string[] }`
-- `compare_graph_to_text`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "references" | "unresolved" | "macros" | "common_methods")[], "edge_kinds"?: string[] }`
 - `impact_surface`: `{ "query"?: string, "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "docs" | "git" | "papertrail" | "text_fallback" | "memories")[], "full_memories"?: boolean }`
+- `compare_graph_to_text`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "references" | "unresolved" | "macros" | "common_methods")[], "edge_kinds"?: string[] }`
+- `compare_graph_to_scip`: `{}`
 - `ffi_surface`: `{ "limit"?: number }`
-- `docs_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
+
+**Orientation & ranking**
+
+- `repo_brief`: `{ "mode"?: "spine" | "churn" | "god_modules" | "refactor_candidates", "limit"?: number, "include"?: ("memories" | "generated")[] }`
+- `repo_clusters`: `{ "limit"?: number, "include"?: ("memories" | "generated")[], "min_cluster_size"?: number }`
+- `important_symbols`: `{ "limit"?: number, "personalize"?: string[] }`
+
+**Clones**
+
+- `find_clones`: `{ "min_similarity"?: number, "min_copies"?: number, "limit"?: number }`
+- `clones_for_symbol`: `{ "id"?: string, "ref"?: string, "path"?: string, "line"?: number }`
+
+**Read**
+
 - `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include"?: ("memories")[] }`
+
+**Git & GitHub history**
+
 - `commit_search`: `{ "query": string, "limit"?: number }`
 - `git_history_for_path`: `{ "path": string, "limit"?: number }`
 - `git_history_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "lang"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
@@ -73,10 +101,40 @@ To run from a checkout without installing, use a project-scoped server whose com
 - `github_issue_search`: `{ "query": string, "limit"?: number }`
 - `github_refs_for_path`: `{ "path": string, "limit"?: number }`
 - `rationale_search`: `{ "query": string, "limit"?: number, "include"?: ("fallback")[] }`
+
+**Index health**
+
 - `llm_status`: `{}`
 - `heal_index`: `{ "limit"?: number }`
 - `github_sync_status`: `{}`
 - `index_status`: `{}`
+
+**Repo memories**
+
+- `memory_create`: `{ "kind": MemoryKind, "title": string, "body": string, "confidence": "high" | "medium" | "low", "created_by"?: string, "source"?: "agent" | "human" | "imported" | "generated", "tags"?: string[], "payload"?: object, "bind"?: BindTarget }`
+- `memory_rebind`: `{ "memory_id": string, "bind": BindTarget }`
+- `memory_update`: `{ "memory_id": string, "kind"?: MemoryKind, "title"?: string, "body"?: string, "confidence"?: "high" | "medium" | "low", "status"?: "active" | "stale" | "obsolete" | "rejected", "tags"?: string[], "payload"?: object }`
+- `memory_search`: `{ "query": string, "limit"?: number }`
+- `memory_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
+- `memory_for_path`: `{ "path": string, "limit"?: number }`
+- `memory_for_call_path`: `{ "edge_sequence_hash": string, "limit"?: number }`
+- `memory_show`: `{ "memory_id": string }`
+- `memory_validate`: `{}`
+- `memory_doctor`: `{}`
+- `memory_mark_obsolete`: `{ "memory_id": string }`
+- `memory_edge_add`: `{ "source_node_id": string, "relation": "depends_on" | "relates_to" | "supersedes" | "derived_from" | "tracks", "target_node_id"?: string, "target_repo_id"?: string, "github_owner"?: string, "github_repo"?: string, "github_number"?: number }`
+- `memory_edge_remove`: `{ "edge_key": string }`
+- `memory_edges`: `{ "direction": "from" | "into", "node_id"?: string, "github_owner"?: string, "github_repo"?: string, "github_number"?: number }`
+
+`MemoryKind` is one of `Invariant`, `Decision`, `RejectedAlternative`, `Risk`, `BugPattern`,
+`TestExpectation`, `PerformanceNote`, `SecurityNote`, `FFIBoundary`, `PlatformQuirk`, `FollowUp`,
+`OpenQuestion`, `Task`, `Concept`, `Obsolete`. `BindTarget` names **exactly one** anchor — see
+[Repo memories](#repo-memories) below for its shape.
+
+**Dream (memory maintenance)**
+
+- `dream`: `{ "limit"?: number, "all"?: boolean }`
+- `dream_review`: `{ "finding": string, "verdict": "accept" | "dismiss" | "reset" }`
 
 **The `include` array** replaces the former `include_*` boolean params (#149 follow-up — shorter,
 token-cheaper). Presence in the list turns a section on. **Omit `include` entirely to keep each
@@ -301,6 +359,14 @@ rows are also listed in `likely_false_positives`. The tool includes the same `co
 graph traversal envelopes so audit output can be checked for stale source and parser failures before
 treating the counts as authoritative.
 
+`compare_graph_to_scip` is the graph-vs-compiler audit bridge — where `compare_graph_to_text` diffs
+the tree-sitter graph against a regex, this diffs it against the **SCIP oracle**. It reports only the
+edges where the compiler and tree-sitter *disagree* on a callee's resolution (the compiler resolves a
+call the heuristic graph got wrong or missed). It takes no arguments (`{}`) and reports over the whole
+oracle-covered checkout; it requires `rag-rat oracle run` to have populated compiler verdicts first,
+and returns nothing when no oracle data exists. Use it to debug the resolver and to see where turning
+the oracle on would change the graph. See [`oracle.md`](oracle.md).
+
 `impact_surface` is the graph-backed rg replacement path for a selected symbol. For
 `id`, `ref`, or `symbol` requests it returns sections instead of a flat list:
 
@@ -382,3 +448,100 @@ short serialized transaction per batch.
 Parser failures are visible through `index_status.parser_failure_paths`, with path, language, and
 message for each failed source parse. Markdown files are chunked by headings instead of parsed with
 tree-sitter.
+
+### Orientation & ranking
+
+`repo_brief`, `repo_clusters`, and `important_symbols` answer "what is this repo, and what holds it
+together?" before you know a symbol to look up.
+
+`repo_brief` ranks files by `mode`: `spine` (central coupling — what the rest of the code depends on),
+`churn` (git change frequency), `god_modules` (oversized high-fan-in files), or `refactor_candidates`.
+Each row carries size/coupling/churn/memory signals and a suggested next tool. `repo_clusters` groups
+the repo into ownership clusters from path proximity, graph edges, and git co-touch, with a
+representative file per cluster (`min_cluster_size` sets the floor). Both accept the orientation
+`include` array (`memories` on by default, `generated` off).
+
+`important_symbols` ranks the most load-bearing symbols by weighted PageRank over the call/type/import
+edge graph — SCIP-aware once `rag-rat oracle run` has populated compiler edges. With **no**
+`personalize`, it auto-seeds from your current git diff and returns importance *relative to your
+current changes* (the random surfer teleports back to what you're editing, lifting the spine those
+symbols depend on). Pass `personalize` (a list of names, `path::name` refs, or `sym_<hex>` handles) to
+seed it explicitly, or a single `"global"` to force whole-repo PageRank. The result is labeled: `mode`
+(which scale), `seed_source` (seed provenance), and `symbols`. See [`oracle.md`](oracle.md) for how the
+oracle sharpens the ranking.
+
+### Clones
+
+`find_clones` returns candidate clone classes ranked by refactor ROI (cross-module spread × member
+count × token length × load-bearing factor × cohesion), each with a completeness provenance block.
+`min_similarity` (if set) must be in `[0.5, 1.0]` (θ default `0.7`); `min_copies` defaults to `2`. A
+**limited** query (`limit: N`) is capped at the refine budget (currently 50): it returns at most 50
+classes, all refined with anti-unification metrics; omit `limit` (or pass `null`) to retrieve every
+class with only the top 50 refined. `completeness.refine_budget_clamped` is true when a supplied limit
+hit that cap. The candidate graph is precomputed in the background, so the tool stays responsive on
+large repos.
+
+`clones_for_symbol` returns the one clone class containing a specific symbol — selected by **exactly
+one** of `id` (a `sym_<hex>` handle), `ref` (`path::name`), or `path` + `line` together. It returns
+the candidate class if the symbol is fingerprinted and has clone siblings, or `null` if it is unique
+or not fingerprinted. This is the same signal the Write/Edit clone-check hook uses at write time.
+
+### Repo memories
+
+Memory tools read and write the durable, source-anchored notes described in the
+[README](../README.md#repo-memories). `memory_create` records one (typed `kind`, `title`, `body`,
+`confidence`), `memory_search` finds them by keyword, and `memory_for_symbol` / `memory_for_path` /
+`memory_for_call_path` fetch the full memories bound to an anchor (the expanded form of the compact
+headers `impact_surface` attaches). `memory_show` expands one memory to its full body by
+`memory_id` — the expand path for a `[memory] surface = "summary"` compact attachment.
+
+`memory_update` edits text/status/confidence/kind/tags; `memory_mark_obsolete` retires a memory
+(kept for audit, hidden from active recall). `memory_validate` re-anchors every memory against current
+source and marks each `current` / `relocated` / `stale` / `gone` / `pending` (it also runs
+automatically after indexing); `memory_doctor` lists the stale/gone/pending ones with suggested
+re-anchor targets. Rebind a moved memory with `memory_rebind` rather than obsoleting and recreating it
+— a `pending` anchor is alive on an in-flight worktree branch and re-anchors itself when that branch
+lands, so leave those alone.
+
+**`BindTarget`** (the `bind` on `memory_create` / `memory_rebind`) names **exactly one** anchor form:
+a logical symbol (`id`), a concrete `chunk_id`, a graph `edge_id`, a `path` (optionally with
+`start_line` + `end_line`), a `commit_hash`, a GitHub ref (`github_owner` + `github_repo` +
+`github_number`), a call-path (`edge_path`: an ordered list of edge ids, from which the server derives
+the authoritative `edge_sequence_hash`), or a directory (`dir`, relative to the repo root; `""` anchors
+to the root). Omit `bind` entirely to create an **unanchored** node — a `Concept` or standalone `Task`
+that lives only as a graph node.
+
+**Memory graph edges.** Memories are not only a flat list — they form a typed graph.
+`memory_edge_add` connects a source node to another node or a GitHub issue with a relation:
+`depends_on` (a task DAG), `relates_to` (a mind-map link), `supersedes`, `derived_from`, or `tracks`
+(issue ← task). Give **exactly one** target: a `target_node_id` (with an optional `target_repo_id` for
+a cross-repo edge) or a full GitHub ref. `memory_edges` lists a node's edges — `direction: "from"` for
+its outgoing edges (dependencies / links / tracks), `direction: "into"` for the reverse traversal
+(e.g. the tasks that `tracks` an issue, or the nodes that depend on this one). `memory_edge_remove`
+deletes an edge by its stable `edge_key`.
+
+### Dream — memory maintenance
+
+`dream` is the pull surface for keeping the memory layer honest as the code moves under it. It
+recomputes a deterministic **maintenance worklist** on each call and returns it ranked, each finding
+with a stable `id`:
+
+- **coverage gaps** — load-bearing symbols (by the same PageRank as `important_symbols`) that carry no
+  memory, so the next agent editing them gets nothing.
+- **stale references** — a memory citing a path or anchor that no longer resolves.
+- **model-verdict findings** (e.g. `memory_divergence`) that a prior opt-in model pass persisted — see
+  below.
+
+`dream` is classified as a **write** tool (like `rag-rat dream`, it syncs the `dream_findings` table)
+even though it returns a worklist. It runs the **deterministic** findings only; it does **not** run the
+optional model passes — those stay on the CLI/cron `rag-rat dream --verify` (recompute each memory's
+verdict against current source reality) and `--compact` (rewrite a memory to a tighter summary), which
+run a small model on an ephemeral remote GPU (`[llm.dream.remote]`) only when work is pending. Findings
+those passes persist still surface through `dream`.
+
+`dream_review` applies a human (or strong-agent) verdict to **one** finding by `id` — a full id or an
+unambiguous git-style prefix — as `accept` (a real gap to act on), `dismiss` (noise), or `reset` (clear
+a prior verdict, back to the open worklist). Verdicts survive future dream runs, so the worklist burns
+down instead of re-proposing settled findings. Pass `all: true` to `dream` to also list the already
+`accepted` / `dismissed` findings (for a reviewer to see and `reset`). This mirrors the CLI
+`rag-rat dream <id> --accept|--dismiss|--reset`.
