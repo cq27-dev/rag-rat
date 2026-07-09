@@ -7,6 +7,11 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# Don't run the release workflow on pull requests. The default ("plan") runs `dist plan` on every
+# PR, which also emits a skipped `build-local-artifacts` matrix job whose name can't be expanded for
+# a skipped job — so the checks list shows the raw `${{ join(matrix.targets, ', ') }}` template.
+# "skip" drops the PR trigger entirely; the release path (version tags) is unaffected.
+pr-run-mode = "skip"
 # The installers to generate for each app. `npm` produces an npm package that fetches the
 # prebuilt binary from the GitHub release — so `npx @rag-rat/bin` works with no Rust toolchain.
 installers = ["shell", "powershell", "npm"]
