@@ -114,7 +114,7 @@ mod listener {
                 if let Err(err) = serve_one(stream, &config, &mut sessions).await
                     && std::env::var_os("RAG_RAT_HOOK_DEBUG").is_some()
                 {
-                    eprintln!("claude-hook listener: {err:#}");
+                    eprintln!("agent-hook listener: {err:#}");
                 }
             }
         })

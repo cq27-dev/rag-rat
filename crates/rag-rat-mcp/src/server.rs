@@ -398,7 +398,7 @@ async fn run_stdio_unix(
     // match so it covers both cold start and hot-upgrade resume. On normal EOF shutdown the guard
     // aborts the task so the socket + election lock release promptly; on a hot-`exec` the process
     // image is replaced (task vanishes) and the new process re-elects.
-    let _hook_listener = AbortOnDrop(crate::claude_hook::spawn_listener(config.clone()));
+    let _hook_listener = AbortOnDrop(crate::agent_hook::spawn_listener(config.clone()));
 
     // Arm the SIGUSR1 hot-upgrade handler only when an install target is configured.
     if let Some(install_path) = install_path {

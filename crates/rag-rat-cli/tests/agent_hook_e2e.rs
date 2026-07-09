@@ -1,4 +1,4 @@
-//! End-to-end tests for `rag-rat claude-hook` (Unix only for socket paths; the no-op
+//! End-to-end tests for `rag-rat agent-hook` (Unix only for socket paths; the no-op
 //! contract tests run everywhere).
 
 use std::io::Write;
@@ -15,7 +15,7 @@ use std::{
 
 fn run_hook(stdin_body: &str, cwd: &std::path::Path) -> (String, std::process::ExitStatus) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
-        .arg("claude-hook")
+        .arg("agent-hook")
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -62,7 +62,7 @@ fn non_search_tool_means_silent_exit_zero() {
     assert!(stdout.is_empty());
 }
 
-/// Full path: a live `rag-rat mcp` elects the hook listener, the `claude-hook` client reaches it
+/// Full path: a live `rag-rat mcp` elects the hook listener, the `agent-hook` client reaches it
 /// over the Unix socket and gets the indexed symbol, a repeat in the same session is deduped to
 /// nothing, a fresh session sees it again, and once the server dies the client falls back to a
 /// direct read-only SQLite query (no dedupe). Proves listener + client + dedupe + fallback wiring.
@@ -211,7 +211,7 @@ impl TestRepo {
             "tool_name": "Grep", "tool_input": {"pattern": "frobnicate_xyz"}
         });
         let (stdout, status) = run_hook(&input.to_string(), &self.root);
-        assert!(status.success(), "claude-hook must exit zero on every path");
+        assert!(status.success(), "agent-hook must exit zero on every path");
         stdout
     }
 

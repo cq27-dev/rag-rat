@@ -1,9 +1,13 @@
-//! `rag-rat claude-hook`: the Claude Code hook client (PreToolUse + SessionStart).
+//! `rag-rat agent-hook`: the coding-agent hook client (PreToolUse + SessionStart). Harness-neutral
+//! — Claude Code, Codex, and Cursor all use the same `hook_event_name` / `tool_name` / `tool_input`
+//! input and the same `hookSpecificOutput.additionalContext` output, so one entrypoint serves all.
 //!
 //! Reads the hook JSON from stdin and branches on `hook_event_name`:
 //! - `"SessionStart"`: injects a read-only repo orientation digest into the model context.
-//! - anything else (or absent): the PreToolUse grep-augmentation path — asks the elected listener
-//!   or falls back to a direct read-only query, prints `additionalContext` JSON.
+//! - PreToolUse (anything else, or absent): grep-augmentation on `Grep`/`Bash` (asks the elected
+//!   listener or falls back to a direct read-only query), and the write-time clone check on the
+//!   edit tools — `Write`/`Edit`/`MultiEdit` (Claude) and `apply_patch` (Codex/Cursor, whose V4A
+//!   diff is parsed for added lines). Prints `additionalContext` JSON.
 //!
 //! Exit 0 on every path — the hook must never block a tool call or session start.
 
@@ -278,7 +282,7 @@ fn shell_tokens(segment: &str) -> Option<Vec<String>> {
     Some(tokens)
 }
 
-/// Entry point for `rag-rat claude-hook`. Every failure path prints nothing and returns
+/// Entry point for `rag-rat agent-hook`. Every failure path prints nothing and returns
 /// Ok(()) — the hook must never block a grep (spec: error posture).
 pub fn run() -> anyhow::Result<()> {
     let _ = run_inner(); // swallow: silence is the contract
@@ -385,7 +389,7 @@ fn version_line(status: &rag_rat_core::version_check::VersionStatus) -> Option<S
 /// PreToolUse path: the write-time clone check (#287) on the edit tools, grep augmentation
 /// otherwise.
 fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
-    if matches!(input.tool_name.as_str(), "Write" | "Edit" | "MultiEdit") {
+    if matches!(input.tool_name.as_str(), "Write" | "Edit" | "MultiEdit" | "apply_patch") {
         return clone_check(input);
     }
     let Some(search) = extract_search(input) else { return Ok(()) };
@@ -460,11 +464,15 @@ fn clone_check(input: &HookInput) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pull the (relative-path, text) inputs to clone-check from a Write/Edit/MultiEdit tool call:
+/// Pull the (relative-path, text) inputs to clone-check from an edit tool call:
 /// Write → the whole `content`; Edit → the `new_string`; MultiEdit → each edit's `new_string` (a
-/// batch). A fragment that isn't a complete function simply yields no fingerprints downstream (a
-/// no-op).
+/// batch); `apply_patch` (Codex / Cursor) → the added (`+`) lines of each Add/Update-File section
+/// of the V4A patch in `tool_input.command`. A fragment that isn't a complete function simply
+/// yields no fingerprints downstream (a no-op).
 fn extract_clone_inputs(input: &HookInput, root: &Path) -> Vec<CloneCheckInput> {
+    if input.tool_name == "apply_patch" {
+        return extract_apply_patch_inputs(&input.tool_input, root);
+    }
     let ti = &input.tool_input;
     let Some(file_path) = ti.get("file_path").and_then(|v| v.as_str()) else { return Vec::new() };
     let abs = Path::new(file_path);
@@ -497,6 +505,65 @@ fn extract_clone_inputs(input: &HookInput, root: &Path) -> Vec<CloneCheckInput> 
         _ => Vec::new(),
     };
     texts.into_iter().map(|text| CloneCheckInput { text, language, path: rel.clone() }).collect()
+}
+
+/// Extract clone-check inputs from a Codex / Cursor `apply_patch` V4A envelope
+/// (`tool_input.command`). Each Add/Update-File section contributes its added (`+`) lines as one
+/// text; the file path picks the language. Non-code paths (no recognized language) are dropped.
+fn extract_apply_patch_inputs(tool_input: &serde_json::Value, root: &Path) -> Vec<CloneCheckInput> {
+    let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    parse_v4a_added_lines(command)
+        .into_iter()
+        .filter_map(|(path, text)| {
+            let abs = Path::new(&path);
+            let language = Language::from_path(abs)?;
+            // The indexed refs are root-relative, so relativize for the parse + self-file
+            // exclusion.
+            let rel = abs.strip_prefix(root).unwrap_or(abs).to_path_buf();
+            Some(CloneCheckInput { text, language, path: rel })
+        })
+        .collect()
+}
+
+/// Parse a V4A `apply_patch` envelope into `(file path, added-line text)` for each Add/Update-File
+/// section. Only `+`-prefixed lines contribute; `*** Delete File:` and the `*** Begin|End Patch`
+/// markers close the current section, and everything else inside a section (context, removed, `@@`
+/// hunk anchors) is skipped. `*** Move to:` is ignored — the Update-File path picks the language.
+fn parse_v4a_added_lines(patch: &str) -> Vec<(String, String)> {
+    fn flush(path: &mut Option<String>, added: &mut String, out: &mut Vec<(String, String)>) {
+        if let Some(p) = path.take()
+            && !added.is_empty()
+        {
+            out.push((p, std::mem::take(added)));
+        }
+        added.clear();
+    }
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut path: Option<String> = None;
+    let mut added = String::new();
+    for line in patch.lines() {
+        if let Some(p) =
+            line.strip_prefix("*** Add File: ").or_else(|| line.strip_prefix("*** Update File: "))
+        {
+            flush(&mut path, &mut added, &mut out);
+            path = Some(p.trim().to_string());
+        } else if line.starts_with("*** Delete File: ")
+            || line.starts_with("*** Begin Patch")
+            || line.starts_with("*** End Patch")
+        {
+            flush(&mut path, &mut added, &mut out);
+        } else if path.is_some()
+            && let Some(rest) = line.strip_prefix('+')
+        {
+            added.push_str(rest);
+            added.push('\n');
+        }
+    }
+    flush(&mut path, &mut added, &mut out);
+    out
 }
 
 /// Render clone-check findings as the `additionalContext` injected back to the agent, or `None`

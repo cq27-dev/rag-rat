@@ -281,7 +281,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // brief staleness gap. post-commit / post-rewrite touch only git metadata, which the
     // file-watcher can't see, so those still run (and are cheap — no file content changed).
     if matches!(trigger.as_str(), "post-checkout" | "post-merge")
-        && crate::claude_hook::watcher_state(config).0
+        && crate::agent_hook::watcher_state(config).0
     {
         print_output(&serde_json::json!({
             "trigger": trigger,

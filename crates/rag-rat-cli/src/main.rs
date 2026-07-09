@@ -18,7 +18,7 @@ pub(crate) use render::*;
 
 use crate::cli::{Cli, Command as Cmd};
 
-mod claude_hook;
+mod agent_hook;
 mod claude_settings;
 mod init;
 
@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
     // Claude Code hook entrypoint reads its event from stdin. Everything else needs a config.
     match &cli.command {
         Cmd::Init(args) => return init::run(args, cli.config.as_deref().unwrap_or("rag-rat.toml")),
-        Cmd::ClaudeHook => return claude_hook::run(),
+        Cmd::AgentHook => return agent_hook::run(),
         _ => {},
     }
 
@@ -80,13 +80,13 @@ fn main() -> anyhow::Result<()> {
 
     // Debug logging (off unless `[log] enabled` or `RAG_RAT_LOG`). Writes are blocking (synchronous
     // to the file), so nothing is lost on exit or on the `Cmd::Mcp` hot-upgrade `exec()`.
-    // `Cmd::Init` / `Cmd::ClaudeHook` returned above (no config, and claude-hook fires
+    // `Cmd::Init` / `Cmd::AgentHook` returned above (no config, and agent-hook fires
     // per-tool-call — logging it would flood the per-process dir and evict the mcp/maintenance
     // signal).
     let _log = rag_rat_core::logging::init_logging(&config, log_role(&cli.command));
 
     match cli.command {
-        Cmd::Init(_) | Cmd::ClaudeHook => unreachable!("handled before the config load above"),
+        Cmd::Init(_) | Cmd::AgentHook => unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
         Cmd::Doctor => doctor(&config)?,
         Cmd::Query(args) => query(&config, &args)?,

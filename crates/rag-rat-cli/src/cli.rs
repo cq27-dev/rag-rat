@@ -38,9 +38,10 @@ pub(crate) enum Command {
     /// Scan the repository and write a starter rag-rat.toml (interactive).
     Init(InitArgs),
 
-    /// Internal: Claude Code hook entrypoint (reads a JSON event on stdin).
+    /// Internal: coding-agent hook entrypoint (reads a JSON hook event on stdin; Claude Code,
+    /// Codex, Cursor).
     #[command(hide = true)]
-    ClaudeHook,
+    AgentHook,
 
     /// Index the repository (default: changed files only).
     Index(IndexArgs),

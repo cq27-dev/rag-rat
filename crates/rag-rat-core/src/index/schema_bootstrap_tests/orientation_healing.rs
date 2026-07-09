@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn orientation_composes_through_read_only_connection() {
-    // Regression guard: the production SessionStart path (claude_hook::session_start) opens the
+    // Regression guard: the production SessionStart path (agent_hook::session_start) opens the
     // index via IndexConnection::open_read_only (SQLITE_OPEN_READ_ONLY on the main DB) and then
     // runs orientation(), which CREATEs a TEMP table + TEMP VIEW.  A read-only main DB still
     // permits writes to the TEMP database, so this must succeed — prove it here.

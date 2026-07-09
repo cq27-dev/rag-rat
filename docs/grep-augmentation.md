@@ -36,7 +36,7 @@ Install globally (writes `~/.claude/settings.json`, applies to all Claude Code s
 rag-rat hooks install --claude --global
 ```
 
-The global install is safe to run from any directory. When `rag-rat claude-hook` is invoked by
+The global install is safe to run from any directory. When `rag-rat agent-hook` is invoked by
 Claude Code, it walks up from the hook's reported `cwd` looking for a `rag-rat.toml`. If none is
 found, the hook exits immediately without printing anything — a silent no-op for repositories that
 are not indexed by rag-rat.
@@ -49,7 +49,7 @@ rag-rat hooks uninstall --claude [--global]
 ```
 
 The install adds two `PreToolUse` entries to the `hooks` block — one `matcher: Grep` and one
-`matcher: Bash` — each calling `rag-rat claude-hook` with a 10-second timeout.
+`matcher: Bash` — each calling `rag-rat agent-hook` with a 10-second timeout.
 
 ## How it serves
 

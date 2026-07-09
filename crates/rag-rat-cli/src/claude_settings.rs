@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-pub const HOOK_COMMAND: &str = "rag-rat claude-hook";
+pub const HOOK_COMMAND: &str = "rag-rat agent-hook";
 // `Grep`/`Bash` drive the grep-augmentation; `Write`/`Edit`/`MultiEdit` drive the write-time clone
-// check (#287). All five fire the one `rag-rat claude-hook` command, which dispatches on tool name.
+// check (#287). All five fire the one `rag-rat agent-hook` command, which dispatches on tool name.
 const MATCHERS: &[&str] = &["Grep", "Bash", "Write", "Edit", "MultiEdit"];
 const SESSION_START_MATCHER: &str = "startup|clear|compact";
 const SESSION_START_TIMEOUT: u64 = 5;

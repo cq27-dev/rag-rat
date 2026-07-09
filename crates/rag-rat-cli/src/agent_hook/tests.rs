@@ -576,6 +576,39 @@ fn extract_clone_inputs_skips_non_code_and_missing_path() {
 }
 
 #[test]
+fn extract_clone_inputs_apply_patch_v4a() {
+    let root = std::path::Path::new("/repo");
+    // Codex/Cursor send the V4A envelope in `tool_input.command`: an Update (only the '+' lines),
+    // an Add (whole new file), a Delete (contributes nothing), and a non-code file (dropped for
+    // want of a language).
+    let patch = "\
+*** Begin Patch
+*** Update File: /repo/src/a.rs
+@@ fn existing()
+ fn existing() {
+-    old();
++    new_a();
++    new_b();
+ }
+*** Add File: /repo/src/b.rs
++fn added() {
++    body();
++}
+*** Delete File: /repo/src/gone.rs
+*** Add File: /repo/notes.txt
++not code, dropped
+*** End Patch
+";
+    let ev = write_event("apply_patch", serde_json::json!({ "command": patch }));
+    let got = super::extract_clone_inputs(&ev, root);
+    assert_eq!(got.len(), 2, "two code files; .txt dropped, Delete contributes nothing");
+    assert_eq!(got[0].path, std::path::PathBuf::from("src/a.rs"), "path relativized to root");
+    assert_eq!(got[0].text, "    new_a();\n    new_b();\n", "only the added lines of the Update");
+    assert_eq!(got[1].path, std::path::PathBuf::from("src/b.rs"));
+    assert_eq!(got[1].text, "fn added() {\n    body();\n}\n", "the whole added file");
+}
+
+#[test]
 fn format_clone_warning_renders_matches_and_is_silent_when_empty() {
     assert!(super::format_clone_warning(&[]).is_none());
     let m = rag_rat_core::index::TextCloneMatch {
