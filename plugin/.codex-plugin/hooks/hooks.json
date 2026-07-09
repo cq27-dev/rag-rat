@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CODEX_PLUGIN_ROOT}/scripts/launch.js\" --no-install claude-hook",
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}

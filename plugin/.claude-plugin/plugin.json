@@ -11,7 +11,7 @@
   "mcpServers": {
     "rag-rat": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp-launch.js", "mcp"]
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/launch.js", "mcp"]
     }
   }
 }

@@ -1,0 +1,42 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Grep",
+      "hooks": [
+        { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install claude-hook", "timeout": 10 }
+      ]
+    },
+    {
+      "matcher": "Bash",
+      "hooks": [
+        { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install claude-hook", "timeout": 10 }
+      ]
+    },
+    {
+      "matcher": "Write",
+      "hooks": [
+        { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install claude-hook", "timeout": 10 }
+      ]
+    },
+    {
+      "matcher": "Edit",
+      "hooks": [
+        { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install claude-hook", "timeout": 10 }
+      ]
+    },
+    {
+      "matcher": "MultiEdit",
+      "hooks": [
+        { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install claude-hook", "timeout": 10 }
+      ]
+    }
+  ],
+  "SessionStart": [
+    {
+      "matcher": "startup|clear|compact",
+      "hooks": [
+        { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/launch.js\" --no-install claude-hook", "timeout": 5 }
+      ]
+    }
+  ]
+}

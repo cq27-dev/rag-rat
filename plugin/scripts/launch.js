@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// rag-rat MCP launcher — ensures a version-matched `rag-rat` binary is available, then runs it with
-// the forwarded args (the plugin passes `mcp`) wired straight to the agent's stdio.
+// rag-rat launcher — ensures a version-matched `rag-rat` binary is available, then runs it with the
+// forwarded args (the plugin passes `mcp`, or `claude-hook` for hook events) wired straight to the
+// agent's stdio.
 //
 // Why Node (not a .sh): the plugin must work on every OS the coding agents run on, including native
 // Windows where there is no bash. Node is present wherever Claude Code / Codex / Cursor run, and one
@@ -15,12 +16,17 @@
 // against the release checksum, installs it into a stable per-user cache, and runs it. Every run
 // after is a direct spawn of the cached binary — no network, no per-launch cost.
 //
+// A leading `--no-install` (passed by hook invocations) resolves from an existing binary only and
+// NEVER blocks on a download — a hook must be fast and must not blow its timeout. The MCP server's
+// own launch is what triggers the one-time install; until then the hook is a harmless no-op.
+//
 // Resolution order (first hit wins):
 //   1. $RAG_RAT_BIN     — explicit override (a local dev build); used unconditionally.
 //   2. managed cache    — <cache>/rag-rat/bin/<version>/rag-rat[.exe]  (version-exact by construction)
 //   3. plugin bin/      — a pre-seeded binary shipped next to the plugin
 //   4. PATH rag-rat     — only if its --version matches the plugin's declared version
 //   5. download+verify  — fetch the platform archive from the GitHub release, checksum, cache it
+//                         (skipped under --no-install)
 //
 // CRITICAL: stdout is the MCP stdio protocol channel. Every diagnostic here goes to stderr.
 
@@ -33,7 +39,12 @@ const crypto = require("node:crypto");
 const { spawn, spawnSync } = require("node:child_process");
 
 const GH_REPO = "cq27-dev/rag-rat";
-const FORWARD_ARGS = process.argv.slice(2); // e.g. ["mcp"]
+
+// A leading `--no-install` (hook invocations) means: resolve from an existing binary only.
+let _args = process.argv.slice(2);
+const NO_INSTALL = _args[0] === "--no-install";
+if (NO_INSTALL) _args = _args.slice(1);
+const FORWARD_ARGS = _args; // e.g. ["mcp"] or ["claude-hook"]
 
 const log = (m) => process.stderr.write(`rag-rat-launch: ${m}\n`);
 const die = (m) => {
@@ -140,7 +151,13 @@ if (onPath) {
   if (v) log(`PATH rag-rat is ${v}, plugin wants ${VERSION} — fetching the matched build`);
 }
 
-// ---- 4) download + verify + cache ----------------------------------------------------------------
+// ---- 4) download + verify + cache (skipped for hooks via --no-install) ---------------------------
+if (NO_INSTALL) {
+  // Hook fast path: no cached binary yet. Do nothing rather than block on a download — the MCP
+  // server's launch installs it; the hook is a harmless no-op until then.
+  log("no cached binary yet — skipping (rag-rat installs on MCP server start)");
+  process.exit(0);
+}
 downloadAndRun().catch((e) => die(e.message));
 
 async function downloadAndRun() {

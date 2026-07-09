@@ -7,5 +7,7 @@
   "repository": "https://github.com/cq27-dev/rag-rat",
   "license": "MIT",
   "keywords": ["mcp", "code-intelligence", "semantic-search", "code-graph", "repo-memory"],
-  "mcpServers": "./.codex-plugin/.mcp.json"
+  "mcpServers": "./.codex-plugin/.mcp.json",
+  "skills": "./skills/",
+  "hooks": "./.codex-plugin/hooks/hooks.json"
 }
