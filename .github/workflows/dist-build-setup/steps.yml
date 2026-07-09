@@ -1,0 +1,18 @@
+# Injected into cargo-dist's `build-local-artifacts` job before `dist build`
+# (via `github-build-setup` in dist-workspace.toml). Kept out of `.github/workflows/` root on
+# purpose — a bare steps array is not a valid workflow, and GitHub only parses YAML directly in the
+# workflows dir, so nesting it one level down avoids an "invalid workflow" annotation.
+#
+# Windows CRT alignment (mirrors ci-cross-platform.yml): esaxx-rs (a C++ dep reached via
+# tokenizers <- model2vec/fastembed) hardcodes cc's `.static_crt(true)` => /MT, but the ort_sys ONNX
+# Runtime prebuilt is /MD. `msvc-crt-static = false` flips Rust's own objects to /MD, which then
+# leaves esaxx's /MT as the odd one out => LNK2038/LNK1319. cc appends env CFLAGS/CXXFLAGS AFTER its
+# own /MT and cl.exe is last-flag-wins, so /MD here overrides esaxx's /MT to match ort. MUST stay
+# Windows-only: on macOS the esaxx build is clang, where `-MD` means "emit make dependencies" and
+# would break the build.
+- name: Align MSVC CRT to dynamic (/MD) to match the ort prebuilt
+  if: runner.os == 'Windows'
+  shell: bash
+  run: |
+    echo "CFLAGS=-MD" >> "$GITHUB_ENV"
+    echo "CXXFLAGS=-MD" >> "$GITHUB_ENV"

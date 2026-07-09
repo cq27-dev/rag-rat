@@ -21,5 +21,33 @@ npm-package = "bin"
 # On each release, publish `@rag-rat/bin` to the npm registry. The release job reads the `NPM_TOKEN`
 # repo secret (must have publish rights to the @rag-rat org); scoped packages publish `--access public`.
 publish-jobs = ["npm"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Target platforms to build apps for (Rust target-triple syntax).
+# NOTE: x86_64-apple-darwin (Intel Mac) is intentionally absent — `ort` ships no prebuilt ONNX
+# Runtime for that target (ort-sys build/download/dist.txt lists aarch64- but not x86_64-apple-darwin),
+# so the only way to build it is compiling ONNX from source. Apple Silicon (aarch64) is covered.
+# Bare `cargo install rag-rat` does NOT work on Intel Mac either — the default features enable
+# fastembed → ort and hit the same missing target. Intel Mac's only source path is the pure-Rust
+# embedder: `cargo install rag-rat --no-default-features --features model2vec` (drops the ONNX/E5
+# fastembed backend, keeps model2vec).
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+
+# Link the Windows CRT dynamically (default is static/+crt-static). The prebuilt ONNX Runtime that
+# `ort` downloads is built against the dynamic CRT (/MD); static linking left its stdio imports
+# (__imp_tolower, __imp__wsopen_s, __imp_fgetc, …) unresolved → LNK2019. Dynamic CRT matches it.
+# This flips only Rust's own objects; esaxx-rs (C++) still hardcodes /MT, so github-build-setup below
+# additionally forces CFLAGS/CXXFLAGS=/MD on Windows to avoid an LNK2038 CRT mismatch.
+msvc-crt-static = false
+
+# Steps injected into the build job before `dist build`. Used for the Windows /MD CRT alignment that
+# msvc-crt-static alone can't do (esaxx-rs hardcodes /MT); see the file's comment. Path is relative
+# to `.github/workflows/`.
+github-build-setup = "dist-build-setup/steps.yml"
+
+# Build the Linux targets on glibc-2.39 images instead of dist's default ubuntu-22.04 (glibc 2.35).
+# The prebuilt ONNX Runtime references the C23 strtol family (__isoc23_strtoll/strtoull/strtol),
+# added in glibc 2.38 — on 2.35 they're undefined at link time. The resulting binaries then require
+# glibc ≥2.38 at runtime, which they already did (they statically embed a glibc-2.38 ONNX build).
+# aarch64 builds natively on an arm runner rather than cross-compiling.
+[dist.github-custom-runners]
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"

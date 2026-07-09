@@ -126,6 +126,12 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Align MSVC CRT to dynamic (/MD) to match the ort prebuilt"
+        if: "runner.os == 'Windows'"
+        run: |
+          echo "CFLAGS=-MD" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-MD" >> "$GITHUB_ENV"
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
