@@ -9,12 +9,12 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app. `npm` produces an npm package that fetches the
 # prebuilt binary from the GitHub release — so `npx @rag-rat/bin` works with no Rust toolchain.
-# Published under the `@rag-rat` npm org (see `npm-scope`/`npm-package`). Publishing to the registry
-# is a separate maintainer step (set `publish-jobs = ["npm"]` + an `NPM_TOKEN` secret) — until then
-# the npm package ships as a GitHub-release artifact only.
 installers = ["shell", "powershell", "npm"]
 # Publish the npm installer as `@rag-rat/bin` (alongside @rag-rat/skills, @rag-rat/setup).
 npm-scope = "@rag-rat"
 npm-package = "bin"
+# On each release, publish `@rag-rat/bin` to the npm registry. The release job reads the `NPM_TOKEN`
+# repo secret (must have publish rights to the @rag-rat org); scoped packages publish `--access public`.
+publish-jobs = ["npm"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
