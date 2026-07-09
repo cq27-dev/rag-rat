@@ -21,6 +21,7 @@
 mod auto_run;
 mod corpus;
 mod join;
+mod lsp;
 mod manifest;
 mod report;
 mod run;
