@@ -91,3 +91,8 @@ zeroize = "1"
 # fast; it's compiled once then cached.
 [profile.dev.package.libsqlite3-sys]
 opt-level = 3
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

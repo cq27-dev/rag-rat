@@ -1,0 +1,19 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app. `npm` produces an npm package that fetches the
+# prebuilt binary from the GitHub release — so `npx @rag-rat/rag-rat` works with no Rust toolchain.
+# Published under the `@rag-rat` npm org (see `npm-scope`). Publishing to the registry is a separate
+# maintainer step (set `publish-jobs = ["npm"]` + an `NPM_TOKEN` secret) — until then the npm package
+# ships as a GitHub-release artifact only.
+installers = ["shell", "powershell", "npm"]
+# Publish the npm installer under the @rag-rat org (alongside @rag-rat/skills, @rag-rat/setup).
+npm-scope = "@rag-rat"
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

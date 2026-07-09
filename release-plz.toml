@@ -14,16 +14,21 @@ git_release_enable = false
 # members point at the same root CHANGELOG.md to produce one combined history.
 changelog_update = true
 
-# `rag-rat` is the user-facing binary and the natural anchor for the workspace tag/release. Because
-# every release shares one version (version_group), this crate bumps on every release, so it always
-# emits exactly one `vX.Y.Z` tag + release covering the whole workspace.
+# `rag-rat` is the user-facing binary and the natural anchor for the workspace tag. Because every
+# release shares one version (version_group), this crate bumps on every release, so it always emits
+# exactly one `vX.Y.Z` tag covering the whole workspace.
+#
+# The GitHub *release* is created by cargo-dist (`dist`), NOT release-plz: `git_release_enable =
+# false` hands it off. release-plz still cuts the `vX.Y.Z` tag (git_tag_enable = true); that tag push
+# triggers `.github/workflows/release.yml`, which builds the prebuilt binaries + npm installer and
+# creates/publishes the GitHub release with the changelog. Do not re-enable git_release_enable here
+# or the two tools will race to create the same release.
 [[package]]
 name = "rag-rat"
 version_group = "rag-rat"
 git_tag_enable = true
-git_release_enable = true
+git_release_enable = false
 git_tag_name = "v{{ version }}"
-git_release_name = "v{{ version }}"
 changelog_path = "./CHANGELOG.md"
 
 [[package]]
