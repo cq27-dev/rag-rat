@@ -78,6 +78,18 @@ rag-rat init
 offers to install the local embedding model, and can register the MCP server and git hooks. Preview
 without writing anything with `rag-rat init --dry-run`; `--yes` runs the non-interactive defaults.
 
+**Install the agent skills.** `init` wires up the index and MCP server; a pair of skills teaches your
+agent to actually reach for them. Install into whatever agents you have (Claude Code, Codex, Cursor,
+and 70+ others, detected automatically):
+
+```bash
+npx @rag-rat/skills
+```
+
+That installs **`using-rag-rat`** (reach for the MCP tools before grep; record durable findings as
+memories) and **`dream-review`** (triage the memory-maintenance worklist). See
+[`skills/README.md`](skills/README.md) for `update` / `list` / `remove` and per-agent flags.
+
 Manual setup and every config knob live in [`docs/config.md`](docs/config.md). For a large repo where
 the default local embedder is too slow, see [Embedding backends](#embedding-backends).
 
