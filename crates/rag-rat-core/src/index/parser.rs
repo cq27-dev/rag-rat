@@ -497,16 +497,20 @@ fn child_name(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn first_descendant_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if kinds.contains(&child.kind()) {
-            return Some(child);
+    // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep subtree
+    // (#543).
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if kinds.contains(&child.kind()) {
+                return Some(child);
+            }
+            if let Some(value) = first_descendant_node(child, kinds) {
+                return Some(value);
+            }
         }
-        if let Some(value) = first_descendant_node(child, kinds) {
-            return Some(value);
-        }
-    }
-    None
+        None
+    })
 }
 
 /// Whether a C/C++ `*_specifier` node carries its body (`field_declaration_list` /
@@ -579,15 +583,17 @@ fn kotlin_property_name(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn kotlin_variable_declaration(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).find_map(|child| {
-        if child.kind() == "variable_declaration" {
-            Some(child)
-        } else if matches!(child.kind(), "modifiers" | "type_parameters" | "type_constraints") {
-            None
-        } else {
-            kotlin_variable_declaration(child)
-        }
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).find_map(|child| {
+            if child.kind() == "variable_declaration" {
+                Some(child)
+            } else if matches!(child.kind(), "modifiers" | "type_parameters" | "type_constraints") {
+                None
+            } else {
+                kotlin_variable_declaration(child)
+            }
+        })
     })
 }
 
@@ -601,17 +607,19 @@ fn function_name(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn last_descendant_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    let mut last = None;
-    for child in node.named_children(&mut cursor) {
-        if kinds.contains(&child.kind()) {
-            last = Some(child);
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        let mut last = None;
+        for child in node.named_children(&mut cursor) {
+            if kinds.contains(&child.kind()) {
+                last = Some(child);
+            }
+            if let Some(value) = last_descendant_node(child, kinds) {
+                last = Some(value);
+            }
         }
-        if let Some(value) = last_descendant_node(child, kinds) {
-            last = Some(value);
-        }
-    }
-    last
+        last
+    })
 }
 
 fn impl_name(node: Node<'_>) -> Option<Node<'_>> {

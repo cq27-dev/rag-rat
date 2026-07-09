@@ -360,3 +360,81 @@ fn deeply_nested_input_does_not_overflow_the_symbol_walk() {
         "the function symbol survives the deep walk",
     );
 }
+
+/// #543 tripwire: EVERY function under `src/index/` that both recurses (references its own name)
+/// AND descends via `named_children` / `.children()` must wrap its recursion in `grow_stack`.
+/// Point-wrapping known helpers kept missing new ones; this enforces the invariant at test time so
+/// a newly-added tree-sitter helper can't silently reintroduce the stack-overflow class. Dogfoods
+/// `parse_symbols` to split functions (no hand brace-matching), and walks the whole `index/` tree
+/// so a new `edges/extract/<lang>.rs` is covered automatically.
+///
+/// KNOWN LIMITATIONS (this catches the common direct-recursion mistake, not every conceivable
+/// shape): mutual recursion `A -> B -> A` where neither references its own name evades it — the two
+/// intentional wrapper/`_impl` splits here are that shape, both verified `grow_stack`-guarded; and
+/// a recurser that descends ONLY via `.child(i)` / `named_child(i)` / `goto_first_child` /
+/// `child_by_field_name` (no `named_children`/`.children()` loop) is not seen as descending. The
+/// paren-callee regression test is the end-to-end backstop.
+#[test]
+fn every_recursive_tree_descender_grows_the_stack() {
+    // Whole-word occurrence of `name` in `body` — matches a direct call `name(` AND a
+    // function-pointer reference `.any(name)` / `find_map(.. name)` (no trailing `(`). Word
+    // boundaries on both sides so `foo` matches neither `foo_bar` nor `xfoo`.
+    fn references_self(body: &str, name: &str) -> bool {
+        let bytes = body.as_bytes();
+        let is_word = |b: u8| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_');
+        let mut from = 0;
+        while let Some(rel) = body[from..].find(name) {
+            let at = from + rel;
+            let end = at + name.len();
+            let before_ok = at == 0 || !is_word(bytes[at - 1]);
+            let after_ok = end >= bytes.len() || !is_word(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = at + name.len();
+        }
+        false
+    }
+
+    fn rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}")) {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let index_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/index");
+    let mut files = Vec::new();
+    rs_files(&index_root, &mut files);
+    assert!(files.len() > 20, "index/ walk found only {} files; wrong root?", files.len());
+
+    let mut offenders = Vec::new();
+    for path in &files {
+        let rel =
+            path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(path).display().to_string();
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let symbols = parser::parse_symbols(path, Language::Rust, &src).expect("parse source");
+        for symbol in symbols.iter().filter(|s| s.kind == "function") {
+            let span = &src[symbol.start_byte..symbol.end_byte];
+            // Body only (skip the signature, which contains the function's own name).
+            let body = span.split_once('{').map(|(_, rest)| rest).unwrap_or(span);
+            let recursive = references_self(body, &symbol.name);
+            let descends = body.contains("named_children") || body.contains(".children(");
+            if recursive && descends && !body.contains("grow_stack(") {
+                offenders.push(format!("{rel}::{}", symbol.name));
+            }
+        }
+    }
+    offenders.sort();
+    offenders.dedup();
+    assert!(
+        offenders.is_empty(),
+        "recursive tree descenders missing a grow_stack wrap (a deeply-nested source file \
+         overflows the indexer stack via these — wrap the recursion in crate::index::grow_stack, \
+         #543):\n{offenders:#?}",
+    );
+}

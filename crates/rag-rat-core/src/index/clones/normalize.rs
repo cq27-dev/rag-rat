@@ -208,10 +208,14 @@ fn walk_spanned(
     tokens.push(kind.to_string());
     spans.push(NodeSpan { start_byte, end_byte, kind, is_leaf: false });
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_spanned(child, src, lang, idents, tokens, spans);
-    }
+    // grow_stack: this recurses to full subtree depth; a hostile deeply-nested clone body must grow
+    // the stack, not overflow it (#543).
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk_spanned(child, src, lang, idents, tokens, spans);
+        }
+    });
 }
 
 #[cfg(test)]

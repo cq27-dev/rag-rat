@@ -475,3 +475,33 @@ mod collect_edges_depth_tests {
             .expect("the edge walk must not overflow the stack on deeply-nested input");
     }
 }
+
+#[cfg(test)]
+mod deep_expression_helper_tests {
+    use std::path::Path;
+
+    use crate::language::Language;
+
+    // The whole-tree walks (collect_edges/collect_symbols) are iterative (#520), but the extractors
+    // call name-finding helpers that recurse to full SUBTREE depth. A hostile file whose CALLEE is
+    // thousands of nested parens drives those helpers deep — grow_stack must grow the stack instead
+    // of overflowing it (#543). The input is far under the 512 KB parse cap and aborts with a stack
+    // overflow WITHOUT the grow_stack wraps.
+
+    #[test]
+    fn a_call_with_a_deeply_nested_paren_callee_does_not_overflow() {
+        // `((((…g…))))();` — the callee is 8000 nested parens (unambiguous, so the parse is fast),
+        // so call_target_name -> last_identifier_text -> collect_identifiers recurses 8000 deep.
+        let depth = 8_000;
+        let src = format!("fn f() {{ {}g{}(); }}\n", "(".repeat(depth), ")".repeat(depth));
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                super::edge_candidates(Path::new("deep.rs"), Language::Rust, &src, &[])
+                    .expect("edge extraction");
+            })
+            .expect("spawn")
+            .join()
+            .expect("a deeply-nested paren callee must not overflow the stack");
+    }
+}

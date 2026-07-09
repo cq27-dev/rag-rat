@@ -127,16 +127,20 @@ pub(crate) fn child_name_text(node: Node<'_>, text: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 pub(crate) fn first_identifier_text(node: Node<'_>, text: &str) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if is_identifier_kind(child.kind()) {
-            return child.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned);
+    // grow_stack: this recurses to full subtree depth; a hostile deeply-nested callee must grow
+    // the stack, not overflow it (#543).
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if is_identifier_kind(child.kind()) {
+                return child.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned);
+            }
+            if let Some(value) = first_identifier_text(child, text) {
+                return Some(value);
+            }
         }
-        if let Some(value) = first_identifier_text(child, text) {
-            return Some(value);
-        }
-    }
-    None
+        None
+    })
 }
 pub(crate) fn last_identifier_text(node: Node<'_>, text: &str) -> Option<String> {
     identifiers_under(node, text).into_iter().last()
@@ -155,25 +159,31 @@ pub(crate) fn collect_identifiers(node: Node<'_>, text: &str, out: &mut Vec<Stri
         }
         return;
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_identifiers(child, text, out);
-    }
+    // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep subtree
+    // (#543).
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_identifiers(child, text, out);
+        }
+    });
 }
 /// Node-returning twin of [`first_identifier_text`]: the first identifier-kind node in document
 /// order, so its byte range can be recorded for the SCIP join (#67). Same traversal, so the node it
 /// returns is exactly the token whose text [`first_identifier_text`] would have produced.
 pub(crate) fn first_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if is_identifier_kind(child.kind()) {
-            return Some(child);
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if is_identifier_kind(child.kind()) {
+                return Some(child);
+            }
+            if let Some(found) = first_identifier_node(child) {
+                return Some(found);
+            }
         }
-        if let Some(found) = first_identifier_node(child) {
-            return Some(found);
-        }
-    }
-    None
+        None
+    })
 }
 /// Node-returning twin of [`last_identifier_text`]: the last identifier-kind node under `node`.
 pub(crate) fn last_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -193,10 +203,12 @@ fn collect_identifier_nodes<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>
         out.push(node);
         return;
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_identifier_nodes(child, out);
-    }
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_identifier_nodes(child, out);
+        }
+    });
 }
 /// Narrow a scoped/dotted identifier node (`scoped_identifier` / `scoped_type_identifier`, whose
 /// text is the full `a::b::c`) down to its final segment — the callee/type name `c`. The

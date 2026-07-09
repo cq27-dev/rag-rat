@@ -149,8 +149,11 @@ fn arm_rebinds_local(node: Node<'_>) -> bool {
     {
         return true;
     }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).any(arm_rebinds_local)
+    // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep arm (#543).
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).any(arm_rebinds_local)
+    })
 }
 
 /// Whether `node`'s subtree contains an `identifier` — used to decide if an assignment target can
@@ -159,8 +162,10 @@ fn subtree_has_identifier(node: Node<'_>) -> bool {
     if node.kind() == "identifier" {
         return true;
     }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).any(subtree_has_identifier)
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).any(subtree_has_identifier)
+    })
 }
 
 /// See [`collect_handler_calls`]. `scope` maps an in-scope binding name to the ALREADY-RESOLVED
@@ -168,6 +173,17 @@ fn subtree_has_identifier(node: Node<'_>) -> bool {
 /// assignment of the same name replaces the entry). A binding read just contributes its stored
 /// handlers — there is no binding→binding recursion, hence no depth/cycle guard.
 fn result_handler_calls<'a>(
+    node: Node<'a>,
+    text: &str,
+    scope: &std::collections::HashMap<String, Vec<Node<'a>>>,
+    out: &mut Vec<Node<'a>>,
+) {
+    // grow_stack: recurses to full expression depth across many arms; wrap the whole recursion so a
+    // hostile deeply-nested handler expression grows the stack rather than overflowing (#543).
+    crate::index::grow_stack(|| result_handler_calls_impl(node, text, scope, out));
+}
+
+fn result_handler_calls_impl<'a>(
     node: Node<'a>,
     text: &str,
     scope: &std::collections::HashMap<String, Vec<Node<'a>>>,
@@ -474,6 +490,12 @@ fn unwrap_to_call(node: Node<'_>) -> Option<Node<'_>> {
 /// their producer and to mask match-arm payloads so they don't resolve to an outer `let` (#208
 /// review).
 fn pattern_binding_names(pattern: Node<'_>, text: &str, out: &mut Vec<String>) {
+    // grow_stack: recurses to full pattern depth across several arms; wrap the whole recursion so a
+    // hostile deeply-nested destructuring pattern grows the stack rather than overflowing (#543).
+    crate::index::grow_stack(|| pattern_binding_names_impl(pattern, text, out));
+}
+
+fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<String>) {
     match pattern.kind() {
         "shorthand_field_identifier" =>
             if let Ok(name) = pattern.utf8_text(text.as_bytes()) {

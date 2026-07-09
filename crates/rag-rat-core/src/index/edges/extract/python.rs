@@ -222,10 +222,14 @@ fn emit_python_type_refs(
     match node.kind() {
         "type" | "generic_type" | "subscript" | "binary_operator" | "list" | "tuple"
         | "type_parameter" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                emit_python_type_refs(child, symbols, text, out);
-            }
+            // grow_stack: a deeply-nested annotation (a PEP 604 union `A|A|…`, nested generics)
+            // recurses to full subtree depth here — grow rather than overflow (#543).
+            crate::index::grow_stack(|| {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    emit_python_type_refs(child, symbols, text, out);
+                }
+            });
         },
         "identifier" =>
             if let Some(name) = last_identifier_text(node, text) {
@@ -424,8 +428,10 @@ fn python_rebinding_effective_byte(node: Node<'_>, name: &str, text: &str) -> Op
             .and_then(|name_node| last_identifier_text(name_node, text))
             .filter(|defined| defined == name)
             .map(|_| node.start_byte()),
-        "expression_statement" =>
-            node.named_child(0).and_then(|inner| python_rebinding_effective_byte(inner, name, text)),
+        "expression_statement" => node.named_child(0).and_then(|inner| {
+            // grow_stack: uniform depth guard (#543); shallow today, no-op fast path.
+            crate::index::grow_stack(|| python_rebinding_effective_byte(inner, name, text))
+        }),
         "assignment"
             if node.child_by_field_name("right").is_some()
                 && node
@@ -455,12 +461,13 @@ fn python_assignment_target_binds(target: Node<'_>, name: &str, text: &str) -> b
     match target.kind() {
         "identifier" => node_text(target, text) == name,
         "pattern_list" | "tuple_pattern" | "list_pattern" | "splat_pattern"
-        | "list_splat_pattern" | "expression_list" => {
+        | "list_splat_pattern" | "expression_list" => crate::index::grow_stack(|| {
+            // grow_stack: nested unpacking (`a, (b, (c, …))`) recurses to full depth (#543).
             let mut cursor = target.walk();
             target
                 .named_children(&mut cursor)
                 .any(|element| python_assignment_target_binds(element, name, text))
-        },
+        }),
         _ => false,
     }
 }
@@ -472,24 +479,30 @@ fn python_assignment_target_binds(target: Node<'_>, name: &str, text: &str) -> b
 fn python_import_binds_name(node: Node<'_>, name: &str, text: &str) -> bool {
     let from_import = node.kind() == "import_from_statement";
     let module_id = node.child_by_field_name("module_name").map(|module| module.id());
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).any(|child| {
-        if Some(child.id()) == module_id {
-            return false;
-        }
-        match child.kind() {
-            "aliased_import" => child
-                .child_by_field_name("alias")
-                .and_then(|alias| last_identifier_text(alias, text))
-                .is_some_and(|alias| alias == name),
-            // from-import: the imported leaf (`from m import Account`). plain import: the top-level
-            // segment of the dotted module path (`import other.Account` binds `other`).
-            "dotted_name" if from_import =>
-                last_identifier_text(child, text).is_some_and(|leaf| leaf == name),
-            "dotted_name" => first_identifier_text(child, text).is_some_and(|root| root == name),
-            "import_list" => python_import_binds_name(child, name, text),
-            _ => false,
-        }
+    // grow_stack: uniform depth guard for a tree descender (#543); `import_list` doesn't nest
+    // deeply today, so this is a no-op fast path.
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).any(|child| {
+            if Some(child.id()) == module_id {
+                return false;
+            }
+            match child.kind() {
+                "aliased_import" => child
+                    .child_by_field_name("alias")
+                    .and_then(|alias| last_identifier_text(alias, text))
+                    .is_some_and(|alias| alias == name),
+                // from-import: the imported leaf (`from m import Account`). plain import: the
+                // top-level segment of the dotted module path (`import other.Account` binds
+                // `other`).
+                "dotted_name" if from_import =>
+                    last_identifier_text(child, text).is_some_and(|leaf| leaf == name),
+                "dotted_name" =>
+                    first_identifier_text(child, text).is_some_and(|root| root == name),
+                "import_list" => python_import_binds_name(child, name, text),
+                _ => false,
+            }
+        })
     })
 }
 
@@ -503,10 +516,22 @@ fn python_import_target(
     out: &mut Vec<EdgeCandidate>,
 ) {
     if child.kind() == "import_list" {
-        let mut cursor = child.walk();
-        for clause in child.named_children(&mut cursor) {
-            python_import_target(clause, text, path, record_alias, import_start, module_root, out);
-        }
+        // grow_stack: uniform depth guard for a tree descender (#543); `import_list` doesn't nest
+        // deeply today, so this is a no-op fast path, but the invariant stays uniform.
+        crate::index::grow_stack(|| {
+            let mut cursor = child.walk();
+            for clause in child.named_children(&mut cursor) {
+                python_import_target(
+                    clause,
+                    text,
+                    path,
+                    record_alias,
+                    import_start,
+                    module_root,
+                    out,
+                );
+            }
+        });
         return;
     }
     // `from <module> import <target> as <alias>` — a SYMBOL alias (#174). Emit the Imports edge to
@@ -1134,5 +1159,43 @@ mod python_edge_tests {
             "scope starts at the import"
         );
         assert_eq!(scope.scope_end, src.len(), "a redef before the import does not shrink scope");
+    }
+
+    #[test]
+    fn nested_type_annotations_emit_type_refs_via_the_recursive_walk() {
+        // Exercises emit_python_type_refs recursing through generic/subscript/union nodes (#543
+        // grow_stack-wrapped) on NORMAL input.
+        let e = edges("def f(x: dict[str, list[int]]) -> Account | Other:\n    pass\n");
+        assert!(has(&e, EdgeKind::ReferencesType, "dict"), "generic type ref: {e:?}");
+        assert!(has(&e, EdgeKind::ReferencesType, "int"), "nested subscript type ref: {e:?}");
+        assert!(has(&e, EdgeKind::ReferencesType, "Account"), "union member type ref: {e:?}");
+        assert!(has(&e, EdgeKind::ReferencesType, "Other"), "union member type ref: {e:?}");
+    }
+
+    #[test]
+    fn parenthesized_import_list_records_each_target() {
+        // Exercises python_import_target recursing into `import_list` (#543 grow_stack-wrapped).
+        let e = edges("from pkg import (Alpha, Beta as B, Gamma)\n");
+        assert!(has(&e, EdgeKind::Imports, "Alpha"), "first list member: {e:?}");
+        assert!(has(&e, EdgeKind::Imports, "Beta"), "aliased list member target: {e:?}");
+        assert!(has(&e, EdgeKind::Imports, "Gamma"), "third list member: {e:?}");
+        assert!(!has(&e, EdgeKind::Imports, "B"), "alias must not be an import target: {e:?}");
+    }
+
+    #[test]
+    fn alias_scope_scan_walks_unpacking_and_expression_statements() {
+        // The aliased import triggers the module-scope rebinding scan (python_next_module_binding →
+        // python_rebinding_effective_byte over statements → python_assignment_target_binds on a
+        // nested unpacking target). All #543 grow_stack-wrapped; this runs them on normal input.
+        // The plain dotted `import Acct.deep` makes the scan's dotted-name arm run
+        // `first_identifier_text` (checking whether the root `Acct` rebinds the alias).
+        let e = edges(
+            "from mod import Account as Acct\n(a, (b, c)) = g()\nresult\nimport Acct.deep\nAcct = \
+             5\n",
+        );
+        // Running the scan is the point (it walks the wrapped helpers on normal input); the import
+        // target is still recorded, and the local `as` alias is never itself an import.
+        assert!(has(&e, EdgeKind::Imports, "Account"), "aliased import target: {e:?}");
+        assert!(!has(&e, EdgeKind::Imports, "Acct"), "alias is not an import target: {e:?}");
     }
 }

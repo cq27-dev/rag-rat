@@ -235,22 +235,26 @@ fn span_is_plumbing(
     start_byte: usize,
     end_byte: usize,
 ) -> bool {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).all(|child| {
-        if child.end_byte() <= start_byte || child.start_byte() >= end_byte {
-            return true;
-        }
-        if is_plumbing_node(language, child) {
-            return true;
-        }
-        if start_byte <= child.start_byte() && child.end_byte() <= end_byte {
-            // A whole non-plumbing statement inside the chunk is signal.
-            return false;
-        }
-        // The child extends beyond the span — a container the chunk slices into. Classify the
-        // slice by the child's own children. A sliced leaf (e.g. one line inside a long string
-        // literal) has none and classifies as plumbing, consistent with docstring interiors.
-        span_is_plumbing(language, child, start_byte, end_byte)
+    // grow_stack: this recurses into container children to full subtree depth; a hostile
+    // deeply-nested chunk must grow the stack, not overflow it (#543).
+    crate::index::grow_stack(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).all(|child| {
+            if child.end_byte() <= start_byte || child.start_byte() >= end_byte {
+                return true;
+            }
+            if is_plumbing_node(language, child) {
+                return true;
+            }
+            if start_byte <= child.start_byte() && child.end_byte() <= end_byte {
+                // A whole non-plumbing statement inside the chunk is signal.
+                return false;
+            }
+            // The child extends beyond the span — a container the chunk slices into. Classify the
+            // slice by the child's own children. A sliced leaf (e.g. one line inside a long string
+            // literal) has none and classifies as plumbing, consistent with docstring interiors.
+            span_is_plumbing(language, child, start_byte, end_byte)
+        })
     })
 }
 
