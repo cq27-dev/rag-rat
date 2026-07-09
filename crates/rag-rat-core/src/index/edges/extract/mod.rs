@@ -140,29 +140,42 @@ pub(crate) fn syntactic_edges(
     collect_edges(language, text, tree.root_node(), symbols, path, &mut out);
     Ok(out)
 }
+/// Pre-order DFS over the named nodes of `root`, running the per-language edge extractor at each.
+///
+/// Iterative (#520): the old per-node recursion allocated a fresh `node.walk()` cursor each frame
+/// and recursed to full tree depth, overflowing the stack on a deeply-nested 512 KB file. An
+/// explicit heap stack keeps the call stack O(1); one reused cursor + one reused child buffer keep
+/// it single-allocation. The per-language extractors are unchanged. Error/missing subtrees are
+/// pruned and named children pop in document order — same visit set/order, so edges are emitted
+/// identically.
 pub(crate) fn collect_edges(
     language: Language,
     text: &str,
-    node: Node<'_>,
+    root: Node<'_>,
     symbols: &[IndexedSymbol],
     path: &Path,
     out: &mut Vec<EdgeCandidate>,
 ) {
-    if node.is_error() || node.is_missing() {
-        return;
-    }
-    match language {
-        Language::Rust => rust::rust_edges(text, node, symbols, path, out),
-        Language::TypeScript => typescript::typescript_edges(text, node, symbols, path, out),
-        Language::Kotlin => kotlin::kotlin_edges(text, node, symbols, path, out),
-        Language::C | Language::Cpp => c_like::c_like_edges(text, node, symbols, path, out),
-        Language::Python => python::python_edges(text, node, symbols, path, out),
-        Language::Markdown => {},
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_edges(language, text, child, symbols, path, out);
+    let mut stack = vec![root];
+    let mut cursor = root.walk();
+    let mut named_children = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            continue;
+        }
+        match language {
+            Language::Rust => rust::rust_edges(text, node, symbols, path, out),
+            Language::TypeScript => typescript::typescript_edges(text, node, symbols, path, out),
+            Language::Kotlin => kotlin::kotlin_edges(text, node, symbols, path, out),
+            Language::C | Language::Cpp => c_like::c_like_edges(text, node, symbols, path, out),
+            Language::Python => python::python_edges(text, node, symbols, path, out),
+            Language::Markdown => {},
+        }
+        named_children.clear();
+        named_children.extend(node.named_children(&mut cursor));
+        for &child in named_children.iter().rev() {
+            stack.push(child);
+        }
     }
 }
 
@@ -434,5 +447,31 @@ mod contains_edges_tests {
             sym(8, 130, 180),
         ];
         assert_equiv(&symbols);
+    }
+}
+
+#[cfg(test)]
+mod collect_edges_depth_tests {
+    use std::path::Path;
+
+    use crate::language::Language;
+
+    #[test]
+    fn deeply_nested_input_does_not_overflow_the_edge_walk() {
+        // The edge walk (collect_edges) recurses the whole tree just like the symbol walk, so it
+        // has the same stack-overflow exposure on deeply-nested input (#520). Small stack + a
+        // thousands-deep tree: a per-node recursive walk overflows here; the iterative one does
+        // not.
+        let depth = 8_000;
+        let src = format!("fn deep_edges_fn() {}{}\n", "{".repeat(depth), "}".repeat(depth));
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                super::edge_candidates(Path::new("deep.rs"), Language::Rust, &src, &[])
+                    .expect("edge extraction")
+            })
+            .expect("spawn walk thread")
+            .join()
+            .expect("the edge walk must not overflow the stack on deeply-nested input");
     }
 }

@@ -306,29 +306,44 @@ pub fn parse_error(path: &Path, language: Language, text: &str) -> anyhow::Resul
     }
 }
 
+/// Pre-order DFS over the named nodes of `root`, emitting a symbol for each declaration node.
+///
+/// Iterative (#520): a per-node recursion with a fresh `node.walk()` cursor each frame allocated a
+/// cursor per node AND recursed to full tree depth — a deeply-nested 512 KB file (thousands of
+/// nested blocks/expressions) overflows the stack on a worker thread even though the parse itself
+/// stays within budget. An explicit heap stack keeps the call stack O(1); one reused cursor + one
+/// reused child buffer keep it single-allocation. Error/missing subtrees are pruned (skipped, not
+/// descended) and named children are pushed in reverse so they pop in document order — the same
+/// visit set and order as the recursion, so the emitted symbols are byte-identical.
 fn collect_symbols(
     path: &Path,
     language: Language,
     text: &str,
-    node: Node<'_>,
+    root: Node<'_>,
     out: &mut Vec<ParsedSymbol>,
 ) {
-    if node.is_error() || node.is_missing() {
-        return;
-    }
-    if let Some((kind, name_node)) = symbol_node(language, node, text) {
-        let name = node_text(name_node, text).unwrap_or_default();
-        if !name.is_empty() {
-            // The span (chunk/embedding) is the matched `node`; the SIGNATURE is read from the
-            // declaration node, which differs for a decorated Python def (the span starts at the
-            // decorator, but the signature must be the `def`/`class` line).
-            let signature_node = signature_source_node(language, node);
-            out.push(make_symbol(path, language, text, node, signature_node, kind, name));
+    let mut stack = vec![root];
+    let mut cursor = root.walk();
+    let mut named_children = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            continue;
         }
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_symbols(path, language, text, child, out);
+        if let Some((kind, name_node)) = symbol_node(language, node, text) {
+            let name = node_text(name_node, text).unwrap_or_default();
+            if !name.is_empty() {
+                // The span (chunk/embedding) is the matched `node`; the SIGNATURE is read from the
+                // declaration node, which differs for a decorated Python def (the span starts at
+                // the decorator, but the signature must be the `def`/`class` line).
+                let signature_node = signature_source_node(language, node);
+                out.push(make_symbol(path, language, text, node, signature_node, kind, name));
+            }
+        }
+        named_children.clear();
+        named_children.extend(node.named_children(&mut cursor));
+        for &child in named_children.iter().rev() {
+            stack.push(child);
+        }
     }
 }
 
