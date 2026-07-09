@@ -129,7 +129,8 @@ branch overlay over the indexed checkout — omitted from the signatures below f
 `MemoryKind` is one of `Invariant`, `Decision`, `RejectedAlternative`, `Risk`, `BugPattern`,
 `TestExpectation`, `PerformanceNote`, `SecurityNote`, `FFIBoundary`, `PlatformQuirk`, `FollowUp`,
 `OpenQuestion`, `Task`, `Concept`, `Obsolete`. `BindTarget` names **exactly one** anchor — see
-[Repo memories](#repo-memories) below for its shape.
+[Repo memories](#repo-memories) below for its shape. `payload` is accepted **only** for the
+polymorphic graph-node kinds `Task` and `Concept` (#465); passing it for any other kind is rejected.
 
 **Dream (memory maintenance)**
 
@@ -360,12 +361,14 @@ graph traversal envelopes so audit output can be checked for stale source and pa
 treating the counts as authoritative.
 
 `compare_graph_to_scip` is the graph-vs-compiler audit bridge — where `compare_graph_to_text` diffs
-the tree-sitter graph against a regex, this diffs it against the **SCIP oracle**. It reports only the
-edges where the compiler and tree-sitter *disagree* on a callee's resolution (the compiler resolves a
-call the heuristic graph got wrong or missed). It takes no arguments (`{}`) and reports over the whole
-oracle-covered checkout; it requires `rag-rat oracle run` to have populated compiler verdicts first,
-and returns nothing when no oracle data exists. Use it to debug the resolver and to see where turning
-the oracle on would change the graph. See [`oracle.md`](oracle.md).
+the tree-sitter graph against a regex, this diffs it against the **SCIP oracle**. It reports only
+**contradictions**: edges where the heuristic resolved a callee to one target and the compiler says
+it is actually another. Calls the heuristic merely *missed* or under-resolved are agreement-shaped
+(the oracle classifies them `Upgrade` / `ResolvedExternal`) and are **not** reported — so an empty
+result means "no contradictions," not "SCIP found no missed edges." It takes no arguments (`{}`) and
+reports over the whole oracle-covered checkout; it requires `rag-rat oracle run` to have populated
+compiler verdicts first, and returns nothing when no oracle data exists. Use it to debug the resolver
+where tree-sitter and the compiler actively disagree. See [`oracle.md`](oracle.md).
 
 `impact_surface` is the graph-backed rg replacement path for a selected symbol. For
 `id`, `ref`, or `symbol` requests it returns sections instead of a flat list:
@@ -508,8 +511,9 @@ a logical symbol (`id`), a concrete `chunk_id`, a graph `edge_id`, a `path` (opt
 `start_line` + `end_line`), a `commit_hash`, a GitHub ref (`github_owner` + `github_repo` +
 `github_number`), a call-path (`edge_path`: an ordered list of edge ids, from which the server derives
 the authoritative `edge_sequence_hash`), or a directory (`dir`, relative to the repo root; `""` anchors
-to the root). Omit `bind` entirely to create an **unanchored** node — a `Concept` or standalone `Task`
-that lives only as a graph node.
+to the root). On **`memory_create`** only, omit `bind` entirely to create an **unanchored** node — a
+`Concept` or standalone `Task` that lives only as a graph node. **`memory_rebind`** requires a real
+target: it rejects an empty `bind` (to unanchor an existing memory, delete and recreate it).
 
 **Memory graph edges.** Memories are not only a flat list — they form a typed graph.
 `memory_edge_add` connects a source node to another node or a GitHub issue with a relation:
