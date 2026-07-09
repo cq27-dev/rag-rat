@@ -625,10 +625,8 @@ fn raw_remote_draft(doc: &DocumentMut) -> Option<RemoteDraft> {
     let model = string("model")?;
     let mode = if let Some(endpoint) = string("endpoint") {
         RemoteMode::Connect(endpoint)
-    } else if let Some(cookbook) = string("cookbook") {
-        RemoteMode::Ephemeral(cookbook)
     } else {
-        return None;
+        RemoteMode::Ephemeral(string("cookbook")?)
     };
     let batch_size = remote
         .get("batch_size")
