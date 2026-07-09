@@ -120,7 +120,7 @@ pub(crate) fn reconcile_with_options_progress(
     //    (`provision_remote=false`) whose local `query_endpoint` is absent or UNREACHABLE — defer
     //    incremental embedding to an explicit reconcile. (WITH a REACHABLE `query_endpoint`, that
     //    pass takes the light local-embed path → `Ready`, not here.) Returning here avoids paying
-    //    the O(repo) `embedding_policy_skip_summary` just to report a deferral.
+    //    the repo-wide `embedding_policy_skip_summary` scan just to report a deferral.
     //  - NoEphemeralWork: an explicit provisioning reconcile on an already-current ephemeral model
     //    (never cold-start a paid box for zero work, #330-6). `acquire_chunk_embedder` confirmed
     //    ZERO candidates, so the policy scan would likewise be wasted work.
@@ -186,7 +186,7 @@ pub(crate) fn reconcile_with_options_progress(
         other => other,
     };
 
-    // Ready / NotReady: BOTH report the per-policy skip counts, so run the O(repo) policy summary
+    // Ready / NotReady: BOTH report the per-policy skip counts, so run the repo-wide policy summary
     // now. (SkipEphemeral already returned above without paying it.)
     let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let skipped_chunks = skipped_by_policy.values().sum();
@@ -739,17 +739,20 @@ pub(crate) fn embedding_policy_skip_summary(
     conn: &Connection,
     max_embedding_chars: usize,
 ) -> anyhow::Result<BTreeMap<String, u64>> {
-    let mut skipped_by_policy = BTreeMap::new();
-    // STREAM the chunks one row at a time, counting skips, instead of materializing every chunk.
-    // The previous `current_chunks(conn, None)` loaded ALL chunk rows — including each chunk's full
-    // `text` — into a `Vec` just to produce this count. On a kernel-sized index (~4.2M chunks) that
-    // is ~4 GB resident for a summary that keeps nothing per row, and it runs on every reconcile
-    // (and `reconcile_plan`), so it dominated `index --full` peak memory. The same
-    // `embedding_policy_for_chunk` runs over the same chunks, so the counts are identical.
+    // Re-derive each chunk's policy from its text and count the ineligible ones by category. This
+    // is DIAGNOSTIC-ONLY (reported in status/plan; nothing gates work on it). It deliberately does
+    // NOT read the persisted `chunks.embedding_policy`: that column is stamped at index time with
+    // DEFAULT_MAX_EMBEDDING_CHARS and (for chunks predating its migration) defaults to 'Embed'
+    // without a backfill, so aggregating it would under-report the skips the authoritative
+    // `select_reconcile_batch` (which recomputes with the runtime cap) actually makes — defeating
+    // the summary's whole job of explaining WHY nothing embedded. Recomputing keeps it exact for
+    // any cap and any index age. Streams one chunk at a time to bound memory (#379): the previous
+    // `current_chunks(conn, None)` materialized every chunk's decompressed text into a `Vec`.
     //
-    // Chunk text comes from the compressed `chunk_text` store (#77 Phase 2); the `chunks.text`
-    // column is gone, so INNER JOIN `chunk_text` (every live chunk has one blob). One dict decoder
-    // for the whole stream (versions loaded once, reused per row).
+    // The hotter watcher/maintenance gate (`estimated_reconcile_jobs`) avoids this scan entirely by
+    // ordering its freshness check before the policy check (#522), so the parse there fires only
+    // for genuinely stale chunks.
+    let mut skipped_by_policy = BTreeMap::new();
     let dicts = crate::query::chunk_text_dicts(conn)?;
     let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
     let mut stmt = conn.prepare(

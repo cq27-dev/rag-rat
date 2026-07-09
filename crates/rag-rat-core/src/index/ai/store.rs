@@ -53,8 +53,7 @@ pub(crate) fn current_chunk_row(
 /// on the fly and handing the owned [`CurrentChunk`] to `f` — WITHOUT collecting the whole set into
 /// a `Vec`. This bounds the resident memory of a full-index pass to one chunk's text at a time.
 /// `embedding_reconcile_plan` counts over it so a plan on a kernel-scale index never materializes
-/// every candidate's decompressed text at once (#379, mirroring the already-streamed
-/// `embedding_policy_skip_summary`). `limit == None` walks every candidate.
+/// every candidate's decompressed text at once (#379). `limit == None` walks every candidate.
 pub(crate) fn for_each_embedding_candidate(
     conn: &Connection,
     model_id: &str,
@@ -248,8 +247,9 @@ pub(crate) fn estimated_reconcile_jobs(
     // peak. The `force` branch queries with an empty model_id (no embedding rows join, so every
     // chunk is a candidate — matching the old `current_chunks`); otherwise use the active model
     // so `needs_embedding` sees each chunk's embedding row. Text is still decompressed per row
-    // (both `policy_for_job` and `needs_embedding` read it), but only ONE chunk is resident at
-    // a time now.
+    // (`needs_embedding`'s input hash reads it; `policy_for_job` reads it only for the stale
+    // chunks that reach the policy gate after the #522 reorder), but only ONE chunk is resident
+    // at a time now.
     let (model_id, model_version, dim, changed_first) = if options.force {
         ("", "", 0, false)
     } else {
@@ -264,15 +264,25 @@ pub(crate) fn estimated_reconcile_jobs(
         options.limit,
         changed_first,
         |candidate| {
-            let eligible = policy_for_job(&candidate, scan.max_embedding_chars).eligible
-                && (options.force
-                    || needs_embedding(
-                        &candidate,
-                        scan.model_id,
-                        scan.model_version,
-                        scan.dim,
-                        scan.max_embedding_chars,
-                    ));
+            // Freshness FIRST, policy second (#522). Both operands are pure, so `&&` commutes and
+            // the count is byte-identical to the old policy-first order — but in steady state most
+            // chunks are already `Current`, so `needs_embedding` returns false and short-circuits
+            // BEFORE `policy_for_job`, whose low-signal gate would otherwise re-parse the chunk
+            // with tree-sitter. The parse now runs only for genuinely stale chunks (about to be
+            // embedded anyway) or under `--force` (where `options.force` short-circuits
+            // `needs_embedding`). Policy-skipped chunks (generated/tiny/fixture) are always
+            // missing, so `needs_embedding` decides them on its first (cheap) clause
+            // without building or hashing the text — the idle gate does not pay an
+            // O(text) pass per skipped chunk.
+            let eligible = (options.force
+                || needs_embedding(
+                    &candidate,
+                    scan.model_id,
+                    scan.model_version,
+                    scan.dim,
+                    scan.max_embedding_chars,
+                ))
+                && policy_for_job(&candidate, scan.max_embedding_chars).eligible;
             if eligible {
                 count = count.saturating_add(1);
             }

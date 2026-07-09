@@ -7,14 +7,26 @@ pub(crate) fn needs_embedding(
     dim: usize,
     max_embedding_chars: usize,
 ) -> bool {
-    let input = build_embedding_input(chunk, max_embedding_chars);
-    let expected_input_hash = embedding_input_hash(model_id, model_version, &input.text);
-    chunk.embedding_status.as_deref() != Some("Current")
+    // Evaluate the CHEAP staleness signals first. The only clause that needs the (O(text))
+    // embedding input + its hash is the `input_hash` comparison, so defer building them until
+    // every cheaper signal has said "fresh" — a chunk that is missing (no embedding row →
+    // status != "Current"), re-hashed, model-/dim-/text-version-shifted is decided here without
+    // touching the text. This is a pure reordering of an OR chain (`build_embedding_input` is
+    // side-effect-free), so the boolean is byte-identical; it matters because
+    // `estimated_reconcile_jobs` runs this per candidate on the idle watcher/maintenance gate,
+    // where a repo full of policy-skipped chunks (all missing, so decided by the first clause)
+    // must not pay a build+hash each pass.
+    if chunk.embedding_status.as_deref() != Some("Current")
         || chunk.source_text_hash.as_deref() != Some(chunk.text_hash.as_str())
         || chunk.model_version.as_deref() != Some(model_version)
         || chunk.embedding_dim != Some(i64::try_from(dim).unwrap_or(i64::MAX))
-        || chunk.input_hash.as_deref() != Some(expected_input_hash.as_str())
         || chunk.embedding_text_version.as_deref() != Some(EMBEDDING_TEXT_VERSION)
+    {
+        return true;
+    }
+    let input = build_embedding_input(chunk, max_embedding_chars);
+    let expected_input_hash = embedding_input_hash(model_id, model_version, &input.text);
+    chunk.input_hash.as_deref() != Some(expected_input_hash.as_str())
 }
 
 /// How the `SkipLowSignal` gate classifies a chunk. Evaluated ONLY if the cheaper gates

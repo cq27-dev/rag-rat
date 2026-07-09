@@ -712,6 +712,135 @@ fn reconcile_policy_skips_tiny_chunks_before_embedding() {
 }
 
 #[test]
+fn policy_skip_summary_recomputes_exactly_for_a_non_default_char_cap() {
+    // #522: the skip summary recomputes each chunk's policy against the RUNTIME cap — it must not
+    // trust the persisted `chunks.embedding_policy` (stamped at index time with the default cap),
+    // so the diagnostic matches what the authoritative `select_reconcile_batch` will actually skip.
+    // A ~5 KB generated chunk is SkipGenerated at the default cap (5 KB < 16 KB) but SkipTooLarge
+    // at cap=1000 (5 KB > 4 KB); the summary bucket must track the cap actually used.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("gen")).unwrap();
+    // ~5.3 KB across 80 lines (one generated chunk: split_text_chunks flushes every 160 lines).
+    let big =
+        "// generated data line with sufficient length to matter for the cap xxxxx\n".repeat(80);
+    fs::write(root.join("gen/bindings.rs"), &big).unwrap();
+    let config = Config {
+        repo_id_override: None,
+        database_key_pinned: true,
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "generated".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("gen")],
+            include: vec!["gen/".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Generated,
+        }],
+        llm: Default::default(),
+        watch: Default::default(),
+        version_check: Default::default(),
+        oracle: Default::default(),
+        search: Default::default(),
+        memory: Default::default(),
+        log: Default::default(),
+        source_root_reanchored_from: None,
+        allow_empty: false,
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
+
+    // Default cap: the persisted (default-stamped) policy is SkipGenerated; the fast path agrees.
+    let default_run = db
+        .reconcile_with_options_progress(
+            crate::index::ai::ReconcileOptions { batch_size: Some(8), ..Default::default() },
+            |_| {},
+        )
+        .unwrap();
+    assert!(
+        default_run.skipped_by_policy.get("SkipGenerated").copied().unwrap_or(0) >= 1,
+        "default cap: {:?}",
+        default_run.skipped_by_policy
+    );
+    assert_eq!(
+        default_run.skipped_by_policy.get("SkipTooLarge"),
+        None,
+        "default cap must not see SkipTooLarge: {:?}",
+        default_run.skipped_by_policy
+    );
+
+    // Non-default cap: the fallback recomputes and the same chunk is now SkipTooLarge — the report
+    // explains the skip that `select_reconcile_batch` (which also uses the runtime cap) will make.
+    let small_cap_run = db
+        .reconcile_with_options_progress(
+            crate::index::ai::ReconcileOptions {
+                batch_size: Some(8),
+                max_embedding_chars: 1_000,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+    assert!(
+        small_cap_run.skipped_by_policy.get("SkipTooLarge").copied().unwrap_or(0) >= 1,
+        "cap=1000 must recompute SkipTooLarge: {:?}",
+        small_cap_run.skipped_by_policy
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn policy_skip_summary_buckets_ineligible_chunks_across_categories() {
+    // #522: the skip summary must bucket ineligible chunks by policy across distinct categories
+    // (SkipTooSmall, SkipGenerated), never count an eligible `Embed` chunk, and leave a supported
+    // language out of SkipLanguageUnsupported.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/generated")).unwrap();
+    // A real, embeddable function (>= MIN_EMBEDDING_CHARS, real body → Embed) plus a tiny one
+    // (< 80 chars → SkipTooSmall).
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn real_function_with_a_meaningful_body(input: usize) -> usize {\n    let doubled = \
+         input * 2;\n    doubled + 7\n}\n\nfn x() {}\n",
+    )
+    .unwrap();
+    // Path-heuristic codegen under a Source target still gets symbols, but every chunk is
+    // SkipGenerated (looks_generated_path fires on `/generated/`).
+    fs::write(
+        root.join("src/generated/bindings.rs"),
+        "pub fn generated_alpha() -> u32 {\n    1\n}\n\npub fn generated_beta() -> u32 {\n    \
+         2\n}\n",
+    )
+    .unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
+
+    let skipped = db.reconcile_plan().unwrap().embeddings.skipped_by_policy;
+
+    // The summary holds ONLY ineligible chunks — an eligible `Embed` chunk is never a bucket.
+    assert!(
+        !skipped.contains_key("Embed"),
+        "Embed must not appear in the skip summary: {skipped:?}"
+    );
+    // The tiny `fn x() {}` chunk.
+    assert_eq!(skipped.get("SkipTooSmall"), Some(&1), "summary: {skipped:?}");
+    // Both generated functions (plus any generated context chunk) — path-heuristic SkipGenerated.
+    assert!(
+        skipped.get("SkipGenerated").copied().unwrap_or(0) >= 2,
+        "expected >=2 SkipGenerated: {skipped:?}"
+    );
+    // Rust is a supported embedding language.
+    assert_eq!(skipped.get("SkipLanguageUnsupported"), None, "summary: {skipped:?}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn reconcile_plan_reports_policy_skips_for_fastembed_model() {
     let (root, config) = markdown_config("tiny\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
