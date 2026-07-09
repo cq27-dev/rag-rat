@@ -8,8 +8,9 @@ plus dirty worktree overlay in the same way as CLI queries.
 ## Install
 
 The MCP server is launched by the MCP client over STDIO; it does not listen on a TCP port. The
-recommended setup is `rag-rat init` from the target repo, which indexes it and registers a
-**project-scoped** MCP server. The per-repo setup, by hand:
+recommended setup is `rag-rat init` from the target repo, which indexes it and prints the one command
+that registers a **project-scoped** MCP server (`init` does not register it for you). The per-repo
+setup, by hand:
 
 ```bash
 cd /path/to/your/repo

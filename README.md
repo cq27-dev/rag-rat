@@ -75,25 +75,26 @@ rag-rat init
 ```
 
 `init` scans the repo, prompts for languages and path bindings, writes `rag-rat.toml`, indexes,
-offers to install the local embedding model, and can register the MCP server and git hooks. Preview
-without writing anything with `rag-rat init --dry-run`; `--yes` runs the non-interactive defaults.
+offers to install the local embedding model, and can install git hooks; on completion it prints the
+one command to connect your agent. Preview without writing anything with `rag-rat init --dry-run`;
+`--yes` runs the non-interactive defaults.
 
 Manual setup and every config knob live in [`docs/config.md`](docs/config.md). For a large repo where
 the default local embedder is too slow, see [Embedding backends](#embedding-backends).
 
 ## Connect it to your agent (MCP)
 
-The MCP server is STDIO — the client launches `rag-rat` as a child process. **`rag-rat init` is the
-recommended path:** it registers the server **per project** (`claude mcp add --scope project` /
-`codex mcp add`), so each repo gets its own index.
-
-To wire it up by hand, register a **project-scoped** server that runs in the repo directory:
+The MCP server is STDIO — the client launches `rag-rat` as a child process. Registering it is **one
+command**, run from the repo directory so the server resolves that repo's `rag-rat.toml` and each
+repo gets its own index:
 
 ```bash
-claude mcp add --scope project rag-rat -- rag-rat mcp
+claude mcp add --scope project rag-rat -- rag-rat mcp     # Claude Code
+codex  mcp add rag-rat -- rag-rat mcp                     # Codex
 ```
 
-or a project `.mcp.json` / equivalent:
+`rag-rat init` prints this command on completion — it does not register the server for you. Or add a
+project `.mcp.json` / equivalent:
 
 ```json
 {

@@ -76,9 +76,9 @@ fn run_non_interactive(
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
     let db = setup_index(&config)?;
     setup_model_and_reconcile(&config, &db, options.yes)?;
-    offer_mcp_install(&config, &options.config_path, options.yes)?;
     offer_hooks_install(&config, options.yes)?;
     eprintln!("init: complete");
+    print_mcp_connect_hint();
     Ok(())
 }
 
@@ -117,10 +117,9 @@ fn run_interactive(options: &InitOptions) -> anyhow::Result<()> {
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
     let db = setup_index(&config)?;
     setup_model_and_reconcile(&config, &db, false)?;
-    // `false` = prompt the user — the wizard didn't cover MCP install, so ask after completing.
-    offer_mcp_install(&config, &options.config_path, false)?;
     apply_wizard_hooks(&config, &result)?;
     eprintln!("init: complete");
+    print_mcp_connect_hint();
     Ok(())
 }
 
@@ -392,26 +391,14 @@ pub(crate) fn setup_model_and_reconcile(
     )?;
     Ok(())
 }
-pub(crate) fn offer_mcp_install(
-    config: &Config,
-    config_path: &Path,
-    assume_yes: bool,
-) -> anyhow::Result<()> {
-    let absolute_config = absolute_config_path(config, config_path)?;
-    if assume_yes
-        || Confirm::new()
-            .with_prompt("Install rag-rat MCP for Claude Code?")
-            .default(false)
-            .interact()?
-    {
-        install_claude_mcp(&absolute_config)?;
-    }
-    if assume_yes
-        || Confirm::new().with_prompt("Install rag-rat MCP for Codex?").default(false).interact()?
-    {
-        install_codex_mcp(&absolute_config)?;
-    }
-    Ok(())
+/// `init` does not register the MCP server with the user's agent — that is one short command the
+/// user runs themselves (`init` shelling out to `claude`/`codex` was fragile and hid the command).
+/// Print the project-scoped one-liner instead, so the connection step stays discoverable. See the
+/// README "Connect it to your agent (MCP)" section.
+fn print_mcp_connect_hint() {
+    eprintln!("Next — connect your coding agent to rag-rat (run from this repo):");
+    eprintln!("    claude mcp add --scope project rag-rat -- rag-rat mcp   # Claude Code");
+    eprintln!("    codex  mcp add rag-rat -- rag-rat mcp                   # Codex");
 }
 pub(crate) fn offer_hooks_install(config: &Config, assume_yes: bool) -> anyhow::Result<()> {
     let install = assume_yes
@@ -430,71 +417,6 @@ pub(crate) fn offer_hooks_install(config: &Config, assume_yes: bool) -> anyhow::
     eprintln!("init: installed hooks in {}", git.hooks_dir.display());
     Ok(())
 }
-pub(crate) fn install_claude_mcp(config_path: &Path) -> anyhow::Result<()> {
-    let exe = current_exe_for_mcp()?;
-    let status = Command::new("claude")
-        .arg("mcp")
-        .arg("add")
-        .arg("--scope")
-        .arg("project")
-        .arg("rag-rat")
-        .arg("--")
-        .arg(&exe)
-        .arg("mcp")
-        .arg("--config")
-        .arg(config_path)
-        .status();
-    match status {
-        Ok(status) if status.success() => eprintln!("init: installed Claude Code MCP server"),
-        Ok(status) => eprintln!("init: claude mcp add exited with status {status}"),
-        Err(err) => eprintln!("init: could not run claude mcp add: {err}"),
-    }
-    Ok(())
-}
-pub(crate) fn install_codex_mcp(config_path: &Path) -> anyhow::Result<()> {
-    let exe = current_exe_for_mcp()?;
-    let status = Command::new("codex")
-        .arg("mcp")
-        .arg("add")
-        .arg("rag-rat")
-        .arg("--")
-        .arg(&exe)
-        .arg("mcp")
-        .arg("--config")
-        .arg(config_path)
-        .status();
-    match status {
-        Ok(status) if status.success() => eprintln!("init: installed Codex MCP server"),
-        Ok(status) => {
-            eprintln!("init: codex mcp add exited with status {status}");
-            print_codex_config_snippet(&exe, config_path);
-        },
-        Err(err) => {
-            eprintln!("init: could not run codex mcp add: {err}");
-            print_codex_config_snippet(&exe, config_path);
-        },
-    }
-    Ok(())
-}
-pub(crate) fn current_exe_for_mcp() -> anyhow::Result<PathBuf> {
-    env::current_exe().map_err(Into::into)
-}
-pub(crate) fn print_codex_config_snippet(exe: &Path, config_path: &Path) {
-    eprintln!(
-        "Add this to ~/.codex/config.toml if your Codex build does not support `codex mcp add`:"
-    );
-    eprintln!("[mcp_servers.rag-rat]");
-    eprintln!("command = {:?}", exe.display().to_string());
-    eprintln!("args = [\"mcp\", \"--config\", {:?}]", config_path.display().to_string());
-}
-pub(crate) fn absolute_config_path(config: &Config, config_path: &Path) -> anyhow::Result<PathBuf> {
-    if config_path.is_absolute() {
-        Ok(config_path.to_path_buf())
-    } else {
-        Ok(config.root.join(config_path).canonicalize()?)
-    }
-}
-
 #[cfg(test)]
 mod default_plan_tests {
     use std::path::Path;

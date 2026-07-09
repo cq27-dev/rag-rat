@@ -4,7 +4,6 @@ mod scan;
 mod wizard;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::{env, fs, io};
 
 use dialoguer::Confirm;
