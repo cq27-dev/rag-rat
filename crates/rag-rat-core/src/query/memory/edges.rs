@@ -189,6 +189,8 @@ pub(crate) fn add_edge(
     // Backfill the pre-existing history (idempotent) + the edge INSERT + the EdgeAdd op in ONE
     // transaction (strict-atomic); the write via `conn` participates in the open txn.
     authoring::backfill_memory_oplog(conn, now)?;
+    // Authored write: the EdgeAdd op is signed op-log content, so commit durably (#560).
+    let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = conn.unchecked_transaction()?;
     // Whether this is a GENUINELY new edge vs an idempotent re-add: the INSERT below is
     // `ON CONFLICT DO UPDATE` refreshing ONLY the per-device resolution columns
@@ -244,6 +246,8 @@ pub(crate) fn remove_edge(conn: &Connection, edge_key: &str) -> anyhow::Result<b
     let repo_clause = periphery_edge_scope_clause(&scope);
     let now = now_ms();
     authoring::backfill_memory_oplog(conn, now)?;
+    // Authored write: the EdgeRemove tombstone is signed op-log content, so commit durably (#560).
+    let _durability = authoring::AuthoredDurability::begin(conn)?;
     let tx = conn.unchecked_transaction()?;
     let n = conn
         .execute(&format!("DELETE FROM repo_node_edges WHERE edge_key = ?1{repo_clause}"), [

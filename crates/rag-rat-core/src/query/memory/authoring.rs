@@ -13,6 +13,41 @@
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 use super::hydrate::tags_for_memory;
+
+/// Scoped durability bump for an AUTHORED write (#560). The index connection runs
+/// `synchronous = NORMAL` — the right policy for the high-frequency, fully reconstructable
+/// derived-index writes, where skipping the per-commit WAL fsync is a throughput win and the only
+/// cost is that the last committed transaction can roll back on power loss (a re-index recovers
+/// it).
+///
+/// Authored memory / op-log mutations are the OPPOSITE class: irreplaceable, low-frequency, and
+/// they return success to the caller. They must not acknowledge under a mode that can silently lose
+/// the last commit, so they raise `synchronous = FULL` (fsync the WAL on commit) for the duration
+/// of their transaction and restore `NORMAL` on drop. The guard is held ACROSS the authored
+/// `BEGIN .. COMMIT` and dropped after, so the commit fsyncs; restore runs on every path (including
+/// error/panic), so a shared connection is never stranded at FULL — and a stray failure could only
+/// leave it on the *safer*, slower setting, never a less durable one.
+pub(super) struct AuthoredDurability<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> AuthoredDurability<'a> {
+    /// Raise `synchronous = FULL`. MUST be called OUTSIDE a transaction (SQLite only applies a
+    /// `synchronous` change to subsequent transactions), i.e. immediately before the authored
+    /// `BEGIN`/`unchecked_transaction`.
+    pub(super) fn begin(conn: &'a Connection) -> anyhow::Result<Self> {
+        conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        Ok(Self { conn })
+    }
+}
+
+impl Drop for AuthoredDurability<'_> {
+    fn drop(&mut self) {
+        // Best-effort restore of the connection default (see the struct doc for why swallowing is
+        // safe). Runs after the authored txn has committed/rolled back, so no transaction is open.
+        let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
+    }
+}
 use super::{EdgeRelation, NodeEdge, RepoMemory, all_edges_from, memory_repo_scope};
 use crate::oplog::{
     EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, StreamId, author_genesis_in_tx,
@@ -158,6 +193,9 @@ pub(crate) fn backfill_memory_oplog(conn: &Connection, now_ms: i64) -> anyhow::R
     // writers — THEN read the memory/edge snapshot and author it, so a memory created between the
     // read and the batch cannot be silently omitted from the complete history (after which the
     // idempotency gate would hide it forever). The empty-chain gate is re-checked inside this txn.
+    // The genesis backfill mints signed op-log entries — authored, irreplaceable data — so it
+    // commits durably (#560).
+    let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let mut ops = Vec::new();
     for row in read_memory_rows(&tx, &repo_id)? {
@@ -380,6 +418,38 @@ mod tests {
 
     fn projected_node_count(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM oplog_projected_nodes", [], |r| r.get(0)).unwrap()
+    }
+
+    /// #560 durability split: an authored write commits under `synchronous = FULL`, and the guard
+    /// restores the connection's `NORMAL` default on drop so derived-index writes are unaffected.
+    /// Uses a file-backed index connection (WAL + NORMAL, like every real open) because an
+    /// in-memory database ignores the `synchronous` setting and would not report the change.
+    #[test]
+    fn authored_durability_raises_full_then_restores_normal() {
+        let dir = std::env::temp_dir().join(format!("ragrat-authdur-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = crate::storage::IndexConnection::open(&dir.join("index.db")).unwrap();
+        let conn = storage.connection();
+        let synchronous = |c: &Connection| -> i64 {
+            c.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap()
+        };
+
+        assert_eq!(synchronous(conn), 1, "an index connection defaults to synchronous=NORMAL (=1)");
+        {
+            let _durability = AuthoredDurability::begin(conn).unwrap();
+            assert_eq!(
+                synchronous(conn),
+                2,
+                "an authored write must raise synchronous=FULL (=2) for its commit"
+            );
+        }
+        assert_eq!(
+            synchronous(conn),
+            1,
+            "the authored-durability guard must restore synchronous=NORMAL (=1) on drop"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

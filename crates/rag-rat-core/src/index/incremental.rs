@@ -11,6 +11,20 @@ struct IncrementalFilesOutcome {
     carried: usize,
 }
 
+/// Everything the incremental/discover WRITE phase needs, computed entirely OUTSIDE the write
+/// transaction (#560): the filesystem walk, `git_changed_paths`, the discovery snapshot, and the
+/// tree-sitter parse all happen while producing this, so `BEGIN IMMEDIATE` then covers only the
+/// SQLite writes. The read→write gap is made safe by holding the per-repo write flock across both
+/// phases (see [`IndexDatabase::index_incremental_with_progress`]).
+struct PreparedIncrementalPass {
+    manifest_in_change_set: bool,
+    /// `files.id`s to re-stamp into the active commit scope (#502). Empty in Changed mode.
+    carried_ids: Vec<i64>,
+    /// Parsed files ready to insert — the tree-sitter work is already done here, off the lock.
+    prepared_files: Vec<PreparedIndexFile>,
+    deleted: BTreeSet<PathBuf>,
+}
+
 impl IndexDatabase {
     pub fn index_changed(config: &Config) -> anyhow::Result<Self> {
         Self::index_changed_with_progress(config, |_| {})
@@ -57,6 +71,25 @@ impl IndexDatabase {
         if Self::migration_check(&config.database)?.state == schema::SchemaState::Missing {
             return Self::rebuild_with_progress(config, progress).map(|db| (db, true));
         }
+
+        // Acquire the per-repo write flock BEFORE opening + scoping the connection (#560/#561). It
+        // MUST precede `set_context` and every live-generation read below: if a sibling
+        // `rebuild_with_progress` holds this flock, blocking for it AFTER `set_context` pinned
+        // `active_generation` would resume this pass on the pre-flip (now-dead) generation and land
+        // every delete/carry/insert there — a silent no-op that still returns success. Acquiring
+        // first means `open_bare` / `set_context` / the count reads all observe the post-rebuild
+        // live generation, and no flock-respecting writer can flip it out from under this pass.
+        // It is also the exclusion the hoisted reads rely on: the filesystem walk / git status /
+        // parse / git-history join below moved OUT of `BEGIN IMMEDIATE` (freeing the SQLite writer
+        // slot so a cross-repo writer on a consolidated DB can slip a short write in), so this
+        // flock — not the SQLite lock — is now what keeps a sibling rebuild/discover from
+        // racing this pass's generation. The same flock every rebuild ENTRY holds
+        // (`rebuild.rs`); reentrant, so watcher/maintenance callers that already hold it
+        // just depth-increment and a CLI one-shot `index` acquires it fresh. GLOBAL-LOCK
+        // ORDERING RULE holds: per-repo taken before the global schema lock `open_bare` may
+        // take (per-repo → global), same as every rebuild entry.
+        let lock_repo = crate::locks::write_lock_repo_id(config);
+        let _write_lock = crate::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
 
         // Open in ADOPTION-PENDING mode: the multi-repo fail-fast must not fire (the config below
         // supplies the scope, unlike a genuinely config-less `Self::open`), and the graph check is
@@ -146,40 +179,74 @@ impl IndexDatabase {
             database: config.database.clone(),
             mode: effective_mode,
         });
-        // Gate the git-history reload. Unchanged HEAD/root/shallow skips it entirely; a
-        // fast-forward HEAD prepares only the new range (`old..new`) and appends rows; uncertainty,
-        // shallow history, root drift, and non-fast-forward rewrites prepare the full history. The
-        // append plan is revalidated after BEGIN IMMEDIATE because preparation happens before this
-        // writer owns the lock.
-        let mut git_history = if db.git_history_is_current(&config.root) {
+        // Gate + spawn the git-history reload BEFORE `BEGIN IMMEDIATE` (unchanged gate). Unchanged
+        // HEAD/root/shallow skips it entirely; a fast-forward HEAD prepares only the new range
+        // (`old..new`); uncertainty, shallow history, root drift, and non-fast-forward rewrites
+        // prepare the full history. The prepared append plan is revalidated at APPLY time (inside
+        // the terminal txn, via `apply_prepared`), so preparing — and now joining — off the SQLite
+        // lock is safe.
+        let git_history_handle = if db.git_history_is_current(&config.root) {
             None
         } else {
             progress(IndexProgress::IndexingGitHistory);
             let plan = git_history::prepare_plan(db.storage.connection(), &config.root);
             Some(spawn_git_history_prepare_with_plan(&config.root, plan))
         };
-        let result = (|| -> anyhow::Result<bool> {
-            // BEGIN IMMEDIATE: acquire the write lock up front so a racing writer waits out
-            // busy_timeout instead of failing the deferred read→write upgrade with SQLITE_BUSY.
+
+        // PREPARE — OUTSIDE the SQLite write transaction (#560): filesystem walk,
+        // `git_changed_paths`, discovery snapshot (a pure DB read), tree-sitter parse. This
+        // is the work the audit found holding the writer lock for time proportional to repo
+        // size (unbounded in Discover mode); hoisting it is the entire point of the patch.
+        let prepare_started = std::time::Instant::now();
+        let prepared = match db.prepare_incremental_pass(config, effective_mode, progress) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                // Prepare failed off the lock (e.g. an unreadable changed file). JOIN the pending
+                // git-history worker before bailing, so its (possibly full `git log`) scan does not
+                // detach and keep burning CPU/IO after the failed pass — matching the pre-hoist
+                // error path, which joined the handle before returning.
+                if let Some(handle) = git_history_handle {
+                    let _ = join_git_history_prepare(handle);
+                }
+                return Err(err);
+            },
+        };
+        // Join the git-history prepare thread OUTSIDE the write lock too — a thread `join()` must
+        // not sit inside `BEGIN IMMEDIATE`. The apply below still revalidates the append plan under
+        // the lock, preserving the git-history freshness invariant.
+        let prepared_git_history = match git_history_handle {
+            Some(handle) => Some(join_git_history_prepare(handle)?),
+            None => None,
+        };
+        let prepare_ms = prepare_started.elapsed().as_millis() as u64;
+
+        // WRITE — ONE `BEGIN IMMEDIATE` .. COMMIT (#560). The incremental path writes the LIVE
+        // generation directly (no staging, no pointer flip — unlike the full rebuild), so every
+        // write must land ATOMICALLY: a reader sees the pre-pass or the post-pass state, never a
+        // half-applied change set. That is why these writes are NOT split into per-wave commits the
+        // way the staged rebuild's are — a rebuild wave is invisible until the flip, but a
+        // live-generation wave commit would publish a partially-updated generation. Every effect
+        // here is publication authority and stays in this one transaction; the expensive reads are
+        // already hoisted above, so the writer lock now covers only DB mutation.
+        let write_started = std::time::Instant::now();
+        let result = (|| -> anyhow::Result<(bool, usize, usize, usize)> {
+            // BEGIN IMMEDIATE: take the write lock up front so a racing writer waits out
+            // busy_timeout instead of failing a deferred read→write upgrade with SQLITE_BUSY.
             db.storage.execute_batch("BEGIN IMMEDIATE")?;
             // Write meta only when it actually changed, and track whether this pass mutated
-            // anything at all. A periodic sweep or a spurious event over an unchanged tree must
-            // NOT churn the WAL with a timestamp-only write + COMMIT (issue #63) — that idle write
-            // is also exactly the false signal the watcher-loop diagnostic keys on
-            // (indexed_at_ms advancing while content is unchanged).
+            // anything at all. A periodic sweep or a spurious event over an unchanged
+            // tree must NOT churn the WAL with a timestamp-only write + COMMIT (issue
+            // #63) — that idle write is also the false signal the watcher-loop
+            // diagnostic keys on (indexed_at_ms advancing while content is unchanged).
             let source_root_changed =
                 db.set_repo_meta_if_changed("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             let git_meta_changed = db.write_git_meta(&config.root)?;
-            // Heal the active embedding model from config INSIDE the txn: the incremental /
-            // maintenance / watch path opens config-blind via `Self::open` and can't seed on its
-            // own, so a pre-#394 index (active unset or still provisional) would
-            // otherwise keep reconciling via the hash fallback here. Doing it in-txn
-            // means a failed pass rolls the reseed back with everything else, rather
-            // than stranding the active model on a possibly-uninstalled configured
-            // model (#394 review). A no-op unless a seed is owed, preserving the idle-pass
-            // no-write invariant (#63); when owed it counts as a mutation so the COMMIT persists
-            // it.
+            // Heal the active embedding model from config INSIDE the txn (#394): a failed pass
+            // rolls the reseed back with everything else rather than stranding the
+            // active model on a possibly-uninstalled configured model. A no-op unless a
+            // seed is owed (preserving the #63 idle-pass no-write invariant); when owed
+            // it counts as a mutation so COMMIT persists it.
             let embedding_model_seeded = ai::active_embedding_model_seed_owed(
                 db.storage.connection(),
                 config.llm.embedding.backend.model_id(),
@@ -190,27 +257,25 @@ impl IndexDatabase {
                     config.llm.embedding.backend.model_id(),
                 )?;
             }
-            let outcome = match effective_mode {
-                IndexMode::Changed => db.index_changed_files_with_progress(config, progress)?,
-                IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
-                IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
-            };
-            let IncrementalFilesOutcome { indexed, manifest_in_change_set, carried } = outcome;
+            // Apply the prepared plan — WRITES ONLY (the parse already happened during prepare).
+            // Freshness is revalidated cheaply here at apply time, not re-derived: the #502 carry
+            // re-stamp pins `repo_id`/`generation`/scope in its UPDATE `WHERE`, so a candidate that
+            // went stale between prepare and now updates nothing rather than the wrong row; the
+            // per-file writes are keyed by (path, commit_sha, worktree_id) scope, so they are
+            // idempotent against any intervening lockless overlay heal; and the flock has excluded
+            // the only writer that could flip `active_generation`.
+            let IncrementalFilesOutcome { indexed, manifest_in_change_set, carried } =
+                db.apply_prepared_incremental_pass(&prepared, effective_mode, progress)?;
             let base_scope_discovery_marked = if effective_mode == IndexMode::Discover {
                 db.mark_active_base_scope_discovered(&config.targets)?
             } else {
                 false
             };
-            // Self-heal stale worktree-overlay rows (#87): a dirty-then-committed file's overlay
-            // row otherwise lingers forever, shadowing its (correct) committed row in every
-            // scoped read and colliding with a later full rebuild. Runs AFTER the indexing step
-            // so a freshly discovered committed row can take over. Read-only when there is
-            // nothing to heal, preserving the idle-pass no-write invariant (#63).
-            let healed = match git_changed_paths(&config.root) {
-                Ok(changes) => db.heal_stale_overlay_rows(&changes)?,
-                // Non-git roots have no commit scope; overlays are their canonical rows.
-                Err(_) => 0,
-            };
+            // Self-heal stale worktree-overlay rows (#87). The heal walks git status IN-TXN before
+            // any destructive decision, so a path dirtied/restored/deleted during the off-lock
+            // window or the BEGIN wait cannot be mis-healed (#561). Read-only +
+            // walk-free when there are no overlay candidates (#63).
+            let healed = db.heal_stale_overlay_rows(&config.root)?;
             let mut mutated = indexed > 0
                 || healed > 0
                 || carried > 0
@@ -218,27 +283,19 @@ impl IndexDatabase {
                 || git_meta_changed
                 || embedding_model_seeded
                 || base_scope_discovery_marked;
-            // None when the gate above found git history already current — skip the reload.
-            if let Some(handle) = git_history.take() {
-                db.apply_prepared_git_history(&config.root, handle)?;
+            // None when the gate found git history already current. The handle was JOINED outside
+            // the lock; `apply_prepared` revalidates the append plan here, under the lock, so a
+            // history rewrite between prepare and now is caught (git-history freshness invariant).
+            if let Some(prepared_history) = prepared_git_history {
+                db.apply_joined_git_history(&config.root, prepared_history)?;
                 mutated = true;
             }
-            // Per-package import scope (#61, salvaging #95's ordering): rewrite `packages` +
-            // refresh the global `local_crate_roots` union BEFORE the resolve pass, so
-            // the resolver sees the current package map (the file→package mapping is
-            // then computed at resolve LOAD time from those rows — there is no
-            // persisted `files.package_id` to reassign). Run it when a Cargo.toml is in
-            // the change set (the crate set may have changed) OR a file was (re)indexed
-            // — OUTSIDE the `indexed>0 || healed>0` gate, so a manifest-only change (no
-            // Rust file touched, indexed==0) still refreshes (#95 bug: the refresh was nested
-            // inside that gate and was skipped, leaving the crate set stale until the
-            // next full rebuild). `refresh_packages` returns whether the package map
-            // changed, which forces a re-resolve even when no file was indexed.
-            // `carried > 0` also refreshes (#502): the package map is keyed by
-            // `(commit_sha, worktree_id)`, so a carried scope needs its rows re-derived at the
-            // new commit even when nothing was (re)indexed — otherwise import resolution falls
-            // open until the next real edit (the incremental twin of the rebuild's
-            // `carry_forward_overlay_packages`).
+            // Per-package import scope (#61, salvaging #95): rewrite `packages` + refresh the
+            // global `local_crate_roots` union BEFORE the resolve pass. Runs OUTSIDE
+            // the `indexed>0 || healed>0` gate so a manifest-only change (indexed==0)
+            // still refreshes; `carried > 0` also refreshes (#502) since the package
+            // map is keyed by `(commit_sha, worktree_id)`. `refresh_packages` returns
+            // whether the map changed, forcing a re-resolve.
             let roots_changed =
                 if indexed > 0 || healed > 0 || carried > 0 || manifest_in_change_set {
                     db.refresh_packages(&config.root)?
@@ -248,13 +305,11 @@ impl IndexDatabase {
             if roots_changed {
                 mutated = true;
             }
-            // Healing can delete overlay symbols (NULLing their in-edges via
-            // `remove_file_in_scope`), so it needs the same re-derive tail as real file changes.
-            // Also re-resolve when the crate set changed but no file was indexed (a manifest-only
-            // change) so `use new_crate::X` resolves correctly (#95). A carried scope (#502)
-            // re-resolves too: a carried caller's edge may point at a symbol of a file that
-            // changed (or vanished) across the HEAD move and was re-derived with fresh rowids —
-            // the full-scope resolve every ordinary edit pass runs is what re-points it.
+            // Healing can delete overlay symbols (NULLing in-edges via `remove_file_in_scope`), so
+            // it needs the same re-derive tail as real file changes; a manifest-only
+            // change re-resolves so `use new_crate::X` binds (#95); a carried scope
+            // re-resolves so a carried caller's edge re-points at re-derived rowids
+            // (#502).
             if indexed > 0 || healed > 0 || carried > 0 || roots_changed {
                 progress(IndexProgress::RebuildingLogicalSymbols);
                 // Defer: this pass re-parsed only the CHANGED files, so it must not stamp the
@@ -271,22 +326,31 @@ impl IndexDatabase {
                 db.storage.execute_batch("COMMIT")?;
             } else {
                 // Nothing changed since the last pass — close the (empty) transaction without
-                // writing, so an idle server does not touch the DB.
+                // writing, so an idle server does not touch the DB (#63).
                 db.storage.execute_batch("ROLLBACK")?;
             }
             progress(IndexProgress::Finished { files: indexed });
             // Report whether index *content* changed (files added / edited / removed, or stale
-            // overlays healed — symbols move scope), so the watch loop can skip the
-            // reconcile / memory-validate tail on an idle sweep.
-            Ok(indexed > 0 || healed > 0)
+            // overlays healed — symbols move scope), so the watch loop can skip the reconcile /
+            // memory-validate tail on an idle sweep.
+            Ok((indexed > 0 || healed > 0, indexed, carried, healed))
         })();
         if result.is_err() {
-            if let Some(handle) = git_history.take() {
-                let _ = join_git_history_prepare(handle);
-            }
             let _ = db.storage.execute_batch("ROLLBACK");
         }
-        let content_changed = result?;
+        let (content_changed, indexed, carried, healed) = result?;
+        // #560 measurement: prepare (reads/parse) vs write (BEGIN IMMEDIATE..COMMIT) durations +
+        // row counts, so the write-lock hold time is observable independently of the hoisted reads.
+        tracing::debug!(
+            target: "rag_rat::index::incremental",
+            mode = ?effective_mode,
+            prepare_ms,
+            write_ms = write_started.elapsed().as_millis() as u64,
+            files = indexed,
+            carried,
+            healed,
+            "incremental pass (reads hoisted out of the write transaction)"
+        );
         Ok((db, content_changed))
     }
 
@@ -497,58 +561,113 @@ impl IndexDatabase {
         Ok((total, graph))
     }
 
-    /// The manifest flag is true when any changed or deleted path is a `Cargo.toml`, signalling
-    /// the workspace crate set may have changed and the `packages` map should be refreshed
-    /// before the resolve pass (#61, salvaging #95). Changed mode never carries: it only sees
-    /// working-tree dirt, and the stale base-scope marker promotes a HEAD move to Discover
-    /// (#459), where the carry lives.
-    fn index_changed_files_with_progress<F>(
+    /// PREPARE phase (#560): everything an incremental/discover pass can compute WITHOUT the SQLite
+    /// write lock — the git status walk, the discovery snapshot (a pure DB read), scope assignment,
+    /// and the tree-sitter parse. Returns a [`PreparedIncrementalPass`] the caller applies inside
+    /// its terminal `BEGIN IMMEDIATE`. NO writes happen here: the #502 carry re-stamp is a write,
+    /// so it is only SELECTED here (`plan.carried`) and applied later. Runs under the per-repo
+    /// write flock, so the snapshot it reads cannot be flipped by a sibling rebuild/discover
+    /// before it is applied.
+    fn prepare_incremental_pass<F>(
         &self,
         config: &Config,
+        mode: IndexMode,
         progress: &mut F,
-    ) -> anyhow::Result<IncrementalFilesOutcome>
+    ) -> anyhow::Result<PreparedIncrementalPass>
     where
         F: FnMut(IndexProgress),
     {
         progress(IndexProgress::Discovering);
-        let changes = git_changed_paths(&config.root)?;
-        let manifest_in_change_set =
-            paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
-                || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path));
-        let files = collect_changed_index_files(config, &changes)?;
-        let files = self.assign_file_scopes(files, &changes);
-        let indexed = self.apply_incremental_file_plan(files, changes.deleted, progress)?;
-        Ok(IncrementalFilesOutcome { indexed, manifest_in_change_set, carried: 0 })
+        match mode {
+            // Changed mode never carries: it only sees working-tree dirt, and a stale base-scope
+            // marker promotes a HEAD move to Discover (#459), where the carry lives.
+            IndexMode::Changed => {
+                let changes = git_changed_paths(&config.root)?;
+                let manifest_in_change_set =
+                    paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
+                        || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path));
+                let files = collect_changed_index_files(config, &changes)?;
+                let files = self.assign_file_scopes(files, &changes);
+                let deleted = changes.deleted.clone();
+                progress(IndexProgress::Discovered { files: files.len() });
+                let prepared_files = prepare_files_with_progress(&files, progress, 0, files.len())?;
+                Ok(PreparedIncrementalPass {
+                    manifest_in_change_set,
+                    carried_ids: Vec::new(),
+                    prepared_files,
+                    deleted,
+                })
+            },
+            // The manifest flag also consults the discovery plan's file list, so a NEW (untracked,
+            // not-yet-committed) `Cargo.toml` is caught even though git status would not list it as
+            // changed (#61, salvaging #95).
+            IndexMode::Discover => {
+                // The status walk feeds BOTH the plan's carry filter (a dirty/untracked path must
+                // never be carried into the committed scope) and the scope assignment below.
+                // Discover tolerates a status error (falls back to an empty set): the carry's real
+                // guard is its exact-sha match, not this belt. The overlay heal uses its own fresh
+                // walk (taken later, in the caller) so it is not affected by this snapshot.
+                let changes = git_changed_paths(&config.root).unwrap_or_default();
+                let plan = discovery_plan(self.storage.connection(), config, &changes)?;
+                let manifest_in_change_set =
+                    paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
+                        || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path))
+                        || paths_include_cargo_toml(
+                            plan.files.iter().map(|file| file.relative_path.as_path()),
+                        );
+                let carried_ids = plan.carried;
+                let deleted = plan.deleted;
+                let files = self.assign_file_scopes(plan.files, &changes);
+                progress(IndexProgress::Discovered { files: files.len() });
+                let prepared_files = prepare_files_with_progress(&files, progress, 0, files.len())?;
+                Ok(PreparedIncrementalPass {
+                    manifest_in_change_set,
+                    carried_ids,
+                    prepared_files,
+                    deleted,
+                })
+            },
+            IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
+        }
     }
 
-    /// The manifest flag also consults the discovery plan's file list, so a NEW (untracked,
-    /// not-yet-committed) `Cargo.toml` is caught even though git status would not list it as
-    /// changed (#61, salvaging #95). Applies the plan's carry candidates (#502) — retained
-    /// committed rows re-stamped into the active commit scope — before deriving the (diff-sized)
-    /// remainder, all inside the caller's pass transaction.
-    fn index_discovered_files_with_progress<F>(
+    /// APPLY phase (#560): the WRITE half of an incremental/discover pass, run inside the caller's
+    /// terminal `BEGIN IMMEDIATE`. Applies the #502 carry re-stamp (Discover only — before the
+    /// diff-sized remainder, preserving the old ordering), then the deletions and per-file
+    /// remove+insert. All keyed writes, so applying a plan prepared off the lock is idempotent
+    /// under the per-repo write flock. No filesystem/parse work happens here.
+    fn apply_prepared_incremental_pass<F>(
         &self,
-        config: &Config,
+        prepared: &PreparedIncrementalPass,
+        mode: IndexMode,
         progress: &mut F,
     ) -> anyhow::Result<IncrementalFilesOutcome>
     where
         F: FnMut(IndexProgress),
     {
-        progress(IndexProgress::Discovering);
-        // The status walk feeds BOTH the plan's carry filter (a dirty/untracked path must never
-        // be carried into the committed scope) and the scope assignment below — one walk, shared.
-        let changes = git_changed_paths(&config.root).unwrap_or_default();
-        let plan = discovery_plan(self.storage.connection(), config, &changes)?;
-        let carried = self.carry_retained_files_into_active_scope(&plan.carried)?;
-        let manifest_in_change_set =
-            paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
-                || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path))
-                || paths_include_cargo_toml(
-                    plan.files.iter().map(|file| file.relative_path.as_path()),
-                );
-        let files = self.assign_file_scopes(plan.files, &changes);
-        let indexed = self.apply_incremental_file_plan(files, plan.deleted, progress)?;
-        Ok(IncrementalFilesOutcome { indexed, manifest_in_change_set, carried })
+        // The #502 carry re-stamps a retained committed row into the active scope. Its dirty-path
+        // belt is the discovery status set, but its PRIMARY guard is the exact (sha256, lang, kind)
+        // match in `discovery_plan` — a dirty file's disk content does not match a retained
+        // committed row's sha — so it is safe to run whether or not that status walk succeeded, and
+        // it always runs in Discover mode (unconditionally marking the base scope discovered, as
+        // before). This is the pre-#560 behavior; only the destructive, sha-less overlay HEAL gates
+        // on a reliable status snapshot.
+        let carried = if mode == IndexMode::Discover {
+            self.carry_retained_files_into_active_scope(&prepared.carried_ids)?
+        } else {
+            0
+        };
+        let indexed = self.write_prepared_incremental_files(
+            &prepared.prepared_files,
+            &prepared.deleted,
+            Some(mode),
+            progress,
+        )?;
+        Ok(IncrementalFilesOutcome {
+            indexed,
+            manifest_in_change_set: prepared.manifest_in_change_set,
+            carried,
+        })
     }
 
     pub(super) fn assign_file_scopes(
@@ -591,10 +710,7 @@ impl IndexDatabase {
     /// Returns the number of rows healed. Purely a read when nothing is stale, so an idle pass
     /// stays write-free (#63). Non-git contexts (`active_commit_sha` empty) are untouched —
     /// overlay rows ARE their canonical scope.
-    pub(super) fn heal_stale_overlay_rows(
-        &self,
-        changes: &GitChangedPaths,
-    ) -> anyhow::Result<usize> {
+    pub(super) fn heal_stale_overlay_rows(&self, root: &Path) -> anyhow::Result<usize> {
         if self.active_commit_sha.is_empty() {
             return Ok(0);
         }
@@ -619,10 +735,33 @@ impl IndexDatabase {
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        // No overlay candidates → nothing to heal and NO walk under the lock (the common clean-tree
+        // / idle pass pays nothing).
+        if overlays.is_empty() {
+            return Ok(0);
+        }
+        // Authoritative dirty set, walked INSIDE the write txn (#561). The off-lock discovery
+        // snapshot CANNOT soundly pre-filter these: the flock excludes rag-rat writers but NOT the
+        // user's editor, so between prepare and now a file dirty-at-prepare may have been restored
+        // to clean (its overlay is now stale and due for a delete) and a file
+        // clean-at-prepare may have been dirtied (its overlay is now canonical). Every
+        // candidate is therefore rechecked against a FRESH status walk here. `Err` => skip
+        // the heal entirely (the pre-#560 `Err(_) => 0`). This is the original pre-hoist
+        // behavior: the git-status walk (cheap next to the hoisted parse) stays in-txn for
+        // correctness, and it only runs when overlay candidates exist.
+        let changes = match git_changed_paths(root) {
+            Ok(changes) => changes,
+            Err(_) => return Ok(0),
+        };
         let mut healed = 0usize;
         for (file_id, path, sha) in overlays {
-            if changes.changed.contains(Path::new(&path)) {
-                continue; // genuinely dirty — the overlay is the canonical row
+            let p = Path::new(&path);
+            if changes.changed.contains(p) || changes.deleted.contains(p) {
+                // Dirtied OR deleted since the snapshot — the overlay is NOT stale-clean. Skipping
+                // a DELETED path is essential: its delete branch would remove the
+                // overlay and expose the base committed file the worktree just
+                // deleted (#561).
+                continue;
             }
             let committed_exists: bool = self.storage.connection().query_row(
                 // Generation-qualified (A6): only a committed row at THIS connection's live
@@ -656,6 +795,11 @@ impl IndexDatabase {
         Ok(healed)
     }
 
+    /// Prepare + apply a file plan in one shot, parsing INSIDE the caller's transaction. Retained
+    /// for the bounded read-path zero-hit heal (`query_api`, ≤4 files) and the worktree-overlay
+    /// pass, which are not part of the #560 incremental hoist. The main incremental/discover pass
+    /// instead prepares OFF the lock (`prepare_incremental_pass`) and calls
+    /// [`Self::write_prepared_incremental_files`] directly.
     pub(super) fn apply_incremental_file_plan<F>(
         &self,
         files: Vec<IndexFile>,
@@ -666,36 +810,110 @@ impl IndexDatabase {
         F: FnMut(IndexProgress),
     {
         progress(IndexProgress::Discovered { files: files.len() });
+        let prepared = prepare_files_with_progress(&files, progress, 0, files.len())?;
+        // In-txn caller (zero-hit heal / worktree-overlay pass): the parse+write share one
+        // transaction, so no concurrent commit can interleave — no guards needed (#561).
+        self.write_prepared_incremental_files(&prepared, &deleted, None, progress)
+    }
 
-        let deleted_count = deleted.len();
+    /// Write ALREADY-PREPARED files into the live generation: tombstone the deletions, then
+    /// per-file remove+insert. Purely SQL writes — no parse — so this is what a terminal `BEGIN
+    /// IMMEDIATE` covers. `deleted` and each prepared file are keyed by (path, scope), so
+    /// replaying a plan that was prepared off the lock is idempotent under the per-repo write
+    /// flock (#560).
+    pub(super) fn write_prepared_incremental_files<F>(
+        &self,
+        prepared: &[PreparedIndexFile],
+        deleted: &BTreeSet<PathBuf>,
+        mode_guard: Option<IndexMode>,
+        progress: &mut F,
+    ) -> anyhow::Result<usize>
+    where
+        F: FnMut(IndexProgress),
+    {
+        // `mode_guard` is `Some` only for the #560 hoisted path, whose plan was prepared OFF the
+        // write lock; the in-txn callers (zero-hit heal, worktree-overlay pass) prepare inside
+        // their own transaction — no concurrent commit is possible — so they pass `None`
+        // and skip both guards below. The mtime guard (changed-file overwrites) applies in
+        // either hoisted mode.
+        let guard_concurrent_writes = mode_guard.is_some();
+        // The fs-deletion restore recheck applies ONLY in Changed mode. There, `deleted` is purely
+        // git file-deletions and the target/ignore set is stable within the pass, so "exists on
+        // disk" means "restored AND still in scope". Discover's `deleted` also carries
+        // SEMANTIC deletions (a path that left the target set or became gitignored but
+        // still exists on disk) which MUST be tombstoned regardless of disk existence — and
+        // a genuine fs-restore in Discover self-heals on the next discover pass anyway.
+        let revalidate_fs_deletions = mode_guard == Some(IndexMode::Changed);
+        let mut deleted_count = 0usize;
         for path in deleted {
-            self.mark_file_deleted(&path)?;
+            // A git-deleted path may have been RESTORED on disk during the off-lock window (#561).
+            // Tombstoning it would HIDE it — and a file restored to HEAD-clean content is in no
+            // later CHANGED set and the stale-overlay heal skips `kind='deleted'` rows,
+            // so it would not self-heal until a discover pass. Skip the tombstone only when the
+            // path is a regular FILE on disk again: a directory (or other non-file)
+            // recreated at that path is not a restored source file and would never be
+            // re-indexed, so it must still tombstone.
+            if revalidate_fs_deletions
+                && self
+                    .storage
+                    .source_root()
+                    .map(|root| root.join(path))
+                    .is_some_and(|full| full.is_file())
+            {
+                continue;
+            }
+            self.mark_file_deleted(path)?;
+            deleted_count += 1;
         }
 
-        let prepared = prepare_files_with_progress(&files, progress, 0, files.len())?;
+        let total = prepared.len();
+        let mut written = 0usize;
         for (index, prepared_file) in prepared.iter().enumerate() {
             let current = index + 1;
-            if should_report_file_progress(current, files.len()) {
+            if should_report_file_progress(current, total) {
                 progress(IndexProgress::IndexingFile {
                     current,
-                    total: files.len(),
+                    total,
                     path: prepared_file.file.relative_path.clone(),
                     language: prepared_file.file.language,
                     kind: prepared_file.file.kind,
                 });
+            }
+            // A lockless heal could have indexed a NEWER on-disk version of THIS exact scope key in
+            // the off-lock prepare window (#561). Compare the CURRENT row's disk mtime to the one
+            // we prepared: if the row already reflects a newer disk state, skip the
+            // remove+insert so a concurrent heal's row is not rolled back to our stale
+            // content. Disk mtime — not the indexing clock — is the signal, so our OWN
+            // prior row (an OLDER-or-equal disk mtime, since edits only advance it)
+            // never trips this; only a genuinely newer index does. A skip leaves the
+            // path dirty for the next changed pass, so it can only DEFER, never strand.
+            if guard_concurrent_writes
+                && let Ok(content) = &prepared_file.prepared
+                && let Some(row_modified_at_ms) = self.scope_row_modified_at_ms(
+                    &prepared_file.file.relative_path,
+                    &prepared_file.file.commit_sha,
+                    &prepared_file.file.worktree_id,
+                )?
+                && row_modified_at_ms > content.modified_at_ms
+            {
+                continue;
             }
             self.remove_file_in_scope(
                 &prepared_file.file.relative_path,
                 &prepared_file.file.commit_sha,
                 &prepared_file.file.worktree_id,
             )?;
-            // Incremental: per-file replace; chunk_fts is kept synced in place by the inline write
-            // in insert_chunks (no full rebuild_fts). No accumulator — edges are inserted
-            // unresolved here and resolved by resolve_edges.
+            // Incremental per-file replace; chunk_fts is kept synced in place by the inline write
+            // in insert_chunks (no full rebuild_fts). No accumulator — edges are
+            // inserted unresolved here and resolved by resolve_edges in the caller's
+            // terminal tail.
             self.insert_prepared_file(prepared_file, None)?;
+            written += 1;
         }
 
-        Ok(files.len() + deleted_count)
+        // Count only what actually landed (skips excluded), so an all-skipped pass keeps the
+        // caller's `mutated` flag honest and preserves the #63 idle no-write invariant.
+        Ok(written + deleted_count)
     }
 }
 
