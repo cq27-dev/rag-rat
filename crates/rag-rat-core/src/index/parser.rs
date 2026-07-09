@@ -235,7 +235,10 @@ pub fn parser_kind(path: &Path, language: Language) -> ParserKind {
 const PARSE_ERROR_MESSAGE: &str =
     "tree-sitter parse produced error nodes; partial structural index was retained";
 
-fn grammar_for(kind: ParserKind) -> Option<tree_sitter::Language> {
+/// The tree-sitter grammar for a [`ParserKind`], or `None` for kinds with no structural grammar
+/// (Markdown). The single source of truth for the kind → grammar mapping — edge extraction routes
+/// through here rather than duplicating the match (#519).
+pub(crate) fn grammar_for(kind: ParserKind) -> Option<tree_sitter::Language> {
     Some(match kind {
         ParserKind::Rust => tree_sitter_rust::LANGUAGE.into(),
         ParserKind::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),

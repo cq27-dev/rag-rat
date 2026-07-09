@@ -45,25 +45,36 @@ pub(crate) fn dotted_qualified_name(identifiers: &[String]) -> Option<String> {
 pub(crate) fn c_like_qualified_name(identifiers: &[String]) -> Option<String> {
     (identifiers.len() > 1).then(|| identifiers.join("::"))
 }
+/// The smallest-span symbol whose byte range covers `byte` (a call/reference site's owner). When
+/// that smallest is a `const`/`property`/`static` — a value binding whose initializer is where the
+/// call actually lives, so the enclosing definition is the better owner — the smallest-span
+/// container that ISN'T one of those is preferred instead, falling back to the value binding when
+/// none exists.
+///
+/// One O(S) pass, no per-call allocation or sort (#519): the old filter-into-`Vec` + stable
+/// sort-by-span ran once per edge candidate (O(E·S) plus an alloc+sort each). Tracking the two
+/// running minima gives byte-identical selection — a strict `<` update keeps the FIRST symbol of an
+/// equal-span tie, exactly as the stable sort did.
 pub(crate) fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedSymbol> {
-    let mut matches = symbols
-        .iter()
-        .filter(|symbol| symbol.start_byte <= byte && symbol.end_byte >= byte)
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|symbol| symbol.end_byte.saturating_sub(symbol.start_byte));
-    let first = matches.first().copied()?;
-    if matches!(first.kind.as_str(), "const" | "property" | "static") {
-        matches
-            .iter()
-            .copied()
-            .find(|symbol| {
-                symbol.id != first.id
-                    && !matches!(symbol.kind.as_str(), "const" | "property" | "static")
-            })
-            .or(Some(first))
-    } else {
-        Some(first)
+    let span = |symbol: &IndexedSymbol| symbol.end_byte.saturating_sub(symbol.start_byte);
+    let is_special =
+        |symbol: &IndexedSymbol| matches!(symbol.kind.as_str(), "const" | "property" | "static");
+    let mut smallest: Option<&IndexedSymbol> = None;
+    let mut smallest_non_special: Option<&IndexedSymbol> = None;
+    for symbol in symbols {
+        if symbol.start_byte > byte || symbol.end_byte < byte {
+            continue;
+        }
+        if smallest.is_none_or(|best| span(symbol) < span(best)) {
+            smallest = Some(symbol);
+        }
+        if !is_special(symbol) && smallest_non_special.is_none_or(|best| span(symbol) < span(best))
+        {
+            smallest_non_special = Some(symbol);
+        }
     }
+    let smallest = smallest?;
+    if is_special(smallest) { smallest_non_special.or(Some(smallest)) } else { Some(smallest) }
 }
 /// A trailing turbofish (`f::<T>`) wraps the callee path in a `generic_function`; unwrap it so the
 /// type arguments' identifiers / byte ranges aren't mistaken for the callee.
@@ -471,4 +482,125 @@ pub(crate) fn collect_rows<T>(
         out.push(row?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod containing_symbol_tests {
+    use super::*;
+
+    fn sym(id: i64, kind: &str, start: usize, end: usize) -> IndexedSymbol {
+        IndexedSymbol {
+            id,
+            file_id: 0,
+            language: "rust".to_string(),
+            name: format!("s{id}"),
+            qualified_name: format!("s{id}"),
+            scope_path: String::new(),
+            kind: kind.to_string(),
+            start_byte: start,
+            end_byte: end,
+            start_line: 0,
+            end_line: 0,
+        }
+    }
+
+    /// The pre-#519 filter-into-`Vec` + stable-sort-by-span implementation, kept verbatim so the
+    /// single-pass rewrite can be proven byte-identical (same selected id, same tie-break) across a
+    /// battery of inputs — including degenerate equal-span sets a real parse can't produce.
+    fn reference(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedSymbol> {
+        let mut matches = symbols
+            .iter()
+            .filter(|symbol| symbol.start_byte <= byte && symbol.end_byte >= byte)
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|symbol| symbol.end_byte.saturating_sub(symbol.start_byte));
+        let first = matches.first().copied()?;
+        if matches!(first.kind.as_str(), "const" | "property" | "static") {
+            matches
+                .iter()
+                .copied()
+                .find(|symbol| {
+                    symbol.id != first.id
+                        && !matches!(symbol.kind.as_str(), "const" | "property" | "static")
+                })
+                .or(Some(first))
+        } else {
+            Some(first)
+        }
+    }
+
+    fn assert_equiv(symbols: &[IndexedSymbol], byte: usize) {
+        let got = containing_symbol(symbols, byte).map(|symbol| symbol.id);
+        let want = reference(symbols, byte).map(|symbol| symbol.id);
+        assert_eq!(got, want, "byte={byte}");
+    }
+
+    #[test]
+    fn smallest_enclosing_wins_over_a_nested_chain() {
+        let symbols =
+            [sym(1, "module", 0, 100), sym(2, "function", 10, 90), sym(3, "struct", 40, 60)];
+        assert_eq!(containing_symbol(&symbols, 50).map(|s| s.id), Some(3), "innermost");
+        assert_eq!(containing_symbol(&symbols, 20).map(|s| s.id), Some(2));
+        assert_eq!(containing_symbol(&symbols, 5).map(|s| s.id), Some(1));
+        assert!(containing_symbol(&symbols, 200).is_none(), "outside every span");
+    }
+
+    #[test]
+    fn boundary_bytes_are_inclusive() {
+        let symbols = [sym(1, "function", 10, 20)];
+        assert_eq!(containing_symbol(&symbols, 10).map(|s| s.id), Some(1), "start is inclusive");
+        assert_eq!(containing_symbol(&symbols, 20).map(|s| s.id), Some(1), "end is inclusive");
+        assert!(containing_symbol(&symbols, 9).is_none());
+        assert!(containing_symbol(&symbols, 21).is_none());
+    }
+
+    #[test]
+    fn const_property_static_reselects_the_smallest_non_special_container() {
+        // A `const` is the smallest span at the byte, but a non-special container exists → pick it.
+        let symbols = [sym(1, "function", 0, 100), sym(2, "const", 40, 60)];
+        assert_eq!(containing_symbol(&symbols, 50).map(|s| s.id), Some(1), "reselect the fn");
+        assert_equiv(&symbols, 50);
+    }
+
+    #[test]
+    fn a_const_with_no_non_special_container_stays_selected() {
+        let symbols = [sym(1, "const", 40, 60)];
+        assert_eq!(containing_symbol(&symbols, 50).map(|s| s.id), Some(1));
+        assert_equiv(&symbols, 50);
+    }
+
+    #[test]
+    fn reselection_prefers_the_smallest_non_special_container() {
+        // Two non-special containers wrap a `const`; the SMALLER-span one is chosen (not just any).
+        let symbols =
+            [sym(1, "module", 0, 200), sym(2, "function", 30, 70), sym(3, "property", 45, 55)];
+        assert_eq!(containing_symbol(&symbols, 50).map(|s| s.id), Some(2), "smallest non-special");
+        assert_equiv(&symbols, 50);
+    }
+
+    #[test]
+    fn equal_span_containers_keep_the_first_in_array_order() {
+        // Degenerate (unreachable from a real parse): two containers with an identical span at the
+        // byte. Both `containing_symbol` and the reference must pick the FIRST in array order.
+        let symbols = [sym(7, "function", 10, 20), sym(8, "function", 10, 20)];
+        assert_eq!(containing_symbol(&symbols, 15).map(|s| s.id), Some(7));
+        assert_equiv(&symbols, 15);
+    }
+
+    #[test]
+    fn matches_the_reference_across_a_swept_battery() {
+        // Overlapping/nested/sibling spans of mixed kinds; sweep every byte and every reordering-
+        // sensitive case to pin byte-identical selection against the old implementation.
+        let symbols = [
+            sym(1, "module", 0, 100),
+            sym(2, "const", 0, 100),
+            sym(3, "function", 20, 80),
+            sym(4, "static", 20, 80),
+            sym(5, "struct", 40, 60),
+            sym(6, "property", 40, 60),
+            sym(7, "function", 50, 50),
+        ];
+        for byte in 0..=110 {
+            assert_equiv(&symbols, byte);
+        }
+    }
 }

@@ -16,7 +16,7 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use tree_sitter::Node;
 
-use crate::index::parser::{self, ParserKind};
+use crate::index::parser;
 use crate::language::Language;
 
 pub const MAX_GRAPH_PARSE_BYTES: usize = 512_000;

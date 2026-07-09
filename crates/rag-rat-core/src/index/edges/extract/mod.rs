@@ -61,32 +61,57 @@ pub(crate) fn edge_candidates_from_root(
 pub(crate) fn qn_tail(qualified_name: &str) -> &str {
     qualified_name.rsplit("::").next().unwrap_or(qualified_name)
 }
+/// `Contains` edges: each symbol → its immediate enclosing symbol (the smallest-span container).
+///
+/// Symbols come from the AST, so their byte ranges form a properly-nested forest — any two are
+/// either disjoint or one contains the other, never partially overlapping, and no two distinct
+/// symbols share an exact `(start, end)` span. Under that invariant the smallest-span container of
+/// a symbol IS its immediate parent in the nesting forest, so a single nesting-stack sweep finds
+/// every parent in O(S log S) instead of the old O(S²) per-child rescan (#519). Edges are still
+/// emitted in the input's original order, so the output is byte-identical.
 pub(crate) fn contains_edges(symbols: &[IndexedSymbol]) -> Vec<EdgeCandidate> {
-    let mut out = Vec::new();
-    for child in symbols {
-        let parent = symbols
-            .iter()
-            .filter(|candidate| {
-                candidate.id != child.id
-                    && candidate.start_byte <= child.start_byte
-                    && candidate.end_byte >= child.end_byte
-            })
-            .min_by_key(|candidate| candidate.end_byte.saturating_sub(candidate.start_byte));
-        if let Some(parent) = parent {
-            out.push(EdgeCandidate {
-                from_symbol_id: Some(parent.id),
-                from_name: Some(parent.qualified_name.clone()),
-                to_name: child.qualified_name.clone(),
-                target_qualified_name: Some(child.qualified_name.clone()),
-                evidence: Some(child.qualified_name.clone()),
-                receiver_hint: None,
-                source_span: child.span(),
-                callee_span: None,
-                import_scope: None,
-                edge_kind: EdgeKind::Contains,
-                confidence: EdgeConfidence::Exact,
-            });
+    // Visit outer symbols before the ones they enclose: `start` ascending puts a container first,
+    // and on an equal start `end` DESCENDING puts the larger (containing) span first.
+    let mut order = (0..symbols.len()).collect::<Vec<_>>();
+    order.sort_by(|&a, &b| {
+        symbols[a]
+            .start_byte
+            .cmp(&symbols[b].start_byte)
+            .then_with(|| symbols[b].end_byte.cmp(&symbols[a].end_byte))
+    });
+
+    // `stack` holds the currently-open enclosers, innermost on top. For each symbol we pop the
+    // enclosers whose span ends before it (they can't contain it); the remaining top is its
+    // immediate parent.
+    let mut parent = vec![None; symbols.len()];
+    let mut stack = Vec::<usize>::new();
+    for &index in &order {
+        let end = symbols[index].end_byte;
+        while stack.last().is_some_and(|&top| symbols[top].end_byte < end) {
+            stack.pop();
         }
+        parent[index] = stack.last().copied();
+        stack.push(index);
+    }
+
+    let mut out = Vec::new();
+    for (index, child) in symbols.iter().enumerate() {
+        let Some(parent) = parent[index].map(|parent_index| &symbols[parent_index]) else {
+            continue;
+        };
+        out.push(EdgeCandidate {
+            from_symbol_id: Some(parent.id),
+            from_name: Some(parent.qualified_name.clone()),
+            to_name: child.qualified_name.clone(),
+            target_qualified_name: Some(child.qualified_name.clone()),
+            evidence: Some(child.qualified_name.clone()),
+            receiver_hint: None,
+            source_span: child.span(),
+            callee_span: None,
+            import_scope: None,
+            edge_kind: EdgeKind::Contains,
+            confidence: EdgeConfidence::Exact,
+        });
     }
     out
 }
@@ -96,15 +121,10 @@ pub(crate) fn syntactic_edges(
     text: &str,
     symbols: &[IndexedSymbol],
 ) -> anyhow::Result<Vec<EdgeCandidate>> {
-    let grammar = match parser::parser_kind(path, language) {
-        ParserKind::Rust => tree_sitter_rust::LANGUAGE.into(),
-        ParserKind::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        ParserKind::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        ParserKind::Kotlin => tree_sitter_kotlin::LANGUAGE.into(),
-        ParserKind::C => tree_sitter_c::LANGUAGE.into(),
-        ParserKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        ParserKind::Python => tree_sitter_python::LANGUAGE.into(),
-        ParserKind::Markdown => return Ok(Vec::new()),
+    // Single source of truth for the grammar mapping (#519); `None` (Markdown / no grammar) yields
+    // no edges, same as the old `ParserKind::Markdown` arm.
+    let Some(grammar) = parser::grammar_for(parser::parser_kind(path, language)) else {
+        return Ok(Vec::new());
     };
     // Cancel/abandon a pathological parse (a grammar-ambiguity blowup, e.g. some Kotlin files)
     // rather than hang the indexer forever — a timed-out file yields no edges, same as a parse
@@ -293,5 +313,126 @@ pub(crate) fn symbol_edge_with_context(
         import_scope: None,
         edge_kind,
         confidence,
+    }
+}
+
+#[cfg(test)]
+mod contains_edges_tests {
+    use super::*;
+
+    fn sym(id: i64, start: usize, end: usize) -> IndexedSymbol {
+        IndexedSymbol {
+            id,
+            file_id: 0,
+            language: "rust".to_string(),
+            name: format!("s{id}"),
+            qualified_name: format!("s{id}"),
+            scope_path: String::new(),
+            kind: "function".to_string(),
+            start_byte: start,
+            end_byte: end,
+            start_line: 0,
+            end_line: 0,
+        }
+    }
+
+    /// The pre-#519 O(S²) implementation: for each child, scan ALL symbols for the smallest-span
+    /// symbol that encloses it. Kept verbatim so the nesting-sweep rewrite is proven to emit the
+    /// same (parent → child) edges in the same order.
+    fn reference(symbols: &[IndexedSymbol]) -> Vec<EdgeCandidate> {
+        let mut out = Vec::new();
+        for child in symbols {
+            let parent = symbols
+                .iter()
+                .filter(|candidate| {
+                    candidate.id != child.id
+                        && candidate.start_byte <= child.start_byte
+                        && candidate.end_byte >= child.end_byte
+                })
+                .min_by_key(|candidate| candidate.end_byte.saturating_sub(candidate.start_byte));
+            if let Some(parent) = parent {
+                out.push(EdgeCandidate {
+                    from_symbol_id: Some(parent.id),
+                    from_name: Some(parent.qualified_name.clone()),
+                    to_name: child.qualified_name.clone(),
+                    target_qualified_name: Some(child.qualified_name.clone()),
+                    evidence: Some(child.qualified_name.clone()),
+                    receiver_hint: None,
+                    source_span: child.span(),
+                    callee_span: None,
+                    import_scope: None,
+                    edge_kind: EdgeKind::Contains,
+                    confidence: EdgeConfidence::Exact,
+                });
+            }
+        }
+        out
+    }
+
+    /// (parent from_symbol_id, child to_name) in emission order — the identity of a Contains edge.
+    fn projection(edges: &[EdgeCandidate]) -> Vec<(Option<i64>, String)> {
+        edges.iter().map(|edge| (edge.from_symbol_id, edge.to_name.clone())).collect()
+    }
+
+    fn assert_equiv(symbols: &[IndexedSymbol]) {
+        assert_eq!(
+            projection(&contains_edges(symbols)),
+            projection(&reference(symbols)),
+            "contains_edges diverged from the O(S^2) reference",
+        );
+    }
+
+    #[test]
+    fn a_nested_chain_links_each_symbol_to_its_immediate_parent() {
+        // module(0..100) ⊃ function(10..90) ⊃ struct(40..60); each child's parent is the next
+        // enclosing span, and the outermost has none.
+        let symbols = [sym(1, 0, 100), sym(2, 10, 90), sym(3, 40, 60)];
+        let edges = contains_edges(&symbols);
+        // Emitted in original (child) array order: s2's parent (the module), then s3's parent
+        // (the function).
+        assert_eq!(projection(&edges), vec![
+            (Some(1), "s2".to_string()), // function's parent is the module
+            (Some(2), "s3".to_string()), // struct's parent is the function
+        ]);
+        assert_equiv(&symbols);
+    }
+
+    #[test]
+    fn siblings_share_a_parent_and_the_outermost_has_none() {
+        let symbols = [sym(1, 0, 100), sym(2, 10, 30), sym(3, 40, 60), sym(4, 70, 90)];
+        assert_equiv(&symbols);
+        assert_eq!(contains_edges(&symbols).len(), 3, "three children, one root");
+    }
+
+    #[test]
+    fn a_symbol_with_no_container_emits_no_edge() {
+        let symbols = [sym(1, 0, 10), sym(2, 20, 30)];
+        assert!(contains_edges(&symbols).is_empty());
+    }
+
+    #[test]
+    fn equal_start_container_is_the_parent() {
+        // A container sharing its child's start byte (e.g. `impl X { fn y }` where the grammar
+        // happened to align starts) must still be recognised as the enclosing parent.
+        let symbols = [sym(1, 0, 50), sym(2, 0, 20)];
+        assert_eq!(projection(&contains_edges(&symbols)), vec![(Some(1), "s2".to_string())]);
+        assert_equiv(&symbols);
+    }
+
+    #[test]
+    fn matches_the_reference_across_nested_and_sibling_shapes() {
+        // Deep nesting plus siblings at several depths, in the (start ASC, end ASC) order both real
+        // input paths produce — sweep the whole shape against the O(S²) reference.
+        let symbols = [
+            sym(1, 0, 200),
+            sym(2, 10, 90),
+            sym(3, 20, 40),
+            sym(4, 50, 80),
+            sym(5, 55, 60),
+            sym(6, 100, 190),
+            sym(7, 110, 120),
+            sym(8, 130, 180),
+        ];
+        assert_equiv(&symbols);
     }
 }
