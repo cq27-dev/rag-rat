@@ -28,13 +28,18 @@ use super::failure::{
 };
 use super::model::VerdictModel;
 use super::verify::{
-    self, EvidencePack, VerificationQueueEntry, evidence_pack, verification_queue,
+    self, EvidencePack, IdentifierResolution, ResolutionKind, VerificationQueueEntry,
+    evidence_pack, verification_queue,
 };
 use crate::index::schema;
 
 /// The verdict prompt version, stamped into `memory_reality.prompt_version`. Bump on any change to
-/// [`VERDICT_PROMPT_HEAD`] or the pack rendering so a stale-prompt verdict is distinguishable.
-pub(crate) const PROMPT_VERSION: &str = "verify-pack-v1";
+/// [`VERDICT_PROMPT_HEAD`] or the pack rendering so a stale-prompt verdict is distinguishable — a
+/// bump re-queues every prior verdict (`VerificationReason::PromptChanged`) and the finding surface
+/// stops reporting stale-prompt verdicts until they are re-checked. v2: the identifier resolver
+/// gained a verbatim-text tier + a shape-split terminal, and the prompt teaches those labels, so v1
+/// verdicts (which over-reported divergence off bare NOT-FOUND rows) are not comparable.
+pub(crate) const PROMPT_VERSION: &str = "verify-pack-v2";
 
 /// Rank for a `memory_divergence` finding — high, but below a broken-anchor's pass-0 signal.
 const DIVERGENCE_RANK: f64 = 0.8;
@@ -298,10 +303,16 @@ fn render_verdict_prompt(entry: &VerificationQueueEntry, binding: &str, pack_tex
 pub(super) fn render_pack(pack: &EvidencePack) -> String {
     let mut s = String::new();
     s.push_str("IDENTIFIERS (resolved against the whole source tree):\n");
-    if pack.identifiers.is_empty() {
+    // A `ResolutionKind::Unresolvable` span (a paraphrase / snippet / flag that is not code-shaped
+    // and matches no text) carries no presence-or-absence signal, so it is NOT rendered — the model
+    // never sees it and so cannot cite it to (wrongly) rule `diverged`. Symbol / file /
+    // verbatim-text (presence) and NOT-FOUND (genuine absence) rows are all shown and citable.
+    let shown: Vec<&IdentifierResolution> =
+        pack.identifiers.iter().filter(|id| id.kind != ResolutionKind::Unresolvable).collect();
+    if shown.is_empty() {
         s.push_str("- (no identifiers extracted)\n");
     } else {
-        for id in &pack.identifiers {
+        for id in shown {
             s.push_str("- `");
             s.push_str(&id.identifier);
             s.push_str("` -> ");
@@ -751,7 +762,7 @@ mod tests {
 
     #[test]
     fn parse_resets_on_a_new_verdict_section_ignoring_a_scratchpad() {
-        // Regression (PR #428 Codex P2): a model that emits a scratchpad VERDICT/EVIDENCE block and
+        // Regression (PR #428): a model that emits a scratchpad VERDICT/EVIDENCE block and
         // then a FINAL one must be parsed from the LAST section only — the scratchpad's evidence
         // must not carry into (and back-justify) the final verdict.
         let parsed = parse_verdict(
@@ -808,6 +819,7 @@ mod tests {
             identifiers: vec![verify::IdentifierResolution {
                 identifier: "real_symbol".to_string(),
                 resolution: "symbol src/lib.rs::real_symbol".to_string(),
+                kind: verify::ResolutionKind::Symbol,
             }],
             excerpts: Vec::new(),
         });
@@ -839,8 +851,41 @@ mod tests {
     }
 
     #[test]
+    fn render_pack_hides_unresolvable_rows_so_they_cannot_be_cited() {
+        // An `Unresolvable` span (a paraphrase / snippet that is not code-shaped and matches no
+        // text) carries no signal, so it is never rendered — the model can't see it, and the
+        // fabrication guard (which matches rendered content lines) can't accept a citation of it.
+        // Symbol / verbatim-text (presence) and NOT-FOUND (absence) rows ARE shown.
+        let mk = |identifier: &str, resolution: &str, kind| verify::IdentifierResolution {
+            identifier: identifier.to_string(),
+            resolution: resolution.to_string(),
+            kind,
+        };
+        let pack = render_pack(&EvidencePack {
+            memory_id: "m1".to_string(),
+            identifiers: vec![
+                mk("real", "symbol src/a.rs::real", verify::ResolutionKind::Symbol),
+                mk(
+                    "gone_symbol",
+                    "NOT FOUND anywhere in the source tree",
+                    verify::ResolutionKind::Absent,
+                ),
+                mk(
+                    "Ok(None)",
+                    "not a resolvable identifier (no symbol, file, or verbatim-text match)",
+                    verify::ResolutionKind::Unresolvable,
+                ),
+            ],
+            excerpts: Vec::new(),
+        });
+        assert!(pack.contains("`real`"), "a symbol row is shown: {pack}");
+        assert!(pack.contains("`gone_symbol`"), "a NOT-FOUND (absence) row is shown: {pack}");
+        assert!(!pack.contains("Ok(None)"), "the unresolvable row is hidden: {pack}");
+    }
+
+    #[test]
     fn citation_guard_rejects_a_bare_locator_prefix() {
-        // Regression (PR #428 Codex P2): an excerpt renders as `path:line: <code>`, so a bare
+        // Regression (PR #428): an excerpt renders as `path:line: <code>`, so a bare
         // `path:line` locator is a substring of it and long enough — but cites no actual source.
         // The guard must require text beyond the locator.
         let pack = render_pack(&EvidencePack {
@@ -1177,7 +1222,7 @@ mod tests {
 
     #[test]
     fn a_plain_dream_run_does_not_resolve_a_prior_verify_runs_divergence_finding() {
-        // Regression (PR #428 Codex P2): the resolve sweep is kind-scoped, so a plain `dream`
+        // Regression (PR #428): the resolve sweep is kind-scoped, so a plain `dream`
         // (verify off) must NOT resolve the `memory_divergence` finding a prior `--verify` run
         // opened — it never re-evaluated that kind.
         use super::super::{DreamOptions, dream_run, dream_run_with_passes};
@@ -1219,7 +1264,7 @@ mod tests {
 
     #[test]
     fn divergence_finding_drops_when_the_body_is_edited_without_a_recheck() {
-        // Regression (PR #428 Codex P2): a stored `diverged` verdict is against the OLD body; once
+        // Regression (PR #428): a stored `diverged` verdict is against the OLD body; once
         // the body is edited it must not be surfaced against the new note even if the model pass is
         // absent (disabled / budget-exhausted / skipped) so no re-check happened.
         use super::super::{DreamOptions, dream_run, dream_run_with_passes};
@@ -1269,7 +1314,7 @@ mod tests {
 
     #[test]
     fn divergence_finding_drops_under_an_obsolete_prompt_version() {
-        // Regression (PR #428 Codex P2): a stored `diverged` verdict from an OLD verdict prompt is
+        // Regression (PR #428): a stored `diverged` verdict from an OLD verdict prompt is
         // not comparable; after a `PROMPT_VERSION` bump it must not keep refreshing a finding until
         // a fresh verdict is recorded (the queue re-queues it as `PromptChanged`; this is
         // the matching surfacing gate). Symmetric to the stale-body case.

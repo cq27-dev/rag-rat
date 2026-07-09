@@ -28,6 +28,9 @@ use crate::index::schema;
 /// The authoritative "resolves nowhere" verdict — trustworthy precisely because the index is
 /// whole-tree, so a miss is a real absence, not a scoping artifact.
 const NOT_FOUND: &str = "NOT FOUND anywhere in the source tree";
+/// The resolution for a code-shaped-but-unresolved span that is uninformative — a paraphrase,
+/// snippet, or flag whose non-match is a shape artifact, NEVER evidence of divergence.
+const UNRESOLVABLE: &str = "not a resolvable identifier (no symbol, file, or verbatim-text match)";
 /// Context lines above/below an identifier hit in a bound-file excerpt window.
 const EXCERPT_RADIUS: i64 = 3;
 /// Upper bound on the total excerpt lines an evidence pack carries (keeps a single-turn verdict
@@ -48,6 +51,29 @@ static SNAKE_RE: LazyLock<Regex> =
 /// path separators — those resolve as files, not symbols).
 static BARE_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("static regex"));
+/// A bare or `::`-qualified name (`foo`, `foo::bar::Baz`) — the shape whose GENUINE absence is a
+/// divergence signal (a named code entity the note describes is gone), so a whole-tree miss on it
+/// earns the authoritative [`NOT_FOUND`] rather than the uninformative "not a resolvable
+/// identifier".
+static SYMBOL_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$").expect("static regex")
+});
+/// The character set of a file path (letters, digits, `_./@+-` — `@` for scoped package dirs like
+/// `packages/@scope/app/src/index.ts`). Combined with a "has a `/` or a trailing `.ext`" check to
+/// decide path-shapedness (so a bare `commit_fts` is judged by [`SYMBOL_PATH_RE`], not a path).
+static PATH_SHAPE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_./@+-]+$").expect("static regex"));
+/// A trailing file extension (`.rs`, `.md`, …) — the other half of path-shapedness for a bare
+/// filename with no directory separator.
+static FILE_EXT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\.[A-Za-z0-9]{1,8}$").expect("static regex"));
+
+/// Runaway guard on candidate chunks a verbatim-text probe scans per identifier. The PHRASE
+/// narrowing (adjacent tokens) keeps a real identifier's candidate set in the low hundreds, well
+/// under this; the guard only bounds a degenerate phrase (e.g. a backticked English sentence). It
+/// is NOT a correctness knob — a scan that reaches it yields `Capped` (indeterminate), never a
+/// false `Absent`; the phrase set of a real identifier is exhausted long before the guard.
+const TEXT_PRESENCE_SCAN_CAP: usize = 2000;
 
 /// Why a memory is in the verification queue. Not persisted (a transient queue reason), so it
 /// carries no `as_db_str`; the [`Self::rank`] priority orders the queue.
@@ -116,8 +142,48 @@ impl EvidencePack {
     ///
     /// The verdict pass records a terminal (verdict-less) row for an uncitable pack instead of
     /// calling the model, so it churn-skips rather than re-queuing every run.
+    ///
+    /// "Citable" = carries at least one piece of PRESENCE evidence: a bound-file excerpt, or an
+    /// identifier that resolved to a symbol / file / verbatim source text
+    /// ([`ResolutionKind::is_present`]). A pack whose every identifier is
+    /// [`ResolutionKind::Absent`] (a real gone-symbol) or [`ResolutionKind::Unresolvable`] (a
+    /// paraphrase / non-code span) carries no positive evidence — pass 0 already decides such a
+    /// memory `memory_unverifiable`, so it must not be asked of the model (asking would invite
+    /// a `diverged` verdict cited off a bare NOT-FOUND / unresolvable row).
     pub(super) fn is_citable(&self) -> bool {
-        !self.excerpts.is_empty() || self.identifiers.iter().any(|id| id.resolution != NOT_FOUND)
+        !self.excerpts.is_empty() || self.identifiers.iter().any(|id| id.kind.is_present())
+    }
+}
+
+/// How an extracted span resolves against the whole-tree index — the classification that decides
+/// whether the span is PRESENCE evidence, a genuine absence (divergence-grade), or an uninformative
+/// non-code span. Kept distinct from the rendered [`IdentifierResolution::resolution`] string so
+/// the citability / "resolves" gates never string-match the human-facing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionKind {
+    /// Resolved to ≥1 indexed symbol by name.
+    Symbol,
+    /// Resolved to ≥1 indexed file by path (exact or suffix).
+    File,
+    /// Not a symbol or file, but appears VERBATIM in indexed source text (a DB table/column name, a
+    /// local variable, a common expression, an attribute). Presence evidence, NOT a divergence.
+    TextPresent,
+    /// An identifier- or path-shaped span that resolves to NOTHING — no symbol, no file, not even
+    /// verbatim text. THE genuine divergence signal: a named code entity the note describes is
+    /// gone.
+    Absent,
+    /// A span that is not shaped like a code symbol or path (whitespace, parens, brackets, quotes,
+    /// operators — a paraphrased expression / SQL snippet / CLI flag) AND does not appear verbatim.
+    /// Uninformative: its non-match is an artifact of the span shape, never evidence of divergence.
+    Unresolvable,
+}
+
+impl ResolutionKind {
+    /// Whether this resolution is POSITIVE presence evidence (symbol / file / verbatim text) — the
+    /// citability + "any identifier resolves" gate. `Absent` and `Unresolvable` are not present.
+    fn is_present(self) -> bool {
+        matches!(self, Self::Symbol | Self::File | Self::TextPresent)
     }
 }
 
@@ -125,8 +191,12 @@ impl EvidencePack {
 #[derive(Debug, Clone, Serialize)]
 pub struct IdentifierResolution {
     pub identifier: String,
-    /// `symbol <path>::<name>`, `file <path>`, or the authoritative [`NOT_FOUND`].
+    /// Human/model-facing text: `symbol <path>::<name>`, `file <path>`, a verbatim-text note, the
+    /// authoritative [`NOT_FOUND`], or a "not a resolvable identifier" note. See
+    /// [`ResolutionKind`] for the machine classification (which is what the gates read, never
+    /// this string).
     pub resolution: String,
+    pub kind: ResolutionKind,
 }
 
 /// A current-text excerpt window from a bound file, addressed by absolute line range.
@@ -347,7 +417,12 @@ fn identifier_resolution_pairs(
     let file_paths = indexed_file_paths(conn)?;
     let mut out = Vec::with_capacity(identifiers.len());
     for ident in &identifiers {
-        out.push((ident.clone(), resolve_identifier(conn, ident, &file_paths)?));
+        // Fold the rendered resolution STRING. It is now path-independent for every tier —
+        // `TextPresent` names no files, symbol/file carry stable identity, NOT_FOUND / unresolvable
+        // are fixed — so the churn key re-verifies on a genuine tier flip or a symbol/file identity
+        // change but stays stable against unrelated repo churn (adding a file carrying a cited
+        // common token no longer re-queues the paid verdict).
+        out.push((ident.clone(), resolve_identifier(conn, ident, &file_paths)?.0));
     }
     Ok(out)
 }
@@ -375,10 +450,8 @@ pub fn evidence_pack(conn: &Connection, memory_id: &str) -> anyhow::Result<Evide
     let file_paths = indexed_file_paths(conn)?;
     let mut resolutions = Vec::with_capacity(identifiers.len());
     for ident in &identifiers {
-        resolutions.push(IdentifierResolution {
-            resolution: resolve_identifier(conn, ident, &file_paths)?,
-            identifier: ident.clone(),
-        });
+        let (resolution, kind) = resolve_identifier(conn, ident, &file_paths)?;
+        resolutions.push(IdentifierResolution { identifier: ident.clone(), resolution, kind });
     }
     let excerpts = bound_file_excerpts(conn, memory_id, &scope, &identifiers)?;
     Ok(EvidencePack { memory_id: memory_id.to_string(), identifiers: resolutions, excerpts })
@@ -500,66 +573,465 @@ fn extract_identifiers(title: &str, body: &str) -> Vec<String> {
     ids.into_iter().collect()
 }
 
-/// Resolve one identifier EXHAUSTIVELY: a symbol by (bare / last-`::`-segment) name first, then a
-/// file by path segment (suffix-aware), else the authoritative [`NOT_FOUND`].
+/// Resolve one extracted span against the whole-tree index through a four-tier ladder, returning
+/// both the human/model-facing string and its [`ResolutionKind`]:
+///   1. SYMBOL — the trailing `::` segment (call-args stripped) as a symbol name.
+///   2. FILE — an exact or suffix path match.
+///   3. VERBATIM TEXT — not a symbol/file, but present as literal source text (a DB table/column
+///      name, a local variable, a common expression). PRESENCE evidence, not a divergence — but the
+///      label states it is NOT a defined symbol, so a note claiming it is a live function can still
+///      be judged diverged.
+///   4. TERMINAL — nothing resolved. Split by span SHAPE: a symbol- or path-shaped span that is
+///      genuinely absent is the real divergence signal ([`NOT_FOUND`] /
+///      [`ResolutionKind::Absent`]); a non-code span (parens, brackets, quotes, operators,
+///      whitespace — a paraphrase / snippet / flag) is uninformative
+///      ([`ResolutionKind::Unresolvable`]), never evidence of divergence.
+///
+/// The old resolver conflated tiers 3 and 4 into a blanket [`NOT_FOUND`], so a memory citing a
+/// table name, an attribute, or an expression was reported as "absent" and the verdict model
+/// over-reported `diverged` — the root of the divergence false-positive class.
 fn resolve_identifier(
     conn: &Connection,
     ident: &str,
     file_paths: &[String],
-) -> rusqlite::Result<String> {
-    let symbol_name = ident.rsplit("::").next().unwrap_or(ident);
-    if BARE_NAME_RE.is_match(symbol_name) {
-        let locs = resolve_symbol(conn, symbol_name)?;
+) -> rusqlite::Result<(String, ResolutionKind)> {
+    // `norm` drops a Rust turbofish (`build_index::<Cfg>(cfg)` -> `build_index(cfg)`) for the
+    // SYMBOL and SHAPE tiers, so a generic-argument `::` is never mistaken for a qualified path
+    // (which would probe the generic args and hide a real absence). The FILE and TEXT tiers
+    // keep the ORIGINAL span: the source carries the generic args verbatim, so a normalized
+    // `HashMap::new` is NOT contiguous in the source's `HashMap::<T>::new()` and text-probing
+    // it would miss a present call.
+    let normalized = strip_turbofish(ident);
+    let norm = normalized.as_ref();
+    // 1. SYMBOL — probe the trailing name with any call-argument list (and macro bang) stripped, so
+    //    a qualified call (`Mod::from_config(&x)`) still resolves its method instead of failing the
+    //    bare-name gate on the parens. Only the trailing name (never the receiver type) is tried,
+    //    so a deleted method on a surviving type still falls through to a genuine-absence signal
+    //    below.
+    if let Some(symbol_name) = symbol_lookup_name(norm) {
+        // A macro invocation (`foo!`) resolves ONLY to a macro-kind symbol, so a removed macro is
+        // not masked by a same-named non-macro (a surviving `fn foo`).
+        let kind = is_macro_invocation(norm).then_some("macro");
+        let locs = resolve_symbol(conn, &symbol_name, kind)?;
         match locs.as_slice() {
             [] => {},
-            [one] => return Ok(format!("symbol {one}")),
+            [one] => return Ok((format!("symbol {one}"), ResolutionKind::Symbol)),
             // AMBIGUOUS: more than one live definition shares this bare name. Present ALL of them
             // (sorted) rather than the first — the model must not audit against, and the churn key
             // must not be pinned to, an UNRELATED same-named symbol (so deleting/renaming the one
             // the note actually described re-verifies even when a namesake survives).
-            many => return Ok(format!("symbols ({}): {}", many.len(), many.join(", "))),
+            many => {
+                return Ok((
+                    format!("symbols ({}): {}", many.len(), many.join(", ")),
+                    ResolutionKind::Symbol,
+                ));
+            },
         }
     }
-    // A shorthand path (`lib.rs`, `src/lib.rs`) can suffix-match MORE than one indexed file;
-    // present ALL of them for the SAME reason as ambiguous symbols above — else
-    // deleting/changing the file the note meant is masked by an unrelated same-suffix file, and
-    // the churn key stays pinned to the first match. An exact path match is definitive
-    // (returned alone).
+    // 2. FILE — a shorthand path (`lib.rs`, `src/lib.rs`) can suffix-match MORE than one indexed
+    //    file; present ALL of them for the SAME reason as ambiguous symbols above. An exact path
+    //    match is definitive (returned alone).
     let files = resolve_file_segment(ident, file_paths);
     match files.as_slice() {
         [] => {},
-        [one] => return Ok(format!("file {one}")),
-        many => return Ok(format!("files ({}): {}", many.len(), many.join(", "))),
+        [one] => return Ok((format!("file {one}"), ResolutionKind::File)),
+        many => {
+            return Ok((
+                format!("files ({}): {}", many.len(), many.join(", ")),
+                ResolutionKind::File,
+            ));
+        },
     }
-    Ok(NOT_FOUND.to_string())
+    // 3. VERBATIM TEXT — present in source but not a symbol/file (a DB table/column name, a local,
+    //    a common expression). Present, so NOT a divergence — but "not a defined symbol" keeps the
+    //    door open for a note claiming it is a live function. The resolution names NO files, so the
+    //    rendered pack and the churn key stay stable as unrelated files gain/lose the token. Probe
+    //    the NORMALIZED callee first (so a present turbofish call whose args/generics differ,
+    //    `from_str::<Cfg>(payload)` vs a source `from_str(&body)`, is found by its contiguous
+    //    name); for a turbofish whose QUALIFIED callee is split by generics in source, fall back to
+    //    the ORIGINAL span's exact match.
+    let text = match text_probe(conn, norm)? {
+        TextProbe::Present => TextProbe::Present,
+        // A turbofish's normalized callee was inconclusive (Exhausted or Capped, e.g. a common
+        // `new`/`parse`) — try the EXACT original span, a much narrower query. Confirm Present if
+        // it matches; else keep the normalized result, never downgrading an inconclusive
+        // callee into a false absence via the exact miss.
+        norm_result if norm != ident => match text_probe(conn, ident)? {
+            TextProbe::Present => TextProbe::Present,
+            _ => norm_result,
+        },
+        norm_result => norm_result,
+    };
+    match text {
+        TextProbe::Present => {
+            // A path-shaped span that reached here is NOT an indexed file (tier 2 missed) yet
+            // appears verbatim — a FILE claim can still diverge, so it carries a file-specific
+            // label symmetric to the symbol case; a name / expression keeps the
+            // symbol-oriented one.
+            let label = if is_file_path_shaped(ident, file_paths) {
+                "not an indexed file; appears verbatim only as source text"
+            } else {
+                "not a defined symbol; appears verbatim as source text"
+            };
+            return Ok((label.to_string(), ResolutionKind::TextPresent));
+        },
+        // Presence INDETERMINATE — the phrase matched more chunks than the scan cap, so the
+        // verbatim chunk may rank beyond the window and go unchecked. Do NOT risk a false
+        // `Absent` on that; treat the span as uninformative.
+        TextProbe::Capped => return Ok((UNRESOLVABLE.to_string(), ResolutionKind::Unresolvable)),
+        TextProbe::Exhausted => {},
+    }
+    // 4. TERMINAL — genuinely not present. A qualified CALL (`Type::method(args)`) or qualified
+    //    MACRO (`mod::foo!`) is NOT ruled `Absent`: a method/macro not written verbatim and not
+    //    resolved above is too ambiguous to convict — usually dot-called, external/std, imported,
+    //    or a paraphrase — so the false-positive-averse posture drops that speculative signal. Only
+    //    a code-shaped span that is neither, and resolves nowhere, is a genuine absence; anything
+    //    else is uninformative.
+    if span_is_code_shaped(norm, file_paths)
+        && !is_qualified_call(norm)
+        && !is_qualified_macro(norm)
+    {
+        Ok((NOT_FOUND.to_string(), ResolutionKind::Absent))
+    } else {
+        Ok((UNRESOLVABLE.to_string(), ResolutionKind::Unresolvable))
+    }
 }
 
-/// Whether ANY extracted identifier resolves — the "zero identifiers resolve" gate for
-/// `unverifiable_findings` (short-circuits on the first hit).
+/// The three outcomes of a verbatim-text probe. `Capped` (the scan hit its guard before confirming)
+/// is kept distinct from `Exhausted` (every phrase-match was checked, none matched) so the caller
+/// never rules `Absent` on an indeterminate result — the sound fallback the raised scan cap needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextProbe {
+    Present,
+    Exhausted,
+    Capped,
+}
+
+/// Whether a span is a QUALIFIED CALL — a `::`-qualified head followed by a call-arg list
+/// (`Type::method(args)`). Such a span is never ruled `Absent` (the method may be dot-called,
+/// external, or a paraphrase); presence for it comes only from a verbatim match of the qualified
+/// name at tier 3.
+fn is_qualified_call(ident: &str) -> bool {
+    ident.split_once('(').is_some_and(|(head, _)| head.trim().contains("::"))
+}
+
+/// Whether a span is a `::`-QUALIFIED MACRO invocation (`crate::foo!`, `mod::foo!(x)`). Kept
+/// conservative (never ruled `Absent`, like a qualified method call): the index tracks macros by
+/// bare name only, so a qualified macro can't be told apart from an external / imported / moved /
+/// namesake macro — forcing NOT_FOUND would false-positive on a live `tracing::info!()`.
+fn is_qualified_macro(ident: &str) -> bool {
+    macro_head(ident).is_some_and(|head| head.contains("::"))
+}
+
+/// The bare symbol name to probe for a span at tier 1, or `None` when the span is not name-shaped:
+///   - BARE span (no `::`): strip a trailing call-arg list and a macro bang so `some_fn(x)` probes
+///     `some_fn` and `my_macro!(x)` / `my_macro!` probe `my_macro` — safe, the note named the
+///     callee bare, and resolving it to its (accurate) `Symbol` avoids a false absence for a
+///     defined free function or macro.
+///   - QUALIFIED span (`::`): the last `::` segment of the FULL span WITHOUT stripping args, so a
+///     qualified CALL (`Type::method(x)`) keeps its parens and is NOT bare-probed — probing the
+///     bare method would match an UNRELATED namesake and MASK the call's disappearance. A plain
+///     qualified NAME (no args) still probes its last segment. A present qualified call resolves
+///     through the verbatim-text tier (on its arg-stripped NAME), and the terminal is conservative
+///     for it.
+fn symbol_lookup_name(ident: &str) -> Option<String> {
+    let last = if ident.contains("::") {
+        ident.rsplit("::").next().unwrap_or(ident).trim()
+    } else {
+        call_head(ident)
+    };
+    BARE_NAME_RE.is_match(last).then(|| last.to_string())
+}
+
+/// The callee NAME at the head of a call or macro-invocation span — everything before the first
+/// `(`, with a trailing macro bang stripped: `build_index(cfg)`, `my_macro!(x)`, and `my_macro!`
+/// all yield the bare name (`build_index` / `my_macro`). A `::`-qualified head keeps its path
+/// (`Type::method`). (Turbofish is already normalized away before this runs.)
+fn call_head(ident: &str) -> &str {
+    if let Some(mh) = macro_head(ident) {
+        return mh.strip_suffix('!').unwrap_or(mh); // `vec!` -> `vec`
+    }
+    ident.split('(').next().unwrap_or(ident).trim() // `some_fn(x)` -> `some_fn`
+}
+
+/// The head of a Rust MACRO invocation WITH its bang — `foo!` for `foo!`, `foo!(x)`, `foo![x]`, and
+/// `foo! { .. }` — or `None` when the span is not a macro invocation. The delimiter after the bang
+/// may be `()`, `[]`, or `{}` (or absent); the trailing `!` is what distinguishes a macro
+/// (`vec![x]`) from indexing (`arr[i]`).
+fn macro_head(ident: &str) -> Option<&str> {
+    let head = ident.split(['(', '[', '{']).next().unwrap_or(ident).trim();
+    head.ends_with('!').then_some(head)
+}
+
+/// Whether a span is a Rust MACRO invocation (see [`macro_head`]). Constrains the symbol lookup to
+/// macro-kind symbols so a removed macro is not masked by a same-named non-macro symbol.
+fn is_macro_invocation(ident: &str) -> bool {
+    macro_head(ident).is_some()
+}
+
+/// Strip Rust turbofish segments (`::<...>`, balanced) so `build_index::<Cfg>(cfg)` normalizes to
+/// `build_index(cfg)` before any `::`/call logic — a turbofish `::` is a generic-argument marker,
+/// not a path separator, and must not be read as a qualified path.
+fn strip_turbofish(ident: &str) -> std::borrow::Cow<'_, str> {
+    if !ident.contains("::<") {
+        return std::borrow::Cow::Borrowed(ident);
+    }
+    let mut out = String::with_capacity(ident.len());
+    let mut depth = 0usize; // turbofish `<`/`>` nesting
+    let mut group = 0usize; // `()`/`[]`/`{}` nesting INSIDE the turbofish (fn-pointer args, arrays,
+    // const-generic blocks) — `<`/`>` there are types/comparisons, not turbofish brackets
+    let mut prev = '\0';
+    let mut chars = ident.char_indices();
+    while let Some((i, ch)) = chars.next() {
+        if depth == 0 && ident[i..].starts_with("::<") {
+            depth = 1;
+            chars.next(); // consume the second ':'
+            chars.next(); // consume the '<'
+            prev = '<';
+            continue;
+        }
+        if depth > 0 {
+            match ch {
+                '(' | '[' | '{' => group += 1,
+                ')' | ']' | '}' => group = group.saturating_sub(1),
+                '<' if group == 0 => depth += 1,
+                // At the turbofish level, a `>` closes a level — EXCEPT a `->` (fn-pointer return);
+                // inside a group (`{ N > 0 }`, `[T; N > 0]`) it is a comparison, never a close.
+                '>' if group == 0 && prev != '-' => depth -= 1,
+                _ => {},
+            }
+            prev = ch;
+            continue;
+        }
+        out.push(ch);
+        prev = ch;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether a span is shaped like a code symbol or a file path — the shape whose genuine whole-tree
+/// absence is a DIVERGENCE signal (a named entity the note describes is gone). A bare /
+/// `::`-qualified name (with or without a stripped call-arg list), or a path (a `/`, or a bare
+/// filename with a trailing extension), qualifies. Anything carrying whitespace, parens (that are
+/// not a stripped call on a qualified name), brackets, quotes, or operators is a paraphrase /
+/// snippet / flag, whose non-match is a shape artifact — not evidence of divergence.
+fn span_is_code_shaped(ident: &str, file_paths: &[String]) -> bool {
+    let ident = ident.trim();
+    if SYMBOL_PATH_RE.is_match(ident) {
+        return true;
+    }
+    if is_file_path_shaped(ident, file_paths) {
+        return true;
+    }
+    // A CALL or MACRO span: the head before `(` (macro bang stripped) is name-shaped (a bare
+    // `some_fn` / `my_macro`, or a `::`-qualified `Type::method`). A removed BARE call or macro is
+    // a genuine absence — its arg-stripped name resolves nowhere, exactly as tiers 1 and 3
+    // already probe it — so it must reach the NOT_FOUND terminal instead of falling to
+    // Unresolvable and skipping the model (the deleted-function / note-ahead case). A qualified
+    // call is still held back from the terminal by the caller's `!is_qualified_call` gate (the
+    // namesake-masking guard); a PRESENT expression head (`Ok(None)`) is diverted to
+    // TextPresent by tier 3 before this runs.
+    SYMBOL_PATH_RE.is_match(call_head(ident))
+}
+
+/// Whether a span reads as a FILE PATH — a `/`-bearing or `stem.ext` shape whose extension an
+/// indexed file actually uses (see [`looks_like_path`]). Shared by [`span_is_code_shaped`] (a
+/// path's genuine whole-tree absence is a divergence signal) and the verbatim-text tier (a path
+/// present only as source text gets a FILE-specific label, not the symbol one).
+fn is_file_path_shaped(ident: &str, file_paths: &[String]) -> bool {
+    let ident = ident.trim();
+    PATH_SHAPE_RE.is_match(ident) && looks_like_path(ident, file_paths)
+}
+
+/// Whether a path-charset span reads as an INDEX-AUTHORITATIVE FILE PATH — one whose final segment
+/// carries an extension that indexed files actually use. The extension gate is what makes a tier-2
+/// miss INFORMATIVE: a `.rs`/`.md` path the index covers is a genuine file absence when gone, but a
+/// path the index does NOT cover is a COVERAGE artifact, not an absence, and must not read as a
+/// divergence:
+///   - an unindexed extension (`.github/workflows/ci.yml` when only `crates`/`docs` are indexed),
+///   - a DIRECTORY or extension-less path (`src/oplog/`, `src/oplog`) the index tracks no file for,
+///   - dotted FIELD ACCESS (`DreamOptions.verify`, `config.dream.model`) — no indexed file's
+///     extension, so not a path.
+///
+/// Any of these misses `Unresolvable`, never a false `Absent`. A `/` DISAMBIGUATES a real path from
+/// field access: a slashed span is a file when its last segment's extension is covered, but a
+/// NO-SLASH span must be a clean single-dot `stem.ext` — a bare MULTI-DOT span (`config.docs.md`)
+/// is ambiguous with dotted field access, so the FP-averse call is to treat it as not-a-file.
+fn looks_like_path(s: &str, file_paths: &[String]) -> bool {
+    let last_segment = s.rsplit('/').next().unwrap_or(s);
+    let Some(dot) = last_segment.rfind('.') else {
+        return false; // a directory or extension-less name — the index tracks no such file
+    };
+    // No-slash multi-dot spans are ambiguous with field access; only a slash proves a path.
+    if !s.contains('/') && last_segment.matches('.').count() != 1 {
+        return false;
+    }
+    let ext = &last_segment[dot..]; // e.g. ".rs"
+    FILE_EXT_RE.is_match(ext) && file_paths.iter().any(|p| p.ends_with(ext))
+}
+
+/// How the span appears VERBATIM in indexed source text (repo-scoped) — `Present`, `Exhausted`
+/// (every phrase-match was checked, none contains it → genuine absence), or `Capped` (the scan hit
+/// its guard first → INDETERMINATE, so the caller must not rule `Absent`). The probe target is the
+/// span's arg-stripped NAME for a call (`Type::method(args)` -> `Type::method`, `some_fn(x)` ->
+/// `some_fn`), else the full span (see `text_search_target`). `chunk_fts` (porter) narrows with a
+/// PHRASE of the target's alphanumeric tokens: a chunk that contains the literal target has those
+/// tokens ADJACENT (non-alphanumerics are token separators), so the phrase match cannot miss it — a
+/// SOUND narrowing, unlike an AND + rank-capped one (empirically real for `clone_edges`: 1025
+/// AND-matches ≫ 256). Candidates are decoded LAZILY in rank order; the FIRST confirmed hit settles
+/// it, so a present token decodes ~one blob. Presence is FILE-INDEPENDENT (the resolution names no
+/// files, so the pack and churn key stay stable as unrelated files gain/lose the token).
+/// `TEXT_PRESENCE_SCAN_CAP` bounds the scan for a common phrase whose verbatim chunk ranks late —
+/// exhausting FEWER rows than the cap is a definitive absence; hitting the cap is `Capped`
+/// (indeterminate — never a false absence). A corrupt blob is skipped best-effort.
+fn text_probe(conn: &Connection, ident: &str) -> rusqlite::Result<TextProbe> {
+    let target = text_search_target(ident);
+    let Some(query) = fts_phrase_query(target) else {
+        return Ok(TextProbe::Exhausted);
+    };
+    let dicts = chunk_text_dict_bytes(conn)?;
+    let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+    // Candidate chunks: contentless `chunk_fts.rowid` == `chunks.id`; the JOIN through the
+    // repo-scoped `files` view keeps only the active repo's chunks (LIMIT is applied POST-join, so
+    // a sibling repo's chunks never consume the guard budget). Rows are STEPPED lazily — the
+    // return at the first confirmed hit stops the fetch, not just the decode.
+    let mut stmt = conn.prepare(
+        "SELECT ct.blob, ct.raw_len, ct.dict_version FROM chunk_fts JOIN chunks c ON c.id = \
+         chunk_fts.rowid JOIN chunk_text ct ON ct.chunk_id = c.id JOIN files f ON f.id = \
+         c.file_id WHERE chunk_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![query, TEXT_PRESENCE_SCAN_CAP as i64], |r| {
+        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+    })?;
+    let mut seen = 0usize;
+    for row in rows {
+        seen += 1;
+        let (blob, raw_len, dict_version) = row?;
+        let Ok(bytes) = decoder.decompress(dict_version, &blob, raw_len.max(0) as usize) else {
+            continue; // corrupt/undecodable chunk — best-effort skip
+        };
+        if std::str::from_utf8(&bytes).is_ok_and(|text| contains_at_token_boundary(text, target)) {
+            return Ok(TextProbe::Present);
+        }
+    }
+    // Fewer than the cap were scanned → the whole phrase set was checked (definitive absence);
+    // reaching the cap leaves presence unknown beyond it.
+    Ok(if seen >= TEXT_PRESENCE_SCAN_CAP { TextProbe::Capped } else { TextProbe::Exhausted })
+}
+
+/// Whether `needle` occurs in `haystack` bounded by non-token chars on any end that is itself a
+/// token char — so a verbatim probe for `commit_fts` is NOT satisfied by a longer token that merely
+/// contains it (`commit_fts_v2`), which would mask a rename/deletion of the non-symbol identifier
+/// as still present. The boundary is required only where `needle` ends in a token char; a
+/// punctuation-delimited span (`#[cfg(test)]`, `Ok(None)`) is self-delimiting and imposes no extra
+/// constraint. The token alphabet is `[A-Za-z0-9_]`, PLUS `-` when the needle is kebab/flag-shaped
+/// (contains `-`), so a cited `--config` is not "found" inside a longer `--config-file`, while an
+/// identifier needle keeps `-` as a delimiter (a C `foo->bar` still finds `foo`). Neighbor lookups
+/// are byte-wise and UTF-8-safe: `match_indices` yields char-boundary offsets, and any non-ASCII
+/// neighbor byte is non-token (a boundary).
+fn contains_at_token_boundary(haystack: &str, needle: &str) -> bool {
+    let bytes = needle.as_bytes();
+    let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
+        return false; // an empty target can't be a verbatim presence
+    };
+    let hyphen_is_token = needle.contains('-');
+    let is_token = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || (hyphen_is_token && b == b'-');
+    let guard_start = is_token(first);
+    let guard_end = is_token(last);
+    let hay = haystack.as_bytes();
+    for (start, m) in haystack.match_indices(needle) {
+        let end = start + m.len();
+        let left_ok = !guard_start || start == 0 || !is_token(hay[start - 1]);
+        let right_ok = !guard_end || end == hay.len() || !is_token(hay[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// The verbatim-text probe target: match the callee NAME so a present callee resolves regardless of
+/// its specific (often paraphrased) arguments.
+///   - CALL span (`Type::method(args)` -> `Type::method`, `some_fn(x)` -> `some_fn`).
+///   - MACRO span (`my_macro!(x)` / `my_macro!` -> `my_macro!`): the target KEEPS the bang, so the
+///     text probe requires the actual macro INVOCATION — a same-named non-macro (`fn my_macro`, no
+///     bang) is not a false presence for a removed macro.
+///   - Any other span — an attribute, an expression, a snippet — is matched in FULL, so a loose
+///     prefix can't spuriously "confirm" it (e.g. `#[cfg(never)]` must not match on the `#[cfg`
+///     prefix of a real `#[cfg(test)]`).
+fn text_search_target(ident: &str) -> &str {
+    let ident = ident.trim();
+    if let Some(mh) = macro_head(ident) {
+        // The invocation form WITH the bang (`foo!`, from any of `foo!(x)` / `foo![x]` /
+        // `foo!{x}`); require a name-shaped callee so a non-code snippet falls through to
+        // the full-span match.
+        if SYMBOL_PATH_RE.is_match(mh.strip_suffix('!').unwrap_or(mh)) {
+            return mh;
+        }
+    } else if ident.contains('(') {
+        let head = call_head(ident);
+        if SYMBOL_PATH_RE.is_match(head) {
+            return head;
+        }
+    }
+    ident
+}
+
+/// The `chunk_fts MATCH` PHRASE query for a verbatim-text probe: EVERY non-empty alphanumeric token
+/// of `target`, in order, inside ONE quoted phrase (`"clone edges"`). Every token is kept, even a
+/// 1-char one — dropping an interior token would break the adjacency the phrase relies on. `None`
+/// when the target yields no token (so it can't be in the FTS index — the probe is skipped).
+fn fts_phrase_query(target: &str) -> Option<String> {
+    let tokens: Vec<&str> =
+        target.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| !t.is_empty()).collect();
+    (!tokens.is_empty()).then(|| format!("\"{}\"", tokens.join(" ")))
+}
+
+/// The resident `chunk_text` dictionaries as a `version -> bytes` map, read with plain SQL so the
+/// verbatim-text probe stays on `rusqlite::Result` (no `anyhow` in the resolution path). Mirrors
+/// `crate::query::chunk_text_dicts` without its `anyhow` return.
+fn chunk_text_dict_bytes(
+    conn: &Connection,
+) -> rusqlite::Result<std::collections::HashMap<i64, Vec<u8>>> {
+    conn.prepare("SELECT version, dict FROM chunk_text_dict")?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+        .collect()
+}
+
+/// Whether ANY extracted identifier is PRESENCE evidence (symbol / file / verbatim text) — the
+/// "zero identifiers resolve" gate for `unverifiable_findings` (short-circuits on the first present
+/// one). A span that is [`ResolutionKind::Absent`] or [`ResolutionKind::Unresolvable`] does not
+/// count.
 fn any_identifier_resolves(
     conn: &Connection,
     identifiers: &[String],
     file_paths: &[String],
 ) -> rusqlite::Result<bool> {
     for ident in identifiers {
-        if resolve_identifier(conn, ident, file_paths)? != NOT_FOUND {
+        if resolve_identifier(conn, ident, file_paths)?.1.is_present() {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-/// EVERY live symbol whose `name` matches, as `path::name`, path-sorted, through the `files` view
-/// (repo-scoped). Empty when the name is unknown anywhere in the tree. Returns all matches (not
-/// `LIMIT 1`) so a common bare name is surfaced as ambiguous rather than silently pinned to its
-/// first definition — see [`resolve_identifier`]. `DISTINCT` collapses a symbol indexed twice at
-/// the same path (e.g. across chunks) but keeps genuinely distinct same-named definitions.
-fn resolve_symbol(conn: &Connection, name: &str) -> rusqlite::Result<Vec<String>> {
+/// EVERY live symbol whose `name` matches (optionally constrained to a `kind`), as `path::name`,
+/// path-sorted, through the `files` view (repo-scoped). Empty when the name is unknown anywhere in
+/// the tree. Returns all matches (not `LIMIT 1`) so a common bare name is surfaced as ambiguous
+/// rather than silently pinned to its first definition — see [`resolve_identifier`]. `DISTINCT`
+/// collapses a symbol indexed twice at the same path (e.g. across chunks) but keeps genuinely
+/// distinct same-named definitions. `kind` is `Some("macro")` for a macro invocation (`foo!`), so a
+/// removed macro does NOT resolve to a same-named NON-macro (`fn foo`) and mask its absence.
+fn resolve_symbol(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT f.path, s.name FROM symbols s JOIN files f ON f.id = s.file_id WHERE \
-         s.name = ?1 ORDER BY f.path, s.name",
+         s.name = ?1 AND (?2 IS NULL OR s.kind = ?2) ORDER BY f.path, s.name",
     )?;
-    stmt.query_map([name], |r| {
+    stmt.query_map(rusqlite::params![name, kind], |r| {
         Ok(format!("{}::{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })?
     .collect()
@@ -819,6 +1291,12 @@ mod tests {
         .unwrap();
         let chunk_id = c.last_insert_rowid();
         crate::index::chunk_text_store::seed_chunk_text(c, chunk_id, text).unwrap();
+        // Mirror production: the chunk is FTS-searchable, so `resolve_identifier`'s verbatim-text
+        // tier can narrow to it (`seed_chunk_text` alone populates only `chunk_text`).
+        c.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", rusqlite::params![
+            chunk_id, text
+        ])
+        .unwrap();
         file_id
     }
 
@@ -992,7 +1470,7 @@ mod tests {
 
     #[test]
     fn checked_inputs_hash_folds_child_files_of_a_directory_binding() {
-        // Regression (PR #428 Codex P2): a `--dir` binding stores a directory in
+        // Regression (PR #428): a `--dir` binding stores a directory in
         // repo_memory_bindings.path that never equals a files.path, so the inputs hash must fold in
         // the directory's CHILD files — else it stays the empty sentinel and a dir-scoped memory
         // churn-skips with a stale verdict as its files change.
@@ -1032,7 +1510,7 @@ mod tests {
 
     #[test]
     fn checked_inputs_hash_folds_all_files_for_a_repo_root_binding() {
-        // Regression (PR #428 Codex P2): a `--dir .` binding normalizes to an empty path, which
+        // Regression (PR #428): a `--dir .` binding normalizes to an empty path, which
         // matches no `files.path` under the file-or-child pattern — it must instead fold in EVERY
         // indexed file (a root-scoped note is invalidated by any repo change).
         let c = mem_db();
@@ -1066,7 +1544,7 @@ mod tests {
 
     #[test]
     fn directory_binding_does_not_fold_a_like_wildcard_sibling() {
-        // Regression (PR #428 Codex P2): a bound dir path with a SQLite LIKE wildcard (`_`) must be
+        // Regression (PR #428): a bound dir path with a SQLite LIKE wildcard (`_`) must be
         // escaped, or `src/foo_bar` also matches an unrelated `src/fooXbar/…`, folding a sibling's
         // files into this memory's hash.
         let c = mem_db();
@@ -1099,7 +1577,7 @@ mod tests {
 
     #[test]
     fn checked_inputs_hash_reflects_the_bound_path_not_just_content() {
-        // Regression (PR #428 Codex P2): hashing only unique shas is blind to a rebind that keeps
+        // Regression (PR #428): hashing only unique shas is blind to a rebind that keeps
         // identical content — the (path, sha) multiset must change when the bound path changes.
         let c = mem_db();
         set_repo(&c, "r");
@@ -1134,7 +1612,7 @@ mod tests {
 
     #[test]
     fn checked_inputs_hash_tracks_identifier_resolution_with_no_bound_file() {
-        // Regression (PR #428 Codex P2): the churn key must fingerprint the WHOLE evidence pack,
+        // Regression (PR #428): the churn key must fingerprint the WHOLE evidence pack,
         // not just bound files. A memory with no binding whose identifier flips from
         // NOT_FOUND to a real symbol (the index gained it) must change hash, so an
         // all-NOT_FOUND uncitable memory re-queues once the code adds the symbol.
@@ -1159,7 +1637,7 @@ mod tests {
 
     #[test]
     fn evidence_pack_excerpts_respect_the_line_cap_across_a_merged_window() {
-        // Regression (PR #428 Codex P2): `identifier_windows` merges adjacent hits into ONE range,
+        // Regression (PR #428): `identifier_windows` merges adjacent hits into ONE range,
         // so an identifier repeated on hundreds of lines yields a single huge window. The
         // cap must be enforced per-append (clamping the range), not only checked before it,
         // or one push blows past MAX_EXCERPT_LINES and overflows the model prompt.
@@ -1184,7 +1662,7 @@ mod tests {
 
     #[test]
     fn a_memory_whose_identifiers_all_resolve_nowhere_is_not_citable() {
-        // Regression (PR #428 Codex P2): a note whose every identifier resolves to NOT_FOUND and
+        // Regression (PR #428): a note whose every identifier resolves to NOT_FOUND and
         // has no bound-file excerpts is the pass-0 unverifiable case and must NOT be
         // citable, or the model would be asked and could open a divergence citing the
         // NOT_FOUND rows.
@@ -1202,7 +1680,7 @@ mod tests {
 
     #[test]
     fn queue_records_a_terminal_row_for_an_uncitable_memory_so_it_stops_re_queuing() {
-        // Regression (PR #428 Codex P2): a prose-only memory with no identifiers / excerpts yields
+        // Regression (PR #428): a prose-only memory with no identifiers / excerpts yields
         // an uncitable pack; the verdict pass must record a terminal (verdict-less) row so
         // it churn-skips instead of consuming a budget slot forever.
         use super::super::model::mock::MockVerdictModel;
@@ -1236,7 +1714,7 @@ mod tests {
 
     #[test]
     fn queue_re_enqueues_when_the_verdict_prompt_version_changes() {
-        // Regression (PR #428 Codex P2): a stored verdict from an older PROMPT_VERSION is not
+        // Regression (PR #428): a stored verdict from an older PROMPT_VERSION is not
         // comparable, so an unchanged memory must re-queue on a prompt bump instead of skipping.
         let c = mem_db();
         set_repo(&c, "r");
@@ -1346,7 +1824,7 @@ mod tests {
 
     #[test]
     fn queue_re_enqueues_on_title_only_edit() {
-        // Regression (PR #428 Codex P2): the verdict prompt audits TITLE + body, so the
+        // Regression (PR #428): the verdict prompt audits TITLE + body, so the
         // content_hash covers the title — a title-only edit must re-queue even when the
         // body is unchanged.
         let c = mem_db();
@@ -1378,7 +1856,7 @@ mod tests {
 
     #[test]
     fn resolve_bound_files_is_path_sorted_not_rowid_order() {
-        // Regression (PR #428 Codex P2): the excerpt-budget cap consumes files in THIS order, so it
+        // Regression (PR #428): the excerpt-budget cap consumes files in THIS order, so it
         // must be path-sorted (deterministic across reindex), not the volatile `files.id` rowid
         // order the expansion query returns.
         let c = mem_db();
@@ -1405,7 +1883,7 @@ mod tests {
 
     #[test]
     fn resolve_symbol_returns_all_same_named_matches_as_ambiguous() {
-        // Regression (PR #428 Codex P2): a common bare name must surface as AMBIGUOUS (all
+        // Regression (PR #428): a common bare name must surface as AMBIGUOUS (all
         // matches), not silently pinned to the first path-ordered definition — else the
         // model audits against, and the churn key pins to, an unrelated namesake.
         let c = mem_db();
@@ -1422,20 +1900,21 @@ mod tests {
         };
         mk("src/b.rs");
         mk("src/a.rs");
-        let locs = resolve_symbol(&c, "shared_name").unwrap();
+        let locs = resolve_symbol(&c, "shared_name", None).unwrap();
         assert_eq!(
             locs,
             vec!["src/a.rs::shared_name", "src/b.rs::shared_name"],
             "all, path-sorted"
         );
         let files = indexed_file_paths(&c).unwrap();
-        let res = resolve_identifier(&c, "shared_name", &files).unwrap();
+        let (res, kind) = resolve_identifier(&c, "shared_name", &files).unwrap();
         assert!(res.starts_with("symbols (2):"), "renders ambiguous: {res}");
+        assert_eq!(kind, ResolutionKind::Symbol);
     }
 
     #[test]
     fn resolve_file_segment_returns_all_same_suffix_matches_as_ambiguous() {
-        // Regression (PR #428 Codex P2): a shorthand path (`lib.rs`) suffix-matching more than one
+        // Regression (PR #428): a shorthand path (`lib.rs`) suffix-matching more than one
         // indexed file must surface as AMBIGUOUS, not pinned to the first — same class as ambiguous
         // symbols, so deleting the file the note meant re-verifies even when a same-suffix file
         // survives.
@@ -1445,12 +1924,616 @@ mod tests {
         seed_file(&c, "crates/b/lib.rs", "fn f() {}\n", "r");
         seed_file(&c, "crates/a/lib.rs", "fn f() {}\n", "r");
         let files = indexed_file_paths(&c).unwrap();
-        let res = resolve_identifier(&c, "lib.rs", &files).unwrap();
+        let (res, kind) = resolve_identifier(&c, "lib.rs", &files).unwrap();
         assert!(res.starts_with("files (2):"), "renders ambiguous: {res}");
         assert!(
             res.contains("crates/a/lib.rs") && res.contains("crates/b/lib.rs"),
             "lists both matches: {res}"
         );
+        assert_eq!(kind, ResolutionKind::File);
+    }
+
+    #[test]
+    fn resolve_identifier_ladder_classifies_symbol_file_text_absent_and_unresolvable() {
+        // The divergence-false-positive fix: a span that is present in source as a NON-symbol (a DB
+        // table name, a local var) resolves to `TextPresent`, NOT the authoritative NOT_FOUND that
+        // the model over-read as divergence; a non-code-shaped span that matches nothing is
+        // `Unresolvable` (uninformative), never NOT_FOUND; only a name-shaped genuine absence keeps
+        // NOT_FOUND.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let fid = seed_file(
+            &c,
+            "src/db.rs",
+            "fn real_fn() {\n    let local_root_named = 1;\n    conn.execute(\"CREATE TABLE \
+             commit_fts(x)\");\n}\n",
+            "r",
+        );
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','real_fn','function',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        let files = indexed_file_paths(&c).unwrap();
+        let resolve = |id: &str| resolve_identifier(&c, id, &files).unwrap();
+
+        assert_eq!(resolve("real_fn").1, ResolutionKind::Symbol, "1: a defined symbol");
+        // A BARE call to a defined function arg-strips to its name and resolves as a Symbol — NOT a
+        // false Absent / mislabeled TextPresent.
+        assert_eq!(resolve("real_fn(&db, 1)").1, ResolutionKind::Symbol, "1b: a bare call");
+        assert_eq!(resolve("src/db.rs").1, ResolutionKind::File, "2: an indexed file");
+
+        // 3: a DB table name and a local variable — present as literal text, not defined symbols.
+        // The resolution is file-INDEPENDENT (names no files) so the pack/churn key stay stable.
+        let (res, kind) = resolve("commit_fts");
+        assert_eq!(kind, ResolutionKind::TextPresent, "table name in DDL text: {res}");
+        assert!(res.contains("appears verbatim"), "labeled present-but-not-a-symbol: {res}");
+        assert_eq!(resolve("local_root_named").1, ResolutionKind::TextPresent, "a local variable");
+
+        // 4a: a name-shaped identifier that exists nowhere → the genuine divergence signal.
+        let (res, kind) = resolve("no_such_symbol_anywhere");
+        assert_eq!(kind, ResolutionKind::Absent);
+        assert_eq!(res, NOT_FOUND);
+
+        // 4b: an attribute span, absent from text and not name-shaped → uninformative, NOT
+        // NOT_FOUND.
+        let (res, kind) = resolve("#[cfg(never_seen_flag)]");
+        assert_eq!(kind, ResolutionKind::Unresolvable, "attribute span: {res}");
+        assert_ne!(res, NOT_FOUND);
+    }
+
+    #[test]
+    fn resolve_identifier_never_masks_a_deleted_qualified_method_via_a_namesake() {
+        // A qualified call is NOT resolved by bare method name (which would match an unrelated
+        // NAMESAKE and hide the method's deletion). A PRESENT qualified call resolves through the
+        // verbatim-text tier on its arg-stripped NAME. A qualified call is NEVER ruled Absent (a
+        // dot-called / external / paraphrased method is too ambiguous to convict) — an absent one
+        // is Unresolvable, so it can't false-diverge.
+        let c = mem_db();
+        set_repo(&c, "r");
+        // `from_config` exists as a bare free function (the potential namesake), and the qualified
+        // `Present::from_config` appears verbatim in source; `Gone::from_config` does not.
+        let fid = seed_file(
+            &c,
+            "src/m.rs",
+            "fn from_config() {}\nlet x = Present::from_config(&cfg);\n",
+            "r",
+        );
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','from_config','function',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        let files = indexed_file_paths(&c).unwrap();
+
+        // Present qualified call → verbatim text of the qualified NAME (args paraphrased away).
+        let (res, kind) =
+            resolve_identifier(&c, "Present::from_config(&config.dream.model)", &files).unwrap();
+        assert_eq!(kind, ResolutionKind::TextPresent, "present qualified call resolves: {res}");
+
+        // A qualified call whose qualified NAME is not written verbatim is NEVER false-Absented,
+        // whether its bare method survives elsewhere (`Elsewhere::from_config` — `from_config` is a
+        // symbol) or vanished entirely (`Gone::vanished_method_xyz`): both are Unresolvable, so a
+        // dot-called / external / paraphrased qualified reference can't produce a false divergence.
+        // This drops the speculative deleted-qualified-method true-positive to kill a common false
+        // positive.
+        for call in ["Elsewhere::from_config(x)", "Gone::vanished_method_xyz(y)"] {
+            let (res, kind) = resolve_identifier(&c, call, &files).unwrap();
+            assert_eq!(kind, ResolutionKind::Unresolvable, "{call} is not a false absence: {res}");
+        }
+    }
+
+    #[test]
+    fn resolver_is_language_neutral_and_never_false_absents_dotted_references() {
+        // The resolver must not be Rust-centric in a way that manufactures false divergences for
+        // other languages. `::`-qualified handling is Rust/C++-specific, but a `.`-qualified
+        // reference (TS/Kotlin/Python/Java `Class.method`, `module.func`) is NEVER ruled Absent:
+        // present → verbatim TextPresent, absent → Unresolvable. Bare names (any language,
+        // camelCase included) still resolve as Symbol / Absent correctly. So no language
+        // gets a false divergence; the only cross-language gap is precision (a
+        // `.`-qualified name isn't resolved to a Symbol), which costs at most a missed
+        // divergence — the safe direction.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let fid = seed_file(
+            &c,
+            "src/svc.ts",
+            "class UserService { getUserById(id) { return this.repo.findById(id); } }\n",
+            "r",
+        );
+        // A camelCase symbol (as any indexed language yields) resolves by bare name.
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'typescript','getUserById','method',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        let files = indexed_file_paths(&c).unwrap();
+        let kind = |id: &str| resolve_identifier(&c, id, &files).unwrap().1;
+
+        assert_eq!(kind("getUserById"), ResolutionKind::Symbol, "camelCase symbol resolves");
+        assert_eq!(kind("getUserDeleted"), ResolutionKind::Absent, "a gone bare name is absent");
+        // `.`-qualified references: present verbatim → TextPresent; absent → Unresolvable. NEVER
+        // Absent — the FP-averse guarantee holds for non-`::` languages.
+        assert_eq!(
+            kind("UserService.getUserById(id)"),
+            ResolutionKind::Unresolvable,
+            "a dotted method call is never a false absence"
+        );
+        assert_eq!(
+            kind("this.repo.findById"),
+            ResolutionKind::TextPresent,
+            "a dotted reference present verbatim is text-present, not absent"
+        );
+    }
+
+    #[test]
+    fn text_presence_is_sound_past_the_rank_cap() {
+        // Soundness regression: the old AND-of-tokens + `LIMIT 256` narrowing was UNSOUND — the
+        // chunk that literally contains the identifier could rank below the cap among many
+        // token-co-occurring chunks (empirically `clone_edges`: 1025 AND-matches ≫ 256) and
+        // be dropped → a false `Absent` → a false `memory_divergence` on the very token
+        // class the fix targets. The phrase narrowing + scan guard must find the verbatim
+        // chunk even when it ranks last behind a flood of higher-ranked phrase-matches that
+        // do NOT contain it.
+        let c = mem_db();
+        set_repo(&c, "r");
+        // 300 decoys that phrase-match `"poison token"` twice each (higher bm25) but never contain
+        // the underscored identifier; one chunk with the verbatim `poison_token`, ranked last.
+        for i in 0..300 {
+            seed_file(&c, &format!("src/decoy_{i}.rs"), "poison token poison token\n", "r");
+        }
+        seed_file(&c, "src/real.rs", "let poison_token = 1;\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "poison_token", &files).unwrap();
+        assert_eq!(
+            kind,
+            ResolutionKind::TextPresent,
+            "found the verbatim chunk past the 256 cap: {res}"
+        );
+    }
+
+    #[test]
+    fn checked_inputs_hash_is_stable_against_unrelated_text_presence_churn() {
+        // Churn-stability regression: the churn hash must NOT fold the TextPresent path
+        // enumeration, or adding an UNRELATED file that happens to carry a cited common
+        // token re-keys the memory and re-runs the paid verdict for no reason. A
+        // `TextPresent` token contributes a KIND marker only.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/a.rs", "let commit_fts_seen = 1;\n", "r");
+        seed_memory(&c, "m1", "t", "note about the `commit_fts_seen` local", "r");
+        let before = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        // Another file carrying the same token — unrelated to this memory. Hash must not move.
+        seed_file(&c, "src/b.rs", "let commit_fts_seen = 2;\n", "r");
+        let after = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        assert_eq!(before, after, "unrelated text-presence file must not re-key the churn hash");
+    }
+
+    #[test]
+    fn dotted_field_access_is_unresolvable_not_a_false_file_absence() {
+        // Regression: field access reads as NOT a file — interior dots
+        // (`config.dream.model`) OR a single dot whose extension no indexed file uses
+        // (`DreamOptions.verify` — `.verify` is not a source extension) → `Unresolvable`, never
+        // `Absent`/NOT_FOUND (a false divergence). A single-extension filename whose extension IS
+        // indexed (`.rs`) stays code-shaped, so a genuinely gone one is a real absence.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/only.rs", "fn f() {}\n", "r"); // an indexed `.rs`; nothing else below
+        let files = indexed_file_paths(&c).unwrap();
+        assert_eq!(
+            resolve_identifier(&c, "config.dream.model", &files).unwrap().1,
+            ResolutionKind::Unresolvable,
+            "interior-dot field access is not a file"
+        );
+        assert_eq!(
+            resolve_identifier(&c, "DreamOptions.verify", &files).unwrap().1,
+            ResolutionKind::Unresolvable,
+            "single-dot field access with a non-source extension is not a file"
+        );
+        assert_eq!(
+            resolve_identifier(&c, "deleted_module.rs", &files).unwrap().1,
+            ResolutionKind::Absent,
+            "a bare filename with an indexed extension is a genuine file absence"
+        );
+    }
+
+    #[test]
+    fn deleted_bare_call_is_a_genuine_absence_not_unresolvable() {
+        // A note citing a function in CALL form whose function was REMOVED must surface the
+        // genuine-absence signal (the deleted-function / note-ahead case), not be silently dropped
+        // as Unresolvable. The arg-stripped bare name is name-shaped, so its whole-tree absence is
+        // a divergence signal — consistent with tiers 1 and 3, which both arg-strip a bare
+        // call. The text tier still diverts a PRESENT expression head (`Ok(None)`) to
+        // TextPresent first, so this does not reintroduce a false NOT_FOUND on illustrative
+        // expressions.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/x.rs", "fn other() {}\n", "r"); // does not mention `new_helper` at all
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "new_helper()", &files).unwrap();
+        assert_eq!(kind, ResolutionKind::Absent, "a removed bare call is a genuine absence: {res}");
+        assert_eq!(res, NOT_FOUND);
+        assert_eq!(
+            resolve_identifier(&c, "build_index(cfg)", &files).unwrap().1,
+            ResolutionKind::Absent,
+            "a removed bare call carrying args is still a genuine absence"
+        );
+        // GUARD: an enum-constructor / expression whose head is PRESENT as text stays TextPresent
+        // (the text tier resolves it before the terminal), so bare-call absence does not
+        // manufacture a false NOT_FOUND on an illustrative expression.
+        seed_file(&c, "src/y.rs", "let v = Ok(None);\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        assert_eq!(
+            resolve_identifier(&c, "Ok(None)", &files).unwrap().1,
+            ResolutionKind::TextPresent,
+            "a present expression head is text-present, not a false absence"
+        );
+    }
+
+    #[test]
+    fn renamed_identifier_superstring_does_not_mask_absence() {
+        // Token-boundary soundness: when a NON-symbol identifier was renamed to a longer token
+        // (`commit_fts` -> `commit_fts_v2`), the old name survives only as a SUBSTRING of the new
+        // one. A raw substring match would mask the rename as TextPresent and suppress the absence
+        // signal; the verbatim probe must confirm the match at token boundaries, so the gone name
+        // resolves as a genuine absence while the renamed-TO token is still found.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/db.rs", "let commit_fts_v2 = open();\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "commit_fts", &files).unwrap();
+        assert_eq!(kind, ResolutionKind::Absent, "a rename to a superstring is not masked: {res}");
+        assert_eq!(res, NOT_FOUND);
+        assert_eq!(
+            resolve_identifier(&c, "commit_fts_v2", &files).unwrap().1,
+            ResolutionKind::TextPresent,
+            "the bounded token itself is still found (boundaries don't reject real matches)"
+        );
+    }
+
+    #[test]
+    fn deleted_file_present_only_as_text_gets_a_file_specific_label() {
+        // A path-shaped span that is NOT an indexed file but appears verbatim (in a comment/string)
+        // must carry a FILE-specific text-present label, so a memory claiming the file exists can
+        // still diverge — the symbol-oriented label only contradicts SYMBOL claims. Symmetry with
+        // the "not a defined symbol" case for names.
+        let c = mem_db();
+        set_repo(&c, "r");
+        // An indexed `.md` file establishes `.md` as a COVERED extension (so a `.md` miss is
+        // index-authoritative); a comment mentions a DELETED `.md` file verbatim.
+        seed_file(&c, "docs/current.md", "# current docs\n", "r");
+        seed_file(&c, "src/note.rs", "// see docs/old.md for the legacy format\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "docs/old.md", &files).unwrap();
+        assert_eq!(kind, ResolutionKind::TextPresent, "present as text: {res}");
+        assert!(res.contains("not an indexed file"), "file-specific label: {res}");
+        // A NON-path present token still gets the symbol-oriented label.
+        seed_file(&c, "src/t.rs", "let commit_fts = 1;\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, _) = resolve_identifier(&c, "commit_fts", &files).unwrap();
+        assert!(res.contains("not a defined symbol"), "a name keeps the symbol label: {res}");
+    }
+
+    #[test]
+    fn scoped_package_path_with_at_sign_is_recognized_as_a_path() {
+        // A scoped package directory (`@scope/`) uses `@`, a valid path char — a deleted but
+        // index-covered `.ts` file under it is a genuine file absence, not Unresolvable.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "packages/@scope/app/src/index.ts", "export const x = 1;\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        assert_eq!(
+            resolve_identifier(&c, "packages/@scope/app/src/gone.ts", &files).unwrap().1,
+            ResolutionKind::Absent,
+            "a deleted scoped-package path is a genuine file absence"
+        );
+    }
+
+    #[test]
+    fn unindexed_path_reference_is_unresolvable_not_a_false_absence() {
+        // A tier-2 file MISS is a genuine absence only where the index has AUTHORITY over the path:
+        // a path whose extension no indexed file uses (`.yml` when only `.rs`/`.md` are indexed), a
+        // DIRECTORY path (no file extension), or an out-of-root path is a coverage artifact — the
+        // file may well exist on disk, just outside the index — so its miss is Unresolvable, never
+        // the NOT_FOUND that reads as a genuine deletion / divergence.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "crates/x/src/lib.rs", "fn f() {}\n", "r"); // `.rs` indexed
+        seed_file(&c, "docs/guide.md", "# guide\n", "r"); // `.md` indexed (for the field-access case)
+        let files = indexed_file_paths(&c).unwrap();
+        for p in [
+            ".github/workflows/release.yml", // unindexed extension, out of root
+            "crates/x/src/oplog/",           // a directory (trailing slash, no file extension)
+            "crates/x/src/oplog",            // a directory (no file extension)
+            "/workspace/rag-rat.toml",       // out-of-root, unindexed extension
+            "config.docs.md",                /* a bare MULTI-DOT dotted ref (field access), not
+                                              * a file */
+        ] {
+            let (res, kind) = resolve_identifier(&c, p, &files).unwrap();
+            assert_eq!(
+                kind,
+                ResolutionKind::Unresolvable,
+                "{p} is not a false file absence: {res}"
+            );
+            assert_ne!(res, NOT_FOUND);
+        }
+        // CONTRAST: paths with an INDEXED extension that are genuinely gone stay real absences,
+        // including a slashed MULTI-DOT filename — the slash disambiguates a path from the bare
+        // multi-dot field access above.
+        for gone in ["crates/x/src/deleted.rs", "crates/x/src/schema.test.rs", "gone_module.rs"] {
+            assert_eq!(
+                resolve_identifier(&c, gone, &files).unwrap().1,
+                ResolutionKind::Absent,
+                "a gone path with an indexed extension is still a genuine file absence: {gone}"
+            );
+        }
+    }
+
+    #[test]
+    fn turbofish_generic_call_resolves_by_callee_name_not_its_generic_args() {
+        // A Rust turbofish (`build_index::<Cfg>(cfg)`) must resolve by its CALLEE name — its
+        // `::<...>` is a generic-argument marker, not a qualified-path separator. A present
+        // one resolves to its symbol; a removed one is a genuine absence (NOT_FOUND), not
+        // hidden as Unresolvable.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let fid = seed_file(&c, "src/x.rs", "fn build_index() {}\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','build_index','function',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        let files = indexed_file_paths(&c).unwrap();
+        assert_eq!(
+            resolve_identifier(&c, "build_index::<Cfg>(cfg)", &files).unwrap().1,
+            ResolutionKind::Symbol,
+            "a present generic call resolves to its callee symbol"
+        );
+        assert_eq!(
+            resolve_identifier(&c, "gone_index::<Cfg>(cfg)", &files).unwrap(),
+            (NOT_FOUND.to_string(), ResolutionKind::Absent),
+            "a removed generic call is a genuine absence, not hidden"
+        );
+        // A turbofish argument carrying a `->` (fn-pointer return type) or a const-generic
+        // comparison (`{ N > 0 }`) must not have its inner `>` read as the end of the generic list.
+        for gone in ["gone_index::<fn() -> u8>(x)", "gone_index::<{ N > 0 }>()"] {
+            assert_eq!(
+                resolve_identifier(&c, gone, &files).unwrap(),
+                (NOT_FOUND.to_string(), ResolutionKind::Absent),
+                "a turbofish arg with `->`/const-generic `>` is stripped cleanly: {gone}"
+            );
+        }
+        // A PRESENT bare turbofish call whose callee appears with different args/generics must not
+        // be a false absence — the normalized callee `from_str` is found by its contiguous
+        // name.
+        seed_file(&c, "src/y.rs", "let v = from_str::<Real>(&body);\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        assert_ne!(
+            resolve_identifier(&c, "from_str::<Cfg>(payload)", &files).unwrap().1,
+            ResolutionKind::Absent,
+            "a present bare turbofish callee (different args) is not a false absence"
+        );
+    }
+
+    #[test]
+    fn qualified_macros_are_conservative_never_a_false_absence() {
+        // A `::`-qualified macro can't be disambiguated from an external / imported / moved /
+        // namesake macro (the index tracks macros by BARE name only), so it stays CONSERVATIVE
+        // (Unresolvable), never NOT_FOUND: a live `tracing::info!()` must not be falsely marked
+        // absent, a possibly-removed `crate::gone_macro!()` is uninformative rather than a
+        // fabricated divergence, and `old_mod::foo!` is not silently masked by an unrelated
+        // same-named macro.
+        let c = mem_db();
+        set_repo(&c, "r");
+        // The macro is external: the source imports and invokes it BARE (`info!`), with no local
+        // macro symbol and no verbatim `tracing::info!` spelling.
+        seed_file(&c, "src/x.rs", "use tracing::info;\nfn f() { info!(\"hi\"); }\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        for cited in
+            ["tracing::info!()", "crate::gone_macro!(x)", "crate::gone_macro![x]", "old_mod::foo!"]
+        {
+            assert_eq!(
+                resolve_identifier(&c, cited, &files).unwrap().1,
+                ResolutionKind::Unresolvable,
+                "a qualified macro is conservative, never a false absence: {cited}"
+            );
+        }
+    }
+
+    #[test]
+    fn present_qualified_turbofish_call_is_text_present_not_hidden() {
+        // A PRESENT qualified turbofish call must stay citable. The source carries the generic args
+        // verbatim, so the TEXT tier probes the ORIGINAL span — a normalized `HashMap::new` is NOT
+        // contiguous in `HashMap::<T>::new()` and would falsely miss (Unresolvable/uncitable).
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/x.rs", "let m = HashMap::<String, Vec<u8>>::new();\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        assert_eq!(
+            resolve_identifier(&c, "HashMap::<String, Vec<u8>>::new()", &files).unwrap().1,
+            ResolutionKind::TextPresent,
+            "a present qualified turbofish call is found verbatim, not hidden"
+        );
+    }
+
+    #[test]
+    fn removed_macro_invocation_is_a_genuine_absence() {
+        // A macro is a named code entity: a removed `my_macro!` / `my_macro!(x)` must surface
+        // NOT_FOUND, not be hidden as Unresolvable because of the `!`. A present one resolves.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let fid = seed_file(&c, "src/x.rs", "macro_rules! live_macro { () => {}; }\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','live_macro','macro',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        let files = indexed_file_paths(&c).unwrap();
+        assert_eq!(
+            resolve_identifier(&c, "live_macro!", &files).unwrap().1,
+            ResolutionKind::Symbol,
+            "a present macro resolves to its symbol"
+        );
+        for gone in ["gone_macro!", "gone_macro!(x)"] {
+            assert_eq!(
+                resolve_identifier(&c, gone, &files).unwrap(),
+                (NOT_FOUND.to_string(), ResolutionKind::Absent),
+                "a removed macro invocation is a genuine absence: {gone}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_macro_is_not_masked_by_a_same_named_non_macro_symbol() {
+        // A removed macro `gone_macro!` with a surviving same-named NON-macro (`fn gone_macro`)
+        // must surface as a genuine absence, not be masked: the symbol lookup is
+        // macro-kind-constrained (no false Symbol), and the text probe searches the
+        // INVOCATION form `gone_macro!` (with the bang), which the bare `fn gone_macro`
+        // does not satisfy — so it resolves NOT_FOUND.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let fid = seed_file(&c, "src/x.rs", "fn gone_macro() {}\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','gone_macro','function',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        let files = indexed_file_paths(&c).unwrap();
+        assert_eq!(
+            resolve_identifier(&c, "gone_macro!", &files).unwrap(),
+            (NOT_FOUND.to_string(), ResolutionKind::Absent),
+            "a removed macro surfaces as absent, not masked by a non-macro namesake"
+        );
+    }
+
+    #[test]
+    fn macro_invocations_with_bracket_or_brace_delimiters_resolve() {
+        // Rust macros invoke with `()`, `[]`, or `{}` delimiters. A present `live_vec![x]` resolves
+        // to its macro symbol; a removed `gone_vec![x]` / `gone_tl! { .. }` surfaces NOT_FOUND
+        // rather than falling through as Unresolvable.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let fid = seed_file(&c, "src/x.rs", "macro_rules! live_vec { () => {}; }\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','live_vec','macro',0,0)",
+            rusqlite::params![fid],
+        )
+        .unwrap();
+        let files = indexed_file_paths(&c).unwrap();
+        assert_eq!(
+            resolve_identifier(&c, "live_vec![x]", &files).unwrap().1,
+            ResolutionKind::Symbol,
+            "a present macro invoked with [] resolves to its symbol"
+        );
+        for gone in ["gone_vec![x]", "gone_tl! { a }"] {
+            assert_eq!(
+                resolve_identifier(&c, gone, &files).unwrap(),
+                (NOT_FOUND.to_string(), ResolutionKind::Absent),
+                "a removed bracket/brace macro is a genuine absence: {gone}"
+            );
+        }
+    }
+
+    #[test]
+    fn present_invoked_macro_without_a_symbol_is_text_present() {
+        // A macro invoked in source but not indexed as a symbol (an external macro) resolves via
+        // its INVOCATION form in text — present, not a false absence.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/x.rs", "fn f() { ext_macro!(1); }\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        assert_eq!(
+            resolve_identifier(&c, "ext_macro!", &files).unwrap().1,
+            ResolutionKind::TextPresent,
+            "a present invoked macro is found via its invocation form"
+        );
+    }
+
+    #[test]
+    fn flag_prefix_rename_is_not_masked_as_verbatim_presence() {
+        // A cited CLI flag whose only source occurrence is a LONGER flag (`--config` vs
+        // `--config-file`) must NOT be reported present — `-` is a token char for a flag needle, so
+        // the prefix is not a boundary match. The exact longer flag itself is still found.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/cli.rs", "let f = value_of(\"--config-file\");\n", "r");
+        let files = indexed_file_paths(&c).unwrap();
+        let (res, kind) = resolve_identifier(&c, "--config", &files).unwrap();
+        assert_ne!(
+            kind,
+            ResolutionKind::TextPresent,
+            "a flag prefix must not be masked as verbatim presence: {res}"
+        );
+        assert_eq!(
+            resolve_identifier(&c, "--config-file", &files).unwrap().1,
+            ResolutionKind::TextPresent,
+            "the exact flag is present at a boundary"
+        );
+    }
+
+    #[test]
+    fn is_citable_requires_presence_evidence_not_bare_absence_or_unresolvable() {
+        let id = |kind| IdentifierResolution {
+            identifier: "i".to_string(),
+            resolution: "r".to_string(),
+            kind,
+        };
+        let pack = |ids: Vec<IdentifierResolution>| EvidencePack {
+            memory_id: "m".to_string(),
+            identifiers: ids,
+            excerpts: Vec::new(),
+        };
+        assert!(
+            !pack(vec![id(ResolutionKind::Absent), id(ResolutionKind::Unresolvable)]).is_citable(),
+            "a pack of only genuine-absence + uninformative rows carries no evidence — uncitable"
+        );
+        assert!(
+            pack(vec![id(ResolutionKind::Absent), id(ResolutionKind::TextPresent)]).is_citable(),
+            "verbatim-text presence is citable evidence"
+        );
+        assert!(pack(vec![id(ResolutionKind::Symbol)]).is_citable(), "a symbol is citable");
+    }
+
+    #[test]
+    fn a_note_citing_a_present_table_name_is_not_unverifiable() {
+        // The `memory_unverifiable` gate now counts verbatim-text presence as "resolves", so a
+        // binding-less note that names a real DB table (present only as source text) is NOT flagged
+        // unverifiable — while a note whose only identifier is genuinely absent still is.
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/schema.rs", "conn.execute(\"CREATE TABLE commit_fts(id)\");\n", "r");
+        seed_memory(&c, "present", "t", "the `commit_fts` table stores the FTS mirror", "r");
+        seed_memory(&c, "absent", "t", "the `no_such_table_at_all` thing", "r");
+        let flagged: Vec<String> =
+            unverifiable_findings(&c).unwrap().into_iter().map(|f| f.subject).collect();
+        assert!(
+            !flagged.contains(&"present".to_string()),
+            "text-present note resolves: {flagged:?}"
+        );
+        assert!(
+            flagged.contains(&"absent".to_string()),
+            "absent-only note is unverifiable: {flagged:?}"
+        );
+    }
+
+    #[test]
+    fn checked_inputs_hash_flips_when_a_name_gains_verbatim_text_presence() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "t", "note about the `commit_fts` table", "r");
+        let before = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        // The name now appears as source text → its resolution flips NOT_FOUND → verbatim-text,
+        // which the churn key must reflect so a re-verification is queued.
+        seed_file(&c, "src/schema.rs", "conn.execute(\"CREATE TABLE commit_fts(id)\");\n", "r");
+        let after = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        assert_ne!(before, after, "the resolution-tier flip re-keys the churn hash");
     }
 
     #[test]

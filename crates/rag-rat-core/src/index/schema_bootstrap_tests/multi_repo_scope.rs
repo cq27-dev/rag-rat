@@ -683,7 +683,7 @@ fn orientation_pins_the_fork_repo_over_a_shared_root_sibling() {
     );
 
     // WITHOUT the override: the identity route derives the shared-root UPSTREAM id, but this root
-    // is RECORDED under the fork's pin — the read-only owner mirror (Codex batch 4) now DECLINES
+    // is RECORDED under the fork's pin — the read-only owner mirror (batch 4) now DECLINES
     // instead of serving the sibling's scope, installing the deliberate empty "match nothing"
     // scope. That matches the write path, which refuses this exact shape with the
     // mismatched-root-owner remedy. (Pre-mirror, this phase pinned the sibling BIND as the
@@ -1537,6 +1537,14 @@ fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
         .unwrap();
         let chunk_id = conn.last_insert_rowid();
         crate::index::chunk_text_store::seed_chunk_text(&conn, chunk_id, chunk_text).unwrap();
+        // Make the chunk FTS-searchable too, so `resolve_identifier`'s verbatim-text tier can be
+        // driven — and, for the sibling, PROVE that tier is repo-scoped: the sibling's chunk is in
+        // the GLOBAL chunk_fts, so only the scoped `files` join keeps its text out of repo A's
+        // pack.
+        conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", rusqlite::params![
+            chunk_id, chunk_text
+        ])
+        .unwrap();
     };
     // Repo A: shared symbol `target_symbol`, chunk carries a repo-A marker.
     seed(A5_REPO_A, "target_symbol", "fn target_symbol() { REPO_A_MARKER }");
@@ -1585,8 +1593,10 @@ fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
     assert_eq!(
         resolution("sibling_only_symbol"),
         Some("NOT FOUND anywhere in the source tree"),
-        "a symbol that exists ONLY in the sibling repo must NOT resolve — the resolution is \
-         repo-scoped through the files view",
+        "a name that exists ONLY in the sibling repo must NOT resolve — as a symbol OR as \
+         verbatim text (its chunk IS in the global chunk_fts): every resolver tier is repo-scoped \
+         through the files view, so the miss is the authoritative NOT FOUND, not a sibling \
+         text-presence",
     );
     let excerpt_text: String = pack.excerpts.iter().map(|e| e.text.as_str()).collect();
     assert!(excerpt_text.contains("REPO_A_MARKER"), "the excerpt is the active repo's file text");
@@ -1798,7 +1808,7 @@ fn memory_summary_readers_exclude_a_sibling_repos_memory() {
     let _ = fs::remove_dir_all(fx.root_a);
 }
 
-/// A7 (Codex batch 2 P2): the open-time model-manifest heal must never mutate a SIBLING repo's
+/// A7 (batch 2): the open-time model-manifest heal must never mutate a SIBLING repo's
 /// `repo_meta`. Pre-fix, the incremental pass's low-level open ran `ensure_model_manifest` BEFORE
 /// adoption, so its `active_repo_id` resolved the config-less sole pick — the lexicographically
 /// FIRST repo — and a heal-owed pass (`remove_legacy_models`) DELETED that repo's active-model
@@ -1849,7 +1859,7 @@ fn incremental_open_heal_leaves_a_sibling_repos_model_meta_alone() {
     let _ = fs::remove_dir_all(fx.root_a);
 }
 
-/// A7 (Codex batch 3, same class as the incremental finding — the CALLEE now enforces it): a
+/// A7 (batch 3, same class as the incremental finding — the CALLEE now enforces it): a
 /// config-less `IndexDatabase::migrate` on a MULTI-REPO DB must not run the model-manifest heal —
 /// its connection has no scope context, so `active_repo_id` would resolve the first-sorting repo
 /// and a heal-owed pass would delete THAT sibling's `repo_meta` model keys. This is exactly the
@@ -1896,7 +1906,7 @@ fn config_less_migrate_on_a_multi_repo_db_leaves_sibling_model_meta_alone() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// A7 (Codex batch 4 — the source_root variant of the pre-adoption-pick family): an
+/// A7 (batch 4 — the source_root variant of the pre-adoption-pick family): an
 /// AdoptionPending open derives `source_root` from the config-less SOLE pick (a first-sorting
 /// SIBLING on a consolidated DB); adoption must RESET it from the config before any deferred heal,
 /// or `ensure_graph_index_current` re-reads changed files from the sibling's checkout while
