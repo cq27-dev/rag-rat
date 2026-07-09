@@ -346,7 +346,22 @@ pub fn produce_scip_with_tool(
         .wait()
         .map_err(|err| anyhow::anyhow!("failed waiting for {}: {err}", manifest.program))?;
     let _ = forwarder.join();
-    let bytes = std::fs::read(scip_output).unwrap_or_default();
+    // A MISSING output is the expected "tool crashed before writing the .scip" case — an empty read
+    // lets `accept_produced_index` bail with the accurate "produced no readable index". Any OTHER
+    // read error (permissions, an unreadable partial file, …) is a real I/O failure that must NOT
+    // be masked by that message, so surface it with context instead of swallowing it to an
+    // empty Vec.
+    let bytes = match std::fs::read(scip_output) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "failed to read {} output at {}: {err}",
+                manifest.program,
+                scip_output.display()
+            ));
+        },
+    };
     if let Some(note) = accept_produced_index(
         status.success(),
         tool.exit_code_reflects_diagnostics(),

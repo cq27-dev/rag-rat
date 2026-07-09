@@ -809,7 +809,7 @@ fn cascading_fks_to_volatile_parents(conn: &rusqlite::Connection) -> Vec<(String
 /// Helper: write four renamed clones (identical structure, different identifiers) across two
 /// directories into `root`, returning the rebuilt index. The four functions form ONE clean,
 /// high-fidelity clone class — the canonical refine fixture.
-fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
+fn write_four_renamed_clones(root: &Path) -> IndexDatabase {
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root.join("a")).unwrap();
     fs::create_dir_all(root.join("b")).unwrap();
