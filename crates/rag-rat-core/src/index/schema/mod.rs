@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 55;
+pub const LATEST_SCHEMA_VERSION: u32 = 56;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -382,6 +382,16 @@ const MIGRATION_055_DESCRIPTION: &str =
      instead of stamping, and only a SECOND consecutive gone observation persists the downgrade — \
      so a single torn observation (a validate racing a rebuild window, or a sweep from a narrower \
      checkout) cannot flip a healthy anchor to gone and hand doctor destructive advice";
+const MIGRATION_056_ID: &str = "056_git_change_couplings";
+const MIGRATION_056_CHECKSUM: &str = "sha256:rag-rat-git-change-couplings-v56";
+const MIGRATION_056_DESCRIPTION: &str =
+    "Add git_change_couplings (#566), the windowed file-pair change-coupling table derived from \
+     git_file_changes: one STRICT symmetric row per unordered pair (path_a < path_b) holding raw \
+     co-change + endpoint counts over a bounded recency window of eligible commits, keyed \
+     (repo_id, path_a, path_b) with a secondary (repo_id, path_b) index. A DerivedIndex table \
+     (repo_id-scoped, no FK to the volatile history rows): wholesale-recomputed lazily on the \
+     impact_surface read path against a repo_meta 'git_coupling_stamp', never patched \
+     incrementally. Fresh + empty on create; the first git-inclusive impact read fills it";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -853,6 +863,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_055_CHECKSUM,
         description: MIGRATION_055_DESCRIPTION,
         apply: apply_binding_downgrade_marker,
+    },
+    Migration {
+        id: MIGRATION_056_ID,
+        checksum: MIGRATION_056_CHECKSUM,
+        description: MIGRATION_056_DESCRIPTION,
+        apply: apply_git_change_couplings,
     },
 ];
 

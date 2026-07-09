@@ -47,6 +47,13 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
     "github_review_comments",
     "github_ref_sync",
     "github_fts",
+    // V056 (#566) derived change-coupling table: standalone, direct `repo_id`, no FK children, so
+    // a LocalOnly→Portable adoption re-points its rows here (moving them together with the
+    // `git_coupling_stamp` repo_meta so the derived table stays consistent + fresh), and the
+    // late-merge path DELETEs the retiring id's rows. Without this the stamp would move but the
+    // rows strand — `ensure_coupling_fresh` would then see a matching stamp and serve an empty
+    // section.
+    "git_change_couplings",
 ];
 
 /// The periphery tables that gain a `repo_id` column in the phase-A5 periphery-scoping migration

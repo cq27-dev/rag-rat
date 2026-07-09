@@ -445,7 +445,9 @@ pub struct ImpactArgs {
     pub limit: u32,
     /// What to include — `tests`, `docs`, `git`, `papertrail`, `text_fallback`, `memories`, ALL on
     /// by default (impact's value is the bundled evidence). Omit to keep them; pass an explicit
-    /// list to narrow, e.g. `["git"]` for git history only.
+    /// list to narrow, e.g. `["git"]` for git history only. `git` bundles both the recent commits
+    /// touching the symbol's file and the files that historically co-changed with it (the windowed
+    /// change-coupling section).
     #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub include: Option<Vec<ImpactInclude>>,
     /// Return full memory bodies + every binding + call paths instead of the default compact,

@@ -1190,6 +1190,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_053_ID => Some(53),
             MIGRATION_054_ID => Some(54),
             MIGRATION_055_ID => Some(55),
+            MIGRATION_056_ID => Some(56),
             _ => None,
         })
         .max()
@@ -1254,6 +1255,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_053_ID
             | MIGRATION_054_ID
             | MIGRATION_055_ID
+            | MIGRATION_056_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1315,6 +1317,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_053_ID => migration.checksum != MIGRATION_053_CHECKSUM,
         MIGRATION_054_ID => migration.checksum != MIGRATION_054_CHECKSUM,
         MIGRATION_055_ID => migration.checksum != MIGRATION_055_CHECKSUM,
+        MIGRATION_056_ID => migration.checksum != MIGRATION_056_CHECKSUM,
         _ => false,
     }
 }
@@ -3694,6 +3697,53 @@ pub(crate) fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result
 pub(crate) fn apply_binding_downgrade_marker(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "repo_memory_bindings", "downgrade_pending_at_ms", "INTEGER")?;
     Ok(())
+}
+
+/// V056 (#566): the windowed file-pair change-coupling table, derived from `git_file_changes` over
+/// a bounded recency window of eligible commits. INVARIANTS:
+///  * PURE GIT-HISTORY table: the stored rows are a function of `(git-history window, params)` ONLY
+///    — no `files`-view dependence (generation / generated flag / worktree scope). This makes the
+///    freshness stamp complete by construction; the generated / existence filter is a READ-time
+///    concern (a generated or absent-at-HEAD partner is stored but not surfaced).
+///  * `path_a < path_b` (BINARY) — exactly ONE symmetric row per unordered pair; the two
+///    directional confidences (`P(B|A)` / `P(A|B)`) are derived at READ time from the endpoint
+///    counts.
+///  * DerivedIndex posture: rows are wholesale `DELETE` + `INSERT`ed per recompute inside one
+///    transaction, stamped via `repo_meta` `'git_coupling_stamp'` (=
+///    `history_freshness_key:params`). Rows are never patched incrementally; a stale/absent stamp
+///    means "recompute or treat as absent", never "trust the rows". No FK to `git_file_changes` /
+///    `git_commits`: the row aggregates over commits and must survive a history full-replace
+///    between recompute passes (the stamp, not row integrity, is the freshness authority).
+///  * WRITE-time storage floors (both pure git-history): `co_change_count >= MIN_COUPLING_SUPPORT`
+///    AND `lift = co * N / (a_count * b_count) >= MIN_COUPLING_LIFT`. The lift floor bounds the
+///    table without a per-file cap — a hub file scores `lift ~= 1` with everything and is dropped
+///    here.
+///  * Direct `repo_id` scope (V040): every reader joins AND filters on `repo_id` — a fork sharing
+///    commit hashes must never surface a sibling repo's couplings. The PK covers `(repo_id,
+///    path_a)` lookups; the secondary index covers `(repo_id, path_b)`, so one `OR` query serves
+///    both directions of the symmetric row.
+///
+/// Additive + idempotent (`CREATE ... IF NOT EXISTS`); a fresh DB creates it empty and the first
+/// git-inclusive `impact_surface` read fills it.
+pub(crate) fn apply_git_change_couplings(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS git_change_couplings(
+            repo_id TEXT NOT NULL,
+            path_a TEXT NOT NULL,
+            path_b TEXT NOT NULL,
+            co_change_count INTEGER NOT NULL,
+            path_a_change_count INTEGER NOT NULL,
+            path_b_change_count INTEGER NOT NULL,
+            window_commit_count INTEGER NOT NULL,
+            last_co_change_at_s INTEGER NOT NULL,
+            computed_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(repo_id, path_a, path_b)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_git_change_couplings_b
+            ON git_change_couplings(repo_id, path_b);
+        ",
+    )
 }
 
 pub(crate) fn apply_symbols_is_test(conn: &Connection) -> rusqlite::Result<()> {

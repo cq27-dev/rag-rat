@@ -3,12 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use rusqlite::Connection;
 use serde::Serialize;
 
+// The per-commit co-touch cap is shared with the persisted change-coupling pass
+// (`impact_surface`) so the transient (this file) and windowed/persisted (change_coupling)
+// consumers can't drift.
+use crate::index::change_coupling::MAX_COUPLING_COMMIT_FILES as MAX_COTOUCH_COMMIT_FILES;
 use crate::query::repo_brief::{
     self, FileBriefRow, RepoBriefMemoryCounts, enrich_memory_counts, enrich_symbol_kinds,
 };
 
 const MAX_PATH_BUCKET_FILES: usize = 120;
-const MAX_COTOUCH_COMMIT_FILES: usize = 40;
 const MAX_CLUSTER_PATHS: usize = 8;
 const MIN_EDGE_SCORE: f64 = 0.34;
 

@@ -496,6 +496,25 @@ fn history_cursors(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<Hi
     Ok(raw_history_cursors(conn, repo_id)?.filter(|cursor| cursor.complete))
 }
 
+/// The STORED git-history freshness key for `repo_id` — the exact `(head, root_key, shallow,
+/// complete)` cursor snapshot `is_history_current` keys on — serialized to a stable string. A
+/// derived table computed FROM `git_commits` / `git_file_changes` (change_coupling) folds this into
+/// its own freshness stamp so a history REWRITE at the same HEAD (shallow deepen, subtree re-point,
+/// a best-effort reload flipping `complete`) — which moves these cursors even though HEAD does not
+/// — also invalidates the derived table. `None` when any cursor meta is unset (no committed history
+/// snapshot yet), which a derived table treats as an empty key.
+pub(crate) fn history_freshness_key(
+    conn: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(raw_history_cursors(conn, repo_id)?.map(|cursor| {
+        format!(
+            "{}|{}|{}|{}",
+            cursor.head, cursor.root_key, cursor.shallow as u8, cursor.complete as u8
+        )
+    }))
+}
+
 fn expected_history_cursors_match(
     conn: &Connection,
     repo_id: &str,

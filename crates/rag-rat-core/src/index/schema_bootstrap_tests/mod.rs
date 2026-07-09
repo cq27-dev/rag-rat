@@ -882,6 +882,7 @@ fn fingerprinted_symbol_id_for_ref(db: &IndexDatabase, qualified_name: &str) -> 
         .unwrap_or_else(|e| panic!("no fingerprinted symbol id for ref {qualified_name}: {e}"))
 }
 
+mod change_coupling;
 mod chunk_store_migrations;
 mod clones;
 mod dir_memory_tree;

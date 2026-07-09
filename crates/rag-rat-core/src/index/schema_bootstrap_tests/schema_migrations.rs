@@ -1522,10 +1522,13 @@ fn migration_054_adds_the_single_row_device_identity_table() {
 fn migration_055_adds_the_binding_downgrade_marker_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V055 is the schema tip — this test carries the absolute pin (the older tests dropped to
-    // the symbolic `current_version == LATEST` check).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 55, "V055 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 55, "schema at LATEST after apply");
+    // V056 now holds the absolute tip pin (migration_056's test); this drops to the symbolic
+    // `current_version == LATEST` freshness check.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
     assert!(
         conn_table_columns(&conn, "repo_memory_bindings")
             .contains(&"downgrade_pending_at_ms".to_string()),
@@ -1541,6 +1544,59 @@ fn migration_055_adds_the_binding_downgrade_marker_column() {
     // A forward migrate over a ledger truncated below V055 replays the step and lands the
     // column (the standard lagging-index path).
     truncate_schema_to(&conn, 54);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip"
+    );
+}
+
+#[test]
+fn migration_056_adds_the_git_change_couplings_table() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V056 is the schema tip — this test carries the absolute pin (the older tests dropped to the
+    // symbolic `current_version == LATEST` check).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 56, "V056 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 56, "schema at LATEST after apply");
+    assert!(
+        conn_table_exists(&conn, "git_change_couplings"),
+        "V056 creates the git_change_couplings table"
+    );
+
+    // STRICT + composite (repo_id, path_a, path_b) PK: a duplicate pair is rejected.
+    conn.execute(
+        "INSERT INTO git_change_couplings(repo_id, path_a, path_b, co_change_count, \
+         path_a_change_count, path_b_change_count, window_commit_count, last_co_change_at_s, \
+         computed_at_ms) VALUES ('r', 'a.rs', 'b.rs', 2, 3, 4, 10, 100, 1)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO git_change_couplings(repo_id, path_a, path_b, co_change_count, \
+             path_a_change_count, path_b_change_count, window_commit_count, last_co_change_at_s, \
+             computed_at_ms) VALUES ('r', 'a.rs', 'b.rs', 9, 9, 9, 9, 9, 9)",
+            [],
+        )
+        .is_err(),
+        "the composite PK rejects a duplicate (repo_id, path_a, path_b)"
+    );
+
+    // Deferred-absence in ISOLATION: drop + re-run the applier alone; it recreates, replay is a
+    // no-op.
+    conn.execute_batch("DROP TABLE git_change_couplings;").unwrap();
+    assert!(!conn_table_exists(&conn, "git_change_couplings"), "dropped before the isolated apply");
+    schema::apply_git_change_couplings(&conn).unwrap();
+    schema::apply_git_change_couplings(&conn).expect("replay is a no-op");
+    assert!(
+        conn_table_exists(&conn, "git_change_couplings"),
+        "the isolated applier recreates the table"
+    );
+
+    // A forward migrate over a ledger truncated below V056 replays the step and reaches the tip.
+    truncate_schema_to(&conn, 55);
     schema::migrate_forward(&conn).unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,

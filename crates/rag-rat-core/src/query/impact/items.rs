@@ -213,6 +213,43 @@ pub(crate) fn git_commit_items(
     Ok(surface.into_items(usize::try_from(limit).unwrap_or(usize::MAX)))
 }
 
+/// The "changes-alongside" section: files that historically co-changed with `path` within the
+/// recency window, ranked by asymmetric confidence `P(other | path)` with the read-time lift floor
+/// (see `crate::index::change_coupling`). Pure reader — the freshness recompute is the
+/// `ensure_coupling_fresh` seam on the impact query path, not here. Repo-scoped via
+/// `active_repo_id` (the direct V040 posture), matching `git_commit_items`.
+pub(crate) fn coupling_items(
+    conn: &Connection,
+    path: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let coupled =
+        crate::index::change_coupling::coupled_files_for_path(conn, &repo_id, path, limit)?;
+    Ok(coupled
+        .into_iter()
+        .map(|c| ImpactItem {
+            path: c.other_path,
+            language: c.language,
+            kind: c.kind,
+            symbol: None,
+            category: ImpactCategory::HistoricalPapertrail.as_str().to_string(),
+            reason: "file_co_changed_in_recent_commits".to_string(),
+            evidence: vec![format!(
+                "co-changed with {path} in {co} of {this} commits that touched it, within the \
+                 last {window} eligible commits (confidence {confidence:.2}, lift {lift:.1}); \
+                 last together at {last_at_s}",
+                co = c.co_change_count,
+                this = c.this_change_count,
+                window = c.window_commit_count,
+                confidence = c.confidence,
+                lift = c.lift,
+                last_at_s = c.last_co_change_at_s,
+            )],
+        })
+        .collect())
+}
+
 pub(crate) fn github_ref_items(
     conn: &Connection,
     paths: &[String],
