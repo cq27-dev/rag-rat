@@ -419,6 +419,8 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
     assert_eq!(stale[0].bindings[0].anchor_status, "stale");
 
     db.storage.connection().execute("DELETE FROM chunks WHERE id = ?1", [chunk_id]).unwrap();
+    // Twice: the #492 downgrade hysteresis defers the first gone observation.
+    db.memory_validate().unwrap();
     let report = db.memory_validate().unwrap();
     assert_eq!(report.gone, 1);
     let gone = db.memory_for_symbol(&symbol, 10, crate::config::MemorySurface::Full).unwrap();
@@ -580,6 +582,8 @@ fn a_deleted_at_head_file_makes_a_bare_path_binding_gone() {
             [],
         )
         .unwrap();
+    // Twice: the #492 downgrade hysteresis defers the first gone observation.
+    db.memory_validate().unwrap();
     let report = db.memory_validate().unwrap();
     assert_eq!(status(&db), "gone", "the deleted marker must not shadow the file's absence");
     assert_eq!(report.gone, 1);
@@ -645,16 +649,24 @@ fn a_path_alive_only_in_another_scope_validates_pending_not_gone() {
             .unwrap()
     };
 
-    // A SUPERSEDED generation's not-yet-GC'd row is NOT alive-elsewhere evidence (the review
-    // case: a full rebuild deleted the file; pre-sweep the dead generation still holds a source
-    // row) — only live-generation rows (worktree overlays ride the live generation) count.
+    // An ABANDONED staging's row (generation above live) is NOT alive-elsewhere evidence — only
+    // live-generation rows (worktree overlays ride the live generation) count. It IS, however, a
+    // torn window for the #492 downgrade hysteresis: while it exists, the observed gone neither
+    // arms nor confirms, so the persisted status holds.
     insert_row(live_generation + 7, "dead-gen-sha");
     let report = db.memory_validate().unwrap();
-    assert_eq!(
-        status(&db),
-        "gone",
-        "a superseded generation's leftover row must not report pending"
-    );
+    assert_eq!(report.pending, 0, "a staged generation's leftover row must not report pending");
+    assert_eq!(report.gone, 1, "the observation is gone, not pending");
+    assert_eq!(status(&db), "current", "a staged-window observation must not move the status");
+
+    // gc sweeps the abandoned staging: the two-pass downgrade proceeds.
+    db.storage
+        .connection()
+        .execute("DELETE FROM main.files WHERE sha256 = 'dead-gen-sha'", [])
+        .unwrap();
+    db.memory_validate().unwrap();
+    let report = db.memory_validate().unwrap();
+    assert_eq!(status(&db), "gone", "two trustworthy observations persist the downgrade");
     assert_eq!(report.pending, 0);
 
     // A retained old-commit BASE row (worktree_id = '') at the live generation is THIS context's
@@ -1010,9 +1022,11 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
     db.memory_validate().unwrap();
     assert_eq!(call_path_status(&db), "relocated", "a moved call site relocates the path");
 
-    // Remove the call site → the edge is gone → the call path is gone.
+    // Remove the call site → the edge is gone → the call path is gone. Two passes: the #492
+    // downgrade hysteresis defers the first gone observation.
     fs::write(root.join("src/lib.rs"), "pub fn caller() {}\npub fn callee() {}\n").unwrap();
     let db = IndexDatabase::rebuild(&config).unwrap();
+    db.memory_validate().unwrap();
     db.memory_validate().unwrap();
     assert_eq!(call_path_status(&db), "gone", "deleting the call site makes the path gone");
 
@@ -2213,6 +2227,9 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
     fs::remove_file(root.join("src/a.rs")).unwrap();
     fs::write(root.join("src/b.rs"), "pub fn doctor_src() -> u32 {\n    99\n}\n").unwrap();
     let db = IndexDatabase::rebuild(&config).unwrap();
+    // Twice: the #492 downgrade hysteresis defers the first gone observation, and doctor reads
+    // the PERSISTED status.
+    db.memory_validate().unwrap();
     let validate_report = db.memory_validate().unwrap();
     assert_eq!(
         validate_report.gone, 1,
@@ -2333,6 +2350,9 @@ fn memory_doctor_dedupes_cfg_split_candidates() {
     )
     .unwrap();
     let db = IndexDatabase::rebuild(&config).unwrap();
+    // Twice: the #492 downgrade hysteresis defers the first gone observation, and doctor reads
+    // the PERSISTED status.
+    db.memory_validate().unwrap();
     assert_eq!(db.memory_validate().unwrap().gone, 1, "binding must be gone");
 
     let entries = db.memory_doctor().unwrap();
@@ -3375,6 +3395,261 @@ fn typed_edges_add_traverse_and_resolve() {
     // filter).
     let from_dead = db.memory_edge_add(&a, "depends_on", node(&b)).unwrap_err();
     assert!(from_dead.to_string().contains("not found or is obsolete"), "{from_dead}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #492: a single `gone` observation must not persist a downgrade — a validate pass racing a
+/// rebuild window (or sweeping from a narrower checkout context) can produce a torn observation,
+/// and doctor then hands out destructive mark-obsolete advice for healthy anchors. The persisted
+/// `anchor_status` downgrades only on the SECOND consecutive gone observation; the validation
+/// report still counts what each pass actually saw.
+#[test]
+fn a_downgrade_to_gone_needs_two_consecutive_observations() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn keeper() {}\n").unwrap();
+    fs::write(root.join("src/doomed.rs"), "pub fn doomed() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Risk".to_string(),
+            title: "Anchored to a file a torn pass will misjudge".to_string(),
+            body: "One gone observation arms the marker; only the second downgrades.".to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                path: Some("src/doomed.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+    let persisted = |db: &IndexDatabase| -> (String, Option<i64>) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms FROM repo_memory_bindings
+                 WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    db.memory_validate().unwrap();
+    assert_eq!(persisted(&db), ("current".to_string(), None), "alive file → current, unarmed");
+
+    fs::remove_file(root.join("src/doomed.rs")).unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.files SET kind = 'deleted', sha256 = '' WHERE path = 'src/doomed.rs'",
+            [],
+        )
+        .unwrap();
+
+    // First gone observation: the report says what the pass saw, but the persisted status holds
+    // and the marker arms.
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.gone, 1, "the report counts the computed observation");
+    let (status, marker) = persisted(&db);
+    assert_eq!(status, "current", "one observation must not persist the downgrade");
+    assert!(marker.is_some(), "the first gone observation arms the marker");
+
+    // Second consecutive observation: the downgrade lands and the marker clears.
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.gone, 1);
+    assert_eq!(
+        persisted(&db),
+        ("gone".to_string(), None),
+        "the second consecutive observation persists the downgrade and clears the marker"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #492: a positive observation between two gone observations disarms the pending downgrade — the
+/// ping-pong a pair of checkout contexts produces (one sees the anchor, one does not) must never
+/// land a persisted `gone`.
+#[test]
+fn a_recovered_anchor_clears_the_pending_downgrade() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn keeper() {}\n").unwrap();
+    fs::write(root.join("src/wobbling.rs"), "pub fn wobbling() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Risk".to_string(),
+            title: "Anchored to a file that wobbles across contexts".to_string(),
+            body: "A recovery between gone observations must disarm the downgrade.".to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                path: Some("src/wobbling.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+    let persisted = |db: &IndexDatabase| -> (String, Option<i64>) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms FROM repo_memory_bindings
+                 WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+
+    fs::remove_file(root.join("src/wobbling.rs")).unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.files SET kind = 'deleted', sha256 = '' WHERE path = 'src/wobbling.rs'",
+            [],
+        )
+        .unwrap();
+    db.memory_validate().unwrap();
+    let (status, marker) = persisted(&db);
+    assert_eq!(status, "current");
+    assert!(marker.is_some(), "the gone observation arms the marker");
+
+    // The anchor recovers (the other context's view): the next pass re-asserts it and disarms
+    // the half-armed downgrade.
+    fs::write(root.join("src/wobbling.rs"), "pub fn wobbling() {}\n").unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.files SET kind = 'source', sha256 = 'restored'
+              WHERE path = 'src/wobbling.rs'",
+            [],
+        )
+        .unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(
+        persisted(&db),
+        ("current".to_string(), None),
+        "a positive observation stamps current and clears the marker"
+    );
+
+    // A later gone observation starts the two-pass rule from scratch.
+    fs::remove_file(root.join("src/wobbling.rs")).unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.files SET kind = 'deleted', sha256 = '' WHERE path = 'src/wobbling.rs'",
+            [],
+        )
+        .unwrap();
+    db.memory_validate().unwrap();
+    let (status, marker) = persisted(&db);
+    assert_eq!(status, "current", "the disarmed marker means the count restarts at one");
+    assert!(marker.is_some());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #492: while a STAGED generation exists for the repo (a rebuild is mid-flight, or an abandoned
+/// staging awaits gc), a gone observation is untrustworthy — the pass may be reading a
+/// half-published world. It must neither ARM nor CONFIRM a downgrade; the two-pass rule resumes
+/// once the staging clears.
+#[test]
+fn a_staged_generation_freezes_the_downgrade_rule() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn keeper() {}\n").unwrap();
+    fs::write(root.join("src/torn.rs"), "pub fn torn() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Risk".to_string(),
+            title: "Anchored while a rebuild is mid-flight".to_string(),
+            body: "A torn window's gone observation must not move the downgrade rule.".to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                path: Some("src/torn.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+    let persisted = |db: &IndexDatabase| -> (String, Option<i64>) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms FROM repo_memory_bindings
+                 WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+
+    fs::remove_file(root.join("src/torn.rs")).unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.files SET kind = 'deleted', sha256 = '' WHERE path = 'src/torn.rs'",
+            [],
+        )
+        .unwrap();
+    // A staged (higher-than-live) generation row: the mid-flight rebuild window.
+    let live_generation =
+        crate::index::schema::live_files_generation(db.storage.connection(), &db.active_repo_id)
+            .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO main.files (path, language, kind, sha256, modified_at_ms, generated,
+                                indexed_at_ms, indexed_revision, commit_sha, worktree_id,
+                                has_test_code, repo_id, generation)
+             VALUES ('src/staged.rs', 'rust', 'source', 'staged', 0, 0, 0, '', '', '', 0, ?1, ?2)",
+            params![db.active_repo_id, live_generation + 1],
+        )
+        .unwrap();
+
+    // Repeated gone observations inside the torn window: nothing arms, nothing confirms.
+    db.memory_validate().unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(
+        persisted(&db),
+        ("current".to_string(), None),
+        "a torn window's observations neither arm nor confirm the downgrade"
+    );
+
+    // The staging clears (published or gc-swept): the two-pass rule proceeds.
+    db.storage
+        .connection()
+        .execute("DELETE FROM main.files WHERE path = 'src/staged.rs'", [])
+        .unwrap();
+    db.memory_validate().unwrap();
+    let (status, marker) = persisted(&db);
+    assert_eq!(status, "current");
+    assert!(marker.is_some(), "the first trustworthy gone observation arms the marker");
+    db.memory_validate().unwrap();
+    assert_eq!(persisted(&db), ("gone".to_string(), None), "the second confirms");
 
     let _ = fs::remove_dir_all(&root);
 }

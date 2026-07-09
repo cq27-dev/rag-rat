@@ -1189,6 +1189,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_052_ID => Some(52),
             MIGRATION_053_ID => Some(53),
             MIGRATION_054_ID => Some(54),
+            MIGRATION_055_ID => Some(55),
             _ => None,
         })
         .max()
@@ -1252,6 +1253,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_052_ID
             | MIGRATION_053_ID
             | MIGRATION_054_ID
+            | MIGRATION_055_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1312,6 +1314,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_052_ID => migration.checksum != MIGRATION_052_CHECKSUM,
         MIGRATION_053_ID => migration.checksum != MIGRATION_053_CHECKSUM,
         MIGRATION_054_ID => migration.checksum != MIGRATION_054_CHECKSUM,
+        MIGRATION_055_ID => migration.checksum != MIGRATION_055_CHECKSUM,
         _ => false,
     }
 }
@@ -3680,6 +3683,16 @@ pub(crate) fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result
 
          COMMIT;",
     )?;
+    Ok(())
+}
+
+/// V055 (#492): the anchor-status downgrade hysteresis marker. INVARIANT: NULL means "no gone
+/// observation is pending" — every persisted non-deferred stamp clears it, so a non-null marker
+/// only ever bridges two CONSECUTIVE gone observations of the same binding. Nullable and
+/// additive: existing rows start unarmed, and the pre-V055 behavior (immediate downgrade) simply
+/// becomes the two-pass rule from the next validate on.
+pub(crate) fn apply_binding_downgrade_marker(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "repo_memory_bindings", "downgrade_pending_at_ms", "INTEGER")?;
     Ok(())
 }
 

@@ -269,6 +269,11 @@ fn cross_version_moniker_match_requires_kind_corroboration() {
             .unwrap();
 
         validate_memories(&h.conn, None).unwrap();
+        if expect_status == "gone" {
+            // The #492 downgrade hysteresis defers the first gone observation; the relocated arm
+            // stays single-pass (a second pass would re-judge the freshly moved anchor).
+            validate_memories(&h.conn, None).unwrap();
+        }
         let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
         let symbol_binding =
             memory.bindings.iter().find(|b| b.binding_kind == "symbol").expect("symbol binding");

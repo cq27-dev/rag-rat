@@ -31,6 +31,9 @@ fn path_binding_status_after_validate(h: &Harness, path: &str) -> String {
         bind: RepoMemoryBindTarget { path: Some(path.to_string()), ..Default::default() },
     })
     .unwrap();
+    // Twice: the #492 downgrade hysteresis defers a first gone observation, so the SETTLED
+    // status needs two passes (every other status is a fixpoint under repeated validation).
+    validate_memories(&h.conn, None).unwrap();
     validate_memories(&h.conn, None).unwrap();
     let memory = memory_by_id(&h.conn, &created.memory.memory_id).unwrap().unwrap();
     memory
@@ -259,6 +262,9 @@ fn moniker_binding_validation_statuses() {
     let memory_id = create_target_memory(&h, sym);
 
     let moniker_status = |h: &Harness| -> String {
+        // Twice: the #492 downgrade hysteresis defers a first gone observation, so the SETTLED
+        // status needs two passes (every other status is a fixpoint under repeated validation).
+        validate_memories(&h.conn, None).unwrap();
         validate_memories(&h.conn, None).unwrap();
         let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
         memory
@@ -516,8 +522,10 @@ fn bare_path_binding_survives_file_edit_spanned_goes_stale() {
     );
     assert_eq!(status(&spanned), "stale", "spanned path binding still claims content");
 
-    // Deleting the file row sends both to gone.
+    // Deleting the file row sends both to gone — after TWO passes, per the #492 downgrade
+    // hysteresis (the first observation only arms the marker).
     h.conn.execute("DELETE FROM files WHERE id = ?1", [file]).unwrap();
+    validate_memories(&h.conn, None).unwrap();
     validate_memories(&h.conn, None).unwrap();
     assert_eq!(status(&bare), "gone");
     assert_eq!(status(&spanned), "gone");

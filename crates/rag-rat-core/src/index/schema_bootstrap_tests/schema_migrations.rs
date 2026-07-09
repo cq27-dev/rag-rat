@@ -1471,10 +1471,13 @@ fn migration_053_scopes_the_oplog_by_stream_and_adds_fork_evidence() {
 fn migration_054_adds_the_single_row_device_identity_table() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V054 is the schema tip — this test carries the absolute pin (the older oplog tests dropped to
-    // the symbolic `current_version == LATEST` check).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 54, "V054 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 54, "schema at LATEST after apply");
+    // The absolute-tip pin moved to `migration_055_*` (V055 is the tip now); this drops to the
+    // symbolic check, per the ladder convention.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     // The identity table exists with its full column set.
     for column in ["seed", "public_key", "fingerprint", "created_at_ms"] {
@@ -1512,6 +1515,37 @@ fn migration_054_adds_the_single_row_device_identity_table() {
     assert!(
         conn_table_columns(&conn, "oplog_device_identity").contains(&"seed".to_string()),
         "the isolated applier recreates the table"
+    );
+}
+
+#[test]
+fn migration_055_adds_the_binding_downgrade_marker_column() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V055 is the schema tip — this test carries the absolute pin (the older tests dropped to
+    // the symbolic `current_version == LATEST` check).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 55, "V055 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 55, "schema at LATEST after apply");
+    assert!(
+        conn_table_columns(&conn, "repo_memory_bindings")
+            .contains(&"downgrade_pending_at_ms".to_string()),
+        "repo_memory_bindings carries the downgrade hysteresis marker (#492)"
+    );
+    // Additive + nullable: a re-apply is idempotent and the column survives.
+    schema::apply(&conn).unwrap();
+    assert!(
+        conn_table_columns(&conn, "repo_memory_bindings")
+            .contains(&"downgrade_pending_at_ms".to_string()),
+        "downgrade_pending_at_ms survives a re-apply"
+    );
+    // A forward migrate over a ledger truncated below V055 replays the step and lands the
+    // column (the standard lagging-index path).
+    truncate_schema_to(&conn, 54);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip"
     );
 }
 

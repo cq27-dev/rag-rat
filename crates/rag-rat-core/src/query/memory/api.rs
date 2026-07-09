@@ -964,17 +964,26 @@ pub(crate) fn validate_memories(
     let scope = memory_repo_scope(conn)?;
     let repo_clause =
         crate::index::schema::periphery_repo_scope_clause(&scope, "repo_memory_bindings");
+    // The downgrade-hysteresis torn-window guard (#492): while a STAGED (higher-than-live)
+    // generation exists for this repo — a rebuild is mid-flight, or an abandoned staging awaits
+    // gc — a `gone` observation may be reading a half-published world, so it must neither ARM
+    // nor CONFIRM a downgrade. Positive observations still stamp: evidence of presence is real
+    // in any window.
+    let staged_window = staged_generation_exists(conn, &scope)?;
     let mut stmt = conn.prepare(&format!(
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line,
                logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, github_owner,
                github_repo, github_number, symbol_kind, signature_hash, moniker_tool,
-               moniker_tool_version, relocation_reason, anchor_status, created_at_ms
+               moniker_tool_version, relocation_reason, anchor_status, created_at_ms,
+               downgrade_pending_at_ms
         FROM repo_memory_bindings
         WHERE 1=1{repo_clause}
         "
     ))?;
-    let rows = stmt.query_map([], binding_row)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((binding_row(row)?, row.get::<_, Option<i64>>("downgrade_pending_at_ms")?))
+    })?;
     let tx = conn.unchecked_transaction()?;
     let mut report = RepoMemoryValidationReport {
         checked: 0,
@@ -986,47 +995,35 @@ pub(crate) fn validate_memories(
         unverified: 0,
     };
     for row in rows {
-        let mut binding = row?;
+        let (mut binding, downgrade_pending_at_ms) = row?;
         let original_binding_id = binding.binding_id.clone();
+        let stored_status = binding.anchor_status.clone();
         report.checked += 1;
         let status = validate_binding(conn, &mut binding, fs_root)?;
-        let updated = conn.execute(
-            "
-            UPDATE OR IGNORE repo_memory_bindings
-            SET anchor_status = ?3, logical_symbol_id = ?4, symbol_id = ?5, chunk_id = ?6,
-                edge_id = ?7, path = ?8, start_line = ?9, end_line = ?10,
-                binding_id = ?11, symbol_kind = ?12, signature_hash = ?13,
-                moniker_tool_version = ?15, relocation_reason = ?16
-            WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?14
-            ",
-            params![
-                binding.memory_id,
-                binding.binding_kind,
-                status,
-                binding.logical_symbol_id,
-                binding.symbol_id,
-                binding.chunk_id,
-                binding.edge_id,
-                binding.path,
-                binding.start_line,
-                binding.end_line,
-                binding.binding_id,
-                binding.symbol_kind,
-                binding.signature_hash,
-                original_binding_id,
-                binding.moniker_tool_version,
-                binding.relocation_reason
-            ],
-        )?;
-        // UPDATE OR IGNORE: if a sibling binding already holds the new (memory_id, kind,
-        // binding_id) PK, the rewrite is a no-op rather than a crash. Drop the
-        // now-duplicate stale row.
-        if updated == 0 && binding.binding_id != original_binding_id {
-            conn.execute(
-                "DELETE FROM repo_memory_bindings
-                 WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3",
-                params![binding.memory_id, binding.binding_kind, original_binding_id],
-            )?;
+        // Downgrade hysteresis (#492): a single `gone` observation of a not-yet-gone binding is
+        // exactly what a torn pass produces (a validate racing a rebuild window, or a sweep from
+        // a checkout context that cannot see the anchor another context re-asserts), and a
+        // persisted `gone` is what doctor turns into destructive mark-obsolete advice. So a
+        // FIRST gone observation only ARMS `downgrade_pending_at_ms` — the stored row stays as
+        // it was — and only a SECOND consecutive one persists the downgrade. Any non-gone stamp
+        // clears the marker (the ping-pong never lands), and a staged-generation window freezes
+        // the rule entirely (see `staged_window` above). The REPORT keeps counting the computed
+        // observation: what this pass saw is honest; only what doctor reads is hysteresis-
+        // guarded.
+        if status == "gone" && stored_status != "gone" {
+            if staged_window {
+                // Untrustworthy observation: leave the row exactly as it was.
+            } else if downgrade_pending_at_ms.is_none() {
+                conn.execute(
+                    "UPDATE repo_memory_bindings SET downgrade_pending_at_ms = ?4
+                     WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3",
+                    params![binding.memory_id, binding.binding_kind, original_binding_id, now_ms()],
+                )?;
+            } else {
+                stamp_validated_binding(conn, &binding, &original_binding_id, &status)?;
+            }
+        } else {
+            stamp_validated_binding(conn, &binding, &original_binding_id, &status)?;
         }
         match status.as_str() {
             "current" => report.current += 1,
@@ -1039,4 +1036,72 @@ pub(crate) fn validate_memories(
     }
     tx.commit()?;
     Ok(report)
+}
+
+/// Persist one validated binding: the full field rewrite `validate_memories` stamps for every
+/// non-deferred observation. Clears `downgrade_pending_at_ms` — a persisted stamp is either an
+/// upgrade (the anchor is seen again; the pending downgrade is disarmed) or the confirmed
+/// downgrade itself (the marker's job is done).
+fn stamp_validated_binding(
+    conn: &Connection,
+    binding: &RepoMemoryBinding,
+    original_binding_id: &str,
+    status: &str,
+) -> anyhow::Result<()> {
+    let updated = conn.execute(
+        "
+        UPDATE OR IGNORE repo_memory_bindings
+        SET anchor_status = ?3, logical_symbol_id = ?4, symbol_id = ?5, chunk_id = ?6,
+            edge_id = ?7, path = ?8, start_line = ?9, end_line = ?10,
+            binding_id = ?11, symbol_kind = ?12, signature_hash = ?13,
+            moniker_tool_version = ?15, relocation_reason = ?16,
+            downgrade_pending_at_ms = NULL
+        WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?14
+        ",
+        params![
+            binding.memory_id,
+            binding.binding_kind,
+            status,
+            binding.logical_symbol_id,
+            binding.symbol_id,
+            binding.chunk_id,
+            binding.edge_id,
+            binding.path,
+            binding.start_line,
+            binding.end_line,
+            binding.binding_id,
+            binding.symbol_kind,
+            binding.signature_hash,
+            original_binding_id,
+            binding.moniker_tool_version,
+            binding.relocation_reason
+        ],
+    )?;
+    // UPDATE OR IGNORE: if a sibling binding already holds the new (memory_id, kind,
+    // binding_id) PK, the rewrite is a no-op rather than a crash. Drop the
+    // now-duplicate stale row.
+    if updated == 0 && binding.binding_id != original_binding_id {
+        conn.execute(
+            "DELETE FROM repo_memory_bindings
+             WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3",
+            params![binding.memory_id, binding.binding_kind, original_binding_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether a STAGED (higher-than-live) `files` generation exists for the scoped repo (#492): a
+/// rebuild is mid-flight, or an abandoned staging awaits gc. Scope `None` (a pre-scoping ladder
+/// state) reads as no window — the guard is a refinement, never a gate on validation itself.
+fn staged_generation_exists(conn: &Connection, scope: &Option<String>) -> anyhow::Result<bool> {
+    let Some(repo_id) = scope.as_deref() else {
+        return Ok(false);
+    };
+    let live = crate::index::schema::live_files_generation(conn, repo_id)?;
+    let staged: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND generation > ?2)",
+        params![repo_id, live],
+        |row| row.get(0),
+    )?;
+    Ok(staged)
 }

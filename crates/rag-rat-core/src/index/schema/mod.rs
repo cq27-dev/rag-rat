@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 54;
+pub const LATEST_SCHEMA_VERSION: u32 = 55;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -374,6 +374,14 @@ const MIGRATION_054_DESCRIPTION: &str =
      the 32-byte seed, its derived public_key, and the sha256(public_key) fingerprint. \
      Store-global, not repo-scoped (a device is a machine identity). Purely additive; nothing is \
      wired to the live write path yet";
+const MIGRATION_055_ID: &str = "055_binding_downgrade_marker";
+const MIGRATION_055_CHECKSUM: &str = "sha256:rag-rat-binding-downgrade-marker-v55";
+const MIGRATION_055_DESCRIPTION: &str =
+    "Add repo_memory_bindings.downgrade_pending_at_ms (#492), the anchor-status downgrade \
+     hysteresis marker: a validate pass that observes a non-gone binding as gone arms the marker \
+     instead of stamping, and only a SECOND consecutive gone observation persists the downgrade — \
+     so a single torn observation (a validate racing a rebuild window, or a sweep from a narrower \
+     checkout) cannot flip a healthy anchor to gone and hand doctor destructive advice";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -839,6 +847,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_054_CHECKSUM,
         description: MIGRATION_054_DESCRIPTION,
         apply: apply_oplog_device_identity,
+    },
+    Migration {
+        id: MIGRATION_055_ID,
+        checksum: MIGRATION_055_CHECKSUM,
+        description: MIGRATION_055_DESCRIPTION,
+        apply: apply_binding_downgrade_marker,
     },
 ];
 

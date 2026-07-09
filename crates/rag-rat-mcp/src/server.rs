@@ -722,7 +722,9 @@ mod tests {
             }),
         )
         .unwrap();
-        // A path binding is created `current`; validation flips the absent path to `gone`.
+        // A path binding is created `current`; validation flips the absent path to `gone` —
+        // after TWO passes, per the #492 downgrade hysteresis (the first only arms the marker).
+        toon.call("memory_validate", json!({})).unwrap();
         toon.call("memory_validate", json!({})).unwrap();
 
         // TOON (default, LLM-facing): nudge present as a second block.

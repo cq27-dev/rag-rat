@@ -526,6 +526,9 @@ fn memories_are_isolated_across_repos() {
         })
         .unwrap();
     let db_a = open_scoped(&repo_a, &data_dir);
+    // Twice: the #492 downgrade hysteresis defers the first gone observation, and doctor reads
+    // the PERSISTED status.
+    db_a.memory_validate().unwrap();
     db_a.memory_validate().unwrap();
     let a_doc = db_a.memory_doctor().unwrap();
     assert!(a_doc.iter().any(|e| e.anchor_status == "gone"), "doctor A flags A's gone anchor");
