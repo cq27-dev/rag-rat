@@ -1075,3 +1075,123 @@ fn git_history_reload_is_skipped_when_head_is_unchanged() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn skip_summary_shared_parse_matches_per_chunk_text() {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use crate::index::ai::{
+        self, LowSignalCheck, embedding_policy_for_chunk, embedding_policy_skip_summary,
+    };
+    use crate::index::text_compression::{ChunkTextDecoder, ChunkTextRow};
+
+    // The FromSpan (shared-parse) summary must equal the per-chunk FromText computation on a real
+    // index — exercising reconstruction + sha-verify + one-parse-per-file span classification, and
+    // the markdown-fallback gate. Nested symbols (`impl` methods) create OVERLAPPING chunks.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Plumbing-only file (a use-block ≥ MIN_EMBEDDING_CHARS so it reaches the low-signal gate
+    // rather than SkipTooSmall) → low-signal; real-code file → embeds; markdown → fallback
+    // path.
+    fs::write(
+        root.join("src/plumbing.rs"),
+        "use std::collections::HashMap;\nuse std::collections::BTreeMap;\nuse \
+         std::path::PathBuf;\nuse std::sync::Arc;\npub use crate::foo::Bar;\nuse \
+         a::b::c::d::e::f;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/code.rs"),
+        // Blank lines between symbols become unchunked whitespace gaps → exercises `\n`-padded
+        // reconstruction on the shared-parse path (still hash-matches, so FromSpan applies).
+        "pub fn compute(x: i64, y: i64) -> i64 {\n    let sum = x * 2 + y - 1;\n    let scaled = \
+         sum.wrapping_mul(3);\n    scaled - x + y\n}\n\npub struct Foo {\n    n: i64,\n}\n\nimpl \
+         Foo {\n    pub fn bar(&self) -> i64 {\n        self.n + compute(4, 5)\n    }\n}\n",
+    )
+    .unwrap();
+    // A file under `fixtures/` → every chunk is SkipTestFixture (a cheap gate before low-signal),
+    // so the shared-parse path must not reconstruct/parse it.
+    fs::create_dir_all(root.join("src/fixtures")).unwrap();
+    fs::write(
+        root.join("src/fixtures/data.rs"),
+        "pub fn fixture_helper_that_is_long_enough_to_clear_the_min_embedding_chars() -> i64 {\n    \
+         7\n}\n",
+    )
+    .unwrap();
+    // A CRLF file: chunk text is LF-normalized while byte offsets count `\r\n`, so reconstruction
+    // will NOT hash-match `files.sha256` and must fall back to per-chunk FromText (without the
+    // sha-verify guard this would silently corrupt, failing the equality below).
+    fs::write(
+        root.join("src/crlf.rs"),
+        "use std::io::Read;\r\nuse std::io::Write;\r\nuse std::path::Path;\r\npub use \
+         crate::x::Y;\r\nuse a::b::c::d::e;\r\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/readme.md"), "# Title\n\nsome prose that is not code.\n").unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // Reference: the previous per-chunk FromText classification.
+    let reference: BTreeMap<String, u64> = {
+        let dicts = crate::query::chunk_text_dicts(conn).unwrap();
+        let mut decoder = ChunkTextDecoder::new(&dicts);
+        let mut out = BTreeMap::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT files.path, files.language, files.kind, chunks.chunk_kind,
+                        chunks.symbol_path, chunk_text.blob, chunk_text.raw_len,
+                        chunk_text.dict_version
+                 FROM chunks JOIN files ON files.id = chunks.file_id
+                 JOIN chunk_text ON chunk_text.chunk_id = chunks.id",
+            )
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            let path: String = row.get(0).unwrap();
+            let language: String = row.get(1).unwrap();
+            let file_kind: String = row.get(2).unwrap();
+            let chunk_kind: String = row.get(3).unwrap();
+            let symbol_path: Option<String> = row.get(4).unwrap();
+            let text = ChunkTextRow {
+                blob: row.get(5).unwrap(),
+                raw_len: row.get(6).unwrap(),
+                dict_version: row.get(7).unwrap(),
+            }
+            .resolve(&mut decoder)
+            .unwrap();
+            let decision = embedding_policy_for_chunk(
+                Path::new(&path),
+                &language,
+                &file_kind,
+                &chunk_kind,
+                symbol_path.as_deref(),
+                &text,
+                ai::DEFAULT_MAX_EMBEDDING_CHARS,
+                LowSignalCheck::FromText,
+            );
+            if !decision.eligible {
+                *out.entry(decision.policy).or_default() += 1;
+            }
+        }
+        out
+    };
+
+    let span = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(span, reference, "shared-parse summary must equal the per-chunk FromText reference");
+    assert!(
+        span.get("SkipLowSignal").copied().unwrap_or(0) >= 1,
+        "the all-import file must contribute a low-signal skip (exercises the shared-parse span \
+         classification): {span:?}"
+    );
+    assert!(
+        span.get("SkipTestFixture").copied().unwrap_or(0) >= 1,
+        "the fixtures/ file must be a test-fixture skip (exercises the parse-free cheap gate): \
+         {span:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

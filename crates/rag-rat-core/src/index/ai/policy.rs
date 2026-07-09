@@ -57,6 +57,43 @@ impl LowSignalCheck<'_> {
     }
 }
 
+/// The policy from the cheap, PARSE-FREE gates that precede the low-signal check (`trimmed` is the
+/// pre-trimmed chunk text), or `None` when the chunk REACHES the low-signal gate — the only gate
+/// that needs a tree-sitter parse. A caller that shares one parse across a file's chunks uses this
+/// to skip the parse entirely when no chunk reaches the low-signal gate.
+pub(crate) fn cheap_skip_policy(
+    path: &Path,
+    language: &str,
+    file_kind: &str,
+    chunk_kind: &str,
+    symbol_path: Option<&str>,
+    trimmed: &str,
+    max_embedding_chars: usize,
+) -> Option<EmbeddingPolicyDecision> {
+    let path_text = path.to_string_lossy();
+    if trimmed.chars().count() > max_embedding_chars.saturating_mul(4)
+        && (file_kind == "generated" || chunk_kind == "generated" || symbol_path.is_none())
+    {
+        return Some(policy("SkipTooLarge", 9, false));
+    }
+    if file_kind == "generated" || chunk_kind == "generated" || looks_generated_path(&path_text) {
+        return Some(policy("SkipGenerated", 9, false));
+    }
+    if is_test_fixture_path(&path_text) {
+        return Some(policy("SkipTestFixture", 9, false));
+    }
+    let Ok(language_kind) = language.parse::<Language>() else {
+        return Some(policy("SkipLanguageUnsupported", 9, false));
+    };
+    if !language_kind.supports_embeddings() {
+        return Some(policy("SkipLanguageUnsupported", 9, false));
+    }
+    if trimmed.chars().count() < MIN_EMBEDDING_CHARS {
+        return Some(policy("SkipTooSmall", 9, false));
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn embedding_policy_for_chunk(
     path: &Path,
@@ -68,31 +105,22 @@ pub(crate) fn embedding_policy_for_chunk(
     max_embedding_chars: usize,
     low_signal: LowSignalCheck<'_>,
 ) -> EmbeddingPolicyDecision {
-    let path_text = path.to_string_lossy();
     let trimmed = text.trim();
-    if trimmed.chars().count() > max_embedding_chars.saturating_mul(4)
-        && (file_kind == "generated" || chunk_kind == "generated" || symbol_path.is_none())
-    {
-        return policy("SkipTooLarge", 9, false);
-    }
-    if file_kind == "generated" || chunk_kind == "generated" || looks_generated_path(&path_text) {
-        return policy("SkipGenerated", 9, false);
-    }
-    if is_test_fixture_path(&path_text) {
-        return policy("SkipTestFixture", 9, false);
-    }
-    let Ok(language_kind) = language.parse::<Language>() else {
-        return policy("SkipLanguageUnsupported", 9, false);
-    };
-    if !language_kind.supports_embeddings() {
-        return policy("SkipLanguageUnsupported", 9, false);
-    }
-    if trimmed.chars().count() < MIN_EMBEDDING_CHARS {
-        return policy("SkipTooSmall", 9, false);
+    if let Some(skip) = cheap_skip_policy(
+        path,
+        language,
+        file_kind,
+        chunk_kind,
+        symbol_path,
+        trimmed,
+        max_embedding_chars,
+    ) {
+        return skip;
     }
     if low_signal.is_low_signal(language, chunk_kind, symbol_path, trimmed) {
         return policy("SkipLowSignal", 9, false);
     }
+    let path_text = path.to_string_lossy();
     policy("Embed", embedding_priority(&path_text, language, chunk_kind, symbol_path), true)
 }
 
