@@ -12,10 +12,10 @@ plugin/                          plugin root (CLAUDE_PLUGIN_ROOT / CODEX_PLUGIN_
   scripts/launch.js                the all-OS launcher (shared)
   skills/                          shared skills: using-rag-rat, dream-review
   hooks/hooks.json                 Claude hooks (auto-discovered)
+  .mcp.json                        Codex MCP config (root, per Codex plugin spec)
   .claude-plugin/plugin.json       Claude: mcpServers → node scripts/launch.js mcp
   .claude-plugin/marketplace.json
-  .codex-plugin/plugin.json        Codex: mcpServers + skills + hooks references
-  .codex-plugin/.mcp.json          → node scripts/launch.js mcp
+  .codex-plugin/plugin.json        Codex manifest: mcpServers → ./.mcp.json, skills → ./skills/
   .codex-plugin/hooks/hooks.json   Codex hooks
 ```
 
@@ -106,9 +106,16 @@ no-op; exit-code propagation; MCP `initialize` handshake (clean stdout/stderr); 
   (v0.15.0's build failed). URL/asset naming matches cargo-dist output.
 - **Windows extraction** relies on the bundled `tar` (bsdtar, Win10 1803+); needs a real Windows run.
 - **Codex path resolution + hook firing** are built from OpenAI's hook docs but unverified on a live
-  Codex — confirm the plugin `mcpServers`/`skills`/`hooks` path bases and that the `^Bash$` /
-  `^apply_patch$` matchers fire and inject output. (The `apply_patch` V4A clone-check is implemented
-  and unit-tested in the binary; only the end-to-end Codex wiring is unverified.)
+  Codex — confirm `.mcp.json` at the root resolves, and that Codex auto-discovers
+  `.codex-plugin/hooks/hooks.json` (the `hooks` manifest field was dropped because Codex validation
+  rejects it) and fires the `^Bash$` / `^apply_patch$` matchers. (The `apply_patch` V4A clone-check
+  is implemented and unit-tested in the binary; only the end-to-end Codex wiring is unverified.)
+- **Legacy hook-settings migration (deferred):** the `claude-hook` → `agent-hook` rename means a user
+  who previously ran `rag-rat hooks install --claude` keeps a stale `rag-rat claude-hook` entry, and a
+  fresh install adds a duplicate `agent-hook` one (`is_ours` only matches the new command). A clean
+  fix updates the settings migration to recognize + replace the legacy command; deferred here since it
+  touches `claude_settings.rs` migration semantics and the repo's pre-launch posture tolerates a
+  hooks reinstall.
 - **Final placement**: a real Claude marketplace needs `.claude-plugin/marketplace.json` at the repo
   root; this prototype keeps everything under `plugin/` for isolated review.
 - **First-run timing**: if the binary is not yet cached when a hook fires, the hook no-ops (by

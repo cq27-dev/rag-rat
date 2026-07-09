@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // rag-rat launcher — ensures a version-matched `rag-rat` binary is available, then runs it with the
-// forwarded args (the plugin passes `mcp`, or `claude-hook` for hook events) wired straight to the
+// forwarded args (the plugin passes `mcp`, or `agent-hook` for hook events) wired straight to the
 // agent's stdio.
 //
 // Why Node (not a .sh): the plugin must work on every OS the coding agents run on, including native
@@ -55,11 +55,17 @@ const die = (m) => {
 // Run the resolved binary with stdio wired to the agent, forward signals, propagate exit code.
 function run(bin) {
   const child = spawn(bin, FORWARD_ARGS, { stdio: "inherit" });
-  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-    process.on(sig, () => child.kill(sig));
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
+  const forward = {};
+  for (const sig of signals) {
+    forward[sig] = () => child.kill(sig);
+    process.on(sig, forward[sig]);
   }
   child.on("error", (e) => die(`failed to launch ${bin}: ${e.message}`));
   child.on("exit", (code, signal) => {
+    // Drop our forwarders before re-raising, or the self-signal would hit our own handler (which
+    // re-kills the already-dead child) instead of terminating this process — a shutdown hang.
+    for (const sig of signals) process.off(sig, forward[sig]);
     if (signal) process.kill(process.pid, signal);
     else process.exit(code ?? 0);
   });
@@ -171,7 +177,9 @@ async function downloadAndRun() {
 
     const archive = `rag-rat-${triple}.${ext}`;
     const base = `https://github.com/${GH_REPO}/releases/download/v${VERSION}`;
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rag-rat-launch-"));
+    // Stage under cacheDir (same filesystem as managedBin) so the final install rename is atomic;
+    // a temp dir on a different fs (e.g. tmpfs /tmp) would make fs.renameSync raise EXDEV.
+    const tmp = fs.mkdtempSync(path.join(cacheDir, ".dl-"));
     try {
       const archivePath = path.join(tmp, archive);
       log(`downloading rag-rat v${VERSION} for ${triple} …`);
