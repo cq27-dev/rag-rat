@@ -111,9 +111,13 @@ jobs:
         corpus: ${{ fromJSON(needs.matrix.outputs.corpora) }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        # rust-analyzer as a toolchain component pins the SCIP emitter to the stable release (not the
-        # weekly `releases/latest`), so the `rust-time` leg's numbers don't shift under the PR.
+      # Pinned to 1.96.0, not `@stable`: rust-analyzer 1.97's `next_solver` panics generating the
+      # ground-truth SCIP for the rust-time corpus ("expected int of size 8, but got size 1") — see
+      # #553. 1.96.0 is the last stable whose rust-analyzer emits the fixture SCIP cleanly; revert to
+      # `@stable` once a released RA no longer panics. rust-analyzer as a toolchain component still
+      # pins the SCIP emitter to a stable release (not the weekly `releases/latest`), so the rust-time
+      # leg's numbers don't shift under the PR.
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
@@ -128,9 +132,13 @@ jobs:
           echo "installing $tool for ${{ matrix.corpus }}"
           case "$tool" in
             rust-analyzer)
-              # Already installed as a rustup component (toolchain step). Resolve the proxy to an
-              # absolute path on PATH so the oracle's `rust-analyzer scip` probe finds it.
-              ra="$(rustup which --toolchain stable rust-analyzer)"
+              # Already installed as a rustup component (toolchain step). Resolve the proxy from the
+              # DEFAULT toolchain the `dtolnay/rust-toolchain` step set — NOT a hardcoded `--toolchain
+              # stable`, which would ignore the pin (currently 1.96.0, see the toolchain step) and copy
+              # the panicking stable rust-analyzer. Toolchain-agnostic, so the pin's `uses:` version is
+              # the single line to change when un-pinning. Copy the proxy to an absolute path on PATH
+              # so the oracle's `rust-analyzer scip` probe finds it.
+              ra="$(rustup which rust-analyzer)"
               install -m 0755 "$ra" /usr/local/bin/rust-analyzer
               rust-analyzer --version ;;
             scip-clang)
