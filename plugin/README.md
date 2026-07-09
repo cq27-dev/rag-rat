@@ -50,29 +50,29 @@ copies never drift).
 
 ## Hooks
 
-The hook command routes through the launcher: `node <launcher> --no-install claude-hook`, so it
-resolves the same version-matched binary and never blocks on install.
+The hook command routes through the launcher: `node <launcher> --no-install agent-hook`, so it
+resolves the same version-matched binary and never blocks on install. The handler
+(`rag-rat agent-hook`) is harness-neutral: Claude Code, Codex, and Cursor share the same
+`hook_event_name` / `tool_name` / `tool_input` input and the same `hookSpecificOutput.additionalContext`
+output.
 
-**Claude — full parity** (`hooks/hooks.json`, replicates `rag-rat hooks install --claude`):
+**Claude** (`hooks/hooks.json`, replicates `rag-rat hooks install --claude`):
 - `SessionStart` (`startup|clear|compact`, 5s) → repo orientation digest.
 - `PreToolUse` on `Grep`/`Bash` (10s) → grep-augmentation.
 - `PreToolUse` on `Write`/`Edit`/`MultiEdit` (10s) → write-time clone check.
 
-**Codex — orientation digest** (`.codex-plugin/hooks/hooks.json`):
-- `SessionStart` → the same orientation digest, via the harness-agnostic `claude-hook` (Codex uses
-  the `{"hooks":{...}}` wrapper + `async` schema, not Claude's `timeout`).
+**Codex** (`.codex-plugin/hooks/hooks.json`, `{"hooks":{…}}` wrapper):
+- `SessionStart` → repo orientation digest.
+- `PreToolUse` on `^Bash$` → grep-augmentation.
+- `PreToolUse` on `^apply_patch$` → write-time clone check. The handler parses the V4A diff in
+  `tool_input.command` for added lines (Codex/Cursor edit via `apply_patch`, not `Write`/`Edit`).
 
-### Non-Claude hook parity — what's still owed
+### Still to verify on-device
 
-The existing `rag-rat claude-hook` handler is mostly harness-agnostic (it reads a tolerant
-`HookInput` and branches on `hook_event_name`), but two pieces are Claude-shaped:
-
-- **grep-augmentation on Codex** depends on Codex firing a `PreToolUse` matcher on its shell tool
-  with `tool_input.command` — unverified here; wire it once confirmed on-device.
-- **write-time clone check on Codex/Cursor** matches `Write`/`Edit`/`MultiEdit`; those harnesses edit
-  via `apply_patch`. Reaching parity needs a **rag-rat binary change**: a harness-neutral hook
-  handler that recognizes `apply_patch` and parses its `tool_input`. Tracked as a follow-up (also a
-  good moment to rename `claude-hook` → a neutral `agent-hook`).
+The Codex wiring is built from OpenAI's published hook docs (input field names, PreToolUse tool-name
+regex matching, `hookSpecificOutput.additionalContext` output) but hasn't been exercised against a
+live Codex. Confirm: the plugin `hooks.json` path/schema is read as expected, `^Bash$`/`^apply_patch$`
+matchers actually fire, and the digest/clone-check output is injected. Cursor mirrors the same shape.
 
 ## Installation for non-Claude agents
 
@@ -94,7 +94,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 
 # SessionStart hook through the launcher:
 printf '%s\n' '{"hook_event_name":"SessionStart","source":"startup"}' \
-  | RAG_RAT_BIN="$(command -v rag-rat)" node scripts/launch.js --no-install claude-hook
+  | RAG_RAT_BIN="$(command -v rag-rat)" node scripts/launch.js --no-install agent-hook
 ```
 
 Verified: launcher syntax; `$RAG_RAT_BIN` override; `PATH` version-match; `--no-install` cold-cache
@@ -105,9 +105,10 @@ no-op; exit-code propagation; MCP `initialize` handshake (clean stdout/stderr); 
 - **Download path (#5) untested** until a green cargo-dist release publishes prebuilt assets
   (v0.15.0's build failed). URL/asset naming matches cargo-dist output.
 - **Windows extraction** relies on the bundled `tar` (bsdtar, Win10 1803+); needs a real Windows run.
-- **Codex path resolution + hook schema** are inferred (basemind-style layout); need on-device
-  verification of `mcpServers`/`skills`/`hooks` path bases and the hook-JSON field names.
-- **apply_patch clone-check** for Codex/Cursor needs the rag-rat binary follow-up above.
+- **Codex path resolution + hook firing** are built from OpenAI's hook docs but unverified on a live
+  Codex — confirm the plugin `mcpServers`/`skills`/`hooks` path bases and that the `^Bash$` /
+  `^apply_patch$` matchers fire and inject output. (The `apply_patch` V4A clone-check is implemented
+  and unit-tested in the binary; only the end-to-end Codex wiring is unverified.)
 - **Final placement**: a real Claude marketplace needs `.claude-plugin/marketplace.json` at the repo
   root; this prototype keeps everything under `plugin/` for isolated review.
 - **First-run timing**: if the binary is not yet cached when a hook fires, the hook no-ops (by
