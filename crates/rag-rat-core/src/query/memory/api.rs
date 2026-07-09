@@ -1,4 +1,7 @@
+use rusqlite::{Transaction, TransactionBehavior};
+
 use super::*;
+use crate::query::memory::authoring;
 
 /// Max chars for a memory title (a one-line summary) and body. The body cap is generous on purpose:
 /// Invariant / Decision / BugPattern memories are meant to carry the *why* + *how to apply* in
@@ -57,6 +60,11 @@ pub(crate) fn create_memory(
     // scope drives the repo stamp below.
     let scope = memory_repo_scope(conn)?;
     let id = memory_id(now, &input_hash, &scope);
+    // Backfill the pre-existing history BEFORE this live entry (idempotent; a cheap no-op once the
+    // chain exists), then do the table writes + the op-append in ONE transaction so they commit —
+    // or roll back — together (strict-atomic). Writes via `conn` participate in the open txn.
+    authoring::backfill_memory_oplog(conn, now)?;
+    let tx = conn.unchecked_transaction()?;
     conn.execute(
         "
         INSERT INTO repo_memories(
@@ -100,12 +108,21 @@ pub(crate) fn create_memory(
     upsert_memory_fts(conn, &id)?;
     let memory = memory_by_id(conn, &id)?
         .ok_or_else(|| anyhow::anyhow!("created memory `{id}` could not be read back"))?;
+    // Author the NodeCreate in the SAME txn; an authoring error drops `tx` → the INSERT rolls back.
+    authoring::author_create(&tx, &memory, now)?;
+    tx.commit()?;
     Ok(RepoMemoryCreateResult { memory, duplicate: false })
 }
 pub(crate) fn update_memory(
     conn: &Connection,
     update: RepoMemoryUpdate,
 ) -> anyhow::Result<RepoMemory> {
+    let now = now_ms();
+    // Backfill (idempotent) before opening our txn, then open an IMMEDIATE txn so the current-row
+    // READ and the UPDATE are ONE atomic unit — a racing writer cannot flip the status between the
+    // read and the write and desync the table from the op-log projection.
+    authoring::backfill_memory_oplog(conn, now)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let current = memory_by_id(conn, &update.memory_id)?
         .ok_or_else(|| anyhow::anyhow!("memory `{}` not found", update.memory_id))?;
     if let Some(kind) = update.kind.as_deref() {
@@ -144,7 +161,25 @@ pub(crate) fn update_memory(
     } else {
         None
     };
-    let now = now_ms();
+    // Detect what actually CHANGED before `current`'s fields are moved into the UPDATE params.
+    // Content and status are INDEPENDENT LWW registers: author a NodeUpdate ONLY on a real content
+    // change (else a status-only update would re-assert this device's content and could revert a
+    // concurrent edit under sync) and a NodeStatus ONLY on a real status change.
+    let new_title = update.title.as_deref().unwrap_or(current.title.as_str());
+    let new_body = update.body.as_deref().unwrap_or(current.body.as_str());
+    let new_confidence = update.confidence.as_deref().unwrap_or(current.confidence.as_str());
+    // Compare tags NORMALIZED — `current.tags` is trimmed / non-empty / deduped / sorted (how
+    // `replace_tags` stores and `tags_for_memory` reads them), so raw `update.tags` must be put in
+    // the same shape before comparing, or a whitespace/duplicate-only re-tag would look "changed"
+    // and mint a spurious NodeUpdate (the status-only-update hazard, re-reached through tags).
+    let tags_changed = update.tags.as_ref().is_some_and(|raw| normalize_tags(raw) != current.tags);
+    let content_changed = new_kind != current.kind
+        || new_title != current.title
+        || new_body != current.body
+        || new_confidence != current.confidence
+        || stored_payload != current.payload_json
+        || tags_changed;
+    let status_changed = update.status.as_deref().is_some_and(|s| s != current.status.as_str());
     conn.execute(
         "
         UPDATE repo_memories
@@ -172,9 +207,14 @@ pub(crate) fn update_memory(
         replace_tags(conn, &update.memory_id, &tags)?;
     }
     upsert_memory_fts(conn, &update.memory_id)?;
-    memory_by_id(conn, &update.memory_id)?.ok_or_else(|| {
+    let memory = memory_by_id(conn, &update.memory_id)?.ok_or_else(|| {
         anyhow::anyhow!("updated memory `{}` could not be read back", update.memory_id)
-    })
+    })?;
+    // Author NodeUpdate (+ NodeStatus on a status change) in the SAME txn; an authoring error drops
+    // `tx` → the UPDATE rolls back.
+    authoring::author_update(&tx, &memory, content_changed, status_changed, now)?;
+    tx.commit()?;
+    Ok(memory)
 }
 pub(crate) fn mark_obsolete(conn: &Connection, memory_id: &str) -> anyhow::Result<RepoMemory> {
     update_memory(conn, RepoMemoryUpdate {

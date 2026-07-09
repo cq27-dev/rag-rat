@@ -1,8 +1,6 @@
 mod api;
-// The op-log authoring seam (#524): row→op translation + the one-time full backfill. Unwired to
-// the live write path this increment (only its tests drive it), so it is dead in a non-test build
-// — the next increment calls `backfill_memory_oplog` from `create_memory` and the allow drops.
-#[cfg_attr(not(test), allow(dead_code))]
+// The op-log authoring seam: row→op translation, the one-time full backfill, and the live
+// `author_*` helpers the memory mutations call in-transaction (#532).
 mod authoring;
 mod edges;
 mod hydrate;

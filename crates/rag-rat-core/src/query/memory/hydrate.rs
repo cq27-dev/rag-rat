@@ -71,14 +71,26 @@ pub(crate) fn duplicate_memory_id(
     .optional()
     .map_err(Into::into)
 }
+/// The canonical tag-SET form — trimmed, empties dropped, deduped, sorted. [`replace_tags`] STORES
+/// this shape and [`tags_for_memory`] reads it back sorted, so comparing `normalize_tags(input)`
+/// against a stored set is a stable "did the tags actually change?" test (a whitespace- or
+/// duplicate-only difference is NOT a change — the op-log update-detection relies on this).
+pub(crate) fn normalize_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> =
+        tags.iter().map(|tag| tag.trim().to_string()).filter(|tag| !tag.is_empty()).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 pub(crate) fn replace_tags(
     conn: &Connection,
     memory_id: &str,
     tags: &[String],
 ) -> anyhow::Result<()> {
     conn.execute("DELETE FROM repo_memory_tags WHERE memory_id = ?1", [memory_id])?;
-    for tag in tags.iter().map(|tag| tag.trim()).filter(|tag| !tag.is_empty()) {
-        validate_len("tag", tag, 64)?;
+    for tag in normalize_tags(tags) {
+        validate_len("tag", &tag, 64)?;
         conn.execute(
             "INSERT OR IGNORE INTO repo_memory_tags(memory_id, tag) VALUES (?1, ?2)",
             params![memory_id, tag],

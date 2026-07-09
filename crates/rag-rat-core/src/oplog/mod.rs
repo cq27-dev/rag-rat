@@ -46,13 +46,11 @@ mod stream;
 // private, so this curated re-export is the ONE seam `query::memory` reaches through — and the only
 // direction of the dependency (`oplog` never depends back on `query::memory`).
 pub(crate) use identity::local_device;
-pub(crate) use op::{EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
-// The rest of the minting API completes the frozen surface but is unconsumed until the
-// live-wiring increment: `author_in_tx` / `author_op` mint ONE op (composed into a mutation
-// txn, or standalone), and `author_batch` is the standalone genesis-batch wrapper (the
-// backfill instead drives `author_genesis_in_tx` inside the txn it opens to snapshot memories
-// atomically).
+pub(crate) use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
+// `author_op` / `author_batch` are the standalone (own-txn) wrappers — still only test-used,
+// so their re-export stays `allow(unused_imports)`. The live write path uses the in-txn
+// primitives.
 #[allow(unused_imports)]
-pub(crate) use store::{author_batch, author_in_tx, author_op};
-pub(crate) use store::{author_genesis_in_tx, chain_tail};
-pub(crate) use stream::owner_stream;
+pub(crate) use store::{author_batch, author_op};
+pub(crate) use store::{author_genesis_in_tx, author_in_tx, chain_tail};
+pub(crate) use stream::{StreamId, owner_stream};

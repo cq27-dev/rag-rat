@@ -12,6 +12,7 @@
 //! once its target repo is indexed and its `target_repo_id` self-heals across a repo-id re-point.
 
 use super::*;
+use crate::query::memory::authoring;
 
 /// The relation an edge expresses, from a source memory node to its target. Persisted in
 /// `repo_node_edges.relation`; the db tokens are the snake_case variant names.
@@ -185,6 +186,17 @@ pub(crate) fn add_edge(
         EdgeTarget::Github { .. } => (hint_repo_id.clone(), None, "current".to_string()),
     };
     let now = now_ms();
+    // Backfill the pre-existing history (idempotent) + the edge INSERT + the EdgeAdd op in ONE
+    // transaction (strict-atomic); the write via `conn` participates in the open txn.
+    authoring::backfill_memory_oplog(conn, now)?;
+    let tx = conn.unchecked_transaction()?;
+    // Whether this is a GENUINELY new edge vs an idempotent re-add: the INSERT below is
+    // `ON CONFLICT DO UPDATE` refreshing ONLY the per-device resolution columns
+    // (`target_repo_id`/`target_node_id`/`anchor_status`) — state the log deliberately excludes (no
+    // `Rebind`). A re-add therefore changes nothing log-relevant, so it must NOT author a second
+    // `EdgeAdd`: re-asserting presence at a fresh Lamport could resurrect a concurrent remove from
+    // another device under sync (the symmetric partner of `remove_edge`'s `n > 0` gate).
+    let edge_is_new = edge_by_key(conn, &key)?.is_none();
     conn.execute(
         "
         INSERT INTO repo_node_edges(
@@ -210,6 +222,19 @@ pub(crate) fn add_edge(
             now
         ],
     )?;
+    if edge_is_new {
+        authoring::author_edge_add(
+            &tx,
+            source_node_id,
+            relation,
+            &target_repo_id,
+            target_kind,
+            &target_anchor,
+            &owner_repo_id,
+            now,
+        )?;
+    }
+    tx.commit()?;
     edge_by_key(conn, &key)?.ok_or_else(|| anyhow::anyhow!("edge `{key}` disappeared after insert"))
 }
 
@@ -217,10 +242,18 @@ pub(crate) fn add_edge(
 pub(crate) fn remove_edge(conn: &Connection, edge_key: &str) -> anyhow::Result<bool> {
     let scope = memory_repo_scope(conn)?;
     let repo_clause = periphery_edge_scope_clause(&scope);
+    let now = now_ms();
+    authoring::backfill_memory_oplog(conn, now)?;
+    let tx = conn.unchecked_transaction()?;
     let n = conn
         .execute(&format!("DELETE FROM repo_node_edges WHERE edge_key = ?1{repo_clause}"), [
             edge_key,
         ])?;
+    if n > 0 {
+        // Author an EdgeRemove tombstone ONLY when a row was actually removed, in the same txn.
+        authoring::author_edge_remove(&tx, edge_key, now)?;
+    }
+    tx.commit()?;
     Ok(n > 0)
 }
 
