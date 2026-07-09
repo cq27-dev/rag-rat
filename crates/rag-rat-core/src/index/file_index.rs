@@ -76,76 +76,26 @@ impl IndexDatabase {
         text: &str,
         scope: &FileScope,
     ) -> anyhow::Result<()> {
-        if language != Language::Markdown && kind != TargetKind::Generated {
-            if text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
-                // Large source files are intentionally coarse-indexed to keep full-repo indexing
-                // responsive. This is not a parser failure.
-            } else if let Some(message) = parser::parse_error(path, language, text)
-                .unwrap_or_else(|err| Some(err.to_string()))
-            {
-                self.insert_parser_failure(path, language, &message)?;
-            }
-        }
-        let sha256 = hex_sha256(text.as_bytes());
-        let chunks = if kind == TargetKind::Generated {
-            chunker::generated_chunks_for_file(path, text)
-        } else {
-            chunker::chunks_for_file(path, language, text)
+        // Heal path: prepare from the bytes already in hand through the SAME single-parse core the
+        // full-rebuild / changed-file passes use, then route through `insert_prepared_file` in
+        // incremental mode (`graph = None`). ONE tree-sitter parse instead of 5, and no duplicated
+        // generated-file gate / parser-failure / chunk-source / has_test_code logic (#518).
+        // `heal_file`'s `remove_file_in_scope` already cleared the prior file row and its parser
+        // failure, so the incremental insert writes the live generation in place; `full_path` is
+        // unused by the insert (the bytes are already parsed).
+        let content = prepare_index_content_from_text(path, language, kind, text, modified_at_ms);
+        let prepared_file = PreparedIndexFile {
+            file: IndexFile {
+                full_path: path.to_path_buf(),
+                relative_path: path.to_path_buf(),
+                language,
+                kind,
+                commit_sha: scope.commit_sha.clone(),
+                worktree_id: scope.worktree_id.clone(),
+            },
+            prepared: Ok(content),
         };
-        // No shared tree on the heal path yet (it re-parses per derivation, #518), so the
-        // low-signal gate keeps its text-based fallback here.
-        let chunks = prepare_chunks(path, language.as_str(), kind.as_str(), chunks, text, None);
-        // has_test_code from the SAME chunk-text marker set as insert_prepared_file + the V024
-        // backfill, so a file healed through this path matches a fully-indexed one (#77). The heal
-        // path is a second files-insert site; chunks are prepared up here (they don't need file_id)
-        // so the flag can be set in the INSERT instead of left at the default 0.
-        let has_test_code = chunks.iter().any(|pc| text_has_test_marker(&pc.chunk.text));
-        let file_id = self.storage.connection().query_row(
-            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-             indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code, repo_id, \
-             generation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             RETURNING id",
-            params![
-                path_string(path),
-                language.as_str(),
-                kind.as_str(),
-                sha256,
-                modified_at_ms,
-                file_is_generated(kind, &path_string(path)),
-                now_ms(),
-                sha256,
-                &scope.commit_sha,
-                &scope.worktree_id,
-                has_test_code,
-                self.active_repo_id,
-                // A6: heal writes land on the connection's live generation.
-                self.active_generation,
-            ],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let symbols =
-            if kind == TargetKind::Generated || text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
-                Vec::new()
-            } else {
-                symbols::symbols_for_file(path, language, text)
-            };
-        // Inline/heal path: keep chunk_fts in sync per row (partial file replace would otherwise
-        // desync the external-content index until the next forced rebuild).
-        self.insert_chunks(ChunkInsertFile { file_id, source_revision: &sha256 }, &chunks)?;
-        let symbol_ids = self.insert_symbols(file_id, language, &symbols)?;
-        // (#232 #6) Skip generated files on the incremental/heal path too — same write-side hygiene
-        // and the same `file_is_generated` arg as the full-rebuild prepare gate (prep.rs). Catches
-        // PATH-heuristic codegen under a Source target (`src/generated/*.rs`, `*.d.ts`); the
-        // `kind=Generated` case is already symbol-empty above.
-        if !file_is_generated(kind, &path_string(path)) {
-            self.store_symbol_fingerprints(language, path, text, &symbols, &symbol_ids)?;
-        }
-        if kind != TargetKind::Generated && text.len() <= edges::MAX_GRAPH_PARSE_BYTES {
-            edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
-        }
-        self.mark_fts_dirty()?;
-        Ok(())
+        self.insert_prepared_file(&prepared_file, None)
     }
 
     /// `graph`: on a full rebuild, `Some` accumulator — symbols (with their new DB ids) and
@@ -278,38 +228,6 @@ impl IndexDatabase {
         }
         self.mark_fts_dirty()?;
         Ok(())
-    }
-
-    /// Compute + persist baseline clone fingerprints for the file's function symbols (#215). A
-    /// fingerprint is a pure function of the symbol body, so it is scope-independent and keyed by
-    /// symbol_id; the FK cascade discards it when the symbol is removed on reindex. Re-parses the
-    /// file to walk the AST — the incremental/heal path that calls this already re-reads the file,
-    /// so the extra parse is local to that path. The full-rebuild path computes fingerprints in the
-    /// parallel prepare phase (#230) and calls `write_symbol_fingerprints` directly instead.
-    fn store_symbol_fingerprints(
-        &self,
-        language: Language,
-        path: &Path,
-        text: &str,
-        symbols: &[Symbol],
-        symbol_ids: &[i64],
-    ) -> anyhow::Result<()> {
-        // `kind == "function"` symbols AND function-valued `const` declarators are fingerprinted
-        // (#215; #232 #5). This is a node-free PRE-PARSE early-bail, so it can only widen on the
-        // `kind` SUPERSET — a function-valued declarator is `kind == "const"` (parser.rs) — and let
-        // `fingerprint_symbols` + `symbol_is_function_valued` reject plain-value consts AFTER the
-        // parse. Bail before re-parsing only when NO `function` and NO `const` symbol exists — the
-        // parse is the expensive part of this incremental/heal wrapper.
-        if symbols.iter().all(|s| s.kind != "function" && s.kind != "const") {
-            return Ok(());
-        }
-        let Some(parsed) = parser::parse_file(path, language, text) else {
-            return Ok(());
-        };
-        let fingerprints = clones::fingerprint_symbols(parsed.root(), text, language, symbols);
-        // Heal/inline path runs no full-rebuild finalize, so the LIVE df is kept current here via
-        // the per-token bump (drift-tolerated; see write_symbol_fingerprints).
-        self.write_symbol_fingerprints(symbol_ids, &fingerprints, BumpDf(true))
     }
 
     /// Write precomputed baseline clone fingerprints (#215). `fingerprints` carries

@@ -256,17 +256,38 @@ pub(crate) fn should_report_file_progress(current: usize, total: usize) -> bool 
 pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<PreparedIndexContent> {
     let text = fs::read_to_string(&file.full_path)?;
     let modified_at_ms = file_metadata_ms(&file.full_path)?;
+    Ok(prepare_index_content_from_text(
+        &file.relative_path,
+        file.language,
+        file.kind,
+        &text,
+        modified_at_ms,
+    ))
+}
+
+/// The parse-once core of [`prepare_index_content`], operating on text already in hand (no file
+/// I/O). ONE tree-sitter parse feeds chunks + symbols + edges + fingerprints + the parser-failure
+/// flag, instead of re-parsing the same file. Shared by the full-rebuild / changed-file prepare
+/// phase (which reads the file first) AND the heal path (`file_index::index_file`, which already
+/// holds the bytes) — so a lazily-healed file parses ONCE like a fully-indexed one instead of 5×
+/// (#518), and the two entry points can't drift on the generated-file gate, the chunk-source
+/// selection, or the parser-failure message.
+pub(crate) fn prepare_index_content_from_text(
+    relative_path: &Path,
+    language: Language,
+    kind: TargetKind,
+    text: &str,
+    modified_at_ms: i64,
+) -> PreparedIndexContent {
     let sha256 = hex_sha256(text.as_bytes());
 
-    // ONE tree-sitter parse per file, shared by chunks + symbols + edges + the parser-failure flag,
-    // instead of re-parsing the same file four times. Only for structural (non-generated,
-    // non-markdown) code within the parse-size cap; everything else takes the line-based paths.
-    let structural_eligible = file.kind != TargetKind::Generated
-        && file.language != Language::Markdown
+    // Only structural (non-generated, non-markdown) code within the parse-size cap gets a shared
+    // tree; everything else takes the line-based paths.
+    let structural_eligible = kind != TargetKind::Generated
+        && language != Language::Markdown
         && text.len() <= chunker::MAX_STRUCTURAL_PARSE_BYTES;
-    let parsed = structural_eligible
-        .then(|| parser::parse_file(&file.relative_path, file.language, &text))
-        .flatten();
+    let parsed =
+        structural_eligible.then(|| parser::parse_file(relative_path, language, text)).flatten();
 
     let symbols = parsed.as_ref().map(|p| symbols::from_parsed(&p.symbols)).unwrap_or_default();
 
@@ -282,22 +303,22 @@ pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<Prepared
         None
     };
 
-    let chunks = if file.kind == TargetKind::Generated {
-        chunker::generated_chunks_for_file(&file.relative_path, &text)
+    let chunks = if kind == TargetKind::Generated {
+        chunker::generated_chunks_for_file(relative_path, text)
     } else if let Some(p) = &parsed {
-        chunker::code_chunks_for_symbols(&file.relative_path, &text, &p.symbols)
+        chunker::code_chunks_for_symbols(relative_path, text, &p.symbols)
     } else {
         // Markdown, oversized, or a hard parse failure: line-based chunking, no shared tree.
-        chunker::chunks_for_file(&file.relative_path, file.language, &text)
+        chunker::chunks_for_file(relative_path, language, text)
     };
     // Precompute per-chunk hashes / anchor / embedding policy here, in parallel. The low-signal
     // gate classifies chunk spans against the shared tree (one parse per file, #516).
     let chunks = prepare_chunks(
-        &file.relative_path,
-        file.language.as_str(),
-        file.kind.as_str(),
+        relative_path,
+        language.as_str(),
+        kind.as_str(),
         chunks,
-        &text,
+        text,
         parsed.as_ref().map(|p| p.root()),
     );
 
@@ -305,14 +326,8 @@ pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<Prepared
     // index, remapped to the real DB id at insert time. Empty when there's no structural parse.
     let edge_candidates = match &parsed {
         Some(p) => {
-            let local = edges::IndexedSymbol::local_from_prepared(file.language, &symbols);
-            edges::edge_candidates_from_root(
-                &file.relative_path,
-                file.language,
-                &text,
-                p.root(),
-                &local,
-            )
+            let local = edges::IndexedSymbol::local_from_prepared(language, &symbols);
+            edges::edge_candidates_from_root(relative_path, language, text, p.root(), &local)
         },
         None => Vec::new(),
     };
@@ -327,16 +342,16 @@ pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<Prepared
     // codegen under a SOURCE target (`src/generated/*.rs`, `*.d.ts`) — those DO get symbols and
     // so used to get fingerprints. The arg is byte-identical to the `files.generated` INSERT
     // (file_index.rs), so the index skip and the read filter agree.
-    let symbol_fingerprints = if file_is_generated(file.kind, &path_string(&file.relative_path)) {
+    let symbol_fingerprints = if file_is_generated(kind, &path_string(relative_path)) {
         Vec::new()
     } else {
         parsed
             .as_ref()
-            .map(|p| clones::fingerprint_symbols(p.root(), &text, file.language, &symbols))
+            .map(|p| clones::fingerprint_symbols(p.root(), text, language, &symbols))
             .unwrap_or_default()
     };
 
-    Ok(PreparedIndexContent {
+    PreparedIndexContent {
         modified_at_ms,
         sha256,
         chunks,
@@ -344,7 +359,7 @@ pub(crate) fn prepare_index_content(file: &IndexFile) -> anyhow::Result<Prepared
         edge_candidates,
         symbol_fingerprints,
         parser_failure,
-    })
+    }
 }
 
 #[cfg(test)]

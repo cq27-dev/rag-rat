@@ -251,10 +251,11 @@ pub(crate) fn grammar_for(kind: ParserKind) -> Option<tree_sitter::Language> {
     })
 }
 
-/// A single tree-sitter parse of a file plus everything derived directly from the tree. The
-/// full-rebuild prepare phase parses each file ONCE through this and feeds the tree to chunking,
-/// symbols, and edges — instead of re-parsing the same file 4× (parse_error + chunker + symbols +
-/// edges). `tree` is kept so callers can walk it (e.g. edge extraction) without re-parsing.
+/// A single tree-sitter parse of a file plus everything derived directly from the tree. Both the
+/// full-rebuild prepare phase and the heal path parse each file ONCE through this and feed the tree
+/// to chunking, symbols, edges, and the parser-failure flag — instead of re-parsing the same file
+/// per derivation (#518). `tree` is kept so callers can walk it (e.g. edge extraction) without
+/// re-parsing.
 pub struct ParsedFile {
     tree: tree_sitter::Tree,
     pub symbols: Vec<ParsedSymbol>,
@@ -294,14 +295,6 @@ pub fn parse_symbols(
         Some(parsed) => Ok(parsed.symbols),
         // Markdown (no grammar) yields no symbols; a hard parse failure is the error case.
         None if parser_kind(path, language) == ParserKind::Markdown => Ok(Vec::new()),
-        None => Err(anyhow::anyhow!("tree-sitter parse failed")),
-    }
-}
-
-pub fn parse_error(path: &Path, language: Language, text: &str) -> anyhow::Result<Option<String>> {
-    match parse_file(path, language, text) {
-        Some(parsed) => Ok(parsed.parser_failure()),
-        None if parser_kind(path, language) == ParserKind::Markdown => Ok(None),
         None => Err(anyhow::anyhow!("tree-sitter parse failed")),
     }
 }

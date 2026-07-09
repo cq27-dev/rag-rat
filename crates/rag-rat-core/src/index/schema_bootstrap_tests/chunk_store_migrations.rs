@@ -754,6 +754,73 @@ fn files_has_test_code_flag_survives_the_heal_path() {
 }
 
 #[test]
+fn heal_reindexes_a_file_to_the_same_chunk_policies_as_a_full_rebuild() {
+    // #518: the heal path (`heal_file` -> `index_file`) now prepares each file through the SAME
+    // single-parse core (`prepare_index_content_from_text` -> `insert_prepared_file`) the
+    // full-rebuild / changed passes use, instead of its own 5×-parse derivation with a text-based
+    // low-signal fallback. This pins the end-to-end consequence: a file re-indexed by heal lands
+    // the SAME per-chunk `embedding_policy` (the span-based low-signal decision) as the full
+    // rebuild that first indexed it. If `index_file` ever regresses to a bespoke derivation,
+    // the policies drift and this fails.
+    let _poison = crate::index::poison_sibling::disable_poison_sibling();
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // A doc-comment + `use` block (low-signal) alongside real function bodies (embed) — the same
+    // shape as prep.rs's `span_and_text_low_signal_paths_agree_on_prepared_chunk_policies`, so both
+    // policy outcomes occur and the parity check below is non-vacuous.
+    let src = "//! Module documentation explaining what this file is for.\n\nuse \
+               std::collections::BTreeMap;\nuse std::collections::HashSet;\nuse \
+               std::path::PathBuf;\n\npub fn real_work(input: usize) -> usize {\n    let doubled \
+               = input * 2;\n    let shifted = doubled + 7;\n    shifted * shifted\n}\n\npub fn \
+               more_work(count: usize) -> usize {\n    let mut total = 0;\n    for step in \
+               0..count {\n        total += step;\n    }\n    total\n}\n";
+    fs::write(root.join("src/lib.rs"), src).unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let repo_id = crate::index::schema::active_repo_id(db.storage.connection()).unwrap();
+    // Content-keyed (not rowid-keyed: heal removes + re-inserts, so ids change) chunk-policy
+    // snapshot for the file, scoped to the active repo (the poison-sibling harness seeds a
+    // same-path row under a sibling repo).
+    let policies = || -> Vec<(i64, i64, String)> {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.start_byte, c.end_byte, c.embedding_policy
+                 FROM main.chunks c JOIN main.files f ON f.id = c.file_id
+                 WHERE f.path = 'src/lib.rs' AND f.repo_id = ?1
+                 ORDER BY c.start_byte, c.end_byte",
+            )
+            .unwrap();
+        stmt.query_map([&repo_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+
+    let before = policies();
+    assert!(
+        before.iter().any(|(.., p)| p == "SkipLowSignal"),
+        "fixture must exercise the low-signal outcome: {before:?}"
+    );
+    assert!(
+        before.iter().any(|(.., p)| p == "Embed"),
+        "fixture must exercise the embed outcome: {before:?}"
+    );
+
+    // Heal the UNCHANGED file: the heal derivation must reproduce the rebuild's chunk policies.
+    db.heal_file(std::path::Path::new("src/lib.rs")).unwrap();
+    assert_eq!(
+        policies(),
+        before,
+        "heal re-indexes the file to the same span-based chunk policies as the full rebuild (#518)"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn has_test_code_backfill_is_case_sensitive() {
     // PR #223 review: the V024 backfill must use the SAME case rules as the index-time
     // `str::contains` (case-sensitive). SQLite `LIKE` is case-insensitive for ASCII, so it would
