@@ -371,6 +371,48 @@ fn read_memory_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<Memo
     Ok(rows)
 }
 
+/// The repo's memories with NO projected node on `stream` — the rows the signed log is MISSING —
+/// in deterministic `(created_at_ms, id)` order, tags attached. On an EMPTY projection this is
+/// every memory (genesis); on a populated one, the ghosts a raw writer or an old binary left
+/// behind (#541).
+///
+/// Not yet called outside its own test — Task 3 (#541) wires this into the reconcile.
+#[allow(dead_code)]
+fn read_unauthored_memory_rows(
+    conn: &Connection,
+    repo_id: &str,
+    stream: StreamId,
+) -> anyhow::Result<Vec<MemoryRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.kind, m.title, m.body, m.confidence, m.status, m.source, m.payload_json
+         FROM repo_memories m
+         WHERE m.repo_id = ?1
+           AND NOT EXISTS (
+                 SELECT 1 FROM oplog_projected_nodes p
+                 WHERE p.stream_id = ?2 AND p.node_id = m.id)
+         ORDER BY m.created_at_ms, m.id",
+    )?;
+    let mut rows = stmt
+        .query_map(params![repo_id, stream.to_bytes().as_slice()], |row| {
+            Ok(MemoryRow {
+                memory_id: row.get(0)?,
+                kind: row.get(1)?,
+                title: row.get(2)?,
+                body: row.get(3)?,
+                confidence: row.get(4)?,
+                status: row.get(5)?,
+                source: row.get(6)?,
+                payload_json: row.get(7)?,
+                tags: Vec::new(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for row in &mut rows {
+        row.tags = tags_for_memory(conn, &row.memory_id)?;
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +569,24 @@ mod tests {
         };
         let err = memory_to_ops(&row, REPO, &[]).unwrap_err();
         assert!(err.to_string().contains("unknown status"), "an unknown status fails the backfill");
+    }
+
+    /// #541: the reconcile's memory reader anti-joins `repo_memories` against
+    /// `oplog_projected_nodes` — only a row with no projected node (never signed) comes back.
+    #[test]
+    fn read_unauthored_memory_rows_returns_only_rows_absent_from_the_projection() {
+        let conn = scoped_conn();
+        insert_memory(&conn, "mem_live", "active", 100);
+        insert_memory(&conn, "mem_ghost", "active", 200);
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        conn.execute(
+            "INSERT INTO oplog_projected_nodes(stream_id, node_id, content_json, status)
+             VALUES (?1, 'mem_live', '{}', 'active')",
+            params![stream.to_bytes().as_slice()],
+        )
+        .unwrap();
+        let missing = read_unauthored_memory_rows(&conn, REPO, stream).unwrap();
+        assert_eq!(missing.iter().map(|r| r.memory_id.as_str()).collect::<Vec<_>>(), ["mem_ghost"]);
     }
 
     #[test]
