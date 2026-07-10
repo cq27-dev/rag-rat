@@ -253,8 +253,8 @@ pub(crate) fn backfill_memory_oplog(conn: &Connection, now_ms: i64) -> anyhow::R
 /// consolidation uses to author freshly-imported (remapped) rows into the TARGET's owner stream
 /// under the TARGET's identity (#541). The source's pre-remap signed entries are intentionally NOT
 /// carried (they are signed under the source device over pre-remap ids). Wired into consolidation
-/// by Task 5 of #541.
-#[allow(dead_code)]
+/// by [`crate::index::consolidate::run`] (#541 Task 5), immediately after the import commits and
+/// before the legacy file is renamed away.
 pub(crate) fn reconcile_owner_stream_for_repo(
     conn: &Connection,
     repo_id: &str,
