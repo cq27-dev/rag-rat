@@ -11,10 +11,15 @@ use std::collections::BTreeSet;
 
 pub use api::memory_evidence_for_symbol;
 pub(crate) use api::*;
+// The scope-explicit reconcile entry (#541): `authoring` is a PRIVATE module, so
+// `index::consolidate` can only name this through a re-export. Wired into consolidation by
+// Task 5 of #541, so it stays `allow(unused_imports)` until that non-test caller lands.
+#[allow(unused_imports)]
+pub(crate) use authoring::reconcile_owner_stream_for_repo;
 // The typed-edge public surface (#464): the boundary types cross the FFI/MCP/CLI edge, so they
 // are `pub`; the query fns stay crate-internal.
 pub use edges::{EdgeRelation, EdgeTarget, NodeEdge};
-pub(crate) use edges::{add_edge, all_edges_from, edge_key, edges_from, edges_into, remove_edge};
+pub(crate) use edges::{add_edge, edge_key, edges_from, edges_into, remove_edge};
 pub(crate) use hydrate::*;
 pub(crate) use moniker::*;
 pub(crate) use resolve::*;
