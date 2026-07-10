@@ -60,7 +60,8 @@ pub const CLONE_DELTA_MAX_FILES: usize = 64;
 /// - `NotEligible` — no live Complete postings-aware generation to patch (or a full rebuild is in
 ///   flight, or an overlay scope is active); the caller falls back to the full-rebuild path.
 /// - `Escalate` — the delta is too large to patch in place (more changed files than the caller's
-///   cap); the caller schedules a full rebuild instead. Nothing was written.
+///   cap, or candidate hydration exceeded the posting-row work budget — #598); the caller schedules
+///   a full rebuild instead. Nothing was written.
 #[derive(Debug, Clone, Serialize)]
 pub struct CloneDeltaReport {
     pub status: String,
@@ -73,7 +74,18 @@ pub struct CloneDeltaReport {
     /// frozen df epoch owes a full rebuild — the caller lets the quiet-gated full path take it.
     pub full_rebuild_owed: bool,
     pub elapsed_ms: u64,
+    /// Posting rows candidate hydration ASKED for, cache hits included (#598) — the combinatorics
+    /// proxy the work budget meters: it also tracks the per-candidate verify CPU that follows,
+    /// which physical I/O alone (see `posting_rows_fetched`) stops measuring once hot lists are
+    /// served from the per-application cache.
+    pub posting_rows_requested: u64,
+    /// Posting rows physically read from `clone_subblock_postings` (cache misses only).
+    pub posting_rows_fetched: u64,
 }
+
+/// Floor for the derived posting-row work budget (#598), so small corpora — where even heavy
+/// token sharing is cheap in absolute terms — never flap a healthy delta to Escalate.
+const CLONE_DELTA_MIN_POSTING_ROW_BUDGET: u64 = 100_000;
 
 impl IndexDatabase {
     /// Apply one clone-graph delta toward the current `content_revision()`, bounded to
@@ -82,6 +94,27 @@ impl IndexDatabase {
     /// runs lock-stable outside a transaction, and all writes commit in ONE transaction, so a
     /// reader sees either the old graph or the fully-applied delta.
     pub fn apply_clone_graph_delta(&self, max_files: usize) -> anyhow::Result<CloneDeltaReport> {
+        self.apply_clone_graph_delta_inner(max_files, None)
+    }
+
+    /// [`Self::apply_clone_graph_delta`] with an explicit posting-row work budget — the test seam
+    /// for the #598 Escalate bail (production derives the budget from the generation's postings
+    /// table size). Test-gated like other test-only helpers, or non-test clippy fails on
+    /// dead_code (#467).
+    #[cfg(test)]
+    pub(crate) fn apply_clone_graph_delta_with_budget(
+        &self,
+        max_files: usize,
+        posting_row_budget: u64,
+    ) -> anyhow::Result<CloneDeltaReport> {
+        self.apply_clone_graph_delta_inner(max_files, Some(posting_row_budget))
+    }
+
+    fn apply_clone_graph_delta_inner(
+        &self,
+        max_files: usize,
+        posting_row_budget: Option<u64>,
+    ) -> anyhow::Result<CloneDeltaReport> {
         let started = Instant::now();
         let conn = self.storage.connection();
 
@@ -182,13 +215,26 @@ impl IndexDatabase {
         //
         // Deliberately NO #271 hot-token filtering anywhere below: the persisted-graph build
         // walks every sub-block token uncapped (the cap belongs to the live candidate paths), so
-        // the delta must too — see the module doc's parity discipline.
+        // the delta must too — see the module doc's parity discipline. What IS bounded (#598) is
+        // the delta's total hydration work: the file-count cap above can't see posting fan-out,
+        // and a ≤`max_files` delta whose bags hit hot tokens was observed grinding one core for
+        // 38+ minutes under the write lock. When hydration requests more posting rows than the
+        // budget, the delta escalates — the same nothing-written escape as the file-count bail,
+        // and the full rebuild (budgeted + resumable) reads each posting once anyway. Default
+        // budget: ~two sweeps of the generation's postings table; past that the rebuild is
+        // provably competitive on I/O and the per-candidate verify CPU is the next cliff.
+        let posting_row_budget = match posting_row_budget {
+            Some(budget) => budget,
+            None =>
+                CLONE_DELTA_MIN_POSTING_ROW_BUDGET.max(2 * postings_row_count(conn, generation)?),
+        };
 
         let delta_path_set: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
         let by_id: BTreeMap<i64, &SymbolBag> =
             delta_bags.iter().map(|b| (b.symbol_id, b)).collect();
         let mut edge_batch: Vec<EdgeRow> = Vec::new();
         let mut posting_groups: Vec<PostingGroup> = Vec::new();
+        let mut hydrator = CandidateHydrator::new(generation, &delta_path_set, posting_row_budget);
 
         // (a) delta symbol vs the UNCHANGED corpus.
         for bag in &delta_bags {
@@ -211,9 +257,24 @@ impl IndexDatabase {
             }
 
             // Near candidates via the persisted postings (every sub-block token, uncapped —
-            // build parity).
-            let candidates =
-                hydrate_posting_candidates(conn, generation, sub, &bag.language, &delta_path_set)?;
+            // build parity), memoized across bags and metered against the work budget (#598).
+            let Some(candidates) = hydrator.candidates(conn, sub, &bag.language)? else {
+                return Ok(CloneDeltaReport {
+                    posting_rows_requested: hydrator.posting_rows_requested,
+                    posting_rows_fetched: hydrator.posting_rows_fetched,
+                    ..report(
+                        "Escalate",
+                        Some(
+                            "posting hydration exceeded the delta work budget — a full rebuild is \
+                             cheaper",
+                        ),
+                        paths.len() as u64,
+                        0,
+                        0,
+                        started,
+                    )
+                });
+            };
             for (t_bag, t_anchor) in candidates {
                 if t_anchor.0 == s_anchor.0 && t_anchor.1 == s_anchor.1 {
                     continue; // self
@@ -356,6 +417,8 @@ impl IndexDatabase {
                 conn.execute_batch("COMMIT")?;
                 Ok(CloneDeltaReport {
                     full_rebuild_owed: drift_after(paths.len() as i64),
+                    posting_rows_requested: hydrator.posting_rows_requested,
+                    posting_rows_fetched: hydrator.posting_rows_fetched,
                     ..report(
                         "Applied",
                         None,
@@ -390,6 +453,8 @@ fn report(
         edges_removed,
         full_rebuild_owed: false,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        posting_rows_requested: 0,
+        posting_rows_fetched: 0,
     }
 }
 
@@ -506,111 +571,261 @@ fn old_struct_partners(
     Ok(partners)
 }
 
-/// Resolve + hydrate the persisted-postings candidates for one delta bag's non-hot sub-block
-/// tokens: postings rows → distinct anchors → scoped bags with the BUILD-corpus filters and the
-/// `file_sha` read-staleness discipline (a posting whose anchor sha no longer matches the current
-/// `files.sha256` is dead weight from a torn state — never a live candidate). Anchors under the
-/// delta files are excluded (their postings were just accounted for deletion; their pairs belong
-/// to the delta-vs-delta stage).
-fn hydrate_posting_candidates(
-    conn: &Connection,
+/// The generation's persisted posting-row count — sizes the default #598 work budget.
+/// (`clone_subblock_postings` is generation-keyed, not `repo_id`-scoped: the generation id —
+/// itself resolved repo-scoped — is the scope.)
+fn postings_row_count(conn: &Connection, generation: i64) -> anyhow::Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM clone_subblock_postings WHERE build_generation = ?1",
+        [generation],
+        |r| r.get(0),
+    )?;
+    Ok(count.max(0) as u64)
+}
+
+/// One delta application's candidate-hydration state (#598), replacing the bare per-bag query.
+/// Two properties that query lacked:
+/// - MEMOIZATION: posting lists (`postings_by_token`) and hydrated anchors (`bags_by_anchor`) are
+///   cached across bags. Hot tokens are shared by MANY bags — the observed pathology re-walked the
+///   same ~3k-row posting lists once per bag, cold page by cold page, for 38+ minutes under the
+///   write lock.
+/// - METERING: every posting row a bag's tokens ask for counts against `budget`, CACHE HITS
+///   INCLUDED — requested rows are the combinatorics proxy (each hydrated candidate also buys a
+///   `verified_clone` call later), which physical I/O stops measuring once hot lists are cached.
+///   Exhaustion surfaces as `Ok(None)`; the caller escalates to the full rebuild with nothing
+///   written.
+///
+/// Corpus-filter PARITY with the build is unchanged (the module-doc discipline): anchor
+/// hydration keeps `generated = 0`, baseline + `NORM_VERSION`, non-NULL bag, and the posting-sha
+/// staleness check. The per-bag LANGUAGE filter moved from the hydration SQL to the assembly
+/// step — an anchor is hydrated once and served to any bag whose language matches, returning
+/// exactly the rows a per-bag query would.
+struct CandidateHydrator<'a> {
     generation: i64,
-    tokens: &[i64],
-    language: &str,
-    delta_path_set: &BTreeSet<&str>,
-) -> anyhow::Result<Vec<(SymbolBag, Anchor)>> {
-    if tokens.is_empty() {
-        return Ok(Vec::new());
-    }
-    // 1. Candidate anchors from the postings.
-    let mut anchor_sha: BTreeMap<(String, i64), String> = BTreeMap::new();
-    for chunk in tokens.chunks(DELTA_SQL_CHUNK) {
-        let placeholders: Vec<String> = (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT path, start_byte, file_sha FROM clone_subblock_postings
-              WHERE build_generation = ?1 AND token_hash IN ({})",
-            placeholders.join(", ")
-        ))?;
-        let mut values: Vec<Value> = Vec::with_capacity(1 + chunk.len());
-        values.push(Value::Integer(generation));
-        values.extend(chunk.iter().map(|&t| Value::Integer(t)));
-        let rows = stmt.query_map(params_from_iter(values), |r| {
-            Ok(((r.get::<_, String>(0)?, r.get::<_, i64>(1)?), r.get::<_, String>(2)?))
-        })?;
-        for row in rows {
-            let (key, sha) = row?;
-            if delta_path_set.contains(key.0.as_str()) {
-                continue;
-            }
-            anchor_sha.entry(key).or_insert(sha);
+    delta_path_set: &'a BTreeSet<&'a str>,
+    /// token_hash → its posting rows (anchor path, start_byte, build-time file sha). A token
+    /// with no postings caches an EMPTY list so it is never re-queried.
+    postings_by_token: BTreeMap<i64, Vec<(String, i64, String)>>,
+    /// (path, start_byte) → decoded bag + LIVE file sha, or `None` when the anchor doesn't
+    /// hydrate under the build-corpus filters (no fingerprint row, NULL/undecodable bag) — the
+    /// negative is cached too, or every bag sharing the token would re-query it.
+    bags_by_anchor: BTreeMap<(String, i64), Option<HydratedAnchor>>,
+    posting_rows_requested: u64,
+    posting_rows_fetched: u64,
+    budget: u64,
+}
+
+struct HydratedAnchor {
+    bag: SymbolBag,
+    live_sha: String,
+}
+
+impl<'a> CandidateHydrator<'a> {
+    fn new(generation: i64, delta_path_set: &'a BTreeSet<&'a str>, budget: u64) -> Self {
+        Self {
+            generation,
+            delta_path_set,
+            postings_by_token: BTreeMap::new(),
+            bags_by_anchor: BTreeMap::new(),
+            posting_rows_requested: 0,
+            posting_rows_fetched: 0,
+            budget,
         }
-    }
-    if anchor_sha.is_empty() {
-        return Ok(Vec::new());
     }
 
-    // 2. Hydrate only those anchors, with staleness + corpus filters.
-    let keys: Vec<(String, i64)> = anchor_sha.keys().cloned().collect();
-    let mut out: Vec<(SymbolBag, Anchor)> = Vec::new();
-    for chunk in keys.chunks(DELTA_SQL_CHUNK / 2) {
-        let tuples: Vec<String> =
-            (0..chunk.len()).map(|i| format!("(?{}, ?{})", 2 * i + 3, 2 * i + 4)).collect();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT f.path, s.start_byte, f.sha256, s.language, sf.struct_hash, sf.token_len,
-                    sf.token_bag, s.id
-               FROM symbol_fingerprints sf
-               JOIN symbols s ON s.id = sf.symbol_id
-               JOIN files f ON f.id = s.file_id
-              WHERE sf.normalizer_kind = 'baseline' AND sf.normalizer_version = ?1
-                AND f.generated = 0 AND s.language = ?2
-                AND (f.path, s.start_byte) IN (VALUES {})",
-            tuples.join(", ")
-        ))?;
-        let mut values: Vec<Value> = Vec::with_capacity(2 + 2 * chunk.len());
-        values.push(Value::Integer(NORM_VERSION));
-        values.push(Value::Text(language.to_string()));
-        for (path, start_byte) in chunk {
-            values.push(Value::Text(path.clone()));
-            values.push(Value::Integer(*start_byte));
+    /// Hydrated candidates for one bag's sub-block `tokens`: distinct non-delta anchors from the
+    /// tokens' posting lists whose build-time sha still matches the live file (a stale posting is
+    /// dead weight from a torn state — never a live candidate) and whose symbol language matches.
+    /// `Ok(None)` = the work budget is exhausted; the caller escalates.
+    fn candidates(
+        &mut self,
+        conn: &Connection,
+        tokens: &[i64],
+        language: &str,
+    ) -> anyhow::Result<Option<Vec<(SymbolBag, Anchor)>>> {
+        if tokens.is_empty() {
+            return Ok(Some(Vec::new()));
         }
-        let rows = stmt.query_map(params_from_iter(values), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, Option<Vec<u8>>>(6)?,
-                r.get::<_, i64>(7)?,
-            ))
-        })?;
-        for row in rows {
-            let (path, start_byte, live_sha, lang, struct_hash, token_len, blob, symbol_id) = row?;
-            if anchor_sha.get(&(path.clone(), start_byte)).is_none_or(|s| *s != live_sha) {
-                continue; // the anchor's build-time sha must still be the current sha
+        // Fetch the missing posting lists. Rows streamed here are counted as BOTH fetched and
+        // requested (the fetch happens on behalf of this asking bag), so a first giant list
+        // trips the budget MID-STREAM instead of after materializing it.
+        let Some(just_fetched) = self.load_postings(conn, tokens)? else {
+            return Ok(None);
+        };
+        // Cache-hit tokens' rows are requested-only; `just_fetched` ones were already counted.
+        for token in tokens {
+            if just_fetched.contains(token) {
+                continue;
             }
-            let Some(blob) = blob else { continue };
-            let Some(bag_pairs) = crate::index::clones::bag_blob::decode_token_bag(&blob) else {
+            let len = self.postings_by_token.get(token).map_or(0, |rows| rows.len() as u64);
+            self.posting_rows_requested += len;
+            if self.posting_rows_requested > self.budget {
+                return Ok(None);
+            }
+        }
+        // Distinct candidate anchors for THIS bag (first-seen posting sha wins, matching the
+        // pre-#598 `or_insert`), excluding anchors under the delta files (their postings were
+        // just accounted for deletion; their pairs belong to the delta-vs-delta stage).
+        let mut anchor_sha: BTreeMap<(String, i64), String> = BTreeMap::new();
+        for token in tokens {
+            let Some(rows) = self.postings_by_token.get(token) else { continue };
+            for (path, start_byte, file_sha) in rows {
+                if self.delta_path_set.contains(path.as_str()) {
+                    continue;
+                }
+                anchor_sha.entry((path.clone(), *start_byte)).or_insert_with(|| file_sha.clone());
+            }
+        }
+        if anchor_sha.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        self.hydrate_anchors(conn, &anchor_sha)?;
+        let mut out: Vec<(SymbolBag, Anchor)> = Vec::new();
+        for ((path, start_byte), posting_sha) in &anchor_sha {
+            let Some(Some(hydrated)) = self.bags_by_anchor.get(&(path.clone(), *start_byte)) else {
                 continue;
             };
-            let tokens = bag_pairs
-                .into_iter()
-                .map(|(token_hash, freq)| super::substrate::TokenPosting {
-                    token_hash,
-                    freq,
-                    // df is irrelevant for the VERIFY side (overlap ignores it); DF_FALLBACK
-                    // keeps the struct well-formed without loading the df map per candidate.
-                    coalesced_df: super::substrate::DF_FALLBACK,
-                })
-                .collect();
+            if hydrated.bag.language != language || hydrated.live_sha != *posting_sha {
+                continue;
+            }
             out.push((
-                SymbolBag { symbol_id, language: lang, struct_hash, token_len, tokens },
-                (path, start_byte, live_sha),
+                hydrated.bag.clone(),
+                (path.clone(), *start_byte, hydrated.live_sha.clone()),
             ));
         }
+        Ok(Some(out))
     }
-    Ok(out)
+
+    /// Load the posting lists for `tokens` not yet cached, metering streamed rows. Returns the
+    /// set of tokens fetched by THIS call (their rows are already counted as requested), or
+    /// `None` when the budget tripped mid-stream.
+    fn load_postings(
+        &mut self,
+        conn: &Connection,
+        tokens: &[i64],
+    ) -> anyhow::Result<Option<BTreeSet<i64>>> {
+        let missing: Vec<i64> =
+            tokens.iter().copied().filter(|t| !self.postings_by_token.contains_key(t)).collect();
+        for &token in &missing {
+            // Pre-seed empty so a no-postings token is cached (never re-queried) even when the
+            // stream below returns nothing for it.
+            self.postings_by_token.insert(token, Vec::new());
+        }
+        for chunk in missing.chunks(DELTA_SQL_CHUNK) {
+            let placeholders: Vec<String> =
+                (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT token_hash, path, start_byte, file_sha FROM clone_subblock_postings
+                  WHERE build_generation = ?1 AND token_hash IN ({})",
+                placeholders.join(", ")
+            ))?;
+            let mut values: Vec<Value> = Vec::with_capacity(1 + chunk.len());
+            values.push(Value::Integer(self.generation));
+            values.extend(chunk.iter().map(|&t| Value::Integer(t)));
+            let rows = stmt.query_map(params_from_iter(values), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (token, path, start_byte, file_sha) = row?;
+                self.posting_rows_fetched += 1;
+                self.posting_rows_requested += 1;
+                if self.posting_rows_requested > self.budget {
+                    return Ok(None);
+                }
+                self.postings_by_token.entry(token).or_default().push((path, start_byte, file_sha));
+            }
+        }
+        Ok(Some(missing.into_iter().collect()))
+    }
+
+    /// Batch-hydrate the anchors in `anchor_sha` not yet cached, with the BUILD-corpus filters
+    /// (parity: `generated = 0`, baseline + `NORM_VERSION`, non-NULL decodable bag). Anchors the
+    /// query does not return cache `None`.
+    fn hydrate_anchors(
+        &mut self,
+        conn: &Connection,
+        anchor_sha: &BTreeMap<(String, i64), String>,
+    ) -> anyhow::Result<()> {
+        let missing: Vec<(String, i64)> = anchor_sha
+            .keys()
+            .filter(|key| !self.bags_by_anchor.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in &missing {
+            self.bags_by_anchor.insert(key.clone(), None);
+        }
+        for chunk in missing.chunks(DELTA_SQL_CHUNK / 2) {
+            let tuples: Vec<String> =
+                (0..chunk.len()).map(|i| format!("(?{}, ?{})", 2 * i + 2, 2 * i + 3)).collect();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT f.path, s.start_byte, f.sha256, s.language, sf.struct_hash, sf.token_len,
+                        sf.token_bag, s.id
+                   FROM symbol_fingerprints sf
+                   JOIN symbols s ON s.id = sf.symbol_id
+                   JOIN files f ON f.id = s.file_id
+                  WHERE sf.normalizer_kind = 'baseline' AND sf.normalizer_version = ?1
+                    AND f.generated = 0
+                    AND (f.path, s.start_byte) IN (VALUES {})",
+                tuples.join(", ")
+            ))?;
+            let mut values: Vec<Value> = Vec::with_capacity(1 + 2 * chunk.len());
+            values.push(Value::Integer(NORM_VERSION));
+            for (path, start_byte) in chunk {
+                values.push(Value::Text(path.clone()));
+                values.push(Value::Integer(*start_byte));
+            }
+            let rows = stmt.query_map(params_from_iter(values), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, Option<Vec<u8>>>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            })?;
+            for row in rows {
+                let (path, start_byte, live_sha, lang, struct_hash, token_len, blob, symbol_id) =
+                    row?;
+                let Some(blob) = blob else { continue };
+                let Some(bag_pairs) = crate::index::clones::bag_blob::decode_token_bag(&blob)
+                else {
+                    continue;
+                };
+                let tokens = bag_pairs
+                    .into_iter()
+                    .map(|(token_hash, freq)| super::substrate::TokenPosting {
+                        token_hash,
+                        freq,
+                        // df is irrelevant for the VERIFY side (overlap ignores it); DF_FALLBACK
+                        // keeps the struct well-formed without loading the df map per candidate.
+                        coalesced_df: super::substrate::DF_FALLBACK,
+                    })
+                    .collect();
+                self.bags_by_anchor.insert(
+                    (path.clone(), start_byte),
+                    Some(HydratedAnchor {
+                        bag: SymbolBag {
+                            symbol_id,
+                            language: lang,
+                            struct_hash,
+                            token_len,
+                            tokens,
+                        },
+                        live_sha,
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1167,5 +1382,74 @@ mod tests {
             .unwrap();
         assert_eq!(applied, 1, "the drift counter absorbed one file");
         assert!(!db.pending_clone_graph().unwrap(), "the graph reads as current after the delta");
+    }
+    /// #598: the file-count Escalate bail can't see posting fan-out — a ≤64-file delta whose bags
+    /// hit hot tokens hydrates candidate posting lists uncapped (build parity forbids filtering)
+    /// and was observed pinning a core for 38+ minutes under the write lock. The delta now also
+    /// escalates when hydration REQUESTS more posting rows than its work budget — same escape as
+    /// the file-count bail: nothing written, the caller schedules the (budgeted, resumable) full
+    /// rebuild.
+    #[test]
+    fn delta_escalates_when_posting_hydration_exceeds_the_work_budget() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-work-budget");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        drop(db);
+
+        // A near-clone family member: its bag's tokens hit the corpus postings, so hydration
+        // requests a non-zero number of posting rows — more than a zero budget allows.
+        std::fs::write(
+            config.root.join("src/c.rs"),
+            "pub fn load_invoice(db: Db) -> i32 { let v = db.get(30); validate(v); v + 1 }\n",
+        )
+        .unwrap();
+        let db = reindex(&config);
+        let before = edge_keys(&db);
+
+        let report = db.apply_clone_graph_delta_with_budget(64, 0).unwrap();
+        assert_eq!(report.status, "Escalate", "budget exhaustion escalates: {report:?}");
+        assert!(
+            report.reason.as_deref().is_some_and(|r| r.contains("work budget")),
+            "the reason names the work budget: {report:?}"
+        );
+        assert!(report.posting_rows_requested > 0, "the bail happened because rows were owed");
+        assert_eq!(edge_keys(&db), before, "an escalated delta writes nothing");
+
+        // The default budget applies the same delta — the bail is about pathology, not size 1.
+        let report = db.apply_clone_graph_delta(64).unwrap();
+        assert_eq!(report.status, "Applied", "{report:?}");
+    }
+
+    /// #598: posting lists are hydrated ONCE per token per delta application — bags sharing hot
+    /// tokens re-use the cached rows instead of re-walking the same b-tree lists (the observed
+    /// pathology re-walked ~3k-row lists once per bag). `posting_rows_requested` deliberately
+    /// still counts cache hits (it is the combinatorics proxy the work budget meters), so
+    /// memoization shows as fetched < requested.
+    #[test]
+    fn posting_hydration_memoizes_shared_tokens_across_bags() {
+        let _poison = crate::index::poison_sibling::disable_poison_sibling();
+        let config = clone_fixture_config("delta-hydration-memo");
+        let db = crate::IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        drop(db);
+
+        // TWO near-identical family members in the delta: their sub-block prefixes share tokens,
+        // so the second bag's hydration must hit the first's cached posting lists.
+        std::fs::write(
+            config.root.join("src/c.rs"),
+            "pub fn load_invoice(db: Db) -> i32 { let v = db.get(30); validate(v); v + 1 }\npub \
+             fn load_receipt(db: Db) -> i32 { let r = db.get(40); validate(r); r + 1 }\n",
+        )
+        .unwrap();
+        let db = reindex(&config);
+
+        let report = db.apply_clone_graph_delta(64).unwrap();
+        assert_eq!(report.status, "Applied", "{report:?}");
+        assert!(report.posting_rows_fetched > 0, "hydration touched the postings: {report:?}");
+        assert!(
+            report.posting_rows_fetched < report.posting_rows_requested,
+            "shared tokens are served from the per-application cache: {report:?}"
+        );
     }
 }
