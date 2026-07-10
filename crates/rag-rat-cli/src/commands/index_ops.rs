@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use rag_rat_core::{Config, IndexDatabase, OutputFormat};
 
-use crate::cli::{IndexArgs, MaintenanceArgs, ReconcileArgs};
+use crate::cli::{DoctorArgs, IndexArgs, MaintenanceArgs, ReconcileArgs};
 use crate::commands::output_format;
 use crate::render::{
     print_output, print_reconcile_plan, render_index_progress, render_reconcile_progress,
@@ -214,7 +214,10 @@ pub(crate) fn run_watch(config: Config) -> anyhow::Result<()> {
     }
 }
 
-pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
+pub(crate) fn doctor(config: &Config, args: &DoctorArgs) -> anyhow::Result<()> {
+    if args.vacuum {
+        return vacuum(config);
+    }
     let schema = IndexDatabase::migration_check(&config.database)?;
     let (index, discovery, storage, clone_fingerprints, file_health) =
         if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
@@ -257,6 +260,27 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
             "source_read_only": true,
             "index_writes": "sqlite_auto_heal"
         }
+    }))
+}
+
+/// `doctor --vacuum`: reclaim dead space by rewriting the database (#574). Explicit operator action
+/// — VACUUM takes the global schema lock and rewrites the whole file, so it's never automatic.
+fn vacuum(config: &Config) -> anyhow::Result<()> {
+    let db = IndexDatabase::open_config(config)?;
+    let report = db.reclaim_freelist()?;
+    let reclaimed_bytes = report.main_bytes_before.saturating_sub(report.main_bytes_after);
+    // VACUUM cleared the freelist, but a live reader can pin the WAL so the post-VACUUM checkpoint
+    // can't truncate — the file then stays large on disk. Say so, actionably, rather than report a
+    // silent "success".
+    let note = (!report.wal_truncated).then_some(
+        "dead space was cleared but the compacted image is staged in the WAL — a live reader \
+         pinned it, so the file has not shrunk on disk; stop agents/watchers/MCP servers and \
+         re-run `rag-rat doctor --vacuum`",
+    );
+    print_output(&serde_json::json!({
+        "vacuum": report,
+        "reclaimed_bytes": reclaimed_bytes,
+        "note": note,
     }))
 }
 
@@ -555,6 +579,55 @@ mod tests {
     use rag_rat_core::{Config, IndexDatabase};
 
     static N: AtomicU64 = AtomicU64::new(0);
+
+    /// #574: `doctor --vacuum` opens the store, reclaims dead space under the schema lock, and
+    /// leaves the freelist empty. (Reclamation-under-load correctness is unit-tested in
+    /// `db_file_health`; this pins the CLI wiring — dispatch → open_config → VACUUM → report.)
+    #[test]
+    fn doctor_vacuum_runs_and_leaves_no_freelist() {
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-vacuum-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/a.md"), "# Title\nalpha token\n").unwrap();
+        let config = Config {
+            repo_id_override: None,
+            database_key_pinned: true,
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "markdown".to_string(),
+                language: Language::Markdown,
+                directories: vec![PathBuf::from("docs")],
+                include: vec!["**/*.md".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Docs,
+            }],
+            llm: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+            search: Default::default(),
+            memory: Default::default(),
+            log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        super::doctor(&config, &crate::cli::DoctorArgs { vacuum: true }).unwrap();
+
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert_eq!(
+            db.database_file_health().unwrap().freelist_pages,
+            0,
+            "a vacuum leaves no reclaimable freelist"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn maintenance_command_refreshes_a_linked_worktree_overlay() {

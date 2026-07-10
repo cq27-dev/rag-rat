@@ -41,6 +41,25 @@ pub struct WalCheckpointReport {
     pub truncated: bool,
 }
 
+/// How long [`IndexDatabase::reclaim_freelist`] waits for the global schema lock before giving up.
+/// VACUUM is an explicit operator action, so a generous window lets a quiet moment open up; a
+/// timeout surfaces an error rather than blocking forever.
+const VACUUM_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What [`IndexDatabase::reclaim_freelist`] reclaimed: the main-file size and freelist before/after
+/// the VACUUM, for the operator's report.
+#[derive(Debug, Clone, Serialize)]
+pub struct FreelistReclaimReport {
+    pub main_bytes_before: u64,
+    pub main_bytes_after: u64,
+    pub freelist_pages_before: i64,
+    pub freelist_pages_after: i64,
+    /// Whether the post-VACUUM checkpoint truncated the WAL (`busy = 0`). False when a live reader
+    /// pinned frames: VACUUM still cleared the freelist, but the compacted image is staged in the
+    /// `-wal` and the main file has NOT shrunk on disk yet — stop agents/servers and retry.
+    pub wal_truncated: bool,
+}
+
 /// Physical health of the database file for the `doctor` report: sizes, freelist share, and the
 /// two warning flags with an actionable note. Facts a reader acts on, not internal counters.
 #[derive(Debug, Clone, Serialize)]
@@ -86,6 +105,77 @@ impl IndexDatabase {
         Ok(WalCheckpointReport { wal_bytes_before, attempted: true, truncated: busy == 0 })
     }
 
+    /// Reclaim dead space by running `VACUUM` — rewrites the file compactly, dropping the whole
+    /// freelist. Takes the GLOBAL schema lock, which serializes VACUUM against MIGRATIONS and other
+    /// VACUUMs (the other whole-file rewriters). It does NOT exclude ordinary per-repo WRITERS: on
+    /// a consolidated DB those take separate per-repo write flocks (`schema_lock_path` is
+    /// documented as disjoint from `write_lock_path`) and write concurrently by design — there
+    /// is no single lock they all honor. So VACUUM relies on SQLite's own file locking and
+    /// FAILS with a busy error if a writer (a watcher/`index` for ANY repo, or an MCP server
+    /// holding a read txn) is active mid-run — no corruption, just a clean refusal telling the
+    /// operator to quiesce agents and retry. An explicit operator action (`doctor --vacuum`),
+    /// never automatic: it can rewrite hundreds of MB.
+    pub fn reclaim_freelist(&self) -> anyhow::Result<FreelistReclaimReport> {
+        let path = self.storage.database_path().to_path_buf();
+        let _lock = crate::locks::WriteLock::acquire_schema_timeout(&path, VACUUM_LOCK_TIMEOUT)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "timed out waiting for the schema lock to VACUUM the database — another \
+                     rag-rat writer is active; stop agents/watchers and retry"
+                )
+            })?;
+        // Snapshot under the lock so `before` can't drift against a concurrent writer.
+        let before = self.database_file_health()?;
+        // VACUUM on a FRESH bare connection, not `self`: a scoped `IndexDatabase` installs a
+        // `temp.files` TEMP VIEW (`install_scope_view`), and VACUUM rejects a connection carrying a
+        // temp view ("views may not be indexed"). A pragma'd bare open matches the manual
+        // `sqlite3 <db> VACUUM` remedy and rewrites the same file; `self` sees the compacted result
+        // on its next read.
+        let vacuum_conn = crate::storage::IndexConnection::open(&path)?;
+        // A concurrent writer (any repo's watcher/index, or a reader holding a txn) makes VACUUM
+        // fail busy — the schema lock doesn't hold those off. Turn a raw SQLITE_BUSY into an
+        // actionable refusal (no corruption, just retry once quiet).
+        if let Err(err) = vacuum_conn.connection().execute_batch("VACUUM") {
+            let err = anyhow::Error::from(err);
+            return Err(if crate::storage::is_busy(&err) {
+                anyhow::anyhow!(
+                    "VACUUM could not get exclusive access to the database — a rag-rat writer (a \
+                     watcher/index for any repo, or an active reader) is running. Stop \
+                     agents/watchers/MCP servers and re-run `rag-rat doctor --vacuum`."
+                )
+            } else {
+                err.context("VACUUM failed")
+            });
+        }
+        // VACUUM may RENUMBER git_commits' rowids — it has no explicit INTEGER PRIMARY KEY (keyed
+        // by `hash` / `(repo_id, hash)`), and SQLite documents that VACUUM can change
+        // rowids for such tables. That desyncs the external-content `commit_fts`
+        // (content='git_commits', content_rowid='rowid'), so `commit_search` would return
+        // wrong/missing commits. Rebuild it against the post-VACUUM rowids. It is the ONLY
+        // at-risk FTS: `chunk_fts` is contentless and `github_fts`/`repo_memory_fts` are
+        // standalone (not rowid-linked).
+        crate::index::schema::rebuild_commit_fts(vacuum_conn.connection())?;
+        // In WAL mode VACUUM's compaction lands in the `-wal`; fold it back and truncate the
+        // sidecar so the main file physically shrinks (and doesn't just move dead space to the
+        // WAL). The checkpoint returns (busy, log, checkpointed): busy = 1 means a reader
+        // pinned frames and the truncate could not complete — surface it (`wal_truncated`)
+        // rather than swallow it, or `doctor --vacuum` would report success while the file
+        // never shrank on disk.
+        let busy =
+            vacuum_conn
+                .connection()
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0))?;
+        drop(vacuum_conn);
+        let after = self.database_file_health()?;
+        Ok(FreelistReclaimReport {
+            main_bytes_before: before.main_bytes,
+            main_bytes_after: after.main_bytes,
+            freelist_pages_before: before.freelist_pages,
+            freelist_pages_after: after.freelist_pages,
+            wal_truncated: busy == 0,
+        })
+    }
+
     /// Size and dead-space facts about the database file, with warning flags at the default
     /// thresholds. Read-only; feeds the `doctor` report.
     pub fn database_file_health(&self) -> anyhow::Result<DatabaseFileHealth> {
@@ -126,9 +216,9 @@ impl IndexDatabase {
                 }
                 if freelist {
                     parts.push(
-                        "dead space is excessive — reclaim with a one-off `VACUUM` on the \
-                         database while no rag-rat writers are running (stop agents/watchers \
-                         first)",
+                        "dead space is excessive — reclaim it with `rag-rat doctor --vacuum` (a \
+                         one-off VACUUM that rewrites the file; best run while agents/watchers \
+                         are quiet)",
                     );
                 }
                 Some(parts.join("; "))
@@ -243,6 +333,137 @@ mod tests {
             wal_bytes(db.storage.database_path()),
             0,
             "TRUNCATE resets the WAL high-water mark to an empty sidecar"
+        );
+    }
+
+    /// Free a deterministic batch of pages into the main-file freelist: stage a scratch table,
+    /// fill it, drop it, then checkpoint so the freed pages land in `main` (not just the WAL) — so
+    /// `main_bytes` reflects the dead space and a VACUUM's shrink is observable.
+    fn seed_dead_space(db: &crate::IndexDatabase) {
+        db.storage
+            .execute_batch(
+                "CREATE TABLE file_health_scratch(x BLOB);
+                 WITH RECURSIVE cnt(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM cnt WHERE i < 200)
+                 INSERT INTO file_health_scratch SELECT randomblob(4096) FROM cnt;
+                 DROP TABLE file_health_scratch;",
+            )
+            .unwrap();
+        db.checkpoint_wal_if_oversized(1).unwrap();
+    }
+
+    #[test]
+    fn reclaim_freelist_drops_dead_space_and_shrinks_the_file() {
+        let db = build_fixture("reclaim");
+        seed_dead_space(&db);
+        let before = db.database_file_health().unwrap();
+        assert!(before.freelist_pages > 0, "fixture must have dead pages to reclaim");
+
+        let report = db.reclaim_freelist().unwrap();
+
+        let after = db.database_file_health().unwrap();
+        assert_eq!(after.freelist_pages, 0, "VACUUM reclaims the whole freelist");
+        assert!(
+            after.main_bytes < before.main_bytes,
+            "reclaimed pages shrink the file: {} -> {}",
+            before.main_bytes,
+            after.main_bytes
+        );
+        assert_eq!(report.freelist_pages_before, before.freelist_pages);
+        assert_eq!(report.freelist_pages_after, 0);
+        assert_eq!(report.main_bytes_before, before.main_bytes);
+        assert!(report.main_bytes_after < report.main_bytes_before);
+        assert!(
+            report.wal_truncated,
+            "no concurrent reader → the post-VACUUM checkpoint truncates"
+        );
+    }
+
+    #[test]
+    fn reclaim_freelist_reports_a_busy_checkpoint_without_shrinking() {
+        use rusqlite::TransactionBehavior;
+
+        let db = build_fixture("reclaim-busy");
+        seed_dead_space(&db);
+        let before = db.database_file_health().unwrap();
+        assert!(before.freelist_pages > 0);
+
+        // A second connection holds an open READ transaction over the file for the whole reclaim,
+        // pinning WAL frames so the post-VACUUM `wal_checkpoint(TRUNCATE)` reports busy = 1. VACUUM
+        // itself still completes (WAL readers don't block the writer), so the freelist clears, but
+        // the main file cannot be truncated while the reader is live.
+        let mut reader = rusqlite::Connection::open(db.storage.database_path()).unwrap();
+        let read_txn = reader.transaction_with_behavior(TransactionBehavior::Deferred).unwrap();
+        read_txn
+            .query_row("SELECT count(*) FROM main.files", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+
+        let report = db.reclaim_freelist().unwrap();
+
+        assert!(!report.wal_truncated, "a pinned reader must leave the checkpoint busy");
+        assert_eq!(report.freelist_pages_after, 0, "VACUUM still clears the freelist");
+        assert_eq!(
+            report.main_bytes_after, report.main_bytes_before,
+            "a busy checkpoint means the file did not shrink on disk"
+        );
+        drop(read_txn);
+    }
+
+    #[test]
+    fn reclaim_freelist_refuses_when_a_writer_holds_the_database() {
+        use rusqlite::TransactionBehavior;
+
+        let db = build_fixture("reclaim-writer");
+        seed_dead_space(&db);
+
+        // A second connection holds a write transaction (BEGIN IMMEDIATE = RESERVED lock) for the
+        // whole reclaim: the schema lock doesn't hold off writers, so VACUUM can't get exclusive
+        // access and fails busy. The refusal must be actionable, not a raw SQLITE_BUSY.
+        let mut writer = rusqlite::Connection::open(db.storage.database_path()).unwrap();
+        let write_txn = writer.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+
+        let err = db.reclaim_freelist().expect_err("a held writer must make VACUUM refuse");
+        assert!(
+            err.to_string().contains("doctor --vacuum"),
+            "the refusal names the retry remedy: {err}"
+        );
+        drop(write_txn);
+    }
+
+    #[test]
+    fn reclaim_freelist_resyncs_commit_fts_after_vacuum() {
+        use rusqlite::OptionalExtension;
+
+        let db = build_fixture("reclaim-commitfts");
+        // git_commits has no INTEGER PRIMARY KEY, so VACUUM can renumber its rowids and desync the
+        // external-content `commit_fts`. Insert a commit but DON'T sync the FTS — reclaim must
+        // rebuild it, or `commit_search` (which joins `git_commits.rowid = commit_fts.rowid`) is
+        // wrong after `doctor --vacuum`.
+        db.storage
+            .execute_batch(
+                "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s, \
+                 committed_at_s, subject, body, repo_id) VALUES ('deadbeefcafe', 'a', 'a@x', 1, \
+                 1, 'vacuumtoken subject', '', (SELECT repo_id FROM repos LIMIT 1));",
+            )
+            .unwrap();
+        seed_dead_space(&db);
+
+        db.reclaim_freelist().unwrap();
+
+        let hash: Option<String> = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT gc.hash FROM commit_fts JOIN git_commits gc ON gc.rowid = \
+                 commit_fts.rowid WHERE commit_fts MATCH 'vacuumtoken'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            hash.as_deref(),
+            Some("deadbeefcafe"),
+            "reclaim must rebuild commit_fts in sync with git_commits' post-VACUUM rowids"
         );
     }
 

@@ -95,7 +95,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::Init(_) | Cmd::ClaudeHook => unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
-        Cmd::Doctor => doctor(&config)?,
+        Cmd::Doctor(args) => doctor(&config, &args)?,
         Cmd::Query(args) => query(&config, &args)?,
         Cmd::Brief(args) => brief(&config, &args)?,
         Cmd::Clusters(args) => clusters(&config, &args)?,
@@ -388,7 +388,7 @@ fn log_role(cmd: &Cmd) -> rag_rat_core::logging::Role {
         Cmd::Maintenance(_) => Role::Cli("maintenance".to_string()),
         Cmd::Reconcile(_) => Role::Cli("reconcile".to_string()),
         Cmd::Index(_) => Role::Cli("index".to_string()),
-        Cmd::Doctor => Role::Cli("doctor".to_string()),
+        Cmd::Doctor(_) => Role::Cli("doctor".to_string()),
         Cmd::Gc => Role::Cli("gc".to_string()),
         _ => Role::Cli("cmd".to_string()),
     }
