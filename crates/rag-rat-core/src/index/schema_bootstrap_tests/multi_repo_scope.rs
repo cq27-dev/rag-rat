@@ -2028,3 +2028,45 @@ fn current_callee_monikers_ignores_a_sibling_repos_rows() {
          the sibling's row — and the sibling's newer run must not supersede the active repo's"
     );
 }
+
+#[test]
+fn rebuild_certifies_the_policy_version_only_for_the_active_repo() {
+    // The #530 fast-path stamp lives in PER-REPO `repo_meta` (keyed by repo_id), so a rebuild
+    // certifies ONLY the active repo. Exercise the isolation with repo B present in the shared DB
+    // DURING a rebuild of repo A: give B a SENTINEL stamp first, then rebuild A. A repo-scoped
+    // stamp leaves B's sentinel untouched; a repo-blind / global stamp would overwrite it to
+    // current — so this catches the regression the "seed B after the rebuild" shape could not.
+    let fx = two_repo_fixture();
+    let conn = fx.db.storage.connection();
+    crate::index::meta::set_repo_meta(
+        conn,
+        REPO_B,
+        ai::EMBEDDING_POLICY_VERSION_KEY,
+        "repo-b-sentinel",
+    )
+    .unwrap();
+    let db_path: String = conn
+        .query_row("SELECT file FROM pragma_database_list WHERE name = 'main'", [], |r| r.get(0))
+        .unwrap();
+
+    // Rebuild repo A AGAIN, now with repo B co-resident in the shared DB.
+    let mut config_a = source_config(fx.root_a.clone(), Language::Rust);
+    config_a.database = PathBuf::from(db_path);
+    let db = IndexDatabase::rebuild(&config_a).unwrap();
+    let conn = db.storage.connection();
+
+    assert_eq!(
+        crate::index::meta::repo_meta(conn, &fx.repo_a_id, ai::EMBEDDING_POLICY_VERSION_KEY)
+            .unwrap()
+            .as_deref(),
+        Some(ai::EMBEDDING_POLICY_VERSION),
+        "repo A's rebuild certified repo A"
+    );
+    assert_eq!(
+        crate::index::meta::repo_meta(conn, REPO_B, ai::EMBEDDING_POLICY_VERSION_KEY)
+            .unwrap()
+            .as_deref(),
+        Some("repo-b-sentinel"),
+        "the rebuild of repo A must leave co-resident repo B's stamp untouched"
+    );
+}

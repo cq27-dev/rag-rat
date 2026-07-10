@@ -169,3 +169,94 @@ fn reconcile_plan_classifies_at_the_requested_cap() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn incremental_edit_keeps_the_certified_column_fresh() {
+    // The fast path reads the PERSISTED `chunks.embedding_policy` column, so it stays correct after
+    // EDITS only if incremental indexing keeps that column fresh — it routes through the same
+    // single chunk-writer and never restamps. Flip a chunk's class via an edit + heal and read
+    // the column DIRECTLY: this proves the incremental writer updated it in place, regardless
+    // of which summary path would run (a summary assertion alone can't distinguish the column
+    // from a recompute — the recompute would see the edited import-only file as low-signal
+    // too).
+    let root = unique_temp_root();
+    // A >= MIN_EMBEDDING_CHARS real fn, so it classifies Embed (a shorter one would be
+    // SkipTooSmall).
+    rust_fixture(&root);
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    let conn = db.storage.connection();
+
+    // Count a policy in the PERSISTED column, read via the SAME FROM/JOIN the fast path
+    // (`policy_skip_summary_from_column`) uses — `chunks` scoped by the `files` view AND joined to
+    // `chunk_text` — so it counts exactly the row set the fast path would, not a superset. (Without
+    // the `chunk_text` join, a heal that wrote the policy but dropped the chunk_text row would
+    // count here yet be excluded by the real summary.) No recompute, no summary.
+    let policy_in_column = |value: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM chunks
+             JOIN files ON files.id = chunks.file_id
+             JOIN chunk_text ON chunk_text.chunk_id = chunks.id
+             WHERE chunks.embedding_policy = ?1",
+            [value],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
+    // Fresh rebuild: the fn chunk is stamped Embed in the column; the fast path is live.
+    assert_eq!(policy_version(&db).as_deref(), Some(ai::EMBEDDING_POLICY_VERSION));
+    assert!(policy_in_column("Embed") >= 1, "the fn chunk is Embed in the column");
+    assert_eq!(policy_in_column("SkipLowSignal"), 0, "no low-signal chunk yet");
+
+    // Edit the file to pure imports (low-signal) and heal it (the incremental single-writer path).
+    fs::write(
+        root.join("src/code.rs"),
+        "use std::collections::HashMap;\nuse std::fmt::Debug;\nuse std::io::Read;\nuse \
+         std::sync::Arc;\n",
+    )
+    .unwrap();
+    db.heal_file(std::path::Path::new("src/code.rs")).unwrap();
+
+    // The incremental writer updated the PERSISTED column IN PLACE — the old Embed value is gone
+    // and the flipped SkipLowSignal value is written — while leaving the version stamp valid.
+    // So the fast path serves the fresh column with no full rebuild.
+    assert_eq!(policy_in_column("Embed"), 0, "the old Embed value is gone from the column");
+    assert!(
+        policy_in_column("SkipLowSignal") >= 1,
+        "the heal wrote the flipped policy into the certified column"
+    );
+    assert_eq!(
+        policy_version(&db).as_deref(),
+        Some(ai::EMBEDDING_POLICY_VERSION),
+        "incremental indexing must not invalidate the stamp"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn absent_stamp_takes_the_recompute_path() {
+    // A never-stamped index (a pre-#530 DB, or one never fully rebuilt with this binary) has NO
+    // version key — the fast path must fall back to recompute exactly like a stale stamp. Poison
+    // the column and DELETE the stamp: the summary must IGNORE the poison and recompute from
+    // source.
+    let root = unique_temp_root();
+    rust_fixture(&root);
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    let conn = db.storage.connection();
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    conn.execute(
+        "UPDATE main.chunks SET embedding_policy = 'SkipGenerated'
+         WHERE id = (SELECT MIN(id) FROM main.chunks WHERE embedding_policy = 'Embed')",
+        [],
+    )
+    .unwrap();
+    crate::index::meta::delete_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY).unwrap();
+
+    let summary = ai::embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(
+        summary.get("SkipGenerated").copied().unwrap_or(0),
+        0,
+        "an absent stamp forces a recompute that ignores the poisoned column: {summary:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
