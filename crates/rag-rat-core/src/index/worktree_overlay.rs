@@ -48,6 +48,12 @@ pub struct WorktreeOverlayReport {
     pub indexed: usize,
     pub tombstoned: usize,
     pub pruned: usize,
+    /// Whether the working-tree status portion of the delta was read in FULL (see
+    /// [`WorktreeOverlayDelta::status_complete`]). A partial refresh may have missed dirty/
+    /// untracked/deleted paths, so the watcher must not record it as a skip-proof basis (#577):
+    /// with the periodic sweep disabled, later scoped passes would skip the stale overlay
+    /// indefinitely on the strength of matching heads.
+    pub status_complete: bool,
 }
 
 /// The `config.root` subdir prefix (relative to the repo's workdir) and the LINKED checkout's
@@ -317,7 +323,83 @@ fn change_location_path(change: &gix::object::tree::diff::Change<'_, '_, '_>) ->
     PathBuf::from(location.to_str_lossy().as_ref())
 }
 
+/// `repo_meta` key prefix for a linked worktree's overlay refresh basis (#577): one key per
+/// `worktree_id`, value `"<base_sha>\n<linked_head_sha>"` — the (base HEAD, linked HEAD) pair the
+/// overlay delta was last computed against. A scoped watcher pass skips a worktree not implicated
+/// by events ONLY while this pair still matches; either head moving (a base commit re-basing every
+/// overlay, a linked commit with no file event) forces the refresh. Kept per worktree in the
+/// per-repo kv rather than a dedicated table: it is a marker, not queried relationally, and the
+/// `watch_shutdown_reconcile_pending` marker set the pattern.
+const WORKTREE_OVERLAY_BASIS_META_PREFIX: &str = "worktree_overlay_basis:";
+
 impl IndexDatabase {
+    /// The recorded refresh basis for `worktree_id`: `(base_sha, linked_head_sha)` at the last
+    /// successful overlay refresh, or `None` when never refreshed (or written by a pre-#577
+    /// build) — the caller then refreshes unconditionally.
+    pub(crate) fn worktree_overlay_basis(
+        &self,
+        worktree_id: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
+        Ok(self.repo_meta(&key)?.and_then(|value| {
+            let (base_sha, linked_head) = value.split_once('\n')?;
+            Some((base_sha.to_string(), linked_head.to_string()))
+        }))
+    }
+
+    /// Upsert the refresh basis after a successful overlay refresh. `set_repo_meta_if_changed` so
+    /// an unchanged-basis `All` sweep stays write-free (#63 idle backstop).
+    pub(crate) fn record_worktree_overlay_basis(
+        &self,
+        worktree_id: &str,
+        base_sha: &str,
+        linked_head_sha: &str,
+    ) -> anyhow::Result<()> {
+        let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
+        self.set_repo_meta_if_changed(&key, &format!("{base_sha}\n{linked_head_sha}"))?;
+        Ok(())
+    }
+
+    /// Drop the refresh-basis keys of worktrees outside `live_worktrees` (gc, alongside the
+    /// overlay-row prune) so a removed checkout's marker doesn't accumulate forever. The rows are
+    /// one-per-worktree, so the filtering runs in Rust over the prefix-selected keys.
+    pub(crate) fn prune_worktree_overlay_basis_outside(
+        &self,
+        live_worktrees: &[String],
+    ) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        let mut stmt = conn
+            .prepare("SELECT key FROM repo_meta WHERE repo_id = ?1 AND key LIKE ?2 ESCAPE '\\'")?;
+        // LIKE-escape the prefix's wildcard characters (it carries literal underscores).
+        let escaped = WORKTREE_OVERLAY_BASIS_META_PREFIX
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let keys = stmt
+            .query_map(params![self.active_repo_id, pattern], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for key in keys {
+            let Some(worktree_id) = key.strip_prefix(WORKTREE_OVERLAY_BASIS_META_PREFIX) else {
+                continue;
+            };
+            if !live_worktrees.iter().any(|live| live == worktree_id) {
+                delete_repo_meta(conn, &self.active_repo_id, &key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop `worktree_id`'s refresh basis. The watcher calls this when a refresh FAILED or was
+    /// PARTIAL: neither HEAD may have moved (a dirty edit doesn't), so a previously recorded
+    /// basis would keep matching and scoped passes would skip the stale overlay until an `All`
+    /// pass (#577 review).
+    pub(crate) fn clear_worktree_overlay_basis(&self, worktree_id: &str) -> anyhow::Result<()> {
+        let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
+        delete_repo_meta(self.storage.connection(), &self.active_repo_id, &key)?;
+        Ok(())
+    }
+
     /// Index a linked worktree's branch/working-tree delta as overlay rows that shadow the base
     /// scope, and tombstone the files it removed (#219 stage 2). No-op (empty `worktree_id` in the
     /// report) when `linked_path` is not a valid linked sibling of `config.root`'s repo. Leaves the
@@ -416,7 +498,13 @@ impl IndexDatabase {
             },
         };
 
-        Ok(WorktreeOverlayReport { worktree_id, indexed, tombstoned, pruned })
+        Ok(WorktreeOverlayReport {
+            worktree_id,
+            indexed,
+            tombstoned,
+            pruned,
+            status_complete: delta.status_complete,
+        })
     }
 
     /// The post-write finalize tail of `index_worktree_overlay`, run INSIDE its transaction — ONLY

@@ -68,6 +68,7 @@ pub use query_api::{
     WalCheckpointReport,
 };
 pub(crate) use util::*;
+pub use worktree_overlay::WorktreeOverlayReport;
 
 #[cfg(test)]
 mod anchor_tests;

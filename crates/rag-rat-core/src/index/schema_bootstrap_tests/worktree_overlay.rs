@@ -188,7 +188,12 @@ fn refresh_worktree_overlays_reconciles_overlay_scope_embeddings() {
     let options = ai::ReconcileOptions { batch_size: Some(8), ..Default::default() };
     let budget = crate::watch::ReconcileBudget::new(options, std::time::Instant::now());
     // The pass refreshes the overlay AND reconciles its embeddings inline.
-    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, Some(&budget));
+    let changed = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        Some(&budget),
+        &crate::watch::OverlayScope::All,
+    );
     assert!(changed, "the overlay changed (a new branch file was indexed)");
 
     // In the overlay scope, the new branch file's chunk must carry a Current embedding — not be
@@ -1283,4 +1288,233 @@ fn rebuild_restores_durable_wal_after_bulk_build() {
     assert!(!db.symbols("alpha", Some(Language::Rust), 10).unwrap().is_empty());
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn scoped_overlay_refresh_skips_an_unlisted_worktree_with_unchanged_basis() {
+    // #577: an event-scoped pass must not pay the per-worktree delta computation (tree diff +
+    // status walk + ignore compile) for a worktree that is not implicated by events and whose
+    // recorded refresh basis (base HEAD, linked HEAD) is unchanged. Observable proof of the skip:
+    // a DIRTY edit in the unlisted worktree — visible only to a status walk — stays out of its
+    // overlay on the scoped pass, and is picked up by the next `All` (periodic-sweep) pass.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_a() {}\n").unwrap();
+    fs::write(main.join("src/b.rs"), "pub fn base_b() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let listed = unique_temp_root();
+    let _ = fs::remove_dir_all(&listed);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-listed", listed.to_str().unwrap()]);
+    let skipped = unique_temp_root();
+    let _ = fs::remove_dir_all(&skipped);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-skipped", skipped.to_str().unwrap()]);
+
+    // Full refresh records each worktree's basis (both identical to base → no overlay rows yet).
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    // DIRTY (uncommitted) edits in BOTH worktrees — no HEAD moves, so only the event scope or a
+    // status walk could reveal them.
+    fs::write(listed.join("src/a.rs"), "pub fn listed_dirty() {}\n").unwrap();
+    fs::write(skipped.join("src/b.rs"), "pub fn skipped_dirty() {}\n").unwrap();
+
+    let scope =
+        crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([listed.clone()]));
+    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope);
+    assert!(changed, "the listed worktree's dirty edit is refreshed");
+
+    db.use_worktree_scope(&main, Some(&listed)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/a.rs"),
+        vec!["listed_dirty".to_string()],
+        "the listed worktree's overlay picked up the dirty edit"
+    );
+    db.use_worktree_scope(&main, Some(&skipped)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/b.rs"),
+        vec!["base_b".to_string()],
+        "the unlisted worktree with an unchanged basis was skipped (its dirty edit is not \
+         overlaid by the scoped pass)"
+    );
+
+    // The `All` (periodic-sweep) backstop heals the skipped worktree.
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    db.use_worktree_scope(&main, Some(&skipped)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/b.rs"),
+        vec!["skipped_dirty".to_string()],
+        "the All sweep refreshes the previously-skipped worktree"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&listed);
+    let _ = fs::remove_dir_all(&skipped);
+}
+
+#[test]
+fn scoped_overlay_refresh_refreshes_an_unlisted_worktree_whose_head_moved() {
+    // #577: a commit in a linked worktree (a hook-driven pass, or a commit made without the
+    // watcher observing file events) moves its HEAD. The recorded basis catches that: the pass
+    // refreshes the worktree even when the event scope does not list it.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    // Control: with an unchanged basis, an empty-scoped pass is a no-op for this worktree.
+    let empty = crate::watch::OverlayScope::Linked(std::collections::BTreeSet::new());
+    assert!(
+        !crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty),
+        "unchanged basis + empty scope refreshes nothing"
+    );
+
+    // The branch COMMITS a new file; no event scope names the worktree.
+    fs::write(linked.join("src/new.rs"), "pub fn new_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch adds file"]);
+
+    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty);
+    assert!(changed, "the moved linked HEAD invalidates the basis and forces the refresh");
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert_eq!(
+        names_in_scope(&db, "src/new.rs"),
+        vec!["new_fn".to_string()],
+        "the committed branch file is overlaid despite the empty event scope"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn scoped_overlay_refresh_refreshes_after_a_base_commit_changes_the_diff_basis() {
+    // #577: a base commit changes the base↔linked diff basis for EVERY linked worktree — files
+    // the base moved past must now be shadowed by the branch's older version. The basis check
+    // forces that refresh even on a pass whose event scope is empty (base-only events).
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/shared.rs"), "pub fn v1() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "v1"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    set_base_scope(&mut db, &main);
+    assert_eq!(overlay_row_count(&db), 0, "no divergence yet, so no overlay rows");
+
+    // Control: empty scope + unchanged basis refreshes nothing.
+    let empty = crate::watch::OverlayScope::Linked(std::collections::BTreeSet::new());
+    assert!(
+        !crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty),
+        "unchanged basis + empty scope refreshes nothing"
+    );
+
+    // The BASE advances shared.rs to v2: the branch (still at v1) must now shadow it.
+    fs::write(main.join("src/shared.rs"), "pub fn v2() {}\n").unwrap();
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "v2"]);
+
+    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty);
+    assert!(changed, "the moved base HEAD invalidates every worktree's basis");
+    set_base_scope(&mut db, &main);
+    assert!(
+        overlay_row_count(&db) > 0,
+        "the worktree's v1 of the file the base moved past is now overlaid"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn worktree_overlay_gc_prunes_a_removed_worktrees_refresh_basis() {
+    // #577: the refresh-basis marker (`repo_meta` `worktree_overlay_basis:<id>`) must follow the
+    // overlay rows: gc drops a removed worktree's key and keeps a live sibling's.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let removed = unique_temp_root();
+    let _ = fs::remove_dir_all(&removed);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-removed", removed.to_str().unwrap()]);
+    let kept = unique_temp_root();
+    let _ = fs::remove_dir_all(&kept);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-kept", kept.to_str().unwrap()]);
+
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    let removed_id = crate::index::worktree_id_of(&removed);
+    let kept_id = crate::index::worktree_id_of(&kept);
+    assert!(
+        db.worktree_overlay_basis(&removed_id).unwrap().is_some(),
+        "the refresh recorded a basis for each worktree"
+    );
+
+    set_base_scope(&mut db, &main);
+    run_git(&main, &["worktree", "remove", "--force", removed.to_str().unwrap()]);
+    db.garbage_collect().unwrap();
+    assert_eq!(
+        db.worktree_overlay_basis(&removed_id).unwrap(),
+        None,
+        "gc prunes the removed worktree's refresh basis with its overlay"
+    );
+    assert!(
+        db.worktree_overlay_basis(&kept_id).unwrap().is_some(),
+        "a live worktree's basis survives gc"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&removed);
+    let _ = fs::remove_dir_all(&kept);
 }

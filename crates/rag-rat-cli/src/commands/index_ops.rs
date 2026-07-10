@@ -432,7 +432,12 @@ fn run_maintenance_pass(
     // CHANGED overlay's embeddings are reconciled INLINE (while scoped to it) so worktree queries
     // aren't BM25-only for branch content. It restores the base scope afterward so the base
     // reconcile/gc/memory-validate below run unscoped.
-    rag_rat_core::watch::refresh_worktree_overlays(&mut db, config, budget.as_ref());
+    rag_rat_core::watch::refresh_worktree_overlays(
+        &mut db,
+        config,
+        budget.as_ref(),
+        &rag_rat_core::watch::OverlayScope::All,
+    );
     // The base reconcile gets whatever budget the overlays left; `None` → exhausted (or no cap left
     // at all), so skip it rather than start a fresh full-budget reconcile.
     let reconcile_report = match budget

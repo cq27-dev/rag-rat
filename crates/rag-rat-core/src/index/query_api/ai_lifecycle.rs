@@ -79,6 +79,17 @@ impl IndexDatabase {
         ai::pending_embedding_jobs(self.storage.connection())
     }
 
+    /// [`Self::pending_embedding_jobs`] with the caller's candidate sizing — SQL-only, no embedder
+    /// acquisition (no probe request), so the watcher's `All`-sweep overlay backlog check is free
+    /// of network work on an idle pass (#577). Whether the backlog can actually drain is decided
+    /// inside the reconcile itself.
+    pub(crate) fn pending_embedding_jobs_with_options(
+        &self,
+        options: &ai::ReconcileOptions,
+    ) -> anyhow::Result<u64> {
+        ai::pending_embedding_jobs_with_options(self.storage.connection(), options)
+    }
+
     pub(crate) fn pending_embedding_jobs_with_available_incremental_embedder(
         &self,
         options: &ai::ReconcileOptions,

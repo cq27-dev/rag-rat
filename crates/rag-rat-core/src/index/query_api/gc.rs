@@ -160,6 +160,8 @@ impl IndexDatabase {
         // dead-GENERATION sweep already ran above, unconditionally.
         self.delete_staged_files_cascade(StagedSweep::DeadContext)?;
         conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
+        // A removed worktree's overlay refresh basis (#577) follows its overlay rows out.
+        self.prune_worktree_overlay_basis_outside(live_worktrees)?;
         // Since #248 `edge_oracle` is content-keyed with NO `edges_data` FK (it survives reindex,
         // the moniker model), so the file/edge prune above no longer cascades verdicts
         // away. Dangling verdicts are harmless for correctness — every read joins live
