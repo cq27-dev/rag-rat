@@ -109,11 +109,13 @@ validation — see [`plugin/test/README.md`](test/README.md).
 - **Download path (#5) untested** until a green cargo-dist release publishes prebuilt assets
   (v0.15.0's build failed). URL/asset naming matches cargo-dist output.
 - **Windows extraction** relies on the bundled `tar` (bsdtar, Win10 1803+); needs a real Windows run.
-- **Codex path resolution + hook firing** are built from OpenAI's hook docs but unverified on a live
-  Codex — confirm `.mcp.json` at the root resolves, and that Codex auto-discovers
-  `.codex-plugin/hooks/hooks.json` (the `hooks` manifest field was dropped because Codex validation
-  rejects it) and fires the `^Bash$` / `^apply_patch$` matchers. (The `apply_patch` V4A clone-check
-  is implemented and unit-tested in the binary; only the end-to-end Codex wiring is unverified.)
+- **Codex install is verified; hook *firing* is not.** `codex plugin add rag-rat@rag-rat` +
+  `codex plugin list` install + enable the plugin non-interactively (no auth) and stage every
+  component into the cache — the CI `codex-install` job asserts this. What a live (authed) session
+  would still settle: whether the `^Bash$` / `^apply_patch$` hooks actually fire, and **which** hooks
+  file Codex loads (root `hooks/hooks.json` — currently Claude's wrapper+matchers — vs
+  `.codex-plugin/hooks/hooks.json`). The `apply_patch` V4A clone-check is implemented + unit-tested in
+  the binary; only the in-session Codex hook wiring is unverified (L4).
 - **Legacy hook-settings migration (deferred):** the `claude-hook` → `agent-hook` rename means a user
   who previously ran `rag-rat hooks install --claude` keeps a stale `rag-rat claude-hook` entry, and a
   fresh install adds a duplicate `agent-hook` one (`is_ours` only matches the new command). A clean

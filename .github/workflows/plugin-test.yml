@@ -76,11 +76,10 @@ jobs:
             RAG_RAT_BIN=/w/bin/rag-rat sh plugin/test/verify-launcher.sh
           '
 
-  # ── Claude Code: non-interactive plugin install + manifest validation (no API key needed) ───────
+  # ── Claude Code: non-interactive plugin install + component assertions (no API key needed) ──────
   claude-install:
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
     runs-on: ubuntu-latest
-    continue-on-error: true # exploratory until non-interactive install / trust-prompt behaviour is confirmed
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -89,19 +88,17 @@ jobs:
       - run: npm install -g @anthropic-ai/claude-code
       - run: bash plugin/test/verify-claude-install.sh
 
-  # ── Codex: marketplace-add manifest validation (catches mis-placed .mcp.json / hooks paths) ─────
-  codex-validate:
+  # ── Codex: non-interactive `plugin add` + `plugin list` install + component staging (no API key) ─
+  codex-install:
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
     runs-on: ubuntu-latest
-    continue-on-error: true # exploratory; also confirms the correct Codex plugin layout empirically
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Install the Codex CLI
-        run: npm install -g @openai/codex || echo "::warning::adjust the Codex npm package name"
-      - run: bash plugin/test/verify-codex-marketplace.sh
+      - run: npm install -g @openai/codex
+      - run: bash plugin/test/verify-codex-install.sh
 
   # ── Download path (dispatch with a published release version): fetch real assets per distro ──────
   download-path:
