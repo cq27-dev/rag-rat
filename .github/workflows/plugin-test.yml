@@ -41,8 +41,8 @@ jobs:
           name: rag-rat-linux-gnu
           path: target/debug/rag-rat
 
-  # ── Launcher × glibc/musl matrix. `pass` distros (glibc >= 2.38) must handshake; `fail` distros ──
-  # ── (older glibc / musl) are informational — they document exactly where the binary's floor bites.─
+  # ── Launcher matrix on modern glibc. Old OSes and Alpine/musl are out of scope: ort/ONNX is ──────
+  # ── glibc-only, so a musl build would need a separate model2vec-only pipeline (not worth it). ─────
   launcher:
     needs: build-binary
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
@@ -50,20 +50,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { image: "ubuntu:24.04", expect: pass } # glibc 2.39
-          - { image: "fedora:41", expect: pass } # glibc ~2.40
-          - { image: "node:22-bookworm-slim", expect: fail } # glibc 2.36 (< 2.38 floor)
-          - { image: "node:22-bullseye-slim", expect: fail } # glibc 2.31
-          - { image: "node:22-alpine", expect: fail } # musl
-    continue-on-error: ${{ matrix.expect == 'fail' }}
+        image: ["ubuntu:24.04", "fedora:41"] # glibc 2.39 / ~2.40 — the shipped gnu binary
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: rag-rat-linux-gnu
           path: bin
-      - name: "verify launcher in ${{ matrix.image }} (expect ${{ matrix.expect }})"
+      - name: "verify launcher in ${{ matrix.image }}"
         run: |
           docker run --rm -v "$PWD:/w" -w /w "${{ matrix.image }}" sh -c '
             set -e
@@ -107,12 +101,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image:
-          - "ubuntu:24.04"
-          - "fedora:41"
-          - "node:22-bookworm-slim"
-          - "node:22-bullseye-slim"
-          - "node:22-alpine"
+        image: ["ubuntu:24.04", "fedora:41"]
     steps:
       - uses: actions/checkout@v4
       - name: "download-path handshake in ${{ matrix.image }} (v${{ github.event.inputs.release_version }})"

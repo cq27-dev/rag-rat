@@ -28,10 +28,10 @@ bash plugin/test/verify-codex-install.sh
 
 ## CI modes
 
-- **PR / dispatch (no version):** build a debug `rag-rat`, run L1 across the matrix, and the Claude +
-  Codex install jobs. In L1, `expect: pass` distros (glibc ≥ 2.38) must handshake; `expect: fail`
-  distros (older glibc / musl) are **informational** (`continue-on-error`) and document where the
-  binary's glibc floor bites — the same floor the release build chose.
+- **PR / dispatch (no version):** build a debug `rag-rat`, run L1 across a **modern-glibc** matrix
+  (`ubuntu:24.04`, `fedora:41`), and the Claude + Codex install jobs. Old OSes and Alpine/musl are out
+  of scope — `ort`/ONNX is glibc-only, so a musl build would need a separate model2vec-only pipeline
+  (deemed not worth it).
 - **Dispatch with `release_version=X.Y.Z`:** the `download-path` job skips the local build and makes the
   launcher **download** that release's assets in each distro, then handshakes — validates the real
   download + checksum + extraction + per-distro run. Use it once a green cargo-dist release exists.
