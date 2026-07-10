@@ -59,7 +59,8 @@ impl RagRatService {
         // and serve a config that appears mid-session — a server without the active lifecycle
         // (watcher, git-hook freshness) could return results NOT validated against current source,
         // breaking rag-rat's core guarantee. Dormancy is binary: dormant, or fully active from
-        // launch. The notice tells the user to restart the MCP server after `init` + `index` (#603).
+        // launch. The notice tells the user to restart the MCP server after `init` + `index`
+        // (#603).
         let Some(config) = &self.config else {
             return Ok(self.dormant_tool_result());
         };
@@ -133,10 +134,10 @@ impl RagRatService {
     fn dormant_tool_result(&self) -> CallToolResult {
         let payload = serde_json::json!({
             "status": "no_index",
-            "message": "rag-rat has no index for this directory — it doesn't look like a rag-rat \
-                        repository (no `rag-rat.toml` here or in any parent directory).",
-            "remedy": "Run `rag-rat init` then `rag-rat index` in the repository root; this server \
-                       picks up the new index on the next tool call, no restart needed.",
+            "message": "This rag-rat MCP server was started outside an indexed rag-rat repository, \
+                        so it has no index to serve here.",
+            "remedy": "Run `rag-rat init` then `rag-rat index` in the repository root, then restart \
+                       (reconnect) the rag-rat MCP server so it activates against the new index.",
         });
         let text = rag_rat_core::render(&payload, self.output_format);
         CallToolResult::success(vec![Content::text(text)])

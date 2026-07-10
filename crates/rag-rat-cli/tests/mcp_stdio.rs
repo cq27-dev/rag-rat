@@ -261,8 +261,14 @@ fn mcp_stdio_dormant_result_is_valid_json_in_json_mode() {
 /// Self-healing (#603): a server that started DORMANT activates its tools as soon as the directory
 /// becomes a rag-rat repo mid-session — a `rag-rat init` + index run reachable through the dormant
 /// notice actually works, with NO MCP restart. The server re-discovers the config on each call.
+/// Dormancy is BINARY and decided at launch: a server that started dormant does NOT half-activate
+/// when the directory becomes a rag-rat repo mid-session — it keeps returning the notice (which
+/// tells the user to restart) rather than serving through a config it discovered per-call. A
+/// per-call-discovered server would lack the active lifecycle (watcher / git-hook freshness) and
+/// could return results not validated against current source, breaking rag-rat's core guarantee
+/// (#603). Activation requires a restart; the smoke test covers the launched-with-config path.
 #[test]
-fn mcp_stdio_dormant_server_activates_after_the_repo_is_indexed() {
+fn mcp_stdio_dormant_server_stays_dormant_until_restart() {
     let root = unique_temp_root();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn healed_symbol_marker() {}\n").unwrap();
@@ -302,8 +308,7 @@ fn mcp_stdio_dormant_server_activates_after_the_repo_is_indexed() {
     let before = recv(&mut reader)["result"]["content"][0]["text"].as_str().unwrap().to_string();
     assert!(before.contains("no_index"), "must be dormant before the repo is indexed: {before}");
 
-    // The agent (here, the test) turns the dir into an indexed rag-rat repo — exactly what the
-    // dormant notice instructs. The server's cwd IS `root`, so its re-discovery finds this config.
+    // Turn the dir into an indexed rag-rat repo mid-session — but do NOT restart the server.
     fs::write(
         root.join("rag-rat.toml"),
         "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
@@ -313,24 +318,17 @@ fn mcp_stdio_dormant_server_activates_after_the_repo_is_indexed() {
     let config = Config::load(root.join("rag-rat.toml")).unwrap();
     rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
 
-    // After init+index: the SAME server now serves the tool for real — no restart.
-    // `semantic_search` returns actual hits (the smoke test proves it works on a fresh
-    // hash-embedder index).
+    // Without a restart the SAME server stays dormant — it does not half-activate against the new
+    // config; the notice (restart to activate) still stands.
     send(
         &mut stdin,
         json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                "params": {"name": "semantic_search", "arguments": {"query": "healed", "limit": 3}}}),
     );
-    let after = recv(&mut reader);
-    let after_text = after["result"]["content"][0]["text"].as_str().unwrap().to_string();
+    let after = recv(&mut reader)["result"]["content"][0]["text"].as_str().unwrap().to_string();
     assert!(
-        !after_text.contains("no_index"),
-        "server must self-heal after indexing, still dormant: {after_text}"
-    );
-    let hits = response_text_json(after);
-    assert!(
-        hits.as_array().is_some_and(|hits| !hits.is_empty()),
-        "the self-healed server must serve real search hits, got: {after_text}",
+        after.contains("no_index"),
+        "a launched-dormant server must stay dormant until restart, got: {after}",
     );
 
     stop(child);
