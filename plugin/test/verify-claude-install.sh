@@ -22,6 +22,13 @@ timeout 90 claude plugin install rag-rat@rag-rat --scope user </dev/null || fail
 step "inspect the installed plugin (expect MCP server + skills + hooks, no load errors)"
 det="$(timeout 30 claude plugin details rag-rat </dev/null 2>&1)"; echo "$det"
 echo "$det" | grep -qiE "rag-rat" || fail "plugin details did not report rag-rat"
+echo "$det" | grep -qE "Skills \(2\)" && echo "PASS: 2 skills registered" || fail "expected Skills (2)"
+echo "$det" | grep -qE "MCP servers \(1\)" && echo "PASS: 1 MCP server registered" || fail "expected MCP servers (1)"
+if echo "$det" | grep -qE "Hooks \([1-9]"; then
+  echo "PASS: hooks registered"
+else
+  fail "hooks did not register (Hooks (0)) — check plugin/hooks/hooks.json format/location"
+fi
 
 step "on-disk state"
 ls -la "$HOME/.claude/plugins" 2>/dev/null || true
