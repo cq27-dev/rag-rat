@@ -111,7 +111,10 @@ fn ready_embedding_scan_parts(
     Ok(Some((model_id, model_version, dim, max_embedding_chars)))
 }
 
-pub(crate) fn reconcile_plan(conn: &Connection) -> anyhow::Result<ReconcilePlan> {
+pub(crate) fn reconcile_plan(
+    conn: &Connection,
+    max_embedding_chars: usize,
+) -> anyhow::Result<ReconcilePlan> {
     ensure_model_manifest(conn)?;
     let model_id = active_embedding_model_id(conn)?;
     let model = model(conn, &model_id)?;
@@ -119,6 +122,10 @@ pub(crate) fn reconcile_plan(conn: &Connection) -> anyhow::Result<ReconcilePlan>
     let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
     let available = validate_ready_model(&model).is_ok();
     let message = (!available).then(|| model_not_ready_reason(&model));
+    // The plan must classify against the SAME cap the reconcile it previews will use
+    // (`options.max_embedding_chars.max(MIN_EMBEDDING_CHARS)`), or its skip counts and per-job
+    // decisions diverge from what `reconcile` actually does at a non-default configured cap.
+    let max_embedding_chars = max_embedding_chars.max(MIN_EMBEDDING_CHARS);
     Ok(ReconcilePlan {
         embeddings: embedding_reconcile_plan(
             conn,
@@ -127,6 +134,7 @@ pub(crate) fn reconcile_plan(conn: &Connection) -> anyhow::Result<ReconcilePlan>
             dim,
             available,
             message,
+            max_embedding_chars,
         )?,
         summaries: SummaryReconcilePlan {
             enabled: false,
@@ -142,8 +150,9 @@ pub(crate) fn embedding_reconcile_plan(
     dim: usize,
     available: bool,
     message: Option<String>,
+    max_embedding_chars: usize,
 ) -> anyhow::Result<EmbeddingReconcilePlan> {
-    let skipped_by_policy = embedding_policy_skip_summary(conn, DEFAULT_MAX_EMBEDDING_CHARS)?;
+    let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let mut missing_by_priority = BTreeMap::new();
     let mut current = 0_u64;
     let mut missing = 0_u64;
@@ -158,7 +167,7 @@ pub(crate) fn embedding_reconcile_plan(
     // over `embedding_job_candidates(None)`, so the counts are identical; only the peak memory
     // drops.
     for_each_embedding_candidate(conn, &model.model_id, model_version, dim, None, false, |job| {
-        let policy = policy_for_job(&job, DEFAULT_MAX_EMBEDDING_CHARS);
+        let policy = policy_for_job(&job, max_embedding_chars);
         if !policy.eligible {
             return Ok(());
         }
@@ -168,14 +177,14 @@ pub(crate) fn embedding_reconcile_plan(
             && job.embedding_dim == Some(i64::try_from(dim).unwrap_or(i64::MAX))
             && job.embedding_text_version.as_deref() == Some(EMBEDDING_TEXT_VERSION)
             && job.input_hash.as_deref().is_some_and(|input_hash| {
-                let input = build_embedding_input(&job, DEFAULT_MAX_EMBEDDING_CHARS);
+                let input = build_embedding_input(&job, max_embedding_chars);
                 input_hash == embedding_input_hash(&model.model_id, model_version, &input.text)
             });
         if current_artifact {
             current += 1;
             return Ok(());
         }
-        let reason = job.reason(model_version, dim, now_ms(), DEFAULT_MAX_EMBEDDING_CHARS);
+        let reason = job.reason(model_version, dim, now_ms(), max_embedding_chars);
         match reason {
             ReconcileReason::Missing => missing += 1,
             ReconcileReason::SourceChanged => stale += 1,

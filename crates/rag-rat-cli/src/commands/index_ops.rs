@@ -132,7 +132,11 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
     // `reconcile --plan --reencode-vectors` from mutating the index during a dry run. Do not
     // reorder.
     if args.plan {
-        let plan = db.reconcile_plan()?;
+        // Same cap the actual reconcile below resolves (`args` override else config), so `--plan`
+        // classifies against exactly what the run it previews will use.
+        let plan = db.reconcile_plan_with_cap(
+            args.max_embedding_chars.unwrap_or(config.llm.embedding.runtime.max_embedding_chars),
+        )?;
         // `--plan` prints a human summary by default; the global `--json` switches to the
         // structured plan.
         if output_format() == OutputFormat::Json {

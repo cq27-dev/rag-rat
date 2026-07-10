@@ -887,6 +887,7 @@ mod chunk_store_migrations;
 mod clones;
 mod dir_memory_tree;
 mod dispatch;
+mod embedding_policy_fast_path;
 mod generation_rebuild;
 mod git_history_reload;
 mod github_papertrail;

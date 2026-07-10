@@ -298,6 +298,21 @@ impl IndexDatabase {
         self.set_meta(GENERATED_FLAGS_VERSION_KEY, GENERATED_FLAGS_VERSION)
     }
 
+    /// Stamp the embedding-policy freshness for THIS repo (`repo_meta`, not the DB-global
+    /// `index_meta`), certifying that every `chunks.embedding_policy` reflects the current
+    /// classifier ([`EMBEDDING_POLICY_VERSION`](crate::index::ai::EMBEDDING_POLICY_VERSION)) at
+    /// the default cap. The reconcile skip-summary then reads the column via `GROUP BY` instead
+    /// of re-parsing every file (#530). Called ONLY where every chunk was (re)derived by
+    /// current code — a full rebuild and the reconcile self-heal — NEVER an incremental pass,
+    /// which restamps only changed files and so cannot certify unchanged chunks.
+    pub(super) fn mark_embedding_policy_current(&self) -> anyhow::Result<()> {
+        self.set_repo_meta(ai::EMBEDDING_POLICY_VERSION_KEY, ai::EMBEDDING_POLICY_VERSION)?;
+        self.set_repo_meta(
+            ai::EMBEDDING_POLICY_CAP_KEY,
+            &ai::DEFAULT_MAX_EMBEDDING_CHARS.to_string(),
+        )
+    }
+
     fn rederive_generated_flags(&self) -> anyhow::Result<()> {
         let conn = self.storage.connection();
         // The generated flag is a property of the file PATH (+ target kind), not the active scope,

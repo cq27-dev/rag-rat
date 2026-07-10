@@ -1,5 +1,27 @@
 use super::*;
 
+/// Behavior version of the embedding-policy classifier. It certifies that a persisted
+/// `chunks.embedding_policy` value reflects the CURRENT classifier — the reconcile skip-summary
+/// reads the column via `GROUP BY` (the always-fast path, #530) only when a full rebuild has
+/// stamped this version into `repo_meta`. It is the hash of `embedding_policy_for_chunk`'s
+/// decisions over a fixed corpus, pinned by `policy_version_tests`: any behavior change — a
+/// threshold, a gate, a plumbing node kind, or a tree-sitter grammar bump that reclassifies a node
+/// with zero rag-rat source diff — changes the hash and reddens that test with the value to set
+/// here. That is what makes the version impossible to forget: a hand-bumped const fails UNSAFE (a
+/// stale-but-matching stamp would let the fast path serve mixed-code counts). A version mismatch
+/// instead correctly forces the slow recompute. See the freshness-model Risk memory bound to this
+/// file.
+pub(crate) const EMBEDDING_POLICY_VERSION: &str = "255dcc2c31e35a19";
+
+/// `repo_meta` keys carrying the embedding-policy freshness stamp a full rebuild writes
+/// (`mark_embedding_policy_current`). PER-REPO, not the DB-global `index_meta`: one database can
+/// host several repos and a rebuild of one must not certify another's un-rebuilt column.
+/// `_VERSION_KEY` stores [`EMBEDDING_POLICY_VERSION`]; `_CAP_KEY` stores the char cap the column
+/// was stamped at (always [`DEFAULT_MAX_EMBEDDING_CHARS`] — prep stamps at the default), so the
+/// fast path can refuse a request at a different cap that would re-bucket `SkipTooLarge`.
+pub(crate) const EMBEDDING_POLICY_VERSION_KEY: &str = "embedding_policy_version";
+pub(crate) const EMBEDDING_POLICY_CAP_KEY: &str = "embedding_policy_cap";
+
 pub(crate) fn needs_embedding(
     chunk: &CurrentChunk,
     model_id: &str,
@@ -458,5 +480,332 @@ mod low_signal_span_tests {
         let src = "use a::b;\nfn real() {}\n";
         let file = parsed("s.rs", Language::Rust, src);
         assert!(!is_low_signal_span(Language::Rust, file.root(), 0, src.len()));
+    }
+}
+
+/// Behavior-hash tripwire for [`EMBEDDING_POLICY_VERSION`] (#530). The corpus routes through every
+/// embedding-policy gate — the parse-free cheap gates and the low-signal gate, the latter both
+/// `FromText` and `FromSpan` across every grammar — so any classifier change (a threshold, a gate,
+/// a plumbing node kind) or a tree-sitter grammar bump that reclassifies a node changes the hash
+/// and fails this test with the value to set. The version certifies the persisted
+/// `chunks.embedding_policy` column, so it must move whenever the classifier's output could.
+#[cfg(test)]
+mod policy_version_tests {
+    use std::fmt::Write as _;
+    use std::path::Path;
+
+    use super::{
+        DEFAULT_MAX_EMBEDDING_CHARS, EMBEDDING_POLICY_VERSION, LowSignalCheck, MIN_EMBEDDING_CHARS,
+        embedding_policy_for_chunk,
+    };
+    use crate::index::parser;
+    use crate::index::util::hex_sha256;
+    use crate::language::Language;
+
+    fn record(sig: &mut String, label: &str, d: &super::EmbeddingPolicyDecision) {
+        let _ = writeln!(sig, "{label}|{}|{}|{}", d.policy, d.priority, d.eligible);
+    }
+
+    fn behavior_signature() -> String {
+        let mut sig = String::new();
+        let big = "x".repeat(20_000);
+        // Boundary-adjacent lengths pinned as LITERALS (not `MIN_EMBEDDING_CHARS`, which would move
+        // with the constant and never flip): one exactly AT the current MIN and one just BELOW it,
+        // so a `<` vs `<=` change or an off-by-one shift of the SkipTooSmall gate flips the
+        // hash.
+        let at_min = "a".repeat(80);
+        let below_min = "a".repeat(79);
+
+        // Parse-free cheap gates (FromText — no tree needed for these to decide).
+        // (label, path, language, file_kind, chunk_kind, symbol_path, text, cap)
+        type TextCase<'a> =
+            (&'a str, &'a str, &'a str, &'a str, &'a str, Option<&'a str>, &'a str, usize);
+        let text_cases: &[TextCase] = &[
+            ("too_large_generated", "a.rs", "rust", "generated", "code", None, &big, 4000),
+            ("too_large_no_symbol", "a.rs", "rust", "source", "code", None, &big, 4000),
+            ("at_min_len", "a.rs", "rust", "source", "code", Some("s"), &at_min, 4000),
+            ("below_min_len", "a.rs", "rust", "source", "code", Some("s"), &below_min, 4000),
+            // FromText low-signal branch (`is_low_signal_chunk`) — the classifier used for
+            // oversized / markdown / parse-failure files, which the span cases below
+            // do NOT exercise. An all-imports block (>= MIN) is low-signal; a real
+            // definition is not.
+            (
+                "fromtext_plumbing",
+                "a.rs",
+                "rust",
+                "source",
+                "code",
+                Some("s"),
+                "use std::collections::HashMap;\nuse std::fmt::Debug;\nuse std::io::Read;\nuse \
+                 std::sync::Arc;\n",
+                4000,
+            ),
+            (
+                "fromtext_signal",
+                "a.rs",
+                "rust",
+                "source",
+                "code",
+                Some("s"),
+                "pub fn real_function(x: i64) -> i64 {\n    let value = x * 2 + 1;\n    \
+                 value.wrapping_mul(3)\n}\n",
+                4000,
+            ),
+            (
+                "generated_file_kind",
+                "a.rs",
+                "rust",
+                "generated",
+                "code",
+                Some("s"),
+                "fn a() {}",
+                4000,
+            ),
+            (
+                "generated_chunk_kind",
+                "a.rs",
+                "rust",
+                "source",
+                "generated",
+                Some("s"),
+                "fn a() {}",
+                4000,
+            ),
+            (
+                "generated_path",
+                "pkg/target/a.rs",
+                "rust",
+                "source",
+                "code",
+                Some("s"),
+                "fn a() { let value = compute(); process(value); }",
+                4000,
+            ),
+            (
+                "test_fixture_path",
+                "pkg/fixtures/a.rs",
+                "rust",
+                "source",
+                "code",
+                Some("s"),
+                "fn a() { let value = compute(); process(value); }",
+                4000,
+            ),
+            (
+                "lang_unsupported",
+                "a.txt",
+                "plaintext",
+                "source",
+                "code",
+                Some("s"),
+                "some prose here that is long enough to clear the small gate for sure",
+                4000,
+            ),
+            ("too_small", "a.rs", "rust", "source", "code", Some("s"), "fn a() {}", 4000),
+            (
+                "embed_plain",
+                "a.rs",
+                "rust",
+                "source",
+                "code",
+                Some("s"),
+                "fn real() { let value = compute_something(); process_the(value); done(); }",
+                4000,
+            ),
+        ];
+        for (label, path, lang, fk, ck, sp, text, cap) in text_cases {
+            let d = embedding_policy_for_chunk(
+                Path::new(path),
+                lang,
+                fk,
+                ck,
+                *sp,
+                text,
+                *cap,
+                LowSignalCheck::FromText,
+            );
+            record(&mut sig, label, &d);
+        }
+
+        // EVERY path-predicate branch of `looks_generated_path` + `is_test_fixture_path`, so an
+        // edit to any one of them flips the hash (the two path cases above only sample
+        // `/target/` and `/fixtures/`). A non-generated, non-fixture path is the code
+        // default and is already covered by `embed_plain` / the span cases.
+        let path_cases: &[&str] = &[
+            "pkg/generated/a.rs",
+            "pkg/src/generated/a.rs",
+            "pkg/target/a.rs",
+            "Cargo.lock",
+            "some/dir/package-lock.json",
+            "some/dir/pnpm-lock.yaml",
+            "pkg/fixtures/a.rs",
+            "pkg/__fixtures__/a.rs",
+            "pkg/testdata/a.rs",
+            "pkg/snapshots/a.rs",
+            "pkg/thing.snap",
+        ];
+        for path in path_cases {
+            // A path gate fires before the low-signal check, so the text and cap are immaterial
+            // here.
+            let d = embedding_policy_for_chunk(
+                Path::new(path),
+                "rust",
+                "source",
+                "code",
+                Some("s"),
+                "fn a() { let value = compute(); process(value); }",
+                4000,
+                LowSignalCheck::FromText,
+            );
+            record(&mut sig, &format!("path_{path}"), &d);
+        }
+
+        // Low-signal via FromSpan across every grammar: a pure-plumbing file (imports/comments
+        // only, >=80 chars so it reaches the low-signal gate) classifies low-signal; a file
+        // with a real definition classifies as signal. Exercises `is_plumbing_node` per
+        // language + the grammar. (label, path, language, plumbing_src, def_src)
+        // Every fixture is >=80 chars so it clears the SkipTooSmall gate and actually reaches the
+        // span classifier (the point of the FromSpan cases). Whatever each classifies as is the
+        // pinned behavior; a grammar bump that reclassifies a node flips the hash.
+        let span_cases: &[(&str, &str, Language, &str, &str)] = &[
+            (
+                "rust",
+                "s.rs",
+                Language::Rust,
+                "use std::collections::HashMap;\nuse std::fmt::Debug;\n// a descriptive comment \
+                 line\nuse std::io::Read;\nuse std::sync::Arc;\n",
+                "pub fn real_function(input: i32) -> i32 {\n    let value = input + 1;\n    \
+                 println!(\"{}\", value);\n    another_call(value)\n}\n",
+            ),
+            (
+                "typescript",
+                "s.ts",
+                Language::TypeScript,
+                "import defaultThing from 'a';\n// a descriptive comment line here now\nimport { \
+                 namedThing } from 'b';\nimport * as ns from 'c';\n",
+                "export function realFunction(input: number): number {\n    const value = input + \
+                 1;\n    return value + compute(value);\n}\n",
+            ),
+            (
+                "kotlin",
+                "s.kt",
+                Language::Kotlin,
+                "package com.example.app\nimport kotlin.collections.List\n// a descriptive \
+                 comment line here now\nimport kotlin.io.println\n",
+                "fun realFunction(input: Int): Int {\n    val value = input + 1\n    return value \
+                 + compute(value)\n}\n",
+            ),
+            (
+                "c",
+                "s.c",
+                Language::C,
+                "#include <stdio.h>\n#include \"local_header.h\"\n// a descriptive comment line \
+                 here now goes on\n#include <string.h>\n",
+                "int real_function(int input) {\n    int value = input + 1;\n    return value + \
+                 compute(value);\n}\n",
+            ),
+            (
+                "cpp",
+                "s.cpp",
+                Language::Cpp,
+                "#include <vector>\n#include <string>\n// a descriptive comment line here now \
+                 goes on and on\n#include <memory>\n",
+                "int real_function(int input) {\n    int value = input + 1;\n    return value + \
+                 compute(value);\n}\n",
+            ),
+            (
+                "python",
+                "s.py",
+                Language::Python,
+                "import os\nimport sys\nfrom collections import defaultdict\n# a descriptive \
+                 comment line here now goes on\n",
+                "def real_function(input):\n    value = input + 1\n    result = value + \
+                 compute(value)\n    return result\n",
+            ),
+        ];
+        for (label, path, language, plumbing, def) in span_cases {
+            let pf =
+                parser::parse_file(Path::new(path), *language, plumbing).expect("plumbing parses");
+            let d = embedding_policy_for_chunk(
+                Path::new(path),
+                &language.to_string(),
+                "source",
+                "code",
+                Some("s"),
+                plumbing,
+                4000,
+                LowSignalCheck::FromSpan {
+                    language: *language,
+                    root: pf.root(),
+                    start_byte: 0,
+                    end_byte: plumbing.len(),
+                },
+            );
+            record(&mut sig, &format!("span_plumbing_{label}"), &d);
+
+            let df = parser::parse_file(Path::new(path), *language, def).expect("def parses");
+            let d = embedding_policy_for_chunk(
+                Path::new(path),
+                &language.to_string(),
+                "source",
+                "code",
+                Some("s"),
+                def,
+                4000,
+                LowSignalCheck::FromSpan {
+                    language: *language,
+                    root: df.root(),
+                    start_byte: 0,
+                    end_byte: def.len(),
+                },
+            );
+            record(&mut sig, &format!("span_def_{label}"), &d);
+        }
+
+        // Fold the governing thresholds in directly, so a change to any of them flips the hash even
+        // if no corpus case happens to straddle the new boundary (the `MIN 80→79` blind spot).
+        let _ = writeln!(
+            sig,
+            "consts|{}|{}|{}",
+            MIN_EMBEDDING_CHARS,
+            DEFAULT_MAX_EMBEDDING_CHARS,
+            crate::index::chunker::MAX_STRUCTURAL_PARSE_BYTES,
+        );
+
+        sig
+    }
+
+    #[test]
+    fn policy_version_pins_classifier_behavior() {
+        let hash = &hex_sha256(behavior_signature().as_bytes())[..16];
+        assert_eq!(
+            hash, EMBEDDING_POLICY_VERSION,
+            "embedding-policy behavior changed (a classifier gate/threshold or a tree-sitter \
+             grammar bump); set EMBEDDING_POLICY_VERSION to \"{hash}\""
+        );
+    }
+
+    #[test]
+    fn corpus_exercises_every_policy() {
+        // The tripwire only pins the HASH; this guards that the corpus keeps EXERCISING every
+        // policy outcome, so a future corpus edit that collapses cases (e.g. every case
+        // falling into `SkipTooSmall`) can't silently weaken the version guard. `record`
+        // writes `label|policy|..`.
+        let sig = behavior_signature();
+        for expected in [
+            "SkipTooLarge",
+            "SkipGenerated",
+            "SkipTestFixture",
+            "SkipLanguageUnsupported",
+            "SkipTooSmall",
+            "SkipLowSignal",
+            "Embed",
+        ] {
+            assert!(
+                sig.contains(&format!("|{expected}|")),
+                "the version corpus must exercise {expected} — otherwise the hash guard covers \
+                 less than it appears to"
+            );
+        }
     }
 }

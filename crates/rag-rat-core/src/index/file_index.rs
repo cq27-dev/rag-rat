@@ -314,6 +314,12 @@ impl IndexDatabase {
     /// embedding policy were all computed in the parallel prepare phase (see `prepare_chunks`), so
     /// nothing here hashes or parses.
     ///
+    /// SINGLE WRITER of `chunks.embedding_policy`: full rebuild, incremental, and heal all route
+    /// their chunk inserts through here, so a full rebuild's version stamp can certify the whole
+    /// column for the reconcile fast path (#530). A NEW insert path that bypasses `prepare_chunks`
+    /// would write the `NOT NULL DEFAULT 'Embed'` fallback and silently poison that fast path under
+    /// a still-valid stamp — route any new chunk insert through here (or re-derive + restamp).
+    ///
     /// Writes the per-row `chunk_fts` token row inline on EVERY path. `chunk_fts` is contentless
     /// (#77 Phase 2), so it cannot be bulk-rebuilt from a content column — the only way it stays in
     /// sync is this inline write at index time (full rebuild, incremental, and heal all insert

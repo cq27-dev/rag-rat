@@ -1180,8 +1180,18 @@ fn skip_summary_shared_parse_matches_per_chunk_text() {
         out
     };
 
+    // #530: a fresh rebuild stamps the policy version, so the summary takes the FAST path (GROUP BY
+    // the certified column). Both paths must agree with the per-chunk FromText reference here.
+    let fast = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(fast, reference, "fast-path (certified column) must equal the FromText reference");
+
+    // Clear the stamp → the slow recompute (#572's subject: FromSpan reconstruction + sha-verify)
+    // runs and must also equal the reference.
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+        .unwrap();
     let span = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
-    assert_eq!(span, reference, "shared-parse summary must equal the per-chunk FromText reference");
+    assert_eq!(span, reference, "slow recompute must equal the per-chunk FromText reference");
     assert!(
         span.get("SkipLowSignal").copied().unwrap_or(0) >= 1,
         "the all-import file must contribute a low-signal skip (exercises the shared-parse span \
@@ -1191,6 +1201,190 @@ fn skip_summary_shared_parse_matches_per_chunk_text() {
         span.get("SkipTestFixture").copied().unwrap_or(0) >= 1,
         "the fixtures/ file must be a test-fixture skip (exercises the parse-free cheap gate): \
          {span:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn skip_summary_fast_path_reads_certified_column_and_falls_back_when_stale() {
+    use crate::index::ai::{self, embedding_policy_skip_summary};
+
+    // #530: after a full rebuild the policy version is stamped, so the summary reads its counts
+    // from the certified `chunks.embedding_policy` column (GROUP BY, no parse). Prove (a) the
+    // fast path really READS the column — poisoning one chunk moves the count — and (b) a stale
+    // stamp falls back to the recompute, which classifies from source and so IGNORES the
+    // poisoned column.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/code.rs"),
+        "pub fn compute(x: i64, y: i64) -> i64 {\n    let sum = x * 2 + y - 1;\n    \
+         sum.wrapping_mul(3)\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/plumbing.rs"),
+        "use std::collections::HashMap;\nuse std::collections::BTreeMap;\nuse \
+         std::path::PathBuf;\nuse std::sync::Arc;\npub use crate::foo::Bar;\n",
+    )
+    .unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // Fresh rebuild certified the column: fast path.
+    let fast = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    let embed_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks WHERE embedding_policy = 'Embed'", [], |r| r.get(0))
+        .unwrap();
+    assert!(embed_before >= 1, "fixture must have an eligible (Embed) chunk to poison");
+
+    // Poison one Embed chunk in the base table; the fast path must reflect the (wrong) column
+    // value.
+    conn.execute(
+        "UPDATE main.chunks SET embedding_policy = 'SkipGenerated'
+         WHERE id = (SELECT MIN(id) FROM main.chunks WHERE embedding_policy = 'Embed')",
+        [],
+    )
+    .unwrap();
+    let poisoned = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(
+        poisoned.get("SkipGenerated").copied().unwrap_or(0),
+        fast.get("SkipGenerated").copied().unwrap_or(0) + 1,
+        "fast path must read the poisoned column: {poisoned:?} vs fresh {fast:?}"
+    );
+
+    // Clear the stamp → recompute from source ignores the poisoned column and returns ground truth.
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+        .unwrap();
+    let recomputed = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(
+        recomputed, fast,
+        "stale stamp must recompute from source, ignoring the poisoned column: {recomputed:?} vs \
+         {fast:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reconcile_self_heals_stale_policy_column_and_restamps() {
+    use crate::index::ai::{self, embedding_policy_skip_summary};
+
+    // #530: after a rag-rat upgrade bumps the classifier version, an incrementally-maintained index
+    // never full-rebuilds, so its column stays uncertified and every summary pays the O(files)
+    // parse. The reconcile self-heal fixes that: it recomputes from source, writes the column
+    // back, and restamps the version — so the FIRST reconcile after the bump pays once and
+    // every later reconcile/plan takes the fast path.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/code.rs"),
+        "pub fn compute(x: i64, y: i64) -> i64 {\n    let sum = x * 2 + y - 1;\n    \
+         sum.wrapping_mul(3)\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/plumbing.rs"),
+        "use std::collections::HashMap;\nuse std::collections::BTreeMap;\nuse \
+         std::path::PathBuf;\nuse std::sync::Arc;\npub use crate::foo::Bar;\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+
+    // Ground truth from the freshly certified column.
+    let truth = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+
+    // Simulate a version bump that left the column stale: poison one chunk AND stale the stamp.
+    conn.execute(
+        "UPDATE main.chunks SET embedding_policy = 'SkipGenerated'
+         WHERE id = (SELECT MIN(id) FROM main.chunks WHERE embedding_policy = 'Embed')",
+        [],
+    )
+    .unwrap();
+    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+        .unwrap();
+
+    // A reconcile (no model → NotReady, but it still runs the summary + self-heal) must repair the
+    // column and restamp the version current.
+    let _ = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(
+        crate::index::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY)
+            .unwrap()
+            .as_deref(),
+        Some(ai::EMBEDDING_POLICY_VERSION),
+        "reconcile must restamp the policy version current"
+    );
+    let healed = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(healed, truth, "self-heal must restore the column to ground truth: {healed:?}");
+
+    // Prove it is the FAST path now: re-poisoning moves the count (a recompute would ignore it).
+    conn.execute(
+        "UPDATE main.chunks SET embedding_policy = 'SkipGenerated'
+         WHERE id = (SELECT MIN(id) FROM main.chunks WHERE embedding_policy = 'Embed')",
+        [],
+    )
+    .unwrap();
+    let after = embedding_policy_skip_summary(conn, ai::DEFAULT_MAX_EMBEDDING_CHARS).unwrap();
+    assert_eq!(
+        after.get("SkipGenerated").copied().unwrap_or(0),
+        truth.get("SkipGenerated").copied().unwrap_or(0) + 1,
+        "after self-heal the summary reads the certified column (fast path): {after:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn self_heal_does_not_certify_a_repo_with_another_live_scope() {
+    use crate::index::ai::{self};
+
+    // #530 (Codex): the self-heal reparses only the ACTIVE scope, so it must NOT write the
+    // repo-wide version stamp when another live scope exists (a second linked-worktree overlay
+    // / other-commit leftover) — that scope would go un-healed while the stamp certified it.
+    // Simulate the other scope with a live `main.files` row outside the active (base) scope and
+    // assert the reconcile self-heal leaves the stamp stale (so every scope keeps recomputing).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/code.rs"), "pub fn compute(x: i64) -> i64 {\n    x * 2 + 1\n}\n")
+        .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    let generation = crate::index::schema::active_generation(conn).unwrap();
+
+    // Stale the stamp (simulate a version bump) so the self-heal would otherwise fire and restamp.
+    crate::index::meta::set_repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY, "stale")
+        .unwrap();
+    // A live row OUTSIDE the active base scope (git-less fixture ⇒ active commit_sha/worktree_id
+    // are both ''): commit_sha != '' AND worktree_id != '' is what
+    // `carry_forward_live_overlays` treats as a foreign scope.
+    conn.execute(
+        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+                                repo_id, generation, commit_sha, worktree_id)
+         VALUES ('other/f.rs', 'rust', 'source', 'deadbeef', 0, 0, ?1, ?2, 'othercommit', \
+         'otherwt')",
+        rusqlite::params![repo_id, generation],
+    )
+    .unwrap();
+
+    let _ = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(
+        crate::index::meta::repo_meta(conn, &repo_id, ai::EMBEDDING_POLICY_VERSION_KEY)
+            .unwrap()
+            .as_deref(),
+        Some("stale"),
+        "self-heal must NOT certify a repo whose active scope is not its whole live set"
     );
 
     let _ = fs::remove_dir_all(root);

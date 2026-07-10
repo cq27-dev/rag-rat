@@ -33,8 +33,21 @@ impl IndexDatabase {
         ai::reconcile(self.storage.connection(), limit, batch_size)
     }
 
+    /// Plan the embedding reconcile at the DEFAULT char cap. The CLI uses the cap-aware
+    /// [`reconcile_plan_with_cap`](Self::reconcile_plan_with_cap) so `--plan` classifies against
+    /// the same cap the run will; this default-cap form stays for callers without a configured
+    /// cap.
     pub fn reconcile_plan(&self) -> anyhow::Result<ReconcilePlan> {
-        ai::reconcile_plan(self.storage.connection())
+        self.reconcile_plan_with_cap(ai::DEFAULT_MAX_EMBEDDING_CHARS)
+    }
+
+    /// `max_embedding_chars` is the caller's configured/overridden cap, so the plan classifies
+    /// against the SAME cap the reconcile it previews will use.
+    pub fn reconcile_plan_with_cap(
+        &self,
+        max_embedding_chars: usize,
+    ) -> anyhow::Result<ReconcilePlan> {
+        ai::reconcile_plan(self.storage.connection(), max_embedding_chars)
     }
 
     pub fn reconcile_with_progress(
