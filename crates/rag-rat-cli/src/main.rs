@@ -11,7 +11,7 @@ pub(crate) use commands::*;
 pub(crate) use fs_atomic::*;
 pub(crate) use hooks_support::*;
 use rag_rat_core::index::IndexProgress;
-use rag_rat_core::index::github::GitHubSyncAction;
+use rag_rat_core::index::papertrail::PapertrailSyncAction;
 use rag_rat_core::search::lexical::SearchHit;
 use rag_rat_core::{Config, IndexDatabase};
 pub(crate) use render::*;
@@ -126,7 +126,7 @@ fn main() -> anyhow::Result<()> {
         },
         Cmd::Memory(args) => memory(&config, &args)?,
         Cmd::Dream(args) => dream(&config, &args)?,
-        Cmd::Github(args) => github(&config, &args)?,
+        Cmd::Github(args) => papertrail(&config, &args)?,
         Cmd::Hooks(args) => hooks(&config, &args)?,
         Cmd::Maintenance(args) => maintenance(&config, &args)?,
         Cmd::Models(args) => models(&config, &args)?,

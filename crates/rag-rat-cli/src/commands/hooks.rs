@@ -6,17 +6,17 @@ use std::fs;
 use rag_rat_core::Config;
 
 use crate::cli::{GithubArgs, GithubCommand, HookAction, HooksArgs};
-use crate::render::{print_output, render_github_sync_progress};
+use crate::render::{print_output, render_papertrail_sync_progress};
 use crate::{MANAGED_HOOKS, claude_settings, git_paths, install_hook, is_rag_rat_hook, open_index};
 
-pub(crate) fn github(config: &Config, args: &GithubArgs) -> anyhow::Result<()> {
+pub(crate) fn papertrail(config: &Config, args: &GithubArgs) -> anyhow::Result<()> {
     match &args.command {
         GithubCommand::Sync { from_refs, issue, offline } => {
             let db = open_index(config)?;
             let report = if let Some(issue) = issue {
-                db.github_sync_issue(issue, *offline)?
+                db.papertrail_sync_issue(issue, *offline)?
             } else if *from_refs {
-                db.github_sync_from_refs_with_progress(*offline, render_github_sync_progress)?
+                db.papertrail_sync_from_refs_with_progress(*offline, render_papertrail_sync_progress)?
             } else {
                 anyhow::bail!("github sync needs --from-refs or --issue <owner/repo#number>");
             };

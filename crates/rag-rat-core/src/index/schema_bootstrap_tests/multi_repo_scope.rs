@@ -882,15 +882,15 @@ fn papertrail_queries_never_surface_the_other_repo() {
     let conn = fx.db.storage.connection();
 
     // github_issue_search → search_fts, which filters github_fts.repo_id.
-    let leaked = fx.db.github_issue_search(B_ISSUE_TOKEN, 10).unwrap();
+    let leaked = fx.db.papertrail_issue_search(B_ISSUE_TOKEN, 10).unwrap();
     assert!(leaked.is_empty(), "repo B issue leaked into repo A github search: {leaked:?}");
-    let own = fx.db.github_issue_search(A_ISSUE_TOKEN, 10).unwrap();
+    let own = fx.db.papertrail_issue_search(A_ISSUE_TOKEN, 10).unwrap();
     assert!(!own.is_empty(), "repo A must still see its own issue");
 
     // refs_for_path filters github_refs.repo_id.
-    let leaked_refs = crate::index::github::refs_for_path(conn, "src/b_only.rs", 10).unwrap();
+    let leaked_refs = crate::index::papertrail::refs_for_path(conn, "src/b_only.rs", 10).unwrap();
     assert!(leaked_refs.is_empty(), "repo B github ref leaked: {leaked_refs:?}");
-    let own_refs = crate::index::github::refs_for_path(conn, "src/a_only.rs", 10).unwrap();
+    let own_refs = crate::index::papertrail::refs_for_path(conn, "src/a_only.rs", 10).unwrap();
     assert!(!own_refs.is_empty(), "repo A must still see its own github ref");
 
     let _ = fs::remove_dir_all(fx.root_a);

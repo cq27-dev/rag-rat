@@ -70,7 +70,7 @@ impl IndexDatabase {
         git_history::status(self.storage.connection(), root)
     }
 
-    pub(super) fn github_status(&self) -> anyhow::Result<GitHubStatus> {
-        github::status(self.storage.connection(), &self.github)
+    pub(super) fn papertrail_status(&self) -> anyhow::Result<PapertrailStatus> {
+        papertrail::status(self.storage.connection(), &self.papertrail)
     }
 }

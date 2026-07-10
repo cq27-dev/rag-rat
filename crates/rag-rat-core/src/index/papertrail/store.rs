@@ -15,7 +15,7 @@ use super::*;
 // because every sync path ends in the whole-table [`rebuild_fts`], which re-derives each mirror
 // row's `repo_id` from its base row.
 
-pub(crate) fn store_ref(conn: &Connection, reference: &GitHubRef) -> anyhow::Result<()> {
+pub(crate) fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result<()> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     // The widened `idx_github_refs_unique` (V044) leads with `repo_id`, so a conflict is always
     // THIS repo re-discovering its OWN ref — keep the first-sighting row untouched (`DO

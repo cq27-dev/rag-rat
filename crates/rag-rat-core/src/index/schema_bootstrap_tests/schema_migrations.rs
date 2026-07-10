@@ -391,7 +391,7 @@ fn migrate_preserves_github_papertrail_cache() {
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    github::sync_from_refs(
+    papertrail::sync_from_refs(
         db.storage.connection(),
         &root,
         Some(&MockGitHubClient),
@@ -422,7 +422,7 @@ fn migrate_preserves_github_papertrail_cache() {
     assert_eq!(row_count(&db, "github_reviews"), 1);
     assert_eq!(row_count(&db, "github_review_comments"), 1);
     assert_eq!(row_count(&db, "github_fts"), 5);
-    let hits = db.github_issue_search("sqlite", 10).unwrap();
+    let hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].number, 42);
 
@@ -439,7 +439,7 @@ fn full_rebuild_preserves_github_papertrail_cache() {
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    github::sync_from_refs(
+    papertrail::sync_from_refs(
         db.storage.connection(),
         &root,
         Some(&MockGitHubClient),
@@ -461,7 +461,7 @@ fn full_rebuild_preserves_github_papertrail_cache() {
     assert_eq!(row_count(&db, "github_review_comments"), 1);
     assert_eq!(row_count(&db, "github_ref_sync"), 1);
     assert_eq!(row_count(&db, "github_fts"), 5);
-    let hits = db.github_issue_search("sqlite", 10).unwrap();
+    let hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].number, 42);
 

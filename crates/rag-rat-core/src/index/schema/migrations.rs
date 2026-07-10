@@ -2851,7 +2851,7 @@ pub(crate) fn apply_memory_model_failures_table(conn: &Connection) -> rusqlite::
 /// duplicated child rows still cannot FIND them through the scoped FTS readers
 /// (`rationale_search` / papertrail filter `repo_id = active`) until some later github sync
 /// happens to run the sync-tail rebuild — the migration would fix the base tables while the
-/// mirror kept serving the last-syncer state. The derivation mirrors `github::rebuild_fts`'s
+/// mirror kept serving the last-syncer state. The derivation mirrors `papertrail::rebuild_fts`'s
 /// column mapping exactly (per-kind title slots; reviews' `COALESCE(html_url,'')`); the
 /// `classification` column is a Rust-derived label (`classify_text`), so it is CARRIED from the
 /// old mirror by `(item_kind, item_id)` — identical per item across per-repo duplicates — with

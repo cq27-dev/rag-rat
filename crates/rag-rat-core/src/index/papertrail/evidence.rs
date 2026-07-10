@@ -4,7 +4,7 @@ pub(crate) fn evidence_for_path(
     conn: &Connection,
     path: &str,
     limit: u32,
-) -> anyhow::Result<Vec<GitHubEvidence>> {
+) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let refs = refs_for_path(conn, path, limit)?;
     let mut evidence = Vec::new();
     for reference in refs {
@@ -52,7 +52,7 @@ pub(crate) fn evidence_for_issue(
     repo: &str,
     number: i64,
     limit: u32,
-) -> anyhow::Result<Vec<GitHubEvidence>> {
+) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
@@ -75,7 +75,7 @@ pub(crate) fn evidence_for_commit_refs(
     conn: &Connection,
     commit_hash: &str,
     limit: u32,
-) -> anyhow::Result<Vec<GitHubEvidence>> {
+) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "
@@ -106,7 +106,7 @@ pub(crate) fn search_fts(
     query: &str,
     kind: Option<&str>,
     limit: u32,
-) -> anyhow::Result<Vec<GitHubEvidence>> {
+) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let fts_query = fts_query(query);
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     // The `repo_id` filter is MANDATORY (V041): `github_fts` is one index over every repo's
@@ -143,7 +143,7 @@ pub(crate) fn search_fts(
 pub(crate) fn positive_rank_score(rank: usize) -> f64 {
     1.0 / ((rank + 1) as f64).sqrt()
 }
-pub(crate) fn dedupe_evidence(evidence: &mut Vec<GitHubEvidence>) {
+pub(crate) fn dedupe_evidence(evidence: &mut Vec<PapertrailEvidence>) {
     let mut seen = BTreeSet::new();
     evidence.retain(|item| {
         seen.insert((
@@ -155,10 +155,10 @@ pub(crate) fn dedupe_evidence(evidence: &mut Vec<GitHubEvidence>) {
         ))
     });
 }
-pub(crate) fn evidence_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitHubEvidence> {
+pub(crate) fn evidence_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PapertrailEvidence> {
     let title: String = row.get(6)?;
     let body: String = row.get(7)?;
-    Ok(GitHubEvidence {
+    Ok(PapertrailEvidence {
         owner: row.get(0)?,
         repo: row.get(1)?,
         number: row.get(2)?,
@@ -172,8 +172,8 @@ pub(crate) fn evidence_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitHubEv
         score: row.get(9)?,
     })
 }
-pub(crate) fn ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitHubRef> {
-    Ok(GitHubRef {
+pub(crate) fn ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PapertrailRef> {
+    Ok(PapertrailRef {
         owner: row.get(0)?,
         repo: row.get(1)?,
         number: row.get(2)?,
@@ -184,7 +184,7 @@ pub(crate) fn ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitHubRef> {
         source_text: row.get(7)?,
     })
 }
-pub(crate) fn refs(conn: &Connection) -> anyhow::Result<Vec<GitHubRef>> {
+pub(crate) fn refs(conn: &Connection) -> anyhow::Result<Vec<PapertrailRef>> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let mut stmt = conn.prepare(
         "SELECT owner, repo, number, ref_kind, source_kind, source_path, source_commit, \

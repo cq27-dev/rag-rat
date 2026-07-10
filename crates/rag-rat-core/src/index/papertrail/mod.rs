@@ -23,14 +23,14 @@ use crate::index::now_ms;
 /// parallelism, and unauthenticated in CI — so it is resolved ONLY at the real-usage boundary
 /// (`IndexDatabase::open_config`) and never in tests, which pass an explicit context (#60).
 #[derive(Debug, Clone, Default)]
-pub struct GitHubContext {
+pub struct PapertrailContext {
     /// `owner/repo` used to qualify bare `#N` refs. `None` leaves bare refs unresolved.
     pub default_repo: Option<String>,
     /// Whether the `gh` CLI is available (reported as a capability in status).
     pub gh_available: bool,
 }
 
-impl GitHubContext {
+impl PapertrailContext {
     /// Resolve from the local `gh` CLI. Call ONLY at the real-usage boundary (open_config),
     /// never inside the library internals or tests.
     pub(crate) fn from_gh() -> Self {
@@ -48,7 +48,7 @@ impl GitHubContext {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct GitHubStatus {
+pub struct PapertrailStatus {
     pub refs: u64,
     pub issues: u64,
     pub comments: u64,
@@ -60,18 +60,18 @@ pub struct GitHubStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct GitHubSyncReport {
+pub struct PapertrailSyncReport {
     pub offline: bool,
     pub discovered_refs: usize,
     pub skipped_refs: usize,
     pub failed_refs: usize,
     pub synced_items: usize,
-    pub errors: Vec<GitHubSyncError>,
-    pub status: GitHubStatus,
+    pub errors: Vec<PapertrailSyncError>,
+    pub status: PapertrailStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct GitHubSyncError {
+pub struct PapertrailSyncError {
     pub owner: String,
     pub repo: String,
     pub number: i64,
@@ -80,18 +80,18 @@ pub struct GitHubSyncError {
 }
 
 #[derive(Debug, Clone)]
-pub struct GitHubSyncProgress {
+pub struct PapertrailSyncProgress {
     pub current: usize,
     pub total: usize,
     pub owner: String,
     pub repo: String,
     pub number: i64,
-    pub action: GitHubSyncAction,
+    pub action: PapertrailSyncAction,
     pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitHubSyncAction {
+pub enum PapertrailSyncAction {
     Syncing,
     Skipped,
     Synced,
@@ -100,7 +100,7 @@ pub enum GitHubSyncAction {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct GitHubRef {
+pub struct PapertrailRef {
     pub owner: String,
     pub repo: String,
     pub number: i64,
@@ -112,7 +112,7 @@ pub struct GitHubRef {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct GitHubEvidence {
+pub struct PapertrailEvidence {
     pub owner: String,
     pub repo: String,
     pub number: i64,
@@ -129,9 +129,9 @@ pub struct GitHubEvidence {
 #[derive(Debug, Clone, Serialize)]
 pub struct Papertrail {
     pub current_source: Option<CurrentSourceEvidence>,
-    pub github_evidence: Vec<GitHubEvidence>,
+    pub github_evidence: Vec<PapertrailEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub fallback_github_evidence: Vec<GitHubEvidence>,
+    pub fallback_github_evidence: Vec<PapertrailEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,7 +300,7 @@ pub(crate) struct SyncRefsReport {
     synced_items: usize,
     skipped_refs: usize,
     failed_refs: usize,
-    errors: Vec<GitHubSyncError>,
+    errors: Vec<PapertrailSyncError>,
 }
 
 pub(crate) struct FtsRow<'a> {

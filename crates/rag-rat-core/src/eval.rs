@@ -909,7 +909,7 @@ fn skipped_report(query: &EvalQuery, reason: impl Into<String>) -> EvalQueryRepo
 }
 
 fn papertrail_cache_available(db: &IndexDatabase) -> anyhow::Result<bool> {
-    let status = db.github_sync_status()?;
+    let status = db.papertrail_sync_status()?;
     Ok(status.issues + status.comments + status.pulls + status.reviews + status.review_comments > 0)
 }
 

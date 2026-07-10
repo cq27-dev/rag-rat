@@ -224,8 +224,8 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
 }
 
 /// GitHub context for tests: the rag-rat repo itself, never the live `gh` CLI (#60).
-fn test_gh_ctx() -> github::GitHubContext {
-    github::GitHubContext::new(Some("cq27-dev/rag-rat"), false)
+fn test_gh_ctx() -> papertrail::PapertrailContext {
+    papertrail::PapertrailContext::new(Some("cq27-dev/rag-rat"), false)
 }
 // ---- #219 stage 2: linked-worktree overlay indexing ----
 
@@ -548,9 +548,9 @@ fn git_output(root: &Path, args: &[&str]) -> String {
 
 struct MockGitHubClient;
 
-impl github::GitHubClient for MockGitHubClient {
-    fn issue(&self, owner: &str, repo: &str, number: i64) -> anyhow::Result<github::GitHubIssue> {
-        Ok(github::GitHubIssue {
+impl papertrail::GitHubClient for MockGitHubClient {
+    fn issue(&self, owner: &str, repo: &str, number: i64) -> anyhow::Result<papertrail::GitHubIssue> {
+        Ok(papertrail::GitHubIssue {
             owner: owner.to_string(),
             repo: repo.to_string(),
             number,
@@ -570,8 +570,8 @@ impl github::GitHubClient for MockGitHubClient {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> anyhow::Result<Vec<github::GitHubComment>> {
-        Ok(vec![github::GitHubComment {
+    ) -> anyhow::Result<Vec<papertrail::GitHubComment>> {
+        Ok(vec![papertrail::GitHubComment {
             id: 4201,
             owner: owner.to_string(),
             repo: repo.to_string(),
@@ -589,8 +589,8 @@ impl github::GitHubClient for MockGitHubClient {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> anyhow::Result<Option<github::GitHubPullRequest>> {
-        Ok(Some(github::GitHubPullRequest {
+    ) -> anyhow::Result<Option<papertrail::GitHubPullRequest>> {
+        Ok(Some(papertrail::GitHubPullRequest {
             owner: owner.to_string(),
             repo: repo.to_string(),
             number,
@@ -610,8 +610,8 @@ impl github::GitHubClient for MockGitHubClient {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> anyhow::Result<Vec<github::GitHubReview>> {
-        Ok(vec![github::GitHubReview {
+    ) -> anyhow::Result<Vec<papertrail::GitHubReview>> {
+        Ok(vec![papertrail::GitHubReview {
             id: 4202,
             owner: owner.to_string(),
             repo: repo.to_string(),
@@ -629,8 +629,8 @@ impl github::GitHubClient for MockGitHubClient {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> anyhow::Result<Vec<github::GitHubReviewComment>> {
-        Ok(vec![github::GitHubReviewComment {
+    ) -> anyhow::Result<Vec<papertrail::GitHubReviewComment>> {
+        Ok(vec![papertrail::GitHubReviewComment {
             id: 4203,
             owner: owner.to_string(),
             repo: repo.to_string(),
@@ -647,8 +647,8 @@ impl github::GitHubClient for MockGitHubClient {
 
 struct PartiallyFailingGitHubClient;
 
-impl github::GitHubClient for PartiallyFailingGitHubClient {
-    fn issue(&self, owner: &str, repo: &str, number: i64) -> anyhow::Result<github::GitHubIssue> {
+impl papertrail::GitHubClient for PartiallyFailingGitHubClient {
+    fn issue(&self, owner: &str, repo: &str, number: i64) -> anyhow::Result<papertrail::GitHubIssue> {
         if number == 404 {
             anyhow::bail!("gh: Not Found (HTTP 404)");
         }
@@ -660,7 +660,7 @@ impl github::GitHubClient for PartiallyFailingGitHubClient {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> anyhow::Result<Vec<github::GitHubComment>> {
+    ) -> anyhow::Result<Vec<papertrail::GitHubComment>> {
         MockGitHubClient.issue_comments(owner, repo, number)
     }
 
@@ -669,7 +669,7 @@ impl github::GitHubClient for PartiallyFailingGitHubClient {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> anyhow::Result<Option<github::GitHubPullRequest>> {
+    ) -> anyhow::Result<Option<papertrail::GitHubPullRequest>> {
         MockGitHubClient.pull(owner, repo, number)
     }
 
@@ -678,7 +678,7 @@ impl github::GitHubClient for PartiallyFailingGitHubClient {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> anyhow::Result<Vec<github::GitHubReview>> {
+    ) -> anyhow::Result<Vec<papertrail::GitHubReview>> {
         MockGitHubClient.pull_reviews(owner, repo, number)
     }
 
@@ -687,7 +687,7 @@ impl github::GitHubClient for PartiallyFailingGitHubClient {
         owner: &str,
         repo: &str,
         number: i64,
-    ) -> anyhow::Result<Vec<github::GitHubReviewComment>> {
+    ) -> anyhow::Result<Vec<papertrail::GitHubReviewComment>> {
         MockGitHubClient.pull_review_comments(owner, repo, number)
     }
 }

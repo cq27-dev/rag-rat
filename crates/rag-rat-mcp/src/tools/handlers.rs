@@ -146,11 +146,11 @@ pub(crate) fn call_tool_with_db(
         },
         "github_issue_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
-            json!(db.github_issue_search(&args.query, args.limit)?)
+            json!(db.papertrail_issue_search(&args.query, args.limit)?)
         },
         "github_refs_for_path" => {
             let args: PathHistoryArgs = serde_json::from_value(arguments)?;
-            json!(db.github_refs_for_path(&args.path, args.limit)?)
+            json!(db.papertrail_refs_for_path(&args.path, args.limit)?)
         },
         "rationale_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
@@ -171,7 +171,7 @@ pub(crate) fn call_tool_with_db(
             let args: HealIndexArgs = serde_json::from_value(arguments)?;
             json!(db.heal_index(args.limit)?)
         },
-        "github_sync_status" => json!(db.github_sync_status()?),
+        "github_sync_status" => json!(db.papertrail_sync_status()?),
         "index_status" => {
             let mut value = json!(db.status(db.database_path())?);
             // The full migration ledger is static detail (use the CLI `doctor`/`migrate` for it),

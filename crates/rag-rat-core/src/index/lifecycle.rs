@@ -137,7 +137,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             active_generation,
-            github: github::GitHubContext::default(),
+            papertrail: papertrail::PapertrailContext::default(),
             config: None,
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
@@ -159,7 +159,7 @@ impl IndexDatabase {
             active_generation: 0,
             // Real usage: resolve the GitHub repo context from the local `gh` CLI here, at the
             // boundary. rebuild/open (used by tests and the bare index command) leave it offline.
-            github: github::GitHubContext::from_gh(),
+            papertrail: papertrail::PapertrailContext::from_gh(),
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
@@ -326,7 +326,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             active_generation: 0,
-            github: github::GitHubContext::from_gh(),
+            papertrail: papertrail::PapertrailContext::from_gh(),
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
@@ -363,8 +363,8 @@ impl IndexDatabase {
 
     /// Set the GitHub repo context explicitly (tests / non-gh callers), so the library never
     /// shells out to `gh`.
-    pub fn set_github_context(&mut self, default_repo: Option<&str>, gh_available: bool) {
-        self.github = github::GitHubContext::new(default_repo, gh_available);
+    pub fn set_papertrail_context(&mut self, default_repo: Option<&str>, gh_available: bool) {
+        self.papertrail = papertrail::PapertrailContext::new(default_repo, gh_available);
     }
 
     pub fn migrate(path: &Path) -> anyhow::Result<schema::SchemaStatus> {
@@ -448,7 +448,7 @@ impl IndexDatabase {
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
             active_generation: 0,
-            github: github::GitHubContext::default(),
+            papertrail: papertrail::PapertrailContext::default(),
             config: None,
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),

@@ -1724,10 +1724,10 @@ fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
     let mut db = IndexDatabase::rebuild(&config).unwrap();
     // Resolve the repo context explicitly so db.rationale_search("Fixes #42") qualifies the bare
     // ref without shelling out to `gh` (#60).
-    db.set_github_context(Some("cq27-dev/rag-rat"), false);
+    db.set_papertrail_context(Some("cq27-dev/rag-rat"), false);
     let mock = MockGitHubClient;
 
-    let offline = github::sync_from_refs::<MockGitHubClient>(
+    let offline = papertrail::sync_from_refs::<MockGitHubClient>(
         db.storage.connection(),
         &root,
         None,
@@ -1740,7 +1740,7 @@ fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
     assert_eq!(offline.synced_items, 0);
 
     let report =
-        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+        papertrail::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
             .unwrap();
     assert!(!report.offline);
     assert_eq!(report.discovered_refs, 1);
@@ -1751,12 +1751,12 @@ fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
     assert_eq!(report.status.reviews, 1);
     assert_eq!(report.status.review_comments, 1);
 
-    let issue_hits = db.github_issue_search("sqlite", 10).unwrap();
+    let issue_hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(issue_hits.len(), 1);
     assert_eq!(issue_hits[0].classification, "decision");
     assert_eq!(issue_hits[0].evidence_kind, "historical_github");
 
-    let refs = db.github_refs_for_path("docs/search.md", 10).unwrap();
+    let refs = db.papertrail_refs_for_path("docs/search.md", 10).unwrap();
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].source_kind, "file");
 

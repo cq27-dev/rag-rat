@@ -20,7 +20,7 @@ fn papertrail_for_commit_prefers_commit_sourced_github_refs() {
         .query_row("SELECT hash FROM git_commits LIMIT 1", [], |row| row.get::<_, String>(0))
         .unwrap();
     let mock = MockGitHubClient;
-    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+    papertrail::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
         .unwrap();
 
     let papertrail = db.papertrail_for_commit(&commit[..7], 10).unwrap();
@@ -50,7 +50,7 @@ fn papertrail_for_symbol_dedupes_duplicate_file_refs() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let mock = MockGitHubClient;
-    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+    papertrail::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
         .unwrap();
     let papertrail = db
         .papertrail_for_symbol("tracked_symbol", Some(Language::Rust), 10)
@@ -79,7 +79,7 @@ fn github_sync_keeps_partial_cache_and_skips_synced_refs_after_404() {
     let mock = PartiallyFailingGitHubClient;
 
     let report =
-        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+        papertrail::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
             .unwrap();
     assert_eq!(report.discovered_refs, 2);
     assert_eq!(report.synced_items, 5);
@@ -88,12 +88,12 @@ fn github_sync_keeps_partial_cache_and_skips_synced_refs_after_404() {
     assert_eq!(report.errors[0].number, 404);
     assert_eq!(report.errors[0].status, "not_found");
 
-    let issue_hits = db.github_issue_search("sqlite", 10).unwrap();
+    let issue_hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(issue_hits.len(), 1);
     assert_eq!(issue_hits[0].number, 42);
 
     let second =
-        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+        papertrail::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
             .unwrap();
     assert_eq!(second.synced_items, 0);
     assert_eq!(second.skipped_refs, 2);
@@ -610,7 +610,7 @@ fn both_repos_keep_a_shared_prs_comments_across_syncs() {
             [repo_id],
         )
         .unwrap();
-        crate::index::github::store_comment(&conn, &crate::index::github::GitHubComment {
+        crate::index::papertrail::store_comment(&conn, &crate::index::papertrail::GitHubComment {
             id: 7,
             owner: "o".into(),
             repo: "r".into(),

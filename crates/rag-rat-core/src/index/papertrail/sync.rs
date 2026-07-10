@@ -3,8 +3,8 @@ use super::*;
 pub(crate) fn discover_and_store_refs(
     conn: &Connection,
     root: &Path,
-    ctx: &GitHubContext,
-) -> anyhow::Result<Vec<GitHubRef>> {
+    ctx: &PapertrailContext,
+) -> anyhow::Result<Vec<PapertrailRef>> {
     let default_repo = ctx.default_repo().map(str::to_string);
     let mut refs = Vec::new();
     discover_commit_refs(conn, default_repo.as_deref(), &mut refs)?;
@@ -15,7 +15,7 @@ pub(crate) fn discover_and_store_refs(
         .map(|name| name.shorten().to_string())
         .unwrap_or_default();
     for parsed in parse_refs(&branch, default_repo.as_deref()) {
-        refs.push(GitHubRef {
+        refs.push(PapertrailRef {
             owner: parsed.owner,
             repo: parsed.repo,
             number: parsed.number,
@@ -46,8 +46,8 @@ pub(crate) fn discover_and_store_refs(
 pub(crate) fn sync_refs<'a, C: GitHubClient>(
     conn: &Connection,
     client: &C,
-    refs: impl Iterator<Item = &'a GitHubRef>,
-    progress: &mut impl FnMut(GitHubSyncProgress),
+    refs: impl Iterator<Item = &'a PapertrailRef>,
+    progress: &mut impl FnMut(PapertrailSyncProgress),
 ) -> anyhow::Result<SyncRefsReport> {
     let refs = refs.collect::<Vec<_>>();
     let total = refs
@@ -62,24 +62,24 @@ pub(crate) fn sync_refs<'a, C: GitHubClient>(
             continue;
         }
         let current = seen.len();
-        if github_ref_synced(conn, reference)? {
+        if papertrail_ref_synced(conn, reference)? {
             report.skipped_refs += 1;
-            progress(sync_progress(reference, current, total, GitHubSyncAction::Skipped, None));
+            progress(sync_progress(reference, current, total, PapertrailSyncAction::Skipped, None));
             continue;
         }
-        progress(sync_progress(reference, current, total, GitHubSyncAction::Syncing, None));
+        progress(sync_progress(reference, current, total, PapertrailSyncAction::Syncing, None));
         match sync_one_ref(conn, client, reference) {
             Ok(items) => {
                 report.synced_items += items;
                 mark_ref_sync(conn, reference, "synced", None)?;
-                progress(sync_progress(reference, current, total, GitHubSyncAction::Synced, None));
+                progress(sync_progress(reference, current, total, PapertrailSyncAction::Synced, None));
             },
             Err(err) => {
                 let message = err.to_string();
                 let status = if is_not_found_error(&message) { "not_found" } else { "failed" };
                 mark_ref_sync(conn, reference, status, Some(&message))?;
                 report.failed_refs += 1;
-                report.errors.push(GitHubSyncError {
+                report.errors.push(PapertrailSyncError {
                     owner: reference.owner.clone(),
                     repo: reference.repo.clone(),
                     number: reference.number,
@@ -90,19 +90,19 @@ pub(crate) fn sync_refs<'a, C: GitHubClient>(
                     reference,
                     current,
                     total,
-                    GitHubSyncAction::Failed,
+                    PapertrailSyncAction::Failed,
                     Some(message),
                 ));
             },
         }
     }
-    progress(GitHubSyncProgress {
+    progress(PapertrailSyncProgress {
         current: total,
         total,
         owner: String::new(),
         repo: String::new(),
         number: 0,
-        action: GitHubSyncAction::RebuildingFts,
+        action: PapertrailSyncAction::RebuildingFts,
         message: None,
     });
     rebuild_fts(conn)?;
@@ -111,7 +111,7 @@ pub(crate) fn sync_refs<'a, C: GitHubClient>(
 pub(crate) fn sync_one_ref<C: GitHubClient>(
     conn: &Connection,
     client: &C,
-    reference: &GitHubRef,
+    reference: &PapertrailRef,
 ) -> anyhow::Result<usize> {
     let mut synced = 0;
     let issue = client.issue(&reference.owner, &reference.repo, reference.number)?;
@@ -138,13 +138,13 @@ pub(crate) fn sync_one_ref<C: GitHubClient>(
     Ok(synced)
 }
 pub(crate) fn sync_progress(
-    reference: &GitHubRef,
+    reference: &PapertrailRef,
     current: usize,
     total: usize,
-    action: GitHubSyncAction,
+    action: PapertrailSyncAction,
     message: Option<String>,
-) -> GitHubSyncProgress {
-    GitHubSyncProgress {
+) -> PapertrailSyncProgress {
+    PapertrailSyncProgress {
         current,
         total,
         owner: reference.owner.clone(),
@@ -154,7 +154,7 @@ pub(crate) fn sync_progress(
         message,
     }
 }
-pub(crate) fn github_ref_synced(conn: &Connection, reference: &GitHubRef) -> anyhow::Result<bool> {
+pub(crate) fn papertrail_ref_synced(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result<bool> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let status = conn
         .query_row(
@@ -184,7 +184,7 @@ pub(crate) fn github_ref_synced(conn: &Connection, reference: &GitHubRef) -> any
 }
 pub(crate) fn mark_ref_sync(
     conn: &Connection,
-    reference: &GitHubRef,
+    reference: &PapertrailRef,
     status: &str,
     error: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -216,7 +216,7 @@ pub(crate) fn is_not_found_error(message: &str) -> bool {
 pub(crate) fn discover_commit_refs(
     conn: &Connection,
     default_repo: Option<&str>,
-    out: &mut Vec<GitHubRef>,
+    out: &mut Vec<PapertrailRef>,
 ) -> anyhow::Result<()> {
     // `git_commits` is direct-scoped (V040), so discovery only mines the ACTIVE repo's commit
     // messages for issue refs — a consolidated DB must not attribute a sibling repo's `#N` refs to
@@ -231,7 +231,7 @@ pub(crate) fn discover_commit_refs(
         let (hash, subject, body) = row?;
         for text in [subject, body] {
             for parsed in parse_refs(&text, default_repo) {
-                out.push(GitHubRef {
+                out.push(PapertrailRef {
                     owner: parsed.owner,
                     repo: parsed.repo,
                     number: parsed.number,
@@ -250,7 +250,7 @@ pub(crate) fn discover_file_refs(
     conn: &Connection,
     root: &Path,
     default_repo: Option<&str>,
-    out: &mut Vec<GitHubRef>,
+    out: &mut Vec<PapertrailRef>,
 ) -> anyhow::Result<()> {
     let mut stmt = conn.prepare("SELECT path FROM files ORDER BY path")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -261,7 +261,7 @@ pub(crate) fn discover_file_refs(
         };
         for line in text.lines() {
             for parsed in parse_refs(line, default_repo) {
-                out.push(GitHubRef {
+                out.push(PapertrailRef {
                     owner: parsed.owner,
                     repo: parsed.repo,
                     number: parsed.number,
