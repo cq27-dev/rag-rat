@@ -5,7 +5,11 @@ use super::*;
 
 impl IndexDatabase {
     pub fn commit_search(&self, query: &str, limit: u32) -> anyhow::Result<Vec<CommitSearchHit>> {
-        git_history::commit_search(self.storage.connection(), query, limit)
+        // #582: ranked commit_fts read — heal-and-retry on shadow corruption.
+        crate::index::retry_once_on_fts_corruption(
+            || git_history::commit_search(self.storage.connection(), query, limit),
+            || self.heal_corrupt_fts(),
+        )
     }
 
     /// Commit-replay eval cases (#120) from the indexed git history — commit message as query, the
@@ -179,7 +183,10 @@ impl IndexDatabase {
         query: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<PapertrailEvidence>> {
-        papertrail::issue_search(self.storage.connection(), query, limit)
+        crate::index::retry_once_on_fts_corruption(
+            || papertrail::issue_search(self.storage.connection(), query, limit),
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn rationale_search(
@@ -187,7 +194,17 @@ impl IndexDatabase {
         query: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<PapertrailEvidence>> {
-        papertrail::rationale_search(self.storage.connection(), query, limit, &self.papertrail)
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                papertrail::rationale_search(
+                    self.storage.connection(),
+                    query,
+                    limit,
+                    &self.papertrail,
+                )
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn papertrail_refs_for_path(

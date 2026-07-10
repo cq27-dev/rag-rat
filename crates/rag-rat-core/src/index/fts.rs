@@ -9,6 +9,8 @@
 //! pay a full FTS rebuild forever after a sibling synced (stale-dirty loop). Do NOT route these
 //! back through `self.repo_meta` / `self.set_repo_meta`.
 
+use anyhow::Context as _;
+
 use super::*;
 
 impl IndexDatabase {
@@ -144,5 +146,182 @@ impl IndexDatabase {
 
     pub(super) fn fts_dirty(&self) -> anyhow::Result<bool> {
         Ok(self.meta("fts_dirty")?.as_deref() == Some("true"))
+    }
+}
+
+impl IndexDatabase {
+    /// #582: rebuild EVERY FTS mirror from its durable source, THROUGH THIS CONNECTION — the
+    /// corruption-recovery path behind [`retry_once_on_fts_corruption`]. All-of-them because the
+    /// bare "database disk image is malformed" a corrupt read returns does not name the table
+    /// (the #582 incident burned three wrong theories on exactly that); every mirror rebuilds
+    /// losslessly (`chunk_fts`/`commit_fts` from the chunk/commit stores, `repo_memory_fts` from
+    /// `repo_memories`, `github_fts` from the papertrail tables), so over-healing costs one
+    /// re-tokenize, not data. Healing through the querying connection is what makes the fix
+    /// visible to a long-lived server: an out-of-band repair leaves the connection's cached
+    /// corrupt pages serving `SQLITE_CORRUPT` indefinitely.
+    pub(crate) fn heal_corrupt_fts(&self) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        // ONE `BEGIN IMMEDIATE` transaction fences the whole heal. The mirrors are GLOBAL on a
+        // consolidated DB while write flocks are per-repo, so a flock cannot serialize sibling
+        // repos' writers — the DATABASE-wide write lock can, and it also makes the
+        // multi-statement rebuilds one atomic unit. An active writer makes the BEGIN fail
+        // (busy timeout) and a connection already inside a transaction (a heal firing from
+        // within a pass) cannot open one — both surface here and the caller returns the
+        // ORIGINAL corruption error; the next query (or explicit `heal_index`) retries.
+        let fence =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        self.rebuild_fts()?;
+        crate::query::memory::heal_repo_memory_fts(conn)?;
+        crate::index::papertrail::rebuild_fts(conn)?;
+        fence.commit()?;
+        Ok(())
+    }
+}
+
+impl IndexDatabase {
+    /// `heal_index`'s FTS phase (#582): probe each mirror with a query that EXECUTES rank — only
+    /// rank/bm25 decodes docsize, the corruption class BOTH `PRAGMA integrity_check` and FTS5's
+    /// own `'integrity-check'` miss (a COUNT over the same MATCH passes; the ORDER BY is
+    /// optimized away) — and rebuild the mirrors whose probe returns SQLITE_CORRUPT. Returns the
+    /// rebuilt table names. The broad prefix disjunction matches essentially any text corpus; an
+    /// empty mirror matches nothing and probes clean, which is right (nothing ranks it).
+    pub(crate) fn heal_fts_if_corrupt(&self) -> anyhow::Result<Vec<String>> {
+        // Every a-z/0-9 prefix: any token leading with an ASCII alphanumeric matches, so the
+        // ranked probe reads docsize for essentially every row a real query could rank. (A corpus
+        // of exclusively non-ASCII-leading tokens would evade it; the query-layer retry still
+        // covers those.)
+        let probe_query =
+            ('a'..='z').chain('0'..='9').map(|c| format!("{c}*")).collect::<Vec<_>>().join(" OR ");
+        let conn = self.storage.connection();
+        let probe_corrupt = |table: &str| -> anyhow::Result<bool> {
+            let sql =
+                format!("SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY rank LIMIT 1");
+            match conn.query_row(&sql, [probe_query.as_str()], |_| Ok(())) {
+                Ok(()) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+                Err(err) => {
+                    let err: anyhow::Error = err.into();
+                    if error_is_fts_corruption(&err) { Ok(true) } else { Err(err) }
+                },
+            }
+        };
+        let mut healed = Vec::new();
+        // chunk_fts and commit_fts share one recovery (`rebuild_fts` repopulates both).
+        let chunk_corrupt = probe_corrupt("chunk_fts")?;
+        let commit_corrupt = probe_corrupt("commit_fts")?;
+        let memory_corrupt = probe_corrupt("repo_memory_fts")?;
+        let github_corrupt = probe_corrupt("github_fts")?;
+        if !(chunk_corrupt || commit_corrupt || memory_corrupt || github_corrupt) {
+            return Ok(healed);
+        }
+        // Same database-wide fence as `heal_corrupt_fts`: the rebuilds are global and
+        // multi-statement, and per-repo flocks cannot serialize a consolidated DB's siblings.
+        let fence =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        if chunk_corrupt || commit_corrupt {
+            self.rebuild_fts()?;
+            if chunk_corrupt {
+                healed.push("chunk_fts".to_string());
+            }
+            if commit_corrupt {
+                healed.push("commit_fts".to_string());
+            }
+        }
+        if memory_corrupt {
+            crate::query::memory::heal_repo_memory_fts(conn)?;
+            healed.push("repo_memory_fts".to_string());
+        }
+        if github_corrupt {
+            crate::index::papertrail::rebuild_fts(conn)?;
+            healed.push("github_fts".to_string());
+        }
+        fence.commit()?;
+        Ok(healed)
+    }
+}
+
+/// #582: whether `err`'s chain contains SQLITE_CORRUPT — the FTS5 shadow-table variant surfaces
+/// as extended `SQLITE_CORRUPT_VTAB` (267), whose primary code rusqlite maps to
+/// `DatabaseCorrupt`, rendered as the bare "database disk image is malformed".
+pub(crate) fn error_is_fts_corruption(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseCorrupt
+        )
+    })
+}
+
+/// Run `op`; when it fails with FTS corruption, run `heal` and retry ONCE. A non-corruption
+/// error, a heal failure, and corruption that survives the heal all surface unchanged — there is
+/// deliberately no loop (#582).
+pub(crate) fn retry_once_on_fts_corruption<T>(
+    mut op: impl FnMut() -> anyhow::Result<T>,
+    heal: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    match op() {
+        Ok(value) => Ok(value),
+        Err(err) if error_is_fts_corruption(&err) => {
+            heal().context("healing corrupt FTS indexes (#582)")?;
+            op()
+        },
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod corruption_tests {
+    use super::*;
+
+    fn corrupt_error() -> anyhow::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseCorrupt,
+                extended_code: 267, // SQLITE_CORRUPT_VTAB — the FTS5 shadow variant
+            },
+            Some("database disk image is malformed".to_string()),
+        )
+        .into()
+    }
+
+    #[test]
+    fn corruption_retries_once_after_heal() {
+        let mut calls = 0;
+        let mut healed = false;
+        let result = retry_once_on_fts_corruption(
+            || {
+                calls += 1;
+                if calls == 1 { Err(corrupt_error()) } else { Ok(42) }
+            },
+            || {
+                healed = true;
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap(), 42);
+        assert!(healed, "the heal ran between the attempts");
+    }
+
+    #[test]
+    fn non_corruption_errors_do_not_heal() {
+        let result: anyhow::Result<i32> = retry_once_on_fts_corruption(
+            || anyhow::bail!("some other failure"),
+            || panic!("a non-corruption error must not trigger the heal"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn corruption_that_survives_the_heal_surfaces_without_looping() {
+        let mut calls = 0;
+        let result: anyhow::Result<i32> = retry_once_on_fts_corruption(
+            || {
+                calls += 1;
+                Err(corrupt_error())
+            },
+            || Ok(()),
+        );
+        assert!(error_is_fts_corruption(&result.unwrap_err()));
+        assert_eq!(calls, 2, "exactly one retry, no loop");
     }
 }

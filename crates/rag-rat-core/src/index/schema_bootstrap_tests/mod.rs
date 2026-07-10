@@ -926,6 +926,7 @@ mod clones;
 mod dir_memory_tree;
 mod dispatch;
 mod embedding_policy_fast_path;
+mod fts_corruption;
 mod generation_rebuild;
 mod git_history_reload;
 mod graph_edges;

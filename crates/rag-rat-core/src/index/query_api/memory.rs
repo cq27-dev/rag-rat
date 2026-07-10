@@ -65,9 +65,17 @@ impl IndexDatabase {
         surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
-        let mut memories = crate::query::memory::memory_search(conn, query, limit)?;
-        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
-        Ok(memories)
+        // #582: both the MATCH and the surface hydration (whose Summary path runs a RANKED
+        // chunk_fts query) can hit FTS shadow corruption; heal-and-retry rather than surfacing
+        // a bare "database disk image is malformed" forever.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                let mut memories = crate::query::memory::memory_search(conn, query, limit)?;
+                crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                Ok(memories)
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn memory_for_symbol(

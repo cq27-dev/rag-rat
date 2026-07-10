@@ -549,6 +549,7 @@ impl IndexDatabase {
                 removed_files: 0,
                 skipped_files: 0,
                 fts_fresh: !self.fts_dirty()?,
+                fts_healed: Vec::new(),
                 message: Some(
                     "skipped: heal does not run under a linked-worktree overlay scope".to_string(),
                 ),
@@ -565,6 +566,7 @@ impl IndexDatabase {
             removed_files: 0,
             skipped_files: 0,
             fts_fresh: false,
+            fts_healed: Vec::new(),
             message: None,
         };
 
@@ -599,6 +601,10 @@ impl IndexDatabase {
             report.healed_files += 1;
         }
 
+        // Probe for FTS shadow corruption BEFORE the freshness pass (#582): a dirty-flagged
+        // index would otherwise be incidentally repaired by `ensure_fts_fresh`'s rebuild and the
+        // report would under-attribute what was actually corrupt.
+        report.fts_healed = self.heal_fts_if_corrupt()?;
         if report.healed_files > 0 || report.removed_files > 0 {
             self.sync_fts()?;
         } else {

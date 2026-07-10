@@ -74,7 +74,13 @@ impl IndexDatabase {
             explain: request.explain,
             options: request.options,
         };
-        let mut hits = self.search_with_heal(&query, Heal::Allow)?;
+        // #582: a ranked chunk_fts read is the one path that decodes docsize — the corruption
+        // class every integrity check misses. Heal the mirrors and retry once instead of
+        // surfacing "database disk image is malformed" on every search until manual repair.
+        let mut hits = crate::index::retry_once_on_fts_corruption(
+            || self.search_with_heal(&query, Heal::Allow),
+            || self.heal_corrupt_fts(),
+        )?;
         graph_meta::attach_to_search_hits(
             self.storage.connection(),
             &mut hits,
@@ -92,13 +98,19 @@ impl IndexDatabase {
         include_generated: bool,
         graded_history: bool,
     ) -> anyhow::Result<Vec<SearchHit>> {
-        self.ensure_fts_fresh()?;
-        crate::search::lexical::search_hash_baseline(
-            self.storage.connection(),
-            query,
-            limit,
-            include_generated,
-            graded_history,
+        // #582: an independent ranked chunk_fts path — heal-and-retry like `search`.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                self.ensure_fts_fresh()?;
+                crate::search::lexical::search_hash_baseline(
+                    self.storage.connection(),
+                    query,
+                    limit,
+                    include_generated,
+                    graded_history,
+                )
+            },
+            || self.heal_corrupt_fts(),
         )
     }
 

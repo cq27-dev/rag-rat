@@ -709,8 +709,14 @@ impl IndexDatabase {
     ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
         // impact's chunk-mention evidence runs `chunk_fts MATCH` (#77 Phase 1), so the FTS index
         // must be fresh first — same precondition search enforces before its MATCH queries.
-        self.ensure_fts_fresh()?;
-        crate::query::impact::impact_surface(self.storage.connection(), query, limit)
+        // #582: the papertrail-rationale section also ranks github_fts — heal-and-retry.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                self.ensure_fts_fresh()?;
+                crate::query::impact::impact_surface(self.storage.connection(), query, limit)
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn impact_surface_with_options(
@@ -719,12 +725,17 @@ impl IndexDatabase {
         limit: u32,
         resolution_mode: crate::query::graph::GraphResolutionMode,
     ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
-        self.ensure_fts_fresh()?;
-        crate::query::impact::impact_surface_with_options(
-            self.storage.connection(),
-            query,
-            limit,
-            resolution_mode,
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                self.ensure_fts_fresh()?;
+                crate::query::impact::impact_surface_with_options(
+                    self.storage.connection(),
+                    query,
+                    limit,
+                    resolution_mode,
+                )
+            },
+            || self.heal_corrupt_fts(),
         )
     }
 
@@ -734,12 +745,17 @@ impl IndexDatabase {
         limit: u32,
         resolution_mode: crate::query::graph::GraphResolutionMode,
     ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
-        self.ensure_fts_fresh()?;
-        crate::query::impact::impact_surface_for_symbol(
-            self.storage.connection(),
-            symbol,
-            limit,
-            resolution_mode,
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                self.ensure_fts_fresh()?;
+                crate::query::impact::impact_surface_for_symbol(
+                    self.storage.connection(),
+                    symbol,
+                    limit,
+                    resolution_mode,
+                )
+            },
+            || self.heal_corrupt_fts(),
         )
     }
 
@@ -771,12 +787,19 @@ impl IndexDatabase {
         // finding
         // 4) and before the memory-evidence edge-id collection — so a compiler-upgraded neighbor
         // can't be dropped by the heuristic limit, and downstream counts see the final window.
-        let mut report = crate::query::impact::impact_surface_report_for_symbol(
-            self.storage.connection(),
-            symbol,
-            limit,
-            options,
-            |hops| self.enrich_hops_with_oracle(hops),
+        // #582: the text sections rank chunk_fts and the papertrail sections rank github_fts —
+        // heal-and-retry the report build on shadow corruption.
+        let mut report = crate::index::retry_once_on_fts_corruption(
+            || {
+                crate::query::impact::impact_surface_report_for_symbol(
+                    self.storage.connection(),
+                    symbol,
+                    limit,
+                    options,
+                    |hops| self.enrich_hops_with_oracle(hops),
+                )
+            },
+            || self.heal_corrupt_fts(),
         )?;
         // Attach the LOCAL structural-load signal (scoped weighted fan-in — the third importance
         // scale, NOT PageRank) to the direct graph neighbors AFTER the oracle re-rank + truncate,

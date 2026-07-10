@@ -4025,7 +4025,7 @@ fn rebuild_dream_findings_with_repo_id(conn: &Connection) -> rusqlite::Result<()
 /// `repo_id` come from each memory's freshly-added column and needs no FTS `RENAME` (which has
 /// historically been fragile on shadow tables); the DROP + CREATE keeps the canonical table name.
 /// `memory_search` then filters `repo_id` after the MATCH.
-fn rebuild_repo_memory_fts_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn rebuild_repo_memory_fts_with_repo_id(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         DROP TABLE IF EXISTS repo_memory_fts;

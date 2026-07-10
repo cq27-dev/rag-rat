@@ -128,6 +128,25 @@ pub(crate) fn upsert_memory_fts(conn: &Connection, memory_id: &str) -> anyhow::R
     }
     Ok(())
 }
+/// #582: recover `repo_memory_fts` after shadow-table corruption. Lossless first: FTS5
+/// `'rebuild'` re-derives the inverted index from the table's own content shadow. When the
+/// content shadow is torn too (the `'rebuild'` itself errors), fall back to the nuclear path —
+/// DROP + CREATE + repopulate from `repo_memories` (the FTS is derived; the memories table is
+/// the source of truth, so nothing is lost). The nuclear shape carries `repo_id` (post-A5);
+/// a pre-A5 store has no source `repo_id` to rebuild from, so it gets the lossless path only.
+pub(crate) fn heal_repo_memory_fts(conn: &Connection) -> anyhow::Result<()> {
+    if conn.execute("INSERT INTO repo_memory_fts(repo_memory_fts) VALUES('rebuild')", []).is_ok() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        memory_repo_scope(conn)?.is_some(),
+        "repo_memory_fts is corrupt beyond an in-place rebuild and this pre-A5 store cannot be \
+         repopulated from source"
+    );
+    crate::index::schema::rebuild_repo_memory_fts_with_repo_id(conn)?;
+    Ok(())
+}
+
 pub(crate) fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemory> {
     Ok(RepoMemory {
         memory_id: row.get("memory_id")?,
