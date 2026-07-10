@@ -47,6 +47,11 @@ mod stream;
 // direction of the dependency (`oplog` never depends back on `query::memory`).
 pub(crate) use identity::local_device;
 pub(crate) use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
+// `author_batch_in_tx` is the gate-free batch-author primitive (#541) extracted for the
+// reconcile — not yet wired into a live caller (that lands in a later increment), so its
+// re-export stays `allow(unused_imports)` until then.
+#[allow(unused_imports)]
+pub(crate) use store::author_batch_in_tx;
 // `author_op` / `author_batch` are the standalone (own-txn) wrappers — still only test-used,
 // so their re-export stays `allow(unused_imports)`. The live write path uses the in-txn
 // primitives.
