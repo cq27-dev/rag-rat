@@ -2529,7 +2529,7 @@ fn github_object_exists(conn: &Connection, kind: &str, name: &str) -> rusqlite::
 }
 
 /// Rebuild `github_issues` dropping the inline `UNIQUE(owner, repo, number)` and adding a NAMED
-/// unique index `(repo_id, owner, repo, number)` (the V044 sentinel + the `store_issue` `ON
+/// unique index `(repo_id, owner, repo, number)` (the V044 sentinel + the `store_item` `ON
 /// CONFLICT` target). The full V041 column set (through `repo_id`) is reproduced verbatim; `id`
 /// values are copied so a mid-flight papertrail resync's `github_fts.item_id` stays stable. Runs
 /// inside the caller's transaction (opens none of its own).
@@ -2569,7 +2569,7 @@ fn rebuild_github_issues_with_repo_scoped_key(conn: &Connection) -> rusqlite::Re
 }
 
 /// Rebuild `github_pull_requests` dropping the inline `UNIQUE(owner, repo, number)` and adding a
-/// NAMED unique index `(repo_id, owner, repo, number)` (the `store_pull` `ON CONFLICT` target). See
+/// NAMED unique index `(repo_id, owner, repo, number)` (the `store_item` change-request `ON CONFLICT` target). See
 /// [`rebuild_github_issues_with_repo_scoped_key`] for the shared rationale.
 fn rebuild_github_pull_requests_with_repo_scoped_key(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(

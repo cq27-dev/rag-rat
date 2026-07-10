@@ -16,7 +16,10 @@ pub(crate) fn papertrail(config: &Config, args: &GithubArgs) -> anyhow::Result<(
             let report = if let Some(issue) = issue {
                 db.papertrail_sync_issue(issue, *offline)?
             } else if *from_refs {
-                db.papertrail_sync_from_refs_with_progress(*offline, render_papertrail_sync_progress)?
+                db.papertrail_sync_from_refs_with_progress(
+                    *offline,
+                    render_papertrail_sync_progress,
+                )?
             } else {
                 anyhow::bail!("github sync needs --from-refs or --issue <owner/repo#number>");
             };

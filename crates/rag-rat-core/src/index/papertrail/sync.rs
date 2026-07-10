@@ -43,7 +43,7 @@ pub(crate) fn discover_and_store_refs(
     }
     Ok(refs)
 }
-pub(crate) fn sync_refs<'a, C: GitHubClient>(
+pub(crate) async fn sync_refs<'a, C: PapertrailClient>(
     conn: &Connection,
     client: &C,
     refs: impl Iterator<Item = &'a PapertrailRef>,
@@ -68,11 +68,17 @@ pub(crate) fn sync_refs<'a, C: GitHubClient>(
             continue;
         }
         progress(sync_progress(reference, current, total, PapertrailSyncAction::Syncing, None));
-        match sync_one_ref(conn, client, reference) {
+        match sync_one_ref(conn, client, reference).await {
             Ok(items) => {
                 report.synced_items += items;
                 mark_ref_sync(conn, reference, "synced", None)?;
-                progress(sync_progress(reference, current, total, PapertrailSyncAction::Synced, None));
+                progress(sync_progress(
+                    reference,
+                    current,
+                    total,
+                    PapertrailSyncAction::Synced,
+                    None,
+                ));
             },
             Err(err) => {
                 let message = err.to_string();
@@ -108,32 +114,18 @@ pub(crate) fn sync_refs<'a, C: GitHubClient>(
     rebuild_fts(conn)?;
     Ok(report)
 }
-pub(crate) fn sync_one_ref<C: GitHubClient>(
+pub(crate) async fn sync_one_ref<C: PapertrailClient>(
     conn: &Connection,
     client: &C,
     reference: &PapertrailRef,
 ) -> anyhow::Result<usize> {
-    let mut synced = 0;
-    let issue = client.issue(&reference.owner, &reference.repo, reference.number)?;
-    store_issue(conn, &issue)?;
-    synced += 1;
-    for comment in client.issue_comments(&reference.owner, &reference.repo, reference.number)? {
+    let project = format!("{}/{}", reference.owner, reference.repo);
+    let key = reference.number.to_string();
+    let item = client.item(&project, &key).await?;
+    let mut synced = store_item(conn, &item)?;
+    for comment in client.item_comments(&project, &key).await? {
         store_comment(conn, &comment)?;
         synced += 1;
-    }
-    if let Some(pull) = client.pull(&reference.owner, &reference.repo, reference.number)? {
-        store_pull(conn, &pull)?;
-        synced += 1;
-        for review in client.pull_reviews(&reference.owner, &reference.repo, reference.number)? {
-            store_review(conn, &review)?;
-            synced += 1;
-        }
-        for comment in
-            client.pull_review_comments(&reference.owner, &reference.repo, reference.number)?
-        {
-            store_review_comment(conn, &comment)?;
-            synced += 1;
-        }
     }
     Ok(synced)
 }
@@ -154,7 +146,10 @@ pub(crate) fn sync_progress(
         message,
     }
 }
-pub(crate) fn papertrail_ref_synced(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result<bool> {
+pub(crate) fn papertrail_ref_synced(
+    conn: &Connection,
+    reference: &PapertrailRef,
+) -> anyhow::Result<bool> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
     let status = conn
         .query_row(

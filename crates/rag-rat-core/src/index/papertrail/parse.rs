@@ -89,95 +89,83 @@ pub(crate) fn classify_text(text: &str) -> String {
     }
     .to_string()
 }
-pub(crate) fn issue_from_value(owner: &str, repo: &str, value: &Value) -> GitHubIssue {
-    GitHubIssue {
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-        number: value["number"].as_i64().unwrap_or_default(),
-        html_url: string_value(value, "html_url"),
+pub(crate) fn item_from_issue_value(project: &str, value: &Value) -> PapertrailItem {
+    // GitHub's issues endpoints return PR-shadow rows; the `pull_request` object marks the kind
+    // and (on list payloads) carries `merged_at`.
+    let shadow = value.get("pull_request");
+    PapertrailItem {
+        project: project.to_string(),
+        item_kind: if shadow.is_some() { ItemKind::ChangeRequest } else { ItemKind::Issue },
+        item_key: value["number"].as_i64().unwrap_or_default().to_string(),
+        url: string_value(value, "html_url"),
         state: string_value(value, "state"),
         title: string_value(value, "title"),
         body: string_value(value, "body"),
         author: value.pointer("/user/login").and_then(Value::as_str).map(str::to_string),
         created_at: value["created_at"].as_str().map(str::to_string),
         updated_at: value["updated_at"].as_str().map(str::to_string),
-        is_pull_request: value.get("pull_request").is_some(),
+        merged_at: shadow.and_then(|shadow| shadow["merged_at"].as_str()).map(str::to_string),
     }
 }
-pub(crate) fn comment_from_value(
-    owner: &str,
-    repo: &str,
-    number: i64,
-    value: &Value,
-) -> GitHubComment {
-    GitHubComment {
-        id: value["id"].as_i64().unwrap_or_default(),
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-        number,
-        html_url: string_value(value, "html_url"),
+/// Fold the richer pulls-endpoint payload into a change request built from its issue shadow.
+pub(crate) fn enrich_item_from_pull_value(item: &mut PapertrailItem, value: &Value) {
+    if let Some(state) = value["state"].as_str() {
+        item.state = state.to_string();
+    }
+    if let Some(merged_at) = value["merged_at"].as_str() {
+        item.merged_at = Some(merged_at.to_string());
+    }
+}
+pub(crate) fn comment_from_value(project: &str, key: &str, value: &Value) -> PapertrailComment {
+    PapertrailComment {
+        project: project.to_string(),
+        item_key: key.to_string(),
+        comment_id: value["id"].as_i64().unwrap_or_default().to_string(),
+        url: value["html_url"].as_str().map(str::to_string),
         body: string_value(value, "body"),
         author: value.pointer("/user/login").and_then(Value::as_str).map(str::to_string),
         created_at: value["created_at"].as_str().map(str::to_string),
         updated_at: value["updated_at"].as_str().map(str::to_string),
+        review_state: None,
+        anchor_path: None,
     }
 }
-pub(crate) fn pull_from_value(
-    owner: &str,
-    repo: &str,
-    number: i64,
+pub(crate) fn review_to_comment_from_value(
+    project: &str,
+    key: &str,
     value: &Value,
-) -> GitHubPullRequest {
-    GitHubPullRequest {
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-        number,
-        html_url: string_value(value, "html_url"),
-        state: string_value(value, "state"),
-        title: string_value(value, "title"),
-        body: string_value(value, "body"),
-        author: value.pointer("/user/login").and_then(Value::as_str).map(str::to_string),
-        created_at: value["created_at"].as_str().map(str::to_string),
-        updated_at: value["updated_at"].as_str().map(str::to_string),
-        merged_at: value["merged_at"].as_str().map(str::to_string),
+) -> PapertrailComment {
+    PapertrailComment {
+        created_at: value["submitted_at"].as_str().map(str::to_string),
+        updated_at: value["submitted_at"].as_str().map(str::to_string),
+        review_state: Some(string_value(value, "state")),
+        ..comment_from_value(project, key, value)
     }
 }
-pub(crate) fn review_from_value(
-    owner: &str,
-    repo: &str,
-    number: i64,
+pub(crate) fn review_comment_to_comment_from_value(
+    project: &str,
+    key: &str,
     value: &Value,
-) -> GitHubReview {
-    GitHubReview {
-        id: value["id"].as_i64().unwrap_or_default(),
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-        number,
-        html_url: value["html_url"].as_str().map(str::to_string),
-        state: string_value(value, "state"),
-        body: string_value(value, "body"),
-        author: value.pointer("/user/login").and_then(Value::as_str).map(str::to_string),
-        submitted_at: value["submitted_at"].as_str().map(str::to_string),
+) -> PapertrailComment {
+    PapertrailComment {
+        anchor_path: value["path"].as_str().map(str::to_string),
+        ..comment_from_value(project, key, value)
     }
 }
-pub(crate) fn review_comment_from_value(
-    owner: &str,
-    repo: &str,
-    number: i64,
+/// Map one entry of a repo-wide comment stream, deriving the parent item key from the payload's
+/// `issue_url` / `pull_request_url` tail. `None` when the payload names no parent.
+pub(crate) fn repo_comment_from_value(
+    project: &str,
     value: &Value,
-) -> GitHubReviewComment {
-    GitHubReviewComment {
-        id: value["id"].as_i64().unwrap_or_default(),
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-        number,
-        path: value["path"].as_str().map(str::to_string),
-        html_url: string_value(value, "html_url"),
-        body: string_value(value, "body"),
-        author: value.pointer("/user/login").and_then(Value::as_str).map(str::to_string),
-        created_at: value["created_at"].as_str().map(str::to_string),
-        updated_at: value["updated_at"].as_str().map(str::to_string),
+    anchored: bool,
+) -> Option<PapertrailComment> {
+    let parent_key = if anchored { "pull_request_url" } else { "issue_url" };
+    let key = value[parent_key].as_str()?.rsplit('/').next()?.to_string();
+    let mut comment = comment_from_value(project, &key, value);
+    if anchored {
+        comment.anchor_path = value["path"].as_str().map(str::to_string);
     }
+    Some(comment)
 }
 pub(crate) fn gh_api_json(path: &str) -> anyhow::Result<Value> {
     let output = Command::new("gh").args(["api", path]).output()?;

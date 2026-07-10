@@ -48,8 +48,24 @@ pub(crate) fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow:
     )?;
     Ok(())
 }
-pub(crate) fn store_issue(conn: &Connection, issue: &GitHubIssue) -> anyhow::Result<()> {
+/// Split a normalized item identity back onto the github_* cache key columns. The tables keep
+/// the provider-shaped `(owner, repo, number)` key until the schema normalization; this glue is
+/// the only place that reverse mapping lives.
+fn github_key(project: &str, item_key: &str) -> anyhow::Result<(String, String, i64)> {
+    let (owner, repo) = split_repo(project)
+        .ok_or_else(|| anyhow::anyhow!("malformed papertrail project `{project}`"))?;
+    let number = item_key
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("non-numeric github item key `{item_key}`"))?;
+    Ok((owner.to_string(), repo.to_string(), number))
+}
+/// Store one normalized item into the github_* cache. Returns the number of rows written: every
+/// item keeps an issue-shadow row (GitHub's shared numbering — a change request IS an issue on
+/// the issues endpoints, and refs resolve through one table regardless of kind), and a change
+/// request additionally refreshes its `github_pull_requests` row.
+pub(crate) fn store_item(conn: &Connection, item: &PapertrailItem) -> anyhow::Result<usize> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let (owner, repo, number) = github_key(&item.project, &item.item_key)?;
     conn.execute(
         "
         INSERT INTO github_issues(owner, repo, number, html_url, state, title, body, author, \
@@ -62,49 +78,24 @@ pub(crate) fn store_issue(conn: &Connection, issue: &GitHubIssue) -> anyhow::Res
             synced_at_ms = excluded.synced_at_ms
         ",
         params![
-            issue.owner,
-            issue.repo,
-            issue.number,
-            issue.html_url,
-            issue.state,
-            issue.title,
-            issue.body,
-            issue.author,
-            issue.created_at,
-            issue.updated_at,
-            issue.is_pull_request,
+            owner,
+            repo,
+            number,
+            item.url,
+            item.state,
+            item.title,
+            item.body,
+            item.author,
+            item.created_at,
+            item.updated_at,
+            item.item_kind == ItemKind::ChangeRequest,
             now_ms(),
             repo_id,
         ],
     )?;
-    Ok(())
-}
-pub(crate) fn store_comment(conn: &Connection, comment: &GitHubComment) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    conn.execute(
-        "
-        INSERT OR REPLACE INTO github_comments(id, owner, repo, number, html_url, body, author, \
-         created_at, updated_at, synced_at_ms, repo_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-        ",
-        params![
-            comment.id,
-            comment.owner,
-            comment.repo,
-            comment.number,
-            comment.html_url,
-            comment.body,
-            comment.author,
-            comment.created_at,
-            comment.updated_at,
-            now_ms(),
-            repo_id,
-        ],
-    )?;
-    Ok(())
-}
-pub(crate) fn store_pull(conn: &Connection, pull: &GitHubPullRequest) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
+    if item.item_kind != ItemKind::ChangeRequest {
+        return Ok(1);
+    }
     conn.execute(
         "
         INSERT INTO github_pull_requests(owner, repo, number, html_url, state, title, body, \
@@ -117,65 +108,92 @@ pub(crate) fn store_pull(conn: &Connection, pull: &GitHubPullRequest) -> anyhow:
             synced_at_ms = excluded.synced_at_ms
         ",
         params![
-            pull.owner,
-            pull.repo,
-            pull.number,
-            pull.html_url,
-            pull.state,
-            pull.title,
-            pull.body,
-            pull.author,
-            pull.created_at,
-            pull.updated_at,
-            pull.merged_at,
+            owner,
+            repo,
+            number,
+            item.url,
+            item.state,
+            item.title,
+            item.body,
+            item.author,
+            item.created_at,
+            item.updated_at,
+            item.merged_at,
             now_ms(),
             repo_id,
         ],
     )?;
-    Ok(())
+    Ok(2)
 }
-pub(crate) fn store_review(conn: &Connection, review: &GitHubReview) -> anyhow::Result<()> {
+/// Store one normalized comment into the github_* cache, routed by its markers: a file-anchored
+/// comment lands in `github_review_comments`, a review event in `github_reviews`, and a plain
+/// thread comment in `github_comments`.
+pub(crate) fn store_comment(conn: &Connection, comment: &PapertrailComment) -> anyhow::Result<()> {
     let repo_id = crate::index::schema::active_repo_id(conn)?;
+    let (owner, repo, number) = github_key(&comment.project, &comment.item_key)?;
+    let id = comment
+        .comment_id
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("non-numeric github comment id `{}`", comment.comment_id))?;
+    if comment.anchor_path.is_some() {
+        conn.execute(
+            "
+            INSERT OR REPLACE INTO github_review_comments(id, owner, repo, number, path, html_url, \
+             body, author, created_at, updated_at, synced_at_ms, repo_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ",
+            params![
+                id,
+                owner,
+                repo,
+                number,
+                comment.anchor_path,
+                comment.url.as_deref().unwrap_or_default(),
+                comment.body,
+                comment.author,
+                comment.created_at,
+                comment.updated_at,
+                now_ms(),
+                repo_id,
+            ],
+        )?;
+        return Ok(());
+    }
+    if let Some(review_state) = &comment.review_state {
+        conn.execute(
+            "
+            INSERT OR REPLACE INTO github_reviews(id, owner, repo, number, html_url, state, body, \
+             author, submitted_at, synced_at_ms, repo_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ",
+            params![
+                id,
+                owner,
+                repo,
+                number,
+                comment.url,
+                review_state,
+                comment.body,
+                comment.author,
+                comment.created_at,
+                now_ms(),
+                repo_id,
+            ],
+        )?;
+        return Ok(());
+    }
     conn.execute(
         "
-        INSERT OR REPLACE INTO github_reviews(id, owner, repo, number, html_url, state, body, \
-         author, submitted_at, synced_at_ms, repo_id)
+        INSERT OR REPLACE INTO github_comments(id, owner, repo, number, html_url, body, author, \
+         created_at, updated_at, synced_at_ms, repo_id)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ",
         params![
-            review.id,
-            review.owner,
-            review.repo,
-            review.number,
-            review.html_url,
-            review.state,
-            review.body,
-            review.author,
-            review.submitted_at,
-            now_ms(),
-            repo_id,
-        ],
-    )?;
-    Ok(())
-}
-pub(crate) fn store_review_comment(
-    conn: &Connection,
-    comment: &GitHubReviewComment,
-) -> anyhow::Result<()> {
-    let repo_id = crate::index::schema::active_repo_id(conn)?;
-    conn.execute(
-        "
-        INSERT OR REPLACE INTO github_review_comments(id, owner, repo, number, path, html_url, \
-         body, author, created_at, updated_at, synced_at_ms, repo_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-        ",
-        params![
-            comment.id,
-            comment.owner,
-            comment.repo,
-            comment.number,
-            comment.path,
-            comment.html_url,
+            id,
+            owner,
+            repo,
+            number,
+            comment.url.as_deref().unwrap_or_default(),
             comment.body,
             comment.author,
             comment.created_at,
@@ -289,88 +307,74 @@ mod fts_rebuild_tests {
     use super::*;
     use crate::index::schema;
 
+    fn item(kind: ItemKind, key: &str, title: &str, body: &str) -> PapertrailItem {
+        PapertrailItem {
+            project: "o/r".into(),
+            item_kind: kind,
+            item_key: key.into(),
+            url: format!("http://item/{key}"),
+            state: "open".into(),
+            title: title.into(),
+            body: body.into(),
+            author: None,
+            created_at: None,
+            updated_at: None,
+            merged_at: None,
+        }
+    }
+
+    fn comment(key: &str, id: &str, body: &str) -> PapertrailComment {
+        PapertrailComment {
+            project: "o/r".into(),
+            item_key: key.into(),
+            comment_id: id.into(),
+            url: Some(format!("http://comment/{id}")),
+            body: body.into(),
+            author: None,
+            created_at: None,
+            updated_at: None,
+            review_state: None,
+            anchor_path: None,
+        }
+    }
+
     // rebuild_fts collapses five near-identical per-kind loaders into insert_fts_rows. This pins
-    // the behaviour they shared: every item kind lands in github_fts under its own item_kind, the
-    // body is tokenized/searchable, and the title slot is populated the way each old loader did —
-    // the title text for issues/pulls, the file path for review comments, empty for the rest.
+    // the behaviour they shared: every comment routing target lands in github_fts under its own
+    // item_kind, the body is tokenized/searchable, and the title slot is populated the way each
+    // old loader did — the title text for issues/pulls, the file path for review comments, empty
+    // for the rest. A change request keeps its issue-shadow row (shared GitHub numbering), so it
+    // surfaces under BOTH the issue and pull kinds.
     #[test]
     fn rebuild_fts_indexes_every_item_kind_with_the_right_title() {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn).unwrap();
 
-        store_issue(&conn, &GitHubIssue {
-            owner: "o".into(),
-            repo: "r".into(),
-            number: 1,
-            html_url: "http://i".into(),
-            state: "open".into(),
-            title: "issuetitle".into(),
-            body: "issuebody".into(),
-            author: None,
-            created_at: None,
-            updated_at: None,
-            is_pull_request: false,
+        store_item(&conn, &item(ItemKind::Issue, "1", "issuetitle", "issuebody")).unwrap();
+        store_comment(&conn, &comment("1", "10", "commentbody")).unwrap();
+        let stored =
+            store_item(&conn, &item(ItemKind::ChangeRequest, "2", "pulltitle", "pullbody"))
+                .unwrap();
+        assert_eq!(stored, 2, "a change request writes its issue-shadow row AND the pull row");
+        // url None exercises the review loader's COALESCE(html_url, '').
+        store_comment(&conn, &PapertrailComment {
+            url: None,
+            review_state: Some("approved".into()),
+            ..comment("2", "20", "reviewbody")
         })
         .unwrap();
-        store_comment(&conn, &GitHubComment {
-            id: 10,
-            owner: "o".into(),
-            repo: "r".into(),
-            number: 1,
-            html_url: "http://c".into(),
-            body: "commentbody".into(),
-            author: None,
-            created_at: None,
-            updated_at: None,
-        })
-        .unwrap();
-        store_pull(&conn, &GitHubPullRequest {
-            owner: "o".into(),
-            repo: "r".into(),
-            number: 2,
-            html_url: "http://p".into(),
-            state: "open".into(),
-            title: "pulltitle".into(),
-            body: "pullbody".into(),
-            author: None,
-            created_at: None,
-            updated_at: None,
-            merged_at: None,
-        })
-        .unwrap();
-        // html_url None exercises the review loader's COALESCE(html_url, '').
-        store_review(&conn, &GitHubReview {
-            id: 20,
-            owner: "o".into(),
-            repo: "r".into(),
-            number: 2,
-            html_url: None,
-            state: "approved".into(),
-            body: "reviewbody".into(),
-            author: None,
-            submitted_at: None,
-        })
-        .unwrap();
-        store_review_comment(&conn, &GitHubReviewComment {
-            id: 30,
-            owner: "o".into(),
-            repo: "r".into(),
-            number: 2,
-            path: Some("src/lib.rs".into()),
-            html_url: "http://rc".into(),
-            body: "reviewcommentbody".into(),
-            author: None,
-            created_at: None,
-            updated_at: None,
+        store_comment(&conn, &PapertrailComment {
+            anchor_path: Some("src/lib.rs".into()),
+            ..comment("2", "30", "reviewcommentbody")
         })
         .unwrap();
 
         rebuild_fts(&conn).unwrap();
 
-        // One row per stored item, each keyed by its own item_kind, with the expected title slot.
+        // One row per stored table row, each keyed by its item_kind, with the expected title.
         let rows: Vec<(String, String)> = {
-            let mut stmt =
-                conn.prepare("SELECT item_kind, title FROM github_fts ORDER BY item_kind").unwrap();
+            let mut stmt = conn
+                .prepare("SELECT item_kind, title FROM github_fts ORDER BY item_kind, title")
+                .unwrap();
             let mapped = stmt
                 .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
                 .unwrap();
@@ -381,6 +385,7 @@ mod fts_rebuild_tests {
             vec![
                 ("comment".to_string(), String::new()),
                 ("issue".to_string(), "issuetitle".to_string()),
+                ("issue".to_string(), "pulltitle".to_string()),
                 ("pull".to_string(), "pulltitle".to_string()),
                 ("review".to_string(), String::new()),
                 ("review_comment".to_string(), "src/lib.rs".to_string()),

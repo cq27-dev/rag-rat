@@ -1727,7 +1727,7 @@ fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
     db.set_papertrail_context(Some("cq27-dev/rag-rat"), false);
     let mock = MockGitHubClient;
 
-    let offline = papertrail::sync_from_refs::<MockGitHubClient>(
+    let offline = sync_from_refs_blocking::<MockGitHubClient>(
         db.storage.connection(),
         &root,
         None,
@@ -1740,13 +1740,13 @@ fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
     assert_eq!(offline.synced_items, 0);
 
     let report =
-        papertrail::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+        sync_from_refs_blocking(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
             .unwrap();
     assert!(!report.offline);
     assert_eq!(report.discovered_refs, 1);
-    assert_eq!(report.synced_items, 5);
+    assert_eq!(report.synced_items, 6);
     assert_eq!(report.status.issues, 1);
-    assert_eq!(report.status.comments, 1);
+    assert_eq!(report.status.comments, 2);
     assert_eq!(report.status.pulls, 1);
     assert_eq!(report.status.reviews, 1);
     assert_eq!(report.status.review_comments, 1);

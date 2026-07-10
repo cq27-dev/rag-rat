@@ -160,23 +160,23 @@ impl IndexDatabase {
             anyhow::bail!("index has no source_root metadata; rebuild required");
         };
         if offline {
-            papertrail::sync_from_refs::<papertrail::GhCliGitHubClient>(
+            papertrail::block_on(papertrail::sync_from_refs::<papertrail::GitHubClient>(
                 self.storage.connection(),
                 root,
                 None,
                 true,
                 &self.papertrail,
-            )
+            ))
         } else {
-            let client = papertrail::GhCliGitHubClient;
-            papertrail::sync_from_refs_with_progress(
+            let client = papertrail::GitHubClient;
+            papertrail::block_on(papertrail::sync_from_refs_with_progress(
                 self.storage.connection(),
                 root,
                 Some(&client),
                 false,
                 &self.papertrail,
                 progress,
-            )
+            ))
         }
     }
 
@@ -186,22 +186,22 @@ impl IndexDatabase {
         offline: bool,
     ) -> anyhow::Result<PapertrailSyncReport> {
         if offline {
-            papertrail::sync_issue::<papertrail::GhCliGitHubClient>(
+            papertrail::block_on(papertrail::sync_issue::<papertrail::GitHubClient>(
                 self.storage.connection(),
                 issue_ref,
                 None,
                 true,
                 &self.papertrail,
-            )
+            ))
         } else {
-            let client = papertrail::GhCliGitHubClient;
-            papertrail::sync_issue(
+            let client = papertrail::GitHubClient;
+            papertrail::block_on(papertrail::sync_issue(
                 self.storage.connection(),
                 issue_ref,
                 Some(&client),
                 false,
                 &self.papertrail,
-            )
+            ))
         }
     }
 
@@ -213,7 +213,11 @@ impl IndexDatabase {
         papertrail::issue_search(self.storage.connection(), query, limit)
     }
 
-    pub fn rationale_search(&self, query: &str, limit: u32) -> anyhow::Result<Vec<PapertrailEvidence>> {
+    pub fn rationale_search(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<PapertrailEvidence>> {
         papertrail::rationale_search(self.storage.connection(), query, limit, &self.papertrail)
     }
 
@@ -267,7 +271,12 @@ impl IndexDatabase {
         symbol: &crate::query::symbol::SymbolHit,
         limit: u32,
     ) -> anyhow::Result<Papertrail> {
-        papertrail::papertrail_for_symbol(self.storage.connection(), symbol, limit, &self.papertrail)
+        papertrail::papertrail_for_symbol(
+            self.storage.connection(),
+            symbol,
+            limit,
+            &self.papertrail,
+        )
     }
 
     pub fn papertrail_for_commit(
@@ -275,6 +284,11 @@ impl IndexDatabase {
         commit_hash: &str,
         limit: u32,
     ) -> anyhow::Result<Papertrail> {
-        papertrail::papertrail_for_commit(self.storage.connection(), commit_hash, limit, &self.papertrail)
+        papertrail::papertrail_for_commit(
+            self.storage.connection(),
+            commit_hash,
+            limit,
+            &self.papertrail,
+        )
     }
 }

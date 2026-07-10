@@ -1,16 +1,16 @@
 use super::*;
 use crate::index::{repo_meta, schema, scoped_table_row_count, set_repo_meta};
 
-pub(crate) fn sync_from_refs<C: GitHubClient>(
+pub(crate) async fn sync_from_refs<C: PapertrailClient>(
     conn: &Connection,
     root: &Path,
     client: Option<&C>,
     offline: bool,
     ctx: &PapertrailContext,
 ) -> anyhow::Result<PapertrailSyncReport> {
-    sync_from_refs_with_progress(conn, root, client, offline, ctx, |_| {})
+    sync_from_refs_with_progress(conn, root, client, offline, ctx, |_| {}).await
 }
-pub(crate) fn sync_from_refs_with_progress<C: GitHubClient>(
+pub(crate) async fn sync_from_refs_with_progress<C: PapertrailClient>(
     conn: &Connection,
     root: &Path,
     client: Option<&C>,
@@ -23,7 +23,7 @@ pub(crate) fn sync_from_refs_with_progress<C: GitHubClient>(
         SyncRefsReport::default()
     } else {
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
-        sync_refs(conn, client, refs.iter(), &mut progress)?
+        sync_refs(conn, client, refs.iter(), &mut progress).await?
     };
     let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
@@ -37,7 +37,7 @@ pub(crate) fn sync_from_refs_with_progress<C: GitHubClient>(
         status: status(conn, ctx)?,
     })
 }
-pub(crate) fn sync_issue<C: GitHubClient>(
+pub(crate) async fn sync_issue<C: PapertrailClient>(
     conn: &Connection,
     issue_ref: &str,
     client: Option<&C>,
@@ -61,7 +61,8 @@ pub(crate) fn sync_issue<C: GitHubClient>(
         SyncRefsReport::default()
     } else {
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
-        sync_refs(conn, client, refs.iter().filter(|r| r.number == parsed.number), &mut |_| {})?
+        sync_refs(conn, client, refs.iter().filter(|r| r.number == parsed.number), &mut |_| {})
+            .await?
     };
     let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, "github_last_sync_ms", &now_ms().to_string())?;
@@ -75,7 +76,10 @@ pub(crate) fn sync_issue<C: GitHubClient>(
         status: status(conn, ctx)?,
     })
 }
-pub(crate) fn status(conn: &Connection, ctx: &PapertrailContext) -> anyhow::Result<PapertrailStatus> {
+pub(crate) fn status(
+    conn: &Connection,
+    ctx: &PapertrailContext,
+) -> anyhow::Result<PapertrailStatus> {
     // The github_* tables are direct-scoped (V041); report only the ACTIVE repo's counts, not the
     // union across a consolidated DB.
     let repo_id = schema::active_repo_id(conn)?;

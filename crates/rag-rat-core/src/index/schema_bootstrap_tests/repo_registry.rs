@@ -2734,18 +2734,18 @@ fn v044_a_syncing_repo_is_isolated_from_stranded_placeholder_github_rows() {
         source_text: "o/r#7".to_string(),
     };
     crate::index::papertrail::store_ref(&conn, &reference).unwrap();
-    crate::index::papertrail::store_issue(&conn, &crate::index::papertrail::GitHubIssue {
-        owner: "o".to_string(),
-        repo: "r".to_string(),
-        number: 7,
-        html_url: "http://fresh".to_string(),
+    crate::index::papertrail::store_item(&conn, &crate::index::papertrail::PapertrailItem {
+        project: "o/r".to_string(),
+        item_kind: crate::index::papertrail::ItemKind::Issue,
+        item_key: "7".to_string(),
+        url: "http://fresh".to_string(),
         state: "closed".to_string(),
         title: "fresh title".to_string(),
         body: "fresh body".to_string(),
         author: None,
         created_at: None,
         updated_at: None,
-        is_pull_request: false,
+        merged_at: None,
     })
     .unwrap();
     crate::index::papertrail::mark_ref_sync(&conn, &reference, "synced", None).unwrap();

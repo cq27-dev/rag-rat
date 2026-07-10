@@ -3,9 +3,9 @@ pub mod anchors;
 pub mod chunker;
 pub mod edges;
 pub mod git_history;
-pub mod papertrail;
 pub mod ignore_rules;
 pub mod oracle;
+pub mod papertrail;
 pub mod parser;
 pub mod schema;
 pub mod symbols;
@@ -102,7 +102,9 @@ use crate::index::git_history::{
     ChunkBlameSummary, CommitSearchHit, GitHistoryIndexStatus, PathHistoryItem, QueryCommitHit,
     SymbolHistoryItem,
 };
-use crate::index::papertrail::{PapertrailEvidence, PapertrailStatus, PapertrailSyncReport, Papertrail};
+use crate::index::papertrail::{
+    Papertrail, PapertrailEvidence, PapertrailStatus, PapertrailSyncReport,
+};
 use crate::index::symbols::Symbol;
 use crate::language::Language;
 use crate::query::graph_meta::{self, GraphMetaMode};

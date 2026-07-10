@@ -227,6 +227,17 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
 fn test_gh_ctx() -> papertrail::PapertrailContext {
     papertrail::PapertrailContext::new(Some("cq27-dev/rag-rat"), false)
 }
+
+/// Test-side bridge over the async sync entry point, mirroring the IndexDatabase boundary.
+fn sync_from_refs_blocking<C: papertrail::PapertrailClient>(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    client: Option<&C>,
+    offline: bool,
+    ctx: &papertrail::PapertrailContext,
+) -> anyhow::Result<papertrail::PapertrailSyncReport> {
+    papertrail::block_on(papertrail::sync_from_refs(conn, root, client, offline, ctx))
+}
 // ---- #219 stage 2: linked-worktree overlay indexing ----
 
 fn init_git_repo(root: &Path) {
@@ -548,147 +559,135 @@ fn git_output(root: &Path, args: &[&str]) -> String {
 
 struct MockGitHubClient;
 
-impl papertrail::GitHubClient for MockGitHubClient {
-    fn issue(&self, owner: &str, repo: &str, number: i64) -> anyhow::Result<papertrail::GitHubIssue> {
-        Ok(papertrail::GitHubIssue {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number,
-            html_url: format!("https://github.com/{owner}/{repo}/issues/{number}"),
+impl MockGitHubClient {
+    fn mock_item(project: &str, key: &str) -> papertrail::PapertrailItem {
+        papertrail::PapertrailItem {
+            project: project.to_string(),
+            item_kind: papertrail::ItemKind::ChangeRequest,
+            item_key: key.to_string(),
+            url: format!("https://github.com/{project}/pull/{key}"),
             state: "open".to_string(),
             title: "Decision: keep sqlite".to_string(),
             body: "We decided sqlite is required for binary size.".to_string(),
             author: Some("octo".to_string()),
             created_at: Some("2026-01-01T00:00:00Z".to_string()),
             updated_at: Some("2026-01-02T00:00:00Z".to_string()),
-            is_pull_request: true,
-        })
+            merged_at: None,
+        }
     }
 
-    fn issue_comments(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: i64,
-    ) -> anyhow::Result<Vec<papertrail::GitHubComment>> {
-        Ok(vec![papertrail::GitHubComment {
-            id: 4201,
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number,
-            html_url: format!("https://github.com/{owner}/{repo}/issues/{number}#comment-1"),
-            body: "Rejected alternative: duckdb was too large.".to_string(),
+    fn mock_comments(project: &str, key: &str) -> Vec<papertrail::PapertrailComment> {
+        let comment = |id: &str, body: &str| papertrail::PapertrailComment {
+            project: project.to_string(),
+            item_key: key.to_string(),
+            comment_id: id.to_string(),
+            url: Some(format!("https://github.com/{project}/issues/{key}#comment-{id}")),
+            body: body.to_string(),
             author: Some("octo".to_string()),
             created_at: Some("2026-01-01T01:00:00Z".to_string()),
             updated_at: Some("2026-01-01T01:00:00Z".to_string()),
-        }])
+            review_state: None,
+            anchor_path: None,
+        };
+        vec![
+            comment("4201", "Rejected alternative: duckdb was too large."),
+            comment("4204", "Constraint: normal queries must use cache only."),
+            papertrail::PapertrailComment {
+                url: None,
+                author: Some("reviewer".to_string()),
+                review_state: Some("COMMENTED".to_string()),
+                ..comment("4202", "Risk: live crawling during search would be surprising.")
+            },
+            papertrail::PapertrailComment {
+                author: Some("reviewer".to_string()),
+                anchor_path: Some("docs/search.md".to_string()),
+                ..comment("4203", "No longer use obsolete duckdb rationale.")
+            },
+        ]
+    }
+}
+
+impl papertrail::PapertrailClient for MockGitHubClient {
+    async fn item(&self, project: &str, key: &str) -> anyhow::Result<papertrail::PapertrailItem> {
+        Ok(Self::mock_item(project, key))
     }
 
-    fn pull(
+    async fn item_comments(
         &self,
-        owner: &str,
-        repo: &str,
-        number: i64,
-    ) -> anyhow::Result<Option<papertrail::GitHubPullRequest>> {
-        Ok(Some(papertrail::GitHubPullRequest {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number,
-            html_url: format!("https://github.com/{owner}/{repo}/pull/{number}"),
-            state: "open".to_string(),
-            title: "Use sqlite".to_string(),
-            body: "Constraint: normal queries must use cache only.".to_string(),
-            author: Some("octo".to_string()),
-            created_at: Some("2026-01-01T00:00:00Z".to_string()),
-            updated_at: Some("2026-01-02T00:00:00Z".to_string()),
-            merged_at: None,
-        }))
+        project: &str,
+        key: &str,
+    ) -> anyhow::Result<Vec<papertrail::PapertrailComment>> {
+        Ok(Self::mock_comments(project, key))
     }
 
-    fn pull_reviews(
+    async fn items_page(
         &self,
-        owner: &str,
-        repo: &str,
-        number: i64,
-    ) -> anyhow::Result<Vec<papertrail::GitHubReview>> {
-        Ok(vec![papertrail::GitHubReview {
-            id: 4202,
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number,
-            html_url: Some(format!("https://github.com/{owner}/{repo}/pull/{number}#review")),
-            state: "COMMENTED".to_string(),
-            body: "Risk: live crawling during search would be surprising.".to_string(),
-            author: Some("reviewer".to_string()),
-            submitted_at: Some("2026-01-01T02:00:00Z".to_string()),
-        }])
+        project: &str,
+        _cursor: &papertrail::PageCursor,
+    ) -> anyhow::Result<papertrail::ItemsPage> {
+        Ok(papertrail::ItemsPage { items: vec![Self::mock_item(project, "42")], next: None })
     }
 
-    fn pull_review_comments(
+    async fn comments_page(
         &self,
-        owner: &str,
-        repo: &str,
-        number: i64,
-    ) -> anyhow::Result<Vec<papertrail::GitHubReviewComment>> {
-        Ok(vec![papertrail::GitHubReviewComment {
-            id: 4203,
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number,
-            path: Some("docs/search.md".to_string()),
-            html_url: format!("https://github.com/{owner}/{repo}/pull/{number}#discussion"),
-            body: "No longer use obsolete duckdb rationale.".to_string(),
-            author: Some("reviewer".to_string()),
-            created_at: Some("2026-01-01T03:00:00Z".to_string()),
-            updated_at: Some("2026-01-01T03:00:00Z".to_string()),
-        }])
+        project: &str,
+        _cursor: &papertrail::PageCursor,
+    ) -> anyhow::Result<papertrail::CommentsPage> {
+        Ok(papertrail::CommentsPage { comments: Self::mock_comments(project, "42"), next: None })
+    }
+
+    async fn freshness_probe(
+        &self,
+        _project: &str,
+        cursor: &papertrail::PageCursor,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(match cursor.updated_since.as_deref() {
+            Some(since) if since >= "2026-01-02T00:00:00Z" => None,
+            _ => Some("2026-01-02T00:00:00Z".to_string()),
+        })
     }
 }
 
 struct PartiallyFailingGitHubClient;
 
-impl papertrail::GitHubClient for PartiallyFailingGitHubClient {
-    fn issue(&self, owner: &str, repo: &str, number: i64) -> anyhow::Result<papertrail::GitHubIssue> {
-        if number == 404 {
+impl papertrail::PapertrailClient for PartiallyFailingGitHubClient {
+    async fn item(&self, project: &str, key: &str) -> anyhow::Result<papertrail::PapertrailItem> {
+        if key == "404" {
             anyhow::bail!("gh: Not Found (HTTP 404)");
         }
-        MockGitHubClient.issue(owner, repo, number)
+        MockGitHubClient.item(project, key).await
     }
 
-    fn issue_comments(
+    async fn item_comments(
         &self,
-        owner: &str,
-        repo: &str,
-        number: i64,
-    ) -> anyhow::Result<Vec<papertrail::GitHubComment>> {
-        MockGitHubClient.issue_comments(owner, repo, number)
+        project: &str,
+        key: &str,
+    ) -> anyhow::Result<Vec<papertrail::PapertrailComment>> {
+        MockGitHubClient.item_comments(project, key).await
     }
 
-    fn pull(
+    async fn items_page(
         &self,
-        owner: &str,
-        repo: &str,
-        number: i64,
-    ) -> anyhow::Result<Option<papertrail::GitHubPullRequest>> {
-        MockGitHubClient.pull(owner, repo, number)
+        project: &str,
+        cursor: &papertrail::PageCursor,
+    ) -> anyhow::Result<papertrail::ItemsPage> {
+        MockGitHubClient.items_page(project, cursor).await
     }
 
-    fn pull_reviews(
+    async fn comments_page(
         &self,
-        owner: &str,
-        repo: &str,
-        number: i64,
-    ) -> anyhow::Result<Vec<papertrail::GitHubReview>> {
-        MockGitHubClient.pull_reviews(owner, repo, number)
+        project: &str,
+        cursor: &papertrail::PageCursor,
+    ) -> anyhow::Result<papertrail::CommentsPage> {
+        MockGitHubClient.comments_page(project, cursor).await
     }
 
-    fn pull_review_comments(
+    async fn freshness_probe(
         &self,
-        owner: &str,
-        repo: &str,
-        number: i64,
-    ) -> anyhow::Result<Vec<papertrail::GitHubReviewComment>> {
-        MockGitHubClient.pull_review_comments(owner, repo, number)
+        project: &str,
+        cursor: &papertrail::PageCursor,
+    ) -> anyhow::Result<Option<String>> {
+        MockGitHubClient.freshness_probe(project, cursor).await
     }
 }
 
