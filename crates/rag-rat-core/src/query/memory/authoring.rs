@@ -983,6 +983,58 @@ mod tests {
         assert_eq!(projected_edge_count(&conn), 0, "remove_edge authored an EdgeRemove tombstone");
     }
 
+    // --- live mutation seam self-heals a ghost end to end (#541 Task 4) ---
+
+    #[test]
+    fn mark_obsolete_on_a_ghost_authors_a_create_not_an_inert_status() {
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap(); // roots the chain
+        insert_memory(&conn, "mem_ghost", "active", 500); // raw, un-authored ghost
+        // mark_obsolete reconciles first (heals NodeCreate + NodeStatus{active}), THEN authors the
+        // obsolete NodeStatus — so it is NOT inert and the node projects obsolete.
+        crate::query::memory::mark_obsolete(&conn, "mem_ghost").unwrap();
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        let node = projected_state(&conn, stream)
+            .nodes
+            .get(&NodeId::from("mem_ghost"))
+            .cloned()
+            .expect("ghost healed then obsoleted");
+        assert_eq!(node.status, NodeStatus::Obsolete);
+    }
+
+    #[test]
+    fn remove_edge_on_a_ghost_edge_heals_then_tombstones_not_an_inert_remove() {
+        // The EdgeRemove path: `remove_edge` calls backfill (edges.rs) BEFORE its delete txn, so a
+        // raw ghost edge is first healed (EdgeAdd authored), then the delete authors EdgeRemove —
+        // the signed history is add→remove (complete), and the projection ends with the
+        // edge ABSENT (not an inert tombstone with no matching add).
+        //
+        // `remove_edge` authors its `EdgeRemove` unconditionally once the raw row is deleted
+        // (edges.rs gates it on `n > 0`, NOT on whether an `EdgeAdd` was ever signed) — so
+        // `edges.is_empty()` alone is satisfied whether or not the heal ran (a
+        // never-authored edge and a healed-then-removed edge both project empty). The
+        // `entry_count` delta is what actually distinguishes them: it is +2 (heal's
+        // `EdgeAdd` + `remove_edge`'s own `EdgeRemove`) only when the reconcile fired; a
+        // disabled reconcile would author just the bare `EdgeRemove` (+1).
+        let conn = scoped_conn();
+        let a = create_concept(&conn, "a").unwrap().memory.memory_id;
+        let b = create_concept(&conn, "b").unwrap().memory.memory_id;
+        insert_raw_node_edge(&conn, &a, "relates_to", &b);
+        let key = crate::query::memory::edge_key(&a, "relates_to", "node", &b);
+        let before = entry_count(&conn);
+        crate::query::memory::remove_edge(&conn, &key).unwrap();
+        assert_eq!(
+            entry_count(&conn),
+            before + 2,
+            "the heal's EdgeAdd + remove_edge's own EdgeRemove — not a bare, inert tombstone"
+        );
+        let stream = crate::oplog::owner_stream(REPO).unwrap();
+        assert!(
+            projected_state(&conn, stream).edges.is_empty(),
+            "healed then tombstoned → edge absent"
+        );
+    }
+
     #[test]
     fn a_failed_author_rolls_back_the_memory_write() {
         let conn = scoped_conn();
