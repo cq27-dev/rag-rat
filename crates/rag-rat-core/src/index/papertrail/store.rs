@@ -405,3 +405,62 @@ mod fts_rebuild_tests {
         assert_eq!(hits, 1, "review-comment body is tokenized and searchable after rebuild");
     }
 }
+
+#[cfg(test)]
+mod store_glue_tests {
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::index::schema;
+
+    // The reverse (owner, repo, number) mapping is the ONLY place normalized identities meet the
+    // github_* key columns until the schema normalization — a non-GitHub-shaped identity must be
+    // rejected loudly, never coerced into a wrong key.
+    #[test]
+    fn store_glue_rejects_non_github_shaped_identities() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+
+        let item = PapertrailItem {
+            project: "no-slash".into(),
+            item_kind: ItemKind::Issue,
+            item_key: "7".into(),
+            url: String::new(),
+            state: "open".into(),
+            title: String::new(),
+            body: String::new(),
+            author: None,
+            created_at: None,
+            updated_at: None,
+            merged_at: None,
+        };
+        let err = store_item(&conn, &item).unwrap_err().to_string();
+        assert!(err.contains("malformed papertrail project"), "{err}");
+
+        let err = store_item(&conn, &PapertrailItem {
+            project: "o/r".into(),
+            item_key: "PROJ-7".into(),
+            ..item.clone()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("non-numeric github item key"), "{err}");
+
+        let err = store_comment(&conn, &PapertrailComment {
+            project: "o/r".into(),
+            item_kind: ItemKind::Issue,
+            item_key: "7".into(),
+            comment_id: "abc".into(),
+            url: None,
+            body: String::new(),
+            author: None,
+            created_at: None,
+            updated_at: None,
+            review_state: None,
+            anchor_path: None,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("non-numeric github comment id"), "{err}");
+    }
+}

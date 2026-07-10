@@ -227,6 +227,16 @@ pub struct CommentsPage {
     pub next: Option<PageCursor>,
 }
 
+/// Advance decision for a freshness probe: the newest `updated_at` the provider reported vs the
+/// cursor's position. `Some(latest)` when the tracker moved past the cursor, `None` when nothing
+/// did (provider timestamps compare lexicographically — ISO-8601 UTC).
+pub(crate) fn probe_advance(latest: Option<String>, since: Option<&str>) -> Option<String> {
+    match (latest, since) {
+        (Some(latest), Some(since)) if latest.as_str() <= since => None,
+        (latest, _) => latest,
+    }
+}
+
 /// Provider client behind the papertrail sync. Implementations exist per tracker (GitHub today;
 /// GitLab / Bitbucket / Jira to follow) and own URL building, pagination, and payload mapping.
 ///
@@ -272,9 +282,12 @@ pub trait PapertrailClient {
 /// Drive a papertrail future to completion from the synchronous call paths (CLI, maintenance).
 /// Uses a private lazily-built current-thread runtime. Callable from inside a multi-thread tokio
 /// runtime too (the worker is demoted via `block_in_place`, matching how the pre-async code
-/// simply blocked); a caller on a CURRENT-THREAD runtime has no sound way to block and panics in
-/// `block_in_place` — expose an async entry point instead of bridging there.
-pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+/// simply blocked). A caller on a CURRENT-THREAD ambient runtime has no sound way to block the
+/// thread — and the future cannot be offloaded, it borrows the `!Sync` connection — so that case
+/// returns an error instead of panicking; such callers need an async entry point.
+pub(crate) fn block_on<T>(
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     let runtime = RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
@@ -283,8 +296,13 @@ pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
             .expect("papertrail runtime")
     });
     match tokio::runtime::Handle::try_current() {
-        Ok(_) => tokio::task::block_in_place(|| runtime.block_on(future)),
         Err(_) => runtime.block_on(future),
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            tokio::task::block_in_place(|| runtime.block_on(future)),
+        Ok(_) => anyhow::bail!(
+            "papertrail sync cannot block inside a current-thread tokio runtime; drive the async \
+             sync entry points on that runtime instead"
+        ),
     }
 }
 
@@ -391,10 +409,7 @@ impl PapertrailClient for GitHubClient {
             .and_then(|items| items.first())
             .and_then(|item| item["updated_at"].as_str())
             .map(str::to_string);
-        Ok(match (latest, cursor.updated_since.as_deref()) {
-            (Some(latest), Some(since)) if latest.as_str() <= since => None,
-            (latest, _) => latest,
-        })
+        Ok(probe_advance(latest, cursor.updated_since.as_deref()))
     }
 }
 #[derive(Default)]
@@ -425,4 +440,58 @@ pub(crate) struct ParsedRef {
     repo: String,
     number: i64,
     kind: String,
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    #[test]
+    fn probe_advance_only_reports_movement_past_the_cursor() {
+        assert_eq!(probe_advance(None, None), None);
+        assert_eq!(probe_advance(None, Some("2026-01-01T00:00:00Z")), None);
+        assert_eq!(
+            probe_advance(Some("2026-01-02T00:00:00Z".into()), None).as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(
+            probe_advance(Some("2026-01-02T00:00:00Z".into()), Some("2026-01-01T00:00:00Z"))
+                .as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+        // At-or-before the cursor is quiet — equality must not loop the delta lane forever.
+        assert_eq!(
+            probe_advance(Some("2026-01-01T00:00:00Z".into()), Some("2026-01-01T00:00:00Z")),
+            None
+        );
+        assert_eq!(
+            probe_advance(Some("2025-12-31T00:00:00Z".into()), Some("2026-01-01T00:00:00Z")),
+            None
+        );
+    }
+
+    // The bridge must behave like the pre-async code (block) wherever blocking is sound, and
+    // refuse gracefully where it is not — never panic.
+    #[test]
+    fn block_on_bridges_from_a_multi_thread_runtime_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let value = runtime
+            .block_on(async {
+                tokio::task::spawn(async { block_on(async { anyhow::Ok(7) }) }).await.unwrap()
+            })
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn block_on_refuses_gracefully_on_a_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let err =
+            runtime.block_on(async { block_on(async { anyhow::Ok(7) }) }).unwrap_err().to_string();
+        assert!(err.contains("current-thread"), "{err}");
+    }
 }

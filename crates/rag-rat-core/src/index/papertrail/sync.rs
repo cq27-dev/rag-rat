@@ -164,9 +164,16 @@ pub(crate) fn papertrail_ref_synced(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    if matches!(status.as_deref(), Some("synced" | "not_found")) {
-        return Ok(true);
+    match status.as_deref() {
+        Some("synced" | "not_found") => return Ok(true),
+        // An explicit failed row MUST retry: a partial sync (item stored, comments failed)
+        // leaves a cached issue row behind, and falling through to the cached-issue probe
+        // would skip the ref forever with its comments permanently missing.
+        Some(_) => return Ok(false),
+        None => {},
     }
+    // No sync-state row at all: trust a cached issue row (rows synced before the
+    // github_ref_sync table existed).
     let cached_issue = conn.query_row(
         "
         SELECT EXISTS(

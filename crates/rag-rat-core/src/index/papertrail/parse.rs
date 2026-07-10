@@ -245,3 +245,156 @@ pub(crate) fn collect_rows<T>(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod mapper_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    // The gh-payload mappers are the provider boundary: the sync tests drive mock clients that
+    // never touch them, so they are pinned here against realistic REST payload shapes.
+
+    #[test]
+    fn item_from_issue_value_maps_a_plain_issue() {
+        let item = item_from_issue_value(
+            "o/r",
+            &json!({
+                "number": 42,
+                "html_url": "https://github.com/o/r/issues/42",
+                "state": "open",
+                "title": "t",
+                "body": "b",
+                "user": {"login": "octo"},
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-02T00:00:00Z",
+            }),
+        );
+        assert_eq!(item.item_kind, ItemKind::Issue);
+        assert_eq!(item.project, "o/r");
+        assert_eq!(item.item_key, "42");
+        assert_eq!(item.author.as_deref(), Some("octo"));
+        assert_eq!(item.merged_at, None);
+    }
+
+    #[test]
+    fn item_from_issue_value_resolves_a_pr_shadow_with_its_merge_stamp() {
+        let item = item_from_issue_value(
+            "o/r",
+            &json!({
+                "number": 7,
+                "html_url": "https://github.com/o/r/pull/7",
+                "state": "closed",
+                "title": "t",
+                "body": "b",
+                "pull_request": {"merged_at": "2026-02-01T00:00:00Z"},
+            }),
+        );
+        assert_eq!(item.item_kind, ItemKind::ChangeRequest);
+        assert_eq!(item.merged_at.as_deref(), Some("2026-02-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn enrich_item_from_pull_value_folds_state_and_merge_stamp() {
+        let mut item = item_from_issue_value(
+            "o/r",
+            &json!({
+                "number": 7,
+                "state": "closed",
+                "title": "t",
+                "body": "b",
+                "pull_request": {},
+            }),
+        );
+        enrich_item_from_pull_value(
+            &mut item,
+            &json!({
+                "state": "open",
+                "merged_at": "2026-02-01T00:00:00Z",
+            }),
+        );
+        assert_eq!(item.state, "open");
+        assert_eq!(item.merged_at.as_deref(), Some("2026-02-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn comment_mappers_stamp_the_unifying_markers() {
+        let payload = json!({
+            "id": 9,
+            "html_url": "https://c",
+            "body": "b",
+            "user": {"login": "octo"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        });
+        let plain = comment_from_value("o/r", ItemKind::Issue, "42", &payload);
+        assert_eq!(plain.comment_id, "9");
+        assert_eq!(plain.item_kind, ItemKind::Issue);
+        assert_eq!((plain.review_state, plain.anchor_path), (None, None));
+
+        let review = review_to_comment_from_value(
+            "o/r",
+            ItemKind::ChangeRequest,
+            "7",
+            &json!({
+                "id": 10,
+                "state": "APPROVED",
+                "body": "b",
+                "submitted_at": "2026-01-03T00:00:00Z",
+            }),
+        );
+        assert_eq!(review.review_state.as_deref(), Some("APPROVED"));
+        assert_eq!(review.created_at.as_deref(), Some("2026-01-03T00:00:00Z"));
+        assert_eq!(review.updated_at.as_deref(), Some("2026-01-03T00:00:00Z"));
+        assert_eq!(review.anchor_path, None);
+
+        let anchored = review_comment_to_comment_from_value(
+            "o/r",
+            ItemKind::ChangeRequest,
+            "7",
+            &json!({
+                "id": 11,
+                "path": "src/lib.rs",
+                "html_url": "https://rc",
+                "body": "b",
+            }),
+        );
+        assert_eq!(anchored.anchor_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(anchored.review_state, None);
+    }
+
+    #[test]
+    fn repo_comment_from_value_derives_the_parent_key_from_the_stream_payload() {
+        let unanchored = repo_comment_from_value(
+            "o/r",
+            &json!({
+                "id": 12,
+                "issue_url": "https://api.github.com/repos/o/r/issues/42",
+                "body": "b",
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(unanchored.item_key, "42");
+        assert_eq!(unanchored.item_kind, ItemKind::Issue);
+        assert_eq!(unanchored.anchor_path, None);
+
+        let anchored = repo_comment_from_value(
+            "o/r",
+            &json!({
+                "id": 13,
+                "pull_request_url": "https://api.github.com/repos/o/r/pulls/7",
+                "path": "src/lib.rs",
+                "body": "b",
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(anchored.item_key, "7");
+        assert_eq!(anchored.item_kind, ItemKind::ChangeRequest);
+        assert_eq!(anchored.anchor_path.as_deref(), Some("src/lib.rs"));
+
+        // A payload without its parent URL cannot be attributed — dropped, not misfiled.
+        assert!(repo_comment_from_value("o/r", &json!({"id": 14, "body": "b"}), false).is_none());
+    }
+}
