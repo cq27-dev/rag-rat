@@ -104,6 +104,46 @@ impl Debounce {
     }
 }
 
+/// Clock for the periodic all-worktrees sweep backstop, pure like [`Debounce`] (clock injected).
+/// It measures time since the last **`All`-scoped** pass COMPLETED — not since any pass (#577
+/// review): an event-scoped pass doesn't perform the sweep's duties (refreshing unlisted
+/// worktrees, retrying overlay embed backlogs), so a steady drip of scoped passes must escalate
+/// the next pass to `All` once the interval elapses rather than keep postponing the backstop.
+#[derive(Debug)]
+struct SweepClock {
+    /// `None` disables the periodic sweep (`periodic_sweep_secs = 0`) — never due.
+    interval: Option<Duration>,
+    last_sweep: Instant,
+    /// Whether the pass currently in flight sweeps every worktree. Starts `true`: the startup
+    /// catch-up (an `All` pass) is dispatched just before the event loop runs.
+    in_flight_sweeps_all: bool,
+}
+
+impl SweepClock {
+    fn new(interval: Option<Duration>, now: Instant) -> Self {
+        Self { interval, last_sweep: now, in_flight_sweeps_all: true }
+    }
+
+    fn on_dispatch(&mut self, scope_is_all: bool) {
+        self.in_flight_sweeps_all = scope_is_all;
+    }
+
+    /// A pass completed; only an `All`-scoped one resets the backstop interval.
+    fn on_pass_done(&mut self, now: Instant) {
+        if self.in_flight_sweeps_all {
+            self.last_sweep = now;
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.interval.is_some_and(|p| now >= self.last_sweep + p)
+    }
+
+    fn due_in(&self, now: Instant) -> Option<Duration> {
+        self.interval.map(|p| (self.last_sweep + p).saturating_duration_since(now))
+    }
+}
+
 /// What the event loop asks the pass worker to run (#506).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PassRequest {
@@ -1600,10 +1640,12 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
             Duration::from_millis(self.config.watch.max_latency_ms),
         );
         let mut fleet_debounce = Debounce::new(FLEET_DEBOUNCE, FLEET_MAX_LATENCY);
-        // Periodic backstop (covers event-blind filesystems + missed events). `None` disables it.
+        // Periodic backstop (covers event-blind filesystems + missed events). Counts from the
+        // last ALL-scoped pass, so event-scoped passes can't postpone it (#577 review); `new`
+        // assumes the startup catch-up (an `All` pass) was just dispatched.
         let periodic = (self.config.watch.periodic_sweep_secs > 0)
             .then(|| Duration::from_secs(self.config.watch.periodic_sweep_secs));
-        let mut last_pass = Instant::now(); // the startup catch-up was just dispatched
+        let mut sweep = SweepClock::new(periodic, Instant::now());
         // The overlay scope accumulated while the debounce is armed (#577): every firing event
         // merges its contribution, and the union rides the next dispatched pass. Cleared ONLY on
         // dispatch, like the debounce itself — mid-pass events keep accumulating for the
@@ -1621,9 +1663,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
             let wait = if self.scheduler.in_flight() {
                 fleet_debounce.due_in(now).unwrap_or(IDLE_WAIT)
             } else {
-                let periodic_wait =
-                    periodic.map(|p| (last_pass + p).saturating_duration_since(now));
-                [debounce.due_in(now), fleet_debounce.due_in(now), periodic_wait]
+                [debounce.due_in(now), fleet_debounce.due_in(now), sweep.due_in(now)]
                     .into_iter()
                     .flatten()
                     .min()
@@ -1691,7 +1731,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                 Ok(LoopMsg::Fs(Err(_))) => {},
                 Ok(LoopMsg::PassDone) => {
                     self.scheduler.on_done();
-                    last_pass = Instant::now();
+                    sweep.on_pass_done(Instant::now());
                     // Refresh the live linked-worktree set after every pass. Existing checkout
                     // paths can switch branches and therefore branch-local target sets; rebuilding
                     // the state keeps classification, ignore matchers, and watch placement in one
@@ -1709,11 +1749,13 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             let now = Instant::now();
-            let periodic_due = periodic.is_some_and(|p| now >= last_pass + p);
+            let periodic_due = sweep.due(now);
             if debounce.should_fire(now) || periodic_due {
                 // The periodic sweep is the missed-event backstop, so it refreshes every overlay;
                 // an event-driven pass carries the roots accumulated above (#577). When both are
-                // due at once, `All` is the superset.
+                // due at once, `All` is the superset — and because the sweep clock counts from
+                // the last All COMPLETION, sustained event churn escalates a pass to `All` every
+                // interval instead of postponing the backstop.
                 let overlay_scope = if periodic_due {
                     OverlayScope::All
                 } else {
@@ -1722,6 +1764,11 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                         .unwrap_or_else(|| OverlayScope::Linked(BTreeSet::new()))
                 };
                 if let Some(request) = self.scheduler.dispatch(overlay_scope) {
+                    // The scheduler may widen the scope (gc-cadence passes force `All`), so read
+                    // the DISPATCHED request's scope, not the one handed in.
+                    if let PassRequest::Maintenance { overlay_scope, .. } = &request {
+                        sweep.on_dispatch(matches!(overlay_scope, OverlayScope::All));
+                    }
                     let _ = self.pass_tx.send(request);
                     // Reset ONLY on dispatch: while a pass is in flight the armed debounce (and
                     // the scope accumulated with it) is the record that a follow-up is owed, and
@@ -3719,6 +3766,54 @@ mod tests {
         let d = Debounce::new(Duration::from_millis(400), Duration::from_millis(2500));
         assert!(d.due_in(Instant::now()).is_none());
         assert!(!d.should_fire(Instant::now()));
+    }
+
+    #[test]
+    fn scoped_passes_do_not_postpone_the_periodic_all_sweep() {
+        // #577 review (PR): the periodic backstop measures time since the last ALL-scoped pass
+        // COMPLETED — event-scoped passes don't perform sweep duties (unlisted-worktree refresh,
+        // overlay embed-backlog retries), so a steady drip of scoped passes must escalate the
+        // next pass to `All` once the interval elapses, not keep postponing it.
+        let start = Instant::now();
+        let interval = Duration::from_secs(300);
+        let mut clock = SweepClock::new(Some(interval), start);
+
+        // The startup catch-up (an All pass) is in flight at construction; its completion resets.
+        clock.on_pass_done(start + Duration::from_secs(5));
+        assert!(!clock.due(start + Duration::from_secs(300)), "counts from startup COMPLETION");
+
+        // Scoped passes churn away past the interval — none of them reset the sweep clock.
+        for i in 0..10 {
+            clock.on_dispatch(false);
+            clock.on_pass_done(start + Duration::from_secs(6 + i * 60));
+        }
+        assert!(
+            clock.due(start + Duration::from_secs(5) + interval),
+            "scoped passes do not postpone the sweep"
+        );
+        assert_eq!(
+            clock.due_in(start + Duration::from_secs(6)),
+            Some(Duration::from_secs(299)),
+            "the wait deadline also measures from the last ALL completion"
+        );
+
+        // An ALL pass (periodic or gc-widened) resets the clock at its COMPLETION.
+        clock.on_dispatch(true);
+        let sweep_done = start + Duration::from_secs(700);
+        clock.on_pass_done(sweep_done);
+        assert!(!clock.due(sweep_done + interval - Duration::from_secs(1)));
+        assert!(clock.due(sweep_done + interval));
+    }
+
+    #[test]
+    fn a_disabled_periodic_sweep_is_never_due() {
+        let start = Instant::now();
+        let mut clock = SweepClock::new(None, start);
+        clock.on_pass_done(start + Duration::from_secs(1));
+        clock.on_dispatch(false);
+        clock.on_pass_done(start + Duration::from_secs(2));
+        assert!(!clock.due(start + Duration::from_secs(1_000_000)));
+        assert_eq!(clock.due_in(start), None);
     }
 
     #[test]
