@@ -1522,8 +1522,8 @@ fn migration_054_adds_the_single_row_device_identity_table() {
 fn migration_055_adds_the_binding_downgrade_marker_column() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V056 now holds the absolute tip pin (migration_056's test); this drops to the symbolic
-    // `current_version == LATEST` freshness check.
+    // The absolute tip pin lives with the newest migration's test (`migration_057_*` now); this
+    // drops to the symbolic `current_version == LATEST` freshness check.
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1556,10 +1556,13 @@ fn migration_055_adds_the_binding_downgrade_marker_column() {
 fn migration_056_adds_the_git_change_couplings_table() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V056 is the schema tip — this test carries the absolute pin (the older tests dropped to the
-    // symbolic `current_version == LATEST` check).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 56, "V056 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 56, "schema at LATEST after apply");
+    // The absolute tip pin lives with the newest migration's test (`migration_057_*` now); this
+    // drops to the symbolic `current_version == LATEST` freshness check.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
     assert!(
         conn_table_exists(&conn, "git_change_couplings"),
         "V056 creates the git_change_couplings table"
@@ -1602,6 +1605,139 @@ fn migration_056_adds_the_git_change_couplings_table() {
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
         "forward migrate reaches the tip"
+    );
+}
+
+#[test]
+fn migration_057_adds_the_external_symbols_table() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V057 is the schema tip — this test carries the absolute pin (the older tests dropped to
+    // the symbolic `current_version == LATEST` check).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 57, "V057 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 57, "schema at LATEST after apply");
+
+    // The external-symbol contract table exists with its full column set.
+    for column in [
+        "repo_id",
+        "tool",
+        "tool_version",
+        "commit_sha",
+        "worktree_id",
+        "moniker",
+        "kind",
+        "display_name",
+        "signature_text",
+        "signature_language",
+        "documentation",
+        "deprecated",
+        "computed_at_ms",
+    ] {
+        assert!(
+            conn_table_columns(&conn, "external_symbols").contains(&column.to_string()),
+            "V057 gives external_symbols its {column} column"
+        );
+    }
+
+    // PK `(repo_id, tool, commit_sha, worktree_id, moniker)`: a second row with the same key is
+    // rejected even when the payload differs; the SAME moniker under a DIFFERENT checkout inserts
+    // (the multi-worktree isolation), as does a distinct moniker.
+    let insert = "INSERT INTO external_symbols(repo_id, tool, tool_version, commit_sha, \
+                  worktree_id, moniker, kind, display_name, signature_text, signature_language, \
+                  documentation, deprecated, computed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, \
+                  ?8, ?9, ?10, ?11, ?12, ?13)";
+    conn.execute(insert, rusqlite::params![
+        "r",
+        "rust-analyzer",
+        "1.0",
+        "sha1",
+        "",
+        "crate a 1.0 mod/get().",
+        "Function",
+        "get",
+        "fn get()",
+        "rust",
+        "docs",
+        0,
+        123_i64
+    ])
+    .expect("first external-symbol row inserts");
+    assert!(
+        conn.execute(insert, rusqlite::params![
+            "r",
+            "rust-analyzer",
+            "2.0",
+            "sha1",
+            "",
+            "crate a 1.0 mod/get().",
+            "Method",
+            "get",
+            "fn get(x)",
+            "rust",
+            "other",
+            1,
+            456_i64
+        ])
+        .is_err(),
+        "the (repo_id, tool, commit_sha, worktree_id, moniker) primary key rejects a duplicate"
+    );
+    conn.execute(insert, rusqlite::params![
+        "r",
+        "rust-analyzer",
+        "1.0",
+        "sha2",
+        "",
+        "crate a 1.0 mod/get().",
+        "Function",
+        "get",
+        "fn get()",
+        "rust",
+        "docs",
+        0,
+        123_i64
+    ])
+    .expect("the same moniker under a different checkout (commit_sha) inserts — worktree-isolated");
+    conn.execute(insert, rusqlite::params![
+        "r",
+        "rust-analyzer",
+        "1.0",
+        "sha1",
+        "",
+        "crate a 1.0 mod/other().",
+        "Function",
+        "other",
+        "fn other()",
+        "rust",
+        "docs",
+        0,
+        123_i64
+    ])
+    .expect("a distinct moniker inserts");
+
+    // Deferred-absence in ISOLATION: drop the table and re-run the applier alone (never against the
+    // full ladder's end state). It recreates the table, and a replay is a no-op (CREATE … IF NOT
+    // EXISTS).
+    conn.execute_batch("DROP TABLE external_symbols;").unwrap();
+    assert!(!conn_table_exists(&conn, "external_symbols"), "dropped before the isolated apply");
+    schema::apply_external_symbols(&conn).unwrap();
+    schema::apply_external_symbols(&conn).expect("replay is a no-op");
+    assert!(
+        conn_table_columns(&conn, "external_symbols").contains(&"moniker".to_string()),
+        "the isolated applier recreates the table"
+    );
+
+    // A forward migrate over a ledger truncated below V057 replays the step and lands the table.
+    conn.execute_batch("DROP TABLE external_symbols;").unwrap();
+    truncate_schema_to(&conn, 56);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip"
+    );
+    assert!(
+        conn_table_exists(&conn, "external_symbols"),
+        "the forward migrate re-creates external_symbols"
     );
 }
 

@@ -16,6 +16,23 @@ impl IndexDatabase {
         crate::query::graph::traverse(self.storage.connection(), symbol, true, limit)
     }
 
+    /// `check_library_usage` (#114): join the active checkout's `resolved-external` call sites to
+    /// the `external_symbols` dependency contracts, surface each dependency's current
+    /// signature/docs as context, and assert deprecated-but-compiling usage. Read-only;
+    /// requires an `oracle run` to have populated the side tables (else a `NoOracleRun` /
+    /// `NoExternalSymbols` status).
+    pub fn check_library_usage(
+        &self,
+        opts: &crate::index::oracle::LibraryUsageOptions,
+    ) -> anyhow::Result<crate::index::oracle::LibraryUsageReport> {
+        crate::index::oracle::check_library_usage(
+            self.storage.connection(),
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+            opts,
+        )
+    }
+
     pub fn find_callers_with_options(
         &self,
         symbol: &str,

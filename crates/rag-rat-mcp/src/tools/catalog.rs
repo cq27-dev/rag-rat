@@ -8,6 +8,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "compare_graph_to_text",
     "compare_graph_to_scip",
     "impact_surface",
+    "check_library_usage",
     "repo_brief",
     "repo_clusters",
     "important_symbols",
@@ -101,6 +102,15 @@ pub fn description(name: &str) -> &'static str {
             "Pre-edit blast radius for a symbol or path: graph callers/callees, tests, docs, git \
              history, GitHub papertrail, and the repo memories crossing it, with a completeness / \
              risk summary. Run this before changing anything non-trivial.",
+        "check_library_usage" =>
+            "Dependency-contract check for the code's EXTERNAL library calls, from the SCIP \
+             oracle's external symbol info. For each `resolved-external` call site it surfaces the \
+             dependency's CURRENT signature + docs as inline context (judge arity / misuse \
+             yourself) and ASSERTS a `deprecated` verdict when the docs mark it so. Filter by \
+             `path`, `package`, or `deprecated_only`. Requires an `oracle run`; returns a \
+             `NoOracleRun` / `NoExternalSymbols` status otherwise. Does NOT assert arity or \
+             removed/renamed drift (not instrumented / needs a cross-version baseline) — those \
+             stay context.",
         "repo_brief" =>
             "Orientation for an unfamiliar repo: ranked files by mode — spine (central coupling), \
              churn, god_modules, or refactor_candidates — with size/coupling/churn/memory signals \
@@ -258,6 +268,7 @@ pub fn schema(name: &str) -> Value {
         "compare_graph_to_text" => schema_for::<CompareGraphTextArgs>(),
         "compare_graph_to_scip" => schema_for::<EmptyArgs>(),
         "impact_surface" => schema_for::<ImpactArgs>(),
+        "check_library_usage" => schema_for::<CheckLibraryUsageArgs>(),
         "repo_brief" => schema_for::<RepoBriefArgs>(),
         "repo_clusters" => schema_for::<RepoClustersArgs>(),
         "important_symbols" => schema_for::<ImportantSymbolsArgs>(),

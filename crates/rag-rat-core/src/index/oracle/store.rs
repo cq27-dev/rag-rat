@@ -495,6 +495,99 @@ pub(crate) fn write_logical_symbol_moniker(
     Ok(())
 }
 
+/// Delete the `external_symbols` contracts for a `(tool, checkout)` scope. Called at the start of a
+/// run so the pass is AUTHORITATIVE for its tool in this checkout: a moniker the prior `.scip`
+/// described but the current one no longer emits must not keep a stale contract (upsert alone only
+/// overwrites monikers the current run revisits). Run inside the same transaction that writes the
+/// current rows so the table is never observed mid-clear.
+///
+/// SCOPE (load-bearing): restricted to the ACTIVE `(commit_sha, worktree_id)` checkout AND repo
+/// (`external_symbols.repo_id`, its own column from birth, V056) — the SAME per-checkout, per-repo
+/// scope `oracle_runs` uses, and the reason external_symbols carries those columns. Without the
+/// checkout predicate a run in one linked worktree would erase a SIBLING checkout's contracts (they
+/// share `(repo_id, tool)` but resolve different dependency versions); without the repo predicate a
+/// sibling repo's contracts would go. The clear is per-tool (not per-tool_version) because the
+/// moniker's own version component already separates dependency versions within a checkout.
+pub(crate) fn clear_external_symbols_for_tool(
+    conn: &Connection,
+    tool: OracleTool,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<()> {
+    let repo_clause = oracle_repo_scope_clause(conn, "external_symbols")?;
+    conn.execute(
+        &format!(
+            "DELETE FROM external_symbols WHERE tool = ?1 AND commit_sha = ?2 AND worktree_id = \
+             ?3{repo_clause}"
+        ),
+        params![tool.as_db_str(), commit_sha, worktree_id],
+    )?;
+    Ok(())
+}
+
+/// One external dependency contract to persist: the `SymbolInformation` parsed from
+/// `index.external_symbols`, keyed by its RAW moniker (== `edge_oracle.scip_symbol`).
+pub(crate) struct ExternalSymbolRow<'a> {
+    pub(crate) moniker: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) signature_text: &'a str,
+    pub(crate) signature_language: &'a str,
+    pub(crate) documentation: &'a str,
+    pub(crate) deprecated: bool,
+}
+
+/// Upsert one `external_symbols` row. Keyed by `(repo_id, tool, commit_sha, worktree_id, moniker)`
+/// — re-running the same tool in the SAME checkout overwrites the prior contract, while a sibling
+/// checkout's rows are untouched. `external_symbols` is born post-A5 (V056), so `repo_id` is ALWAYS
+/// present and leads the PK; it is stamped unconditionally here (unlike the moniker / edge writers,
+/// which straddle the pre-/post-A5 table shapes).
+pub(crate) fn write_external_symbol(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+    row: &ExternalSymbolRow<'_>,
+) -> anyhow::Result<()> {
+    let repo_id = oracle_repo_scope(conn)?
+        .ok_or_else(|| anyhow::anyhow!("external_symbols requires post-A5 repo scoping"))?;
+    conn.execute(
+        "
+        INSERT INTO external_symbols(
+            repo_id, tool, tool_version, commit_sha, worktree_id, moniker, kind, display_name,
+            signature_text, signature_language, documentation, deprecated, computed_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ON CONFLICT(repo_id, tool, commit_sha, worktree_id, moniker) DO UPDATE SET
+            tool_version = excluded.tool_version,
+            kind = excluded.kind,
+            display_name = excluded.display_name,
+            signature_text = excluded.signature_text,
+            signature_language = excluded.signature_language,
+            documentation = excluded.documentation,
+            deprecated = excluded.deprecated,
+            computed_at_ms = excluded.computed_at_ms
+        ",
+        params![
+            repo_id,
+            tool.as_db_str(),
+            tool_version,
+            commit_sha,
+            worktree_id,
+            row.moniker,
+            row.kind,
+            row.display_name,
+            row.signature_text,
+            row.signature_language,
+            row.documentation,
+            row.deprecated,
+            now_ms(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Delete the `edge_oracle` verdicts for a `(tool, tool_version)` scope **within the active
 /// checkout**. Called at the start of a run so the pass is **authoritative** for its tool version:
 /// an edge the prior `.scip` covered but the current one no longer yields a verdict for must NOT
@@ -1270,6 +1363,35 @@ pub(crate) fn prune_oracle_runs_outside_scope(
     let deleted = conn.execute(
         &format!(
             "DELETE FROM oracle_runs
+             WHERE commit_sha NOT IN ({commit_list})
+               AND worktree_id NOT IN ({worktree_list}){repo_clause}"
+        ),
+        [],
+    )?;
+    Ok(u64::try_from(deleted).unwrap_or(0))
+}
+
+/// Prune `external_symbols` contracts for dead `(commit_sha, worktree_id)` checkouts (#114) — the
+/// gc companion for the checkout-keyed contract table. Like `oracle_runs`, nothing cascades it, so
+/// a retired branch / linked worktree would otherwise leave its dependency signature+doc payloads
+/// keyed by a dead checkout forever (unbounded growth). Uses the SAME live sets and the SAME
+/// per-repo, both-columns-dead predicate as [`prune_oracle_runs_outside_scope`], so a dropped
+/// checkout's runs and its contracts are pruned together and a sibling repo's rows are never
+/// touched.
+pub(crate) fn prune_external_symbols_outside_scope(
+    conn: &Connection,
+    live_commits: &[String],
+    live_worktrees: &[String],
+) -> anyhow::Result<u64> {
+    if live_commits.is_empty() && live_worktrees.is_empty() {
+        return Ok(0);
+    }
+    let commit_list = sql_quoted_list(live_commits);
+    let worktree_list = sql_quoted_list(live_worktrees);
+    let repo_clause = oracle_repo_scope_clause(conn, "external_symbols")?;
+    let deleted = conn.execute(
+        &format!(
+            "DELETE FROM external_symbols
              WHERE commit_sha NOT IN ({commit_list})
                AND worktree_id NOT IN ({worktree_list}){repo_clause}"
         ),

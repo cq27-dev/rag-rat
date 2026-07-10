@@ -59,6 +59,15 @@ pub(crate) fn call_tool_with_db(
             let resolution_mode = resolution_mode(args.resolution);
             impact_tool(db, args, resolution_mode, memory_surface)?
         },
+        "check_library_usage" => {
+            let args: CheckLibraryUsageArgs = serde_json::from_value(arguments)?;
+            json!(db.check_library_usage(&LibraryUsageOptions {
+                path: args.path,
+                package: args.package,
+                deprecated_only: args.deprecated_only,
+                limit: args.limit as usize,
+            })?)
+        },
         "repo_brief" => {
             let args: RepoBriefArgs = serde_json::from_value(arguments)?;
             json!(db.repo_brief(RepoBriefOptions {

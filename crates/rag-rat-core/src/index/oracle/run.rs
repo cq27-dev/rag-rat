@@ -102,6 +102,9 @@ pub(crate) fn run_in_tx(
     // Monikers are authoritative per tool the same way verdicts are per (tool, tool_version):
     // clear, then write the current `.scip`'s definitions, all in this transaction (#70).
     store::clear_logical_symbol_monikers_for_tool(conn, input.tool)?;
+    // External dependency contracts are authoritative per tool too (#114): clear, then write the
+    // current `.scip`'s `external_symbols` after the moniker pass, all in this transaction.
+    store::clear_external_symbols_for_tool(conn, input.tool, input.commit_sha, input.worktree_id)?;
 
     // Parse the `.scip`, reading each document's current checkout bytes for encoding conversion.
     // The bytes we read here are the SAME bytes whose hash we compare against each candidate's
@@ -407,6 +410,32 @@ pub(crate) fn run_in_tx(
             &moniker,
         )?;
         report.monikers_written += 1;
+    }
+
+    // External dependency contracts (#114): persist the `SymbolInformation` parsed from
+    // `index.external_symbols` — the kind/signature/docs/deprecation `check_library_usage` joins to
+    // `resolved-external` call sites. Unlike the moniker pass these describe OUT-of-corpus symbols
+    // with no local file, so no content-drift gate applies; write each verbatim (the authoritative
+    // clear ran up front). The moniker is stored RAW (never `stabilize_moniker_version`'d) so it
+    // exact-joins `edge_oracle.scip_symbol`, which is likewise the occurrence symbol unstabilized.
+    for (moniker, info) in &index.external_symbol_info {
+        store::write_external_symbol(
+            conn,
+            input.tool,
+            input.tool_version,
+            input.commit_sha,
+            input.worktree_id,
+            &store::ExternalSymbolRow {
+                moniker,
+                kind: &info.kind,
+                display_name: &info.display_name,
+                signature_text: &info.signature_text,
+                signature_language: &info.signature_language,
+                documentation: &info.documentation,
+                deprecated: info.deprecated,
+            },
+        )?;
+        report.external_symbols_written += 1;
     }
 
     // Recall gap: in-corpus *reference* occurrences whose symbol resolves inside the corpus but

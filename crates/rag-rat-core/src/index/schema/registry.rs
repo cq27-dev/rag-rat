@@ -78,6 +78,9 @@ const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     "oracle_runs",
     "edge_oracle",
     "logical_symbol_monikers",
+    // V056 (#114): the per-moniker external dependency contract, repo_id-scoped from birth like
+    // its oracle-periphery siblings; a LocalOnly→Portable adoption must re-point its rows too.
+    "external_symbols",
     "reconcile_attempts",
     "dream_findings",
     "repo_memories",
@@ -557,6 +560,9 @@ const LATE_MERGE_DERIVED_PERIPHERY_TABLES: &[&str] = &[
     "oracle_runs",
     "edge_oracle",
     "logical_symbol_monikers",
+    // V056 (#114): DERIVED (re-produced by a fresh oracle run under the target id), so it is
+    // DROPPED under the retiring id, not moved — same posture as edge_oracle.
+    "external_symbols",
     "reconcile_attempts",
     "dream_findings",
 ];

@@ -470,6 +470,27 @@ pub struct LimitArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct CheckLibraryUsageArgs {
+    /// Restrict to external call sites in this exact file or under this directory prefix (e.g.
+    /// `src/net`). Omit for the whole checkout.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Restrict to one dependency package — the moniker's package component, e.g. `ky` / `tokio`.
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Only surface contracts flagged deprecated (the asserted verdict).
+    #[serde(default)]
+    pub deprecated_only: bool,
+    /// Max dependency-symbol entries returned; summary counts always cover the full set.
+    #[serde(default = "default_graph_limit")]
+    pub limit: u32,
+    /// Absolute path to a linked git worktree you're working in; serves that worktree's branch
+    /// overlay over the indexed checkout. Omit for the indexed checkout.
+    #[serde(default)]
+    pub worktree: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadChunkArgs {
     pub chunk_id: i64,
     #[serde(default = "default_read_chunk_graph_mode")]

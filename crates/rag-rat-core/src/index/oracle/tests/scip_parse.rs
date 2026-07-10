@@ -243,3 +243,133 @@ fn parse_utf16_astral_character_shifts_offset_by_surrogate_width() {
     // Correct surrogate accounting lands the byte range on `foo` (bytes 6..9).
     assert_eq!((occs[0].start_byte, occs[0].end_byte), (6, 9));
 }
+
+// ---------------------------------------------------------------------------
+// scip.rs — external `SymbolInformation` side map (#114): kind / signature / docs / deprecation.
+// ---------------------------------------------------------------------------
+
+/// Build a `SymbolInformation` for an external dependency symbol. `signature` is `(language,
+/// text)`.
+fn external_symbol(
+    moniker: &str,
+    kind: ::scip::types::symbol_information::Kind,
+    display_name: &str,
+    signature: Option<(&str, &str)>,
+    docs: &[&str],
+) -> ::scip::types::SymbolInformation {
+    ::scip::types::SymbolInformation {
+        symbol: moniker.to_string(),
+        display_name: display_name.to_string(),
+        kind: ::protobuf::EnumOrUnknown::new(kind),
+        documentation: docs.iter().map(|doc| doc.to_string()).collect(),
+        signature_documentation: signature
+            .map(|(language, text)| {
+                ::protobuf::MessageField::some(::scip::types::Signature {
+                    language: language.to_string(),
+                    text: text.to_string(),
+                    ..Default::default()
+                })
+            })
+            .unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// Parse an index carrying only `external_symbols` (no documents to read).
+fn parse_external(symbols: Vec<::scip::types::SymbolInformation>) -> ScipIndex {
+    let index = Index { external_symbols: symbols, ..Default::default() };
+    ScipIndex::from_index(&index, PositionEncoding::UTF8CodeUnitOffsetFromLineStart, &mut |_| None)
+        .unwrap()
+}
+
+/// `index.external_symbols` populate the moniker-keyed side map with kind / display_name /
+/// signature text+language / documentation, keyed by the RAW moniker (so it exact-joins
+/// `edge_oracle`).
+#[test]
+fn parse_external_symbols_populates_the_side_map() {
+    use ::scip::types::symbol_information::Kind;
+    let moniker = "scip-typescript npm ky 1.7.2 index.ts/Ky#get().";
+    let idx = parse_external(vec![external_symbol(
+        moniker,
+        Kind::Method,
+        "get",
+        Some(("typescript", "get(url: string, options?: Options): ResponsePromise")),
+        &["Fetches the URL with the given options."],
+    )]);
+
+    let info = idx.external_symbol_info.get(moniker).expect("moniker keyed raw, exact");
+    assert_eq!(info.kind, "Method");
+    assert_eq!(info.display_name, "get");
+    assert_eq!(info.signature_language, "typescript");
+    assert!(info.signature_text.contains("ResponsePromise"), "signature text preserved");
+    assert_eq!(info.documentation, "Fetches the URL with the given options.");
+    assert!(!info.deprecated, "no deprecation marker present");
+}
+
+/// The deprecation verdict fires on a case-insensitive "deprecated" in EITHER the documentation or
+/// the signature text, and stays false when absent.
+#[test]
+fn parse_external_symbols_detect_deprecation_in_docs_or_signature() {
+    use ::scip::types::symbol_information::Kind;
+    let deprecated_in_docs = "pkg a 1 mod/old().";
+    let deprecated_in_sig = "pkg a 1 mod/old2().";
+    let clean = "pkg a 1 mod/current().";
+    let idx = parse_external(vec![
+        external_symbol(deprecated_in_docs, Kind::Function, "old", None, &[
+            "@deprecated Use `new` instead."
+        ]),
+        external_symbol(
+            deprecated_in_sig,
+            Kind::Function,
+            "old2",
+            // Capitalized marker in the signature, none in docs — still caught (case-insensitive).
+            Some(("rust", "fn old2() // DEPRECATED")),
+            &[],
+        ),
+        external_symbol(clean, Kind::Function, "current", Some(("rust", "fn current()")), &[
+            "The supported entry point.",
+        ]),
+    ]);
+
+    assert!(idx.external_symbol_info.get(deprecated_in_docs).unwrap().deprecated);
+    assert!(idx.external_symbol_info.get(deprecated_in_sig).unwrap().deprecated);
+    assert!(!idx.external_symbol_info.get(clean).unwrap().deprecated);
+}
+
+/// `local N` external entries carry no cross-file meaning and are dropped; a duplicate moniker
+/// keeps the FIRST `SymbolInformation` (SCIP emits one per symbol, but the map must be
+/// deterministic).
+#[test]
+fn parse_external_symbols_skip_locals_and_keep_first_on_duplicate() {
+    use ::scip::types::symbol_information::Kind;
+    let dup = "pkg a 1 mod/dup().";
+    let idx = parse_external(vec![
+        external_symbol("local 0", Kind::Function, "scratch", None, &[]),
+        external_symbol(dup, Kind::Function, "first", Some(("rust", "fn dup()")), &[]),
+        external_symbol(dup, Kind::Method, "second", Some(("rust", "fn dup(x)")), &[]),
+    ]);
+
+    assert!(!idx.external_symbol_info.contains_key("local 0"), "local symbols dropped");
+    assert_eq!(
+        idx.external_symbol_info.get(dup).unwrap().display_name,
+        "first",
+        "first entry wins"
+    );
+    assert_eq!(idx.external_symbol_info.len(), 1);
+}
+
+/// A symbol with no `signature_documentation` and an unset `kind` yields empty signature fields and
+/// the "unspecified" kind label — no panic, graceful empties.
+#[test]
+fn parse_external_symbols_tolerate_missing_signature_and_kind() {
+    use ::scip::types::symbol_information::Kind;
+    let moniker = "pkg a 1 mod/bare().";
+    let idx = parse_external(vec![external_symbol(moniker, Kind::UnspecifiedKind, "", None, &[])]);
+
+    let info = idx.external_symbol_info.get(moniker).unwrap();
+    assert_eq!(info.kind, "unspecified");
+    assert_eq!(info.signature_text, "");
+    assert_eq!(info.signature_language, "");
+    assert_eq!(info.documentation, "");
+    assert!(!info.deprecated);
+}

@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use ::protobuf::Message;
-use ::scip::types::{Index, PositionEncoding};
+use ::scip::types::{Index, PositionEncoding, SymbolInformation};
 
 /// A SCIP occurrence reduced to what the join needs: the **byte** range of the identifier token on
 /// its line and the SCIP symbol it refers to. Byte offsets are absolute within the file (not
@@ -49,13 +49,55 @@ pub(crate) struct ScipDefinition {
     pub(crate) end_byte: usize,
 }
 
-/// The parsed `.scip`, reduced to the join's two maps.
+/// The `SymbolInformation` for one EXTERNAL dependency symbol — the metadata `from_index`
+/// previously discarded (#114). `check_library_usage` surfaces `signature_text` + `documentation`
+/// as inline context at external call sites and asserts the `deprecated` verdict.
+#[derive(Debug, Clone)]
+pub(crate) struct ScipSymbolInformation {
+    /// The `SymbolInformation.Kind` variant name (display context, e.g. "Function"/"Method"), or
+    /// "unspecified" for the protobuf default.
+    pub(crate) kind: String,
+    pub(crate) display_name: String,
+    /// `signature_documentation.text` — a printed, language-specific signature string (NOT
+    /// structured params). May be empty when the indexer emits no signature.
+    pub(crate) signature_text: String,
+    /// `signature_documentation.language`, may be empty.
+    pub(crate) signature_language: String,
+    /// `documentation` strings joined with a blank line, may be empty.
+    pub(crate) documentation: String,
+    /// True when the docs/signature mark this symbol deprecated (the one deterministic verdict).
+    pub(crate) deprecated: bool,
+}
+
+impl ScipSymbolInformation {
+    fn from_scip(info: &SymbolInformation) -> Self {
+        let signature = info.signature_documentation.as_ref();
+        let signature_text = signature.map(|sig| sig.text.clone()).unwrap_or_default();
+        let signature_language = signature.map(|sig| sig.language.clone()).unwrap_or_default();
+        let documentation = info.documentation.join("\n\n");
+        let deprecated = documentation_marks_deprecated(&documentation, &signature_text);
+        Self {
+            kind: scip_kind_label(info.kind.enum_value_or_default()),
+            display_name: info.display_name.clone(),
+            signature_text,
+            signature_language,
+            documentation,
+            deprecated,
+        }
+    }
+}
+
+/// The parsed `.scip`, reduced to the join's maps.
 #[derive(Debug, Default)]
 pub(crate) struct ScipIndex {
     /// `relative_path -> occurrences` (definitions and references both), byte-keyed.
     pub(crate) occurrences_by_path: HashMap<String, Vec<ScipOccurrence>>,
     /// `scip_symbol -> definition site`. First definition wins (SCIP emits one per symbol).
     pub(crate) definitions: HashMap<String, ScipDefinition>,
+    /// `raw moniker -> external dependency symbol info`, from `index.external_symbols` (#114). The
+    /// key is the RAW SCIP symbol string, so it exact-matches `edge_oracle.scip_symbol`; first
+    /// entry wins (SCIP emits one `SymbolInformation` per symbol).
+    pub(crate) external_symbol_info: HashMap<String, ScipSymbolInformation>,
 }
 
 impl ScipIndex {
@@ -173,8 +215,51 @@ impl ScipIndex {
             }
             out.occurrences_by_path.insert(path, occurrences);
         }
+
+        // External dependency `SymbolInformation` — the kind/signature/docs the occurrence loop
+        // above ignores. `index.external_symbols` is SCIP's own out-of-corpus symbol set, i.e. the
+        // dependency contracts `check_library_usage` joins to `resolved-external` call sites
+        // (#114). `local N` symbols carry no cross-file meaning (mirrors the occurrence
+        // filter above) and are dropped. First entry wins (SCIP emits one
+        // `SymbolInformation` per symbol).
+        for info in &index.external_symbols {
+            if is_local_symbol(&info.symbol) {
+                continue;
+            }
+            out.external_symbol_info
+                .entry(info.symbol.clone())
+                .or_insert_with(|| ScipSymbolInformation::from_scip(info));
+        }
+
         Ok(out)
     }
+}
+
+/// A legible label for a SCIP `SymbolInformation.Kind`: the enum variant name (e.g. "Function" /
+/// "Method" / "StaticMethod"), with the protobuf default rendered as "unspecified". Stored as
+/// display CONTEXT on `external_symbols.kind` — not a parsed key — so the exact variant name (the
+/// full SCIP taxonomy, not a hand-maintained subset) is the useful, zero-maintenance form.
+fn scip_kind_label(kind: ::scip::types::symbol_information::Kind) -> String {
+    use ::scip::types::symbol_information::Kind;
+    match kind {
+        Kind::UnspecifiedKind => "unspecified".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Whether a symbol's docs/signature mark it deprecated — the one deterministic library-usage
+/// verdict. A case-insensitive scan for "deprecated", which is the near-universal marker across
+/// ecosystems: Rust `#[deprecated]` (rendered into rustdoc), TS/JS `@deprecated` (JSDoc), Python
+/// `.. deprecated::` / "Deprecated:" (Sphinx/docstrings). Deliberately a substring and NOT a claim
+/// about *why*: a false positive only surfaces one extra advisory the agent can dismiss — it never
+/// asserts a signature break — which is the honest posture for a heuristic marker.
+fn documentation_marks_deprecated(documentation: &str, signature_text: &str) -> bool {
+    let mut haystack = String::with_capacity(documentation.len() + signature_text.len() + 1);
+    haystack.push_str(documentation);
+    haystack.push('\n');
+    haystack.push_str(signature_text);
+    haystack.make_ascii_lowercase();
+    haystack.contains("deprecated")
 }
 
 /// `SymbolRole.Definition` is bit 1 (value `1`) of the `symbol_roles` bitset.

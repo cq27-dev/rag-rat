@@ -693,6 +693,58 @@ pub(crate) fn apply_scip_moniker_anchors(conn: &Connection) -> rusqlite::Result<
     Ok(())
 }
 
+/// V056 (#114): `external_symbols` — the per-moniker `SymbolInformation` (`kind`, `display_name`,
+/// `signature_documentation.text`, `documentation`, a derived `deprecated` flag) that `oracle run`
+/// parses out of `index.external_symbols` and previously DISCARDED. This is the dependency-side
+/// contract that `check_library_usage` joins to external call sites to surface signature/docs as
+/// inline context and to assert deprecated-but-compiling usage.
+///
+/// JOIN CONTRACT (load-bearing): `moniker` is the RAW SCIP symbol string, stored byte-for-byte as
+/// it appears in `SymbolInformation.symbol` — the SAME form `edge_oracle.scip_symbol` stores (an
+/// occurrence's `symbol`, unstabilized; see `oracle::join::classify_edge`). The read join is an
+/// exact string match on `moniker = edge_oracle.scip_symbol`; applying `stabilize_moniker_version`
+/// to one side and not the other would silently break it. External monikers carry the dependency's
+/// real version, so a cross-version re-index naturally produces distinct rows (the drift the spike
+/// targets).
+///
+/// INVARIANT (oracle-persisted, #248): NO foreign key — the table is content/moniker-keyed and its
+/// reads JOIN live `edge_oracle`, so a dangling row never resolves rather than being CASCADE-wiped
+/// on reindex. Listed in [`super::ORACLE_PERSISTED_TABLES`]. Born post-A5, so `repo_id` is a birth
+/// column and leads the PK.
+///
+/// CHECKOUT-SCOPED like its run sibling `oracle_runs` (NOT like `logical_symbol_monikers`): the
+/// contract set is the product of ONE oracle run in ONE checkout, so the PK carries `(commit_sha,
+/// worktree_id)`. Two linked worktrees of the same repo — at different dependency versions — keep
+/// DISJOINT contract sets, so the later run's authoritative per-`(tool, checkout)` clear cannot
+/// erase a sibling checkout's contracts (the same multi-worktree isolation `edge_oracle` /
+/// `oracle_runs` already enforce). `tool_version` rides along as write provenance; the moniker's
+/// version component still distinguishes dependency versions within a checkout.
+pub(crate) fn apply_external_symbols(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS external_symbols(
+            repo_id            TEXT NOT NULL,
+            tool               TEXT NOT NULL,
+            tool_version       TEXT NOT NULL,
+            commit_sha         TEXT NOT NULL,
+            worktree_id        TEXT NOT NULL,
+            moniker            TEXT NOT NULL,
+            kind               TEXT NOT NULL,
+            display_name       TEXT NOT NULL,
+            signature_text     TEXT NOT NULL,
+            signature_language TEXT NOT NULL,
+            documentation      TEXT NOT NULL,
+            deprecated         INTEGER NOT NULL,
+            computed_at_ms     INTEGER NOT NULL,
+            PRIMARY KEY(repo_id, tool, commit_sha, worktree_id, moniker)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_external_symbols_deprecated
+            ON external_symbols(repo_id, tool, commit_sha, worktree_id, deprecated);
+        ",
+    )
+}
+
 /// The integer indexes on `edges_data` (#79) — the successors of the old TEXT indexes on `edges`.
 /// Called from baseline (fresh DBs) AND after the V020 conversion (upgrading DBs, where the
 /// same-named legacy indexes blocked `IF NOT EXISTS` until `DROP TABLE edges` removed them).
@@ -1191,6 +1243,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_054_ID => Some(54),
             MIGRATION_055_ID => Some(55),
             MIGRATION_056_ID => Some(56),
+            MIGRATION_057_ID => Some(57),
             _ => None,
         })
         .max()
@@ -1256,6 +1309,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_054_ID
             | MIGRATION_055_ID
             | MIGRATION_056_ID
+            | MIGRATION_057_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1318,6 +1372,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_054_ID => migration.checksum != MIGRATION_054_CHECKSUM,
         MIGRATION_055_ID => migration.checksum != MIGRATION_055_CHECKSUM,
         MIGRATION_056_ID => migration.checksum != MIGRATION_056_CHECKSUM,
+        MIGRATION_057_ID => migration.checksum != MIGRATION_057_CHECKSUM,
         _ => false,
     }
 }

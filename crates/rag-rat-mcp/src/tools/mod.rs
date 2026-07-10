@@ -10,6 +10,7 @@ pub use catalog::*;
 pub(crate) use defaults::*;
 pub(crate) use handlers::*;
 use rag_rat_core::config::MemorySurface;
+use rag_rat_core::index::oracle::LibraryUsageOptions;
 use rag_rat_core::language::Language;
 use rag_rat_core::query::clusters::RepoClustersOptions;
 use rag_rat_core::query::graph::{GraphResolutionMode, GraphTraversalOptions};

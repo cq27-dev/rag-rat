@@ -179,6 +179,10 @@ impl IndexDatabase {
         // `multiple_real_repos` guard, so the prune runs unconditionally again (exactly as it did
         // on a single-repo DB before scoping).
         oracle::prune_oracle_runs_outside_scope(conn, live_commits, live_worktrees)?;
+        // #114: `external_symbols` is checkout-keyed like `oracle_runs` (nothing cascades it), so a
+        // dead checkout's dependency contracts need the SAME per-repo, dead-scope prune — otherwise
+        // signature/doc payloads for retired branches/worktrees accumulate without bound.
+        oracle::prune_external_symbols_outside_scope(conn, live_commits, live_worktrees)?;
         // #357: `embedding_cache` is content-keyed too (survives reindex, like the oracle above),
         // so it needs the SAME global sweep — drop vectors no live chunk references in ANY
         // context (a sibling worktree / branch may still use one, so this must not be

@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 56;
+pub const LATEST_SCHEMA_VERSION: u32 = 57;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -45,7 +45,7 @@ pub const LATEST_SCHEMA_VERSION: u32 = 56;
 // it is intentionally a durable schema-invariant declaration.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ORACLE_PERSISTED_TABLES: &[&str] =
-    &["edge_oracle", "logical_symbol_monikers", "oracle_runs"];
+    &["edge_oracle", "logical_symbol_monikers", "oracle_runs", "external_symbols"];
 
 /// The parent tables a reindex REWRITES (full rebuild and/or per-file `remove_file_in_scope`), so
 /// an `ON DELETE CASCADE`/`RESTRICT` FK from an oracle-derived table to one of these wipes the
@@ -392,6 +392,16 @@ const MIGRATION_056_DESCRIPTION: &str =
      (repo_id-scoped, no FK to the volatile history rows): wholesale-recomputed lazily on the \
      impact_surface read path against a repo_meta 'git_coupling_stamp', never patched \
      incrementally. Fresh + empty on create; the first git-inclusive impact read fills it";
+const MIGRATION_057_ID: &str = "057_external_symbols";
+const MIGRATION_057_CHECKSUM: &str = "sha256:rag-rat-external-symbols-v57";
+const MIGRATION_057_DESCRIPTION: &str =
+    "Add external_symbols (#114), the per-moniker dependency contract oracle run parses out of \
+     the .scip index.external_symbols (kind, display_name, signature_documentation text, \
+     documentation, a derived deprecated flag) — data from_index previously discarded. \
+     Oracle-persisted, content/moniker-keyed with NO reindex-cascading FK, checkout-scoped \
+     (repo_id, tool, commit_sha, worktree_id) from birth; moniker is the RAW SCIP symbol string \
+     so it exact-joins edge_oracle.scip_symbol. Backs the check_library_usage tool that surfaces \
+     the current signature/docs at external call sites and flags deprecated usage";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -869,6 +879,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_056_CHECKSUM,
         description: MIGRATION_056_DESCRIPTION,
         apply: apply_git_change_couplings,
+    },
+    Migration {
+        id: MIGRATION_057_ID,
+        checksum: MIGRATION_057_CHECKSUM,
+        description: MIGRATION_057_DESCRIPTION,
+        apply: apply_external_symbols,
     },
 ];
 
