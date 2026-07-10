@@ -188,6 +188,9 @@ pub struct PapertrailItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PapertrailComment {
     pub project: String,
+    /// Kind of the parent item — part of the parent identity, because namespaced providers
+    /// (GitLab) can have an issue and a change request sharing the same key.
+    pub item_kind: ItemKind,
     pub item_key: String,
     /// Provider comment id, stringly — provider id spaces are not uniformly numeric.
     pub comment_id: String,
@@ -232,12 +235,21 @@ pub struct CommentsPage {
 /// deliberate, not an oversight.
 #[allow(async_fn_in_trait)]
 pub trait PapertrailClient {
-    /// One item with its kind resolved.
-    async fn item(&self, project: &str, key: &str) -> anyhow::Result<PapertrailItem>;
+    /// One item. `kind` is part of the identity: namespaced providers (GitLab) MUST treat it as
+    /// binding — an issue and a change request can share a key — while a shared-numbering
+    /// provider (GitHub) treats it as advisory and returns the item with its kind resolved.
+    async fn item(
+        &self,
+        project: &str,
+        kind: ItemKind,
+        key: &str,
+    ) -> anyhow::Result<PapertrailItem>;
     /// Every comment on one item, unified (thread comments, review events, file-anchored).
+    /// `kind` identifies the parent exactly as in [`Self::item`] — pass the RESOLVED kind.
     async fn item_comments(
         &self,
         project: &str,
+        kind: ItemKind,
         key: &str,
     ) -> anyhow::Result<Vec<PapertrailComment>>;
     /// A page of items updated since the cursor, newest first (mirror backfill/delta).
@@ -258,18 +270,22 @@ pub trait PapertrailClient {
 }
 
 /// Drive a papertrail future to completion from the synchronous call paths (CLI, maintenance).
-/// Uses a private lazily-built current-thread runtime; MUST NOT be called from within an async
-/// context (the MCP server never reaches sync paths that hold a client).
+/// Uses a private lazily-built current-thread runtime. Callable from inside a multi-thread tokio
+/// runtime too (the worker is demoted via `block_in_place`, matching how the pre-async code
+/// simply blocked); a caller on a CURRENT-THREAD runtime has no sound way to block and panics in
+/// `block_in_place` — expose an async entry point instead of bridging there.
 pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("papertrail runtime")
-        })
-        .block_on(future)
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("papertrail runtime")
+    });
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| runtime.block_on(future)),
+        Err(_) => runtime.block_on(future),
+    }
 }
 
 /// The GitHub provider, currently backed by the `gh` CLI (`gh api`); replaced by a native HTTP
@@ -278,13 +294,21 @@ pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
 pub struct GitHubClient;
 
 impl PapertrailClient for GitHubClient {
-    async fn item(&self, project: &str, key: &str) -> anyhow::Result<PapertrailItem> {
+    async fn item(
+        &self,
+        project: &str,
+        _kind: ItemKind,
+        key: &str,
+    ) -> anyhow::Result<PapertrailItem> {
+        // GitHub numbers issues and PRs in one namespace, so the requested kind is advisory:
+        // the issues endpoint resolves either, and the returned item carries the real kind.
         let value = gh_api_json(&format!("repos/{project}/issues/{key}"))?;
         let mut item = item_from_issue_value(project, &value);
-        if item.item_kind == ItemKind::ChangeRequest
-            && let Ok(pull) = gh_api_json(&format!("repos/{project}/pulls/{key}"))
-        {
-            enrich_item_from_pull_value(&mut item, &pull);
+        if item.item_kind == ItemKind::ChangeRequest {
+            enrich_item_from_pull_value(
+                &mut item,
+                &gh_api_json(&format!("repos/{project}/pulls/{key}"))?,
+            );
         }
         Ok(item)
     }
@@ -292,22 +316,22 @@ impl PapertrailClient for GitHubClient {
     async fn item_comments(
         &self,
         project: &str,
+        kind: ItemKind,
         key: &str,
     ) -> anyhow::Result<Vec<PapertrailComment>> {
         let mut comments = Vec::new();
         for value in gh_api_paginated(&format!("repos/{project}/issues/{key}/comments"))? {
-            comments.push(comment_from_value(project, key, &value));
+            comments.push(comment_from_value(project, kind, key, &value));
         }
-        // The pulls endpoints 404 for plain issues — an error here means "not a change
-        // request", not a failure (mirrors the old optional `pull()` probe).
-        if let Ok(values) = gh_api_paginated(&format!("repos/{project}/pulls/{key}/reviews")) {
-            for value in &values {
-                comments.push(review_to_comment_from_value(project, key, value));
+        // Review endpoints exist only for change requests; the caller passes the RESOLVED kind,
+        // so any failure here (rate limit, auth, network) is a real failure and must propagate —
+        // swallowing it would cache an incomplete comment list and mark the ref synced forever.
+        if kind == ItemKind::ChangeRequest {
+            for value in gh_api_paginated(&format!("repos/{project}/pulls/{key}/reviews"))? {
+                comments.push(review_to_comment_from_value(project, kind, key, &value));
             }
-        }
-        if let Ok(values) = gh_api_paginated(&format!("repos/{project}/pulls/{key}/comments")) {
-            for value in &values {
-                comments.push(review_comment_to_comment_from_value(project, key, value));
+            for value in gh_api_paginated(&format!("repos/{project}/pulls/{key}/comments"))? {
+                comments.push(review_comment_to_comment_from_value(project, kind, key, &value));
             }
         }
         Ok(comments)

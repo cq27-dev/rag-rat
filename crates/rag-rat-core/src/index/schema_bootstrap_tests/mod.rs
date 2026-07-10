@@ -579,6 +579,7 @@ impl MockGitHubClient {
     fn mock_comments(project: &str, key: &str) -> Vec<papertrail::PapertrailComment> {
         let comment = |id: &str, body: &str| papertrail::PapertrailComment {
             project: project.to_string(),
+            item_kind: papertrail::ItemKind::ChangeRequest,
             item_key: key.to_string(),
             comment_id: id.to_string(),
             url: Some(format!("https://github.com/{project}/issues/{key}#comment-{id}")),
@@ -608,13 +609,19 @@ impl MockGitHubClient {
 }
 
 impl papertrail::PapertrailClient for MockGitHubClient {
-    async fn item(&self, project: &str, key: &str) -> anyhow::Result<papertrail::PapertrailItem> {
+    async fn item(
+        &self,
+        project: &str,
+        _kind: papertrail::ItemKind,
+        key: &str,
+    ) -> anyhow::Result<papertrail::PapertrailItem> {
         Ok(Self::mock_item(project, key))
     }
 
     async fn item_comments(
         &self,
         project: &str,
+        _kind: papertrail::ItemKind,
         key: &str,
     ) -> anyhow::Result<Vec<papertrail::PapertrailComment>> {
         Ok(Self::mock_comments(project, key))
@@ -651,19 +658,25 @@ impl papertrail::PapertrailClient for MockGitHubClient {
 struct PartiallyFailingGitHubClient;
 
 impl papertrail::PapertrailClient for PartiallyFailingGitHubClient {
-    async fn item(&self, project: &str, key: &str) -> anyhow::Result<papertrail::PapertrailItem> {
+    async fn item(
+        &self,
+        project: &str,
+        kind: papertrail::ItemKind,
+        key: &str,
+    ) -> anyhow::Result<papertrail::PapertrailItem> {
         if key == "404" {
             anyhow::bail!("gh: Not Found (HTTP 404)");
         }
-        MockGitHubClient.item(project, key).await
+        MockGitHubClient.item(project, kind, key).await
     }
 
     async fn item_comments(
         &self,
         project: &str,
+        kind: papertrail::ItemKind,
         key: &str,
     ) -> anyhow::Result<Vec<papertrail::PapertrailComment>> {
-        MockGitHubClient.item_comments(project, key).await
+        MockGitHubClient.item_comments(project, kind, key).await
     }
 
     async fn items_page(

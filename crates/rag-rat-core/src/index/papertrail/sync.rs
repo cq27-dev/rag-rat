@@ -121,9 +121,11 @@ pub(crate) async fn sync_one_ref<C: PapertrailClient>(
 ) -> anyhow::Result<usize> {
     let project = format!("{}/{}", reference.owner, reference.repo);
     let key = reference.number.to_string();
-    let item = client.item(&project, &key).await?;
+    // Discovered refs don't carry a kind (a bare `#N` could be either); ask as an issue and let
+    // the provider resolve, then fetch comments under the RESOLVED kind.
+    let item = client.item(&project, ItemKind::Issue, &key).await?;
     let mut synced = store_item(conn, &item)?;
-    for comment in client.item_comments(&project, &key).await? {
+    for comment in client.item_comments(&project, item.item_kind, &key).await? {
         store_comment(conn, &comment)?;
         synced += 1;
     }

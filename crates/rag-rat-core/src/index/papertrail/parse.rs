@@ -116,9 +116,15 @@ pub(crate) fn enrich_item_from_pull_value(item: &mut PapertrailItem, value: &Val
         item.merged_at = Some(merged_at.to_string());
     }
 }
-pub(crate) fn comment_from_value(project: &str, key: &str, value: &Value) -> PapertrailComment {
+pub(crate) fn comment_from_value(
+    project: &str,
+    kind: ItemKind,
+    key: &str,
+    value: &Value,
+) -> PapertrailComment {
     PapertrailComment {
         project: project.to_string(),
+        item_kind: kind,
         item_key: key.to_string(),
         comment_id: value["id"].as_i64().unwrap_or_default().to_string(),
         url: value["html_url"].as_str().map(str::to_string),
@@ -132,6 +138,7 @@ pub(crate) fn comment_from_value(project: &str, key: &str, value: &Value) -> Pap
 }
 pub(crate) fn review_to_comment_from_value(
     project: &str,
+    kind: ItemKind,
     key: &str,
     value: &Value,
 ) -> PapertrailComment {
@@ -139,29 +146,37 @@ pub(crate) fn review_to_comment_from_value(
         created_at: value["submitted_at"].as_str().map(str::to_string),
         updated_at: value["submitted_at"].as_str().map(str::to_string),
         review_state: Some(string_value(value, "state")),
-        ..comment_from_value(project, key, value)
+        ..comment_from_value(project, kind, key, value)
     }
 }
 pub(crate) fn review_comment_to_comment_from_value(
     project: &str,
+    kind: ItemKind,
     key: &str,
     value: &Value,
 ) -> PapertrailComment {
     PapertrailComment {
         anchor_path: value["path"].as_str().map(str::to_string),
-        ..comment_from_value(project, key, value)
+        ..comment_from_value(project, kind, key, value)
     }
 }
 /// Map one entry of a repo-wide comment stream, deriving the parent item key from the payload's
-/// `issue_url` / `pull_request_url` tail. `None` when the payload names no parent.
+/// `issue_url` / `pull_request_url` tail. `None` when the payload names no parent. The unanchored
+/// stream (`issues/comments`) covers BOTH kinds under GitHub's shared numbering and its payload
+/// does not say which — that kind is provisional (`Issue`); the mirror sync resolves the real one
+/// against the mirrored items.
 pub(crate) fn repo_comment_from_value(
     project: &str,
     value: &Value,
     anchored: bool,
 ) -> Option<PapertrailComment> {
-    let parent_key = if anchored { "pull_request_url" } else { "issue_url" };
-    let key = value[parent_key].as_str()?.rsplit('/').next()?.to_string();
-    let mut comment = comment_from_value(project, &key, value);
+    let (parent_field, kind) = if anchored {
+        ("pull_request_url", ItemKind::ChangeRequest)
+    } else {
+        ("issue_url", ItemKind::Issue)
+    };
+    let key = value[parent_field].as_str()?.rsplit('/').next()?.to_string();
+    let mut comment = comment_from_value(project, kind, &key, value);
     if anchored {
         comment.anchor_path = value["path"].as_str().map(str::to_string);
     }

@@ -615,6 +615,7 @@ fn both_repos_keep_a_shared_prs_comments_across_syncs() {
             &conn,
             &crate::index::papertrail::PapertrailComment {
                 project: "o/r".into(),
+                item_kind: crate::index::papertrail::ItemKind::Issue,
                 item_key: "1".into(),
                 comment_id: "7".into(),
                 url: Some("http://c".into()),

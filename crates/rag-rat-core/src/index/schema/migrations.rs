@@ -2569,8 +2569,8 @@ fn rebuild_github_issues_with_repo_scoped_key(conn: &Connection) -> rusqlite::Re
 }
 
 /// Rebuild `github_pull_requests` dropping the inline `UNIQUE(owner, repo, number)` and adding a
-/// NAMED unique index `(repo_id, owner, repo, number)` (the `store_item` change-request `ON CONFLICT` target). See
-/// [`rebuild_github_issues_with_repo_scoped_key`] for the shared rationale.
+/// NAMED unique index `(repo_id, owner, repo, number)` (the `store_item` change-request `ON
+/// CONFLICT` target). See [`rebuild_github_issues_with_repo_scoped_key`] for the shared rationale.
 fn rebuild_github_pull_requests_with_repo_scoped_key(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "

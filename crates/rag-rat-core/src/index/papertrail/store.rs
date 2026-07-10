@@ -326,6 +326,7 @@ mod fts_rebuild_tests {
     fn comment(key: &str, id: &str, body: &str) -> PapertrailComment {
         PapertrailComment {
             project: "o/r".into(),
+            item_kind: ItemKind::Issue,
             item_key: key.into(),
             comment_id: id.into(),
             url: Some(format!("http://comment/{id}")),
