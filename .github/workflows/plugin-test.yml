@@ -1,0 +1,135 @@
+name: plugin-test
+
+# Exercises the plugin install/run surfaces that unit tests can't:
+#   * launcher × Linux glibc/musl matrix (does the binary run + does the launcher wire MCP stdio?)
+#   * Claude Code non-interactive plugin install + manifest validation
+#   * Codex marketplace-add manifest validation
+# Path-gated so it only runs when the plugin changes. The Claude/Codex jobs are continue-on-error
+# while their non-interactive / auth behaviour is being confirmed (that's what this harness is for).
+
+on:
+  pull_request:
+    paths:
+      - "plugin/**"
+      - ".github/workflows/plugin-test.yml"
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Published release version (e.g. 0.15.1) to test the REAL download path across the distro matrix. Empty = build a binary and test launcher logic + the CLI probes."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Build a rag-rat once so the launcher matrix can drive a real MCP handshake ──────────────────
+  build-binary:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
+    runs-on: ubuntu-latest # glibc 2.39 — this IS the binary's runtime floor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build rag-rat (debug answers mcp + agent-hook fine)
+        run: cargo build -p rag-rat --bin rag-rat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rag-rat-linux-gnu
+          path: target/debug/rag-rat
+
+  # ── Launcher × glibc/musl matrix. `pass` distros (glibc >= 2.38) must handshake; `fail` distros ──
+  # ── (older glibc / musl) are informational — they document exactly where the binary's floor bites.─
+  launcher:
+    needs: build-binary
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "ubuntu:24.04", expect: pass } # glibc 2.39
+          - { image: "fedora:41", expect: pass } # glibc ~2.40
+          - { image: "node:22-bookworm-slim", expect: fail } # glibc 2.36 (< 2.38 floor)
+          - { image: "node:22-bullseye-slim", expect: fail } # glibc 2.31
+          - { image: "node:22-alpine", expect: fail } # musl
+    continue-on-error: ${{ matrix.expect == 'fail' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rag-rat-linux-gnu
+          path: bin
+      - name: "verify launcher in ${{ matrix.image }} (expect ${{ matrix.expect }})"
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "${{ matrix.image }}" sh -c '
+            set -e
+            if ! command -v node >/dev/null 2>&1; then
+              if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq nodejs >/dev/null;
+              elif command -v dnf >/dev/null 2>&1; then dnf install -y -q nodejs >/dev/null;
+              elif command -v apk >/dev/null 2>&1; then apk add --no-cache nodejs >/dev/null; fi
+            fi
+            chmod +x bin/rag-rat || true
+            RAG_RAT_BIN=/w/bin/rag-rat sh plugin/test/verify-launcher.sh
+          '
+
+  # ── Claude Code: non-interactive plugin install + manifest validation (no API key needed) ───────
+  claude-install:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
+    runs-on: ubuntu-latest
+    continue-on-error: true # exploratory until non-interactive install / trust-prompt behaviour is confirmed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: bash plugin/test/verify-claude-install.sh
+
+  # ── Codex: marketplace-add manifest validation (catches mis-placed .mcp.json / hooks paths) ─────
+  codex-validate:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
+    runs-on: ubuntu-latest
+    continue-on-error: true # exploratory; also confirms the correct Codex plugin layout empirically
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install the Codex CLI
+        run: npm install -g @openai/codex || echo "::warning::adjust the Codex npm package name"
+      - run: bash plugin/test/verify-codex-marketplace.sh
+
+  # ── Download path (dispatch with a published release version): fetch real assets per distro ──────
+  download-path:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - "ubuntu:24.04"
+          - "fedora:41"
+          - "node:22-bookworm-slim"
+          - "node:22-bullseye-slim"
+          - "node:22-alpine"
+    steps:
+      - uses: actions/checkout@v4
+      - name: "download-path handshake in ${{ matrix.image }} (v${{ github.event.inputs.release_version }})"
+        env:
+          VER: ${{ github.event.inputs.release_version }}
+        run: |
+          docker run --rm -e VER="$VER" -v "$PWD:/w" -w /w "${{ matrix.image }}" sh -c '
+            set -e
+            if ! command -v node >/dev/null 2>&1; then
+              if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq nodejs curl tar xz-utils >/dev/null;
+              elif command -v dnf >/dev/null 2>&1; then dnf install -y -q nodejs tar xz >/dev/null;
+              elif command -v apk >/dev/null 2>&1; then apk add --no-cache nodejs curl tar xz >/dev/null; fi
+            fi
+            # Point the launcher at the release version and let it DOWNLOAD (no RAG_RAT_BIN).
+            mkdir -p /tmp/vr && printf "{\"version\":\"%s\"}\n" "$VER" > /tmp/vr/plugin.json
+            PLUGIN_ROOT=/tmp/vr RAG_RAT_REQUIRE_HANDSHAKE=1 sh plugin/test/verify-launcher.sh
+          '

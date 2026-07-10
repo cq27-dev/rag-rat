@@ -100,6 +100,10 @@ printf '%s\n' '{"hook_event_name":"SessionStart","source":"startup"}' \
 Verified: launcher syntax; `$RAG_RAT_BIN` override; `PATH` version-match; `--no-install` cold-cache
 no-op; exit-code propagation; MCP `initialize` handshake (clean stdout/stderr); SessionStart digest.
 
+A CI harness (`plugin/test/` + `.github/workflows/plugin-test.yml`) runs the launcher across a Linux
+glibc/musl Docker matrix and drives non-interactive Claude/Codex plugin install + manifest
+validation — see [`plugin/test/README.md`](test/README.md).
+
 ## Status / open items
 
 - **Download path (#5) untested** until a green cargo-dist release publishes prebuilt assets
