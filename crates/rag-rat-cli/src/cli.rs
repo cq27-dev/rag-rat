@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(
     name = "rag-rat",
-    version,
+    version = env!("RAG_RAT_VERSION"),
     about = "Local repo-intelligence index, graph, history, and memory — CLI + MCP server.",
     propagate_version = true
 )]

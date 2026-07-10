@@ -3,6 +3,10 @@ mod commands;
 mod fs_atomic;
 mod hooks_support;
 mod render;
+// The version-string formatter is shared with `build.rs` via `include!`; the crate only needs it
+// under test (the runtime reads the baked `RAG_RAT_VERSION`), so compiling it here is test-only.
+#[cfg(test)]
+mod version_describe;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -54,6 +58,9 @@ fn configure_jemalloc() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Record this binary's git-stamped version (#585) so migration provenance and the stranded-
+    // binary refusal name a dev build (`0.16.0+g<hash>`) distinctly from a release (`0.16.0`).
+    rag_rat_core::set_binary_version(env!("RAG_RAT_VERSION"));
     #[cfg(not(target_env = "msvc"))]
     configure_jemalloc();
     let cli = Cli::parse();
