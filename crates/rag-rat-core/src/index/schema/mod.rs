@@ -11,11 +11,11 @@ pub(crate) use registry::multiple_real_repos;
 pub(crate) use registry::{
     CONNECTION_CONTEXT_GENERATION_KEY, CONNECTION_CONTEXT_REPO_KEY, LIVE_FILES_GENERATION_META_KEY,
     active_generation, active_repo_id, connection_context_value, earliest_recorded_root,
-    live_files_generation, periphery_repo_scope, periphery_repo_scope_clause,
+    live_files_generation, periphery_repo_scope, periphery_repo_scope_clause, registered_repos,
     repo_has_recorded_root, repo_id_is_registered, resolve_config_repo_id, scope_context_repo_id,
     sole_repo_id,
 };
-pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
+pub use registry::{LEGACY_REPO_ID, RegisteredRepo, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 

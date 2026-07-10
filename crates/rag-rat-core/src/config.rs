@@ -1223,7 +1223,9 @@ fn anchor_root_to_main_worktree(root: &Path) -> PathBuf {
 ///    the seam (governance is identical either way).
 ///  * no local file, linked worktree → the MAIN worktree's `rag-rat.toml` (whether or not it exists
 ///    yet — a missing-config hint should name the path where the config BELONGS).
-///  * no local file, main/non-git → the local path (the hint names it).
+///  * no local file, main/non-git → the nearest `rag-rat.toml` in an ANCESTOR directory, so a
+///    launch from a SUBDIRECTORY of a rag-rat repo still finds the repo's config; failing that, the
+///    local path (the hint names it).
 ///
 /// An EXPLICIT `--config` path never routes through this — a user override is taken literally.
 pub fn discover_config_path(dir: &Path) -> PathBuf {
@@ -1232,9 +1234,38 @@ pub fn discover_config_path(dir: &Path) -> PathBuf {
         return local;
     }
     match linked_worktree_main_root(dir) {
+        // Linked worktree: the MAIN checkout's config governs UNCONDITIONALLY — return its path
+        // even when the file is missing. This is the governing seam; the ancestor walk
+        // below must never preempt it (a subdir of the MAIN worktree is deliberately NOT
+        // classified as linked, so it falls into the `None` arm and the walk finds main's
+        // config there).
         Some(main_top) => main_top.join("rag-rat.toml"),
-        None => local,
+        None => nearest_config_at_or_above(dir).unwrap_or(local),
     }
+}
+
+/// Walk upward from `dir` to the nearest directory (at or above `dir`) holding a `rag-rat.toml`,
+/// returning that file's path. `None` ⇒ no rag-rat repo at or above `dir`. The single upward-walk
+/// primitive: `discover_config_path`'s non-worktree arm uses it so a subdirectory launch inside a
+/// repo finds the repo's config, and the Claude-hook cwd→config resolver
+/// (`claude_hook::find_config`) loads the returned path. Unbounded (to the filesystem root),
+/// matching a repo that has no other marker than its `rag-rat.toml`.
+pub fn nearest_config_at_or_above(dir: &Path) -> Option<PathBuf> {
+    // Resolve to an ABSOLUTE path first. A relative `dir` such as `.` has `parent() == Some("")`
+    // then `None`, so the ancestor walk would only ever inspect `.` and never climb the real
+    // filesystem tree (the callers pass `Path::new(".")` for cwd). `canonicalize` also collapses
+    // `..`/symlinks so the climb follows the true directory chain. If it fails (a non-existent
+    // `dir`), fall back to walking `dir` as given rather than aborting discovery.
+    let absolute = dir.canonicalize().ok();
+    let mut current = absolute.as_deref().or(Some(dir));
+    while let Some(cur) = current {
+        let candidate = cur.join("rag-rat.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        current = cur.parent();
+    }
+    None
 }
 
 /// The MAIN worktree top for `root` when `root` sits in a LINKED git worktree — `None` when the
@@ -2329,6 +2360,41 @@ mod tests {
         let plain = tmp.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         assert_eq!(discover_config_path(&plain), plain.join("rag-rat.toml"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The ANCESTOR-WALK arm (non-worktree): a launch from a SUBDIRECTORY of a rag-rat repo
+    /// resolves to the repo root's `rag-rat.toml` instead of dying at the local existence
+    /// check, while a genuinely config-less tree still yields the local (non-existent) path for
+    /// the hint. Also guards the relative-path footgun the walk fixed:
+    /// `nearest_config_at_or_above` must resolve a `.`-style dir to ABSOLUTE before climbing —
+    /// a relative `parent()` is `Some("")` then `None`, so the walk would never leave the
+    /// starting dir.
+    #[test]
+    fn discover_config_path_walks_up_to_a_parent_repo_config() {
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-walkup-{}-{id}", std::process::id()));
+        let repo = tmp.join("repo");
+        let nested = repo.join("crates").join("cli").join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(repo.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+
+        // The walk returns a canonical absolute path (a found file), so compare canonically — temp
+        // roots can be symlinked (macOS `/tmp` → `/private/tmp`).
+        let want = repo.join("rag-rat.toml").canonicalize().unwrap();
+        assert_eq!(
+            discover_config_path(&nested).canonicalize().unwrap(),
+            want,
+            "subdir → repo cfg"
+        );
+        assert_eq!(discover_config_path(&repo).canonicalize().unwrap(), want, "repo root → local");
+
+        // A config-less tree with NO ancestor config: the local (non-existent) path, unchanged —
+        // the not-found fallback returns the original `dir/rag-rat.toml` for the hint, uncanonical.
+        let bare = tmp.join("bare").join("deep");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(discover_config_path(&bare), bare.join("rag-rat.toml"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

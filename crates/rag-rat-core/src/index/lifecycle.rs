@@ -34,6 +34,18 @@ pub(super) enum AdoptIntent {
     ReadOnly,
 }
 
+/// A DB-level, repo-agnostic snapshot of a store, produced by
+/// [`IndexDatabase::global_store_overview`] for the config-less `doctor` path. `schema` is `None`
+/// only when the store file does not exist. Serialized straight into the doctor report.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GlobalStoreOverview {
+    pub database: PathBuf,
+    pub exists: bool,
+    pub size_bytes: Option<u64>,
+    pub schema: Option<schema::SchemaStatus>,
+    pub repos: Vec<schema::RegisteredRepo>,
+}
+
 impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_bare(path, BareOpenMode::ConfigLess)
@@ -426,6 +438,40 @@ impl IndexDatabase {
         schema::status(storage.connection())
     }
 
+    /// A DB-LEVEL, repo-agnostic overview of the store at `path` — for `doctor` invoked OUTSIDE any
+    /// rag-rat repo, where the repo-scoped opens (`open`, `open_config`) deliberately refuse to
+    /// guess a repo in a consolidated multi-repo store. Reports on-disk presence/size, the schema
+    /// status, and the registry of real repos the store holds (each with its recorded roots).
+    /// Side-effect-free when the file is ABSENT (returns `exists: false` without opening/creating
+    /// it); the registry is read only when the schema is `Compatible` (a Missing/Newer/Dirty schema
+    /// has no queryable `repos` table). The registry read is READ-ONLY.
+    pub fn global_store_overview(path: &Path) -> anyhow::Result<GlobalStoreOverview> {
+        if !path.is_file() {
+            return Ok(GlobalStoreOverview {
+                database: path.to_path_buf(),
+                exists: false,
+                size_bytes: None,
+                schema: None,
+                repos: Vec::new(),
+            });
+        }
+        let size_bytes = std::fs::metadata(path).ok().map(|meta| meta.len());
+        let schema = Self::migration_check(path)?;
+        let repos = if schema.state == schema::SchemaState::Compatible {
+            let storage = IndexConnection::open_read_only_blocking(path)?;
+            schema::registered_repos(storage.connection())?
+        } else {
+            Vec::new()
+        };
+        Ok(GlobalStoreOverview {
+            database: path.to_path_buf(),
+            exists: true,
+            size_bytes,
+            schema: Some(schema),
+            repos,
+        })
+    }
+
     /// Create-or-migrate the schema for a full [`rebuild`](Self::rebuild). Leaves the repo scope
     /// UNSET (`active_repo_id` empty): `rebuild` registers/adopts the repo and installs the scope
     /// context itself (so the model-manifest heal and every direct-scoped write see the right repo,
@@ -756,4 +802,71 @@ fn write_repo_generation_view(
         ",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod global_store_overview_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::index::IndexDatabase;
+    use crate::index::schema::{self, register_repo};
+    use crate::repo_identity::{RepoIdentity, RepoIdentityClass};
+    use crate::storage::IndexConnection;
+
+    static N: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db() -> PathBuf {
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("ragrat-gso-{}-{id}", std::process::id()))
+            .join("rag-rat.sqlite")
+    }
+
+    /// An ABSENT store is reported as `exists: false` WITHOUT opening or creating the file —
+    /// `doctor` invoked on a machine that has never indexed anything must not conjure an empty
+    /// global store.
+    #[test]
+    fn overview_reports_an_absent_store_without_creating_it() {
+        let path = temp_db();
+        let overview = IndexDatabase::global_store_overview(&path).unwrap();
+        assert!(!overview.exists);
+        assert!(overview.schema.is_none());
+        assert!(overview.repos.is_empty());
+        assert!(!path.exists(), "reporting an absent store must not create it");
+    }
+
+    /// A store with a registered repo lists it (with its recorded root) and EXCLUDES the
+    /// `__unassigned__` adoption placeholder — the DB-level report the config-less `doctor` shows.
+    #[test]
+    fn overview_lists_registered_repos_excluding_the_placeholder() {
+        let path = temp_db();
+        {
+            let conn = IndexConnection::open(&path).unwrap();
+            schema::apply(conn.connection()).unwrap();
+            register_repo(
+                conn.connection(),
+                &RepoIdentity {
+                    repo_id: "repo-xyz".to_string(),
+                    display_name: "demo".to_string(),
+                    class: RepoIdentityClass::Portable,
+                    shallow_boundary: Vec::new(),
+                },
+                Path::new("/src/demo"),
+                42,
+            )
+            .unwrap();
+        }
+
+        let overview = IndexDatabase::global_store_overview(&path).unwrap();
+        assert!(overview.exists);
+        assert_eq!(overview.schema.unwrap().state, schema::SchemaState::Compatible);
+        assert_eq!(overview.repos.len(), 1, "the '__unassigned__' placeholder is excluded");
+        let repo = &overview.repos[0];
+        assert_eq!(repo.repo_id, "repo-xyz");
+        assert_eq!(repo.display_name, "demo");
+        assert_eq!(repo.roots, vec!["/src/demo".to_string()]);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

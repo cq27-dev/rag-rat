@@ -1038,6 +1038,45 @@ pub(crate) fn multiple_real_repos(conn: &Connection) -> rusqlite::Result<bool> {
     Ok(count > 1)
 }
 
+/// One REAL (non-placeholder) repo in this database's registry, with its recorded source roots —
+/// the read-only shape `doctor`'s machine-global-store report lists. `roots` can be empty (identity
+/// registered but no root recorded yet).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegisteredRepo {
+    pub repo_id: String,
+    pub display_name: String,
+    pub roots: Vec<String>,
+    pub registered_at_ms: i64,
+}
+
+/// List every REAL (non-placeholder) repo in the registry with its recorded roots, ordered by
+/// display name then id — read-only, for `doctor`'s global-store overview. Excludes the
+/// [`LEGACY_REPO_ID`] adoption placeholder.
+pub(crate) fn registered_repos(conn: &Connection) -> rusqlite::Result<Vec<RegisteredRepo>> {
+    let mut repos = conn
+        .prepare(
+            "SELECT repo_id, display_name, registered_at_ms FROM repos WHERE repo_id != ?1 ORDER \
+             BY display_name, repo_id",
+        )?
+        .query_map([LEGACY_REPO_ID], |row| {
+            Ok(RegisteredRepo {
+                repo_id: row.get(0)?,
+                display_name: row.get(1)?,
+                registered_at_ms: row.get(2)?,
+                roots: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut roots_stmt =
+        conn.prepare("SELECT root FROM repo_roots WHERE repo_id = ?1 ORDER BY root")?;
+    for repo in &mut repos {
+        repo.roots = roots_stmt
+            .query_map([&repo.repo_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+    }
+    Ok(repos)
+}
+
 /// Resolve the `repo_id` a config maps to on a connection WITHOUT registering anything — the
 /// READ-path counterpart to [`register_repo`]. Used by the read-only open
 /// (`try_open_config_read_only`) and the raw-connection scope-view installers (the Claude Code /

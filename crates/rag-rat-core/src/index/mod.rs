@@ -54,7 +54,7 @@ pub(crate) use git_context::*;
 // fallback. Gate the re-export so the non-test build doesn't warn it unused.
 #[cfg(test)]
 pub(crate) use lifecycle::install_scope_view;
-pub use lifecycle::{install_worktree_scope_view, resolve_scope_repo_id};
+pub use lifecycle::{GlobalStoreOverview, install_worktree_scope_view, resolve_scope_repo_id};
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub(crate) use meta::{delete_repo_meta, repo_meta, set_repo_meta};
 pub use parser_failures::ParserFailure;
@@ -67,6 +67,7 @@ pub use query_api::{
     OracleShaSnapshots, RoiFactors, SearchRequest, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES,
     WalCheckpointReport,
 };
+pub use schema::RegisteredRepo;
 pub(crate) use util::*;
 pub use worktree_overlay::WorktreeOverlayReport;
 

@@ -3,6 +3,7 @@
 //! re-encode), `maintenance` (the git-hook pass, coalesced), `doctor` (health snapshot), and the
 //! `run_watch` / `run_maintenance_pass` helpers they drive.
 use std::fs;
+use std::path::Path;
 use std::time::Instant;
 
 use rag_rat_core::{Config, IndexDatabase, OutputFormat};
@@ -237,6 +238,7 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
             (None, None, None, None, None)
         };
     print_output(&serde_json::json!({
+        "scope": "repo",
         "config_root": config.root,
         "database": config.database,
         "schema": schema,
@@ -251,6 +253,30 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
             "kind": target.kind.as_str(),
         })).collect::<Vec<_>>(),
         "index": index,
+        "mcp": {
+            "transport": "stdio",
+            "tools": rag_rat_mcp::tools::TOOL_NAMES,
+            "source_read_only": true,
+            "index_writes": "sqlite_auto_heal"
+        }
+    }))
+}
+
+/// `doctor` for the config-less case: report the machine-global store — its schema, on-disk size,
+/// and the registry of repos it holds — rather than a specific repo. Reached from `run_doctor` when
+/// no `rag-rat.toml` is found at or above the cwd. The repo-scoped opens can't run against a
+/// consolidated multi-repo store, so this is a deliberately distinct DB-level report.
+pub(crate) fn doctor_global_store(database: &Path) -> anyhow::Result<()> {
+    let overview = IndexDatabase::global_store_overview(database)?;
+    print_output(&serde_json::json!({
+        "scope": "global-store",
+        "note": "No rag-rat.toml found at or above the cwd — reporting the machine-global store. \
+                 cd into an indexed repo (or run `rag-rat init` here) for a repo-scoped report.",
+        "database": overview.database,
+        "exists": overview.exists,
+        "size_bytes": overview.size_bytes,
+        "schema": overview.schema,
+        "repos": overview.repos,
         "mcp": {
             "transport": "stdio",
             "tools": rag_rat_mcp::tools::TOOL_NAMES,

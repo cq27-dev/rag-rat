@@ -21,7 +21,7 @@ pub(crate) use config_info::{dump_config, version_check};
 pub(crate) use consolidate::consolidate;
 pub(crate) use format::{output_format, set_output_format};
 pub(crate) use hooks::{claude_hooks, hooks, papertrail};
-pub(crate) use index_ops::{doctor, index, maintenance, reconcile};
+pub(crate) use index_ops::{doctor, doctor_global_store, index, maintenance, reconcile};
 pub(crate) use memory::{dream, memory};
 pub(crate) use models::models;
 #[cfg(feature = "eval")]
