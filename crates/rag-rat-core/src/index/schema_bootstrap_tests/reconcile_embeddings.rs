@@ -1389,3 +1389,88 @@ fn self_heal_does_not_certify_a_repo_with_another_live_scope() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn reconcile_heals_an_op_log_ghost_in_an_idle_repo() {
+    // #583 (follow-up to #541). The per-node op-log reconcile heals a "ghost" — a row present in
+    // `repo_memories` but absent from the signed projection, left by a raw writer / a pre-#532
+    // binary — on the next MEMORY mutation. A repo that gets NO subsequent memory mutation would
+    // carry the ghost indefinitely, so an index reconcile pass runs the same idempotent reconcile.
+    // Both `rag-rat reconcile` and the watcher's incremental pass route through
+    // `reconcile_with_options_progress`, so exercising it here covers every idle-repo trigger.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn seed() {}\n").unwrap();
+    // A COMMITTED git repo yields a stable repo_id — the op-log reconcile only roots an immutable
+    // owner stream on a stable id, so a `local:` (uncommitted) id would make it a no-op and the
+    // ghost would never heal, silently voiding the test.
+    run_git(&root, &["init"]);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &[
+        "-c",
+        "user.name=Rag Rat Test",
+        "-c",
+        "user.email=rag-rat@example.invalid",
+        "commit",
+        "-m",
+        "initial",
+    ]);
+    let root = root.canonicalize().unwrap();
+
+    let mut config = source_config(root.clone(), Language::Rust);
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
+
+    // Root the owner chain with a real authored memory — the realistic idle-repo precondition is a
+    // repo that ALREADY has signed history when a ghost slips in (exercises the INCREMENTAL heal,
+    // not genesis). Unanchored `Concept` per #465.
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Concept".to_string(),
+        title: "seed concept".to_string(),
+        body: "roots the owner chain".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test-agent".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        payload_json: None,
+        bind: crate::query::memory::RepoMemoryBindTarget::default(),
+    })
+    .unwrap();
+
+    // A ghost written by RAW SQL — never authored into the signed log.
+    let conn = db.storage.connection();
+    let repo_id = crate::index::schema::active_repo_id(conn).unwrap();
+    conn.execute(
+        "INSERT INTO repo_memories(
+             id, kind, title, body, confidence, status, created_by, created_at_ms, updated_at_ms,
+             source, input_hash, memory_version, repo_id)
+         VALUES ('mem_ghost_583', 'Concept', 'ghost', 'raw-written ghost', 'high', 'active',
+             'raw', 1000, 1000, 'agent', 'h583', 'v1', ?1)",
+        [&repo_id],
+    )
+    .unwrap();
+
+    let ghost_in_projection = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM oplog_projected_nodes WHERE node_id = 'mem_ghost_583'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(ghost_in_projection(conn), 0, "the raw ghost is absent from the signed projection");
+
+    // The idle-repo backstop: a reconcile pass heals the ghost though no memory mutation ran.
+    db.reconcile_with_options_progress(crate::index::ai::ReconcileOptions::default(), |_| {})
+        .unwrap();
+
+    assert_eq!(
+        ghost_in_projection(db.storage.connection()),
+        1,
+        "the reconcile pass authored the idle-repo ghost into the signed log"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

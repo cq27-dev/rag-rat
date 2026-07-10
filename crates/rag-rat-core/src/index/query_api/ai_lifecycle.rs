@@ -65,7 +65,30 @@ impl IndexDatabase {
         options: ai::ReconcileOptions,
         progress: impl FnMut(ai::ReconcileProgress),
     ) -> anyhow::Result<ReconcileReport> {
-        ai::reconcile_with_options_progress(self.storage.connection(), options, progress)
+        let report =
+            ai::reconcile_with_options_progress(self.storage.connection(), options, progress)?;
+        self.heal_memory_oplog_ghosts()?;
+        Ok(report)
+    }
+
+    /// Idle-repo op-log ghost backstop (#583, follow-up to #541). The per-node op-log reconcile
+    /// (#541) heals a "ghost" memory/edge — a row present in `repo_memories`/`repo_node_edges` but
+    /// absent from the signed projection, left by a pre-#532 binary or a raw writer such as the
+    /// `dream` passes — on the next MEMORY mutation. A repo with no subsequent memory mutation
+    /// would carry the ghost indefinitely, so a reconcile pass runs the same idempotent
+    /// reconcile: both `rag-rat reconcile` and the watcher's incremental pass route through
+    /// [`Self::reconcile_with_options_progress`], so this one seam covers every idle-repo trigger.
+    ///
+    /// Cheap and safe on the hot path: [`backfill_memory_oplog`] probes with two indexed anti-joins
+    /// that return empty in steady state and take NO write lock when nothing is missing, and it is
+    /// a no-op under an absent/unstable scope. Runs after the embedding reconcile has
+    /// committed, so its authored write (a durable `IMMEDIATE` txn only when a ghost exists)
+    /// never nests inside it.
+    pub(crate) fn heal_memory_oplog_ghosts(&self) -> anyhow::Result<()> {
+        crate::query::memory::backfill_memory_oplog(
+            self.storage.connection(),
+            crate::index::now_ms(),
+        )
     }
 
     pub fn current_embedding_count(&self, model_id: &str) -> anyhow::Result<u64> {

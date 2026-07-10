@@ -11,6 +11,11 @@ use std::collections::BTreeSet;
 
 pub use api::memory_evidence_for_symbol;
 pub(crate) use api::*;
+// The scope-READING reconcile entry (#541): reconciles the active repo's owner stream, reading
+// the repo id from the connection scope and no-oping under an absent/unstable scope.
+// Re-exported so the index reconcile path (the idle-repo ghost backstop, #583) can name it
+// across the private module.
+pub(crate) use authoring::backfill_memory_oplog;
 // The scope-explicit reconcile entry (#541): `authoring` is a PRIVATE module, so
 // `index::consolidate` names this through this re-export (Task 5 of #541).
 pub(crate) use authoring::reconcile_owner_stream_for_repo;
