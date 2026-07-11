@@ -439,6 +439,12 @@ pub(super) fn decode(entry_type: u32, bytes: &[u8]) -> Result<DecodedAccountOp, 
             // validates the payload only as an opaque bstr (it never recurses into it), so this is
             // the ONLY place the payload interior is checked. (Mirrors `super::super::op::decode`.)
             cbor::require_canonical_cbor(bytes)?;
+            // Every account op is a fixed-length CBOR ARRAY (every known decoder starts with an
+            // array header). A future binary that learns this entry_type would reject a
+            // non-array payload on shape, so require the array here too — else an old
+            // peer accepts bytes a newer peer cannot fold, splitting consensus on a
+            // signed log.
+            cbor::expect_definite_len(&mut Decoder::new(bytes))?;
             return Ok(DecodedAccountOp::Unknown { entry_type: other, bytes: bytes.to_vec() });
         },
     };
@@ -921,6 +927,10 @@ mod tests {
         assert!(decode(999, &non_minimal_uint).is_err(), "non-canonical unknown payload rejected");
         let trailing = vec![0x81, 0x00, 0xff]; // a valid item + a trailing byte
         assert!(decode(999, &trailing).is_err(), "trailing bytes after an unknown op rejected");
+        // A canonical NON-array payload (a bare uint) is rejected: every account op is an array, so
+        // a future binary that learns this entry_type would reject it on shape.
+        assert!(decode(999, &[0x00]).is_err(), "a non-array unknown payload is rejected");
+        assert!(decode(999, &[0xa0]).is_err(), "an empty map unknown payload is rejected");
     }
 
     #[test]

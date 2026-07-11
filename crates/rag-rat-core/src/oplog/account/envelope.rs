@@ -96,6 +96,11 @@ pub(super) fn sign_account_entry(
     // guarantee that holds in every build.
     let mut header = header.clone();
     header.device_fingerprint = secret.public().fingerprint();
+    // Enforce the same header nullity rules decode does, so the authoring path can't sign a header
+    // (seq>0 with a null prev_hash, a crypto_suite/key_id mismatch, …) that decode would reject.
+    if let Some(msg) = header_nullity_error(&header) {
+        anyhow::bail!(msg);
+    }
     let header_bytes = encode_header(&header);
     let body_bytes = encode_body(&header_bytes, payload);
     let signature = secret.sign(&body_bytes);
@@ -274,15 +279,7 @@ fn decode_header(header_bytes: &[u8]) -> Result<AccountEntryHeader, CborError> {
     let auth_len = d.u64()?;
     let key_id = decode_opt_hash(&mut d, "key_id")?;
     let authority_ref = decode_opt_hash(&mut d, "authority_ref")?;
-    // Self-contained structural nullity rules (§6). The `authority_ref` ⇔ `AccountGenesis` coupling
-    // needs entry_type SEMANTICS and is enforced where entry_type is interpreted (ops / fold).
-    if (seq == 0) != prev_hash.is_none() {
-        return Err(CborError::message("prev_hash must be null iff seq == 0"));
-    }
-    if (crypto_suite == 0) != key_id.is_none() {
-        return Err(CborError::message("key_id must be null iff crypto_suite == 0"));
-    }
-    Ok(AccountEntryHeader {
+    let header = AccountEntryHeader {
         account_id,
         log_id,
         device_fingerprint,
@@ -295,7 +292,25 @@ fn decode_header(header_bytes: &[u8]) -> Result<AccountEntryHeader, CborError> {
         auth_len,
         key_id,
         authority_ref,
-    })
+    };
+    if let Some(msg) = header_nullity_error(&header) {
+        return Err(CborError::message(msg));
+    }
+    Ok(header)
+}
+
+/// The self-contained header nullity rules (§6): `prev_hash` is null iff `seq == 0`, and `key_id`
+/// is null iff `crypto_suite == 0`. `Some(msg)` if a rule is violated. Enforced BOTH at decode and
+/// at [`sign_account_entry`] so the authoring path can't sign a header decode would reject. (The
+/// `authority_ref` ⇔ `AccountGenesis` coupling needs entry_type SEMANTICS and lives in ops / fold.)
+fn header_nullity_error(header: &AccountEntryHeader) -> Option<&'static str> {
+    if (header.seq == 0) != header.prev_hash.is_none() {
+        return Some("prev_hash must be null iff seq == 0");
+    }
+    if (header.crypto_suite == 0) != header.key_id.is_none() {
+        return Some("key_id must be null iff crypto_suite == 0");
+    }
+    None
 }
 
 /// Decode a hash slot: CBOR null → `None`, else a 32-byte bstr.
@@ -479,32 +494,35 @@ mod tests {
     }
 
     #[test]
-    fn prev_hash_and_key_id_nullity_rules_are_enforced() {
-        // seq > 0 with a null prev_hash is rejected.
+    fn nullity_rules_are_enforced_at_both_sign_and_decode() {
+        // seq>0 + null prev_hash; seq0 + non-null prev_hash; plaintext + key_id; sealed + null
+        // key_id.
         let mut bad_prev = genesis_header();
         bad_prev.seq = 5;
         bad_prev.prev_hash = None;
-        let signed = sign_account_entry(&secret(), &bad_prev, &payload()).unwrap();
-        assert!(decode_account_signed(&signed.signed_bytes).is_err(), "seq>0 needs prev_hash");
-
-        // seq 0 with a non-null prev_hash is rejected.
         let mut bad_genesis = genesis_header();
         bad_genesis.prev_hash = Some([0x11; 32]);
-        let signed = sign_account_entry(&secret(), &bad_genesis, &payload()).unwrap();
-        assert!(decode_account_signed(&signed.signed_bytes).is_err(), "genesis has no prev_hash");
-
-        // crypto_suite 0 (plaintext) with a non-null key_id is rejected (§15).
         let mut bad_key = genesis_header();
         bad_key.key_id = Some([0x22; 32]);
-        let signed = sign_account_entry(&secret(), &bad_key, &payload()).unwrap();
-        assert!(decode_account_signed(&signed.signed_bytes).is_err(), "plaintext has no key_id");
-
-        // crypto_suite 1 (sealed) with a null key_id is rejected.
         let mut bad_sealed = genesis_header();
         bad_sealed.crypto_suite = 1;
         bad_sealed.key_id = None;
-        let signed = sign_account_entry(&secret(), &bad_sealed, &payload()).unwrap();
-        assert!(decode_account_signed(&signed.signed_bytes).is_err(), "sealed needs a key_id");
+
+        for (bad, why) in [
+            (bad_prev, "seq>0 needs prev_hash"),
+            (bad_genesis, "genesis has no prev_hash"),
+            (bad_key, "plaintext has no key_id"),
+            (bad_sealed, "sealed needs a key_id"),
+        ] {
+            // The authoring path refuses to sign it...
+            assert!(sign_account_entry(&secret(), &bad, &payload()).is_err(), "sign: {why}");
+            // ...and a manually-forged wire with that header is rejected at decode too.
+            let header_bytes = encode_header(&bad);
+            let body_bytes = encode_body(&header_bytes, &payload());
+            let signature = secret().sign(&body_bytes);
+            let forged = encode_signed(&body_bytes, &signature);
+            assert!(decode_account_signed(&forged).is_err(), "decode: {why}");
+        }
     }
 
     #[test]
