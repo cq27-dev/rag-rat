@@ -525,6 +525,11 @@ fn validate_keys(ed25519: &[u8; 32], x25519: &[u8; 32]) -> Result<(), CborError>
 fn encode_content_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[ContentCut]) {
     let mut sorted = cuts.to_vec();
     sorted.sort_by_key(|cut| cut.stream_id.to_bytes());
+    // Collapse EXACT-duplicate cuts (stable sort keeps them adjacent) so encode never emits a
+    // payload the sorted-unique decoder / peers would reject. Two DIFFERENT cuts for one
+    // stream_id remain a caller error the decoder rejects — the authoring path must supply one
+    // cut per stream.
+    sorted.dedup();
     enc.array(sorted.len() as u64).expect(INFALLIBLE);
     for cut in &sorted {
         enc.array(3).expect(INFALLIBLE);
@@ -559,6 +564,9 @@ fn decode_content_cuts(d: &mut Decoder<'_>) -> Result<Vec<ContentCut>, CborError
 fn encode_device_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[DeviceCut]) {
     let mut sorted = cuts.to_vec();
     sorted.sort_by_key(|cut| cut.device_fingerprint.to_bytes());
+    // Collapse EXACT-duplicate cuts (see `encode_content_cuts`) so encode output always
+    // round-trips.
+    sorted.dedup();
     enc.array(sorted.len() as u64).expect(INFALLIBLE);
     for cut in &sorted {
         enc.array(3).expect(INFALLIBLE);
@@ -924,5 +932,37 @@ mod tests {
             enc.str("r").unwrap();
         }
         assert!(decode(entry_type::STREAM_REVOKE, &buf).is_err(), "unsorted device_cuts rejected");
+    }
+
+    #[test]
+    fn exact_duplicate_cuts_are_collapsed_on_encode() {
+        // A caller supplying the same cut twice must still produce a payload the sorted-unique
+        // decoder accepts — encode collapses exact duplicates rather than emitting a dup key that
+        // decode (and peers) would reject. (encode_content_cuts shares the codepath.)
+        let cut = DeviceCut {
+            device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
+            seq: 41,
+            hash: [0xcc; 32],
+        };
+        let doubled = AccountOp::StreamRevoke {
+            stream_id: stream(0x33),
+            grantee_account_id: account(0x99),
+            grant_id: [0xaa; 32],
+            device_cuts: vec![cut.clone(), cut.clone()],
+            reason: "revoked".to_string(),
+        };
+        let single = AccountOp::StreamRevoke {
+            stream_id: stream(0x33),
+            grantee_account_id: account(0x99),
+            grant_id: [0xaa; 32],
+            device_cuts: vec![cut],
+            reason: "revoked".to_string(),
+        };
+        // The duplicate encodes to the same bytes as the single, and round-trips to the single.
+        assert_eq!(encode(&doubled), encode(&single), "exact-duplicate cuts collapse on encode");
+        assert_eq!(
+            decode(entry_type::STREAM_REVOKE, &encode(&doubled)).unwrap(),
+            DecodedAccountOp::Known(single),
+        );
     }
 }

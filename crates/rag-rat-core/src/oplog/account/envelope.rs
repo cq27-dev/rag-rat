@@ -82,29 +82,27 @@ pub(super) struct VerifiedAccountEntry {
 
 /// Author a signed account entry: encode the header, wrap `[header, payload]` as the body, sign the
 /// body under `secret`, and build the transport envelope. Pure + deterministic given `secret`
-/// (ed25519 signing is deterministic). The caller supplies a header whose `device_fingerprint` is
-/// `secret.public().fingerprint()`; [`verify_account_signed`] rejects any mismatch.
+/// (ed25519 signing is deterministic). The author device is DERIVED from `secret` — the header's
+/// `device_fingerprint` is overwritten with `secret.public().fingerprint()` — so a signed entry can
+/// never name a device other than its signer (mirrors `super::super::entry::sign_entry`).
 pub(super) fn sign_account_entry(
     secret: &DeviceSecret,
     header: &AccountEntryHeader,
     payload: &[u8],
 ) -> SignedAccountEntry {
-    // Fail fast at the authoring site if the header names a different device than the signing key —
-    // `verify_account_signed` would reject it later, but a local bug should surface here, not on
-    // the wire. (Aligns this layer's posture with `super::super::entry::sign_entry`, which
-    // derives the fingerprint internally.)
-    debug_assert_eq!(
-        header.device_fingerprint,
-        secret.public().fingerprint(),
-        "header.device_fingerprint must be the signing key's fingerprint",
-    );
-    let header_bytes = encode_header(header);
+    // The signing key IS the author device: derive `device_fingerprint` from `secret` rather than
+    // trusting the caller-supplied field. A `debug_assert` would be compiled out in release and let
+    // a release-build authoring bug ship a self-invalid entry; overwriting is a structural
+    // guarantee that holds in every build.
+    let mut header = header.clone();
+    header.device_fingerprint = secret.public().fingerprint();
+    let header_bytes = encode_header(&header);
     let body_bytes = encode_body(&header_bytes, payload);
     let entry_hash = cbor::sha256(&body_bytes);
     let signature = secret.sign(&body_bytes);
     let signed_bytes = encode_signed(&body_bytes, &signature);
     SignedAccountEntry {
-        header: header.clone(),
+        header,
         payload: payload.to_vec(),
         signature,
         header_bytes,
