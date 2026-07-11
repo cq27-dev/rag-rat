@@ -23,7 +23,6 @@ pub(crate) use render::*;
 use crate::cli::{Cli, Command as Cmd, DoctorArgs};
 
 mod agent_hook;
-mod claude_settings;
 mod init;
 
 // Idle-RSS fix: glibc malloc never hands freed pages back to the OS, so a long-lived `rag-rat mcp`

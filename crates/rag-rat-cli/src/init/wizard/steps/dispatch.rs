@@ -37,8 +37,7 @@ pub(crate) fn step_footer(id: StepId) -> &'static str {
         StepId::Embedding =>
             "Tab/Shift-Tab field  ↑↓/j/k move  PgUp/PgDn scroll  Space select  type edit  d \
              download  t/p test  l log",
-        StepId::Integration =>
-            "↑↓ navigate  Space toggle  t version check  g git  c claude  Enter next",
+        StepId::Integration => "↑↓ navigate  Space toggle  t version check  g git  Enter next",
     }
 }
 

@@ -1,13 +1,12 @@
-//! Git-hook, Claude-hook, and GitHub-sync commands, split out of the `commands` god-module:
-//! `hooks` (install/uninstall/status of the managed git hooks, or delegate to `claude_hooks`),
-//! `claude_hooks` (the Claude Code settings.json hook entries), and `github` (issue / refs sync).
+//! Git-hook and GitHub-sync commands, split out of the `commands` god-module:
+//! `hooks` (install/uninstall/status of the managed git hooks) and `github` (issue / refs sync).
 use std::fs;
 
 use rag_rat_core::Config;
 
 use crate::cli::{GithubArgs, GithubCommand, HookAction, HooksArgs};
 use crate::render::{print_output, render_papertrail_sync_progress};
-use crate::{MANAGED_HOOKS, claude_settings, git_paths, install_hook, is_rag_rat_hook, open_index};
+use crate::{MANAGED_HOOKS, git_paths, install_hook, is_rag_rat_hook, open_index};
 
 pub(crate) fn papertrail(config: &Config, args: &GithubArgs) -> anyhow::Result<()> {
     match &args.command {
@@ -29,9 +28,6 @@ pub(crate) fn papertrail(config: &Config, args: &GithubArgs) -> anyhow::Result<(
 }
 
 pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
-    if args.claude {
-        return claude_hooks(config, args.action.as_str(), args.global);
-    }
     let git = git_paths(&config.root)?;
     match args.action {
         HookAction::Install => {
@@ -94,42 +90,5 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
                 "hooks": hooks,
             }))
         },
-    }
-}
-
-pub(crate) fn claude_hooks(config: &Config, subcommand: &str, global: bool) -> anyhow::Result<()> {
-    let path = claude_settings::settings_path(&config.root, global)?;
-    let mut settings = claude_settings::read_settings(&path)?;
-    match subcommand {
-        "install" => {
-            let changed = claude_settings::merge_hook_entries(&mut settings);
-            if changed {
-                claude_settings::write_settings(&path, &settings)?;
-            }
-            print_output(&serde_json::json!({
-                "status": if changed { "installed" } else { "already_installed" },
-                "settings_path": path,
-                "matchers": ["Grep", "Bash"],
-            }))
-        },
-        "uninstall" => {
-            let changed = claude_settings::remove_hook_entries(&mut settings);
-            if changed {
-                claude_settings::write_settings(&path, &settings)?;
-            }
-            print_output(&serde_json::json!({
-                "status": if changed { "uninstalled" } else { "not_installed" },
-                "settings_path": path,
-            }))
-        },
-        "status" => {
-            let status = claude_settings::hook_status(&settings);
-            print_output(&serde_json::json!({
-                "settings_path": path,
-                "pretooluse_installed": status.pretooluse,
-                "session_start_installed": status.session_start,
-            }))
-        },
-        other => anyhow::bail!("unknown hooks subcommand `{other}`"),
     }
 }

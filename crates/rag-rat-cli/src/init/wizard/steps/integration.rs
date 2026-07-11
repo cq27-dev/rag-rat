@@ -1,4 +1,4 @@
-//! Integration step — version check + git/Claude hook toggles.
+//! Integration step — version check + git hook toggles.
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -14,20 +14,13 @@ use crate::{MANAGED_HOOKS, git_paths, is_rag_rat_hook};
 
 pub(super) fn render_integration(f: &mut Frame, area: Rect, state: &WizardState) {
     let Some(StepState::Integration { focus }) = state.step else { return };
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Min(0),
-    ])
-    .split(area);
+    let chunks =
+        Layout::vertical([Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
 
     let rows = [
         ("version check (t)", state.draft.version_check),
         ("git hooks (g)", state.draft.hooks.git),
-        ("Claude hooks (c)", state.draft.hooks.claude),
-        ("global hooks", state.draft.hooks.claude_global),
     ];
     for (i, (label, on)) in rows.iter().enumerate() {
         let style = if focus == i { theme::selected() } else { theme::base() };
@@ -51,7 +44,7 @@ pub(super) fn handle_integration(key: KeyEvent, state: &mut WizardState) -> Outc
             Outcome::Consumed
         },
         KeyCode::Down | KeyCode::Char('j') => {
-            if *focus + 1 < 4 {
+            if *focus + 1 < 2 {
                 *focus += 1;
             }
             Outcome::Consumed
@@ -61,7 +54,7 @@ pub(super) fn handle_integration(key: KeyEvent, state: &mut WizardState) -> Outc
             Outcome::Consumed
         },
         KeyCode::End => {
-            *focus = 3;
+            *focus = 1;
             Outcome::Consumed
         },
         KeyCode::Char(' ') => {
@@ -69,14 +62,8 @@ pub(super) fn handle_integration(key: KeyEvent, state: &mut WizardState) -> Outc
                 0 => {
                     state.draft.version_check = !state.draft.version_check;
                 },
-                1 => {
-                    state.draft.hooks.git = !state.draft.hooks.git;
-                },
-                2 => {
-                    state.draft.hooks.claude = !state.draft.hooks.claude;
-                },
                 _ => {
-                    state.draft.hooks.claude_global = !state.draft.hooks.claude_global;
+                    state.draft.hooks.git = !state.draft.hooks.git;
                 },
             };
             Outcome::Consumed
@@ -93,10 +80,6 @@ pub(super) fn handle_integration(key: KeyEvent, state: &mut WizardState) -> Outc
         },
         KeyCode::Char('g') | KeyCode::Char('G') => {
             state.draft.hooks.git = !state.draft.hooks.git;
-            Outcome::Consumed
-        },
-        KeyCode::Char('c') | KeyCode::Char('C') => {
-            state.draft.hooks.claude = !state.draft.hooks.claude;
             Outcome::Consumed
         },
         KeyCode::Enter => Outcome::Advance,

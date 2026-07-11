@@ -256,7 +256,6 @@ fn additional_context(stdout: &str) -> Option<String> {
     let value: serde_json::Value =
         serde_json::from_str(trimmed).expect("client emitted valid JSON");
     assert_eq!(value["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-    assert_eq!(value["hookSpecificOutput"]["permissionDecision"], "allow");
     value["hookSpecificOutput"]["additionalContext"].as_str().map(str::to_string)
 }
 

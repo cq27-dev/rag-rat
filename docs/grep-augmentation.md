@@ -24,32 +24,24 @@ through the symbol lane.
 
 ## Install
 
-Install the hook for the current project (writes `.claude/settings.json` in the repo root):
+The grep-augmentation hook ships with the **rag-rat plugin** — installing the plugin registers it in
+one step (along with the MCP server, the agent skills, and the write-time clone-check and
+session-digest hooks):
 
 ```bash
-rag-rat hooks install --claude
+# Claude Code
+claude plugin marketplace add cq27-dev/rag-rat
+claude plugin install rag-rat@rag-rat
+
+# Codex
+codex plugin marketplace add cq27-dev/rag-rat
+codex plugin add rag-rat@rag-rat
 ```
 
-Install globally (writes `~/.claude/settings.json`, applies to all Claude Code sessions):
-
-```bash
-rag-rat hooks install --claude --global
-```
-
-The global install is safe to run from any directory. When `rag-rat agent-hook` is invoked by
-Claude Code, it walks up from the hook's reported `cwd` looking for a `rag-rat.toml`. If none is
-found, the hook exits immediately without printing anything — a silent no-op for repositories that
-are not indexed by rag-rat.
-
-Check or remove the install:
-
-```bash
-rag-rat hooks status --claude [--global]
-rag-rat hooks uninstall --claude [--global]
-```
-
-The install adds two `PreToolUse` entries to the `hooks` block — one `matcher: Grep` and one
-`matcher: Bash` — each calling `rag-rat agent-hook` with a 10-second timeout.
+The plugin registers `PreToolUse` hooks on `Grep`/`Bash` (Claude Code) / `^Bash$` (Codex), each
+invoking `rag-rat agent-hook` with a 10-second timeout. When invoked, `agent-hook` walks up from the
+reported `cwd` looking for a `rag-rat.toml`. If none is found, the hook exits immediately without
+printing anything — a silent no-op for repositories that are not indexed by rag-rat.
 
 ## How it serves
 

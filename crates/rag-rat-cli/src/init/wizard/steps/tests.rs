@@ -1225,8 +1225,8 @@ fn integration_combines_version_check_and_hooks() {
     step_handle_key(StepId::Integration, key(KeyCode::Char(' ')), &mut state);
     assert!(state.draft.hooks.git);
 
-    step_handle_key(StepId::Integration, key(KeyCode::Char('c')), &mut state);
-    assert!(state.draft.hooks.claude);
+    step_handle_key(StepId::Integration, key(KeyCode::Char('g')), &mut state);
+    assert!(!state.draft.hooks.git);
 }
 
 #[test]

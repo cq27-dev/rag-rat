@@ -194,10 +194,6 @@ pub(crate) fn is_default_backend_endpoint(url: &str) -> bool {
 pub(crate) struct HooksDraft {
     /// Whether to install the rag-rat git maintenance hooks (post-checkout/merge/rewrite/commit).
     pub git: bool,
-    /// Whether to install the Claude Code AI hooks (`.claude/settings.json`).
-    pub claude: bool,
-    /// Whether to install the Claude Code hooks in the global settings (vs project-local).
-    pub claude_global: bool,
 }
 
 /// The persistable wizard model — the only thing that renders to `rag-rat.toml`.
@@ -248,7 +244,7 @@ pub(crate) struct WizardDraft {
     pub oracle_min_interval_secs: u64,
     /// `[version_check] enabled`.
     pub version_check: bool,
-    /// Hook installation selections (Task 16 fills `git`/`claude` from current hook status).
+    /// Hook installation selections (Task 16 fills `git` from current hook status).
     pub hooks: HooksDraft,
 }
 
@@ -331,7 +327,7 @@ impl WizardDraft {
     ///   `RemoteMode::Ephemeral`).
     /// - `cfg.oracle.*` → oracle fields.
     /// - `cfg.version_check.enabled` → `version_check`.
-    /// - Hook status: Task 16 fills `git`/`claude`; defaulted to `false` here.
+    /// - Hook status: Task 16 fills `git`; defaulted to `false` here.
     pub(crate) fn from_config(cfg: &Config, config_path: &std::path::Path) -> Self {
         // Group target directories by language. Config preserves TOML order; BTreeMap gives a
         // stable language-sorted order for the wizard display.
@@ -360,7 +356,7 @@ impl WizardDraft {
             oracle_quiet_secs: oracle.auto_run_quiet_period_secs,
             oracle_min_interval_secs: oracle.auto_run_min_interval_secs,
             version_check: cfg.version_check.enabled,
-            // Task 16 fills git/claude from the current installed hook status.
+            // Task 16 fills git from the current installed hook status.
             hooks: HooksDraft::default(),
         }
     }
@@ -1268,7 +1264,6 @@ mod tests {
         assert!(!d.oracle_auto_run);
         assert!(d.version_check);
         assert!(!d.hooks.git);
-        assert!(!d.hooks.claude);
         // root_abs must be the absolute path passed in.
         assert_eq!(d.root_abs, root_abs);
     }

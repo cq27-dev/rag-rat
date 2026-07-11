@@ -9,11 +9,11 @@ rag-rat binary on first run**. Installing the plugin is one step: the user does 
 
 ```
 plugin/                          plugin root (CLAUDE_PLUGIN_ROOT / CODEX_PLUGIN_ROOT)
-  scripts/launch.js                the all-OS launcher (shared)
+  scripts/launch.js                the all-OS hook launcher (resolves the binary; never installs)
   skills/                          shared skills: using-rag-rat, dream-review
   hooks/hooks.json                 Claude hooks (auto-discovered)
-  .mcp.json                        Codex MCP config (root, per Codex plugin spec)
-  .claude-plugin/plugin.json       Claude: mcpServers → node scripts/launch.js mcp
+  .mcp.json                        Codex MCP config (root) → npx @rag-rat/bin mcp
+  .claude-plugin/plugin.json       Claude: mcpServers → npx @rag-rat/bin mcp
   .claude-plugin/marketplace.json
   .codex-plugin/plugin.json        Codex manifest: mcpServers → ./.mcp.json, skills → ./skills/
   .codex-plugin/hooks/hooks.json   Codex hooks
@@ -22,25 +22,31 @@ plugin/                          plugin root (CLAUDE_PLUGIN_ROOT / CODEX_PLUGIN_
 Both harnesses treat `plugin/` as the plugin root, so `scripts/`, `skills/`, and the launcher are
 shared — no per-harness duplication.
 
-## Launcher — one-step, all-OS install (`scripts/launch.js`)
+## MCP server & hook launcher
 
-Node (not `.sh`) so it works on native Windows too. Resolution order, first hit wins:
+**MCP server** — both manifests launch it as `npx -y @rag-rat/bin@latest mcp`. npx runs in the
+agent's project working directory (so the server resolves that repo's `rag-rat.toml`) and installs the
+version-matched binary from the `@rag-rat/bin` npm package on first use — no `cargo install` / `brew`
+/ `PATH` setup first.
+
+**Hooks** — route through `scripts/launch.js` in resolve-only mode
+(`node <launcher> --no-install agent-hook`), never npx: a hook must be a fast no-op when the binary
+isn't present yet, never blocking a tool call on an install or a network fetch. (The launcher can also
+be an MCP runtime — `node <launcher> mcp`, with install — for any other MCP agent that isn't
+Claude/Codex.) Node, not `.sh`, so it works on native Windows too. Resolution order, first hit wins:
 
 1. `$RAG_RAT_BIN` — explicit override (a local dev build).
 2. Managed cache — `<XDG_CACHE_HOME|~/.cache>/rag-rat/bin/<version>/rag-rat[.exe]` (version-exact).
-3. Plugin-local `bin/<binary>`.
+3. The `@rag-rat/bin` npx cache — the binary the MCP server's `npx` run already staged, so a
+   `--no-install` hook resolves a real binary without a download of its own.
 4. `PATH` rag-rat — only if `--version` matches the plugin's declared version.
 5. Download — `rag-rat-<triple>.<ext>` + `.sha256` from the GitHub release, checksum-verified,
-   extracted with `tar` (bsdtar reads `.tar.xz` and `.zip` on Win10+/macOS/Linux), atomically
-   cached. Concurrent launches serialize on a lockfile.
+   extracted with `tar` (bsdtar reads `.tar.xz` and `.zip` on Win10+/macOS/Linux), atomically cached,
+   lockfile-serialized. **Skipped under `--no-install`** — until the MCP server's first `npx` run has
+   installed the binary, a hook is a harmless no-op.
 
 Version comes from `plugin.json`. Intel Mac has no prebuilt → the launcher prints the source path
-(`cargo install rag-rat --no-default-features --features model2vec`). A leading `--no-install`
-(passed by hooks) resolves from an existing binary only and never blocks on a download — the MCP
-server's launch is what installs the binary; until then a hook is a harmless no-op.
-
-Not `npx @rag-rat/bin mcp` as the runtime: npx's shared `_npx/<hash>` staging races across concurrent
-agent sessions (ENOENT) and re-resolves per launch. `@rag-rat/bin` stays a fine *install* channel.
+(`cargo install rag-rat --no-default-features --features model2vec`).
 
 ## Skills
 
@@ -56,7 +62,7 @@ resolves the same version-matched binary and never blocks on install. The handle
 `hook_event_name` / `tool_name` / `tool_input` input and the same `hookSpecificOutput.additionalContext`
 output.
 
-**Claude** (`hooks/hooks.json`, replicates `rag-rat hooks install --claude`):
+**Claude** (`hooks/hooks.json`, auto-discovered):
 - `SessionStart` (`startup|clear|compact`, 5s) → repo orientation digest.
 - `PreToolUse` on `Grep`/`Bash` (10s) → grep-augmentation.
 - `PreToolUse` on `Write`/`Edit`/`MultiEdit` (10s) → write-time clone check.
@@ -111,8 +117,6 @@ Verified end-to-end:
 - **Download path** — against the v0.16.0 release: PATH version-mismatch detection → download the
   platform archive → sha256 verify → extract → atomic install to the version-exact cache → run.
   (Was blocked on a green release; v0.16.0 provides the assets.)
-- **Legacy hook-settings migration** — a pre-rename `rag-rat claude-hook` entry is recognized and
-  upgraded in place on reinstall (no dead subcommand, no duplicate); see `claude_settings.rs`.
 - **Marketplace placement** — the manifest lives at the repo root (`.claude-plugin/marketplace.json`,
   `source: ./plugin`), so `/plugin marketplace add cq27-dev/rag-rat` discovers it; the plugin content
   stays under `plugin/`.

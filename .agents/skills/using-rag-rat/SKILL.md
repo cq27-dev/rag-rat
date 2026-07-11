@@ -73,7 +73,7 @@ Use the MCP to **find and understand**; use your file tools to **change** (and t
 before an edit). The MCP is read-only on source — it never edits files.
 
 If the MCP returns empty/thin results, the index is stale or mis-rooted: `rag-rat index --discover`
-then `rag-rat reconcile`. (Optional but recommended: `rag-rat hooks install --claude` adds a
+then `rag-rat reconcile`. (Optional but recommended: install the rag-rat plugin — it registers a
 PreToolUse hook that auto-augments your `grep`/`rg` calls with symbol + memory context.)
 
 ## Rule 2 — Record durable learnings as rag-rat memories before you finish

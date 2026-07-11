@@ -102,13 +102,6 @@ impl ReviewModel {
             if draft.hooks.git {
                 hooks.push("git");
             }
-            if draft.hooks.claude {
-                if draft.hooks.claude_global {
-                    hooks.push("claude (global)");
-                } else {
-                    hooks.push("claude (project)");
-                }
-            }
             if hooks.is_empty() {
                 summary.push("  hooks:      none".to_string());
             } else {

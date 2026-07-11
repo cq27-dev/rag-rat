@@ -44,7 +44,7 @@ const GH_REPO = "cq27-dev/rag-rat";
 let _args = process.argv.slice(2);
 const NO_INSTALL = _args[0] === "--no-install";
 if (NO_INSTALL) _args = _args.slice(1);
-const FORWARD_ARGS = _args; // e.g. ["mcp"] or ["claude-hook"]
+const FORWARD_ARGS = _args; // e.g. ["mcp"] or ["agent-hook"]
 
 const log = (m) => process.stderr.write(`rag-rat-launch: ${m}\n`);
 const die = (m) => {

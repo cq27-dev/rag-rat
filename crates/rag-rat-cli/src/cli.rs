@@ -621,12 +621,6 @@ pub(crate) struct HooksArgs {
     /// install, uninstall, or status.
     #[arg(value_enum)]
     pub action: HookAction,
-    /// Operate on Claude Code hooks (settings.json) instead of git hooks.
-    #[arg(long)]
-    pub claude: bool,
-    /// With --claude: target ~/.claude/settings.json instead of ./.claude.
-    #[arg(long)]
-    pub global: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -634,16 +628,6 @@ pub(crate) enum HookAction {
     Install,
     Uninstall,
     Status,
-}
-
-impl HookAction {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            HookAction::Install => "install",
-            HookAction::Uninstall => "uninstall",
-            HookAction::Status => "status",
-        }
-    }
 }
 
 #[derive(Debug, Args)]
@@ -763,13 +747,11 @@ mod tests {
     }
 
     #[test]
-    fn hooks_action_and_flags_parse() {
-        let cli = Cli::try_parse_from(["rag-rat", "hooks", "install", "--claude", "--global"])
-            .expect("parse");
+    fn hooks_action_parses() {
+        let cli = Cli::try_parse_from(["rag-rat", "hooks", "install"]).expect("parse");
         match cli.command {
             Command::Hooks(args) => {
                 assert_eq!(args.action, HookAction::Install);
-                assert!(args.claude && args.global);
             },
             other => panic!("expected hooks, got {other:?}"),
         }

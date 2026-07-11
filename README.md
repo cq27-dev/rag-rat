@@ -51,6 +51,11 @@ sequenceDiagram
 
 ## Install
 
+> **Using Claude Code or Codex?** The [plugin](#connect-it-to-your-agent-mcp) is the one-step path —
+> it installs the MCP server, the agent skills, the hooks, **and** a version-matched `rag-rat` binary,
+> so you can skip this section. The manual install below is for the CLI, other agents, or building
+> from source.
+
 The quickest way is a prebuilt binary — no Rust toolchain — for Apple Silicon macOS, glibc ≥2.38
 Linux (x86-64 and arm64), Windows x64, and Android/Termux (arm64):
 
@@ -127,9 +132,27 @@ the default local embedder is too slow, see [Embedding backends](#embedding-back
 
 ## Connect it to your agent (MCP)
 
-The MCP server is STDIO — the client launches `rag-rat` as a child process. Registering it is **one
-command**, run from the repo directory so the server resolves that repo's `rag-rat.toml` and each
-repo gets its own index:
+**Claude Code and Codex: install the plugin — the one-step path.** It registers the MCP server, adds
+the agent skills, wires the hooks (grep-augmentation, write-time clone check, a session-start repo
+digest), and installs a version-matched `rag-rat` binary on first run — so a plugin user skips the
+`npm install` / `cargo install` above entirely:
+
+```bash
+# Claude Code
+claude plugin marketplace add cq27-dev/rag-rat
+claude plugin install rag-rat@rag-rat
+
+# Codex
+codex plugin marketplace add cq27-dev/rag-rat
+codex plugin add rag-rat@rag-rat
+```
+
+Then run `rag-rat init` once in each repo you want indexed (see [Quickstart](#quickstart)); the
+server stays dormant until a repo has a `rag-rat.toml`.
+
+**Any other MCP agent, or wiring it by hand.** The MCP server is STDIO — the client launches
+`rag-rat` as a child process. Register it with one command, run from the repo directory so the server
+resolves that repo's `rag-rat.toml` and each repo gets its own index:
 
 ```bash
 claude mcp add --scope project rag-rat -- rag-rat mcp     # Claude Code

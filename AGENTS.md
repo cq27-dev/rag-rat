@@ -78,8 +78,8 @@ If the MCP returns empty results, the self-index may be stale or pointed at the 
 `rag-rat index --discover` then `rag-rat reconcile` refreshes it.
 
 The grep-augmentation PreToolUse hook augments Claude Code's `Grep` and Bash grep/rg/ag calls with
-symbol and repo-memory context automatically; install it with `rag-rat hooks install --claude` (or
-`--global`).
+symbol and repo-memory context automatically; it ships with the rag-rat plugin (install the plugin —
+see the README's "Connect it to your agent (MCP)" section).
 
 ## Repo orientation
 
