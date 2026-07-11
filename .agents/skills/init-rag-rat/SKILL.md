@@ -81,7 +81,9 @@ Not part of setup: `init` writes no dream config, and a fresh repo has no memori
 have accumulated and the user wants rag-rat to AI-**verify** and **compact** them, load
 **`references/dream-model.md`** — it configures the `[llm.dream]` model passes on the same ephemeral
 infra, but with a **chat** backend (`vllm`/`ollama`, never `infinity`). Off by default; `rag-rat
-dream` stays deterministic without it. Don't raise this during first-time setup.
+dream` stays deterministic without it. Once it's enabled, the agent can run it on demand when
+maintenance is due, or the user can schedule it (the reference has a systemd-timer example). Don't
+raise this during first-time setup.
 
 ## Guardrails
 
