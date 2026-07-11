@@ -112,8 +112,9 @@ pub(crate) fn local_device(conn: &Connection, now_ms: i64) -> anyhow::Result<Loc
             x25519_public,
         }),
         // A row minted before V058 carries no X25519 key yet — backfill it under a CAS so
-        // concurrent opens can't split into two encryption identities.
-        None => backfill_x25519(conn, stored),
+        // concurrent opens can't split into two encryption identities. `stored`'s ed25519 identity
+        // is the same row the backfill re-reads, so nothing from it is needed past this point.
+        None => backfill_x25519(conn),
     }
 }
 
@@ -124,7 +125,7 @@ pub(crate) fn local_device(conn: &Connection, now_ms: i64) -> anyhow::Result<Loc
 /// count; the mandatory re-read below is the source of truth (winner reads its own write, loser
 /// adopts the incumbent), exactly as the ed25519 mint path's `ON CONFLICT DO NOTHING` + re-read
 /// does.
-fn backfill_x25519(conn: &Connection, stored: StoredIdentity) -> anyhow::Result<LocalDevice> {
+fn backfill_x25519(conn: &Connection) -> anyhow::Result<LocalDevice> {
     let fresh = DeviceX25519Secret::generate()?;
     conn.execute(
         "UPDATE oplog_device_identity
@@ -132,14 +133,10 @@ fn backfill_x25519(conn: &Connection, stored: StoredIdentity) -> anyhow::Result<
           WHERE id = 0 AND x25519_secret IS NULL",
         params![fresh.secret_bytes().as_slice(), fresh.public().to_bytes().as_slice()],
     )?;
-    let reread = read_identity(conn)?
+    read_identity(conn)?
         .context("device identity vanished during X25519 backfill")?
         .into_local()
-        .context("X25519 columns still NULL immediately after the backfill CAS")?;
-    // `stored`'s ed25519 identity and the re-read one are the same row; the re-read is
-    // authoritative for the X25519 key that actually landed.
-    let _ = stored;
-    Ok(reread)
+        .context("X25519 columns still NULL immediately after the backfill CAS")
 }
 
 impl StoredIdentity {

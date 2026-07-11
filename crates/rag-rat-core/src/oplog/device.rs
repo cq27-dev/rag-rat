@@ -110,9 +110,11 @@ impl DevicePublic {
 pub(super) struct DeviceX25519Secret(StaticSecret);
 
 impl DeviceX25519Secret {
-    /// Rebuild the X25519 secret from its persisted 32-byte scalar. `StaticSecret::from` clamps, so
-    /// the round-trip through [`secret_bytes`](Self::secret_bytes) is stable — the reopen /
-    /// backfill path re-derives the SAME key. Deterministic (the backfill tests rely on it).
+    /// Rebuild the X25519 secret from its persisted 32-byte scalar. `StaticSecret::from` and
+    /// `to_bytes` are inverses — x25519-dalek 2 stores the scalar VERBATIM (clamping happens at DH
+    /// / public derivation, not construction) — so the round-trip through
+    /// [`secret_bytes`](Self::secret_bytes) re-derives the SAME key. Deterministic (the backfill
+    /// tests rely on it).
     pub(super) fn from_seed(seed: &[u8; 32]) -> Self {
         // Scrub the stack copy; `StaticSecret` zeroizes its own copy on drop (dalek `zeroize`).
         let seed = Zeroizing::new(*seed);
@@ -145,6 +147,11 @@ impl DeviceX25519Secret {
 /// decodes to *some* u-coordinate, so unlike an ed25519 key there is no curve-point rejection;
 /// [`from_bytes`](Self::from_bytes) is where the identity + small-order points are refused instead
 /// (the C1 half of §5 — the all-zero-shared-secret check is C4).
+///
+/// The type does NOT itself guarantee "blocklist-validated": [`DeviceX25519Secret::public`]
+/// constructs one directly (a key derived from a real secret is never small-order). The guarantee
+/// only matters for PEER keys — C4's `DeviceAdd` handling MUST route an incoming public key through
+/// [`from_bytes`](Self::from_bytes) to hit the blocklist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DeviceX25519Public([u8; 32]);
 
@@ -176,7 +183,7 @@ const fn p_offset(byte0: u8) -> [u8; 32] {
     v
 }
 
-/// `1` (order-4 point) in little-endian 32-byte form.
+/// The `u = 1` low-order X25519 point in little-endian 32-byte form.
 const fn low_order_one() -> [u8; 32] {
     let mut v = [0u8; 32];
     v[0] = 1;
@@ -184,31 +191,33 @@ const fn low_order_one() -> [u8; 32] {
 }
 
 /// The canonical X25519 small-order point blocklist (RFC 7748 §6.1 / the libsodium
-/// `crypto_scalarmult_curve25519` blacklist): the identity, the order-2/4/8 points, and the three
-/// `p-1`/`p`/`p+1` encodings. A public key equal (mod the ignored high bit) to any of these yields
-/// an all-zero shared secret and must be refused at `DeviceAdd`.
+/// `crypto_scalarmult_curve25519` blacklist). Every entry is a low-order point: DH with ANY scalar
+/// yields the all-zero shared secret, so accepting one as a peer's public key would silently
+/// produce a predictable key. A public key equal (mod the ignored high bit) to any of these is
+/// refused at `DeviceAdd`. Each is annotated by its u-coordinate, not its torsion order — order
+/// labels vary between references, whereas the verified property is the all-zero DH output.
 const X25519_SMALL_ORDER_POINTS: [[u8; 32]; 7] = [
-    // 0 — the identity (order 1).
+    // u = 0.
     [0u8; 32],
-    // 1 — order 4.
+    // u = 1.
     low_order_one(),
-    // 325606250916557431795983626356110631294008115727848805560023387167927233504 — order 8.
+    // u = 325606250916557431795983626356110631294008115727848805560023387167927233504.
     [
         0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
         0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
         0xb8, 0x00,
     ],
-    // 39382357235489614581723060781553021112529911719440698176882885853963445705823 — order 8.
+    // u = 39382357235489614581723060781553021112529911719440698176882885853963445705823.
     [
         0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
         0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
         0x11, 0x57,
     ],
-    // p-1 — order 2.
+    // u = p - 1  (p = 2^255 - 19).
     p_offset(0xec),
-    // p — order 4 (≡ identity on the prime-order subgroup).
+    // u = p      (≡ u = 0 mod p).
     p_offset(0xed),
-    // p+1 — order 1.
+    // u = p + 1  (≡ u = 1 mod p).
     p_offset(0xee),
 ];
 
