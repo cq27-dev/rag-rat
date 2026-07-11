@@ -230,7 +230,75 @@ pub(super) fn entry_type_of(op: &AccountOp) -> u32 {
 
 /// Encode an op to its canonical-CBOR payload (§10). Sorted cut arrays are emitted in binary-id
 /// order (the decoder rejects an unsorted wire, so `encode(decode) == bytes`).
-pub(super) fn encode(op: &AccountOp) -> Vec<u8> {
+pub(super) fn encode(op: &AccountOp) -> Result<Vec<u8>, CborError> {
+    Ok(encode_canonical(&canonicalize(op)?))
+}
+
+/// Validate + canonicalize an op so its encoding ALWAYS round-trips through [`decode`] — the
+/// authoring path must never sign a payload the sorted-unique / bounded / self-consistent decoder
+/// (and peers) would reject. Derives the `DeviceAdd` fingerprint from its own key, rejects invalid
+/// public keys, sorts + dedups + reject-conflicting + bound-checks the cut arrays, and enforces the
+/// `CutExtend` kind ⇔ stream_id coupling. Everything decode enforces at the op level is enforced
+/// here too, so `encode` cannot emit dead bytes.
+fn canonicalize(op: &AccountOp) -> Result<AccountOp, CborError> {
+    Ok(match op {
+        AccountOp::AccountGenesis { ed25519_pubkey, x25519_pubkey, .. } => {
+            validate_keys(ed25519_pubkey, x25519_pubkey)?;
+            op.clone()
+        },
+        AccountOp::DeviceAdd { ed25519_pubkey, x25519_pubkey, role, label, .. } => {
+            validate_keys(ed25519_pubkey, x25519_pubkey)?;
+            AccountOp::DeviceAdd {
+                // The fingerprint is DERIVED data — sha256 of the added device's own ed25519 key. A
+                // caller-supplied value is ignored, so a stale/placeholder fp can never be signed.
+                device_fingerprint: DeviceFingerprint::from_bytes(cbor::sha256(ed25519_pubkey)),
+                ed25519_pubkey: *ed25519_pubkey,
+                x25519_pubkey: *x25519_pubkey,
+                role: *role,
+                label: label.clone(),
+            }
+        },
+        AccountOp::DeviceRemove {
+            device_fingerprint,
+            control_cut,
+            secrets_cut,
+            content_cuts,
+            reason,
+        } => AccountOp::DeviceRemove {
+            device_fingerprint: *device_fingerprint,
+            control_cut: control_cut.clone(),
+            secrets_cut: secrets_cut.clone(),
+            content_cuts: canonical_content_cuts(content_cuts)?,
+            reason: reason.clone(),
+        },
+        AccountOp::StreamRevoke {
+            stream_id,
+            grantee_account_id,
+            grant_id,
+            device_cuts,
+            reason,
+        } => AccountOp::StreamRevoke {
+            stream_id: *stream_id,
+            grantee_account_id: *grantee_account_id,
+            grant_id: *grant_id,
+            device_cuts: canonical_device_cuts(device_cuts)?,
+            reason: reason.clone(),
+        },
+        AccountOp::CutExtend { chain_kind, stream_id, .. } => {
+            if (*chain_kind == ChainKind::Content) != stream_id.is_some() {
+                return Err(CborError::message(
+                    "CutExtend stream_id is present iff chain_kind is content",
+                ));
+            }
+            op.clone()
+        },
+        _ => op.clone(),
+    })
+}
+
+/// Serialize an ALREADY-canonical op (see [`canonicalize`]) to CBOR. Infallible — the cut arrays
+/// are pre-sorted-unique and every invariant has been checked, so the writers only emit bytes.
+fn encode_canonical(op: &AccountOp) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
     {
         let mut enc = Encoder::new(&mut buf);
@@ -274,7 +342,7 @@ pub(super) fn encode(op: &AccountOp) -> Vec<u8> {
                 enc.bytes(&device_fingerprint.to_bytes()).expect(INFALLIBLE);
                 control_cut.encode_into(&mut enc);
                 secrets_cut.encode_into(&mut enc);
-                encode_content_cuts(&mut enc, content_cuts);
+                write_content_cuts(&mut enc, content_cuts);
                 enc.str(reason).expect(INFALLIBLE);
             },
             AccountOp::OwnerPromote { device_fingerprint } => {
@@ -335,7 +403,7 @@ pub(super) fn encode(op: &AccountOp) -> Vec<u8> {
                 enc.bytes(&stream_id.to_bytes()).expect(INFALLIBLE);
                 enc.bytes(&grantee_account_id.to_bytes()).expect(INFALLIBLE);
                 enc.bytes(grant_id).expect(INFALLIBLE);
-                encode_device_cuts(&mut enc, device_cuts);
+                write_device_cuts(&mut enc, device_cuts);
                 enc.str(reason).expect(INFALLIBLE);
             },
             AccountOp::AccountReRoot { successor_account_id, note } => {
@@ -375,8 +443,9 @@ pub(super) fn decode(entry_type: u32, bytes: &[u8]) -> Result<DecodedAccountOp, 
         },
     };
     // Canonicity guarantee for a KNOWN op: the decoded value must re-encode to the exact wire (this
-    // rejects non-minimal ints, unsorted cut arrays, trailing bytes, etc. in one check).
-    if encode(&op) != bytes {
+    // rejects non-minimal ints, unsorted cut arrays, trailing bytes, etc. in one check). A decoded
+    // op already satisfies every invariant `canonicalize` checks, so the re-encode cannot fail.
+    if encode(&op)? != bytes {
         return Err(CborError::message("op payload is not canonical (re-encode differs)"));
     }
     Ok(DecodedAccountOp::Known(op))
@@ -522,16 +591,26 @@ fn validate_keys(ed25519: &[u8; 32], x25519: &[u8; 32]) -> Result<(), CborError>
     Ok(())
 }
 
-fn encode_content_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[ContentCut]) {
+/// Validate + canonicalize a content-cut array so it matches exactly what the sorted-unique decoder
+/// accepts: sort by stream_id, drop EXACT duplicates, reject two CONFLICTING cuts for one stream (a
+/// silent drop would lose a revocation, so this errors), and enforce the §18a bound.
+fn canonical_content_cuts(cuts: &[ContentCut]) -> Result<Vec<ContentCut>, CborError> {
     let mut sorted = cuts.to_vec();
     sorted.sort_by_key(|cut| cut.stream_id.to_bytes());
-    // Collapse EXACT-duplicate cuts (stable sort keeps them adjacent) so encode never emits a
-    // payload the sorted-unique decoder / peers would reject. Two DIFFERENT cuts for one
-    // stream_id remain a caller error the decoder rejects — the authoring path must supply one
-    // cut per stream.
     sorted.dedup();
-    enc.array(sorted.len() as u64).expect(INFALLIBLE);
-    for cut in &sorted {
+    if sorted.windows(2).any(|pair| pair[0].stream_id == pair[1].stream_id) {
+        return Err(CborError::message("content_cuts has conflicting entries for one stream_id"));
+    }
+    if sorted.len() > CONTENT_CUTS_MAX {
+        return Err(CborError::message("content_cuts exceeds the §18a bound"));
+    }
+    Ok(sorted)
+}
+
+/// Emit an ALREADY-canonical content-cut array (see [`canonical_content_cuts`]).
+fn write_content_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[ContentCut]) {
+    enc.array(cuts.len() as u64).expect(INFALLIBLE);
+    for cut in cuts {
         enc.array(3).expect(INFALLIBLE);
         enc.bytes(&cut.stream_id.to_bytes()).expect(INFALLIBLE);
         enc.u64(cut.seq).expect(INFALLIBLE);
@@ -561,14 +640,25 @@ fn decode_content_cuts(d: &mut Decoder<'_>) -> Result<Vec<ContentCut>, CborError
     Ok(cuts)
 }
 
-fn encode_device_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[DeviceCut]) {
+/// Validate + canonicalize a device-cut array (see [`canonical_content_cuts`]) — sort by
+/// device_fingerprint, drop exact duplicates, reject conflicting entries, enforce the §18a bound.
+fn canonical_device_cuts(cuts: &[DeviceCut]) -> Result<Vec<DeviceCut>, CborError> {
     let mut sorted = cuts.to_vec();
     sorted.sort_by_key(|cut| cut.device_fingerprint.to_bytes());
-    // Collapse EXACT-duplicate cuts (see `encode_content_cuts`) so encode output always
-    // round-trips.
     sorted.dedup();
-    enc.array(sorted.len() as u64).expect(INFALLIBLE);
-    for cut in &sorted {
+    if sorted.windows(2).any(|pair| pair[0].device_fingerprint == pair[1].device_fingerprint) {
+        return Err(CborError::message("device_cuts has conflicting entries for one device"));
+    }
+    if sorted.len() > DEVICE_CUTS_MAX {
+        return Err(CborError::message("device_cuts exceeds the §18a bound"));
+    }
+    Ok(sorted)
+}
+
+/// Emit an ALREADY-canonical device-cut array (see [`canonical_device_cuts`]).
+fn write_device_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[DeviceCut]) {
+    enc.array(cuts.len() as u64).expect(INFALLIBLE);
+    for cut in cuts {
         enc.array(3).expect(INFALLIBLE);
         enc.bytes(&cut.device_fingerprint.to_bytes()).expect(INFALLIBLE);
         enc.u64(cut.seq).expect(INFALLIBLE);
@@ -748,7 +838,7 @@ mod tests {
     }
 
     fn round_trip(op: &AccountOp) {
-        let bytes = encode(op);
+        let bytes = encode(op).unwrap();
         assert_eq!(decode(entry_type_of(op), &bytes).unwrap(), DecodedAccountOp::Known(op.clone()));
     }
 
@@ -761,58 +851,58 @@ mod tests {
 
     #[test]
     fn golden_account_genesis() {
-        assert_eq!(hex(&encode(&sample(entry_type::ACCOUNT_GENESIS))), "855820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c582013be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d50cccccccccccccccccccccccccccccccc1b0000018bcfe56800f6");
+        assert_eq!(hex(&encode(&sample(entry_type::ACCOUNT_GENESIS)).unwrap()), "855820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c582013be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d50cccccccccccccccccccccccccccccccc1b0000018bcfe56800f6");
     }
 
     #[test]
     fn golden_device_add() {
-        assert_eq!(hex(&encode(&sample(entry_type::DEVICE_ADD))), "855820fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff5522638895820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c582013be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d02666c6170746f70");
+        assert_eq!(hex(&encode(&sample(entry_type::DEVICE_ADD)).unwrap()), "855820fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff5522638895820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c582013be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d02666c6170746f70");
     }
 
     #[test]
     fn golden_device_remove() {
-        assert_eq!(hex(&encode(&sample(entry_type::DEVICE_REMOVE))), "855820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb820358201111111111111111111111111111111111111111111111111111111111111111f68183582033333333333333333333333333333333333333333333333333333333333333330758204444444444444444444444444444444444444444444444444444444444444444646c656674");
+        assert_eq!(hex(&encode(&sample(entry_type::DEVICE_REMOVE)).unwrap()), "855820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb820358201111111111111111111111111111111111111111111111111111111111111111f68183582033333333333333333333333333333333333333333333333333333333333333330758204444444444444444444444444444444444444444444444444444444444444444646c656674");
     }
 
     #[test]
     fn golden_owner_promote() {
         assert_eq!(
-            hex(&encode(&sample(entry_type::OWNER_PROMOTE))),
+            hex(&encode(&sample(entry_type::OWNER_PROMOTE)).unwrap()),
             "815820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
     }
 
     #[test]
     fn golden_owner_demote() {
-        assert_eq!(hex(&encode(&sample(entry_type::OWNER_DEMOTE))), "855820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb58205555555555555555555555555555555555555555555555555555555555555555820258206666666666666666666666666666666666666666666666666666666666666666f66764656d6f746564");
+        assert_eq!(hex(&encode(&sample(entry_type::OWNER_DEMOTE)).unwrap()), "855820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb58205555555555555555555555555555555555555555555555555555555555555555820258206666666666666666666666666666666666666666666666666666666666666666f66764656d6f746564");
     }
 
     #[test]
     fn golden_cut_extend() {
-        assert_eq!(hex(&encode(&sample(entry_type::CUT_EXTEND))), "8700f6582077777777777777777777777777777777777777777777777777777777777777775820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0958208888888888888888888888888888888888888888888888888888888888888888");
+        assert_eq!(hex(&encode(&sample(entry_type::CUT_EXTEND)).unwrap()), "8700f6582077777777777777777777777777777777777777777777777777777777777777775820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0958208888888888888888888888888888888888888888888888888888888888888888");
     }
 
     #[test]
     fn golden_stream_own() {
         assert_eq!(
-            hex(&encode(&sample(entry_type::STREAM_OWN))),
+            hex(&encode(&sample(entry_type::STREAM_OWN)).unwrap()),
             "825820333333333333333333333333333333333333333333333333333333333333333343850102"
         );
     }
 
     #[test]
     fn golden_stream_grant() {
-        assert_eq!(hex(&encode(&sample(entry_type::STREAM_GRANT))), "83582033333333333333333333333333333333333333333333333333333333333333335820999999999999999999999999999999999999999999999999999999999999999902");
+        assert_eq!(hex(&encode(&sample(entry_type::STREAM_GRANT)).unwrap()), "83582033333333333333333333333333333333333333333333333333333333333333335820999999999999999999999999999999999999999999999999999999999999999902");
     }
 
     #[test]
     fn golden_stream_revoke() {
-        assert_eq!(hex(&encode(&sample(entry_type::STREAM_REVOKE))), "8558203333333333333333333333333333333333333333333333333333333333333333582099999999999999999999999999999999999999999999999999999999999999995820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa81835820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb18295820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc677265766f6b6564");
+        assert_eq!(hex(&encode(&sample(entry_type::STREAM_REVOKE)).unwrap()), "8558203333333333333333333333333333333333333333333333333333333333333333582099999999999999999999999999999999999999999999999999999999999999995820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa81835820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb18295820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc677265766f6b6564");
     }
 
     #[test]
     fn golden_account_reroot() {
-        assert_eq!(hex(&encode(&sample(entry_type::ACCOUNT_REROOT))), "825820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd6b636f6d70726f6d69736564");
+        assert_eq!(hex(&encode(&sample(entry_type::ACCOUNT_REROOT)).unwrap()), "825820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd6b636f6d70726f6d69736564");
     }
 
     #[test]
@@ -959,10 +1049,104 @@ mod tests {
             reason: "revoked".to_string(),
         };
         // The duplicate encodes to the same bytes as the single, and round-trips to the single.
-        assert_eq!(encode(&doubled), encode(&single), "exact-duplicate cuts collapse on encode");
         assert_eq!(
-            decode(entry_type::STREAM_REVOKE, &encode(&doubled)).unwrap(),
+            encode(&doubled).unwrap(),
+            encode(&single).unwrap(),
+            "exact-duplicate cuts collapse on encode"
+        );
+        assert_eq!(
+            decode(entry_type::STREAM_REVOKE, &encode(&doubled).unwrap()).unwrap(),
             DecodedAccountOp::Known(single),
         );
+    }
+
+    fn revoke_with(device_cuts: Vec<DeviceCut>) -> AccountOp {
+        AccountOp::StreamRevoke {
+            stream_id: stream(0x33),
+            grantee_account_id: account(0x99),
+            grant_id: [0xaa; 32],
+            device_cuts,
+            reason: "r".to_string(),
+        }
+    }
+
+    #[test]
+    fn encode_rejects_conflicting_and_over_bound_cuts() {
+        // Two DIFFERENT cuts for one device ⇒ encode errors (a silent drop would lose a
+        // revocation).
+        let conflicting = revoke_with(vec![
+            DeviceCut {
+                device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
+                seq: 1,
+                hash: [0x01; 32],
+            },
+            DeviceCut {
+                device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
+                seq: 2,
+                hash: [0x02; 32],
+            },
+        ]);
+        assert!(encode(&conflicting).is_err(), "conflicting device_cuts rejected at encode");
+
+        // DEVICE_CUTS_MAX + 1 DISTINCT cuts ⇒ encode errors (decode would reject them too).
+        let many: Vec<DeviceCut> = (0..=DEVICE_CUTS_MAX as u32)
+            .map(|i| {
+                let mut fp = [0u8; 32];
+                fp[..4].copy_from_slice(&i.to_be_bytes());
+                DeviceCut {
+                    device_fingerprint: DeviceFingerprint::from_bytes(fp),
+                    seq: 1,
+                    hash: [0u8; 32],
+                }
+            })
+            .collect();
+        assert!(encode(&revoke_with(many)).is_err(), "over-bound device_cuts rejected at encode");
+    }
+
+    #[test]
+    fn encode_derives_the_device_add_fingerprint_and_validates_keys() {
+        // A DeviceAdd carrying a WRONG fingerprint encodes to the same bytes as the derived-fp op,
+        // and round-trips to the derived one — a stale/placeholder fp can never be signed.
+        let wrong = AccountOp::DeviceAdd {
+            device_fingerprint: DeviceFingerprint::from_bytes([0x00; 32]),
+            ed25519_pubkey: ed25519(),
+            x25519_pubkey: x25519(),
+            role: DeviceRole::Owner,
+            label: Some("laptop".to_string()),
+        };
+        let derived = sample(entry_type::DEVICE_ADD); // fingerprint == sha256(ed25519())
+        assert_eq!(
+            encode(&wrong).unwrap(),
+            encode(&derived).unwrap(),
+            "fingerprint is derived, not trusted"
+        );
+        assert_eq!(
+            decode(entry_type::DEVICE_ADD, &encode(&wrong).unwrap()).unwrap(),
+            DecodedAccountOp::Known(derived),
+        );
+        // An identity X25519 key ⇒ encode errors (validate_keys, mirroring decode).
+        let bad_key = AccountOp::DeviceAdd {
+            device_fingerprint: founder_fp(),
+            ed25519_pubkey: ed25519(),
+            x25519_pubkey: [0u8; 32],
+            role: DeviceRole::Owner,
+            label: None,
+        };
+        assert!(encode(&bad_key).is_err(), "identity x25519 key rejected at encode");
+    }
+
+    #[test]
+    fn encode_rejects_a_cut_extend_coupling_violation() {
+        // Content kind without a stream_id ⇒ encode errors, matching the decode-side rejection.
+        let bad = AccountOp::CutExtend {
+            chain_kind: ChainKind::Content,
+            stream_id: None,
+            incarnation_id: None,
+            subject_account_id: account(0xaa),
+            device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
+            new_seq: 1,
+            new_entry_hash: [0x88; 32],
+        };
+        assert!(encode(&bad).is_err(), "content CutExtend without stream_id rejected at encode");
     }
 }

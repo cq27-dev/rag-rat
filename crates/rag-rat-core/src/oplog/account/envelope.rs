@@ -89,7 +89,7 @@ pub(super) fn sign_account_entry(
     secret: &DeviceSecret,
     header: &AccountEntryHeader,
     payload: &[u8],
-) -> SignedAccountEntry {
+) -> anyhow::Result<SignedAccountEntry> {
     // The signing key IS the author device: derive `device_fingerprint` from `secret` rather than
     // trusting the caller-supplied field. A `debug_assert` would be compiled out in release and let
     // a release-build authoring bug ship a self-invalid entry; overwriting is a structural
@@ -98,10 +98,18 @@ pub(super) fn sign_account_entry(
     header.device_fingerprint = secret.public().fingerprint();
     let header_bytes = encode_header(&header);
     let body_bytes = encode_body(&header_bytes, payload);
-    let entry_hash = cbor::sha256(&body_bytes);
     let signature = secret.sign(&body_bytes);
     let signed_bytes = encode_signed(&body_bytes, &signature);
-    SignedAccountEntry {
+    // Refuse to emit an over-§18a-limit entry: `decode_account_signed` rejects those exact bytes,
+    // so the authoring path must not sign something peers (and its own re-decode) would refuse.
+    if signed_bytes.len() > ACCOUNT_ENVELOPE_MAX_BYTES {
+        anyhow::bail!(
+            "account entry is {} bytes, over the {ACCOUNT_ENVELOPE_MAX_BYTES}-byte §18a limit",
+            signed_bytes.len(),
+        );
+    }
+    let entry_hash = cbor::sha256(&body_bytes);
+    Ok(SignedAccountEntry {
         header,
         payload: payload.to_vec(),
         signature,
@@ -109,7 +117,7 @@ pub(super) fn sign_account_entry(
         body_bytes,
         signed_bytes,
         entry_hash,
-    }
+    })
 }
 
 /// Decode a signed account entry, STRUCTURE only (no signature check — that is
@@ -344,7 +352,7 @@ mod tests {
     fn account_signed_pins_the_envelope() {
         // Frozen primitive: the signature, entry_hash, and chain all build on these bytes; a
         // canonical-rule change must break this and force a deliberate domain bump.
-        let signed = sign_account_entry(&secret(), &genesis_header(), &payload());
+        let signed = sign_account_entry(&secret(), &genesis_header(), &payload()).unwrap();
         assert_eq!(
             hex(&signed.body_bytes),
             "8258678d777261672d7261742f6163636f756e742d656e7472792f315820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa005820fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff55226388900f6f600010000f6f6458501020304",
@@ -359,7 +367,7 @@ mod tests {
 
     #[test]
     fn header_bytes_have_the_expected_13_part_structure() {
-        let signed = sign_account_entry(&secret(), &genesis_header(), &payload());
+        let signed = sign_account_entry(&secret(), &genesis_header(), &payload()).unwrap();
         let h = &signed.header_bytes;
         assert_eq!(h[0], 0x8d, "13-element array header");
         assert_eq!(h[1], 0x77, "text header, len 23");
@@ -384,7 +392,7 @@ mod tests {
 
     #[test]
     fn body_wraps_header_and_payload_as_bstrs() {
-        let signed = sign_account_entry(&secret(), &genesis_header(), &payload());
+        let signed = sign_account_entry(&secret(), &genesis_header(), &payload()).unwrap();
         let b = &signed.body_bytes;
         assert_eq!(b[0], 0x82, "2-element array (header, payload)");
         assert_eq!(b[1], 0x58, "header bstr header (1-byte len)");
@@ -401,7 +409,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_verify() {
-        let signed = sign_account_entry(&secret(), &genesis_header(), &payload());
+        let signed = sign_account_entry(&secret(), &genesis_header(), &payload()).unwrap();
         let verified =
             verify_account_signed(&signed.signed_bytes, &secret().public()).expect("verifies");
         assert_eq!(verified.header, genesis_header());
@@ -415,7 +423,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_the_wrong_key_and_a_fingerprint_mismatch() {
-        let signed = sign_account_entry(&secret(), &genesis_header(), &payload());
+        let signed = sign_account_entry(&secret(), &genesis_header(), &payload()).unwrap();
         let wrong = DeviceSecret::from_seed(&[9u8; 32]).public();
         assert!(verify_account_signed(&signed.signed_bytes, &wrong).is_err(), "wrong key");
 
@@ -445,7 +453,7 @@ mod tests {
         // Every byte of the wire is load-bearing: flipping one in the outer frame / domain / body
         // bstr header breaks the structural decode, and flipping one in the body or signature
         // breaks the signature. So verification must fail no matter which byte is flipped.
-        let signed = sign_account_entry(&secret(), &genesis_header(), &payload());
+        let signed = sign_account_entry(&secret(), &genesis_header(), &payload()).unwrap();
         for index in 0..signed.signed_bytes.len() {
             let mut wire = signed.signed_bytes.clone();
             wire[index] ^= 0x01;
@@ -458,7 +466,7 @@ mod tests {
 
     #[test]
     fn structural_rejections() {
-        let good = sign_account_entry(&secret(), &genesis_header(), &payload());
+        let good = sign_account_entry(&secret(), &genesis_header(), &payload()).unwrap();
         // Trailing bytes.
         let mut trailing = good.signed_bytes.clone();
         trailing.push(0x00);
@@ -476,26 +484,26 @@ mod tests {
         let mut bad_prev = genesis_header();
         bad_prev.seq = 5;
         bad_prev.prev_hash = None;
-        let signed = sign_account_entry(&secret(), &bad_prev, &payload());
+        let signed = sign_account_entry(&secret(), &bad_prev, &payload()).unwrap();
         assert!(decode_account_signed(&signed.signed_bytes).is_err(), "seq>0 needs prev_hash");
 
         // seq 0 with a non-null prev_hash is rejected.
         let mut bad_genesis = genesis_header();
         bad_genesis.prev_hash = Some([0x11; 32]);
-        let signed = sign_account_entry(&secret(), &bad_genesis, &payload());
+        let signed = sign_account_entry(&secret(), &bad_genesis, &payload()).unwrap();
         assert!(decode_account_signed(&signed.signed_bytes).is_err(), "genesis has no prev_hash");
 
         // crypto_suite 0 (plaintext) with a non-null key_id is rejected (§15).
         let mut bad_key = genesis_header();
         bad_key.key_id = Some([0x22; 32]);
-        let signed = sign_account_entry(&secret(), &bad_key, &payload());
+        let signed = sign_account_entry(&secret(), &bad_key, &payload()).unwrap();
         assert!(decode_account_signed(&signed.signed_bytes).is_err(), "plaintext has no key_id");
 
         // crypto_suite 1 (sealed) with a null key_id is rejected.
         let mut bad_sealed = genesis_header();
         bad_sealed.crypto_suite = 1;
         bad_sealed.key_id = None;
-        let signed = sign_account_entry(&secret(), &bad_sealed, &payload());
+        let signed = sign_account_entry(&secret(), &bad_sealed, &payload()).unwrap();
         assert!(decode_account_signed(&signed.signed_bytes).is_err(), "sealed needs a key_id");
     }
 
@@ -503,14 +511,25 @@ mod tests {
     fn header_aad_is_the_header_content_not_the_payload() {
         // Same header, different payload ⇒ identical AAD (the header bytes); the payload is not in
         // it.
-        let a = sign_account_entry(&secret(), &genesis_header(), &payload());
-        let b = sign_account_entry(&secret(), &genesis_header(), &[0xff, 0xfe]);
+        let a = sign_account_entry(&secret(), &genesis_header(), &payload()).unwrap();
+        let b = sign_account_entry(&secret(), &genesis_header(), &[0xff, 0xfe]).unwrap();
         assert_eq!(header_aad(&a), header_aad(&b), "AAD is independent of the payload");
         assert_eq!(header_aad(&a), a.header_bytes.as_slice(), "AAD is the header content bytes");
         // A changed header field changes the AAD.
         let mut other = genesis_header();
         other.auth_len = 9;
-        let c = sign_account_entry(&secret(), &other, &payload());
+        let c = sign_account_entry(&secret(), &other, &payload()).unwrap();
         assert_ne!(header_aad(&a), header_aad(&c), "a header change changes the AAD");
+    }
+
+    #[test]
+    fn sign_refuses_an_over_size_entry() {
+        // A payload large enough to push the signed entry over the §18a limit is refused rather
+        // than signed — `decode_account_signed` would reject those exact bytes.
+        let huge = vec![0u8; ACCOUNT_ENVELOPE_MAX_BYTES];
+        assert!(
+            sign_account_entry(&secret(), &genesis_header(), &huge).is_err(),
+            "an over-§18a-limit entry must not be signed",
+        );
     }
 }
