@@ -29,7 +29,7 @@ import spawn from "cross-spawn";
 const SOURCE = "https://github.com/cq27-dev/rag-rat/tree/main/.agents/skills";
 
 /** rag-rat's own skills — used to scope destructive/refresh subcommands to ONLY these. */
-const RAG_RAT_SKILLS = ["using-rag-rat", "dream-review"];
+const RAG_RAT_SKILLS = ["using-rag-rat", "dream-review", "init-rag-rat"];
 
 /** "install" verbs — mapped to `skills add <SOURCE>`. Includes every upstream `add` alias. */
 const INSTALL = new Set(["add", "install", "i", "a"]);

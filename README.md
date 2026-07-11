@@ -124,7 +124,8 @@ npx @rag-rat/skills
 ```
 
 That installs **`using-rag-rat`** (reach for the MCP tools before grep; record durable findings as
-memories) and **`dream-review`** (triage the memory-maintenance worklist). See
+memories), **`dream-review`** (triage the memory-maintenance worklist), and **`init-rag-rat`** (set
+up a not-yet-indexed repo conversationally — scan, choose an embedding backend, index, restart). See
 [`skills/README.md`](skills/README.md) for `update` / `list` / `remove` and per-agent flags.
 
 Manual setup and every config knob live in [`docs/config.md`](docs/config.md). For a large repo where

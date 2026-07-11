@@ -51,11 +51,19 @@ for (const file of VERSION_FILES) {
   }
 }
 
-// 2) The pinned MCP binary `@rag-rat/bin@<version>` in the npx launch args — pinned (not `@latest`)
-// so an installed plugin never launches a binary newer than its bundled hooks/skills/manifest, and
-// must track the same version. Both the Claude manifest and the Codex `.mcp.json` carry the pin.
-const PIN_FILES = ["plugin/.claude-plugin/plugin.json", "plugin/.mcp.json"];
-const pinRe = /(@rag-rat\/bin@)[^"]*/g;
+// 2) The pinned `@rag-rat/bin@<version>` npx invocations — pinned (not `@latest`) so an installed
+// plugin never launches a binary newer than its bundled hooks/skills/manifest, and must track the
+// same version. Carried by the Claude manifest, the Codex `.mcp.json`, and the init-rag-rat skill's
+// documented CLI command (both its source and shipped copy).
+const PIN_FILES = [
+  "plugin/.claude-plugin/plugin.json",
+  "plugin/.mcp.json",
+  ".agents/skills/init-rag-rat/SKILL.md",
+  "plugin/skills/init-rag-rat/SKILL.md",
+];
+// The version token is word chars / `.` / `+` / `-`, so the match stops at a quote (JSON) or
+// whitespace (the skill's markdown) — one regex fits both contexts.
+const pinRe = /(@rag-rat\/bin@)[\w.+-]*/g;
 for (const file of PIN_FILES) {
   const src = readFileSync(file, "utf8");
   if (!src.includes("@rag-rat/bin@")) fail(`no @rag-rat/bin@<version> pin in ${file}`);
