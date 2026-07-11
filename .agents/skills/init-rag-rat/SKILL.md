@@ -27,13 +27,14 @@ hand-write a config blind, and let a real config load re-check it before indexin
    already exists, this is a *reconfigure* — send the user to the interactive `rag-rat init` wizard
    and stop.
 
-2. **Resolve the CLI** and use the same form throughout, from the **target repo's root**. Match the
-   version the rag-rat MCP server runs, so the index you create is one the server can read — do
-   **not** use `@latest`:
-   - `rag-rat …` if it is on `PATH`;
-   - otherwise `npx -y @rag-rat/bin@0.16.0 …` (the plugin pins `@rag-rat/bin` to its own version and
-     caches the binary privately, so `rag-rat` is often not on `PATH`; `npx` runs it in the current
-     directory).
+2. **Resolve the CLI** and use the same form throughout, from the **target repo's root**. It must
+   match the version the rag-rat MCP server runs, so the index you create is one the server can read —
+   do **not** use `@latest`, and **don't blindly trust an on-`PATH` `rag-rat`**:
+   - If `rag-rat` is on `PATH`, check `rag-rat --version` and use it **only if it matches** the
+     plugin/MCP version — a stale global install would build the index with the wrong binary.
+   - Otherwise (or on a version mismatch) use `npx -y @rag-rat/bin@0.16.0 …` — the plugin pins
+     `@rag-rat/bin` to its own version and caches the binary privately, so this is the
+     version-matched CLI; `npx` runs it in the current directory.
 
 3. **Dry-run discovery.** `<rag-rat> init --yes --dry-run` scans the repo and prints the
    auto-detected config (languages, path bindings, the default local FastEmbed backend) **without
@@ -56,32 +57,35 @@ hand-write a config blind, and let a real config load re-check it before indexin
    - **`references/ephemeral-providers.md`** — provision an ephemeral Modal/RunPod GPU worker
      (cookbook); GPU classes, the cost/trust boundary, and the local+cloud hybrid.
 
-6. **Preview and confirm.** The two paths apply differently — pick one and confirm with the user
-   before writing anything:
-   - **FastEmbed (default):** `<rag-rat> init --yes` writes `rag-rat.toml` **and runs the initial
-     index in one step.** Preview it first with `<rag-rat> init --yes --dry-run` if the user wants to
-     see the config. No hand-editing, and **no separate index step** (step 7 does not re-index).
+6. **Preview and confirm.** Pick the path and confirm with the user before writing anything. Neither
+   installs git hooks — that's a separate, consented step (step 7).
+   - **FastEmbed (default):** `<rag-rat> init --yes --no-hooks` writes `rag-rat.toml`, installs the
+     model, and builds the initial index **and embeddings** in one step. `--no-hooks` is what keeps
+     hook install a separate ask — plain `init --yes` would install the git hooks immediately. Preview
+     first with `<rag-rat> init --yes --dry-run` if the user wants to see the config. No hand-editing,
+     and **no separate index/reconcile step** for this path.
    - **Custom remote backend:** take the base from `<rag-rat> init --yes --dry-run` (which writes
      nothing), add the `[llm.embedding.remote]` block from step 5, show the final config, and write
      `rag-rat.toml` only after the user confirms.
 
-7. **Index (custom path only), decide on the git hooks, then restart.**
-   - **FastEmbed:** the index already ran in step 6 — **do not run `index --discover` again.**
+7. **Index + embed (custom path only), decide on the git hooks, then restart.**
+   - **FastEmbed:** step 6 already indexed **and embedded** — **do not re-run.**
    - **Custom remote backend:** validate the written config by loading it — `<rag-rat> doctor` fails
-     loudly on a bad block (dim mismatch, `gpu` with `endpoint`, missing `query_endpoint`, …) — then
-     index **once**: `<rag-rat> index --discover`. (Never index with FastEmbed and then re-embed
-     remotely — configure first, index once.)
-   - **Git maintenance hooks — ask first.** rag-rat can install managed
-     `post-checkout` / `post-merge` / `post-rewrite` / `post-commit` hooks that keep the index fresh
-     automatically as the repo changes (without them it drifts between manual reindexes). They modify
-     the repo's `.git/hooks`, so **ask the user before enabling them** — don't install silently.
-     - If they agree: `<rag-rat> hooks install` — idempotent, and it **never clobbers a foreign hook**
-       (if a non-rag-rat hook occupies a slot it errors "move it aside or merge manually"; surface
-       that and move on).
-     - If they decline: `<rag-rat> hooks uninstall` — the FastEmbed path's `init --yes` installs the
-       hooks by default, so run this to honor a "no"; on the custom path nothing was installed, so
-       it's a no-op.
-     - Skip entirely if the repo isn't a git worktree.
+     loudly on a bad block (dim mismatch, `gpu` with `endpoint`, missing `query_endpoint`, …). Then
+     run **two commands, in order**:
+     1. `<rag-rat> index --discover` — builds the source/chunk rows. This does **not** compute
+        embeddings.
+     2. `<rag-rat> reconcile` — the embedding backfill: it computes the vectors over the configured
+        remote backend (provisioning the ephemeral box if the config uses `cookbook`). **Skip it and
+        the repo has no semantic-search vectors** until a later maintenance pass — always run it
+        before declaring setup complete.
+   - **Git maintenance hooks — ask, then install.** rag-rat can install managed
+     `post-checkout` / `post-merge` / `post-rewrite` / `post-commit` hooks that keep the index fresh as
+     the repo changes. They modify `.git/hooks`, so **ask the user** — nothing above installed them
+     (the FastEmbed path ran with `--no-hooks`). If they agree: `<rag-rat> hooks install` — idempotent,
+     and it **never clobbers a foreign hook** (if a non-rag-rat hook occupies a slot it errors "move
+     it aside or merge manually"; surface that and move on). If they decline, or it isn't a git
+     worktree, skip it — nothing to undo.
    - **Then restart the rag-rat MCP server** in the agent. A dormant server does not self-activate
      (that would be a half-active server without the watcher and hook listener). After restart it
      discovers `rag-rat.toml`, starts fully active, and ordinary tools work against the new index.
