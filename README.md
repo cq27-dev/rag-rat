@@ -157,7 +157,7 @@ codex plugin add rag-rat@rag-rat
 ```
 
 Then **just ask your agent to set the repo up** — the plugin ships the `init-rag-rat` skill, so it
-scans the repo, picks an embedding backend, writes `rag-rat.toml`, runs the first index, and tells you
+scans the repo, picks an embedding backend, writes `rag-rat.toml`, indexes, installs the git hooks, and tells you
 to reconnect — conversationally. For example:
 
 > Set up rag-rat in this repo.
