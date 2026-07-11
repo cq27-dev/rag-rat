@@ -488,6 +488,16 @@ mod tests {
         }
     }
 
+    fn device_remove(dev: &Dev, control_cut: super::super::cut::Cut) -> AccountOp {
+        AccountOp::DeviceRemove {
+            device_fingerprint: dev.fp,
+            control_cut,
+            secrets_cut: super::super::cut::Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        }
+    }
+
     fn status(conn: &Connection, hash: &[u8; 32]) -> Option<String> {
         entry_status(conn, hash).unwrap().map(|(s, _)| s)
     }
@@ -589,6 +599,58 @@ mod tests {
         let pending: i64 =
             conn.query_row("SELECT COUNT(*) FROM account_pre_verify", [], |r| r.get(0)).unwrap();
         assert_eq!(pending, 0, "the pre-verify queue is drained");
+    }
+
+    #[test]
+    fn a_cut_promotes_its_named_branch_regardless_of_arrival_order_p8() {
+        // B equivocates at seq 0 (two heads b0a/b0b). A DeviceRemove(B) names b0b as its watermark:
+        // the register condemns the OFF-branch head (b0a) and keeps b0b — promoting the cut's
+        // chosen branch over the unforced-fork hash tiebreak. The verdict is identical
+        // whichever head (or the cut) arrives first (P8 arrival-independence, I10a holds
+        // throughout).
+        for order in 0..3u8 {
+            let conn = db();
+            let founder = Dev::new(1);
+            let (acct, gbytes, gh) = genesis(&founder);
+            let b = Dev::new(2);
+            let (add_bytes, add_b) =
+                op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+            // B's two equivocating seq-0 heads (each adds a throwaway member so they differ).
+            let (t8, t9) = (Dev::new(8), Dev::new(9));
+            let (b0a_bytes, b0a) =
+                op(acct, &b, 0, None, Some(add_b), &device_add(&t8, DeviceRole::Member));
+            let (b0b_bytes, b0b) =
+                op(acct, &b, 0, None, Some(add_b), &device_add(&t9, DeviceRole::Member));
+            // The founder removes B, watermark = b0b (keep b0b's branch).
+            let (rm_bytes, _rm) = op(
+                acct,
+                &founder,
+                2,
+                Some(add_b),
+                Some(gh),
+                &device_remove(&b, super::super::cut::Cut::At { seq: 0, hash: b0b }),
+            );
+
+            // Ingest genesis + add_b first (so B resolves), then the three in a rotated order.
+            account_ingest(&conn, &gbytes, NOW).unwrap();
+            account_ingest(&conn, &add_bytes, NOW).unwrap();
+            let mut rest = [&b0a_bytes, &b0b_bytes, &rm_bytes];
+            rest.rotate_left(order as usize);
+            for bytes in rest {
+                account_ingest(&conn, bytes, NOW).unwrap();
+            }
+
+            assert_eq!(
+                status(&conn, &b0b).as_deref(),
+                Some("accepted"),
+                "the cut-named branch b0b is accepted (order {order})",
+            );
+            assert_eq!(
+                status(&conn, &b0a).as_deref(),
+                Some("condemned"),
+                "the off-branch head b0a is condemned (order {order})",
+            );
+        }
     }
 
     #[test]
