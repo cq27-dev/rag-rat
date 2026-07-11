@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.16.0...rag-rat-core-v0.17.0) - 2026-07-11
+
+### Added
+
+- *(plugin)* one-step plugin for Claude Code + Codex — MCP via npx, harness-neutral hooks ([#569](https://github.com/cq27-dev/rag-rat/pull/569))
+- *(account)* the stratified control-log fold (§11–§12) ([#622](https://github.com/cq27-dev/rag-rat/pull/622))
+- *(dist)* ship an android/Termux binary + make npx @rag-rat/bin work there ([#616](https://github.com/cq27-dev/rag-rat/pull/616)) ([#621](https://github.com/cq27-dev/rag-rat/pull/621))
+- *(account)* sync phase C1 wire/crypto layer + fold foundation ([#618](https://github.com/cq27-dev/rag-rat/pull/618))
+- *(doctor)* reclaim freelist dead space with `doctor --vacuum` ([#574](https://github.com/cq27-dev/rag-rat/pull/574)) ([#613](https://github.com/cq27-dev/rag-rat/pull/613))
+
+### Fixed
+
+- *(mcp)* boot a dormant server outside a rag-rat repo instead of dying ([#603](https://github.com/cq27-dev/rag-rat/pull/603)) ([#611](https://github.com/cq27-dev/rag-rat/pull/611))
+
 ## [0.16.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.15.0...rag-rat-core-v0.16.0) - 2026-07-10
 
 ### Added
