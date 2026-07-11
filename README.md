@@ -147,8 +147,10 @@ codex plugin marketplace add cq27-dev/rag-rat
 codex plugin add rag-rat@rag-rat
 ```
 
-Then run `rag-rat init` once in each repo you want indexed (see [Quickstart](#quickstart)); the
-server stays dormant until a repo has a `rag-rat.toml`.
+Then initialize each repo you want indexed with `npx -y @rag-rat/bin init` — the plugin caches its
+binary privately, so `rag-rat` isn't on your `PATH`; run the CLI through npx (or `npm i -g
+@rag-rat/bin`). See [Quickstart](#quickstart). The server stays dormant until a repo has a
+`rag-rat.toml`.
 
 Claude Code asks once per tool before it first runs a rag-rat MCP tool (its standard MCP consent — a
 plugin can't pre-approve its own tools). To allow them all up front, choose "Yes, don't ask again" on

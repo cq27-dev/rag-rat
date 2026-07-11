@@ -159,8 +159,7 @@ if (npxBin) return run(npxBin);
 // ---- 3) PATH rag-rat, only if it matches the declared version ------------------------------------
 const onPath = which(bin);
 if (onPath) {
-  const r = spawnSync(onPath, ["--version"], { encoding: "utf8" });
-  const v = r.status === 0 ? (r.stdout.match(/rag-rat\s+([0-9][^\s]*)/) || [])[1] : "";
+  const v = readBinVersion(onPath);
   if (v === VERSION) return run(onPath);
   if (v) log(`PATH rag-rat is ${v}, plugin wants ${VERSION} — fetching the matched build`);
 }
@@ -234,9 +233,18 @@ function which(name) {
   }
   return null;
 }
+// `rag-rat --version` → the bare version string, or "" if it can't run / parse. A resolved binary is
+// only reused when this EXACTLY matches the plugin's declared VERSION, so a stale cache/PATH entry
+// (e.g. an @rag-rat/bin cached before a rename) is never silently invoked with the wrong subcommands.
+function readBinVersion(p) {
+  const r = spawnSync(p, ["--version"], { encoding: "utf8" });
+  return r.status === 0 ? (r.stdout.match(/rag-rat\s+([0-9][^\s]*)/) || [])[1] || "" : "";
+}
 function npxCachedBin() {
-  // npm stages `npx @rag-rat/bin@latest` under <npm cache>/_npx/<hash>/…/@rag-rat/bin/node_modules/
-  // .bin_real/<bin> — the platform binary @rag-rat/bin downloaded. Reuse whichever hash has it.
+  // npm stages `npx @rag-rat/bin@<version>` under <npm cache>/_npx/<hash>/…/@rag-rat/bin/node_modules/
+  // .bin_real/<bin> — the platform binary @rag-rat/bin downloaded. Reuse whichever hash has a
+  // VERSION-matched binary; a stale hash (an older @rag-rat/bin cached under a prior `@latest`
+  // install, e.g. from before a rename) is skipped rather than invoked with the wrong subcommands.
   const npmCache = process.env.npm_config_cache || path.join(os.homedir(), ".npm");
   let hashes;
   try {
@@ -246,7 +254,7 @@ function npxCachedBin() {
   }
   for (const h of hashes) {
     const p = path.join(npmCache, "_npx", h, "node_modules", "@rag-rat", "bin", "node_modules", ".bin_real", bin);
-    if (isExecutable(p)) return p;
+    if (isExecutable(p) && readBinVersion(p) === VERSION) return p;
   }
   return null;
 }

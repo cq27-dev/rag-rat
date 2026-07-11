@@ -30,22 +30,39 @@ function fail(msg) {
 }
 
 const VERSION = workspaceVersion();
-// Each manifest has exactly one "version" field; rewrite it surgically to preserve formatting.
-const FILES = [
+let changed = 0;
+
+// 1) The manifests' `"version"` field — each has exactly one; rewrite it surgically to preserve
+// formatting.
+const VERSION_FILES = [
   ".claude-plugin/marketplace.json",
   "plugin/.claude-plugin/plugin.json",
   "plugin/.codex-plugin/plugin.json",
 ];
 const versionRe = /("version"\s*:\s*)"[^"]*"/;
-
-let changed = 0;
-for (const file of FILES) {
+for (const file of VERSION_FILES) {
   const src = readFileSync(file, "utf8");
   if (!versionRe.test(src)) fail(`no "version" field in ${file}`);
   const out = src.replace(versionRe, `$1"${VERSION}"`);
   if (out !== src) {
     writeFileSync(file, out);
-    console.error(`sync-plugin-version: ${file} → ${VERSION}`);
+    console.error(`sync-plugin-version: ${file} version → ${VERSION}`);
+    changed++;
+  }
+}
+
+// 2) The pinned MCP binary `@rag-rat/bin@<version>` in the npx launch args — pinned (not `@latest`)
+// so an installed plugin never launches a binary newer than its bundled hooks/skills/manifest, and
+// must track the same version. Both the Claude manifest and the Codex `.mcp.json` carry the pin.
+const PIN_FILES = ["plugin/.claude-plugin/plugin.json", "plugin/.mcp.json"];
+const pinRe = /(@rag-rat\/bin@)[^"]*/g;
+for (const file of PIN_FILES) {
+  const src = readFileSync(file, "utf8");
+  if (!src.includes("@rag-rat/bin@")) fail(`no @rag-rat/bin@<version> pin in ${file}`);
+  const out = src.replace(pinRe, `$1${VERSION}`);
+  if (out !== src) {
+    writeFileSync(file, out);
+    console.error(`sync-plugin-version: ${file} pin → @rag-rat/bin@${VERSION}`);
     changed++;
   }
 }

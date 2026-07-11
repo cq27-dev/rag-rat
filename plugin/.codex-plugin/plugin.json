@@ -8,5 +8,6 @@
   "license": "MIT",
   "keywords": ["mcp", "code-intelligence", "semantic-search", "code-graph", "repo-memory"],
   "mcpServers": "./.mcp.json",
-  "skills": "./skills/"
+  "skills": "./skills/",
+  "hooks": "./.codex-plugin/hooks/hooks.json"
 }
