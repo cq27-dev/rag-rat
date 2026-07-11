@@ -355,7 +355,10 @@ fn register_verdict(
 ) -> RegisterVerdict {
     let mut off_branch = false;
     let mut beyond_cut = false;
-    let mut park: Option<ParkReason> = None;
+    // Track the park CAUSES as flags (not a last-write-wins var) — `registers` iterates in random
+    // HashMap order, so a fixed precedence keeps the observable ParkReason deterministic (I9).
+    let mut park_unknown_target = false;
+    let mut park_incomplete = false;
     for (key, cut) in registers {
         if !key.scopes(c.header()) {
             continue;
@@ -367,19 +370,20 @@ fn register_verdict(
         match candidate::ancestry(&c.hash(), cut, view) {
             Ancestry::OnBranch => {}, // within-cut on the accepted branch: this register admits it
             Ancestry::OffBranch => off_branch = true,
-            Ancestry::Unknown(cause) =>
-                park = Some(match cause {
-                    UnknownCause::UnknownCutTarget => ParkReason::UnknownCutTarget,
-                    UnknownCause::IncompleteCutAncestry => ParkReason::IncompleteCutAncestry,
-                }),
+            Ancestry::Unknown(UnknownCause::UnknownCutTarget) => park_unknown_target = true,
+            Ancestry::Unknown(UnknownCause::IncompleteCutAncestry) => park_incomplete = true,
         }
     }
+    // Precedence: off-branch/beyond (condemned) > a missing watermark entry > a missing mid-chain
+    // link > clear.
     if off_branch {
         RegisterVerdict::Condemned(CondemnedReason::OffBranch)
     } else if beyond_cut {
         RegisterVerdict::Condemned(CondemnedReason::BeyondCut)
-    } else if let Some(reason) = park {
-        RegisterVerdict::Parked(reason)
+    } else if park_unknown_target {
+        RegisterVerdict::Parked(ParkReason::UnknownCutTarget)
+    } else if park_incomplete {
+        RegisterVerdict::Parked(ParkReason::IncompleteCutAncestry)
     } else {
         RegisterVerdict::Clear
     }
@@ -703,6 +707,17 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         // withheld watermark parks the under-cut prefix — I11). Pruning a condemned MINT from
         // `live` kills its dependents transitively (they cite an owner_id no longer live →
         // stale).
+        //
+        // BOUNDARY (per-depth model): a register that retroactively condemns an already-effective
+        // NON-mint entry (e.g. a member DeviceAdd) is reflected in that entry's outcome (the final
+        // overlay), but its roster/tombstone side effect is not rolled back, and a same-depth
+        // dependent may read the stale roster. Reaching that state requires an OWNER surgically
+        // cutting a co-owner's incarnation to strand a member it is concurrently promoting —
+        // Byzantine owner behaviour, which the trusted-owner threat model puts out of automated
+        // resolution (owner-key compromise ⇒ `contested`, never silently reconciled). A full
+        // effect-state rebuild + register-provenance fixpoint would close it and is the natural
+        // home for cross-depth `CutExtend` recovery too; both are deferred with that model in
+        // force.
         parked.clear();
         for c in &candidates {
             if condemned.contains_key(&c.hash()) {
@@ -777,16 +792,21 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         let mut reroots: Vec<(&Candidate, AccountId)> = candidates
             .iter()
             .filter_map(|c| match &c.op {
-                // A recovery re-root must be signed by a pre-contest owner: the FULL authority
-                // check (the cited mint names the signer AND is live in state_before(d)), not
-                // just liveness — else a member citing another device's incarnation could pick
-                // the successor.
+                // A recovery re-root must be signed by a CURRENT pre-contest owner.
+                // `authority_status == Live` binds the signer to the cited mint,
+                // but liveness alone is too weak: a demoted owner's incarnation
+                // stays in `live` (its under-cut ops remain valid) while
+                // leaving `owners`. Require the cited incarnation to be the device's OPEN one — a
+                // former owner cannot select the successor.
                 AccountOp::AccountReRoot { successor_account_id, .. }
                     if !condemned.contains_key(&c.hash())
                         && matches!(
                             authority_status(c, &incarnations, &state),
                             AuthorityStatus::Live
-                        ) =>
+                        )
+                        && incarnations.author_incarnation_id(c).is_some_and(|inc| {
+                            state.owners.get(&c.header().device_fingerprint) == Some(&inc)
+                        }) =>
                     Some((c, *successor_account_id)),
                 _ => None,
             })
@@ -1784,6 +1804,36 @@ mod tests {
         assert!(matches!(h.classification(), AccountClassification::Contested { .. }));
         assert!(!h.is_effective(&bad_reroot), "a non-owner cannot select the recovery successor");
         assert_eq!(h.contested_successor(), None, "no owner re-rooted ⇒ no successor");
+    }
+
+    #[test]
+    fn a_demoted_former_owner_cannot_select_the_contested_successor() {
+        // A is demoted (its incarnation leaves `owners` but stays in `live` — its under-cut history
+        // is still valid). Owners B and C then cut each other ⇒ contested. Both a CURRENT owner (F)
+        // and the demoted A submit re-roots; only F's is admitted. Even though A picked the smaller
+        // successor id, the deterministic successor is F's — a former owner cannot select it.
+        let (fdr, a, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+        let (succ_a, succ_f) =
+            (AccountId::from_bytes([0x11; 32]), AccountId::from_bytes([0x22; 32]));
+        let mut f = Fixture::genesis(&fdr);
+        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_c = f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&a, add_a, Cut::Empty));
+        f.author(&b, Some(add_b), &device_remove(&c, Cut::Empty));
+        f.author(&c, Some(add_c), &device_remove(&b, Cut::Empty));
+        let reroot_f = f.author(&fdr, Some(f.genesis_hash), &account_reroot(succ_f));
+        let reroot_a = f.author(&a, Some(add_a), &account_reroot(succ_a));
+
+        let h = f.fold();
+        assert!(matches!(h.classification(), AccountClassification::Contested { .. }));
+        assert!(h.is_effective(&reroot_f), "a current owner's re-root is admitted");
+        assert!(!h.is_effective(&reroot_a), "a demoted former owner's re-root is not admitted");
+        assert_eq!(
+            h.contested_successor(),
+            Some(succ_f),
+            "the successor is the current owner's, not the demoted owner's smaller id",
+        );
     }
 
     #[test]
