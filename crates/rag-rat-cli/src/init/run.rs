@@ -76,7 +76,9 @@ fn run_non_interactive(
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
     let db = setup_index(&config)?;
     setup_model_and_reconcile(&config, &db, options.yes)?;
-    offer_hooks_install(&config, options.yes)?;
+    if !options.no_hooks {
+        offer_hooks_install(&config, options.yes)?;
+    }
     eprintln!("init: complete");
     print_mcp_connect_hint();
     Ok(())
@@ -452,6 +454,7 @@ mod default_plan_tests {
             yes: false,
             dry_run: false,
             force: false,
+            no_hooks: false,
             config_path: config_path.clone(),
         };
         let existing = load_existing_for_wizard(&options).unwrap();
@@ -493,6 +496,7 @@ mod default_plan_tests {
             yes: false,
             dry_run: false,
             force: false,
+            no_hooks: false,
             config_path: config_path.clone(),
         };
 

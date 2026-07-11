@@ -54,6 +54,7 @@ struct InitOptions {
     yes: bool,
     dry_run: bool,
     force: bool,
+    no_hooks: bool,
     config_path: PathBuf,
 }
 
@@ -121,6 +122,7 @@ impl InitOptions {
             yes: args.yes,
             dry_run: args.dry_run,
             force: args.force,
+            no_hooks: args.no_hooks,
             config_path: PathBuf::from(config_path),
         }
     }

@@ -131,6 +131,10 @@ pub(crate) struct InitArgs {
     /// Overwrite an existing config without prompting.
     #[arg(long)]
     pub force: bool,
+    /// Skip installing the git maintenance hooks. `--yes` installs them by default; pass this to
+    /// leave `.git/hooks` untouched (e.g. an agent that asks for hook consent separately).
+    #[arg(long)]
+    pub no_hooks: bool,
 }
 
 #[derive(Debug, Args)]
