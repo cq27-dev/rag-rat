@@ -85,6 +85,10 @@ pub(super) enum RejectReason {
     /// clause 1), or an `OwnerDemote`'s `owner_id` names a mint minted for a different device
     /// than its subject.
     WrongDevice,
+    /// A known control op at the supported version whose payload does not decode (malformed CBOR /
+    /// invalid enum token). Ingest structurally rejects these; this is the fold's defensive
+    /// backstop — a hard reject, NOT retained, so its header never shapes cut ancestry.
+    Malformed,
     /// A duplicate / no-op / self-referential op with no effect — incl. an `AccountReRoot` in a
     /// `Live` account (admissible only as the terminal recovery op once contested, §12).
     Ineffective,
@@ -492,25 +496,38 @@ fn join_register(
 pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHistory {
     let mut outcomes: HashMap<[u8; 32], Outcome> = HashMap::new();
 
-    // Header index over EVERY verified entry (incl. unknown ops) — the ancestry walk / cut binding
-    // read through it, so a cut can name any held entry as its watermark.
-    let all_headers: HashMap<[u8; 32], &AccountEntryHeader> =
-        entries.iter().map(|e| (e.entry_hash, &e.header)).collect();
-
-    // Fold only KNOWN, control-log (§11), supported-version ops. Everything else — an unknown
-    // entry_type, a non-control-log entry, or a future op_version that may reuse a tag — is
-    // retained unfolded so it can neither mint control authority nor be folded with the wrong
-    // semantics.
+    // Decode once, then classify. `candidates` are the ops the fold actually folds; `all_headers`
+    // is the ancestry / cut-binding view — it holds every STRUCTURALLY-VALID entry (a valid chain
+    // link, incl. a forward-compat unknown or a sealed op), but NOT a malformed one, so invalid
+    // bytes can't shape the accepted branch.
     let mut candidates: Vec<Candidate> = Vec::with_capacity(entries.len());
+    let mut all_headers: HashMap<[u8; 32], &AccountEntryHeader> = HashMap::new();
     for entry in entries {
-        let control = entry.header.log_id == CONTROL_LOG;
-        let supported = entry.header.op_version == SUPPORTED_OP_VERSION;
+        // Fold only a KNOWN op on the control log (§11), at the supported version, with a PLAINTEXT
+        // payload (`crypto_suite == 0`). A sealed op (`!= 0`) is ciphertext that could spuriously
+        // parse as a control op — defer it, decoding its bytes as today's plaintext op would let it
+        // mutate the fold on a node that can't yet decrypt it.
+        let foldable = entry.header.log_id == CONTROL_LOG
+            && entry.header.op_version == SUPPORTED_OP_VERSION
+            && entry.header.crypto_suite == 0;
         match ops::decode(entry.header.entry_type, &entry.payload) {
-            Ok(DecodedAccountOp::Known(op)) if control && supported => {
-                candidates.push(Candidate { entry: entry.clone(), op });
+            // A malformed CURRENT op is a hard reject and does NOT become a chain link.
+            Err(_) => {
+                outcomes.insert(entry.entry_hash, Outcome::Rejected(RejectReason::Malformed));
             },
-            _ => {
-                outcomes.insert(entry.entry_hash, Outcome::RetainedUnfolded);
+            Ok(decoded) => {
+                all_headers.insert(entry.entry_hash, &entry.header);
+                match decoded {
+                    DecodedAccountOp::Known(op) if foldable => {
+                        candidates.push(Candidate { entry: entry.clone(), op });
+                    },
+                    // Unknown / non-control / unsupported / sealed: retained unfolded — it can
+                    // neither mint control authority nor be folded with the wrong semantics, but
+                    // its header remains a valid watermark/ancestry target.
+                    _ => {
+                        outcomes.insert(entry.entry_hash, Outcome::RetainedUnfolded);
+                    },
+                }
             },
         }
     }
@@ -584,6 +601,14 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
             {
                 continue; // unauthorized → the effect pass classifies it (wrong-device / stale / park)
             }
+            // NOTE: the register pass can't gate a DeviceRemove on the target being enrolled — at
+            // this depth the roster does not yet reflect same-depth mints (genesis, DeviceAdd), so
+            // gating here would wrongly skip a founder self-removal / a same-depth remove and lose
+            // the self-condemnation that keeps the account rooted. The effect pass rejects a remove
+            // of a never-enrolled device `Ineffective` (no tombstone); a lingering register for a
+            // genuinely never-enrolled device is revocation persisting across a re-add — the owner
+            // revoked that chain, which the trusted-owner model treats as intended.
+            //
             // An OwnerDemote's `owner_id` must resolve to a mint minted for the demoted device
             // — a wrong-device binding would leave the target's real
             // incarnation unbounded.
@@ -751,12 +776,19 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
             match register_verdict(c, &registers, &view) {
                 RegisterVerdict::Condemned(reason) => {
                     condemned.insert(c.hash(), reason);
-                    // A condemned owner mint leaves BOTH `live` (kills dependents transitively) and
-                    // `owners` (so its device isn't a phantom owner blocking a clean re-promotion).
+                    // A condemned mint leaves `live` (kills dependents transitively) and, if it is
+                    // the device's open incarnation, `owners`. A condemned DeviceAdd ALSO leaves
+                    // the roster — its enrollment is invalidated, so a later
+                    // OwnerPromote must not see the device as enrolled. (A
+                    // condemned OwnerPromote leaves the roster intact —
+                    // the device's separate DeviceAdd enrollment may still be valid.)
                     if c.is_mint() {
                         state.live.remove(&c.hash());
                         if state.owners.get(&c.subject_device()) == Some(&c.hash()) {
                             state.owners.remove(&c.subject_device());
+                        }
+                        if matches!(c.op, AccountOp::DeviceAdd { .. }) {
+                            state.roster.remove(&c.subject_device());
                         }
                     }
                 },
@@ -2106,6 +2138,76 @@ mod tests {
             "removing a never-enrolled device is ineffective",
         );
         assert!(h.is_effective(&add), "the device is not pre-tombstoned, so it can still be added");
+    }
+
+    #[test]
+    fn a_malformed_current_control_op_is_rejected_not_retained() {
+        // A control-log, supported-version entry whose payload does NOT decode as its entry_type is
+        // a hard reject — not RetainedUnfolded — so a malformed entry's header never becomes a
+        // valid cut-ancestry watermark.
+        let fdr = Dev::new(1);
+        let f = Fixture::genesis(&fdr);
+        let header = AccountEntryHeader {
+            account_id: f.account_id,
+            log_id: 0,
+            device_fingerprint: fdr.fp,
+            seq: 1,
+            prev_hash: Some(f.genesis_hash),
+            parent_ref: Some(f.genesis_hash),
+            entry_type: entry_type::DEVICE_ADD,
+            op_version: 1,
+            auth_len: 1,
+            crypto_suite: 0,
+            key_id: None,
+            authority_ref: Some(f.genesis_hash),
+        };
+        let bad_payload = vec![0xa0]; // a CBOR empty map — not the DeviceAdd array shape
+        let signed = sign_account_entry(&fdr.secret, &header, &bad_payload).unwrap();
+        let entry = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
+        let mut entries = f.entries.clone();
+        entries.push(entry.clone());
+
+        let h = fold_account(&entries);
+        assert_eq!(
+            h.outcome(&entry.entry_hash),
+            Some(Outcome::Rejected(RejectReason::Malformed)),
+            "a malformed current op is a hard reject, not retained",
+        );
+    }
+
+    #[test]
+    fn a_sealed_payload_is_not_folded_as_a_plaintext_op() {
+        // `crypto_suite != 0` means the payload is sealed (C4); the fold must not decode it as a
+        // plaintext control op even if the ciphertext happens to parse as one.
+        let (fdr, x) = (Dev::new(1), Dev::new(2));
+        let f = Fixture::genesis(&fdr);
+        let op = device_add(&x, DeviceRole::Owner);
+        let payload = encode(&op).unwrap(); // valid DeviceAdd bytes, but the header marks it sealed
+        let header = AccountEntryHeader {
+            account_id: f.account_id,
+            log_id: 0,
+            device_fingerprint: fdr.fp,
+            seq: 1,
+            prev_hash: Some(f.genesis_hash),
+            parent_ref: Some(f.genesis_hash),
+            entry_type: entry_type_of(&op),
+            op_version: 1,
+            auth_len: 1,
+            crypto_suite: 1,
+            key_id: Some([0x33; 32]), // required when crypto_suite != 0
+            authority_ref: Some(f.genesis_hash),
+        };
+        let signed = sign_account_entry(&fdr.secret, &header, &payload).unwrap();
+        let entry = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
+        let mut entries = f.entries.clone();
+        entries.push(entry.clone());
+
+        let h = fold_account(&entries);
+        assert_eq!(
+            h.outcome(&entry.entry_hash),
+            Some(Outcome::RetainedUnfolded),
+            "a sealed-payload op is deferred, never folded as a plaintext control op",
+        );
     }
 
     #[test]
