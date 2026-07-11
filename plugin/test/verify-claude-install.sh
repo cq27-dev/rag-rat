@@ -5,15 +5,16 @@
 # trust/confirm prompt can't hang CI. This job is exploratory (continue-on-error in CI) until the
 # non-interactive behaviour is confirmed.
 set -u
-PLUGIN_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+# The marketplace manifest lives at the repo root (.claude-plugin/marketplace.json, source: ./plugin).
+MARKETPLACE_DIR="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
 step() { echo; echo "### $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 command -v claude >/dev/null 2>&1 || fail "claude CLI not found"
 echo "claude: $(claude --version 2>&1 | head -n1)"
 
-step "add the local marketplace (validates plugin/.claude-plugin/marketplace.json + plugin.json)"
-timeout 90 claude plugin marketplace add "$PLUGIN_DIR" </dev/null || fail "marketplace add failed"
+step "add the local marketplace (validates .claude-plugin/marketplace.json + plugin/.claude-plugin/plugin.json)"
+timeout 90 claude plugin marketplace add "$MARKETPLACE_DIR" </dev/null || fail "marketplace add failed"
 timeout 30 claude plugin marketplace list </dev/null || true
 
 step "install the plugin to user scope (non-interactive)"

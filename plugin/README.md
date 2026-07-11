@@ -106,23 +106,28 @@ validation — see [`plugin/test/README.md`](test/README.md).
 
 ## Status / open items
 
-- **Download path (#5) untested** until a green cargo-dist release publishes prebuilt assets
-  (v0.15.0's build failed). URL/asset naming matches cargo-dist output.
+Verified end-to-end:
+
+- **Download path** — against the v0.16.0 release: PATH version-mismatch detection → download the
+  platform archive → sha256 verify → extract → atomic install to the version-exact cache → run.
+  (Was blocked on a green release; v0.16.0 provides the assets.)
+- **Legacy hook-settings migration** — a pre-rename `rag-rat claude-hook` entry is recognized and
+  upgraded in place on reinstall (no dead subcommand, no duplicate); see `claude_settings.rs`.
+- **Marketplace placement** — the manifest lives at the repo root (`.claude-plugin/marketplace.json`,
+  `source: ./plugin`), so `/plugin marketplace add cq27-dev/rag-rat` discovers it; the plugin content
+  stays under `plugin/`.
+
+Remaining:
+
+- **Plugin version tracks the release.** The launcher fetches `releases/download/v<plugin-version>`,
+  so `plugin.json` / `marketplace.json` `version` must match a published release that carries prebuilt
+  assets — bump it on each rag-rat release (currently 0.16.0). Note a release binary that carries a
+  `+g<hash>` version suffix won't satisfy the strict PATH `--version` match, so the launcher downloads
+  rather than reusing an on-PATH release build (correct, just not optimal).
 - **Windows extraction** relies on the bundled `tar` (bsdtar, Win10 1803+); needs a real Windows run.
-- **Codex install is verified; hook *firing* is not.** `codex plugin add rag-rat@rag-rat` +
-  `codex plugin list` install + enable the plugin non-interactively (no auth) and stage every
-  component into the cache — the CI `codex-install` job asserts this. What a live (authed) session
-  would still settle: whether the `^Bash$` / `^apply_patch$` hooks actually fire, and **which** hooks
-  file Codex loads (root `hooks/hooks.json` — currently Claude's wrapper+matchers — vs
-  `.codex-plugin/hooks/hooks.json`). The `apply_patch` V4A clone-check is implemented + unit-tested in
-  the binary; only the in-session Codex hook wiring is unverified (L4).
-- **Legacy hook-settings migration (deferred):** the `claude-hook` → `agent-hook` rename means a user
-  who previously ran `rag-rat hooks install --claude` keeps a stale `rag-rat claude-hook` entry, and a
-  fresh install adds a duplicate `agent-hook` one (`is_ours` only matches the new command). A clean
-  fix updates the settings migration to recognize + replace the legacy command; deferred here since it
-  touches `claude_settings.rs` migration semantics and the repo's pre-launch posture tolerates a
-  hooks reinstall.
-- **Final placement**: a real Claude marketplace needs `.claude-plugin/marketplace.json` at the repo
-  root; this prototype keeps everything under `plugin/` for isolated review.
-- **First-run timing**: if the binary is not yet cached when a hook fires, the hook no-ops (by
-  design) until the MCP server installs it.
+- **Codex hook *firing*** — install is verified (CI `codex-install`), but whether the `^Bash$` /
+  `^apply_patch$` hooks fire in a live session (and **which** hooks file Codex loads — root
+  `hooks/hooks.json` vs `.codex-plugin/hooks/hooks.json`) needs an authed session; deliberately out of
+  scope (keyless smoke test). The `apply_patch` V4A clone-check is implemented + unit-tested.
+- **First-run timing**: if the binary is not yet cached when a hook fires, the hook no-ops (by design)
+  until the MCP server installs it.

@@ -4,7 +4,8 @@
 # Install/validate is offline config (no API key); auth is only for a running session. This verifies
 # the manifest is accepted, the plugin installs + enables, and the component files stage into cache.
 set -u
-PLUGIN_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+# The marketplace manifest lives at the repo root (.claude-plugin/marketplace.json, source: ./plugin).
+MARKETPLACE_DIR="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
 step() { echo; echo "### $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
@@ -13,7 +14,7 @@ command -v codex >/dev/null 2>&1 || fail "codex CLI not found"
 echo "codex: $(codex --version 2>&1 | head -n1)"
 
 step "add the local dir as a marketplace"
-timeout 90 codex plugin marketplace add "$PLUGIN_DIR" </dev/null || fail "marketplace add failed (marketplace.json rejected?)"
+timeout 90 codex plugin marketplace add "$MARKETPLACE_DIR" </dev/null || fail "marketplace add failed (marketplace.json rejected?)"
 
 step "install the plugin non-interactively (validates the plugin manifest)"
 out="$(timeout 90 codex plugin add rag-rat@rag-rat </dev/null 2>&1)"; echo "$out"
