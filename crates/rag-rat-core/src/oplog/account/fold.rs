@@ -22,6 +22,7 @@ use super::envelope::{AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, ChainKind, DecodedAccountOp, DeviceRole};
 use super::registers::RegisterKey;
+use crate::oplog::cbor;
 use crate::oplog::op::DeviceFingerprint;
 
 /// The per-entry classification (§16.3 taxonomy). `RetainedUnfolded` is an unknown `entry_type`;
@@ -825,12 +826,28 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     AccountAuthHistory { outcomes, classification, contested_successor }
 }
 
-/// The genesis candidate: an `AccountGenesis` whose payload hashes to the shared `account_id` (§4).
+/// The genesis candidate: an `AccountGenesis` whose payload hashes to the shared `account_id` (§4)
+/// AND whose SIGNER is the founder the id commits to. The header `device_fingerprint` (the signer,
+/// [`Candidate::subject_device`] for genesis) MUST equal `sha256(ed25519_pubkey)` from the payload.
+///
+/// This binding is load-bearing: `account_id` commits to the founder pubkey inside the genesis
+/// payload, but the payload is public. Without this check a non-owner could copy the victim's
+/// genesis payload verbatim, re-sign it under its OWN device key (so a different
+/// `device_fingerprint` still verifies), and be taken for the founder — an account takeover.
+/// `DeviceAdd` enforces the same `fingerprint == sha256(pubkey)` binding at decode; genesis carries
+/// no fingerprint field, so the fold binds it here. Among valid candidates, pick the smallest
+/// `entry_hash` — deterministic, never arrival order (I9) — so two would-be roots can never split
+/// consensus.
 fn find_genesis(candidates: &[Candidate]) -> Option<&Candidate> {
-    candidates.iter().find(|c| {
-        matches!(c.op, AccountOp::AccountGenesis { .. })
-            && account_id_from_genesis_payload(&c.entry.payload) == c.header().account_id
-    })
+    candidates
+        .iter()
+        .filter(|c| match &c.op {
+            AccountOp::AccountGenesis { ed25519_pubkey, .. } =>
+                account_id_from_genesis_payload(&c.entry.payload) == c.header().account_id
+                    && c.header().device_fingerprint.to_bytes() == cbor::sha256(ed25519_pubkey),
+            _ => false,
+        })
+        .min_by_key(|c| c.hash())
 }
 
 /// Whether `c`'s AUTHOR is presently authorized to act — the §"authority rule" preflight shared by
@@ -1834,6 +1851,84 @@ mod tests {
             Some(succ_f),
             "the successor is the current owner's, not the demoted owner's smaller id",
         );
+    }
+
+    #[test]
+    fn a_forged_genesis_re_signed_by_a_non_owner_cannot_take_over_the_account() {
+        // `account_id` commits to the founder pubkey inside the (public) genesis payload, but not
+        // to the SIGNER. An attacker copies the victim's genesis payload verbatim and
+        // re-signs it under its OWN device key. The fold must bind the founder device to
+        // the committed pubkey — else, when the forgery is folded first, the attacker
+        // becomes founder-owner — and must pick the genesis deterministically regardless of
+        // arrival order (I9).
+        let (victim, attacker, x) = (Dev::new(1), Dev::new(9), Dev::new(3));
+        let op = AccountOp::AccountGenesis {
+            ed25519_pubkey: victim.ed,
+            x25519_pubkey: victim.x,
+            nonce16: [0u8; 16],
+            created_at_ms: 1_700_000_000_000,
+            label: None,
+        };
+        let payload = encode(&op).unwrap();
+        let account_id = account_id_from_genesis_payload(&payload);
+        let genesis_header = |signer: &Dev| AccountEntryHeader {
+            account_id,
+            log_id: 0,
+            device_fingerprint: signer.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: entry_type::ACCOUNT_GENESIS,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 0,
+            key_id: None,
+            authority_ref: None,
+        };
+        let signed = |signer: &Dev, hdr: &AccountEntryHeader, pl: &[u8]| {
+            let s = sign_account_entry(&signer.secret, hdr, pl).unwrap();
+            verify_account_signed(&s.signed_bytes, &signer.secret.public()).unwrap()
+        };
+        // Both genesis entries carry the SAME (victim) payload; only the signer differs.
+        let real = signed(&victim, &genesis_header(&victim), &payload);
+        let forged = signed(&attacker, &genesis_header(&attacker), &payload);
+        // The attacker adds itself as owner, citing its forged genesis.
+        let add_op = device_add(&x, DeviceRole::Owner);
+        let add_payload = encode(&add_op).unwrap();
+        let add_header = AccountEntryHeader {
+            account_id,
+            log_id: 0,
+            device_fingerprint: attacker.fp,
+            seq: 1,
+            prev_hash: Some(forged.entry_hash),
+            parent_ref: Some(forged.entry_hash),
+            entry_type: entry_type_of(&add_op),
+            op_version: 1,
+            auth_len: 1,
+            crypto_suite: 0,
+            key_id: None,
+            authority_ref: Some(forged.entry_hash),
+        };
+        let attacker_add = signed(&attacker, &add_header, &add_payload);
+
+        // Arrival order must not matter — the forgery must lose in both.
+        for order in [vec![real.clone(), forged.clone(), attacker_add.clone()], vec![
+            forged.clone(),
+            attacker_add.clone(),
+            real.clone(),
+        ]] {
+            let h = fold_account(&order);
+            assert!(h.is_effective(&real.entry_hash), "the founder-signed genesis is effective");
+            assert!(
+                !h.is_effective(&forged.entry_hash),
+                "a genesis re-signed by a non-owner is not a valid root",
+            );
+            assert!(
+                !h.is_effective(&attacker_add.entry_hash),
+                "an op citing the forged genesis gains no authority",
+            );
+            assert_eq!(h.classification(), AccountClassification::Live);
+        }
     }
 
     #[test]
