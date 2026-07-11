@@ -51,6 +51,20 @@ sequenceDiagram
 
 ## Install
 
+The quickest way is a prebuilt binary — no Rust toolchain — for Apple Silicon macOS, glibc ≥2.38
+Linux (x86-64 and arm64), Windows x64, and Android/Termux (arm64):
+
+```bash
+npm install -g @rag-rat/bin        # puts `rag-rat` on your PATH
+# or run it once, without installing:
+npx @rag-rat/bin --help
+```
+
+`@rag-rat/bin` fetches the prebuilt binary for your platform from the matching GitHub release. It is
+the full build — FastEmbed's ONNX Runtime is statically linked, so nothing else is needed at runtime.
+
+**Build from source** if you'd rather compile it yourself (or assemble it from parts):
+
 ```bash
 cargo install rag-rat              # from crates.io (FastEmbed included by default)
 ```
@@ -61,9 +75,26 @@ From a checkout:
 cargo install --path crates/rag-rat-cli --bin rag-rat
 ```
 
-Add `--no-default-features` for a smaller hash-only build without real embeddings. SQLite is bundled
-(compiled in via `rusqlite`), so there is no system-library prerequisite — see
-[Platform support](#platform-support) for the per-OS C-toolchain note.
+The default build links FastEmbed's ONNX Runtime, whose prebuilt needs **glibc ≥2.38** and doesn't
+exist for **Intel macOS** or **musl/Alpine Linux**. On any of those — an older glibc (e.g. Ubuntu
+22.04), Intel Mac, or musl — build the pure-Rust embedder instead (real embeddings, no ONNX):
+
+```bash
+cargo install rag-rat --no-default-features --features model2vec
+```
+
+`--no-default-features` alone gives a smaller hash-only build with no real embeddings. SQLite is
+bundled (compiled in via `rusqlite`), so there is no system-library prerequisite — see
+[Platform support](#platform-support) for the per-OS C-toolchain note. On Android/Termux, `cargo
+install rag-rat` also builds from source (needs the `rust` package).
+
+**Then add the agent skills** so your agent actually reaches for the index:
+
+```bash
+npx @rag-rat/skills
+```
+
+See [Quickstart](#quickstart) for what the skills do and the one-time `rag-rat init` setup.
 
 ## Quickstart
 
@@ -388,7 +419,9 @@ indexed targets so they're never chunked or embedded, and keep secrets out of qu
 
 rag-rat builds and tests on Linux, macOS, and Windows. Linux is covered on every PR and on every
 push to main; macOS and Windows are exercised on release, so `cargo install rag-rat` builds and
-links on all three.
+links on all three. Android (aarch64, bionic) is also a release target — a prebuilt binary is
+attached to each release and published to `@rag-rat/bin`, so `npx @rag-rat/bin` works on Termux; see
+[Install](#install).
 SQLite is bundled (compiled from source via `rusqlite`), so there's no system-library prerequisite,
 but each platform needs a C toolchain: Linux ships one; on macOS install the Xcode Command Line
 Tools (`xcode-select --install`); on Windows install the Visual Studio Build Tools with the C++
