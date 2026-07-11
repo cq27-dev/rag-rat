@@ -535,6 +535,17 @@ fn run_maintenance_pass(
         total_chunks = artifacts.total_chunks,
         "maintenance pass complete (remaining backlog is unscoped/cross-worktree, #360)"
     );
+    // #573: give the git-hook write path a WAL-checkpoint owner. On a hooks/MCP-only machine (no
+    // long-lived foreground watcher) nothing else truncates the shared global `-wal`, so it grows
+    // unbounded. Size-gated by the same threshold the watcher's quiet-pass checkpoint uses
+    // (`WAL_CHECKPOINT_MIN_BYTES`); best-effort — a busy/failed checkpoint just rides the next pass
+    // and never fails maintenance. Runs under the write lock this pass already holds.
+    let wal_checkpoint = db
+        .checkpoint_wal_if_oversized(rag_rat_core::index::WAL_CHECKPOINT_MIN_BYTES)
+        .inspect_err(|err| {
+            tracing::debug!(target: "rag_rat_core::maintenance", error = %err, "wal checkpoint failed");
+        })
+        .ok();
     Ok(serde_json::json!({
         "trigger": trigger,
         "status": "complete",
@@ -543,6 +554,7 @@ fn run_maintenance_pass(
         "branch_checkout": args.branch_checkout,
         "max_seconds": max_seconds,
         "elapsed_seconds": started.elapsed().as_secs_f64(),
+        "wal_checkpoint": wal_checkpoint,
         "reconcile": reconcile_report,
         // #312: rows the legacy-f32 → int8 re-encode converted this pass, or null when it was
         // skipped (max_seconds == 0, or already done/the gate was set so the call returned 0 — note
@@ -786,6 +798,76 @@ mod tests {
              unscoped={unscoped}"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #573: the hook write path (`run_maintenance_pass`) checkpoints the shared global `-wal`, so a
+    /// hooks/MCP-only machine (no long-lived foreground watcher) has a truncation owner. On a fresh
+    /// fixture the sidecar is under the threshold, so the checkpoint is size-gated to
+    /// attempted:false — asserting the field's presence pins that the pass CALLS the
+    /// checkpoint.
+    #[test]
+    fn maintenance_pass_owns_the_wal_checkpoint() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-maint-wal-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "t"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "base"]);
+        let config = Config {
+            repo_id_override: None,
+            database_key_pinned: true,
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            llm: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+            search: Default::default(),
+            memory: Default::default(),
+            log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        let args = super::MaintenanceArgs {
+            trigger: Some("post-commit".to_string()),
+            max_seconds: Some(0),
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+        let report = super::run_maintenance_pass(&config, &args, "post-commit").unwrap();
+
+        let checkpoint = &report["wal_checkpoint"];
+        assert!(
+            checkpoint.is_object(),
+            "the maintenance pass reports a wal checkpoint — the hook-path owner (#573): {report}"
+        );
+        assert_eq!(
+            checkpoint["attempted"],
+            serde_json::json!(false),
+            "a fresh fixture's -wal is under the threshold, so the checkpoint is size-gated off"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
