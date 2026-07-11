@@ -96,11 +96,21 @@ jobs:
           # binary from the release, which we neither need nor want here (getPackage resolves a URL).
           npm install --omit=dev --ignore-scripts
           node "$GITHUB_WORKSPACE/dist-android/test-npm-package.cjs" .
-      - name: Publish @rag-rat/bin
+      - name: Publish @rag-rat/bin (only if this version is new)
         working-directory: pkg
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: |
+          set -euo pipefail
+          # Guard the same way as the auxiliary packages below: npm rejects re-publishing a version,
+          # so without this a transient failure AFTER @rag-rat/bin published would make every rerun
+          # die here and never reach the skills/cookbook steps. Skip if it's already up.
+          ver="$(node -p "require('./package.json').version")"
+          if npm view "@rag-rat/bin@$ver" version >/dev/null 2>&1; then
+            echo "@rag-rat/bin@$ver already on npm — skipping so a rerun can finish the release"
+          else
+            npm publish --access public
+          fi
 
       # ── @rag-rat/skills + @rag-rat/cookbook: publish only when their version is new ───────────────
       - name: Publish @rag-rat/skills (only if this version is new)

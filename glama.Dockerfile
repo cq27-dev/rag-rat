@@ -17,12 +17,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     RAG_RAT_NO_WATCH=1
 
-# node + mcp-proxy (Glama's harness) + git (rag-rat roots itself in a git worktree). No Rust
-# toolchain / build-essential: rag-rat is the prebuilt @rag-rat/bin npm package. `npm i -g @rag-rat/bin`
-# runs its postinstall, which downloads the platform binary (glibc >=2.38 — trixie has it; FastEmbed's
-# ONNX Runtime is statically linked, so no libonnxruntime.so at runtime) and puts `rag-rat` on PATH.
+# node + mcp-proxy (Glama's harness) + git (rag-rat roots itself in a git worktree) + xz-utils (the
+# postinstall extracts cargo-dist's `.tar.xz` Linux archive — `tar` alone can't). No Rust toolchain /
+# build-essential: rag-rat is the prebuilt @rag-rat/bin npm package. `npm i -g @rag-rat/bin` runs its
+# postinstall, which downloads the platform binary (glibc >=2.38 — trixie has it; FastEmbed's ONNX
+# Runtime is statically linked, so no libonnxruntime.so at runtime) and puts `rag-rat` on PATH.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git \
+        ca-certificates curl git xz-utils \
     && curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g mcp-proxy@6.4.3 @rag-rat/bin@latest \
