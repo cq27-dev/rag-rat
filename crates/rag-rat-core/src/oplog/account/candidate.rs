@@ -52,27 +52,47 @@ pub(super) fn ancestry(target: &[u8; 32], cut: &Cut, view: &dyn HeaderView) -> A
     let Some(watermark) = cut.hash() else {
         return Ancestry::OffBranch;
     };
-    if view.header(&watermark).is_none() {
+    let Some(wm) = view.header(&watermark) else {
         return Ancestry::Unknown(UnknownCause::UnknownCutTarget);
-    }
+    };
+    // The cut bounds ONE device's log: every link on the walk must stay on the watermark's
+    // `(account, log, device)` coordinate with a STRICTLY-DECREASING seq. A signed header only pins
+    // `prev_hash` NULLITY, not that `prev` is a valid parent, so a forged link (jumping coordinate
+    // or not decreasing seq) is not a real predecessor — the branch ends `OffBranch` there.
+    let (account, log, device) = (wm.account_id, wm.log_id, wm.device_fingerprint);
     // Hash chains cannot cycle (a cycle needs a sha256 collision), but guard a corrupt input
     // against an infinite loop by refusing to revisit a hash.
     let mut visited: HashSet<[u8; 32]> = HashSet::new();
     let mut current = watermark;
     loop {
+        let Some(header) = view.header(&current) else {
+            return Ancestry::Unknown(UnknownCause::IncompleteCutAncestry);
+        };
+        // Validate the node is on the bounded chain BEFORE counting it as the target — a forged
+        // link straight to a foreign / off-coordinate entry is not a real on-branch
+        // predecessor.
+        if header.account_id != account
+            || header.log_id != log
+            || header.device_fingerprint != device
+        {
+            return Ancestry::OffBranch;
+        }
         if &current == target {
             return Ancestry::OnBranch;
         }
         if !visited.insert(current) {
             return Ancestry::OffBranch;
         }
-        match view.header(&current) {
-            None => return Ancestry::Unknown(UnknownCause::IncompleteCutAncestry),
-            Some(header) => match header.prev_hash {
-                Some(prev) => current = prev,
-                None => return Ancestry::OffBranch,
-            },
+        let Some(prev) = header.prev_hash else {
+            return Ancestry::OffBranch; // reached the chain origin without hitting the target
+        };
+        // If the predecessor is held, its seq must be strictly lower (a real parent link).
+        if let Some(prev_header) = view.header(&prev)
+            && prev_header.seq >= header.seq
+        {
+            return Ancestry::OffBranch;
         }
+        current = prev;
     }
 }
 
@@ -205,6 +225,52 @@ mod tests {
         assert_eq!(ancestry(&[0x0b; 32], &cut, &view), Ancestry::OnBranch);
         assert_eq!(ancestry(&[0x0c; 32], &cut, &view), Ancestry::OnBranch);
         assert_eq!(ancestry(&[0xff; 32], &cut, &view), Ancestry::OffBranch);
+    }
+
+    #[test]
+    fn ancestry_rejects_forged_links_off_the_bounded_chain() {
+        let mut view = linear_chain(); // g/m/t on (account 0xaa, log 0, device 0xbb)
+        // A forged watermark on device 0xbb whose prev_hash points at an entry on a DIFFERENT
+        // device chain (0xcc) — a fabricated cross-device link, not a real predecessor.
+        view.insert([0xf0; 32], AccountEntryHeader {
+            account_id: AccountId::from_bytes([0xaa; 32]),
+            log_id: 0,
+            device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
+            seq: 5,
+            prev_hash: Some([0xcc; 32]), // points off-chain
+            parent_ref: None,
+            entry_type: 3,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 5,
+            key_id: None,
+            authority_ref: None,
+        });
+        view.insert([0xcc; 32], AccountEntryHeader {
+            account_id: AccountId::from_bytes([0xaa; 32]),
+            log_id: 0,
+            device_fingerprint: DeviceFingerprint::from_bytes([0xcc; 32]), // foreign device
+            seq: 4,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: 3,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 4,
+            key_id: None,
+            authority_ref: None,
+        });
+        // The foreign entry is NOT on the forged watermark's branch — the link is rejected.
+        let forged = Cut::At { seq: 5, hash: [0xf0; 32] };
+        assert_eq!(ancestry(&[0xcc; 32], &forged, &view), Ancestry::OffBranch);
+
+        // A non-decreasing-seq link is likewise forged: a watermark at seq 1 whose prev points at a
+        // same-device entry at seq 1 (not a lower slot).
+        let mut v2 = HashMap::new();
+        insert_chain_entry(&mut v2, [0x01; 32], 1, Some([0x02; 32]));
+        insert_chain_entry(&mut v2, [0x02; 32], 1, None); // sibling at the SAME seq
+        let flat = Cut::At { seq: 1, hash: [0x01; 32] };
+        assert_eq!(ancestry(&[0x02; 32], &flat, &v2), Ancestry::OffBranch);
     }
 
     #[test]

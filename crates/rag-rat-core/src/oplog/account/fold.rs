@@ -89,6 +89,9 @@ pub(super) enum RejectReason {
     /// invalid enum token). Ingest structurally rejects these; this is the fold's defensive
     /// backstop — a hard reject, NOT retained, so its header never shapes cut ancestry.
     Malformed,
+    /// A seq-0 origin entry on the FOUNDER's chain that is not the genesis — a second seq-0 slot
+    /// competing with the root (equivocation). The founder's origin slot is the genesis alone.
+    NonGenesisOrigin,
     /// A duplicate / no-op / self-referential op with no effect — incl. an `AccountReRoot` in a
     /// `Live` account (admissible only as the terminal recovery op once contested, §12).
     Ineffective,
@@ -283,8 +286,10 @@ impl<'a> Incarnations<'a> {
 struct FoldState {
     /// Incarnations proven live so far (owner_ids). Seeded with the genesis incarnation.
     live: HashSet<[u8; 32]>,
-    /// Devices currently enrolled.
-    roster: HashSet<DeviceFingerprint>,
+    /// Each enrolled device → the entry_hash of the DeviceAdd / genesis that enrolled it. Keyed by
+    /// SOURCE (not just presence) so condemning a superseded / duplicate add for a device does not
+    /// erase the enrollment a DIFFERENT, still-valid add contributed.
+    roster: HashMap<DeviceFingerprint, [u8; 32]>,
     /// Each device holding an OPEN owner incarnation → that incarnation's `owner_id`. Keyed by
     /// incarnation (not just device) so a stale `OwnerDemote` naming a since-superseded `owner_id`
     /// cannot close a device's freshly-reopened incarnation.
@@ -528,32 +533,42 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     // bytes can't shape the accepted branch.
     let mut candidates: Vec<Candidate> = Vec::with_capacity(entries.len());
     let mut all_headers: HashMap<[u8; 32], &AccountEntryHeader> = HashMap::new();
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
     for entry in entries {
+        // Dedup the entry SET by hash — the fold classifies each entry once; a duplicated entry
+        // must not apply its state transition (or overwrite its outcome) twice
+        // (order-independence).
+        if !seen.insert(entry.entry_hash) {
+            continue;
+        }
         // Fold only a KNOWN op on the control log (§11), at the supported version, with a PLAINTEXT
-        // payload (`crypto_suite == 0`). A sealed op (`!= 0`) is ciphertext that could spuriously
-        // parse as a control op — defer it, decoding its bytes as today's plaintext op would let it
-        // mutate the fold on a node that can't yet decrypt it.
+        // payload (`crypto_suite == 0`). A NON-foldable entry (unknown type / other log / future
+        // version / sealed `crypto_suite != 0` ciphertext that could spuriously parse) is always
+        // retained header-only — never folded, never HARD-rejected — so a forward-compatible entry
+        // stays a valid watermark/ancestry target and its own layer (C2/C4/newer) folds it.
         let foldable = entry.header.log_id == CONTROL_LOG
             && entry.header.op_version == SUPPORTED_OP_VERSION
             && entry.header.crypto_suite == 0;
+        if !foldable {
+            all_headers.insert(entry.entry_hash, &entry.header);
+            outcomes.insert(entry.entry_hash, Outcome::RetainedUnfolded);
+            continue;
+        }
         match ops::decode(entry.header.entry_type, &entry.payload) {
-            // A malformed CURRENT op is a hard reject and does NOT become a chain link.
+            // A malformed CURRENT-version control op is a hard reject and does NOT become a chain
+            // link (ingest structurally rejects these; this is the fold's defensive backstop).
             Err(_) => {
                 outcomes.insert(entry.entry_hash, Outcome::Rejected(RejectReason::Malformed));
             },
-            Ok(decoded) => {
+            Ok(DecodedAccountOp::Known(op)) => {
                 all_headers.insert(entry.entry_hash, &entry.header);
-                match decoded {
-                    DecodedAccountOp::Known(op) if foldable => {
-                        candidates.push(Candidate { entry: entry.clone(), op });
-                    },
-                    // Unknown / non-control / unsupported / sealed: retained unfolded — it can
-                    // neither mint control authority nor be folded with the wrong semantics, but
-                    // its header remains a valid watermark/ancestry target.
-                    _ => {
-                        outcomes.insert(entry.entry_hash, Outcome::RetainedUnfolded);
-                    },
-                }
+                candidates.push(Candidate { entry: entry.clone(), op });
+            },
+            // A control-log, current-version, unknown-entry_type op: forward-compat, retained
+            // header-only.
+            Ok(DecodedAccountOp::Unknown { .. }) => {
+                all_headers.insert(entry.entry_hash, &entry.header);
+                outcomes.insert(entry.entry_hash, Outcome::RetainedUnfolded);
             },
         }
     }
@@ -571,12 +586,23 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         };
     };
     let genesis_owner_id = genesis.hash();
+    let genesis_founder = genesis.subject_device();
 
     let mut incarnations = Incarnations::build(&candidates, genesis_owner_id);
 
     // Group resolvable candidates by author-depth; unresolvable citations park.
     let mut strata: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (idx, c) in candidates.iter().enumerate() {
+        // The founder's seq-0 origin slot is the genesis ALONE. A second seq-0 entry on the
+        // founder's chain is an origin equivocation with the root — reject it (else, sorting before
+        // genesis by hash, it could take auth_epoch 0 and mutate state before the root is applied).
+        if c.header().seq == 0
+            && c.header().device_fingerprint == genesis_founder
+            && c.hash() != genesis_owner_id
+        {
+            outcomes.insert(c.hash(), Outcome::Rejected(RejectReason::NonGenesisOrigin));
+            continue;
+        }
         match incarnations.author_depth(c) {
             Some(d) => strata.entry(d).or_default().push(idx),
             None => {
@@ -585,11 +611,11 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         }
     }
 
-    // Two passes over the strata (§11.4 recovery): pass 0 accumulates the FINAL register set (all
-    // CutExtends joined); pass 1 re-classifies against it, seeded from depth 0, so a CutExtend
-    // re-blesses its condemned cone even when authored at a DEEPER incarnation depth than the
-    // register's creator. Recovery is thus a pure function of the final registers — never sticky
-    // per-depth condemnation.
+    // A single per-depth pass over the strata (§11.1): each depth admits its live cut ops'
+    // registers, detects contested, condemns/parks against the registers so far, then runs the
+    // effect pass. A CutExtend re-blesses its cone via the same-depth `⊔` join (cross-depth
+    // recovery is the deferred fixpoint's job — a global recompute could preserve a register
+    // whose creator the fold condemns).
     let mut state = FoldState { live: HashSet::from([genesis_owner_id]), ..Default::default() };
     // The revocation registers accumulated so far (extend-only, joined by `⊔`), every entry a
     // register condemns (grows monotonically — a lower-depth decision is final, no oscillation) /
@@ -813,7 +839,12 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
                         if state.owners.get(&c.subject_device()) == Some(&c.hash()) {
                             state.owners.remove(&c.subject_device());
                         }
-                        if matches!(c.op, AccountOp::DeviceAdd { .. }) {
+                        // Roll back the roster only if THIS DeviceAdd is the source of the current
+                        // enrollment — a condemned duplicate/superseded add must not erase the
+                        // enrollment a different, still-valid add contributed.
+                        if matches!(c.op, AccountOp::DeviceAdd { .. })
+                            && state.roster.get(&c.subject_device()) == Some(&c.hash())
+                        {
                             state.roster.remove(&c.subject_device());
                         }
                     }
@@ -1034,14 +1065,14 @@ fn classify_effect(
         AccountOp::DeviceAdd { device_fingerprint, .. } => {
             if state.tombstoned.contains(device_fingerprint) {
                 Outcome::Rejected(RejectReason::TombstoneReAdd)
-            } else if state.roster.contains(device_fingerprint) {
+            } else if state.roster.contains_key(device_fingerprint) {
                 Outcome::Rejected(RejectReason::DuplicateAdd)
             } else {
                 effective(state)
             }
         },
         AccountOp::OwnerPromote { device_fingerprint } => {
-            let enrolled = state.roster.contains(device_fingerprint);
+            let enrolled = state.roster.contains_key(device_fingerprint);
             let already_owner = state.owners.contains_key(device_fingerprint);
             let tombstoned = state.tombstoned.contains(device_fingerprint);
             if enrolled && !already_owner && !tombstoned {
@@ -1064,7 +1095,7 @@ fn classify_effect(
         // tombstone a fingerprint that was never added (I4), permanently barring a future
         // legitimate DeviceAdd for it.
         AccountOp::DeviceRemove { device_fingerprint, .. } =>
-            if state.roster.contains(device_fingerprint) {
+            if state.roster.contains_key(device_fingerprint) {
                 effective(state)
             } else {
                 Outcome::Rejected(RejectReason::Ineffective)
@@ -1095,12 +1126,12 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
     match &c.op {
         AccountOp::AccountGenesis { .. } => {
             state.genesis_seen = true;
-            state.roster.insert(c.subject_device());
+            state.roster.insert(c.subject_device(), c.hash());
             state.owners.insert(c.subject_device(), c.hash());
             state.live.insert(c.hash());
         },
         AccountOp::DeviceAdd { device_fingerprint, role, .. } => {
-            state.roster.insert(*device_fingerprint);
+            state.roster.insert(*device_fingerprint, c.hash());
             if *role == DeviceRole::Owner {
                 state.owners.insert(*device_fingerprint, c.hash());
                 state.live.insert(c.hash());
@@ -2209,6 +2240,95 @@ mod tests {
             .join()
             .unwrap();
         assert!(effective, "a deep delegation chain folds (genesis effective), no overflow");
+    }
+
+    #[test]
+    fn duplicate_entries_are_folded_once() {
+        // Folding is a function of the entry SET, not the multiset — a duplicated verified entry
+        // must classify once and apply its state transition once (order-independence).
+        let (fdr, b) = (Dev::new(1), Dev::new(2));
+        let mut f = Fixture::genesis(&fdr);
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let mut doubled = f.entries.clone();
+        doubled.extend(f.entries.clone());
+
+        let h = fold_account(&doubled);
+        assert!(h.is_effective(&f.genesis_hash));
+        assert!(
+            h.is_effective(&add_b),
+            "the duplicated add is effective once, not overwritten as a DuplicateAdd",
+        );
+    }
+
+    #[test]
+    fn a_second_seq0_entry_on_the_founder_chain_is_rejected() {
+        // The founder's seq-0 origin slot is the genesis alone; a second founder-signed seq-0 op is
+        // an origin equivocation with the root — rejected, so it cannot take auth_epoch 0 ahead of
+        // genesis.
+        let (fdr, x) = (Dev::new(1), Dev::new(2));
+        let f = Fixture::genesis(&fdr);
+        let op = device_add(&x, DeviceRole::Owner);
+        let payload = encode(&op).unwrap();
+        let header = AccountEntryHeader {
+            account_id: f.account_id,
+            log_id: 0,
+            device_fingerprint: fdr.fp, // the founder's device
+            seq: 0,
+            prev_hash: None,
+            parent_ref: Some(f.genesis_hash),
+            entry_type: entry_type_of(&op),
+            op_version: 1,
+            auth_len: 1,
+            crypto_suite: 0,
+            key_id: None,
+            authority_ref: Some(f.genesis_hash),
+        };
+        let signed = sign_account_entry(&fdr.secret, &header, &payload).unwrap();
+        let orphan = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
+        let mut entries = f.entries.clone();
+        entries.push(orphan.clone());
+
+        let h = fold_account(&entries);
+        assert!(h.is_effective(&f.genesis_hash), "genesis is the founder's only origin slot");
+        assert_eq!(
+            h.outcome(&orphan.entry_hash),
+            Some(Outcome::Rejected(RejectReason::NonGenesisOrigin)),
+        );
+    }
+
+    #[test]
+    fn a_sealed_entry_with_unparseable_bytes_is_retained_not_malformed() {
+        // A non-foldable (sealed) entry is retained header-only regardless of whether its
+        // ciphertext parses — it is NEVER hard-rejected as Malformed (which would drop its
+        // header from the ancestry view and hard-reject a forward-compatible entry).
+        let fdr = Dev::new(1);
+        let f = Fixture::genesis(&fdr);
+        let header = AccountEntryHeader {
+            account_id: f.account_id,
+            log_id: 0,
+            device_fingerprint: fdr.fp,
+            seq: 1,
+            prev_hash: Some(f.genesis_hash),
+            parent_ref: Some(f.genesis_hash),
+            entry_type: entry_type::DEVICE_ADD,
+            op_version: 1,
+            auth_len: 1,
+            crypto_suite: 1,          // sealed
+            key_id: Some([0x33; 32]), // required when crypto_suite != 0
+            authority_ref: Some(f.genesis_hash),
+        };
+        let bad = vec![0xff, 0xff]; // not valid CBOR / not a DeviceAdd
+        let signed = sign_account_entry(&fdr.secret, &header, &bad).unwrap();
+        let entry = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
+        let mut entries = f.entries.clone();
+        entries.push(entry.clone());
+
+        let h = fold_account(&entries);
+        assert_eq!(
+            h.outcome(&entry.entry_hash),
+            Some(Outcome::RetainedUnfolded),
+            "a sealed entry is retained, not hard-rejected, even if its bytes don't parse",
+        );
     }
 
     #[test]
