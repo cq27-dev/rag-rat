@@ -32,5 +32,6 @@ mod id;
 mod limits;
 mod ops;
 mod registers;
+mod storage;
 
 pub(crate) use id::AccountId;

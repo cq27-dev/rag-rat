@@ -48,6 +48,53 @@ impl Outcome {
     pub(super) fn is_effective(&self) -> bool {
         matches!(self, Outcome::Effective { .. })
     }
+
+    /// The §16.3 stored-taxonomy `(status, detail)` for this outcome. `Effective` maps to
+    /// `("effective", None)` — the storage layer resolves accepted vs `forked` per slot (I10a) —
+    /// and a fold-semantic `Rejected` maps to `("rejected", reason)`; structural ingest rejects
+    /// are never folded (they are not stored). Kept beside the enum so the projection can't
+    /// drift.
+    pub(super) fn taxonomy(&self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Outcome::Effective { .. } => ("effective", None),
+            Outcome::RetainedUnfolded => ("retained_unfolded", None),
+            Outcome::Condemned(reason) => (
+                "condemned",
+                Some(match reason {
+                    CondemnedReason::BeyondCut => "beyond_cut",
+                    CondemnedReason::OffBranch => "off_branch",
+                    CondemnedReason::ClosedIncarnation => "closed_incarnation",
+                }),
+            ),
+            Outcome::Parked(reason) => (
+                "parked",
+                Some(match reason {
+                    ParkReason::UnknownOwnerRef => "unknown_owner_ref",
+                    ParkReason::UnknownCutTarget => "unknown_cut_target",
+                    ParkReason::IncompleteCutAncestry => "incomplete_cut_ancestry",
+                    ParkReason::ContestedSubject => "contested_subject",
+                    ParkReason::DeferredStreamAuthorization => "deferred_stream_authorization",
+                }),
+            ),
+            Outcome::Rejected(reason) => (
+                "rejected",
+                Some(match reason {
+                    RejectReason::StaleAuthority => "stale_authority",
+                    RejectReason::GenesisSelfHash => "genesis_self_hash",
+                    RejectReason::DuplicateGenesis => "duplicate_genesis",
+                    RejectReason::DuplicateAdd => "duplicate_add",
+                    RejectReason::TombstoneReAdd => "tombstone_re_add",
+                    RejectReason::BadPromote => "bad_promote",
+                    RejectReason::LastOwner => "last_owner",
+                    RejectReason::CutTargetMismatch => "cut_target_mismatch",
+                    RejectReason::WrongDevice => "wrong_device",
+                    RejectReason::Malformed => "malformed",
+                    RejectReason::NonGenesisOrigin => "non_genesis_origin",
+                    RejectReason::Ineffective => "ineffective",
+                }),
+            ),
+        }
+    }
 }
 
 /// Why an entry was killed by a revocation register (§11.2). `BeyondCut` is seq-only (I11) and

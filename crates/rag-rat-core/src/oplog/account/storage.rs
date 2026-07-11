@@ -1,0 +1,634 @@
+//! §16 account candidate-DAG storage: ingest, content-addressed device resolution, the pre-verify
+//! queue, and `refold_account` — the pure [`super::fold::fold_account`] plus branch selection
+//! (§16.2) projected onto the `accepted` flag + the §16.3 status taxonomy.
+//!
+//! The candidate table (`account_entries`) is grow-only and holds EVERY
+//! structurally/signature-valid entry, all branches of an equivocating chain first-class (no
+//! seq-uniqueness). `accepted` is DERIVED — rewritten atomically by every refold, gated by the
+//! `account_accepted_slot` partial unique index (I10a) — never authored. Nothing here touches
+//! [`super::super::store::append`]; the account layer is a separate signed wire layer with its own
+//! DAG.
+
+use std::collections::HashMap;
+
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
+use super::id::account_id_from_genesis_payload;
+use super::ops::{self, AccountOp, DecodedAccountOp};
+use super::{AccountId, fold};
+use crate::oplog::device::DevicePublic;
+use crate::oplog::op::DeviceFingerprint;
+
+/// The result of ingesting one signed account entry (§16.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IngestOutcome {
+    /// Structurally rejected (bad canonicity / over §18a / bad signature / fingerprint or self-hash
+    /// mismatch) — NEVER stored.
+    Rejected(String),
+    /// The signing device is not yet resolvable (`sha256(pk)` matches no known fingerprint) — held
+    /// durably in `account_pre_verify`, retried when a later DeviceAdd/AccountGenesis arrives.
+    PreVerify,
+    /// Stored as a candidate; `status` is its post-refold §16.3 taxonomy label.
+    Ingested { status: String },
+}
+
+/// Ingest one signed account entry: structural decode → content-addressed device resolution →
+/// signature verify → genesis self-hash → `INSERT OR IGNORE` into the candidate DAG → promote any
+/// pre-verify rows this entry now resolves → `refold_account`. Opens its own IMMEDIATE transaction.
+pub(crate) fn account_ingest(
+    conn: &Connection,
+    signed_bytes: &[u8],
+    now_ms: i64,
+) -> anyhow::Result<IngestOutcome> {
+    // Structure + §18a size + canonicity (never stored on failure).
+    let signed = match envelope::decode_account_signed(signed_bytes) {
+        Ok(signed) => signed,
+        Err(err) => return Ok(IngestOutcome::Rejected(err.to_string())),
+    };
+    let account_id = signed.header.account_id;
+    let device_fp = signed.header.device_fingerprint;
+
+    // Resolve the signer's ed25519 pubkey content-addressedly: from stored genesis/DeviceAdd
+    // candidates for this account, plus THIS entry if it self-certifies (a genesis / a DeviceAdd of
+    // its own signer). Unresolvable ⇒ pre-verify queue.
+    let mut pubkeys = stored_device_pubkeys(conn, account_id)?;
+    add_self_pubkey(&mut pubkeys, &signed.header, &signed.payload);
+    let Some(pubkey_bytes) = pubkeys.get(&device_fp).copied() else {
+        insert_pre_verify(conn, &signed.entry_hash, account_id, device_fp, signed_bytes, now_ms)?;
+        return Ok(IngestOutcome::PreVerify);
+    };
+
+    // Verify the signature under the resolved key (also re-binds fingerprint == sha256(pk)).
+    let Ok(pubkey) = DevicePublic::from_bytes(&pubkey_bytes) else {
+        return Ok(IngestOutcome::Rejected("resolved device key is not a valid point".into()));
+    };
+    let verified = match envelope::verify_account_signed(signed_bytes, &pubkey) {
+        Ok(verified) => verified,
+        Err(err) => return Ok(IngestOutcome::Rejected(err.to_string())),
+    };
+    // A genesis must self-hash to its account_id (§4) — a structural reject, before it can seed a
+    // DAG.
+    if is_genesis(&verified.header)
+        && account_id_from_genesis_payload(&verified.payload) != account_id
+    {
+        return Ok(IngestOutcome::Rejected(
+            "genesis payload does not hash to its account_id".into(),
+        ));
+    }
+
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    insert_candidate(&tx, &verified, signed_bytes, now_ms)?;
+    // A DeviceAdd/genesis may resolve devices that were parked — retry their pre-verify rows.
+    if is_genesis(&verified.header) || is_device_add(&verified) {
+        promote_pre_verify(&tx, account_id, now_ms)?;
+    }
+    let status = refold_in_tx(&tx, account_id)?;
+    tx.commit()?;
+    Ok(IngestOutcome::Ingested {
+        status: status.get(&verified.entry_hash).cloned().unwrap_or_else(|| "unknown".into()),
+    })
+}
+
+/// Re-derive the whole account: fold the candidate set, resolve accepted-slot uniqueness (branch
+/// selection §16.2), and rewrite `accepted` + `account_entry_status` in one IMMEDIATE transaction
+/// so the `account_accepted_slot` partial unique index (I10a) never transiently double-accepts a
+/// slot.
+pub(super) fn refold_account(conn: &Connection, account_id: AccountId) -> anyhow::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    refold_in_tx(&tx, account_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The refold body (caller owns the txn). Returns each entry_hash → its projected status.
+fn refold_in_tx(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+) -> anyhow::Result<HashMap<[u8; 32], String>> {
+    let rows = load_candidates(tx, account_id)?;
+    let entries: Vec<VerifiedAccountEntry> = rows.iter().map(|r| r.verified.clone()).collect();
+    let history = fold::fold_account(&entries);
+
+    // Branch selection: an entry is a candidate for `accepted` iff the fold makes it effective;
+    // when two effective entries collide on one (device, seq) slot (an unforced fork the
+    // registers did not resolve), the lexicographically-smaller entry_hash wins the slot and
+    // the loser is `forked` (I10a). Register-named branches were already promoted inside the
+    // fold (off-branch → condemned).
+    let mut slot_winner: HashMap<(DeviceFingerprint, u64), [u8; 32]> = HashMap::new();
+    for row in &rows {
+        if history.outcome(&row.entry_hash).is_some_and(|o| o.is_effective()) {
+            slot_winner
+                .entry((row.device_fingerprint, row.seq))
+                .and_modify(|best| {
+                    if row.entry_hash < *best {
+                        *best = row.entry_hash;
+                    }
+                })
+                .or_insert(row.entry_hash);
+        }
+    }
+
+    // Rewrite: clear every accepted flag for the account, then re-set the winners — atomically,
+    // so the partial unique index never sees two accepted rows at one slot mid-transaction.
+    tx.execute("UPDATE account_entries SET accepted = 0 WHERE account_id = ?1", params![
+        account_id.to_bytes().as_slice()
+    ])?;
+
+    let mut statuses: HashMap<[u8; 32], String> = HashMap::new();
+    for row in &rows {
+        let effective = history.outcome(&row.entry_hash).is_some_and(|o| o.is_effective());
+        let accepted = effective
+            && slot_winner.get(&(row.device_fingerprint, row.seq)) == Some(&row.entry_hash);
+        let (status, detail): (String, Option<String>) = if accepted {
+            ("accepted".to_string(), None)
+        } else if effective {
+            // Effective but lost the slot tiebreak — an equivocation loser.
+            ("forked".to_string(), None)
+        } else {
+            match history.outcome(&row.entry_hash) {
+                Some(outcome) => {
+                    let (s, d) = outcome.taxonomy();
+                    (s.to_string(), d.map(str::to_string))
+                },
+                // Not in the fold's outcome map (unreachable — every candidate is classified).
+                None => ("retained_unfolded".to_string(), None),
+            }
+        };
+        if accepted {
+            tx.execute("UPDATE account_entries SET accepted = 1 WHERE entry_hash = ?1", params![
+                row.entry_hash.as_slice()
+            ])?;
+        }
+        tx.execute(
+            "INSERT INTO account_entry_status(entry_hash, status, detail) VALUES (?1, ?2, ?3)
+             ON CONFLICT(entry_hash) DO UPDATE SET status = excluded.status, detail = \
+             excluded.detail",
+            params![row.entry_hash.as_slice(), status, detail],
+        )?;
+        statuses.insert(row.entry_hash, status);
+    }
+    Ok(statuses)
+}
+
+/// A stored candidate row, with its verified entry reconstituted from the trusted stored bytes (the
+/// signature was checked at ingest; the local DB is the trust boundary, so we re-decode STRUCTURE
+/// only rather than re-verify — which would need the device set we are loading).
+struct CandidateRow {
+    entry_hash: [u8; 32],
+    device_fingerprint: DeviceFingerprint,
+    seq: u64,
+    verified: VerifiedAccountEntry,
+}
+
+fn load_candidates(conn: &Connection, account_id: AccountId) -> anyhow::Result<Vec<CandidateRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT entry_hash, device_fingerprint, seq, signed_bytes
+         FROM account_entries WHERE account_id = ?1
+         ORDER BY entry_hash", // deterministic load order (the fold is order-free regardless)
+    )?;
+    let rows = stmt
+        .query_map(params![account_id.to_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (hash, fp, seq, signed_bytes) in rows {
+        let signed = envelope::decode_account_signed(&signed_bytes)
+            .map_err(|err| anyhow::anyhow!("stored candidate re-decode failed: {err}"))?;
+        out.push(CandidateRow {
+            entry_hash: fixed(&hash)?,
+            device_fingerprint: DeviceFingerprint::from_bytes(fixed(&fp)?),
+            seq: seq as u64,
+            verified: VerifiedAccountEntry {
+                header: signed.header,
+                payload: signed.payload,
+                entry_hash: signed.entry_hash,
+            },
+        });
+    }
+    Ok(out)
+}
+
+fn insert_candidate(
+    tx: &Transaction<'_>,
+    verified: &VerifiedAccountEntry,
+    signed_bytes: &[u8],
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let h = &verified.header;
+    // INSERT OR IGNORE on the entry_hash PK: idempotent, and the candidate table has NO
+    // seq-uniqueness — an equivocation head at an already-occupied slot is a first-class candidate.
+    tx.execute(
+        "INSERT OR IGNORE INTO account_entries(
+             entry_hash, account_id, log_id, device_fingerprint, seq, prev_hash, parent_ref,
+             authority_ref, entry_type, accepted, signed_bytes, received_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
+        params![
+            verified.entry_hash.as_slice(),
+            h.account_id.to_bytes().as_slice(),
+            h.log_id,
+            h.device_fingerprint.to_bytes().as_slice(),
+            h.seq as i64,
+            h.prev_hash.map(|p| p.to_vec()),
+            h.parent_ref.map(|p| p.to_vec()),
+            h.authority_ref.map(|p| p.to_vec()),
+            h.entry_type,
+            signed_bytes,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The `(fingerprint → ed25519_pubkey)` map from every stored genesis / DeviceAdd for the account —
+/// the only ops that carry a device's key. Fold-status-independent (§16.2): a key resolves from ANY
+/// stored candidate carrying it, whether or not it is currently accepted.
+fn stored_device_pubkeys(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<HashMap<DeviceFingerprint, [u8; 32]>> {
+    let mut stmt = conn.prepare(
+        "SELECT signed_bytes FROM account_entries WHERE account_id = ?1 AND entry_type IN (?2, ?3)",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                account_id.to_bytes().as_slice(),
+                ops::entry_type::ACCOUNT_GENESIS,
+                ops::entry_type::DEVICE_ADD,
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = HashMap::new();
+    for signed_bytes in rows {
+        if let Ok(signed) = envelope::decode_account_signed(&signed_bytes) {
+            add_self_pubkey(&mut out, &signed.header, &signed.payload);
+        }
+    }
+    Ok(out)
+}
+
+/// Add the `(fingerprint → pubkey)` an entry itself certifies: a genesis certifies its founder key
+/// (the SIGNER); a DeviceAdd certifies the ADDED device's key. Both bind `sha256(pk) ==
+/// fingerprint` (genesis: the header device; DeviceAdd: the op's `device_fingerprint`, enforced at
+/// decode).
+fn add_self_pubkey(
+    map: &mut HashMap<DeviceFingerprint, [u8; 32]>,
+    header: &AccountEntryHeader,
+    payload: &[u8],
+) {
+    if let Ok(DecodedAccountOp::Known(op)) = ops::decode(header.entry_type, payload) {
+        match op {
+            AccountOp::AccountGenesis { ed25519_pubkey, .. } => {
+                map.insert(header.device_fingerprint, ed25519_pubkey);
+            },
+            AccountOp::DeviceAdd { device_fingerprint, ed25519_pubkey, .. } => {
+                map.insert(device_fingerprint, ed25519_pubkey);
+            },
+            _ => {},
+        }
+    }
+}
+
+fn insert_pre_verify(
+    conn: &Connection,
+    entry_hash: &[u8; 32],
+    account_id: AccountId,
+    fingerprint: DeviceFingerprint,
+    signed_bytes: &[u8],
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO account_pre_verify(
+             entry_hash, claimed_account_id, claimed_fingerprint, raw_bytes, received_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            entry_hash.as_slice(),
+            account_id.to_bytes().as_slice(),
+            fingerprint.to_bytes().as_slice(),
+            signed_bytes,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Retry every pre-verify row for the account against the now-larger device set: a row whose signer
+/// resolves is verified + promoted into `account_entries` and cleared; the rest stay parked.
+fn promote_pre_verify(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let pubkeys = stored_device_pubkeys(tx, account_id)?;
+    let pending: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT entry_hash, claimed_fingerprint, raw_bytes
+             FROM account_pre_verify WHERE claimed_account_id = ?1",
+        )?;
+        stmt.query_map(params![account_id.to_bytes().as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (entry_hash, fp_bytes, raw_bytes) in pending {
+        let fp = DeviceFingerprint::from_bytes(fixed(&fp_bytes)?);
+        let Some(pk_bytes) = pubkeys.get(&fp).copied() else {
+            continue; // still unresolvable
+        };
+        let promoted = DevicePublic::from_bytes(&pk_bytes)
+            .ok()
+            .and_then(|pk| envelope::verify_account_signed(&raw_bytes, &pk).ok())
+            .filter(|v| {
+                !is_genesis(&v.header)
+                    || account_id_from_genesis_payload(&v.payload) == v.header.account_id
+            });
+        if let Some(verified) = promoted {
+            insert_candidate(tx, &verified, &raw_bytes, now_ms)?;
+        }
+        // Resolved (promoted) or refuted (verify failed): clear it from the queue either way.
+        tx.execute("DELETE FROM account_pre_verify WHERE entry_hash = ?1", params![
+            entry_hash.as_slice()
+        ])?;
+    }
+    Ok(())
+}
+
+fn is_genesis(header: &AccountEntryHeader) -> bool {
+    header.entry_type == ops::entry_type::ACCOUNT_GENESIS
+}
+
+fn is_device_add(verified: &VerifiedAccountEntry) -> bool {
+    verified.header.entry_type == ops::entry_type::DEVICE_ADD
+}
+
+/// A stored 32-byte column as a fixed array (errors, never panics, on a wrong-length blob).
+fn fixed(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
+    bytes.try_into().map_err(|_| anyhow::anyhow!("stored hash is {} bytes, not 32", bytes.len()))
+}
+
+/// The projected status of a single entry (§16.3), or `None` if the entry isn't stored (e.g. it is
+/// still in the pre-verify queue). A read helper for queries.
+pub(super) fn entry_status(
+    conn: &Connection,
+    entry_hash: &[u8; 32],
+) -> anyhow::Result<Option<(String, Option<String>)>> {
+    Ok(conn
+        .query_row(
+            "SELECT status, detail FROM account_entry_status WHERE entry_hash = ?1",
+            params![entry_hash.as_slice()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::schema;
+    use crate::oplog::account::envelope::sign_account_entry;
+    use crate::oplog::account::ops::{DeviceRole, encode, entry_type_of};
+    use crate::oplog::device::{DeviceSecret, DeviceX25519Secret};
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn
+    }
+
+    struct Dev {
+        secret: DeviceSecret,
+        fp: DeviceFingerprint,
+        ed: [u8; 32],
+        x: [u8; 32],
+    }
+
+    impl Dev {
+        fn new(seed: u8) -> Self {
+            let secret = DeviceSecret::from_seed(&[seed; 32]);
+            let public = secret.public();
+            let x =
+                DeviceX25519Secret::from_seed(&[seed.wrapping_add(0x80); 32]).public().to_bytes();
+            Dev { fp: public.fingerprint(), ed: public.to_bytes(), x, secret }
+        }
+    }
+
+    fn genesis(founder: &Dev) -> (AccountId, Vec<u8>, [u8; 32]) {
+        let op = AccountOp::AccountGenesis {
+            ed25519_pubkey: founder.ed,
+            x25519_pubkey: founder.x,
+            nonce16: [0u8; 16],
+            created_at_ms: NOW as u64,
+            label: None,
+        };
+        let payload = encode(&op).unwrap();
+        let account_id = account_id_from_genesis_payload(&payload);
+        let header = AccountEntryHeader {
+            account_id,
+            log_id: 0,
+            device_fingerprint: founder.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: ops::entry_type::ACCOUNT_GENESIS,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 0,
+            key_id: None,
+            authority_ref: None,
+        };
+        let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
+        (account_id, signed.signed_bytes, signed.entry_hash)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn op(
+        account_id: AccountId,
+        signer: &Dev,
+        seq: u64,
+        prev: Option<[u8; 32]>,
+        authority_ref: Option<[u8; 32]>,
+        op: &AccountOp,
+    ) -> (Vec<u8>, [u8; 32]) {
+        let payload = encode(op).unwrap();
+        let header = AccountEntryHeader {
+            account_id,
+            log_id: 0,
+            device_fingerprint: signer.fp,
+            seq,
+            prev_hash: prev,
+            parent_ref: None,
+            entry_type: entry_type_of(op),
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref,
+        };
+        let signed = sign_account_entry(&signer.secret, &header, &payload).unwrap();
+        (signed.signed_bytes, signed.entry_hash)
+    }
+
+    fn device_add(dev: &Dev, role: DeviceRole) -> AccountOp {
+        AccountOp::DeviceAdd {
+            device_fingerprint: dev.fp,
+            ed25519_pubkey: dev.ed,
+            x25519_pubkey: dev.x,
+            role,
+            label: None,
+        }
+    }
+
+    fn status(conn: &Connection, hash: &[u8; 32]) -> Option<String> {
+        entry_status(conn, hash).unwrap().map(|(s, _)| s)
+    }
+
+    #[test]
+    fn a_genesis_ingests_and_is_accepted() {
+        let conn = db();
+        let (_acct, bytes, gh) = genesis(&Dev::new(1));
+        let out = account_ingest(&conn, &bytes, NOW).unwrap();
+        assert_eq!(out, IngestOutcome::Ingested { status: "accepted".into() });
+        assert_eq!(status(&conn, &gh).as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn a_forged_re_signed_genesis_is_rejected_not_stored() {
+        // A non-owner re-signs the victim's genesis payload under its own key: the fold binds the
+        // founder key, so ingest verifies but the fold classifies the forgery non-effective. (The
+        // signature verifies under the attacker key AND fingerprint matches — the takeover defence
+        // is the fold's founder binding, exercised end-to-end through ingest.)
+        let conn = db();
+        let (acct, real_bytes, real_gh) = genesis(&Dev::new(1));
+        account_ingest(&conn, &real_bytes, NOW).unwrap();
+        // The attacker re-signs the SAME payload (same account_id) under its own key.
+        let attacker = Dev::new(9);
+        let victim = Dev::new(1);
+        let op = AccountOp::AccountGenesis {
+            ed25519_pubkey: victim.ed,
+            x25519_pubkey: victim.x,
+            nonce16: [0u8; 16],
+            created_at_ms: NOW as u64,
+            label: None,
+        };
+        let payload = encode(&op).unwrap();
+        let header = AccountEntryHeader {
+            account_id: acct,
+            log_id: 0,
+            device_fingerprint: attacker.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: ops::entry_type::ACCOUNT_GENESIS,
+            op_version: 1,
+            crypto_suite: 0,
+            auth_len: 0,
+            key_id: None,
+            authority_ref: None,
+        };
+        let signed = sign_account_entry(&attacker.secret, &header, &payload).unwrap();
+        account_ingest(&conn, &signed.signed_bytes, NOW).unwrap();
+        assert_eq!(
+            status(&conn, &real_gh).as_deref(),
+            Some("accepted"),
+            "the real founder holds it"
+        );
+        assert_ne!(
+            status(&conn, &signed.entry_hash).as_deref(),
+            Some("accepted"),
+            "the forged re-signed genesis never becomes the accepted root",
+        );
+    }
+
+    #[test]
+    fn an_owner_added_after_genesis_is_accepted() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+        let b = Dev::new(2);
+        let (add_bytes, add_hash) =
+            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        let out = account_ingest(&conn, &add_bytes, NOW).unwrap();
+        assert_eq!(out, IngestOutcome::Ingested { status: "accepted".into() });
+        assert_eq!(status(&conn, &add_hash).as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn an_entry_whose_device_is_unknown_is_pre_verified_then_promoted() {
+        // Ingest a founder-signed DeviceAdd BEFORE the genesis: the founder's key isn't resolvable,
+        // so it parks in pre-verify. The genesis arrival resolves the founder and promotes it.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        let b = Dev::new(2);
+        let (add_bytes, add_hash) =
+            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+
+        // The add arrives first — unresolvable device → pre-verify.
+        assert_eq!(account_ingest(&conn, &add_bytes, NOW).unwrap(), IngestOutcome::PreVerify);
+        assert_eq!(status(&conn, &add_hash), None, "not yet a stored candidate");
+
+        // The genesis resolves the founder and promotes the queued add.
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+        assert_eq!(status(&conn, &gh).as_deref(), Some("accepted"));
+        assert_eq!(
+            status(&conn, &add_hash).as_deref(),
+            Some("accepted"),
+            "the queued add promoted"
+        );
+        let pending: i64 =
+            conn.query_row("SELECT COUNT(*) FROM account_pre_verify", [], |r| r.get(0)).unwrap();
+        assert_eq!(pending, 0, "the pre-verify queue is drained");
+    }
+
+    #[test]
+    fn an_equivocation_accepts_one_head_and_forks_the_other() {
+        // The founder equivocates: two DIFFERENT seq-1 entries on its own chain. Both fold
+        // effective, but only one can occupy the (device, seq) slot (I10a) — the smaller
+        // entry_hash wins, the other is `forked`. The partial unique index would blow up if
+        // refold accepted both.
+        let conn = db();
+        let founder = Dev::new(1);
+        let (acct, gbytes, gh) = genesis(&founder);
+        account_ingest(&conn, &gbytes, NOW).unwrap();
+        let (b, c) = (Dev::new(2), Dev::new(3));
+        let (b_bytes, b_hash) =
+            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Member));
+        let (c_bytes, c_hash) =
+            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&c, DeviceRole::Member));
+        account_ingest(&conn, &b_bytes, NOW).unwrap();
+        account_ingest(&conn, &c_bytes, NOW).unwrap();
+
+        let (winner, loser) = if b_hash < c_hash { (b_hash, c_hash) } else { (c_hash, b_hash) };
+        assert_eq!(
+            status(&conn, &winner).as_deref(),
+            Some("accepted"),
+            "smaller hash wins the slot"
+        );
+        assert_eq!(
+            status(&conn, &loser).as_deref(),
+            Some("forked"),
+            "the equivocation loser forks"
+        );
+        // I10a: exactly one accepted entry at the (founder, seq 1) slot.
+        let accepted_at_slot: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries
+                 WHERE account_id = ?1 AND device_fingerprint = ?2 AND seq = 1 AND accepted = 1",
+                params![acct.to_bytes().as_slice(), founder.fp.to_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(accepted_at_slot, 1, "one accepted head per slot (I10a)");
+    }
+}
