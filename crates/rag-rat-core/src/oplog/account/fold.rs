@@ -15,11 +15,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::AccountId;
 use super::candidate::{self, Ancestry, CutCoordinate, HeaderView, JoinResult, UnknownCause};
 use super::cut::{Cut, beyond};
 use super::envelope::{AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
-use super::ops::{self, AccountOp, DecodedAccountOp, DeviceRole};
+use super::ops::{self, AccountOp, ChainKind, DecodedAccountOp, DeviceRole};
 use super::registers::RegisterKey;
 use crate::oplog::op::DeviceFingerprint;
 
@@ -96,11 +97,15 @@ pub(super) enum AccountClassification {
     Contested { state_before_depth: usize },
 }
 
-/// The derived authority history of one account: per-entry outcomes + the account classification.
-/// (Registers land with the cut-op stage.)
+/// The derived authority history of one account: per-entry outcomes, the account classification,
+/// and (only when `contested`) the deterministic recovery successor.
 pub(super) struct AccountAuthHistory {
     outcomes: HashMap<[u8; 32], Outcome>,
     classification: AccountClassification,
+    /// In a `contested` account, the deterministic `AccountReRoot` successor a subscriber follows
+    /// — the smallest `successor_account_id` by byte order among the admitted re-roots (§12).
+    /// `None` when the account is `Live` or no pre-contest owner has re-rooted yet.
+    contested_successor: Option<AccountId>,
 }
 
 impl AccountAuthHistory {
@@ -111,6 +116,11 @@ impl AccountAuthHistory {
 
     pub(super) fn classification(&self) -> AccountClassification {
         self.classification
+    }
+
+    /// The deterministic recovery successor for a `contested` account (§12), if one exists.
+    pub(super) fn contested_successor(&self) -> Option<AccountId> {
+        self.contested_successor
     }
 
     fn is_effective(&self, entry_hash: &[u8; 32]) -> bool {
@@ -277,6 +287,42 @@ fn control_register(c: &Candidate) -> Option<(RegisterKey, Cut, CutCoordinate)> 
     }
 }
 
+/// The CONTROL register a `CutExtend` raises (§10/§11.4) and the new watermark it joins in. A
+/// `CutExtend` does NOT create a register — it extends one a prior `DeviceRemove` / `OwnerDemote`
+/// made — so it is joined separately from the creator cut ops (it is never a cycle participant).
+/// `incarnation_id` selects the owner-incarnation register; its absence selects the device-level
+/// one. Secrets / content extends (C2/C4) return `None`.
+fn cut_extend_register(c: &Candidate) -> Option<(RegisterKey, Cut, CutCoordinate)> {
+    let AccountOp::CutExtend {
+        chain_kind,
+        incarnation_id,
+        subject_account_id,
+        device_fingerprint,
+        new_seq,
+        new_entry_hash,
+        ..
+    } = &c.op
+    else {
+        return None;
+    };
+    if *chain_kind != ChainKind::Ctrl {
+        return None;
+    }
+    let account = *subject_account_id;
+    let cut = Cut::At { seq: *new_seq, hash: *new_entry_hash };
+    let coord = CutCoordinate { account, log: 0, device: *device_fingerprint };
+    let key = match incarnation_id {
+        Some(owner_id) => RegisterKey::OwnerIncarnation {
+            account,
+            log: 0,
+            device: *device_fingerprint,
+            owner_id: *owner_id,
+        },
+        None => RegisterKey::Device { account, log: 0, device: *device_fingerprint },
+    };
+    Some((key, cut, coord))
+}
+
 /// I2: whether admitting this cut op would close the LAST open owner incarnation (ineffective).
 /// Read against the owner set as of the previous depth boundary (same-depth adds are not yet
 /// reflected — the check is deliberately conservative).
@@ -392,6 +438,41 @@ struct AdmittedCut<'a> {
     cut: Cut,
 }
 
+/// The result of `⊔`-joining one register into the accumulated set.
+enum RegisterJoin {
+    /// Installed / raised the watermark.
+    Applied,
+    /// Two incomparable cuts for one key — owner-key compromise (§11.3).
+    Contested,
+    /// The branch relation can't be decided yet — leave the held register, park the newcomer.
+    Parked,
+}
+
+/// `⊔`-join `cut` into `registers` under `key` (§11.3): a fresh key installs it; an existing key
+/// keeps the comparable-ancestor join (the higher on-branch watermark), reports `Contested` on an
+/// incomparable pair, and `Parked` when the branch relation is still undecidable.
+fn join_register(
+    registers: &mut HashMap<RegisterKey, Cut>,
+    key: RegisterKey,
+    cut: Cut,
+    view: &dyn HeaderView,
+) -> RegisterJoin {
+    match registers.get(&key) {
+        None => {
+            registers.insert(key, cut);
+            RegisterJoin::Applied
+        },
+        Some(existing) => match candidate::join_cuts(existing, &cut, view) {
+            JoinResult::Extended(joined) => {
+                registers.insert(key, joined);
+                RegisterJoin::Applied
+            },
+            JoinResult::Incomparable => RegisterJoin::Contested,
+            JoinResult::Unknown => RegisterJoin::Parked,
+        },
+    }
+}
+
 /// Fold one account's control-log candidates into their derived classification (§11). All entries
 /// MUST share `account_id` (the caller groups by account). Order-independent: the result is
 /// identical under every permutation of `entries`.
@@ -419,7 +500,11 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         for c in &candidates {
             outcomes.insert(c.hash(), Outcome::Parked(ParkReason::UnknownOwnerRef));
         }
-        return AccountAuthHistory { outcomes, classification: AccountClassification::Live };
+        return AccountAuthHistory {
+            outcomes,
+            classification: AccountClassification::Live,
+            contested_successor: None,
+        };
     };
     let genesis_owner_id = genesis.hash();
 
@@ -501,30 +586,57 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
             break 'depths;
         }
 
-        // Join each admitted register into the register set (§11.3 `⊔`). Two incomparable cuts for
-        // ONE key (equal-seq different-hash, or divergent branches — only two owner cut ops can
-        // produce this) are a same-depth mutual condemnation ⇒ contested, never a chosen hash.
+        // Join each admitted creator register into the register set (§11.3 `⊔`). Two incomparable
+        // cuts for ONE key (equal-seq different-hash, or divergent branches — only two owner cut
+        // ops can produce this) are a same-depth mutual condemnation ⇒ contested, never a
+        // chosen hash.
         for a in &admitted {
-            match registers.get(&a.key) {
-                None => {
-                    registers.insert(a.key.clone(), a.cut.clone());
+            match join_register(&mut registers, a.key.clone(), a.cut.clone(), &view) {
+                RegisterJoin::Applied => {},
+                RegisterJoin::Contested => {
+                    classification = AccountClassification::Contested { state_before_depth: depth };
+                    break 'depths;
                 },
-                Some(existing) => match candidate::join_cuts(existing, &a.cut, &view) {
-                    JoinResult::Extended(joined) => {
-                        registers.insert(a.key.clone(), joined);
-                    },
-                    JoinResult::Incomparable => {
-                        classification =
-                            AccountClassification::Contested { state_before_depth: depth };
-                        break 'depths;
-                    },
-                    // The branch relation can't be decided yet — keep the held register and park
-                    // the newcomer (it re-joins on the next refold once its
-                    // watermark syncs).
-                    JoinResult::Unknown => {
-                        cut_verdicts
-                            .insert(a.op.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
-                    },
+                // The branch relation can't be decided yet — keep the held register and park the
+                // newcomer (it re-joins on the next refold once its watermark syncs).
+                RegisterJoin::Parked => {
+                    cut_verdicts.insert(a.op.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
+                },
+            }
+        }
+
+        // Raise registers with this depth's live `CutExtend`s (§11.4 recovery). An extend only
+        // grows a watermark along one branch — re-blessing the beyond-cut cone the lower
+        // watermark condemned — so it is joined AFTER the creators and never participates
+        // in the cycle.
+        for &i in &idxs {
+            let c = &candidates[i];
+            if condemned.contains_key(&c.hash()) {
+                continue;
+            }
+            let Some((key, cut, coord)) = cut_extend_register(c) else {
+                continue;
+            };
+            let Some(author_inc) = incarnations.author_incarnation_id(c) else {
+                continue;
+            };
+            if !state.live.contains(&author_inc) {
+                continue;
+            }
+            if candidate::validate_cut_target(&cut, &coord, &view)
+                == candidate::CutBinding::Mismatch
+            {
+                cut_verdicts.insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
+                continue;
+            }
+            match join_register(&mut registers, key, cut, &view) {
+                RegisterJoin::Applied => {},
+                RegisterJoin::Contested => {
+                    classification = AccountClassification::Contested { state_before_depth: depth };
+                    break 'depths;
+                },
+                RegisterJoin::Parked => {
+                    cut_verdicts.insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
                 },
             }
         }
@@ -594,16 +706,38 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         }
     }
 
-    // In a `contested` account authority mutation halts (§12): every candidate the halt left
-    // undecided (the residue cut ops + anything at depth ≥ d) parks as a contested subject —
-    // fail-closed and observable, reclassified if the account recovers.
+    // In a `contested` account authority mutation halts (§12), with ONE exception: `AccountReRoot`
+    // by an owner live in state_before(d). It is advisory (transfers no authority — a subscriber
+    // re-decides trust against the self-certifying successor genesis), so it needs no residue
+    // registers. Multiple re-roots ⇒ the deterministic successor is the smallest by byte order
+    // (order-free). Every other undecided candidate parks as a contested subject — fail-closed and
+    // observable, reclassified if the account recovers.
+    let mut contested_successor: Option<AccountId> = None;
     if matches!(classification, AccountClassification::Contested { .. }) {
+        // Admit re-roots in a deterministic (successor_id, hash) order so `auth_epoch` is
+        // order-free.
+        let mut reroots: Vec<(&Candidate, AccountId)> = candidates
+            .iter()
+            .filter_map(|c| match &c.op {
+                AccountOp::AccountReRoot { successor_account_id, .. } => {
+                    let author_inc = incarnations.author_incarnation_id(c)?;
+                    state.live.contains(&author_inc).then_some((c, *successor_account_id))
+                },
+                _ => None,
+            })
+            .collect();
+        reroots.sort_by_key(|(c, successor)| (successor.to_bytes(), c.hash()));
+        for (c, successor) in &reroots {
+            outcomes.insert(c.hash(), effective(&state));
+            state.next_auth_epoch += 1;
+            contested_successor.get_or_insert(*successor);
+        }
         for c in &candidates {
             outcomes.entry(c.hash()).or_insert(Outcome::Parked(ParkReason::ContestedSubject));
         }
     }
 
-    AccountAuthHistory { outcomes, classification }
+    AccountAuthHistory { outcomes, classification, contested_successor }
 }
 
 /// The genesis candidate: an `AccountGenesis` whose payload hashes to the shared `account_id` (§4).
@@ -899,6 +1033,34 @@ mod tests {
         }
     }
 
+    fn owner_promote(dev: &Dev) -> AccountOp {
+        AccountOp::OwnerPromote { device_fingerprint: dev.fp }
+    }
+
+    fn account_reroot(successor: AccountId) -> AccountOp {
+        AccountOp::AccountReRoot { successor_account_id: successor, note: None }
+    }
+
+    /// A control-log `CutExtend` raising `subject`'s register (device-level when `incarnation_id`
+    /// is `None`, owner-incarnation otherwise) to `[new_seq, new_entry_hash]`.
+    fn cut_extend_ctrl(
+        account: AccountId,
+        subject: &Dev,
+        incarnation_id: Option<[u8; 32]>,
+        new_seq: u64,
+        new_entry_hash: [u8; 32],
+    ) -> AccountOp {
+        AccountOp::CutExtend {
+            chain_kind: ops::ChainKind::Ctrl,
+            stream_id: None,
+            incarnation_id,
+            subject_account_id: account,
+            device_fingerprint: subject.fp,
+            new_seq,
+            new_entry_hash,
+        }
+    }
+
     #[test]
     fn genesis_is_effective() {
         let founder = Dev::new(1);
@@ -1059,11 +1221,15 @@ mod tests {
         // genuine owner-key-compromise signal (§12). The fold fails closed to state_before(1) and
         // halts: neither removal folds, and the residue cut ops park as contested subjects.
         let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let (small, big) = (AccountId::from_bytes([0x11; 32]), AccountId::from_bytes([0x22; 32]));
         let mut f = Fixture::genesis(&fdr);
         let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
         let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
         let remove_b = f.author(&a, Some(add_a), &device_remove(&b, Cut::Empty));
         let remove_a = f.author(&b, Some(add_b), &device_remove(&a, Cut::Empty));
+        // Two competing recovery re-roots by a pre-contest owner (A, live in state_before(1)).
+        let reroot_big = f.author(&a, Some(add_a), &account_reroot(big));
+        let reroot_small = f.author(&a, Some(add_a), &account_reroot(small));
 
         let h = f.fold();
         assert_eq!(
@@ -1081,13 +1247,23 @@ mod tests {
             Some(Outcome::Parked(ParkReason::ContestedSubject)),
             "the residue cut op parks, fail-closed",
         );
-        // Order-independence holds through a contested fold (I9): the same standoff is detected.
+        // The sole admitted ops are the pre-contest owner's re-roots; the successor is
+        // deterministic.
+        assert!(h.is_effective(&reroot_small) && h.is_effective(&reroot_big), "re-roots admitted");
+        assert_eq!(
+            h.contested_successor(),
+            Some(small),
+            "the deterministic successor is the smallest account_id by byte order",
+        );
+        // Order-independence holds through a contested fold (I9): same standoff, same successor.
         for rot in 0..f.entries.len() {
+            let r = f.fold_rotated(rot);
             assert_eq!(
-                f.fold_rotated(rot).classification(),
+                r.classification(),
                 AccountClassification::Contested { state_before_depth: 1 },
                 "rotation {rot} must reach the same contested verdict",
             );
+            assert_eq!(r.contested_successor(), Some(small), "rotation {rot} successor");
         }
     }
 
@@ -1165,6 +1341,116 @@ mod tests {
             healed.outcome(&b2),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
             "b2 stays condemned — healing never flips the beyond-cut verdict",
+        );
+    }
+
+    #[test]
+    fn interleaved_control_set_folds_totally_and_without_oscillation_p2() {
+        // A control set mixing adds, an owner-incarnation demotion (condemning beyond-cut work), a
+        // device removal, and an unresolvable citation. P2: the effect pass classifies EVERY
+        // candidate (totality), and the full outcome map is byte-identical under every arrival
+        // permutation (no oscillation, no order dependence — I9).
+        let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let (d, g, hdev, k) = (Dev::new(4), Dev::new(5), Dev::new(6), Dev::new(7));
+        let mut f = Fixture::genesis(&fdr);
+        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let a0 = f.author(&a, Some(add_a), &device_add(&d, DeviceRole::Member));
+        let b0 = f.author(&b, Some(add_b), &device_add(&g, DeviceRole::Member));
+        let b1 = f.author(&b, Some(add_b), &device_add(&hdev, DeviceRole::Member));
+        // Demote B's incarnation, valid prefix pinned to b0 ⇒ b1 (seq 1) is condemned.
+        f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &owner_demote(&b, add_b, Cut::At { seq: 0, hash: b0 }),
+        );
+        f.author(&a, Some(add_a), &device_remove(&d, Cut::Empty));
+        // An op citing an unresolvable incarnation parks.
+        let foreign = f.author(&a, Some([0x77u8; 32]), &device_add(&k, DeviceRole::Member));
+
+        let baseline = f.fold();
+        // Totality: exactly one outcome per candidate, and the mixed classes are all represented.
+        assert_eq!(baseline.outcomes.len(), f.entries.len(), "every candidate is classified");
+        assert!(baseline.is_effective(&a0) && baseline.is_effective(&add_a));
+        assert_eq!(baseline.outcome(&b1), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
+        assert_eq!(baseline.outcome(&foreign), Some(Outcome::Parked(ParkReason::UnknownOwnerRef)));
+
+        // No oscillation: the FULL map (including auth_epoch numbering) is permutation-invariant.
+        for rot in 0..f.entries.len() {
+            let rotated = f.fold_rotated(rot);
+            assert_eq!(rotated.classification(), AccountClassification::Live);
+            assert_eq!(
+                rotated.outcomes, baseline.outcomes,
+                "rotation {rot} changed the outcome map"
+            );
+        }
+    }
+
+    #[test]
+    fn cut_extend_reblesses_a_condemned_cone_p7() {
+        // F removes B pinned to seq 0, condemning B's later work (b1, b2). F then extends B's
+        // device cut to seq 2 (§11.4). Because condemnation is recomputed against the RAISED
+        // watermark, b1/b2 re-bless on the same fold — recovery is a pure refold, never sticky gate
+        // state. The extend is authored at the same incarnation depth as the removal, so the `⊔`
+        // join lands before the condemnation scan.
+        let (fdr, b) = (Dev::new(1), Dev::new(2));
+        let (d, e, g) = (Dev::new(5), Dev::new(6), Dev::new(7));
+        let mut f = Fixture::genesis(&fdr);
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let b0 = f.author(&b, Some(add_b), &device_add(&d, DeviceRole::Member));
+        let b1 = f.author(&b, Some(add_b), &device_add(&e, DeviceRole::Member));
+        let b2 = f.author(&b, Some(add_b), &device_add(&g, DeviceRole::Member));
+        let remove_b =
+            f.author(&fdr, Some(f.genesis_hash), &device_remove(&b, Cut::At { seq: 0, hash: b0 }));
+        let extend =
+            f.author(&fdr, Some(f.genesis_hash), &cut_extend_ctrl(f.account_id, &b, None, 2, b2));
+
+        // Without the extend, the beyond-cut cone is condemned.
+        let before = f.fold_without(extend);
+        assert_eq!(before.outcome(&b1), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
+        assert_eq!(before.outcome(&b2), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
+
+        // With the extend, the cone re-blesses; the removal + extend themselves are effective.
+        let after = f.fold();
+        assert!(after.is_effective(&b0), "b0 stays within every watermark");
+        assert!(after.is_effective(&b1), "b1 re-blessed by the extend");
+        assert!(after.is_effective(&b2), "b2 re-blessed by the extend");
+        assert!(after.is_effective(&remove_b) && after.is_effective(&extend));
+    }
+
+    #[test]
+    fn recovery_reopens_a_fresh_incarnation_and_bars_tombstone_readd_p7() {
+        // Demotion bounds the OLD incarnation via its register, but a re-PROMOTE mints a FRESH
+        // owner_id with no register, so the device resumes (§11). A tombstoned fingerprint, by
+        // contrast, is a permanent bar (I4): re-adding it is rejected.
+        let (fdr, b, dremoved) = (Dev::new(1), Dev::new(2), Dev::new(4));
+        let (t5, t6) = (Dev::new(5), Dev::new(6));
+        let mut f = Fixture::genesis(&fdr);
+        let g1 = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        // Demote B's incarnation g1 with an empty cut — everything B does under g1 is condemned.
+        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&b, g1, Cut::Empty));
+        let under_g1 = f.author(&b, Some(g1), &device_add(&t5, DeviceRole::Member));
+        // Re-promote B → a fresh incarnation g2 (no register); B's work under g2 accepts.
+        let g2 = f.author(&fdr, Some(f.genesis_hash), &owner_promote(&b));
+        let under_g2 = f.author(&b, Some(g2), &device_add(&t6, DeviceRole::Member));
+        // A removed device's fingerprint is tombstoned; re-adding it is barred (I4).
+        f.author(&fdr, Some(f.genesis_hash), &device_add(&dremoved, DeviceRole::Member));
+        f.author(&fdr, Some(f.genesis_hash), &device_remove(&dremoved, Cut::Empty));
+        let readd =
+            f.author(&fdr, Some(f.genesis_hash), &device_add(&dremoved, DeviceRole::Member));
+
+        let h = f.fold();
+        assert_eq!(
+            h.outcome(&under_g1),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+            "work under the demoted incarnation is condemned",
+        );
+        assert!(h.is_effective(&g2), "the re-promotion mints a fresh incarnation");
+        assert!(h.is_effective(&under_g2), "B resumes under the fresh incarnation");
+        assert_eq!(
+            h.outcome(&readd),
+            Some(Outcome::Rejected(RejectReason::TombstoneReAdd)),
+            "a tombstoned fingerprint can never re-enroll (I4)",
         );
     }
 
