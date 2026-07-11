@@ -119,11 +119,13 @@ Verified end-to-end:
 
 Remaining:
 
-- **Plugin version tracks the release.** The launcher fetches `releases/download/v<plugin-version>`,
-  so `plugin.json` / `marketplace.json` `version` must match a published release that carries prebuilt
-  assets — bump it on each rag-rat release (currently 0.16.0). Note a release binary that carries a
-  `+g<hash>` version suffix won't satisfy the strict PATH `--version` match, so the launcher downloads
-  rather than reusing an on-PATH release build (correct, just not optimal).
+- **Plugin version tracks the release (automated).** The launcher fetches
+  `releases/download/v<plugin-version>`, so the manifests' `version` must match the released crate
+  version. `.github/workflows/release-plz.yml` runs `tools/sync-plugin-version.mjs` on the Release PR
+  to bump all three manifests in lockstep with `Cargo.toml` — no manual step (proves out on the next
+  release). Aside: a release binary that carries a `+g<hash>` version suffix won't satisfy the strict
+  PATH `--version` match, so the launcher downloads rather than reusing an on-PATH release build
+  (correct, just not optimal).
 - **Windows extraction** relies on the bundled `tar` (bsdtar, Win10 1803+); needs a real Windows run.
 - **Codex hook *firing*** — install is verified (CI `codex-install`), but whether the `^Bash$` /
   `^apply_patch$` hooks fire in a live session (and **which** hooks file Codex loads — root

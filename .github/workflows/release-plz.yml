@@ -48,6 +48,28 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # release-plz bumps Cargo.toml but not the plugin JSON manifests, and it has no non-Cargo-file
+      # support. The launcher fetches releases/download/v<plugin-version>, so the manifests must match
+      # the crate version — sync them into the SAME Release PR release-plz just opened/updated. This
+      # runs after release-plz every time, so its force-push of the PR branch can never leave the
+      # manifests stale. Pushes to the release-plz-* branch (never main), so it triggers nothing.
+      - name: Sync plugin manifest versions into the release PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="$(gh pr list --state open --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("release-plz-"))][0].headRefName // ""')"
+          if [ -z "$branch" ]; then echo "no open release-plz PR — nothing to sync"; exit 0; fi
+          echo "release PR branch: $branch"
+          git fetch origin "$branch"
+          git checkout -B "$branch" "origin/$branch"
+          node tools/sync-plugin-version.mjs
+          if git diff --quiet; then echo "manifests already in sync"; exit 0; fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -am "chore: sync plugin manifest versions to the workspace version"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:$branch"
 
   # When the release PR merges (the version commit lands on main), tag, publish each crate to
   # crates.io, and create the GitHub release. No concurrency guard here — we never want a release
