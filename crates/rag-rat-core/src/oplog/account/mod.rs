@@ -27,6 +27,7 @@
 mod candidate;
 mod cut;
 mod envelope;
+mod fold;
 mod id;
 mod limits;
 mod ops;
