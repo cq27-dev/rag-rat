@@ -150,6 +150,14 @@ codex plugin add rag-rat@rag-rat
 Then run `rag-rat init` once in each repo you want indexed (see [Quickstart](#quickstart)); the
 server stays dormant until a repo has a `rag-rat.toml`.
 
+Claude Code asks once per tool before it first runs a rag-rat MCP tool (its standard MCP consent — a
+plugin can't pre-approve its own tools). To allow them all up front, choose "Yes, don't ask again" on
+the prompt, or add to your user settings (`~/.claude/settings.json`):
+
+```json
+{ "permissions": { "allow": ["mcp__rag-rat__*"] } }
+```
+
 **Any other MCP agent, or wiring it by hand.** The MCP server is STDIO — the client launches
 `rag-rat` as a child process. Register it with one command, run from the repo directory so the server
 resolves that repo's `rag-rat.toml` and each repo gets its own index:
