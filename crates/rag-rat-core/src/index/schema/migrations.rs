@@ -1244,6 +1244,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_055_ID => Some(55),
             MIGRATION_056_ID => Some(56),
             MIGRATION_057_ID => Some(57),
+            MIGRATION_058_ID => Some(58),
             _ => None,
         })
         .max()
@@ -1310,6 +1311,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_055_ID
             | MIGRATION_056_ID
             | MIGRATION_057_ID
+            | MIGRATION_058_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -3800,6 +3802,20 @@ pub(crate) fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result
 
          COMMIT;",
     )?;
+    Ok(())
+}
+
+/// V058 (sync phase C, §5): give the single device identity an X25519 ENCRYPTION keypair beside its
+/// ed25519 signing key. Two nullable `BLOB` columns — `x25519_secret` (the 32-byte scalar, the sole
+/// durable copy, D4) and `x25519_public` — added to the STRICT `oplog_device_identity` table
+/// (`BLOB` is a valid STRICT type). Nullable + additive: an existing row keeps its ed25519 identity
+/// and is backfilled at the next `local_device` open via a CAS UPDATE (mirroring the ed25519
+/// mint-if-absent race), so a concurrent open cannot split into two encryption identities.
+/// Idempotent via `add_column_if_missing`; on a fresh DB this runs right after V054 creates the
+/// table, so both columns are present before the first `local_device` call.
+pub(crate) fn apply_oplog_device_x25519(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "oplog_device_identity", "x25519_secret", "BLOB")?;
+    add_column_if_missing(conn, "oplog_device_identity", "x25519_public", "BLOB")?;
     Ok(())
 }
 

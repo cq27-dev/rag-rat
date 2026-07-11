@@ -1492,17 +1492,31 @@ fn migration_054_adds_the_single_row_device_identity_table() {
     }
 
     // `CHECK (id = 0)` + the primary key make it a strict single-row table: id 0 inserts once; a
-    // non-zero id is refused by the CHECK; a second id-0 insert is refused by the PK.
-    conn.execute("INSERT INTO oplog_device_identity VALUES (0, x'00', x'11', x'22', 0)", [])
-        .expect("the sole id=0 identity row inserts");
+    // non-zero id is refused by the CHECK; a second id-0 insert is refused by the PK. (Columns are
+    // named because V058 added the nullable x25519 columns — a positional 5-value insert no longer
+    // matches the 7-column table.)
+    conn.execute(
+        "INSERT INTO oplog_device_identity(id, seed, public_key, fingerprint, created_at_ms)
+         VALUES (0, x'00', x'11', x'22', 0)",
+        [],
+    )
+    .expect("the sole id=0 identity row inserts");
     assert!(
-        conn.execute("INSERT INTO oplog_device_identity VALUES (1, x'00', x'11', x'22', 0)", [])
-            .is_err(),
+        conn.execute(
+            "INSERT INTO oplog_device_identity(id, seed, public_key, fingerprint, created_at_ms)
+             VALUES (1, x'00', x'11', x'22', 0)",
+            [],
+        )
+        .is_err(),
         "CHECK (id = 0) rejects a second, non-zero identity"
     );
     assert!(
-        conn.execute("INSERT INTO oplog_device_identity VALUES (0, x'99', x'88', x'77', 1)", [])
-            .is_err(),
+        conn.execute(
+            "INSERT INTO oplog_device_identity(id, seed, public_key, fingerprint, created_at_ms)
+             VALUES (0, x'99', x'88', x'77', 1)",
+            [],
+        )
+        .is_err(),
         "the id=0 primary key rejects a second identity"
     );
 
@@ -1616,10 +1630,13 @@ fn migration_056_adds_the_git_change_couplings_table() {
 fn migration_057_adds_the_external_symbols_table() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
-    // V057 is the schema tip — this test carries the absolute pin (the older tests dropped to
-    // the symbolic `current_version == LATEST` check).
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 57, "V057 is the schema tip");
-    assert_eq!(schema::status(&conn).unwrap().current_version, 57, "schema at LATEST after apply");
+    // The absolute tip pin moved to `migration_058_*` (V058 is the tip now); this drops to the
+    // symbolic `current_version == LATEST` check, per the ladder convention.
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema at LATEST after apply"
+    );
 
     // The external-symbol contract table exists with its full column set.
     for column in [
@@ -1743,6 +1760,59 @@ fn migration_057_adds_the_external_symbols_table() {
         conn_table_exists(&conn, "external_symbols"),
         "the forward migrate re-creates external_symbols"
     );
+}
+
+#[test]
+fn migration_058_adds_the_oplog_device_x25519_columns() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // V058 is the schema tip — this test carries the absolute pin (the older tests dropped to
+    // the symbolic `current_version == LATEST` check).
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 58, "V058 is the schema tip");
+    assert_eq!(schema::status(&conn).unwrap().current_version, 58, "schema at LATEST after apply");
+
+    // The identity table gains the X25519 encryption columns (sync phase C, §5).
+    for column in ["x25519_secret", "x25519_public"] {
+        assert!(
+            conn_table_columns(&conn, "oplog_device_identity").contains(&column.to_string()),
+            "V058 gives oplog_device_identity its {column} column"
+        );
+    }
+
+    // Deferred-absence in ISOLATION: build the table from the V054 DDL ALONE (never the full
+    // ladder's end state) — the x25519 columns are absent — then the V058 applier adds them, and a
+    // replay is an idempotent no-op (add_column_if_missing).
+    let isolated = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_oplog_device_identity(&isolated).unwrap();
+    for column in ["x25519_secret", "x25519_public"] {
+        assert!(
+            !conn_table_columns(&isolated, "oplog_device_identity").contains(&column.to_string()),
+            "the V054 table alone lacks the {column} column"
+        );
+    }
+    schema::apply_oplog_device_x25519(&isolated).unwrap();
+    schema::apply_oplog_device_x25519(&isolated).expect("replay is a no-op");
+    for column in ["x25519_secret", "x25519_public"] {
+        assert!(
+            conn_table_columns(&isolated, "oplog_device_identity").contains(&column.to_string()),
+            "the isolated V058 applier adds the {column} column"
+        );
+    }
+
+    // A forward migrate over a ledger truncated below V058 replays the step and keeps the columns.
+    truncate_schema_to(&conn, 57);
+    schema::migrate_forward(&conn).unwrap();
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip"
+    );
+    for column in ["x25519_secret", "x25519_public"] {
+        assert!(
+            conn_table_columns(&conn, "oplog_device_identity").contains(&column.to_string()),
+            "the forward migrate keeps the {column} column"
+        );
+    }
 }
 
 #[test]

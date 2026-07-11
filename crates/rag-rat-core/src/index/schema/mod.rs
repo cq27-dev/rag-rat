@@ -19,7 +19,7 @@ pub use registry::{LEGACY_REPO_ID, register_repo, register_repo_read_only};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 57;
+pub const LATEST_SCHEMA_VERSION: u32 = 58;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -402,6 +402,14 @@ const MIGRATION_057_DESCRIPTION: &str =
      (repo_id, tool, commit_sha, worktree_id) from birth; moniker is the RAW SCIP symbol string \
      so it exact-joins edge_oracle.scip_symbol. Backs the check_library_usage tool that surfaces \
      the current signature/docs at external call sites and flags deprecated usage";
+const MIGRATION_058_ID: &str = "058_oplog_device_x25519";
+const MIGRATION_058_CHECKSUM: &str = "sha256:rag-rat-oplog-device-x25519-v58";
+const MIGRATION_058_DESCRIPTION: &str =
+    "Add x25519_secret + x25519_public (nullable BLOB) to oplog_device_identity (sync phase C, \
+     §5): the device's X25519 ENCRYPTION keypair beside its ed25519 signing key. Additive on the \
+     STRICT table; an existing ed25519-only row is backfilled at the next local_device open via a \
+     CAS UPDATE that mirrors the ed25519 mint-if-absent race, so concurrent opens converge on one \
+     encryption identity. C1 only mints/persists/validates the key; ECDH + HKDF is C4";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -889,6 +897,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_057_CHECKSUM,
         description: MIGRATION_057_DESCRIPTION,
         apply: apply_external_symbols,
+    },
+    Migration {
+        id: MIGRATION_058_ID,
+        checksum: MIGRATION_058_CHECKSUM,
+        description: MIGRATION_058_DESCRIPTION,
+        apply: apply_oplog_device_x25519,
     },
 ];
 
