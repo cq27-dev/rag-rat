@@ -25,6 +25,14 @@ use super::registers::RegisterKey;
 use crate::oplog::cbor;
 use crate::oplog::op::DeviceFingerprint;
 
+/// The account CONTROL log the fold operates on (§11) — its registers are control-log scoped
+/// (`log: 0`). A known op on the secrets (1) or content (2) log is not a control op and is retained
+/// unfolded here (its own C2/C4 fold owns it), never minting control authority.
+const CONTROL_LOG: u8 = 0;
+/// The account-op version this fold understands. A known `entry_type` at a different version may
+/// reuse the tag with new semantics, so it is retained-unfolded rather than folded as today's op.
+const SUPPORTED_OP_VERSION: u32 = 1;
+
 /// The per-entry classification (§16.3 taxonomy). `RetainedUnfolded` is an unknown `entry_type`;
 /// `Rejected` will never be effective; `Parked` is undecided pending more entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,16 +267,17 @@ struct FoldState {
     next_auth_epoch: u64,
 }
 
-/// A hash-keyed [`HeaderView`] over the candidate set — the ancestry walk + cut-target binding read
-/// headers through this without owning the fold's storage.
+/// A hash-keyed [`HeaderView`] over ALL verified entries — the ancestry walk + cut-target binding
+/// read headers through this. It spans every entry (incl. forward-compat UNKNOWN ops that are not
+/// folded): a signed header is present whether or not its op decodes, so a cut may name an unknown
+/// entry as its watermark, and unknown entries beyond a cut are condemnable.
 struct CandidateView<'a> {
-    candidates: &'a [Candidate],
-    by_hash: &'a HashMap<[u8; 32], usize>,
+    headers: &'a HashMap<[u8; 32], &'a AccountEntryHeader>,
 }
 
 impl HeaderView for CandidateView<'_> {
     fn header(&self, entry_hash: &[u8; 32]) -> Option<&AccountEntryHeader> {
-        self.by_hash.get(entry_hash).map(|&i| self.candidates[i].header())
+        self.headers.get(entry_hash).copied()
     }
 }
 
@@ -483,16 +492,24 @@ fn join_register(
 pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHistory {
     let mut outcomes: HashMap<[u8; 32], Outcome> = HashMap::new();
 
-    // Decode ops; an unknown entry_type is retained-unfolded and never participates in the fold.
+    // Header index over EVERY verified entry (incl. unknown ops) — the ancestry walk / cut binding
+    // read through it, so a cut can name any held entry as its watermark.
+    let all_headers: HashMap<[u8; 32], &AccountEntryHeader> =
+        entries.iter().map(|e| (e.entry_hash, &e.header)).collect();
+
+    // Fold only KNOWN, control-log (§11), supported-version ops. Everything else — an unknown
+    // entry_type, a non-control-log entry, or a future op_version that may reuse a tag — is
+    // retained unfolded so it can neither mint control authority nor be folded with the wrong
+    // semantics.
     let mut candidates: Vec<Candidate> = Vec::with_capacity(entries.len());
     for entry in entries {
+        let control = entry.header.log_id == CONTROL_LOG;
+        let supported = entry.header.op_version == SUPPORTED_OP_VERSION;
         match ops::decode(entry.header.entry_type, &entry.payload) {
-            Ok(DecodedAccountOp::Known(op)) => {
+            Ok(DecodedAccountOp::Known(op)) if control && supported => {
                 candidates.push(Candidate { entry: entry.clone(), op });
             },
-            // A structurally-valid-but-unknown op (decode already ran at ingest); retain it
-            // unfolded.
-            Ok(DecodedAccountOp::Unknown { .. }) | Err(_) => {
+            _ => {
                 outcomes.insert(entry.entry_hash, Outcome::RetainedUnfolded);
             },
         }
@@ -511,10 +528,6 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         };
     };
     let genesis_owner_id = genesis.hash();
-
-    // A hash → index map backs the [`CandidateView`] the ancestry walk / cut binding read through.
-    let by_hash: HashMap<[u8; 32], usize> =
-        candidates.iter().enumerate().map(|(i, c)| (c.hash(), i)).collect();
 
     let mut incarnations = Incarnations::build(&candidates, genesis_owner_id);
 
@@ -548,7 +561,7 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     let mut classification = AccountClassification::Live;
 
     'depths: for (depth, idxs) in strata {
-        let view = CandidateView { candidates: &candidates, by_hash: &by_hash };
+        let view = CandidateView { headers: &all_headers };
 
         // (a) REGISTER PASS. A cut op installs a register iff its author is AUTHORIZED
         // (authority_status == Live: its cited incarnation resolves to a mint for the SIGNER
@@ -558,13 +571,17 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         let mut admitted: Vec<AdmittedCut<'_>> = Vec::new();
         for &i in &idxs {
             let c = &candidates[i];
-            if condemned.contains_key(&c.hash()) {
+            // A condemned OR parked cut op installs nothing — parked authority (its own chain is
+            // under a not-yet-decided watermark) must not have register side effects before it is
+            // on a known-valid branch.
+            if condemned.contains_key(&c.hash()) || parked.contains_key(&c.hash()) {
                 continue;
             }
             let Some((key, cut, coord)) = control_register(c) else {
                 continue;
             };
-            if !matches!(authority_status(c, &incarnations, &state), AuthorityStatus::Live) {
+            if !matches!(authority_status(c, &incarnations, &state, &parked), AuthorityStatus::Live)
+            {
                 continue; // unauthorized → the effect pass classifies it (wrong-device / stale / park)
             }
             // An OwnerDemote's `owner_id` must resolve to a mint minted for the demoted device
@@ -592,11 +609,12 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
                     continue;
                 },
                 // Held-and-correct, OR not-yet-held: install the register either way. Its
-                // `[seq]` condemns beyond entries from seq alone (I11) even
-                // before the watermark syncs; the under-cut branch decision
-                // parks until it does (a withheld watermark never flips a
-                // verdict). A revoking owner is trusted not to misstate the watermark seq
-                // (§10).
+                // `[seq]` condemns beyond entries from seq alone (I11) even before the watermark
+                // syncs; the under-cut branch decision parks until it does (a withheld watermark
+                // never flips a verdict). A revoking owner is TRUSTED not to misstate the watermark
+                // seq (§10) — a watermark that later resolves to a different coordinate (flipping
+                // this to `CutTargetMismatch`) is owner misbehaviour, out of the trusted-owner
+                // model.
                 candidate::CutBinding::Ok | candidate::CutBinding::TargetNotHeld => {},
             }
             admitted.push(AdmittedCut { op: c, key, cut });
@@ -668,13 +686,14 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         let mut extends: Vec<(&Candidate, RegisterKey, Cut)> = Vec::new();
         for &i in &idxs {
             let c = &candidates[i];
-            if condemned.contains_key(&c.hash()) {
+            if condemned.contains_key(&c.hash()) || parked.contains_key(&c.hash()) {
                 continue;
             }
             let Some((key, cut, coord)) = cut_extend_register(c) else {
                 continue;
             };
-            if !matches!(authority_status(c, &incarnations, &state), AuthorityStatus::Live) {
+            if !matches!(authority_status(c, &incarnations, &state, &parked), AuthorityStatus::Live)
+            {
                 continue;
             }
             if candidate::validate_cut_target(&cut, &coord, &view)
@@ -721,14 +740,24 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         // force.
         parked.clear();
         for c in &candidates {
-            if condemned.contains_key(&c.hash()) {
+            // The genesis is the account's ROOT axiom — it can never be condemned, else a cut on
+            // the founder's own chain (e.g. a self-DeviceRemove with an empty cut,
+            // which condemns everything on that chain incl. seq 0) would leave a `Live`
+            // account with no effective root. The founder's LATER entries stay
+            // condemnable; only the seq-0 root is exempt.
+            if c.hash() == genesis_owner_id || condemned.contains_key(&c.hash()) {
                 continue;
             }
             match register_verdict(c, &registers, &view) {
                 RegisterVerdict::Condemned(reason) => {
                     condemned.insert(c.hash(), reason);
+                    // A condemned owner mint leaves BOTH `live` (kills dependents transitively) and
+                    // `owners` (so its device isn't a phantom owner blocking a clean re-promotion).
                     if c.is_mint() {
                         state.live.remove(&c.hash());
+                        if state.owners.get(&c.subject_device()) == Some(&c.hash()) {
+                            state.owners.remove(&c.subject_device());
+                        }
                     }
                 },
                 RegisterVerdict::Parked(reason) => {
@@ -760,7 +789,7 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
                 outcomes.insert(c.hash(), *verdict);
                 continue;
             }
-            let outcome = classify_effect(c, &incarnations, &state);
+            let outcome = classify_effect(c, &incarnations, &state, &parked);
             if let Outcome::Effective { .. } = outcome {
                 apply_effect(c, &mut state);
             }
@@ -799,10 +828,17 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
                 // stays in `live` (its under-cut ops remain valid) while
                 // leaving `owners`. Require the cited incarnation to be the device's OPEN one — a
                 // former owner cannot select the successor.
+                // Admissible iff signed by a CURRENT pre-contest owner: the cited incarnation must
+                // be live (authority_status), name the signer, AND be the device's OPEN incarnation
+                // — a demoted former owner cannot select the successor. The op is advisory (the
+                // subscriber re-decides trust against the successor genesis), so — per §12's
+                // literal rule — it counts regardless of whether it was authored
+                // before or after the contest surfaced; the account's transition to
+                // `contested` is what makes it admissible.
                 AccountOp::AccountReRoot { successor_account_id, .. }
                     if !condemned.contains_key(&c.hash())
                         && matches!(
-                            authority_status(c, &incarnations, &state),
+                            authority_status(c, &incarnations, &state, &parked),
                             AuthorityStatus::Live
                         )
                         && incarnations.author_incarnation_id(c).is_some_and(|inc| {
@@ -842,9 +878,18 @@ fn find_genesis(candidates: &[Candidate]) -> Option<&Candidate> {
     candidates
         .iter()
         .filter(|c| match &c.op {
-            AccountOp::AccountGenesis { ed25519_pubkey, .. } =>
-                account_id_from_genesis_payload(&c.entry.payload) == c.header().account_id
-                    && c.header().device_fingerprint.to_bytes() == cbor::sha256(ed25519_pubkey),
+            AccountOp::AccountGenesis { ed25519_pubkey, .. } => {
+                let h = c.header();
+                // Canonical root header shape: the seq-0 origin of the control chain with no
+                // predecessor / parent / authority — so a founder-signed genesis at seq > 0 or a
+                // non-origin header cannot be chosen as the root.
+                h.seq == 0
+                    && h.log_id == CONTROL_LOG
+                    && h.prev_hash.is_none()
+                    && h.authority_ref.is_none()
+                    && account_id_from_genesis_payload(&c.entry.payload) == h.account_id
+                    && h.device_fingerprint.to_bytes() == cbor::sha256(ed25519_pubkey)
+            },
             _ => false,
         })
         .min_by_key(|c| c.hash())
@@ -860,17 +905,24 @@ enum AuthorityStatus {
     /// The cited incarnation resolves but its mint names a DIFFERENT device (reject
     /// `wrong_device`).
     WrongDevice,
-    /// The cited incarnation names the signer but is not live (reject `stale_authority`).
+    /// The cited incarnation names the signer but is not live because it was CONDEMNED / rejected —
+    /// a permanent `stale_authority`.
     Stale,
+    /// The cited incarnation names the signer but is itself PARKED (its own watermark not yet
+    /// held). The dependent parks on the same reason, never permanently stale — it heals when
+    /// the mint does (I11).
+    ParkedAuthorizer(ParkReason),
 }
 
 /// The §"authority rule" (clauses 1 + 3): `c`'s cited incarnation must (1) resolve to a mint whose
 /// SUBJECT device is the signer, and (3) be live. `AccountGenesis` acts under its own incarnation
-/// (self-minted, subject = signer), so it passes trivially once seeded live.
+/// (self-minted, subject = signer), so it passes trivially once seeded live. A not-live authorizer
+/// that is merely PARKED (vs condemned) parks the dependent so it can recover on a later refold.
 fn authority_status(
     c: &Candidate,
     incarnations: &Incarnations<'_>,
     state: &FoldState,
+    parked: &HashMap<[u8; 32], ParkReason>,
 ) -> AuthorityStatus {
     let Some(author_inc) = incarnations.author_incarnation_id(c) else {
         return AuthorityStatus::Unresolvable;
@@ -881,22 +933,33 @@ fn authority_status(
     if mint.subject_device() != c.header().device_fingerprint {
         return AuthorityStatus::WrongDevice;
     }
-    if !state.live.contains(&author_inc) {
-        return AuthorityStatus::Stale;
+    if state.live.contains(&author_inc) {
+        return AuthorityStatus::Live;
     }
-    AuthorityStatus::Live
+    match parked.get(&author_inc) {
+        Some(reason) => AuthorityStatus::ParkedAuthorizer(*reason),
+        None => AuthorityStatus::Stale,
+    }
 }
 
 /// Classify one op in the effect pass: authority of its author-incarnation, then the state
 /// preconditions. Does NOT mutate state (that is [`apply_effect`], only on an effective verdict).
-fn classify_effect(c: &Candidate, incarnations: &Incarnations<'_>, state: &FoldState) -> Outcome {
+fn classify_effect(
+    c: &Candidate,
+    incarnations: &Incarnations<'_>,
+    state: &FoldState,
+    parked: &HashMap<[u8; 32], ParkReason>,
+) -> Outcome {
     // The author must act under a LIVE incarnation minted for THIS device (clauses 1 + 3). This is
     // what defeats laundering (a cut authored under a since-condemned owner is not live) AND owner
     // impersonation (a member citing another device's live incarnation — P3-adjacent).
-    match authority_status(c, incarnations, state) {
+    match authority_status(c, incarnations, state, parked) {
         AuthorityStatus::Unresolvable => return Outcome::Parked(ParkReason::UnknownOwnerRef),
         AuthorityStatus::WrongDevice => return Outcome::Rejected(RejectReason::WrongDevice),
         AuthorityStatus::Stale => return Outcome::Rejected(RejectReason::StaleAuthority),
+        // A parked authorizer parks the dependent (recoverable), never permanently stale-rejects
+        // it.
+        AuthorityStatus::ParkedAuthorizer(reason) => return Outcome::Parked(reason),
         AuthorityStatus::Live => {},
     }
     match &c.op {
@@ -939,12 +1002,27 @@ fn classify_effect(c: &Candidate, incarnations: &Incarnations<'_>, state: &FoldS
         // `AccountReRoot` is admissible ONLY as the terminal recovery op once the account is
         // contested (§12) — the contested path admits it. In a `Live` account it has no effect.
         AccountOp::AccountReRoot { .. } => Outcome::Rejected(RejectReason::Ineffective),
-        // DeviceRemove / OwnerDemote / CutExtend reaching here are admitted cut ops — their
-        // register
-        // + binding were decided in the register pass, so they are effective.
-        AccountOp::DeviceRemove { .. }
-        | AccountOp::OwnerDemote { .. }
-        | AccountOp::CutExtend { .. } => effective(state),
+        // A DeviceRemove of a device that was never enrolled is ineffective — otherwise it would
+        // tombstone a fingerprint that was never added (I4), permanently barring a future
+        // legitimate DeviceAdd for it.
+        AccountOp::DeviceRemove { device_fingerprint, .. } =>
+            if state.roster.contains(device_fingerprint) {
+                effective(state)
+            } else {
+                Outcome::Rejected(RejectReason::Ineffective)
+            },
+        // An OwnerDemote reaching here is an admitted cut op (register + binding decided in the
+        // register pass); it is effective.
+        AccountOp::OwnerDemote { .. } => effective(state),
+        // A CONTROL-log CutExtend reaching here was admitted in the register pass. A
+        // secrets/content extend has no control register (its binding is the C2/C4 fold's)
+        // — defer it rather than mark it effective on an unvalidated target.
+        AccountOp::CutExtend { chain_kind, .. } =>
+            if *chain_kind == ChainKind::Ctrl {
+                effective(state)
+            } else {
+                Outcome::Parked(ParkReason::DeferredStreamAuthorization)
+            },
     }
 }
 
@@ -1929,6 +2007,130 @@ mod tests {
             );
             assert_eq!(h.classification(), AccountClassification::Live);
         }
+    }
+
+    #[test]
+    fn the_genesis_root_is_never_condemned() {
+        // A DeviceRemove(founder, empty-cut) installs Device{founder} = ∅, which would condemn the
+        // WHOLE founder chain — including the seq-0 genesis. The root is EXEMPT, so the account
+        // keeps an effective genesis instead of folding `Live` with no root. (The
+        // self-removal is itself self-defeating; the point is the root survives.)
+        let fdr = Dev::new(1);
+        let mut f = Fixture::genesis(&fdr);
+        f.author(&fdr, Some(f.genesis_hash), &device_remove(&fdr, Cut::Empty));
+
+        let h = f.fold();
+        assert!(h.is_effective(&f.genesis_hash), "the genesis root is exempt from condemnation");
+        assert_eq!(h.classification(), AccountClassification::Live);
+    }
+
+    #[test]
+    fn a_known_op_on_a_non_control_log_is_not_folded() {
+        // The fold operates on the control log (0); the registers are control-log scoped. A
+        // DeviceAdd(owner) on log 1 must NOT mint control authority — it is retained unfolded.
+        let (fdr, x) = (Dev::new(1), Dev::new(2));
+        let f = Fixture::genesis(&fdr);
+        let op = device_add(&x, DeviceRole::Owner);
+        let payload = encode(&op).unwrap();
+        let header = AccountEntryHeader {
+            account_id: f.account_id,
+            log_id: 1, // secrets log — not the control log
+            device_fingerprint: fdr.fp,
+            seq: 1,
+            prev_hash: Some(f.genesis_hash),
+            parent_ref: Some(f.genesis_hash),
+            entry_type: entry_type_of(&op),
+            op_version: 1,
+            auth_len: 1,
+            crypto_suite: 0,
+            key_id: None,
+            authority_ref: Some(f.genesis_hash),
+        };
+        let signed = sign_account_entry(&fdr.secret, &header, &payload).unwrap();
+        let entry = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
+        let mut entries = f.entries.clone();
+        entries.push(entry.clone());
+
+        let h = fold_account(&entries);
+        assert_eq!(
+            h.outcome(&entry.entry_hash),
+            Some(Outcome::RetainedUnfolded),
+            "a non-control-log op is retained, never folded as control authority",
+        );
+    }
+
+    #[test]
+    fn a_known_op_at_an_unsupported_version_is_retained() {
+        // A known entry_type at a future op_version may reuse the tag with different semantics — it
+        // must be retained unfolded, not folded as today's op.
+        let (fdr, x) = (Dev::new(1), Dev::new(2));
+        let f = Fixture::genesis(&fdr);
+        let op = device_add(&x, DeviceRole::Owner);
+        let payload = encode(&op).unwrap();
+        let header = AccountEntryHeader {
+            account_id: f.account_id,
+            log_id: 0,
+            device_fingerprint: fdr.fp,
+            seq: 1,
+            prev_hash: Some(f.genesis_hash),
+            parent_ref: Some(f.genesis_hash),
+            entry_type: entry_type_of(&op),
+            op_version: 2, // future version
+            auth_len: 1,
+            crypto_suite: 0,
+            key_id: None,
+            authority_ref: Some(f.genesis_hash),
+        };
+        let signed = sign_account_entry(&fdr.secret, &header, &payload).unwrap();
+        let entry = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
+        let mut entries = f.entries.clone();
+        entries.push(entry.clone());
+
+        let h = fold_account(&entries);
+        assert_eq!(h.outcome(&entry.entry_hash), Some(Outcome::RetainedUnfolded));
+    }
+
+    #[test]
+    fn removing_a_never_enrolled_device_is_ineffective() {
+        // DeviceRemove of a device that was never added must be ineffective — else it tombstones
+        // the fingerprint and permanently bars a later legitimate DeviceAdd (I4).
+        let (fdr, ghost) = (Dev::new(1), Dev::new(7));
+        let mut f = Fixture::genesis(&fdr);
+        let remove = f.author(&fdr, Some(f.genesis_hash), &device_remove(&ghost, Cut::Empty));
+        let add = f.author(&fdr, Some(f.genesis_hash), &device_add(&ghost, DeviceRole::Member));
+
+        let h = f.fold();
+        assert_eq!(
+            h.outcome(&remove),
+            Some(Outcome::Rejected(RejectReason::Ineffective)),
+            "removing a never-enrolled device is ineffective",
+        );
+        assert!(h.is_effective(&add), "the device is not pre-tombstoned, so it can still be added");
+    }
+
+    #[test]
+    fn a_non_control_cut_extend_is_deferred_not_effective() {
+        // A secrets/content `CutExtend` has no control register (its binding is the C2/C4 fold's),
+        // so it must be deferred, never marked effective on an unvalidated target.
+        let fdr = Dev::new(1);
+        let mut f = Fixture::genesis(&fdr);
+        let op = AccountOp::CutExtend {
+            chain_kind: ops::ChainKind::Secrets,
+            stream_id: None,
+            incarnation_id: None,
+            subject_account_id: f.account_id,
+            device_fingerprint: fdr.fp,
+            new_seq: 3,
+            new_entry_hash: [0x44; 32],
+        };
+        let extend = f.author(&fdr, Some(f.genesis_hash), &op);
+
+        let h = f.fold();
+        assert_eq!(
+            h.outcome(&extend),
+            Some(Outcome::Parked(ParkReason::DeferredStreamAuthorization)),
+            "a non-control CutExtend is deferred, not effective",
+        );
     }
 
     #[test]
