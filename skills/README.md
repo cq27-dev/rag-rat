@@ -17,6 +17,7 @@ That installs the skills into whichever agents it detects (Claude Code → `.cla
 | **`using-rag-rat`** | The working rule for any rag-rat repo: reach for the MCP tools (`semantic_search`, `symbol_lookup`, `impact_surface`, the call graph, `important_symbols`) to find and understand code before grep, and record durable, non-obvious learnings as cross-agent rag-rat memories before finishing. |
 | **`dream-review`** | Triage and resolve the `rag-rat dream` memory-maintenance worklist: per finding kind, fix the underlying memory / coverage gap (resolving the finding at the root) or record an accept / dismiss verdict. |
 | **`init-rag-rat`** | Set up rag-rat in a not-yet-indexed repo (a dormant MCP server): scan the repo, guide the embedding-backend choice (local FastEmbed, a local infinity Docker server, or an ephemeral Modal/RunPod GPU worker), preview + write the config after confirmation, run the first index, and prompt an MCP restart. |
+| **`configure-rag-rat-dream`** | Enable and operate the optional AI memory-maintenance passes (`dream --verify`/`--compact`): configure the `[llm.dream]` chat model (Connect, or ephemeral Modal/RunPod via cookbook — vllm/ollama), and run it on demand or on a schedule (systemd timer). Pairs with `dream-review`, which triages the findings it produces. |
 
 ## Commands
 
@@ -28,7 +29,8 @@ npx @rag-rat/skills remove          # remove rag-rat's skills
 ```
 
 `update` and `remove` (plain, or with only `-g`/`-y`) default to rag-rat's own skills
-(`using-rag-rat`, `dream-review`, `init-rag-rat`) — they won't touch unrelated skills you've
+(`using-rag-rat`, `dream-review`, `init-rag-rat`, `configure-rag-rat-dream`) — they won't touch
+unrelated skills you've
 installed. Pass your
 own targets — a skill name, `--agent`, or `--all` — to drive the underlying `skills` CLI directly
 instead.
