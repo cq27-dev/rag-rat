@@ -8,8 +8,8 @@ description: >
   choices, recommends the local FastEmbed default for a modest machine, and — only when a remote /
   GPU embedder is worth it — loads a reference for local infinity (Docker) or an ephemeral
   Modal/RunPod worker, then previews the config, writes it after confirmation, runs the first index,
-  installs the git maintenance hooks (keep the index fresh), and tells the user to restart the MCP
-  server. Triggers: "set up rag-rat", "rag-rat is dormant",
+  offers to set up the git maintenance hooks (asks before touching `.git/hooks`), and tells the user
+  to restart the MCP server. Triggers: "set up rag-rat", "rag-rat is dormant",
   "no rag-rat.toml", "index this repo", "configure rag-rat embeddings".
 ---
 
@@ -65,19 +65,23 @@ hand-write a config blind, and let a real config load re-check it before indexin
      nothing), add the `[llm.embedding.remote]` block from step 5, show the final config, and write
      `rag-rat.toml` only after the user confirms.
 
-7. **Index (custom path only), install the git hooks, then restart.**
+7. **Index (custom path only), decide on the git hooks, then restart.**
    - **FastEmbed:** the index already ran in step 6 — **do not run `index --discover` again.**
    - **Custom remote backend:** validate the written config by loading it — `<rag-rat> doctor` fails
      loudly on a bad block (dim mismatch, `gpu` with `endpoint`, missing `query_endpoint`, …) — then
      index **once**: `<rag-rat> index --discover`. (Never index with FastEmbed and then re-embed
      remotely — configure first, index once.)
-   - **Install the git maintenance hooks** (both paths): `<rag-rat> hooks install`. These are managed
+   - **Git maintenance hooks — ask first.** rag-rat can install managed
      `post-checkout` / `post-merge` / `post-rewrite` / `post-commit` hooks that keep the index fresh
-     automatically as the repo changes — without them it drifts between manual reindexes. It is
-     idempotent and **never clobbers a foreign hook**: if a non-rag-rat hook already occupies a slot
-     it errors ("move it aside or merge manually") rather than overwriting — surface that to the user
-     and move on. (`init --yes` already installs them on the FastEmbed path, so re-running is
-     harmless.) Skip only if the repo isn't a git worktree.
+     automatically as the repo changes (without them it drifts between manual reindexes). They modify
+     the repo's `.git/hooks`, so **ask the user before enabling them** — don't install silently.
+     - If they agree: `<rag-rat> hooks install` — idempotent, and it **never clobbers a foreign hook**
+       (if a non-rag-rat hook occupies a slot it errors "move it aside or merge manually"; surface
+       that and move on).
+     - If they decline: `<rag-rat> hooks uninstall` — the FastEmbed path's `init --yes` installs the
+       hooks by default, so run this to honor a "no"; on the custom path nothing was installed, so
+       it's a no-op.
+     - Skip entirely if the repo isn't a git worktree.
    - **Then restart the rag-rat MCP server** in the agent. A dormant server does not self-activate
      (that would be a half-active server without the watcher and hook listener). After restart it
      discovers `rag-rat.toml`, starts fully active, and ordinary tools work against the new index.

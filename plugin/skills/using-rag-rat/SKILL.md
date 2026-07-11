@@ -34,7 +34,7 @@ Prefer these over `grep`/`cat`/file sweeps when browsing or understanding code:
 - **`important_symbols`** — load-bearing symbols by (SCIP-aware) PageRank; pass `personalize` to bias
   toward what you're editing.
 
-That's the daily loop. The MCP exposes **46 tools** in all — reach past the core ones by the question
+That's the daily loop. The MCP exposes **many more tools** — reach past the core ones by the question
 you're actually asking (full schemas: `docs/mcp-tools.md`):
 
 | When you want to… | Reach for |

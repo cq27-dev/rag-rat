@@ -64,20 +64,25 @@ codex plugin marketplace add cq27-dev/rag-rat
 codex plugin add rag-rat@rag-rat
 ```
 
+After installing, approve the plugin so its tools and hooks run:
+
+- **Claude Code** asks before each rag-rat MCP tool the first time it runs — choose "Yes, don't ask
+  again," or pre-allow them in `~/.claude/settings.json` with
+  `"permissions": { "allow": ["mcp__rag-rat__*"] }`.
+- **Codex** shows a **"Hooks need review"** prompt on the first `codex` session started *inside the
+  repo* (the plugin ships grep-augmentation, clone-check, and session-digest hooks that run outside
+  the sandbox). Choose **"Trust all and continue"** to enable them.
+
 Then open the repository and ask:
 
 > Set up rag-rat in this repo.
 
-The `init-rag-rat` skill scans the repo, explains the material choices, previews `rag-rat.toml`, and
-writes and indexes only after confirmation. The MCP server starts dormant in an unconfigured repo;
-when setup finishes, reconnect it so it restarts fully active against the new index.
+The `init-rag-rat` skill scans the repo, explains the material choices, previews `rag-rat.toml`,
+writes and indexes only after confirmation, and offers to set up the git hooks that keep the index
+fresh. The MCP server starts dormant in an unconfigured repo; when setup finishes, reconnect it so it
+restarts fully active against the new index.
 
-Now try the loop rag-rat is built for:
-
-- "Run `impact_surface` on the function I'm about to edit."
-- "Where is config reload handled, and why is it designed that way?"
-- "Does this helper duplicate anything already in the codebase?"
-- "Record the invariant we just discovered on this symbol."
+Then put it to work — the loop rag-rat is built for is in [Try it](#try-it).
 
 <details>
 <summary><strong>Manual installation and other agents</strong></summary>
@@ -180,7 +185,7 @@ allow the tool namespace in `~/.claude/settings.json`:
 
 ## Try it
 
-Right after `rag-rat init` the code graph, symbols, git history, semantic search, and clone
+Once the repo is indexed, the code graph, symbols, git history, semantic search, and clone
 detection are ready — these answer on the first query. Repo memories start **empty**: they accrue as
 agents record findings with `memory_create` and then surface automatically in later answers. (GitHub
 issue/PR rationale needs a `rag-rat github sync`.)
@@ -274,7 +279,7 @@ Prefer reusing the existing function(s) over duplicating — impact_surface / sy
 
 ## The tools
 
-rag-rat exposes **46 MCP tools** — the full catalog with JSON schemas lives in
+rag-rat's **MCP tools** — the full catalog with JSON schemas lives in
 [`docs/mcp-tools.md`](docs/mcp-tools.md). The ones you'll reach for most:
 
 - **`impact_surface`** — the coding preflight from the loop above: callers, callees, tests, git
