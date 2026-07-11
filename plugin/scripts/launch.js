@@ -103,9 +103,16 @@ function readVersion() {
 }
 const VERSION = readVersion();
 
-// ---- platform → cargo-dist target triple ---------------------------------------------------------
+// The binary filename is the ONLY platform fact the cache / PATH / npx resolution below needs, so
+// compute it up front — it works on EVERY platform, android included. The full target triple + archive
+// extension are deferred to detectTriple() on the download path, so a platform with no prebuilt (Intel
+// Mac) or one that reports an unusual `process.platform` (Termux → 'android') still reuses a cached /
+// npx / PATH binary and honors the `--no-install` hook no-op, instead of dying at platform detection.
+const bin = os.platform() === "win32" ? "rag-rat.exe" : "rag-rat";
+
+// ---- platform → cargo-dist target triple (download path only) ------------------------------------
 function detectTriple() {
-  const platform = os.platform(); // 'linux' | 'darwin' | 'win32' | ...
+  const platform = os.platform(); // 'linux' | 'darwin' | 'win32' | 'android' | ...
   let arch = os.arch(); // 'x64' | 'arm64' | ...
 
   if (platform === "darwin" && arch === "x64") {
@@ -120,10 +127,14 @@ function detectTriple() {
 
   const key = `${platform}-${arch}`;
   switch (key) {
-    case "linux-x64": return { triple: "x86_64-unknown-linux-gnu", ext: "tar.xz", bin: "rag-rat" };
-    case "linux-arm64": return { triple: "aarch64-unknown-linux-gnu", ext: "tar.xz", bin: "rag-rat" };
-    case "darwin-arm64": return { triple: "aarch64-apple-darwin", ext: "tar.xz", bin: "rag-rat" };
-    case "win32-x64": return { triple: "x86_64-pc-windows-msvc", ext: "zip", bin: "rag-rat.exe" };
+    case "linux-x64": return { triple: "x86_64-unknown-linux-gnu", ext: "tar.xz" };
+    case "linux-arm64": return { triple: "aarch64-unknown-linux-gnu", ext: "tar.xz" };
+    case "darwin-arm64": return { triple: "aarch64-apple-darwin", ext: "tar.xz" };
+    case "win32-x64": return { triple: "x86_64-pc-windows-msvc", ext: "zip" };
+    // Termux/Android (`process.platform === 'android'`): a GZIP archive (Termux always has gzip; xz is
+    // not default), injected into @rag-rat/bin by dist-android/patch-npm-package.mjs and attached by
+    // release-android.yml. Only arm64 is built.
+    case "android-arm64": return { triple: "aarch64-linux-android", ext: "tar.gz" };
     case "darwin-x64":
       die(
         "Intel Macs (x86_64-apple-darwin) have no prebuilt — `ort` ships no ONNX Runtime for it.\n" +
@@ -136,7 +147,6 @@ function detectTriple() {
       die(`unsupported platform ${key}. Build from source: cargo install rag-rat`);
   }
 }
-const { triple, ext, bin } = detectTriple();
 
 // ---- 1) managed cache (version-exact) ------------------------------------------------------------
 const cacheHome = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
@@ -174,6 +184,7 @@ if (NO_INSTALL) {
 downloadAndRun().catch((e) => die(e.message));
 
 async function downloadAndRun() {
+  const { triple, ext } = detectTriple(); // platform detection deferred to here (see `bin` above)
   fs.mkdirSync(cacheDir, { recursive: true });
 
   // Serialize concurrent launches: only one downloads per version; the rest wait, then hit the cache.
