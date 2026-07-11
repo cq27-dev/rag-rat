@@ -221,17 +221,43 @@ impl<'a> Incarnations<'a> {
         if let Some(cached) = self.depth.get(&owner_id) {
             return *cached;
         }
-        // Mark in-progress as unresolved to break any (impossible) cycle.
-        self.depth.insert(owner_id, None);
-        let mint = self.candidate(&owner_id)?;
-        let computed = if owner_id == self.genesis_owner_id {
-            Some(0)
-        } else {
-            let parent = mint.header().authority_ref?;
-            self.incarnation_depth(parent).map(|d| d + 1)
+        // ITERATIVE walk of the `authority_ref` chain — NOT recursion. Chain depth is
+        // adversary-controlled (a non-owner can mint a long citation chain; its depth is computed
+        // here, before any authority check, so a deep chain must never overflow the stack — §18b
+        // caps chain LENGTH, not our frames). Walk to a base with a known depth (genesis / cached /
+        // unresolvable), collecting the path, then assign depths back up. The in-progress `None`
+        // marker also breaks an (impossible) cycle: a revisit reads `None` and resolves
+        // unresolvable.
+        let mut chain: Vec<[u8; 32]> = Vec::new();
+        let mut node = owner_id;
+        let base: Option<usize> = loop {
+            if let Some(cached) = self.depth.get(&node) {
+                break *cached;
+            }
+            self.depth.insert(node, None);
+            let Some(mint) = self.candidate(&node) else {
+                break None; // no mint in this account — unresolvable (cross-account P3 / unsynced)
+            };
+            if node == self.genesis_owner_id {
+                break Some(0);
+            }
+            match mint.header().authority_ref {
+                None => break None, // a non-genesis mint with no cited incarnation is unresolvable
+                Some(parent) => {
+                    chain.push(node);
+                    node = parent;
+                },
+            }
         };
-        self.depth.insert(owner_id, computed);
-        computed
+        // The terminal `node`'s depth is `base` (correct the in-progress marker for genesis);
+        // each earlier link is one deeper. `None` propagates up an unresolvable chain.
+        self.depth.insert(node, base);
+        let mut d = base;
+        for &link in chain.iter().rev() {
+            d = d.map(|x| x + 1);
+            self.depth.insert(link, d);
+        }
+        self.depth.get(&owner_id).copied().flatten()
     }
 
     /// The incarnation `e` acts under: genesis acts under its OWN incarnation; else the cited
@@ -1126,6 +1152,19 @@ mod tests {
             let public = secret.public();
             let x =
                 DeviceX25519Secret::from_seed(&[seed.wrapping_add(0x80); 32]).public().to_bytes();
+            Dev { fp: public.fingerprint(), ed: public.to_bytes(), x, secret }
+        }
+
+        /// A distinct device from a wide index (`new` only spans a `u8`) — for building long
+        /// chains.
+        fn seeded(i: u32) -> Self {
+            let mut ed_seed = [0u8; 32];
+            ed_seed[..4].copy_from_slice(&i.to_le_bytes());
+            let secret = DeviceSecret::from_seed(&ed_seed);
+            let public = secret.public();
+            let mut x_seed = ed_seed;
+            x_seed[8] = 0x80;
+            let x = DeviceX25519Secret::from_seed(&x_seed).public().to_bytes();
             Dev { fp: public.fingerprint(), ed: public.to_bytes(), x, secret }
         }
     }
@@ -2138,6 +2177,38 @@ mod tests {
             "removing a never-enrolled device is ineffective",
         );
         assert!(h.is_effective(&add), "the device is not pre-tombstoned, so it can still be added");
+    }
+
+    #[test]
+    fn a_deep_incarnation_chain_folds_without_a_stack_overflow() {
+        // `incarnation_depth` walks the authority_ref chain ITERATIVELY. Its depth is computed for
+        // every candidate BEFORE any authority check, and chain length is adversary-controlled, so
+        // a deep chain must fold to a classification, never recurse to a stack overflow.
+        // Delivered DEEPEST-FIRST (the crash-inducing order) and folded on a SMALL stack,
+        // so a recursive regression would abort loudly here.
+        const N: u32 = 800;
+        let founder = Dev::seeded(0);
+        let mut f = Fixture::genesis(&founder);
+        let genesis_hash = f.genesis_hash;
+        let mut g = genesis_hash;
+        let mut devs = vec![founder];
+        for k in 1..=N {
+            let dev = Dev::seeded(k);
+            g = f.author(&devs[(k - 1) as usize], Some(g), &device_add(&dev, DeviceRole::Owner));
+            devs.push(dev);
+        }
+        let mut entries = f.entries.clone();
+        entries.reverse(); // deepest-first — memoization can't keep the recursion shallow
+
+        // A 64 KiB stack fits the iterative fold's constant call depth but would overflow an
+        // N-deep recursion many times over.
+        let effective = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || fold_account(&entries).is_effective(&genesis_hash))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(effective, "a deep delegation chain folds (genesis effective), no overflow");
     }
 
     #[test]
