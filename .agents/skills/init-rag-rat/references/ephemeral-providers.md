@@ -22,16 +22,24 @@ Before configuring or running an ephemeral path, get explicit go-ahead:
 model = "jinaai/jina-embeddings-v2-base-code"
 
 [llm.embedding.remote]
-backend        = "infinity"
-cookbook       = "@rag-rat/cookbook modal"     # or: @rag-rat/cookbook runpod
-gpu            = "A100"                          # provider-specific, from the tables below
-model          = "jinaai/jina-embeddings-v2-base-code"
-query_endpoint = "http://localhost:7997"        # REQUIRED for infinity/vLLM
+backend           = "infinity"
+cookbook          = "@rag-rat/cookbook modal"  # or: @rag-rat/cookbook runpod
+gpu               = "L4"                         # a MODEST GPU is plenty for embedding — see below
+model             = "jinaai/jina-embeddings-v2-base-code"
+query_endpoint    = "http://localhost:7997"     # REQUIRED for infinity/vLLM
+# Tuning for a heavy 768-dim model like jina-code (optional; sensible defaults):
+batch_size        = 8                           # texts per request — SMALL for jina (heavy); a light
+                                                # model like all-minilm handles ~256
+request_timeout_s = 120                         # generous per-request budget for heavy batches
 ```
 
 `query_endpoint` is **mandatory** for a non-ollama backend: the ephemeral box does the big backfill,
 then queries embed **locally** against the same model. Point it at a local infinity
 (`local-infinity.md`) — see the hybrid below.
+
+**Don't over-provision the GPU.** Embedding is far lighter than LLM inference — a modest GPU
+(`L4`/`T4`/`A10`) saturates infinity for jina-code. The proven default is a Modal **`L4`**; reach for
+an `A100`/`H100` only for a very large repo where the one-time backfill wall-clock matters.
 
 ## Concurrency is auto-tuned — don't hand-set it
 
