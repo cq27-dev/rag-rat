@@ -76,9 +76,8 @@ pub(super) enum RejectReason {
     /// clause 1), or an `OwnerDemote`'s `owner_id` names a mint minted for a different device
     /// than its subject.
     WrongDevice,
-    /// A `StreamGrant` / `StreamRevoke` for a stream with no effective `StreamOwn` (P11).
-    UnownedStream,
-    /// A duplicate / no-op / self-referential op with no effect.
+    /// A duplicate / no-op / self-referential op with no effect — incl. an `AccountReRoot` in a
+    /// `Live` account (admissible only as the terminal recovery op once contested, §12).
     Ineffective,
 }
 
@@ -95,6 +94,11 @@ pub(super) enum ParkReason {
     /// The entry's author is a subject of a residue cut op in a `contested` account (§12) — parked,
     /// quota-bounded, reclassified if the account recovers.
     ContestedSubject,
+    /// A `StreamOwn` / `StreamGrant` / `StreamRevoke`: stream ownership + grant authority is folded
+    /// by the C2 content-chain acceptance predicate (which owns the `/2` spec decoder and the
+    /// grant registers), not the C1 control fold. Parked here so C1 trusts NOTHING from an
+    /// unvalidated stream op; C2 reclassifies it.
+    DeferredStreamAuthorization,
 }
 
 /// The account's classification after folding (§12): `Live`, or `Contested` (owner-key compromise).
@@ -242,12 +246,12 @@ struct FoldState {
     live: HashSet<[u8; 32]>,
     /// Devices currently enrolled.
     roster: HashSet<DeviceFingerprint>,
-    /// Devices that currently hold an open owner incarnation.
-    owners: HashSet<DeviceFingerprint>,
-    /// Removed devices — never re-enroll (I4). (Populated by the cut-op stage.)
+    /// Each device holding an OPEN owner incarnation → that incarnation's `owner_id`. Keyed by
+    /// incarnation (not just device) so a stale `OwnerDemote` naming a since-superseded `owner_id`
+    /// cannot close a device's freshly-reopened incarnation.
+    owners: HashMap<DeviceFingerprint, [u8; 32]>,
+    /// Removed devices — never re-enroll (I4).
     tombstoned: HashSet<DeviceFingerprint>,
-    /// Streams with an effective `StreamOwn`.
-    streams_owned: HashSet<[u8; 32]>,
     /// Whether an `AccountGenesis` has been made effective.
     genesis_seen: bool,
     /// 0-based effective index assigned as `auth_epoch`.
@@ -328,16 +332,6 @@ fn cut_extend_register(c: &Candidate) -> Option<(RegisterKey, Cut, CutCoordinate
         None => RegisterKey::Device { account, log: 0, device: *device_fingerprint },
     };
     Some((key, cut, coord))
-}
-
-/// The device a cut op removes/demotes (its owner-closing SUBJECT), for the I2 last-owner
-/// reservation. Non-cut ops have none.
-fn cut_subject(c: &Candidate) -> Option<DeviceFingerprint> {
-    match &c.op {
-        AccountOp::DeviceRemove { device_fingerprint, .. }
-        | AccountOp::OwnerDemote { device_fingerprint, .. } => Some(*device_fingerprint),
-        _ => None,
-    }
 }
 
 /// The verdict a register scoping `c` reaches — the strictest across all scoping registers governs.
@@ -512,6 +506,7 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         };
     };
     let genesis_owner_id = genesis.hash();
+    let genesis_founder = genesis.subject_device();
 
     // A hash → index map backs the [`CandidateView`] the ancestry walk / cut binding read through.
     let by_hash: HashMap<[u8; 32], usize> =
@@ -539,7 +534,15 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     let mut final_registers: HashMap<RegisterKey, Cut> = HashMap::new();
     for pass in 0..2 {
         let mut outcomes = base_outcomes.clone();
-        let mut state = FoldState { live: HashSet::from([genesis_owner_id]), ..Default::default() };
+        // Seed the genesis founder as an owner (and enrolled) from the start — genesis's own effect
+        // re-inserts it idempotently, but seeding lets the I2 last-owner guard see an owner even at
+        // depth 0, so a founder self-removal can't strand the account with zero owners.
+        let mut state = FoldState {
+            live: HashSet::from([genesis_owner_id]),
+            owners: HashMap::from([(genesis_founder, genesis_owner_id)]),
+            roster: HashSet::from([genesis_founder]),
+            ..Default::default()
+        };
         // The revocation registers accumulated so far (extend-only, joined by `⊔`; pass 1 seeds
         // them with the final set so every depth condemns against final watermarks), every
         // entry a register condemns / parks, and the cut ops decided in the register pass
@@ -621,21 +624,27 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
             }
 
             // I2 last-owner protection across ALL same-depth admitted cuts: simulate the removals
-            // in the deterministic order and reject any cut that would empty the owner
-            // set, reserving a surviving owner. (The pre-depth owner count alone misses
-            // concurrent same-depth removals.)
-            let mut surviving_owners = state.owners.clone();
+            // in the deterministic order and reject any cut that would empty the owner set,
+            // reserving a surviving owner. A cut counts only if it CLOSES a device's currently-open
+            // incarnation (a DeviceRemove of any owner, or an OwnerDemote naming the open
+            // `owner_id`) — a stale demote does not. The seeded founder makes this hold at depth 0.
+            let mut surviving = state.owners.clone();
             admitted.retain(|a| {
-                let Some(subject) = cut_subject(a.op) else {
-                    return true;
+                let closes = match &a.op.op {
+                    AccountOp::DeviceRemove { device_fingerprint, .. } =>
+                        surviving.contains_key(device_fingerprint).then_some(*device_fingerprint),
+                    AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } =>
+                        (surviving.get(device_fingerprint) == Some(owner_id))
+                            .then_some(*device_fingerprint),
+                    _ => None,
                 };
-                if surviving_owners.contains(&subject) {
-                    if surviving_owners.len() == 1 {
+                if let Some(dev) = closes {
+                    if surviving.len() == 1 {
                         cut_verdicts
                             .insert(a.op.hash(), Outcome::Rejected(RejectReason::LastOwner));
                         return false;
                     }
-                    surviving_owners.remove(&subject);
+                    surviving.remove(&dev);
                 }
                 true
             });
@@ -786,12 +795,17 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
             let mut reroots: Vec<(&Candidate, AccountId)> = candidates
                 .iter()
                 .filter_map(|c| match &c.op {
+                    // A recovery re-root must be signed by a pre-contest owner: the FULL authority
+                    // check (the cited mint names the signer AND is live in state_before(d)), not
+                    // just liveness — else a member citing another device's incarnation could pick
+                    // the successor.
                     AccountOp::AccountReRoot { successor_account_id, .. }
-                        if !condemned.contains_key(&c.hash()) =>
-                    {
-                        let author_inc = incarnations.author_incarnation_id(c)?;
-                        state.live.contains(&author_inc).then_some((c, *successor_account_id))
-                    },
+                        if !condemned.contains_key(&c.hash())
+                            && matches!(
+                                authority_status(c, &incarnations, &state),
+                                AuthorityStatus::Live
+                            ) =>
+                        Some((c, *successor_account_id)),
                     _ => None,
                 })
                 .collect();
@@ -894,7 +908,7 @@ fn classify_effect(c: &Candidate, incarnations: &Incarnations<'_>, state: &FoldS
         },
         AccountOp::OwnerPromote { device_fingerprint } => {
             let enrolled = state.roster.contains(device_fingerprint);
-            let already_owner = state.owners.contains(device_fingerprint);
+            let already_owner = state.owners.contains_key(device_fingerprint);
             let tombstoned = state.tombstoned.contains(device_fingerprint);
             if enrolled && !already_owner && !tombstoned {
                 effective(state)
@@ -902,26 +916,22 @@ fn classify_effect(c: &Candidate, incarnations: &Incarnations<'_>, state: &FoldS
                 Outcome::Rejected(RejectReason::BadPromote)
             }
         },
-        // A stream can only be owned once (uniqueness); full self-certification of the spec bytes
-        // (decode → `derive_v2` → owner-account binding) rides the C2 content-chain acceptance
-        // predicate, where the spec decoder + grant registers live.
-        AccountOp::StreamOwn { stream_id, .. } => {
-            if state.streams_owned.contains(&stream_id.to_bytes()) {
-                Outcome::Rejected(RejectReason::Ineffective)
-            } else {
-                effective(state)
-            }
-        },
-        // A grant / revoke is ineffective until its stream has an effective `StreamOwn` (P11).
-        AccountOp::StreamGrant { stream_id, .. } | AccountOp::StreamRevoke { stream_id, .. } =>
-            if state.streams_owned.contains(&stream_id.to_bytes()) {
-                effective(state)
-            } else {
-                Outcome::Rejected(RejectReason::UnownedStream)
-            },
-        // DeviceRemove / OwnerDemote / CutExtend reaching here are admitted cut ops (their register
-        // + binding were decided in the register pass); AccountReRoot is advisory. All effective.
-        _ => effective(state),
+        // Stream ownership + grant authority (self-certifying `/2` spec, grant registers, content
+        // chains) is folded by the C2 predicate — C1 defers it rather than trust an unvalidated
+        // stream op.
+        AccountOp::StreamOwn { .. }
+        | AccountOp::StreamGrant { .. }
+        | AccountOp::StreamRevoke { .. } =>
+            Outcome::Parked(ParkReason::DeferredStreamAuthorization),
+        // `AccountReRoot` is admissible ONLY as the terminal recovery op once the account is
+        // contested (§12) — the contested path admits it. In a `Live` account it has no effect.
+        AccountOp::AccountReRoot { .. } => Outcome::Rejected(RejectReason::Ineffective),
+        // DeviceRemove / OwnerDemote / CutExtend reaching here are admitted cut ops — their
+        // register
+        // + binding were decided in the register pass, so they are effective.
+        AccountOp::DeviceRemove { .. }
+        | AccountOp::OwnerDemote { .. }
+        | AccountOp::CutExtend { .. } => effective(state),
     }
 }
 
@@ -937,18 +947,18 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
         AccountOp::AccountGenesis { .. } => {
             state.genesis_seen = true;
             state.roster.insert(c.subject_device());
-            state.owners.insert(c.subject_device());
+            state.owners.insert(c.subject_device(), c.hash());
             state.live.insert(c.hash());
         },
         AccountOp::DeviceAdd { device_fingerprint, role, .. } => {
             state.roster.insert(*device_fingerprint);
             if *role == DeviceRole::Owner {
-                state.owners.insert(*device_fingerprint);
+                state.owners.insert(*device_fingerprint, c.hash());
                 state.live.insert(c.hash());
             }
         },
         AccountOp::OwnerPromote { device_fingerprint } => {
-            state.owners.insert(*device_fingerprint);
+            state.owners.insert(*device_fingerprint, c.hash());
             state.live.insert(c.hash());
         },
         // An effective removal tombstones the device (I4: never re-enroll) and drops it from the
@@ -958,12 +968,12 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
             state.owners.remove(device_fingerprint);
             state.tombstoned.insert(*device_fingerprint);
         },
-        // A demotion closes the owner incarnation (device stays enrolled as a member).
-        AccountOp::OwnerDemote { device_fingerprint, .. } => {
+        // A demotion closes ONLY the named incarnation: if the device has since reopened a fresh
+        // one (a later OwnerPromote), a stale demote naming the old `owner_id` is a no-op.
+        AccountOp::OwnerDemote { device_fingerprint, owner_id, .. }
+            if state.owners.get(device_fingerprint) == Some(owner_id) =>
+        {
             state.owners.remove(device_fingerprint);
-        },
-        AccountOp::StreamOwn { stream_id, .. } => {
-            state.streams_owned.insert(stream_id.to_bytes());
         },
         _ => {},
     }
@@ -1666,27 +1676,27 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_grant_before_its_stream_own_is_ineffective_p11() {
-        // On F's chain a StreamGrant precedes the StreamOwn (lower seq); the grant is ineffective
-        // until the stream is owned (order-free: the precondition is on effective state,
-        // seq-ordered within the chain), and a later grant after the StreamOwn is
-        // effective.
+    fn stream_ops_are_deferred_to_c2_not_folded_as_authority() {
+        // Stream ownership + grant authority (the self-certifying `/2` spec, grant registers,
+        // content chains) is folded by the C2 predicate, not the C1 control fold. So StreamOwn /
+        // StreamGrant establish NO authority here — they park, and C1 trusts nothing from an
+        // unvalidated stream op (P11's floor: a grant is never effective before its owner because
+        // neither is ever effective in C1).
         let fdr = Dev::new(1);
         let stream = StreamId::from_bytes([0x33; 32]);
         let grantee = AccountId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&fdr);
-        let early = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
         let own = f.author(&fdr, Some(f.genesis_hash), &stream_own(stream));
-        let late = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
 
         let h = f.fold();
-        assert_eq!(
-            h.outcome(&early),
-            Some(Outcome::Rejected(RejectReason::UnownedStream)),
-            "a grant before its StreamOwn is ineffective",
-        );
-        assert!(h.is_effective(&own), "the StreamOwn is effective");
-        assert!(h.is_effective(&late), "a grant after the StreamOwn is effective");
+        for (op, label) in [(own, "StreamOwn"), (grant, "StreamGrant")] {
+            assert_eq!(
+                h.outcome(&op),
+                Some(Outcome::Parked(ParkReason::DeferredStreamAuthorization)),
+                "{label} is deferred to C2, never authority-bearing in C1",
+            );
+        }
     }
 
     #[test]
@@ -1713,6 +1723,89 @@ mod tests {
         assert!(h.is_effective(&remove_b) && h.is_effective(&extend));
         assert!(h.is_effective(&b1), "b1 re-blessed by the deeper-depth extend");
         assert!(h.is_effective(&b2), "b2 re-blessed by the deeper-depth extend");
+    }
+
+    #[test]
+    fn account_reroot_in_a_live_account_is_ineffective() {
+        // AccountReRoot is admissible ONLY as the terminal recovery op once contested (§12). In a
+        // Live account it must not fold effective — else it consumes an auth_epoch and enters the
+        // effective history, and could be auto-selected if a contest later appears.
+        let fdr = Dev::new(1);
+        let mut f = Fixture::genesis(&fdr);
+        let reroot = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &account_reroot(AccountId::from_bytes([0x55; 32])),
+        );
+
+        let h = f.fold();
+        assert_eq!(h.classification(), AccountClassification::Live);
+        assert_eq!(h.outcome(&reroot), Some(Outcome::Rejected(RejectReason::Ineffective)));
+        assert_eq!(h.contested_successor(), None);
+    }
+
+    #[test]
+    fn a_founder_cannot_strand_the_account_by_removing_itself_i2() {
+        // The founder is the only owner at depth 0. Removing itself would leave zero owners — the
+        // seeded founder makes the I2 guard fire even at depth 0, so the self-removal is rejected.
+        let fdr = Dev::new(1);
+        let mut f = Fixture::genesis(&fdr);
+        let remove_self = f.author(
+            &fdr,
+            Some(f.genesis_hash),
+            &device_remove(&fdr, Cut::At { seq: 0, hash: f.genesis_hash }),
+        );
+
+        let h = f.fold();
+        assert!(h.is_effective(&f.genesis_hash), "genesis stands");
+        assert_eq!(
+            h.outcome(&remove_self),
+            Some(Outcome::Rejected(RejectReason::LastOwner)),
+            "the founder cannot remove the last owner (I2)",
+        );
+    }
+
+    #[test]
+    fn a_stale_owner_demote_does_not_close_a_reopened_incarnation() {
+        // B is demoted (g1), then re-promoted (g2). A stale OwnerDemote naming the OLD incarnation
+        // g1 must not close B's fresh g2 — the demote is scoped to its exact incarnation.
+        let (fdr, b, t) = (Dev::new(1), Dev::new(2), Dev::new(5));
+        let mut f = Fixture::genesis(&fdr);
+        let g1 = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&b, g1, Cut::Empty));
+        let g2 = f.author(&fdr, Some(f.genesis_hash), &owner_promote(&b));
+        // A late, stale demote of the OLD incarnation g1.
+        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&b, g1, Cut::Empty));
+        // B authors under the fresh incarnation g2.
+        let under_g2 = f.author(&b, Some(g2), &device_add(&t, DeviceRole::Member));
+
+        let h = f.fold();
+        assert!(h.is_effective(&g2), "the re-promotion mints a fresh incarnation");
+        assert!(
+            h.is_effective(&under_g2),
+            "B's fresh-incarnation work survives the stale demote of the old incarnation",
+        );
+    }
+
+    #[test]
+    fn a_contested_reroot_by_a_non_owner_is_not_admitted() {
+        // Owners A and B cut each other ⇒ contested. A MEMBER M then signs an AccountReRoot citing
+        // A's incarnation. Because the signer is not A, the recovery admission (the FULL authority
+        // check, not just liveness) rejects it — a non-owner cannot select the successor.
+        let (fdr, a, b, m) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+        let mut f = Fixture::genesis(&fdr);
+        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash), &device_add(&m, DeviceRole::Member));
+        f.author(&a, Some(add_a), &device_remove(&b, Cut::Empty));
+        f.author(&b, Some(add_b), &device_remove(&a, Cut::Empty));
+        let bad_reroot =
+            f.author(&m, Some(add_a), &account_reroot(AccountId::from_bytes([0x11; 32])));
+
+        let h = f.fold();
+        assert!(matches!(h.classification(), AccountClassification::Contested { .. }));
+        assert!(!h.is_effective(&bad_reroot), "a non-owner cannot select the recovery successor");
+        assert_eq!(h.contested_successor(), None, "no owner re-rooted ⇒ no successor");
     }
 
     #[test]
