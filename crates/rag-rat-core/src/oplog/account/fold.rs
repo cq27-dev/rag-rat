@@ -969,13 +969,17 @@ fn find_genesis(candidates: &[Candidate]) -> Option<&Candidate> {
         .filter(|c| match &c.op {
             AccountOp::AccountGenesis { ed25519_pubkey, .. } => {
                 let h = c.header();
-                // Canonical root header shape: the seq-0 origin of the control chain with no
-                // predecessor / parent / authority — so a founder-signed genesis at seq > 0 or a
-                // non-origin header cannot be chosen as the root.
+                // Canonical root header shape (§6): the seq-0 origin of the control chain with NO
+                // predecessor / parent / authority and a zero auth_len (genesis is
+                // self-authorizing). A malformed same-payload genesis (e.g. a
+                // non-null parent_ref) must be excluded, so it can't win the
+                // min-hash tiebreak and get the canonical root NonGenesisOrigin'd.
                 h.seq == 0
                     && h.log_id == CONTROL_LOG
                     && h.prev_hash.is_none()
+                    && h.parent_ref.is_none()
                     && h.authority_ref.is_none()
+                    && h.auth_len == 0
                     && account_id_from_genesis_payload(&c.entry.payload) == h.account_id
                     && h.device_fingerprint.to_bytes() == cbor::sha256(ed25519_pubkey)
             },
@@ -2257,6 +2261,51 @@ mod tests {
         assert!(
             h.is_effective(&add_b),
             "the duplicated add is effective once, not overwritten as a DuplicateAdd",
+        );
+    }
+
+    #[test]
+    fn a_genesis_with_non_root_header_fields_is_not_selected_as_root() {
+        // The canonical root has no parent_ref and auth_len 0 (§6). A malformed same-payload
+        // genesis with a non-null parent_ref must be EXCLUDED from root selection (not
+        // merely lose the min-hash tiebreak), so the real root is always chosen and its
+        // descendants authorize.
+        let founder = Dev::new(1);
+        let real = Fixture::genesis(&founder);
+        let op = AccountOp::AccountGenesis {
+            ed25519_pubkey: founder.ed,
+            x25519_pubkey: founder.x,
+            nonce16: [0u8; 16],
+            created_at_ms: 1_700_000_000_000,
+            label: None,
+        };
+        let payload = encode(&op).unwrap();
+        let account_id = account_id_from_genesis_payload(&payload);
+        let header = AccountEntryHeader {
+            account_id,
+            log_id: 0,
+            device_fingerprint: founder.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: Some([0x01; 32]), // a root has no parent
+            entry_type: entry_type::ACCOUNT_GENESIS,
+            op_version: 1,
+            auth_len: 0,
+            crypto_suite: 0,
+            key_id: None,
+            authority_ref: None,
+        };
+        let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
+        let malformed =
+            verify_account_signed(&signed.signed_bytes, &founder.secret.public()).unwrap();
+        let mut entries = real.entries.clone();
+        entries.push(malformed.clone());
+
+        let h = fold_account(&entries);
+        assert!(h.is_effective(&real.genesis_hash), "the canonical root is selected regardless");
+        assert!(
+            !h.is_effective(&malformed.entry_hash),
+            "a genesis with non-root header fields is not the root",
         );
     }
 

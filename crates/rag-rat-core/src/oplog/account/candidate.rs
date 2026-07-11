@@ -56,9 +56,9 @@ pub(super) fn ancestry(target: &[u8; 32], cut: &Cut, view: &dyn HeaderView) -> A
         return Ancestry::Unknown(UnknownCause::UnknownCutTarget);
     };
     // The cut bounds ONE device's log: every link on the walk must stay on the watermark's
-    // `(account, log, device)` coordinate with a STRICTLY-DECREASING seq. A signed header only pins
-    // `prev_hash` NULLITY, not that `prev` is a valid parent, so a forged link (jumping coordinate
-    // or not decreasing seq) is not a real predecessor — the branch ends `OffBranch` there.
+    // `(account, log, device)` coordinate and step down EXACTLY one seq slot. A signed header only
+    // pins `prev_hash` NULLITY, not that `prev` is a valid contiguous parent, so a forged link
+    // (jumping coordinate, or skipping seq slots) is not a real predecessor — `OffBranch` there.
     let (account, log, device) = (wm.account_id, wm.log_id, wm.device_fingerprint);
     // Hash chains cannot cycle (a cycle needs a sha256 collision), but guard a corrupt input
     // against an infinite loop by refusing to revisit a hash.
@@ -86,9 +86,11 @@ pub(super) fn ancestry(target: &[u8; 32], cut: &Cut, view: &dyn HeaderView) -> A
         let Some(prev) = header.prev_hash else {
             return Ancestry::OffBranch; // reached the chain origin without hitting the target
         };
-        // If the predecessor is held, its seq must be strictly lower (a real parent link).
+        // If the predecessor is held, it must be the EXACTLY-preceding slot (`seq - 1`) — a chain
+        // is contiguous, so a link that skips slots (e.g. 5 → 3) is forged, not a real
+        // parent.
         if let Some(prev_header) = view.header(&prev)
-            && prev_header.seq >= header.seq
+            && prev_header.seq + 1 != header.seq
         {
             return Ancestry::OffBranch;
         }
@@ -264,13 +266,22 @@ mod tests {
         let forged = Cut::At { seq: 5, hash: [0xf0; 32] };
         assert_eq!(ancestry(&[0xcc; 32], &forged, &view), Ancestry::OffBranch);
 
-        // A non-decreasing-seq link is likewise forged: a watermark at seq 1 whose prev points at a
+        // A non-decreasing-seq link is forged: a watermark at seq 1 whose prev points at a
         // same-device entry at seq 1 (not a lower slot).
         let mut v2 = HashMap::new();
         insert_chain_entry(&mut v2, [0x01; 32], 1, Some([0x02; 32]));
         insert_chain_entry(&mut v2, [0x02; 32], 1, None); // sibling at the SAME seq
         let flat = Cut::At { seq: 1, hash: [0x01; 32] };
         assert_eq!(ancestry(&[0x02; 32], &flat, &v2), Ancestry::OffBranch);
+
+        // A seq-SKIPPING link is forged: a chain must be contiguous, so a seq-5 header whose prev
+        // is seq 3 (skipping 4) is off-branch — otherwise the skipped slots would look
+        // off-branch.
+        let mut v3 = HashMap::new();
+        insert_chain_entry(&mut v3, [0x05; 32], 5, Some([0x03; 32]));
+        insert_chain_entry(&mut v3, [0x03; 32], 3, None);
+        let skip = Cut::At { seq: 5, hash: [0x05; 32] };
+        assert_eq!(ancestry(&[0x03; 32], &skip, &v3), Ancestry::OffBranch);
     }
 
     #[test]
