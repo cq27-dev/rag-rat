@@ -536,6 +536,10 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     // clear it, or the remedy would leave the DB refusing every open forever (#498). A crash
     // before this point keeps the marker, so a genuinely torn apply still reads as Dirty.
     conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
+    // #585: record which binary brought the schema current, so a stranded fleet is diagnosable.
+    // Best-effort: the schema is already applied, and provenance is diagnostic — a stamp failure
+    // must not fail the migration (the reader tolerates an absent record).
+    let _ = record_migration_provenance(conn);
     Ok(())
 }
 
@@ -917,6 +921,10 @@ pub fn migrate_forward(conn: &Connection) -> anyhow::Result<()> {
             record_migration(conn, step.id, step.checksum, step.description)?;
         }
     }
+    // #585: this path only runs when a forward migration actually happened (early-returned above
+    // otherwise) — stamp who did it (the shared-store stranding path). Best-effort: the migration
+    // has committed; a diagnostic stamp failure must not fail it (the reader tolerates absence).
+    let _ = record_migration_provenance(conn);
     Ok(())
 }
 
@@ -988,13 +996,17 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
             current_version: known_version(&migrations),
             latest_version: LATEST_SCHEMA_VERSION,
             migrations,
-            // #484: on a shared global DB one upgraded agent migrates the schema and every
-            // process still on an older binary lands here — the refusal must carry the remedy,
-            // because it surfaces as the error text of every CLI/MCP open.
+            // #484/#585: on a shared global DB one upgraded agent migrates the schema and every
+            // process still on an older binary lands here — the refusal must carry the remedy AND
+            // name this binary's schema ceiling + WHO migrated the store (from provenance), because
+            // it surfaces as the error text of every CLI/MCP open and is how a fleet outage is
+            // diagnosed.
             message: format!(
-                "index schema was created by a newer rag-rat; refusing to open — upgrade rag-rat \
-                 or restart sessions/servers still running an older binary{}",
-                hot_upgrade_caveat()
+                "index schema was created by a newer rag-rat; refusing to open — this rag-rat \
+                 supports up to schema v{LATEST_SCHEMA_VERSION}, so upgrade rag-rat or restart \
+                 sessions/servers still running an older binary{}{}",
+                hot_upgrade_caveat(),
+                migration_provenance_note(conn),
             ),
         });
     }

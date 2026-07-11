@@ -29,6 +29,23 @@ pub use config::{Config, ResolvedTarget, TargetKind, WatchConfig};
 pub use index::{IndexDatabase, IndexStatus};
 pub use output::{OutputFormat, render};
 
+/// The running binary's version string, for migration provenance (#585) and diagnostics. The CLI
+/// sets it once at startup from its git-stamped `RAG_RAT_VERSION` (a dev build reads e.g.
+/// `0.16.0+g<hash>`, a tagged release `0.16.0`); left unset (library callers, tests) it falls back
+/// to this crate's compile-time `CARGO_PKG_VERSION`.
+static BINARY_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the running binary's version once, at process startup. Idempotent: only the first call
+/// wins, so a later mistaken call can't rewrite provenance mid-run.
+pub fn set_binary_version(version: impl Into<String>) {
+    let _ = BINARY_VERSION.set(version.into());
+}
+
+/// The version string [`set_binary_version`] recorded, or this crate's `CARGO_PKG_VERSION` default.
+pub fn binary_version() -> &'static str {
+    BINARY_VERSION.get().map(String::as_str).unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// Lightweight, lock-free count of active repo memories whose anchor is `gone`/`stale` — the same
 /// population `memory_doctor` lists. Opens a BARE read-only connection (no git resolution, scope
 /// view, or schema migration), so it is cheap enough to call on every MCP tool result to nudge the

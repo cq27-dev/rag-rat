@@ -77,6 +77,12 @@ impl IndexDatabase {
         // (read/MCP/init open) still takes the real lock. Compatible/Newer/Dirty/Missing
         // need no lock — `ensure_compatible_or_migrate` returns or refuses without writing.
         if schema::status(storage.connection())?.state == schema::SchemaState::Older {
+            // #585: refuse a dev/test build's silent forward-migration of the shared global store
+            // BEFORE taking the schema lock — on a box with one global DB the newest-migration
+            // binary otherwise wins the schema race for every process. Installed binaries and
+            // RAG_RAT_ALLOW_MIGRATE proceed; per-repo/temp DBs are never gated.
+            super::migration_gate::MigrationGate::from_env()
+                .ensure_migration_permitted(path, schema::SchemaState::Older)?;
             // A6: the GLOBAL schema lock, not a per-repo write lock — a migration rewrites the
             // shared ladder (every repo's tables), so it serializes across all repos.
             // Reentrant on the holding thread, so a CLI write command that opens under
@@ -520,7 +526,13 @@ impl IndexDatabase {
                         "timed out waiting for the schema-migration lock to apply the schema"
                     )
                 })?;
-        if schema::status(conn)?.state != schema::SchemaState::Compatible {
+        let state = schema::status(conn)?.state;
+        if state != schema::SchemaState::Compatible {
+            // #585: a dev/test build must not silently forward-migrate the shared global store —
+            // it would strand every process still on an older binary. Refused here (Older only;
+            // Missing is first-time init) unless RAG_RAT_ALLOW_MIGRATE / an installed binary.
+            super::migration_gate::MigrationGate::from_env()
+                .ensure_migration_permitted(path, state)?;
             schema::apply(conn)?;
         }
         Ok(())

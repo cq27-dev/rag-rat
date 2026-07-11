@@ -1391,6 +1391,65 @@ pub(crate) fn record_migration(
     Ok(())
 }
 
+/// GLOBAL `index_meta` keys recording WHO last brought this store's schema current (#585). About
+/// the DB file, not a repo — so they live in `index_meta`, not `repo_meta`. Overwritten each time a
+/// migration/create runs, so a stranded fleet is diagnosable in one query instead of forensics.
+pub(crate) const MIGRATION_PROVENANCE_KEYS: &[&str] = &[
+    "last_migration_binary_version",
+    "last_migration_binary_exe",
+    "last_migration_to_version",
+    "last_migration_at_ms",
+];
+
+/// Stamp the migration-provenance keys after the schema is brought current. The binary version is
+/// [`crate::binary_version`] (the CLI's git-stamped `RAG_RAT_VERSION`, else `CARGO_PKG_VERSION`),
+/// so a dev build that migrates a shared store leaves a `+g<hash>` fingerprint that names it.
+///
+/// ONE atomic multi-row upsert: statement-level atomicity means a mid-write failure (e.g. a
+/// concurrent writer's `SQLITE_BUSY`) leaves NO partial provenance — all four keys land or none do,
+/// so the reader never sees a half-written record. Call sites treat a failure here as best-effort
+/// (the migration already committed; provenance is diagnostic), so a stamp failure never fails the
+/// migration — it just leaves the record absent until the next one, which the reader handles.
+pub(crate) fn record_migration_provenance(conn: &Connection) -> rusqlite::Result<()> {
+    let exe =
+        std::env::current_exe().ok().map(|path| path.display().to_string()).unwrap_or_default();
+    conn.execute(
+        "INSERT INTO index_meta(key, value) VALUES (?1, ?2), (?3, ?4), (?5, ?6), (?7, ?8) ON \
+         CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![
+            MIGRATION_PROVENANCE_KEYS[0],
+            crate::binary_version(),
+            MIGRATION_PROVENANCE_KEYS[1],
+            exe,
+            MIGRATION_PROVENANCE_KEYS[2],
+            LATEST_SCHEMA_VERSION.to_string(),
+            MIGRATION_PROVENANCE_KEYS[3],
+            now_ms().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// A human note naming who last migrated this store, appended to the `Newer` refusal (#585). Empty
+/// when no provenance is recorded (an older DB, or one never migrated by a provenance-aware
+/// binary). Defensive: any read error yields "" — `status` must never fail on a weird DB.
+pub(crate) fn migration_provenance_note(conn: &Connection) -> String {
+    let read = |key: &str| -> Option<String> {
+        conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        .filter(|value| !value.is_empty())
+    };
+    match (read("last_migration_binary_version"), read("last_migration_binary_exe")) {
+        (Some(version), Some(exe)) => {
+            format!("; the index was last migrated by rag-rat {version} at {exe}")
+        },
+        (Some(version), None) => format!("; the index was last migrated by rag-rat {version}"),
+        _ => String::new(),
+    }
+}
+
 pub(crate) fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     let exists = conn
         .query_row(

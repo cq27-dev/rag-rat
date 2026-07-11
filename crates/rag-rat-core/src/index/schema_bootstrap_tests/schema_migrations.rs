@@ -665,6 +665,10 @@ fn compatible_open_refuses_dirty_and_newer_schema() {
     // the schema and every older-binary process hits this, so a bare refusal reads as breakage.
     assert!(err.contains("upgrade rag-rat"), "{err}");
     assert!(err.contains("restart"), "{err}");
+    // #585: it also names this binary's schema ceiling. (This fixture never recorded provenance —
+    // no index_meta — so the "who migrated" clause is correctly absent; the defensive note yields
+    // "".)
+    assert!(err.contains(&format!("schema v{}", schema::LATEST_SCHEMA_VERSION)), "{err}");
     // The fleet hot-upgrade re-execs armed MCP servers only on Linux; elsewhere the message must
     // say running servers stay stale until their sessions restart.
     if cfg!(target_os = "linux") {
@@ -1839,4 +1843,95 @@ fn migration_046_deferred_absence_and_reconverges_from_torn_state() {
         [],
     )
     .expect("a new content_hash is a distinct summary row");
+}
+
+/// #585: bringing the schema current records WHO did it into the global `index_meta`, so a stranded
+/// fleet is diagnosable in one query instead of forensics. Covers the `schema::apply` (create /
+/// funnel-2) path.
+#[test]
+fn applying_the_schema_records_migration_provenance() {
+    use rusqlite::OptionalExtension;
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    let read = |key: &str| -> Option<String> {
+        conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
+            .optional()
+            .unwrap()
+    };
+
+    assert_eq!(
+        read("last_migration_to_version").as_deref(),
+        Some(schema::LATEST_SCHEMA_VERSION.to_string().as_str()),
+        "provenance records the schema version migrated TO"
+    );
+    assert_eq!(
+        read("last_migration_binary_version").as_deref(),
+        Some(crate::binary_version()),
+        "provenance records this binary's version string"
+    );
+    assert!(read("last_migration_binary_exe").is_some(), "provenance records the binary path");
+    assert!(
+        read("last_migration_at_ms").and_then(|value| value.parse::<i64>().ok()).unwrap_or(0) > 0,
+        "provenance records a timestamp"
+    );
+}
+
+/// #585: the `Newer`-schema refusal (what every stranded process prints) names this binary's schema
+/// ceiling AND who last migrated the store, so the fleet outage is diagnosable from the error text.
+#[test]
+fn newer_schema_refusal_names_the_migrating_binary_and_ceiling() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap(); // stamps provenance for THIS binary
+    // Fabricate a Newer schema: an applied migration this binary doesn't know.
+    conn.execute(
+        "INSERT INTO schema_version(id, applied_at_ms, checksum, description) VALUES \
+         ('999_from_the_future', 0, 'sha256:future', 'a migration this binary lacks')",
+        [],
+    )
+    .unwrap();
+
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(status.state, schema::SchemaState::Newer);
+    assert!(
+        status.message.contains(crate::binary_version()),
+        "refusal should name the migrating binary version; got: {}",
+        status.message
+    );
+    assert!(
+        status.message.contains(&schema::LATEST_SCHEMA_VERSION.to_string()),
+        "refusal should name this binary's schema ceiling; got: {}",
+        status.message
+    );
+}
+
+/// #585: a forward migration of an existing store (the `migrate_forward` funnel) also stamps
+/// provenance — the stranding path, not just create.
+#[test]
+fn forward_migration_records_migration_provenance() {
+    use rusqlite::OptionalExtension;
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    // Roll back one migration and clear provenance, then forward-migrate.
+    conn.execute(
+        "DELETE FROM schema_version WHERE id = (SELECT id FROM schema_version ORDER BY id DESC \
+         LIMIT 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM index_meta WHERE key LIKE 'last_migration_%'", []).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
+
+    schema::migrate_forward(&conn).unwrap();
+
+    let to: Option<String> = conn
+        .query_row(
+            "SELECT value FROM index_meta WHERE key = 'last_migration_to_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(to.as_deref(), Some(schema::LATEST_SCHEMA_VERSION.to_string().as_str()));
 }

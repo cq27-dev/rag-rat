@@ -11,7 +11,7 @@ resolver = "3"
 # and the internal path deps below pin the same literal, so the three crates always publish in
 # lockstep. Bump this one line (and the two internal-dep `version`s under workspace.dependencies)
 # to release.
-version = "0.15.0"
+version = "0.16.0"
 authors = ["Kristaps Karlsons"]
 edition = "2024"
 # Bundled SQLite (rusqlite `bundled` -> libsqlite3-sys 0.38.1) compiles a build script that uses the
@@ -28,8 +28,8 @@ categories = ["command-line-utilities", "development-tools"]
 # Internal crates — declared once here so the version requirement is set in lockstep with
 # [workspace.package].version above. Members reference these via `{ workspace = true }` and add
 # their own feature toggles at the use site.
-rag-rat-core = { version = "0.15.0", path = "crates/rag-rat-core", default-features = false }
-rag-rat-mcp = { version = "0.15.0", path = "crates/rag-rat-mcp", default-features = false }
+rag-rat-core = { version = "0.16.0", path = "crates/rag-rat-core", default-features = false }
+rag-rat-mcp = { version = "0.16.0", path = "crates/rag-rat-mcp", default-features = false }
 anyhow = "1.0"
 # ed25519 device-identity signing for the op-log's signed entry envelope (§C4 layer-1). Default
 # features (incl. `zeroize`, which zeroizes a `SigningKey`'s seed on drop) are kept; the `rand_core`

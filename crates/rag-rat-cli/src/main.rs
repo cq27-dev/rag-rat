@@ -3,6 +3,10 @@ mod commands;
 mod fs_atomic;
 mod hooks_support;
 mod render;
+// The version-string formatter is shared with `build.rs` via `include!`; the crate only needs it
+// under test (the runtime reads the baked `RAG_RAT_VERSION`), so compiling it here is test-only.
+#[cfg(test)]
+mod version_describe;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +20,7 @@ use rag_rat_core::search::lexical::SearchHit;
 use rag_rat_core::{Config, IndexDatabase};
 pub(crate) use render::*;
 
-use crate::cli::{Cli, Command as Cmd};
+use crate::cli::{Cli, Command as Cmd, DoctorArgs};
 
 mod claude_hook;
 mod claude_settings;
@@ -54,6 +58,9 @@ fn configure_jemalloc() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Record this binary's git-stamped version (#585) so migration provenance and the stranded-
+    // binary refusal name a dev build (`0.16.0+g<hash>`) distinctly from a release (`0.16.0`).
+    rag_rat_core::set_binary_version(env!("RAG_RAT_VERSION"));
     #[cfg(not(target_env = "msvc"))]
     configure_jemalloc();
     let cli = Cli::parse();
@@ -75,7 +82,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Init(args) => return init::run(args, cli.config.as_deref().unwrap_or("rag-rat.toml")),
         Cmd::ClaudeHook => return claude_hook::run(),
         Cmd::Mcp => return run_mcp(cli.config.as_deref(), cli.json),
-        Cmd::Doctor => return run_doctor(cli.config.as_deref()),
+        Cmd::Doctor(args) => return run_doctor(args, cli.config.as_deref()),
         _ => {},
     }
 
@@ -90,7 +97,7 @@ fn main() -> anyhow::Result<()> {
     let _log = rag_rat_core::logging::init_logging(&config, log_role(&cli.command));
 
     match cli.command {
-        Cmd::Init(_) | Cmd::ClaudeHook | Cmd::Mcp | Cmd::Doctor =>
+        Cmd::Init(_) | Cmd::ClaudeHook | Cmd::Mcp | Cmd::Doctor(_) =>
             unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
         Cmd::Query(args) => query(&config, &args)?,
@@ -407,14 +414,26 @@ fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> {
 
 /// Run `doctor`, tolerating the ABSENCE of a config: with no `rag-rat.toml` at or above the cwd,
 /// report the machine-global store (`$XDG_DATA_HOME/rag-rat/rag-rat.sqlite`) instead of erroring —
-/// "no local config" is not "no data". Only when this platform resolves no data dir at all does it
-/// fall back to the friendly "run rag-rat init" hint.
-fn run_doctor(explicit: Option<&str>) -> anyhow::Result<()> {
+/// "no local config" is not "no data". `--vacuum` rewrites a specific repo's index, so it still
+/// requires a config. Only when this platform resolves no data dir at all does the config-less
+/// report fall back to the friendly "run rag-rat init" hint.
+fn run_doctor(args: &DoctorArgs, explicit: Option<&str>) -> anyhow::Result<()> {
     if let Some(config) = discover_config_optional(explicit)? {
-        let _log = rag_rat_core::logging::init_logging(&config, log_role(&Cmd::Doctor));
-        return doctor(&config);
+        let _log = rag_rat_core::logging::init_logging(
+            &config,
+            rag_rat_core::logging::Role::Cli("doctor".to_string()),
+        );
+        return doctor(&config, args);
     }
-    // No rag-rat.toml at or above the cwd: report the machine-global store instead of erroring.
+    // No rag-rat.toml at or above the cwd. `--vacuum` needs a repo (it rewrites that repo's index),
+    // so it can't run against the config-less global-store report.
+    if args.vacuum {
+        anyhow::bail!(
+            "`rag-rat doctor --vacuum` needs a rag-rat repo (it rewrites that repo's index).\nRun \
+             it from the repo checkout, or pass --config <path>."
+        );
+    }
+    // A plain config-less `doctor` reports the machine-global store instead of erroring.
     match rag_rat_core::data_dir::global_database_path() {
         Some(database) => doctor_global_store(&database),
         None => anyhow::bail!(
@@ -438,7 +457,7 @@ fn log_role(cmd: &Cmd) -> rag_rat_core::logging::Role {
         Cmd::Maintenance(_) => Role::Cli("maintenance".to_string()),
         Cmd::Reconcile(_) => Role::Cli("reconcile".to_string()),
         Cmd::Index(_) => Role::Cli("index".to_string()),
-        Cmd::Doctor => Role::Cli("doctor".to_string()),
+        Cmd::Doctor(_) => Role::Cli("doctor".to_string()),
         Cmd::Gc => Role::Cli("gc".to_string()),
         _ => Role::Cli("cmd".to_string()),
     }

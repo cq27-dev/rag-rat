@@ -28,6 +28,7 @@ mod incremental;
 mod lifecycle;
 mod mem_diag;
 mod meta;
+mod migration_gate;
 mod packages;
 mod parser_failures;
 mod prep;

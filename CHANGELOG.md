@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.15.0...rag-rat-core-v0.16.0) - 2026-07-10
+
+### Added
+
+- *(papertrail)* PapertrailClient substrate — async provider trait, normalized DTOs, index/github → index/papertrail ([#600](https://github.com/cq27-dev/rag-rat/pull/600))
+- *(reconcile)* heal op-log ghosts at index reconcile — idle-repo backstop ([#583](https://github.com/cq27-dev/rag-rat/pull/583)) ([#584](https://github.com/cq27-dev/rag-rat/pull/584))
+- *(oracle)* check_library_usage — external-dependency contracts + deprecation from SCIP external_symbols ([#114](https://github.com/cq27-dev/rag-rat/pull/114)) ([#580](https://github.com/cq27-dev/rag-rat/pull/580))
+- *(impact)* windowed file-pair change-coupling signal (V056) ([#570](https://github.com/cq27-dev/rag-rat/pull/570))
+
+### Fixed
+
+- *(schema)* don't let dev/test builds silently migrate the shared global DB ([#585](https://github.com/cq27-dev/rag-rat/pull/585)) ([#601](https://github.com/cq27-dev/rag-rat/pull/601))
+- *(clones)* meter delta hydration against a work budget + memoize posting lists across bags ([#598](https://github.com/cq27-dev/rag-rat/pull/598)) ([#599](https://github.com/cq27-dev/rag-rat/pull/599))
+- *(oplog)* self-healing per-node reconcile so no memory row is a permanent ghost ([#541](https://github.com/cq27-dev/rag-rat/pull/541)) ([#576](https://github.com/cq27-dev/rag-rat/pull/576))
+- *(index)* hoist incremental reads off the SQLite write lock; commit authored writes durably ([#560](https://github.com/cq27-dev/rag-rat/pull/560)) ([#561](https://github.com/cq27-dev/rag-rat/pull/561))
+- *(dream)* four-tier identifier resolution to kill memory_divergence false positives ([#559](https://github.com/cq27-dev/rag-rat/pull/559))
+
+### Other
+
+- *(watch)* event-scoped worktree-overlay refresh with a per-worktree diff basis ([#579](https://github.com/cq27-dev/rag-rat/pull/579))
+- *(reconcile)* cover the fast-path freshness invariants left open by #530 ([#578](https://github.com/cq27-dev/rag-rat/pull/578))
+- *(reconcile)* serve the skip-summary from a version-stamped column ([#575](https://github.com/cq27-dev/rag-rat/pull/575))
+- *(search)* materialize the FTS scope view once per candidate query ([#568](https://github.com/cq27-dev/rag-rat/pull/568))
+- *(reconcile)* classify skip-summary low-signal from one shared parse per file ([#572](https://github.com/cq27-dev/rag-rat/pull/572))
+- *(benchmarks)* refresh kernel-index + SCIP-oracle numbers to v0.15.0 ([#563](https://github.com/cq27-dev/rag-rat/pull/563))
+
 ## [0.15.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.14.0...rag-rat-core-v0.15.0) - 2026-07-09
 
 ### Added
