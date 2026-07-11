@@ -1,9 +1,8 @@
 {
   "mcpServers": {
     "rag-rat": {
-      "command": "node",
-      "args": ["./scripts/launch.js", "mcp"],
-      "cwd": "."
+      "command": "npx",
+      "args": ["-y", "@rag-rat/bin@latest", "mcp"]
     }
   }
 }
