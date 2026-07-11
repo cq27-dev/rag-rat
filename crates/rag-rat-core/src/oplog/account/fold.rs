@@ -6,12 +6,16 @@
 //! `authority_ref` cites an EARLIER-hashed owner-incarnation mint (L1), so the incarnation-citation
 //! graph is a DAG grounded at `AccountGenesis` — depth strata are finite and processed in order, a
 //! decision at depth `d` uses only final depth-`<d` results plus same-depth registers, and
-//! `condemned` only grows (no oscillation). This stage builds the depth/candidate spine + the
-//! effect pass; cut ops (registers, condemnation, `contested`) land in the next stage.
+//! `condemned` only grows (no oscillation). Each depth's live cut ops install revocation registers
+//! (after cut-target binding + the I2 last-owner guard); a register condemns entries beyond its cut
+//! (seq-only, I11) or off the accepted branch (L2), and parks an under-cut prefix whose watermark
+//! is still withheld. A same-depth mutual owner-condemnation cycle or an incomparable-cut register
+//! is genuine owner-key compromise ⇒ the account folds `contested` and halts authority mutation
+//! (§12).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::candidate::{self, Ancestry, CutCoordinate, HeaderView};
+use super::candidate::{self, Ancestry, CutCoordinate, HeaderView, JoinResult, UnknownCause};
 use super::cut::{Cut, beyond};
 use super::envelope::{AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
@@ -75,8 +79,14 @@ pub(super) enum RejectReason {
 pub(super) enum ParkReason {
     /// The cited `authority_ref` owner-incarnation is not resolvable in this account.
     UnknownOwnerRef,
-    /// A cut's watermark entry is not held yet, so its register can't be finalized (§11.3).
+    /// A cut's watermark entry is not held yet, so an under-cut entry can't be placed on/off the
+    /// accepted branch (§11.3, I11 — a withheld watermark parks, never flips a verdict).
     UnknownCutTarget,
+    /// A link on the walk from a cut's watermark toward the entry is missing (I11).
+    IncompleteCutAncestry,
+    /// The entry's author is a subject of a residue cut op in a `contested` account (§12) — parked,
+    /// quota-bounded, reclassified if the account recovers.
+    ContestedSubject,
 }
 
 /// The account's classification after folding (§12): `Live`, or `Contested` (owner-key compromise).
@@ -279,27 +289,107 @@ fn closes_last_owner(c: &Candidate, state: &FoldState) -> bool {
     state.owners.contains(&subject) && state.owners.len() == 1
 }
 
-/// Whether `c` is condemned by any register: scoped by a register key AND either beyond its cut
-/// (seq-only, I11) or off the accepted branch (L2). A withheld watermark (`Unknown` ancestry) does
-/// NOT condemn — the entry stays live until the watermark syncs (a withheld input never flips a
-/// verdict — I11).
-fn condemned_by(
+/// The verdict a register scoping `c` reaches — the strictest across all scoping registers governs.
+enum RegisterVerdict {
+    /// Beyond a cut (seq-only, I11) or off the accepted branch (L2) — never effective this fold.
+    Condemned(CondemnedReason),
+    /// Under a cut whose watermark/ancestry isn't held yet — undecided until it syncs (I11).
+    Parked(ParkReason),
+    /// No register scopes `c`, or every scoping register admits it (within-cut, on-branch).
+    Clear,
+}
+
+/// Classify `c` against the accumulated registers (§11.2). The STRICTEST scoping register governs:
+/// off-branch/beyond (condemned) beats a withheld-watermark park beats clear. Beyond-cut fires from
+/// `[seq]` alone even when the watermark entry is withheld (I11); an under-cut entry whose branch
+/// can't yet be decided PARKS (never silently accepted, never flipped later — I11).
+fn register_verdict(
     c: &Candidate,
     registers: &HashMap<RegisterKey, Cut>,
     view: &dyn HeaderView,
-) -> Option<CondemnedReason> {
+) -> RegisterVerdict {
+    let mut off_branch = false;
+    let mut beyond_cut = false;
+    let mut park: Option<ParkReason> = None;
     for (key, cut) in registers {
         if !key.scopes(c.header()) {
             continue;
         }
         if beyond(c.header().seq, cut) {
-            return Some(CondemnedReason::BeyondCut);
+            beyond_cut = true;
+            continue;
         }
-        if candidate::ancestry(&c.hash(), cut, view) == Ancestry::OffBranch {
-            return Some(CondemnedReason::OffBranch);
+        match candidate::ancestry(&c.hash(), cut, view) {
+            Ancestry::OnBranch => {}, // within-cut on the accepted branch: this register admits it
+            Ancestry::OffBranch => off_branch = true,
+            Ancestry::Unknown(cause) =>
+                park = Some(match cause {
+                    UnknownCause::UnknownCutTarget => ParkReason::UnknownCutTarget,
+                    UnknownCause::IncompleteCutAncestry => ParkReason::IncompleteCutAncestry,
+                }),
         }
     }
-    None
+    if off_branch {
+        RegisterVerdict::Condemned(CondemnedReason::OffBranch)
+    } else if beyond_cut {
+        RegisterVerdict::Condemned(CondemnedReason::BeyondCut)
+    } else if let Some(reason) = park {
+        RegisterVerdict::Parked(reason)
+    } else {
+        RegisterVerdict::Clear
+    }
+}
+
+/// Detect the ONE cycle that means owner-key compromise (§11.1/§12): among the same-depth cut ops
+/// that install registers, `X → Y` iff X's register scopes Y's own chain AND condemns it (beyond /
+/// off-branch). A cycle in this relation is two (or more) owners cutting each other simultaneously
+/// ⇒ `contested`. Self-edges (a device cutting its own chain) are not mutual and are excluded.
+fn has_condemn_cycle(admitted: &[AdmittedCut<'_>], view: &dyn HeaderView) -> bool {
+    let n = admitted.len();
+    let condemns = |x: &AdmittedCut<'_>, y: &AdmittedCut<'_>| -> bool {
+        x.key.scopes(y.op.header())
+            && (beyond(y.op.header().seq, &x.cut)
+                || candidate::ancestry(&y.op.hash(), &x.cut, view) == Ancestry::OffBranch)
+    };
+    let adj: Vec<Vec<usize>> = (0..n)
+        .map(|i| (0..n).filter(|&j| i != j && condemns(&admitted[i], &admitted[j])).collect())
+        .collect();
+    // Iterative DFS 3-colouring (0 = white, 1 = grey/on-stack, 2 = black): a grey re-visit is a
+    // back edge ⇒ cycle.
+    let mut colour = vec![0u8; n];
+    for start in 0..n {
+        if colour[start] != 0 {
+            continue;
+        }
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        colour[start] = 1;
+        while let Some((node, edge)) = stack.last().copied() {
+            if edge < adj[node].len() {
+                stack.last_mut().unwrap().1 += 1;
+                let next = adj[node][edge];
+                match colour[next] {
+                    1 => return true, // back edge into the current DFS stack
+                    0 => {
+                        colour[next] = 1;
+                        stack.push((next, 0));
+                    },
+                    _ => {},
+                }
+            } else {
+                colour[node] = 2;
+                stack.pop();
+            }
+        }
+    }
+    false
+}
+
+/// A same-depth cut op that passed cut-target binding + the I2 last-owner guard and so installs a
+/// register — the unit the cycle detector and the `⊔` join operate over.
+struct AdmittedCut<'a> {
+    op: &'a Candidate,
+    key: RegisterKey,
+    cut: Cut,
 }
 
 /// Fold one account's control-log candidates into their derived classification (§11). All entries
@@ -351,19 +441,25 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     }
 
     let mut state = FoldState { live: HashSet::from([genesis_owner_id]), ..Default::default() };
-    // The revocation registers accumulated so far (extend-only) and every entry a register has
-    // condemned (grows monotonically — no oscillation).
+    // The revocation registers accumulated so far (extend-only, joined by `⊔`), every entry a
+    // register condemns (grows monotonically — no oscillation), and every entry a register parks
+    // (recomputed each depth against the current registers).
     let mut registers: HashMap<RegisterKey, Cut> = HashMap::new();
     let mut condemned: HashMap<[u8; 32], CondemnedReason> = HashMap::new();
+    let mut parked: HashMap<[u8; 32], ParkReason> = HashMap::new();
     // Cut ops decided in the register pass (a binding failure / I2): their verdict is fixed here
     // and re-applied in the effect pass rather than re-derived.
     let mut cut_verdicts: HashMap<[u8; 32], Outcome> = HashMap::new();
+    let mut classification = AccountClassification::Live;
 
-    for (_depth, idxs) in strata {
-        // (a) REGISTER PASS — the LIVE cut ops at this depth install their watermarks. The
-        // transitive-liveness gate defeats laundering: a cut authored under a since-condemned owner
-        // has no author-incarnation in `live`, so it installs nothing (the effect pass marks it
-        // stale).
+    'depths: for (depth, idxs) in strata {
+        // (a) REGISTER PASS — the LIVE cut ops at this depth (author-incarnation ∈ live, not
+        // already condemned) that pass cut-target binding (§11.3) and the I2 last-owner
+        // guard install a register. The transitive-liveness gate defeats laundering: a cut
+        // authored under a since-condemned owner has no live author-incarnation, so it
+        // installs nothing (the effect pass classifies it StaleAuthority).
+        let view = CandidateView { candidates: &candidates, by_hash: &by_hash };
+        let mut admitted: Vec<AdmittedCut<'_>> = Vec::new();
         for &i in &idxs {
             let c = &candidates[i];
             if condemned.contains_key(&c.hash()) {
@@ -376,41 +472,84 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
                 continue;
             };
             if !state.live.contains(&author_inc) {
-                continue; // not live → the effect pass classifies it StaleAuthority
+                continue;
             }
-            let view = CandidateView { candidates: &candidates, by_hash: &by_hash };
             match candidate::validate_cut_target(&cut, &coord, &view) {
+                // A held watermark naming a DIFFERENT coordinate is a structural reject (§11.3).
                 candidate::CutBinding::Mismatch => {
                     cut_verdicts
                         .insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
                     continue;
                 },
-                candidate::CutBinding::TargetNotHeld => {
-                    cut_verdicts.insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
-                    continue;
-                },
-                candidate::CutBinding::Ok => {},
+                // Held-and-correct, OR not-yet-held: install the register either way. Its `[seq]`
+                // condemns beyond entries from seq alone (I11) even before the watermark syncs; the
+                // under-cut branch decision parks until it does (a withheld watermark never flips a
+                // verdict). A revoking owner is trusted not to misstate the watermark seq (§10).
+                candidate::CutBinding::Ok | candidate::CutBinding::TargetNotHeld => {},
             }
             if closes_last_owner(c, &state) {
                 cut_verdicts.insert(c.hash(), Outcome::Rejected(RejectReason::LastOwner));
                 continue;
             }
-            registers.insert(key, cut);
+            admitted.push(AdmittedCut { op: c, key, cut });
         }
 
-        // Condemn every candidate a register now scopes + bounds (beyond / off-branch). Pruning a
-        // condemned MINT from `live` kills its dependents transitively (they cite an owner_id no
-        // longer live → stale).
-        let view = CandidateView { candidates: &candidates, by_hash: &by_hash };
+        // A same-depth mutual owner-condemnation cycle is the genuine owner-key-compromise case
+        // (§12): halt at the last cycle-free stratum (`state_before(d)`), never auto-pick a winner.
+        if has_condemn_cycle(&admitted, &view) {
+            classification = AccountClassification::Contested { state_before_depth: depth };
+            break 'depths;
+        }
+
+        // Join each admitted register into the register set (§11.3 `⊔`). Two incomparable cuts for
+        // ONE key (equal-seq different-hash, or divergent branches — only two owner cut ops can
+        // produce this) are a same-depth mutual condemnation ⇒ contested, never a chosen hash.
+        for a in &admitted {
+            match registers.get(&a.key) {
+                None => {
+                    registers.insert(a.key.clone(), a.cut.clone());
+                },
+                Some(existing) => match candidate::join_cuts(existing, &a.cut, &view) {
+                    JoinResult::Extended(joined) => {
+                        registers.insert(a.key.clone(), joined);
+                    },
+                    JoinResult::Incomparable => {
+                        classification =
+                            AccountClassification::Contested { state_before_depth: depth };
+                        break 'depths;
+                    },
+                    // The branch relation can't be decided yet — keep the held register and park
+                    // the newcomer (it re-joins on the next refold once its
+                    // watermark syncs).
+                    JoinResult::Unknown => {
+                        cut_verdicts
+                            .insert(a.op.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
+                    },
+                },
+            }
+        }
+
+        // Re-derive condemnation + parking against the current registers. Condemnation grows
+        // monotonically (a lower-depth decision is never revised); parking is rebuilt fresh (a
+        // withheld watermark parks the under-cut prefix — I11). Pruning a condemned MINT from
+        // `live` kills its dependents transitively (they cite an owner_id no longer live →
+        // stale).
+        parked.clear();
         for c in &candidates {
             if condemned.contains_key(&c.hash()) {
                 continue;
             }
-            if let Some(reason) = condemned_by(c, &registers, &view) {
-                condemned.insert(c.hash(), reason);
-                if c.is_mint() {
-                    state.live.remove(&c.hash());
-                }
+            match register_verdict(c, &registers, &view) {
+                RegisterVerdict::Condemned(reason) => {
+                    condemned.insert(c.hash(), reason);
+                    if c.is_mint() {
+                        state.live.remove(&c.hash());
+                    }
+                },
+                RegisterVerdict::Parked(reason) => {
+                    parked.insert(c.hash(), reason);
+                },
+                RegisterVerdict::Clear => {},
             }
         }
 
@@ -428,6 +567,10 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
                 outcomes.insert(c.hash(), Outcome::Condemned(*reason));
                 continue;
             }
+            if let Some(reason) = parked.get(&c.hash()) {
+                outcomes.insert(c.hash(), Outcome::Parked(*reason));
+                continue;
+            }
             if let Some(verdict) = cut_verdicts.get(&c.hash()) {
                 outcomes.insert(c.hash(), *verdict);
                 continue;
@@ -440,15 +583,27 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
         }
     }
 
-    // A candidate that was effective at a shallow depth and only condemned later (its incarnation
-    // pruned) must reflect the final condemnation — the overlay wins over an earlier verdict.
+    // Overlay the FINAL register verdicts: a candidate effective at a shallow depth but condemned /
+    // parked by a later register reflects that here (the strictest verdict wins over an earlier
+    // one).
     for c in &candidates {
         if let Some(reason) = condemned.get(&c.hash()) {
             outcomes.insert(c.hash(), Outcome::Condemned(*reason));
+        } else if let Some(reason) = parked.get(&c.hash()) {
+            outcomes.insert(c.hash(), Outcome::Parked(*reason));
         }
     }
 
-    AccountAuthHistory { outcomes, classification: AccountClassification::Live }
+    // In a `contested` account authority mutation halts (§12): every candidate the halt left
+    // undecided (the residue cut ops + anything at depth ≥ d) parks as a contested subject —
+    // fail-closed and observable, reclassified if the account recovers.
+    if matches!(classification, AccountClassification::Contested { .. }) {
+        for c in &candidates {
+            outcomes.entry(c.hash()).or_insert(Outcome::Parked(ParkReason::ContestedSubject));
+        }
+    }
+
+    AccountAuthHistory { outcomes, classification }
 }
 
 /// The genesis candidate: an `AccountGenesis` whose payload hashes to the shared `account_id` (§4).
@@ -702,6 +857,13 @@ mod tests {
             fold_account(&e)
         }
 
+        /// Fold every entry EXCEPT `exclude` — models a watermark (or any entry) not yet synced.
+        fn fold_without(&self, exclude: [u8; 32]) -> AccountAuthHistory {
+            let held: Vec<VerifiedAccountEntry> =
+                self.entries.iter().filter(|e| e.entry_hash != exclude).cloned().collect();
+            fold_account(&held)
+        }
+
         fn effective_set(history: &AccountAuthHistory) -> HashSet<[u8; 32]> {
             history.outcomes.iter().filter(|(_, o)| o.is_effective()).map(|(h, _)| *h).collect()
         }
@@ -887,6 +1049,122 @@ mod tests {
             h.classification(),
             AccountClassification::Live,
             "no mutual same-depth cut — the account is not contested",
+        );
+    }
+
+    #[test]
+    fn mutual_owner_removal_is_contested_p4() {
+        // Founder F adds two owners A and B (both depth-0-authored ⇒ depth-1 incarnations). A and B
+        // then remove EACH OTHER at the same depth — a same-depth mutual condemnation cycle, the
+        // genuine owner-key-compromise signal (§12). The fold fails closed to state_before(1) and
+        // halts: neither removal folds, and the residue cut ops park as contested subjects.
+        let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&fdr);
+        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let remove_b = f.author(&a, Some(add_a), &device_remove(&b, Cut::Empty));
+        let remove_a = f.author(&b, Some(add_b), &device_remove(&a, Cut::Empty));
+
+        let h = f.fold();
+        assert_eq!(
+            h.classification(),
+            AccountClassification::Contested { state_before_depth: 1 },
+            "two owners cutting each other is contested at the last cycle-free depth",
+        );
+        assert!(h.is_effective(&f.genesis_hash), "state_before(1) keeps the depth-0 roster");
+        assert!(h.is_effective(&add_a), "A was a legitimate owner before the standoff");
+        assert!(h.is_effective(&add_b), "B was a legitimate owner before the standoff");
+        assert!(!h.is_effective(&remove_a), "authority mutation is halted — no removal folds");
+        assert!(!h.is_effective(&remove_b), "authority mutation is halted — no removal folds");
+        assert_eq!(
+            h.outcome(&remove_a),
+            Some(Outcome::Parked(ParkReason::ContestedSubject)),
+            "the residue cut op parks, fail-closed",
+        );
+        // Order-independence holds through a contested fold (I9): the same standoff is detected.
+        for rot in 0..f.entries.len() {
+            assert_eq!(
+                f.fold_rotated(rot).classification(),
+                AccountClassification::Contested { state_before_depth: 1 },
+                "rotation {rot} must reach the same contested verdict",
+            );
+        }
+    }
+
+    #[test]
+    fn incomparable_cuts_for_one_key_are_contested_p5() {
+        // D equivocates: two entries at D's seq 0 (different content ⇒ different hashes). Two
+        // owners A and B each remove D, but their control cuts name the two DIFFERENT seq-0
+        // watermarks. One register key (Device{D}) with equal-seq / different-hash
+        // watermarks is incomparable — the fold refuses to pick a hash and folds contested
+        // (§11.3).
+        let (fdr, a, b, d) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+        let (t8, t9) = (Dev::new(8), Dev::new(9));
+        let mut f = Fixture::genesis(&fdr);
+        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_d = f.author(&fdr, Some(f.genesis_hash), &device_add(&d, DeviceRole::Owner));
+        // D's equivocation: two seq-0 entries on D's chain with distinct content.
+        let d0a = f.author_forked(&d, Some(add_d), &device_add(&t8, DeviceRole::Member), 0, None);
+        let d0b = f.author_forked(&d, Some(add_d), &device_add(&t9, DeviceRole::Member), 0, None);
+        assert_ne!(d0a, d0b, "the two seq-0 entries must be distinct watermarks");
+        f.author(&a, Some(add_a), &device_remove(&d, Cut::At { seq: 0, hash: d0a }));
+        f.author(&b, Some(add_b), &device_remove(&d, Cut::At { seq: 0, hash: d0b }));
+
+        let h = f.fold();
+        assert_eq!(
+            h.classification(),
+            AccountClassification::Contested { state_before_depth: 1 },
+            "one register key with equal-seq different-hash cuts is contested",
+        );
+        assert!(h.is_effective(&add_a) && h.is_effective(&add_b) && h.is_effective(&add_d));
+        // The verdict is arrival-order-free: the incomparable join is symmetric (I9).
+        for rot in 0..f.entries.len() {
+            assert_eq!(
+                f.fold_rotated(rot).classification(),
+                AccountClassification::Contested { state_before_depth: 1 },
+                "rotation {rot} must reach the same contested verdict",
+            );
+        }
+    }
+
+    #[test]
+    fn a_withheld_watermark_parks_the_under_cut_prefix_but_beyond_still_fires_p10() {
+        // Founder F removes B with a cut pinned to B's seq-1 entry (b1). I11: beyond-cut
+        // condemnation fires from `[seq]` alone even while b1 is withheld, but the under-cut prefix
+        // (b0, b1) can't be placed on/off the accepted branch yet, so it PARKS — never silently
+        // accepted, never a flipped verdict. When b1 later syncs, the prefix heals to effective.
+        let (fdr, b) = (Dev::new(1), Dev::new(2));
+        let (d, e, g) = (Dev::new(5), Dev::new(6), Dev::new(7));
+        let mut f = Fixture::genesis(&fdr);
+        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let b0 = f.author(&b, Some(add_b), &device_add(&d, DeviceRole::Member));
+        let b1 = f.author(&b, Some(add_b), &device_add(&e, DeviceRole::Member));
+        let b2 = f.author(&b, Some(add_b), &device_add(&g, DeviceRole::Member));
+        f.author(&fdr, Some(f.genesis_hash), &device_remove(&b, Cut::At { seq: 1, hash: b1 }));
+
+        // Withheld: fold WITHOUT b1. Beyond-cut still fires; the under-cut prefix parks.
+        let withheld = f.fold_without(b1);
+        assert_eq!(
+            withheld.outcome(&b0),
+            Some(Outcome::Parked(ParkReason::UnknownCutTarget)),
+            "under-cut b0 parks while the watermark is withheld",
+        );
+        assert_eq!(
+            withheld.outcome(&b2),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+            "beyond-cut b2 is condemned from seq alone (I11) even with the watermark withheld",
+        );
+
+        // Healed: the watermark synced — the prefix is on the accepted branch and re-blesses; the
+        // beyond-cut verdict is unchanged (no prior verdict flipped).
+        let healed = f.fold();
+        assert!(healed.is_effective(&b0), "b0 heals to effective once b1 is held");
+        assert!(healed.is_effective(&b1), "b1 (the watermark slot) is within the cut");
+        assert_eq!(
+            healed.outcome(&b2),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+            "b2 stays condemned — healing never flips the beyond-cut verdict",
         );
     }
 
