@@ -75,6 +75,14 @@ hand-write a config blind, and let a real config load re-check it before indexin
      listener). After restart it discovers `rag-rat.toml`, starts fully active, and ordinary tools
      work against the new index.
 
+## Optional, later — AI memory maintenance (dream)
+
+Not part of setup: `init` writes no dream config, and a fresh repo has no memories yet. Once memories
+have accumulated and the user wants rag-rat to AI-**verify** and **compact** them, load
+**`references/dream-model.md`** — it configures the `[llm.dream]` model passes on the same ephemeral
+infra, but with a **chat** backend (`vllm`/`ollama`, never `infinity`). Off by default; `rag-rat
+dream` stays deterministic without it. Don't raise this during first-time setup.
+
 ## Guardrails
 
 - **Default to FastEmbed.** Don't push a remote backend onto a small repo or a modest machine.
