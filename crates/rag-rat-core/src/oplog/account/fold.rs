@@ -11,9 +11,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::candidate::{self, Ancestry, CutCoordinate, HeaderView};
+use super::cut::{Cut, beyond};
 use super::envelope::{AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceRole};
+use super::registers::RegisterKey;
 use crate::oplog::op::DeviceFingerprint;
 
 /// The per-entry classification (§16.3 taxonomy). `RetainedUnfolded` is an unknown `entry_type`;
@@ -21,6 +24,7 @@ use crate::oplog::op::DeviceFingerprint;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Outcome {
     Effective { auth_epoch: u64 },
+    Condemned(CondemnedReason),
     Rejected(RejectReason),
     Parked(ParkReason),
     RetainedUnfolded,
@@ -30,6 +34,16 @@ impl Outcome {
     pub(super) fn is_effective(&self) -> bool {
         matches!(self, Outcome::Effective { .. })
     }
+}
+
+/// Why an entry was killed by a revocation register (§11.2). `BeyondCut` is seq-only (I11) and
+/// RECOVERABLE (a later `CutExtend` re-blesses); `OffBranch` is the permanent equivocation-loser
+/// class (L2); `ClosedIncarnation` is a mint whose own authorizing incarnation was condemned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CondemnedReason {
+    BeyondCut,
+    OffBranch,
+    ClosedIncarnation,
 }
 
 /// A control op that will never be effective — a permanent state precondition failure.
@@ -47,6 +61,11 @@ pub(super) enum RejectReason {
     TombstoneReAdd,
     /// `OwnerPromote` of a non-enrolled / already-owner / tombstoned device.
     BadPromote,
+    /// A cut op whose effect would close the LAST open owner incarnation (I2).
+    LastOwner,
+    /// A cut whose watermark names a different `(scope, log, device, seq)` than its register
+    /// (§11.3).
+    CutTargetMismatch,
     /// A duplicate / no-op / self-referential op with no effect.
     Ineffective,
 }
@@ -56,6 +75,8 @@ pub(super) enum RejectReason {
 pub(super) enum ParkReason {
     /// The cited `authority_ref` owner-incarnation is not resolvable in this account.
     UnknownOwnerRef,
+    /// A cut's watermark entry is not held yet, so its register can't be finalized (§11.3).
+    UnknownCutTarget,
 }
 
 /// The account's classification after folding (§12): `Live`, or `Contested` (owner-key compromise).
@@ -206,6 +227,81 @@ struct FoldState {
     next_auth_epoch: u64,
 }
 
+/// A hash-keyed [`HeaderView`] over the candidate set — the ancestry walk + cut-target binding read
+/// headers through this without owning the fold's storage.
+struct CandidateView<'a> {
+    candidates: &'a [Candidate],
+    by_hash: &'a HashMap<[u8; 32], usize>,
+}
+
+impl HeaderView for CandidateView<'_> {
+    fn header(&self, entry_hash: &[u8; 32]) -> Option<&AccountEntryHeader> {
+        self.by_hash.get(entry_hash).map(|&i| self.candidates[i].header())
+    }
+}
+
+/// The CONTROL-log register a cut op installs (§11): `DeviceRemove` → a device-level register on
+/// the removed device's control chain (scopes the whole chain); `OwnerDemote` → an
+/// owner-incarnation register scoped to the ops citing `owner_id`. Returns the key, the watermark,
+/// and the coordinate the watermark MUST name (§11.3). Non-cut ops and the secrets/content cuts
+/// (C2/C4) return `None`.
+fn control_register(c: &Candidate) -> Option<(RegisterKey, Cut, CutCoordinate)> {
+    let account = c.header().account_id;
+    match &c.op {
+        AccountOp::DeviceRemove { device_fingerprint, control_cut, .. } => Some((
+            RegisterKey::Device { account, log: 0, device: *device_fingerprint },
+            control_cut.clone(),
+            CutCoordinate { account, log: 0, device: *device_fingerprint },
+        )),
+        AccountOp::OwnerDemote { device_fingerprint, owner_id, control_cut, .. } => Some((
+            RegisterKey::OwnerIncarnation {
+                account,
+                log: 0,
+                device: *device_fingerprint,
+                owner_id: *owner_id,
+            },
+            control_cut.clone(),
+            CutCoordinate { account, log: 0, device: *device_fingerprint },
+        )),
+        _ => None,
+    }
+}
+
+/// I2: whether admitting this cut op would close the LAST open owner incarnation (ineffective).
+/// Read against the owner set as of the previous depth boundary (same-depth adds are not yet
+/// reflected — the check is deliberately conservative).
+fn closes_last_owner(c: &Candidate, state: &FoldState) -> bool {
+    let subject = match &c.op {
+        AccountOp::DeviceRemove { device_fingerprint, .. }
+        | AccountOp::OwnerDemote { device_fingerprint, .. } => *device_fingerprint,
+        _ => return false,
+    };
+    state.owners.contains(&subject) && state.owners.len() == 1
+}
+
+/// Whether `c` is condemned by any register: scoped by a register key AND either beyond its cut
+/// (seq-only, I11) or off the accepted branch (L2). A withheld watermark (`Unknown` ancestry) does
+/// NOT condemn — the entry stays live until the watermark syncs (a withheld input never flips a
+/// verdict — I11).
+fn condemned_by(
+    c: &Candidate,
+    registers: &HashMap<RegisterKey, Cut>,
+    view: &dyn HeaderView,
+) -> Option<CondemnedReason> {
+    for (key, cut) in registers {
+        if !key.scopes(c.header()) {
+            continue;
+        }
+        if beyond(c.header().seq, cut) {
+            return Some(CondemnedReason::BeyondCut);
+        }
+        if candidate::ancestry(&c.hash(), cut, view) == Ancestry::OffBranch {
+            return Some(CondemnedReason::OffBranch);
+        }
+    }
+    None
+}
+
 /// Fold one account's control-log candidates into their derived classification (§11). All entries
 /// MUST share `account_id` (the caller groups by account). Order-independent: the result is
 /// identical under every permutation of `entries`.
@@ -237,6 +333,10 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     };
     let genesis_owner_id = genesis.hash();
 
+    // A hash → index map backs the [`CandidateView`] the ancestry walk / cut binding read through.
+    let by_hash: HashMap<[u8; 32], usize> =
+        candidates.iter().enumerate().map(|(i, c)| (c.hash(), i)).collect();
+
     let mut incarnations = Incarnations::build(&candidates, genesis_owner_id);
 
     // Group resolvable candidates by author-depth; unresolvable citations park.
@@ -251,21 +351,100 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     }
 
     let mut state = FoldState { live: HashSet::from([genesis_owner_id]), ..Default::default() };
+    // The revocation registers accumulated so far (extend-only) and every entry a register has
+    // condemned (grows monotonically — no oscillation).
+    let mut registers: HashMap<RegisterKey, Cut> = HashMap::new();
+    let mut condemned: HashMap<[u8; 32], CondemnedReason> = HashMap::new();
+    // Cut ops decided in the register pass (a binding failure / I2): their verdict is fixed here
+    // and re-applied in the effect pass rather than re-derived.
+    let mut cut_verdicts: HashMap<[u8; 32], Outcome> = HashMap::new();
 
     for (_depth, idxs) in strata {
-        // (b) EFFECT PASS over the stratum in (chain, seq) order — deterministic, order-free (I9).
+        // (a) REGISTER PASS — the LIVE cut ops at this depth install their watermarks. The
+        // transitive-liveness gate defeats laundering: a cut authored under a since-condemned owner
+        // has no author-incarnation in `live`, so it installs nothing (the effect pass marks it
+        // stale).
+        for &i in &idxs {
+            let c = &candidates[i];
+            if condemned.contains_key(&c.hash()) {
+                continue;
+            }
+            let Some((key, cut, coord)) = control_register(c) else {
+                continue;
+            };
+            let Some(author_inc) = incarnations.author_incarnation_id(c) else {
+                continue;
+            };
+            if !state.live.contains(&author_inc) {
+                continue; // not live → the effect pass classifies it StaleAuthority
+            }
+            let view = CandidateView { candidates: &candidates, by_hash: &by_hash };
+            match candidate::validate_cut_target(&cut, &coord, &view) {
+                candidate::CutBinding::Mismatch => {
+                    cut_verdicts
+                        .insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
+                    continue;
+                },
+                candidate::CutBinding::TargetNotHeld => {
+                    cut_verdicts.insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
+                    continue;
+                },
+                candidate::CutBinding::Ok => {},
+            }
+            if closes_last_owner(c, &state) {
+                cut_verdicts.insert(c.hash(), Outcome::Rejected(RejectReason::LastOwner));
+                continue;
+            }
+            registers.insert(key, cut);
+        }
+
+        // Condemn every candidate a register now scopes + bounds (beyond / off-branch). Pruning a
+        // condemned MINT from `live` kills its dependents transitively (they cite an owner_id no
+        // longer live → stale).
+        let view = CandidateView { candidates: &candidates, by_hash: &by_hash };
+        for c in &candidates {
+            if condemned.contains_key(&c.hash()) {
+                continue;
+            }
+            if let Some(reason) = condemned_by(c, &registers, &view) {
+                condemned.insert(c.hash(), reason);
+                if c.is_mint() {
+                    state.live.remove(&c.hash());
+                }
+            }
+        }
+
+        // (b) EFFECT PASS over the stratum in (chain, seq, hash) order — a TOTAL order, so an
+        // equivocation (same device + seq, different content) sorts identically under every arrival
+        // permutation (I9).
         let mut ordered = idxs;
         ordered.sort_by_key(|&i| {
             let h = candidates[i].header();
-            (h.device_fingerprint.to_bytes(), h.seq)
+            (h.device_fingerprint.to_bytes(), h.seq, candidates[i].hash())
         });
         for i in ordered {
             let c = &candidates[i];
+            if let Some(reason) = condemned.get(&c.hash()) {
+                outcomes.insert(c.hash(), Outcome::Condemned(*reason));
+                continue;
+            }
+            if let Some(verdict) = cut_verdicts.get(&c.hash()) {
+                outcomes.insert(c.hash(), *verdict);
+                continue;
+            }
             let outcome = classify_effect(c, &incarnations, &state);
             if let Outcome::Effective { .. } = outcome {
                 apply_effect(c, &mut state);
             }
             outcomes.insert(c.hash(), outcome);
+        }
+    }
+
+    // A candidate that was effective at a shallow depth and only condemned later (its incarnation
+    // pruned) must reflect the final condemnation — the overlay wins over an earlier verdict.
+    for c in &candidates {
+        if let Some(reason) = condemned.get(&c.hash()) {
+            outcomes.insert(c.hash(), Outcome::Condemned(*reason));
         }
     }
 
@@ -353,6 +532,17 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
         AccountOp::OwnerPromote { device_fingerprint } => {
             state.owners.insert(*device_fingerprint);
             state.live.insert(c.hash());
+        },
+        // An effective removal tombstones the device (I4: never re-enroll) and drops it from the
+        // roster/owner sets. The register it installed handles condemning its beyond-cut entries.
+        AccountOp::DeviceRemove { device_fingerprint, .. } => {
+            state.roster.remove(device_fingerprint);
+            state.owners.remove(device_fingerprint);
+            state.tombstoned.insert(*device_fingerprint);
+        },
+        // A demotion closes the owner incarnation (device stays enrolled as a member).
+        AccountOp::OwnerDemote { device_fingerprint, .. } => {
+            state.owners.remove(device_fingerprint);
         },
         AccountOp::StreamOwn { stream_id, .. } => {
             state.streams_owned.insert(stream_id.to_bytes());
@@ -466,6 +656,40 @@ mod tests {
             hash
         }
 
+        /// Author `op` at an EXPLICIT `(seq, prev_hash)` without advancing the device's main chain
+        /// — used to forge an equivocating sibling entry (an off-branch fork) for
+        /// revocation tests.
+        fn author_forked(
+            &mut self,
+            author: &Dev,
+            authority_ref: Option<[u8; 32]>,
+            op: &AccountOp,
+            seq: u64,
+            prev_hash: Option<[u8; 32]>,
+        ) -> [u8; 32] {
+            let payload = encode(op).unwrap();
+            let header = AccountEntryHeader {
+                account_id: self.account_id,
+                log_id: 0,
+                device_fingerprint: author.fp,
+                seq,
+                prev_hash,
+                parent_ref: Some(self.genesis_hash),
+                entry_type: entry_type_of(op),
+                op_version: 1,
+                auth_len: 1,
+                crypto_suite: 0,
+                key_id: None,
+                authority_ref,
+            };
+            let signed = sign_account_entry(&author.secret, &header, &payload).unwrap();
+            let verified =
+                verify_account_signed(&signed.signed_bytes, &author.secret.public()).unwrap();
+            let hash = verified.entry_hash;
+            self.entries.push(verified);
+            hash
+        }
+
         fn fold(&self) -> AccountAuthHistory {
             fold_account(&self.entries)
         }
@@ -490,6 +714,26 @@ mod tests {
             x25519_pubkey: dev.x,
             role,
             label: None,
+        }
+    }
+
+    fn device_remove(dev: &Dev, control_cut: Cut) -> AccountOp {
+        AccountOp::DeviceRemove {
+            device_fingerprint: dev.fp,
+            control_cut,
+            secrets_cut: Cut::Empty,
+            content_cuts: Vec::new(),
+            reason: "revoked".to_string(),
+        }
+    }
+
+    fn owner_demote(dev: &Dev, owner_id: [u8; 32], control_cut: Cut) -> AccountOp {
+        AccountOp::OwnerDemote {
+            device_fingerprint: dev.fp,
+            owner_id,
+            control_cut,
+            secrets_cut: Cut::Empty,
+            reason: "demoted".to_string(),
         }
     }
 
@@ -559,6 +803,90 @@ mod tests {
             h.outcome(&add_b2),
             Some(Outcome::Rejected(RejectReason::DuplicateAdd)),
             "the duplicate DeviceAdd(B) is ineffective",
+        );
+    }
+
+    #[test]
+    fn revocation_is_sound_beyond_within_and_off_branch_p6() {
+        // Founder A adds owner B; B authors a chain b0 <- b1 (<- b2). A then removes B with a cut
+        // pinned to b1. Soundness (§11 valid-prefix, L2):
+        //   * b0, b1 (within the cut, on the accepted branch) stay EFFECTIVE — a removal bounds the
+        //     valid prefix, it does not erase legitimate history.
+        //   * b2 (seq beyond the watermark) is Condemned{BeyondCut} — a back-dated forgery.
+        //   * a forged sibling of b1 (same seq, different branch) is Condemned{OffBranch} — the
+        //     equivocation loser, caught by ancestry even though its seq is within the cut.
+        let (a, b) = (Dev::new(1), Dev::new(2));
+        let (d, e, fdev, g) = (Dev::new(4), Dev::new(5), Dev::new(6), Dev::new(7));
+        let mut f = Fixture::genesis(&a);
+        let add_b = f.author(&a, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let b0 = f.author(&b, Some(add_b), &device_add(&d, DeviceRole::Member));
+        let b1 = f.author(&b, Some(add_b), &device_add(&e, DeviceRole::Member));
+        let b2 = f.author(&b, Some(add_b), &device_add(&fdev, DeviceRole::Member));
+        // A forged sibling of b1: seq 1 (within the cut) but forking off b0 — off the branch b1 is
+        // on.
+        let forged =
+            f.author_forked(&b, Some(add_b), &device_add(&g, DeviceRole::Member), 1, Some(b0));
+        // A removes B, valid prefix pinned to b1 on B's control chain.
+        let remove_b =
+            f.author(&a, Some(f.genesis_hash), &device_remove(&b, Cut::At { seq: 1, hash: b1 }));
+
+        let h = f.fold();
+        assert!(h.is_effective(&remove_b), "the removal itself is effective");
+        assert!(h.is_effective(&b0), "b0 is within the cut and on-branch — effective");
+        assert!(h.is_effective(&b1), "b1 (the watermark slot) is within the cut — effective");
+        assert_eq!(
+            h.outcome(&b2),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+            "b2 is beyond the cut — a back-dated forgery",
+        );
+        assert_eq!(
+            h.outcome(&forged),
+            Some(Outcome::Condemned(CondemnedReason::OffBranch)),
+            "the forged sibling of b1 is off the accepted branch",
+        );
+        // Order-independence holds with revocation in play (I9).
+        let baseline = Fixture::effective_set(&h);
+        for rot in 0..f.entries.len() {
+            assert_eq!(Fixture::effective_set(&f.fold_rotated(rot)), baseline, "rotation {rot}");
+        }
+    }
+
+    #[test]
+    fn a_demoted_owner_cannot_launder_authority_p1() {
+        // A (founder) demotes owner B (owner_id = add_b) with an EMPTY control cut — nothing under
+        // B's incarnation is valid henceforth. B, beyond that cut, tries to mint a new owner C
+        // (DeviceAdd C as owner). C then tries to remove A. No-laundering (P1):
+        //   * A's demotion of B is effective.
+        //   * B's post-cut DeviceAdd(C) is Condemned{BeyondCut} (scoped by the owner-incarnation
+        //     register, beyond an empty cut) — so C's incarnation never becomes live.
+        //   * C's DeviceRemove(A) is StaleAuthority — it cites an incarnation that never lived.
+        //   * The account is NOT contested — there is no mutual, same-depth revocation.
+        let (a, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&a);
+        let add_b = f.author(&a, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let demote_b = f.author(&a, Some(f.genesis_hash), &owner_demote(&b, add_b, Cut::Empty));
+        let add_c = f.author(&b, Some(add_b), &device_add(&c, DeviceRole::Owner));
+        let remove_a = f.author(&c, Some(add_c), &device_remove(&a, Cut::Empty));
+
+        let h = f.fold();
+        assert!(h.is_effective(&f.genesis_hash));
+        assert!(h.is_effective(&add_b), "B was a legitimately-added owner");
+        assert!(h.is_effective(&demote_b), "A's demotion of B is effective");
+        assert_eq!(
+            h.outcome(&add_c),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+            "B's laundered owner-mint is condemned by the demotion cut",
+        );
+        assert_eq!(
+            h.outcome(&remove_a),
+            Some(Outcome::Rejected(RejectReason::StaleAuthority)),
+            "C's removal of A cites an incarnation that never lived",
+        );
+        assert!(!h.is_effective(&remove_a), "A is not removed — laundering defeated");
+        assert_eq!(
+            h.classification(),
+            AccountClassification::Live,
+            "no mutual same-depth cut — the account is not contested",
         );
     }
 
